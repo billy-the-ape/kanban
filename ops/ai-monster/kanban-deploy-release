@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Install this file as root-owned /usr/local/sbin/kanban-deploy-release.
+# It deliberately exposes no arbitrary root command execution to the Actions runner.
+set -Eeuo pipefail
+
+readonly SERVICE="cline-kanban.service"
+readonly RELEASE_ROOT="/opt/cline-kanban/releases"
+readonly OVERRIDE_DIR="/etc/systemd/system/cline-kanban.service.d"
+readonly OVERRIDE_FILE="${OVERRIDE_DIR}/90-source-release.conf"
+readonly HEALTH_URL="http://127.0.0.1:3483/"
+
+source_dir=""
+commit=""
+
+usage() {
+  cat <<'EOF'
+Usage: kanban-deploy-release --source ABSOLUTE_DIRECTORY --commit FULL_SHA
+EOF
+}
+
+while (( "$#" )); do
+  case "$1" in
+    --source) source_dir="${2:-}"; shift 2 ;;
+    --commit) commit="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+
+if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "commit must be a full 40-character lowercase SHA" >&2
+  exit 2
+fi
+if [[ -z "$source_dir" || "$source_dir" != /* ]]; then
+  echo "source must be an absolute directory" >&2
+  exit 2
+fi
+source_dir="$(readlink -f -- "$source_dir")"
+for required in package.json package-lock.json dist/cli.js dist/index.js node_modules; do
+  [[ -e "${source_dir}/${required}" ]] || {
+    echo "missing required build output: ${required}" >&2
+    exit 2
+  }
+done
+
+exec 9>/run/lock/kanban-deploy.lock
+flock -n 9 || {
+  echo "another Kanban deployment is already running" >&2
+  exit 1
+}
+
+release_dir="${RELEASE_ROOT}/${commit}"
+staging_dir="${RELEASE_ROOT}/.${commit}.staging.$$"
+old_override="$(mktemp)"
+had_override=false
+
+cleanup() {
+  rm -f -- "$old_override"
+  [[ -d "$staging_dir" ]] && rm -rf -- "$staging_dir"
+}
+trap cleanup EXIT
+
+[[ ! -e "$release_dir" ]] || {
+  echo "release already exists: ${release_dir}" >&2
+  exit 1
+}
+systemctl --no-pager cat "$SERVICE" >/dev/null
+install -d -m 0755 "$RELEASE_ROOT" "$OVERRIDE_DIR"
+if [[ -f "$OVERRIDE_FILE" ]]; then
+  cp --preserve=mode,timestamps "$OVERRIDE_FILE" "$old_override"
+  had_override=true
+fi
+
+install -d -m 0755 "$staging_dir"
+tar -C "$source_dir" --exclude=.git --exclude=coverage --exclude=.env -cf - . | tar -C "$staging_dir" -xf -
+chmod 0755 "${staging_dir}/dist/cli.js"
+printf '%s\n' "$commit" > "${staging_dir}/SOURCE_COMMIT"
+mv -- "$staging_dir" "$release_dir"
+
+cat > "$OVERRIDE_FILE" <<EOF
+# Managed by /usr/local/sbin/kanban-deploy-release.
+# Source commit: $commit
+[Service]
+ExecStart=
+ExecStart=$release_dir/dist/cli.js --host 127.0.0.1 --port 3483 --no-open --no-passcode --skip-shutdown-cleanup
+EOF
+
+rollback() {
+  echo "deployment health check failed; restoring the prior service override" >&2
+  if [[ "$had_override" == true ]]; then
+    install -m 0644 "$old_override" "$OVERRIDE_FILE"
+  else
+    rm -f -- "$OVERRIDE_FILE"
+  fi
+  systemctl daemon-reload
+  systemctl restart "$SERVICE" || true
+}
+
+systemctl daemon-reload
+systemctl restart "$SERVICE"
+for attempt in {1..10}; do
+  if systemctl --quiet is-active "$SERVICE" &&
+    curl --fail --silent --show-error --max-time 3 "$HEALTH_URL" >/dev/null; then
+    printf 'Deployed Kanban release %s\n' "$commit"
+    exit 0
+  fi
+  sleep 1
+done
+rollback
+exit 1
