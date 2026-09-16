@@ -1,8 +1,9 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
+# disabling this as the deploy-ai-monster.yml now triggers checks on pushes to main
+#  push:
+#    branches: [main]
   pull_request:
     branches: [main]
 
