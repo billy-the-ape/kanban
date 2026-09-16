@@ -40,6 +40,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Validate deployment helper syntax
+        run: bash -n ops/ai-monster/kanban-deploy-release
+
       - name: Install dependencies
         run: npm ci
 

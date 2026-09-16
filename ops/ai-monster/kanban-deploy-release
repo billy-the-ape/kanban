@@ -56,7 +56,9 @@ had_override=false
 
 cleanup() {
   rm -f -- "$old_override"
-  if [[ -d "$staging_dir" ]]; then\n    rm -rf -- "$staging_dir"\n  fi
+  if [[ -d "$staging_dir" ]]; then
+    rm -rf -- "$staging_dir"
+  fi
 }
 trap cleanup EXIT
 
