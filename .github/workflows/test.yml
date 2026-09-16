@@ -11,18 +11,19 @@ jobs:
   build-check-test:
     timeout-minutes: 10
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            node-version: 20
-          - os: ubuntu-latest
-            node-version: 22
-          # - os: windows-latest
-          #   node-version: 22
-          - os: macos-latest
-            node-version: 22
+    # strategy:
+    #   fail-fast: false
+    #   matrix:
+    #     include:
+    #       - os: ubuntu-latest
+    #         node-version: 20
+    #       - os: ubuntu-latest
+    #         node-version: 22
+    #       # - os: windows-latest
+    #       #   node-version: 22
+    #       - os: macos-latest
+    #         node-version: 22
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,7 +31,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version: 22
           cache: npm
 
       # macOS node-gyp/electron rebuilds can fail with Python 3.12/distutils; pin 3.11.
