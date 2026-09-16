@@ -1,7 +1,7 @@
 # Kanban reliability and sequential delivery implementation plan
 
-Document revision: 1  
-Prepared: 2026-09-15  
+Document revision: 2  
+Prepared: 2026-09-15 (revision 2: 2026-09-16)  
 Status: planned; no application fixes or server deployment are claimed by this document.  
 Source baseline: abd4912c27ce6b7f18b5a8106c145fd838e90cc4 (Kanban 0.1.70).  
 Inspected installed SDK: @clinebot/core 0.0.38 and @clinebot/shared 0.0.38.  
@@ -36,16 +36,22 @@ The B identifiers are implementation milestones, not upstream package versions. 
 - src/cline-sdk/cline-context-overflow-compaction.ts implements a temporary Kanban fallback. It keeps approximately the latter half of the message array, advances to a user message, and adds a notice containing a preview of the first user message capped at 300 characters. This is truncation with a notice, not a comprehensive semantic summary.
 - src/cline-sdk/cline-task-session-service.ts contains retryAfterContextOverflow, which reads persisted history, applies the fallback, stops the session, and restarts it with retained messages.
 - The installed SDK exposes CoreCompactionConfig, including enabled, strategy, thresholdRatio, reserveTokens, preserveRecentTokens, contextWindowTokens, and a compaction callback. This proves API availability, not that the correct policy is active in every Kanban request.
+- Kanban never configures that API. No file under src/ or web-ui/src/ references CoreCompactionConfig, thresholdRatio, reserveTokens, preserveRecentTokens, or contextWindowTokens. The only compaction code in the repository is the Kanban-side fallback named above. Whatever compaction behavior exists today is therefore the SDK default, unconfigured by Kanban.
+- The runtime provider-model contract carries no context capacity. src/core/api-contract.ts defines runtimeClineProviderModelSchema with id, name, supportsVision, supportsAttachments, and supportsReasoningEffort only. There is no contextWindow field anywhere in the runtime contract, so no served context limit currently reaches Kanban through provider metadata. A web UI test fixture already supplies contextWindow: null on a model object, which the schema would strip.
 - src/config/runtime-config.ts defines a model-driven commit prompt. It asks for staging, committing, finding the base checkout, possibly stashing, cherry-picking, and resolving conflicts.
 - That default commit prompt does not explicitly require a full pre-commit code review. The user's observed revalidation may result from agent behavior, project rules, or customized prompts. Capture the effective prompt before assigning the cause.
 - web-ui/src/hooks/use-review-auto-actions.ts arms auto-completion after requesting a Git action, then treats zero changed files as evidence for moving the task to Done. A clean worktree does not prove destination integration or push success.
 - src/commands/task.ts couples trash/Done handling to worktree deletion and starting linked tasks. Existing dependency and cleanup mechanisms must be audited across CLI and UI paths.
+- Done and Trash are the same column. src/state/workspace-state.ts declares exactly four board columns: backlog, in_progress, review, and { id: "trash", title: "Done" }. Marking a task complete and discarding it are one board transition, which is why completion currently implies worktree deletion. Separating them is a persisted board-schema and UI change, not only a predicate change.
+- trashTaskById in src/commands/task.ts performs its side effects in this order: mutate board state, stop the task session, start every ready dependent, then delete the task workspace. Dependents are therefore dispatched with no delivery evidence of any kind, and a throw from any startTask call aborts the loop before deleteTaskWorkspace runs, leaving the card in Done, the worktree present, dependents partially started, and nothing recorded.
+- retryAfterContextOverflow restarts the session with the original prompt plus compacted history. The prompt itself is never reduced, and no attempt counter bounds the path, so an oversized prompt cannot be recovered by removing history.
+- isContextOverflowError returns false unless the value is an instanceof Error, so structured or nested provider error objects are not classified at all. Its pattern list is also broad enough that any message merely containing the words "context window" or "context length" matches.
 - The MacBook checkout has origin pointing to the fork and upstream pointing to Cline. The user reported a successful build and clean checkout. The replacement server deployment is not yet verified.
 
 ### Not yet proven
 
 - The exact provider error shape, assembled request size, and effective context limit at a failing commit.
-- Whether SDK compaction fails to trigger, triggers too late, truncates ineffectively, or is bypassed on a particular request path.
+- Whether the SDK's own default compaction (running unconfigured, as confirmed above) triggers at all on the failing request path, and whether configuring CoreCompactionConfig is by itself sufficient.
 - Whether all reported cleanup incidents share the same cause.
 - Whether the SDK already solves some proposed changes when configured correctly.
 - Whether upstream will accept the proposed review stage or deterministic-delivery mode as bug fixes or require feature discussion.
@@ -84,7 +90,7 @@ Names below are proposals, not claims about existing files.
 - Completion coordinator, preferably under a focused src/task-completion/ directory: durable phase transitions, attempts, recovery, cancellation, and deduplication.
 - Review service: fresh-session creation, task-scoped evidence, structured review outcomes, repair limits.
 - Verification service: configured commands, bounded output, exit status, timeouts, artifact references, and tested-tree identity.
-- Git delivery service under the existing workspace layer: task commits, destination integration, push verification, and recovery refs.
+- Git delivery service under the existing workspace layer: task commits, destination integration, push verification, and recovery refs. src/workspace/git-sync.ts already runs fetch/pull/push through runGit with argument arrays and a dirty-tree guard, and is the closest existing component to reuse. Note that its push action is a bare ["push"] with no explicit refspec, which is exactly the ambiguity B-8.6 must remove.
 - Scheduler service: dependency readiness, worker capacity, restart reconciliation, and exclusive task ownership.
 - UI/CLI adapters: invoke the same backend services and render their state. Browser hooks must not be the authoritative scheduler.
 
@@ -126,7 +132,7 @@ All milestones below are planned; partial setup in B-0 does not mean B-0 is comp
 | B-11 | Optional parallel scheduling and integration | B-9, B-10 | Preserve existing compatibility |
 | B-12 | End-to-end release qualification and documentation | B-0 through B-10; B-11 for parallel claims | Release evidence |
 
-Recommended execution is B-0 through B-10, then the sequential portion of B-12. B-11 may follow when hardware is available; B-12 must remain explicit about whether parallel operation is qualified. B-4 and B-5 can be developed independently of context fixes after B-1, but the initial local-model task queue should still run one task at a time.
+B-10's listed prerequisites describe when B-10 is *complete*, not when it may start. Each of B-4 through B-9 must ship the minimal phase visibility for its own behavior as part of that milestone; B-10 then consolidates those surfaces into one coherent interface. Recommended execution is B-0 through B-10, then the sequential portion of B-12. B-11 may follow when hardware is available; B-12 must remain explicit about whether parallel operation is qualified. B-4 and B-5 can be developed independently of context fixes after B-1, but the initial local-model task queue should still run one task at a time.
 
 ## B-0 — Reproducible development and server deployment
 
@@ -169,7 +175,7 @@ Produce a specific failing test and evidence for each proposed repair, including
 - [ ] B-1.3 Inspect effective Git prompts and project rules. Distinguish a full review from conflict resolution or repeated file reads. Record whether the failure happens before the helper/tool is called.
 - [ ] B-1.4 Build a fake OpenAI-compatible provider with a configurable small context ceiling and fixture error responses matching observed failures. Use it for fast automated tests without loading the real local model.
 - [ ] B-1.5 Add disposable Git fixtures with a main checkout, detached task worktree, and local bare origin. Reproduce manual commit during auto-completion, push failure, service interruption, and clean-but-unintegrated work.
-- [ ] B-1.6 Read existing upstream issues and all their comments before drafting related issues. Separate confirmed bugs from feature proposals; do not submit public logs containing private work.
+- [ ] B-1.6 Read existing upstream issues and all their comments before drafting related issues. Separate confirmed bugs from feature proposals, and route the latter to the upstream Feature Request discussion category rather than a PR, since upstream is not accepting feature PRs and may close PRs that have no corresponding issue. Do not submit public logs containing private work.
 
 ### Acceptance and tests
 
@@ -192,12 +198,13 @@ Requests fit the actual served model capacity, including implementation and revi
 ### Implementation tasks
 
 - [ ] B-2.1 Trace model metadata from settings through src/cline-sdk/cline-provider-service.ts, SDK boundaries, and the request pipeline. Verify the LiteLLM-compatible and custom OpenAI-compatible routes used by local inference.
-- [ ] B-2.2 Define context-limit precedence: explicit validated deployment/model override, then reliable provider metadata, then a documented conservative fallback. Use the most restrictive known served limit. Display the source of the selected limit.
+- [ ] B-2.2 Define context-limit precedence: explicit validated deployment/model override, then reliable provider metadata, then a documented conservative fallback. Use the most restrictive known served limit. Display the source of the selected limit. The middle tier does not exist yet and depends on B-2.8; until it does, precedence collapses to override then fallback.
 - [ ] B-2.3 Reuse SDK compaction configuration. Budget system text, tool schemas, current messages, incoming file/tool content, expected output, and a safety margin. Do not count the same reserve twice if the SDK already subtracts it.
 - [ ] B-2.4 Trigger before the assembled request would exceed its input budget. Start evaluation around 80% utilization as a proposed tuning value, not a hardcoded universal answer; use measured behavior to choose defaults.
 - [ ] B-2.5 Bound large file reads, command output, and diff results using pagination or excerpts with local artifact references. A single large result must not bypass the budget merely because previous usage was low.
 - [ ] B-2.6 Apply the same policy to implementation, review, repair, and any optional summarization calls. Serialize local-model usage under the worker limit.
 - [ ] B-2.7 Expose additive configuration through existing settings/schema paths. If the defect is in SDK estimation or provider request assembly, fix it there and consume a released/pinned dependency rather than patching node_modules.
+- [ ] B-2.8 Carry context capacity through the runtime contract. runtimeClineProviderModelSchema in src/core/api-contract.ts has no context-window field, so provider metadata cannot currently inform any budget. Add an optional capacity field, populate it from the SDK model list and the LiteLLM /model/info route where each supplies one, and treat absence as unknown rather than unlimited. Reconcile the existing web UI test fixture that already passes contextWindow: null.
 
 ### Acceptance and tests
 
@@ -219,12 +226,13 @@ Unexpected overflows recover without losing critical task instructions, invalida
 
 ### Implementation tasks
 
-- [ ] B-3.1 Normalize actual provider error objects, nested causes, codes, and message strings through existing SDK utilities. Avoid interpreting unrelated mentions of context as overflow.
+- [ ] B-3.1 Normalize actual provider error objects, nested causes, codes, and message strings through existing SDK utilities. Two defects are already known and must both be fixed: the instanceof Error guard drops structured and nested provider errors before any pattern runs, and the pattern list matches any message merely mentioning a context window or context length. Classify on provider error code and shape first, and treat message matching as a last resort.
 - [ ] B-3.2 Prefer the SDK's supported compaction policy. Preserve task requirements, rules, relevant decisions, phase, outstanding findings, file references, and tool call/result pairing. Retain the original transcript separately for inspection.
 - [ ] B-3.3 Replace or retire the message-count-halving fallback only after proving the SDK path covers its cases. If a fallback remains, make it token-budget-aware and explicit about omitted history.
 - [ ] B-3.4 Bound the summarizer request itself. Use persisted handoff/checkpoint data and bounded chunks if the history already exceeds capacity. If essential pinned material cannot fit, pause with an actionable reason rather than silently discarding it.
 - [ ] B-3.5 Retry only the failed inference request with a smaller valid context and a fixed recovery limit. Do not repeat completed tools, edits, commits, or pushes. If a tool's completion is uncertain, reconcile or pause before retry.
 - [ ] B-3.6 Preserve provider selection, model, tool policies, rules, cancellation, and task/attempt mapping when restarting. A canceled task must not be revived by recovery.
+- [ ] B-3.7 Include the restart prompt in the recovery budget. The current path re-sends the original prompt unchanged alongside compacted history, so a prompt that does not fit by itself can never be recovered by removing history. Measure the prompt against the effective budget from B-2, and when it alone exceeds capacity, pause with that specific reason instead of restarting.
 
 ### Acceptance and tests
 
@@ -252,6 +260,7 @@ The backend knows which completion phase has actually succeeded and can resume s
 - [ ] B-4.4 Introduce idempotent backend phase commands shared by UI and CLI. Double-clicks, duplicate browser tabs, hooks, and restart events must resolve to one attempt owner.
 - [ ] B-4.5 Persist intent before Git side effects and reconcile actual state after restart. Handle the crash between a successful operation and its completion record.
 - [ ] B-4.6 Define cancellation per phase. Do not leave locks permanent; do not assume killing a Git process undoes a ref update.
+- [ ] B-4.7 Define what happens to an in-flight attempt when reliable mode is disabled or the code is rolled back mid-attempt. An attempt parked at committing, integrating, or pushing must either finish under the mode it started in or stop at a phase an operator can resume by hand; it must never silently fall back to the legacy prompt path partway through. Record the mode and policy version on the attempt so this is decidable after restart.
 
 ### Acceptance and tests
 
@@ -273,13 +282,15 @@ Manual commits, session errors, and card moves cannot make unfinished work disap
 
 ### Implementation tasks
 
-- [ ] B-5.1 Replace clean-worktree success inference with completion evidence in reliable mode. Audit use-review-auto-actions.ts and every CLI/API Done/delete path, not only the visible button.
+- [ ] B-5.1 Replace clean-worktree success inference with completion evidence in reliable mode. Audit use-review-auto-actions.ts and every CLI/API Done/delete path, not only the visible button. Note that the hook's terminal action is requestMoveTaskToTrash, so the UI path and the delete path are literally the same call.
 - [ ] B-5.2 Establish a durable task branch or namespaced recovery ref before relying on ephemeral detached HEAD state. Retain task ID, workspace path, starting SHA, latest known commit, and preservation status.
 - [ ] B-5.3 Preserve uncommitted tracked changes, untracked files, and relevant binary content separately from Git refs. A patch alone may be insufficient. Automatic preservation failure must stop cleanup.
 - [ ] B-5.4 Reconcile unexpected external commits or branch changes. A clean workspace containing an unintegrated manual commit is recoverable work, not evidence to delete it.
 - [ ] B-5.5 Separate task completion from workspace garbage collection. Default failed/blocked workspaces to retained. Cleanup requires durable recovery, no active writer, and delivery evidence appropriate to the mode.
 - [ ] B-5.6 Make restore use the preserved task revision rather than recreating a worktree from an older base. Expose a supported locate/recover action.
 - [ ] B-5.7 Define explicit disposal behavior and retention limits. Retention expiry must not silently discard unpreserved work; provide a visible blocked-cleanup reason.
+- [ ] B-5.8 Separate completion from disposal on the board itself. Today src/state/workspace-state.ts maps one column, id "trash" titled "Done", to both meanings, so a completed task and a discarded task are indistinguishable in persisted state. Introduce a distinct completed state with its own persisted representation, migrate existing trash-column cards, and keep both the CLI column vocabulary and the web UI consistent with the result. This is a prerequisite for B-5.5, which cannot separate completion from garbage collection while both share one column.
+- [ ] B-5.9 Make the trash/Done transition atomic and correctly ordered. trashTaskById currently mutates board state, stops the session, starts every ready dependent, and only then deletes the workspace, so a failure while starting a dependent leaves the card completed, the worktree alive, and dependents half-started with nothing recorded. Persist the intended transition first, dispatch dependents only after delivery evidence exists per B-9, and make workspace deletion a separate reconcilable step whose failure is visible.
 
 ### Acceptance and tests
 
@@ -293,7 +304,7 @@ Document workspace retention and recovery storage. Default to retaining failed a
 
 Include a tested recovery recipe and evidence that cleanup predicates hold across UI, CLI, bulk cleanup, and shutdown.
 
-## B-6 — Separate review and bounded cleanup/fix
+## B-6 — Separate review and bounded repair
 
 ### Outcome
 
@@ -335,6 +346,7 @@ Configured checks, not the agent's narrative, determine whether the reviewed con
 - [ ] B-7.4 If a check changes source content, invalidate prior review/verification as appropriate. Do not commit unreviewed formatter changes or test-generated source accidentally.
 - [ ] B-7.5 Feed failed-check evidence into a fresh bounded repair session with existing rules, then rerun required checks. Share one explicit attempt budget so review/verification cannot bounce forever.
 - [ ] B-7.6 Bind accepted evidence to the candidate that will be committed. Re-run checks after integration whenever the resulting tree differs from the verified tree.
+- [ ] B-7.7 Decide and document where verification configuration is stored before implementing it: global runtime configuration alongside the existing prompt templates, per-workspace state, or both with a defined precedence. Because B-7.1 treats this as trusted executable configuration, the storage location is the security boundary; a location writable by task content or by an agent during a task is not acceptable. Record the chosen path, who may write it, and how the application validates it on load.
 
 ### Acceptance and tests
 
@@ -361,7 +373,7 @@ Application code commits the verified task, integrates it, pushes it, and verifi
 - [ ] B-8.3 Create a commit anchored by a durable ref. Respect Git hooks and signing settings; failures remain actionable rather than bypassing policy.
 - [ ] B-8.4 For the initial sequential policy, require the destination to match the recorded base and fast-forward to the task commit. If destination is checked out, refuse dirty state and use the appropriate worktree-aware operation. If not checked out, use an expected-old-SHA ref update.
 - [ ] B-8.5 If the destination advanced or diverged, pause with clear evidence. Do not silently stash user changes, cherry-pick, resolve conflicts, delete lock files, or force-push. Later parallel integration belongs to B-11.
-- [ ] B-8.6 Push the explicit ref using existing credentials. Honor protected-branch settings; the target deployment uses a feature branch. Serialize integration/publication for the destination.
+- [ ] B-8.6 Push an explicit refspec using existing credentials, reusing the Git invocation conventions in src/workspace/git-sync.ts rather than its bare ["push"] argument list, which relies on ambient push configuration and cannot state what was delivered. Honor protected-branch settings; the target deployment uses a feature branch. Serialize integration/publication for the destination.
 - [ ] B-8.7 Verify the remote equals or contains the delivered commit. Fetch the relevant ref for ancestry validation when it advanced. Remote movement that excludes the candidate blocks completion.
 - [ ] B-8.8 Persist the delivery receipt before unlocking dependents. If push times out after server acceptance, reconcile before retry. Reuse existing commits; do not create a new commit merely because the client lost its response.
 - [ ] B-8.9 Keep optional PR creation separate from commit/push. If supported here, use API/CLI with structured metadata, deduplicate by head/base, and preserve the pushed commit on PR creation failure. The primary workflow is many task commits on one feature branch, followed by a later overall PR.
@@ -414,7 +426,7 @@ Users can understand, resume, and recover work without searching hidden director
 
 ### Implementation tasks
 
-- [ ] B-10.1 Display meaningful phases: Implementing, Reviewing, Checking, Committing, Integrating, Pushing, Verifying remote, Done, and Needs attention.
+- [ ] B-10.1 Display meaningful phases: Implementing, Reviewing, Checking, Committing, Integrating, Pushing, Verifying remote, Done, and Needs attention. Done here means the completed state introduced in B-5.8 and must remain visually and behaviorally distinct from discarding a task.
 - [ ] B-10.2 Show branch, commit, workspace location, last successful phase, blocked reason, and preserved-work status in task details. Offer open/copy actions.
 - [ ] B-10.3 Provide backend-backed Retry current phase, Resume repair, Cancel, and Recover workspace actions. Disable invalid transitions and deduplicate requests.
 - [ ] B-10.4 Show context usage as measured or estimated, effective capacity, last compaction event, and omitted-history notice. Do not imply a summary is lossless.
@@ -428,7 +440,7 @@ UI and CLI show the same durable state after reload/restart. A failed push can b
 
 ### Settings and deployment
 
-No new authentication boundary. Extend existing API validation and access checks. Minimal phase visibility must accompany each earlier milestone; this version completes the cohesive interface.
+No new authentication boundary. Extend existing API validation and access checks. Minimal phase visibility ships inside each of B-4 through B-9 for the behavior that milestone introduces; B-10 consolidates those surfaces rather than introducing status display for the first time. The prerequisite list for B-10 is therefore a completion constraint, not a start constraint.
 
 ### Handoff
 
@@ -475,7 +487,7 @@ Ship a measured, reversible release with evidence that the user's actual workflo
 - [ ] B-12.4 Inject failures at review, verification, commit, push, remote confirmation, successor dispatch, and cleanup. Restart the service between side effect and receipt where practical.
 - [ ] B-12.5 Upgrade from baseline persisted state and exercise rollback. If schemas cannot be downgraded, restore a backed-up state snapshot while retaining newer Git work separately; never pretend code rollback alone restores compatibility.
 - [ ] B-12.6 Enable reliable mode first in a disposable repository, then a selected real feature branch. Keep failed work retained. Do not enable parallel mode until B-11 qualification is complete.
-- [ ] B-12.7 Prepare focused upstream PRs tied to agreed issues/discussions. Remove carried patches once equivalent upstream fixes ship; avoid duplicating the upstream SDK.
+- [ ] B-12.7 Prepare focused upstream PRs, each tied to an accepted issue, since upstream may close PRs that have none. Submit only the milestones that are defensible as bug fixes or compatibility work; anything upstream classifies as a feature goes to a Feature Request discussion first and stays fork-only until that discussion concludes. Remove carried patches once equivalent upstream fixes ship; avoid duplicating the upstream SDK.
 - [ ] B-12.8 Finish with a private homelab-documentation PR recording every device/service change, deployed SHA, settings, local provider capacity, test results, rollback procedure, and unresolved limitations.
 
 ### Release acceptance
@@ -492,6 +504,14 @@ All of the following must hold:
 - Required permissions and rules apply in implementation, review, and repair.
 - Rollback has been tested, and deployment/documentation reflect the actual verified state.
 - Parallel capability is either qualified under B-11 or explicitly labeled unqualified/disabled.
+
+### Settings and deployment
+
+Reliable mode is enabled per project in the order given by B-12.6, starting disposable and ending on one real feature branch. Parallel mode stays off until B-11 qualifies it. Record the deployed SHA, the effective context limit the server actually served, and every setting changed from default. Back up persisted state before the upgrade; B-12.5 owns the downgrade path when schemas cannot move backward.
+
+### Handoff
+
+A release record containing the qualification results for each acceptance item above, the deployed SHA and manifest, the settings in force, known unqualified capabilities, the rollback procedure as executed rather than as designed, and the patch ledger described under upstream maintenance.
 
 ## Task packaging for fresh-context agents
 
@@ -520,7 +540,7 @@ The agent must reread current code before exact edits and note drift from the ba
 - Keep fork main as an upstream mirror. Create one topic branch per focused fix; use a separate integration branch for combined unmerged changes.
 - Use GitHub OAuth for cloud-agent edits and PR creation. Do not commit directly to main. Local development follows the user's approved workflow.
 - Before a substantial upstream fix, read related issues and all comments, then agree on the issue/approach. Do not automatically post private repro details.
-- Upstream CONTRIBUTING.md currently prioritizes fixes and compatibility, not feature PRs. Review/fix orchestration and new delivery modes may require a feature discussion. This affects upstream submission strategy, not the ability to maintain the feature in the fork.
+- Upstream CONTRIBUTING.md states plainly that "We are not currently accepting feature PRs" and directs feature ideas to the Feature Request discussion category at https://github.com/cline/kanban/discussions/categories/feature-requests. It also warns that "PRs without a corresponding issue may be closed". Treat both as hard gates: B-6, B-7, B-8, B-9, and B-11 are not submittable as PRs today and need an accepted discussion first, and every upstream PR from any milestone needs a pre-agreed issue. This constrains upstream submission strategy, not the ability to maintain the feature in the fork.
 - Put SDK-specific fixes in the SDK when appropriate. Pin a released compatible version with lockfiles; never edit installed packages as the durable solution.
 - Keep host-specific service definitions and operational records separate from generic application behavior.
 - Every PR description must prominently state environment/settings changes, migrations, deployment actions, rollback, and concise steps to test each changed behavior.
@@ -541,5 +561,8 @@ Inspected against the source baseline above:
 - [Auto-review and clean-worktree completion](https://github.com/cline/kanban/blob/abd4912c27ce6b7f18b5a8106c145fd838e90cc4/web-ui/src/hooks/use-review-auto-actions.ts)
 - [Task commands and lifecycle](https://github.com/cline/kanban/blob/abd4912c27ce6b7f18b5a8106c145fd838e90cc4/src/commands/task.ts)
 - [Worktree handling](https://github.com/cline/kanban/blob/abd4912c27ce6b7f18b5a8106c145fd838e90cc4/src/workspace/task-worktree.ts)
+- [Existing fetch/pull/push implementation](https://github.com/cline/kanban/blob/abd4912c27ce6b7f18b5a8106c145fd838e90cc4/src/workspace/git-sync.ts)
+- [Board column definitions](https://github.com/cline/kanban/blob/abd4912c27ce6b7f18b5a8106c145fd838e90cc4/src/state/workspace-state.ts)
+- [Runtime API contract and provider-model schema](https://github.com/cline/kanban/blob/abd4912c27ce6b7f18b5a8106c145fd838e90cc4/src/core/api-contract.ts)
 
 SDK API observations were read from installed @clinebot/core 0.0.38 type declarations, including dist/types/config.d.ts and dist/extensions/context/compaction.d.ts. Confirm actual runtime behavior during B-1; type declarations alone do not prove effective configuration.
