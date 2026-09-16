@@ -1,0 +1,85 @@
+name: Deploy Kanban to ai-monster
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "Full 40-character commit SHA to build and deploy"
+        required: true
+        type: string
+
+concurrency:
+  group: ai-monster-kanban-deployment
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Build, verify, and deploy
+    runs-on: [self-hosted, linux, x64, monster]
+    timeout-minutes: 30
+    environment:
+      name: kanban-production
+
+    steps:
+      - name: Validate immutable commit input
+        env:
+          COMMIT: ${{ inputs.commit }}
+        run: |
+          if ! [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "commit must be a full 40-character lowercase SHA"
+            exit 1
+          fi
+
+      - name: Check out requested commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Confirm checked-out commit
+        id: revision
+        env:
+          REQUESTED_COMMIT: ${{ inputs.commit }}
+        run: |
+          ACTUAL_COMMIT="$(git rev-parse HEAD)"
+          test "$ACTUAL_COMMIT" = "$REQUESTED_COMMIT"
+          echo "commit=$ACTUAL_COMMIT" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install locked dependencies
+        run: |
+          npm ci
+          npm ci --prefix web-ui
+          npm ci --prefix packages/desktop
+
+      - name: Build and verify
+        run: |
+          npm run build
+          npm run lint
+          npm run typecheck
+          npm test
+          npm --prefix web-ui run test
+          npm --prefix packages/desktop run typecheck
+          npm --prefix packages/desktop test
+
+      - name: Deploy verified release
+        env:
+          COMMIT: ${{ steps.revision.outputs.commit }}
+        run: |
+          sudo -n /usr/local/sbin/kanban-deploy-release \
+            --source "$GITHUB_WORKSPACE" \
+            --commit "$COMMIT"
+
+      - name: Confirm service health
+        run: |
+          systemctl --no-pager is-active cline-kanban.service
+          curl --fail --silent --show-error --max-time 5 http://127.0.0.1:3483/ >/dev/null
