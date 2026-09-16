@@ -1,11 +1,13 @@
 name: Deploy Kanban to ai-monster
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       commit:
-        description: "Full 40-character commit SHA to build and deploy"
-        required: true
+        description: "Optional full 40-character commit SHA for a manual deployment"
+        required: false
         type: string
 
 concurrency:
@@ -26,7 +28,7 @@ jobs:
     steps:
       - name: Validate immutable commit input
         env:
-          COMMIT: ${{ inputs.commit }}
+          COMMIT: ${{ inputs.commit || github.sha }}
         run: |
           if ! [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
             echo "commit must be a full 40-character lowercase SHA"
@@ -36,14 +38,14 @@ jobs:
       - name: Check out requested commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.commit }}
+          ref: ${{ inputs.commit || github.sha }}
           fetch-depth: 1
           persist-credentials: false
 
       - name: Confirm checked-out commit
         id: revision
         env:
-          REQUESTED_COMMIT: ${{ inputs.commit }}
+          REQUESTED_COMMIT: ${{ inputs.commit || github.sha }}
         run: |
           ACTUAL_COMMIT="$(git rev-parse HEAD)"
           test "$ACTUAL_COMMIT" = "$REQUESTED_COMMIT"
