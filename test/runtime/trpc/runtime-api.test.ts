@@ -570,6 +570,8 @@ describe("createRuntimeApi startTaskSession", () => {
 				],
 				providerId: "anthropic",
 				apiKey: "anthropic-api-key",
+				contextWindowTokens: 200_000,
+				contextWindowSource: "fallback",
 				mode: "act",
 				startInPlanMode: true,
 				resumeFromTrash: undefined,
@@ -1598,6 +1600,8 @@ describe("createRuntimeApi startTaskSession", () => {
 			apiKey: "sk-or-test",
 			baseUrl: "https://openrouter.ai/api/v1",
 			reasoningEffort: undefined,
+			contextWindowTokens: 200_000,
+			contextWindowSource: "fallback",
 		});
 	});
 

@@ -16,6 +16,7 @@ import {
 	compactPersistedMessagesForContextOverflow,
 	isContextOverflowError,
 } from "./cline-context-overflow-compaction";
+import type { ContextLimitSource } from "./cline-context-policy";
 import { applyClineSessionEvent } from "./cline-event-adapter";
 import {
 	type ClineMessageRepository,
@@ -74,6 +75,10 @@ export interface StartClineTaskSessionRequest {
 	baseUrl?: string | null;
 	reasoningEffort?: RuntimeClineReasoningEffort | null;
 	systemPrompt?: string | null;
+	/** B-2.2: resolved effective context limit in tokens (override → metadata → fallback). */
+	contextWindowTokens?: number;
+	/** Which tier supplied the resolved effective context limit. */
+	contextWindowSource?: ContextLimitSource;
 }
 
 export interface ClineTaskSessionService {
@@ -431,6 +436,8 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					systemPrompt,
 					userInstructionService: runtimeSetup.userInstructionService,
 					requestToolApproval: runtimeSetup.requestToolApproval,
+					contextWindowTokens: request.contextWindowTokens,
+					contextWindowSource: request.contextWindowSource,
 				});
 				const warningMessage = formatStartWarnings(startResult.warnings);
 				if (warningMessage) {

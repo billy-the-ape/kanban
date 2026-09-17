@@ -245,4 +245,57 @@ describe("service restart with a persisted session (B-1.7)", () => {
 			rmSync(logDir, { recursive: true, force: true });
 		}
 	});
+
+	it("emits the resolved context limit and source in the session-start diagnostic log (B-2.2)", async () => {
+		const harness = createTaskSessionServiceHarness();
+		services.push(harness);
+		const { service, host } = harness;
+
+		const logDir = mkdtempSync(join(tmpdir(), "kanban-b2-2-logs-"));
+		const logPath = join(logDir, "kanban.log");
+		const previousEnabled = process.env.CLINE_LOG_ENABLED;
+		const previousPath = process.env.CLINE_LOG_PATH;
+		process.env.CLINE_LOG_ENABLED = "1";
+		process.env.CLINE_LOG_PATH = logPath;
+		try {
+			await service.startTaskSession({
+				taskId: RESTART_TASK_ID,
+				cwd: "/tmp/worktree",
+				prompt: "Context limit resolution turn",
+				systemPrompt: "test system prompt",
+				providerId: "litellm",
+				modelId: "qwen3-32b",
+				contextWindowTokens: 131_072,
+				contextWindowSource: "override",
+			});
+			await vi.waitFor(() => {
+				expect(host.startedConfigs.length).toBe(1);
+			});
+
+			const raw = readFileSync(logPath, "utf8");
+			const lines = raw
+				.split("\n")
+				.filter((line) => line.trim().length > 0)
+				.map((line) => JSON.parse(line) as { message: string; metadata?: Record<string, unknown> });
+			const startLines = lines.filter(
+				(entry) => entry.message === "Cline session start: effective context metadata",
+			);
+			expect(startLines.length).toBe(1);
+			const metadata = startLines[0]?.metadata ?? {};
+			expect(metadata.contextLimitTokens).toBe(131_072);
+			expect(metadata.contextLimitSource).toBe("override");
+		} finally {
+			if (previousEnabled === undefined) {
+				delete process.env.CLINE_LOG_ENABLED;
+			} else {
+				process.env.CLINE_LOG_ENABLED = previousEnabled;
+			}
+			if (previousPath === undefined) {
+				delete process.env.CLINE_LOG_PATH;
+			} else {
+				process.env.CLINE_LOG_PATH = previousPath;
+			}
+			rmSync(logDir, { recursive: true, force: true });
+		}
+	});
 });

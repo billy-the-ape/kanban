@@ -267,5 +267,214 @@ describe("runtimeClineProviderModelSchema contextWindow", () => {
 			expect(response.models).toEqual([{ id: "openrouter/auto", name: "openrouter/auto" }]);
 			expect(response.models[0]).not.toHaveProperty("contextWindow");
 		});
+
+		describe("getProviderModelContextWindow (B-2.2)", () => {
+			it("returns the LiteLLM /model/info reported capacity for a known model", async () => {
+				const service = createClineProviderService();
+				setProviderSettings({
+					provider: "litellm",
+					model: "qwen3-32b",
+					apiKey: "litellm-key",
+					baseUrl: "http://127.0.0.1:4000",
+				});
+				stubLiteLlmFetch({
+					"/models": { status: 404 },
+					"/model/info": {
+						json: { data: [{ model_name: "qwen3-32b", max_input_tokens: 262144 }] },
+					},
+				});
+
+				await expect(service.getProviderModelContextWindow("litellm", "qwen3-32b")).resolves.toBe(262144);
+			});
+
+			it("returns the SDK catalog capacity for a non-LiteLLM model", async () => {
+				const service = createClineProviderService();
+				setProviderSettings({ provider: "deepseek", model: "deepseek-chat", apiKey: "key-1" });
+				localProviderMocks.getLocalProviderModels.mockResolvedValue({
+					providerId: "deepseek",
+					models: [{ id: "deepseek-chat", name: "DeepSeek Chat" }],
+				});
+				llmsModelMocks.resolveProviderConfig.mockResolvedValue({
+					knownModels: {
+						"deepseek-v4-pro": {
+							id: "deepseek-v4-pro",
+							name: "DeepSeek V4 Pro",
+							contextWindow: 131072,
+						},
+					},
+				});
+
+				await expect(service.getProviderModelContextWindow("deepseek", "deepseek-v4-pro")).resolves.toBe(131072);
+			});
+
+			it("returns null when the model is listed without a capacity", async () => {
+				const service = createClineProviderService();
+				setProviderSettings({
+					provider: "litellm",
+					model: "qwen3-32b",
+					apiKey: "litellm-key",
+					baseUrl: "http://127.0.0.1:4000",
+				});
+				stubLiteLlmFetch({
+					"/model/info": { json: { data: [] } },
+				});
+
+				await expect(service.getProviderModelContextWindow("litellm", "qwen3-32b")).resolves.toBeNull();
+			});
+
+			it("returns null without throwing when the LiteLLM server is unreachable", async () => {
+				const service = createClineProviderService();
+				setProviderSettings({
+					provider: "litellm",
+					model: "qwen3-32b",
+					apiKey: "litellm-key",
+					baseUrl: "http://127.0.0.1:4000",
+				});
+				stubLiteLlmFetch({
+					"/models": { status: 500 },
+					"/model/info": { status: 500 },
+				});
+
+				await expect(service.getProviderModelContextWindow("litellm", "qwen3-32b")).resolves.toBeNull();
+			});
+
+			it("returns null for empty provider or model ids", async () => {
+				const service = createClineProviderService();
+				setProviderSettings({
+					provider: "litellm",
+					model: "qwen3-32b",
+					apiKey: "litellm-key",
+					baseUrl: "http://127.0.0.1:4000",
+				});
+
+				await expect(service.getProviderModelContextWindow("  ", "qwen3-32b")).resolves.toBeNull();
+				await expect(service.getProviderModelContextWindow("litellm", null)).resolves.toBeNull();
+			});
+
+			it("caches lookups within the TTL instead of re-fetching", async () => {
+				const service = createClineProviderService();
+				setProviderSettings({
+					provider: "litellm",
+					model: "qwen3-32b",
+					apiKey: "litellm-key",
+					baseUrl: "http://127.0.0.1:4000",
+				});
+				const fetchMock = vi.fn(async (input: unknown) => {
+					const url = String(input);
+					if (url.endsWith("/model/info")) {
+						return {
+							ok: true,
+							status: 200,
+							json: async () => ({
+								data: [{ model_name: "qwen3-32b", max_input_tokens: 262144 }],
+							}),
+						} as unknown as Response;
+					}
+					return { ok: false, status: 404, json: async () => ({}) } as unknown as Response;
+				});
+				vi.stubGlobal("fetch", fetchMock);
+
+				const first = await service.getProviderModelContextWindow("litellm", "qwen3-32b");
+				const fetchCountAfterFirst = fetchMock.mock.calls.length;
+				const second = await service.getProviderModelContextWindow("litellm", "qwen3-32b");
+
+				expect(first).toBe(262144);
+				expect(second).toBe(262144);
+				expect(fetchCountAfterFirst).toBeGreaterThan(0);
+				expect(fetchMock.mock.calls.length).toBe(fetchCountAfterFirst);
+			});
+		});
+
+		describe("resolveLaunchConfig context limit (B-2.2)", () => {
+			function setLastUsedLitellmSettings(settings: { model: string; contextWindow?: number }): void {
+				const providerSettings = {
+					provider: "litellm",
+					model: settings.model,
+					apiKey: "litellm-key",
+					baseUrl: "http://127.0.0.1:4000",
+					...(settings.contextWindow !== undefined ? { contextWindow: settings.contextWindow } : {}),
+				};
+				setProviderSettings(providerSettings);
+				oauthMocks.getLastUsedProviderSettings.mockReturnValue(providerSettings);
+			}
+
+			it("uses the persisted override when it is more restrictive than the metadata", async () => {
+				const service = createClineProviderService();
+				setLastUsedLitellmSettings({ model: "qwen3-32b", contextWindow: 128_000 });
+				stubLiteLlmFetch({
+					"/models": { status: 404 },
+					"/model/info": {
+						json: { data: [{ model_name: "qwen3-32b", max_input_tokens: 262144 }] },
+					},
+				});
+
+				const config = await service.resolveLaunchConfig();
+
+				expect(config.providerId).toBe("litellm");
+				expect(config.modelId).toBe("qwen3-32b");
+				expect(config.apiKey).toBe("litellm-key");
+				expect(config.contextWindowTokens).toBe(128_000);
+				expect(config.contextWindowSource).toBe("override");
+			});
+
+			it("uses the provider metadata when it is more restrictive than the override", async () => {
+				const service = createClineProviderService();
+				setLastUsedLitellmSettings({ model: "qwen3-32b", contextWindow: 200_000 });
+				stubLiteLlmFetch({
+					"/model/info": {
+						json: { data: [{ model_name: "qwen3-32b", max_input_tokens: 131072 }] },
+					},
+				});
+
+				const config = await service.resolveLaunchConfig();
+
+				expect(config.contextWindowTokens).toBe(131072);
+				expect(config.contextWindowSource).toBe("provider-metadata");
+			});
+
+			it("uses the provider metadata when no override is configured", async () => {
+				const service = createClineProviderService();
+				setLastUsedLitellmSettings({ model: "qwen3-32b" });
+				stubLiteLlmFetch({
+					"/model/info": {
+						json: { data: [{ model_name: "qwen3-32b", max_input_tokens: 262144 }] },
+					},
+				});
+
+				const config = await service.resolveLaunchConfig();
+
+				expect(config.contextWindowTokens).toBe(262144);
+				expect(config.contextWindowSource).toBe("provider-metadata");
+			});
+
+			it("falls back to the conservative limit when no capacity is known", async () => {
+				const service = createClineProviderService();
+				setLastUsedLitellmSettings({ model: "unknown-model" });
+				stubLiteLlmFetch({
+					"/model/info": { json: { data: [] } },
+				});
+
+				const config = await service.resolveLaunchConfig();
+
+				expect(config.modelId).toBe("unknown-model");
+				expect(config.contextWindowTokens).toBe(200_000);
+				expect(config.contextWindowSource).toBe("fallback");
+			});
+
+			it("ignores an invalid persisted override and resolves from the metadata", async () => {
+				const service = createClineProviderService();
+				setLastUsedLitellmSettings({ model: "qwen3-32b", contextWindow: 0 });
+				stubLiteLlmFetch({
+					"/model/info": {
+						json: { data: [{ model_name: "qwen3-32b", max_input_tokens: 131072 }] },
+					},
+				});
+
+				const config = await service.resolveLaunchConfig();
+
+				expect(config.contextWindowTokens).toBe(131072);
+				expect(config.contextWindowSource).toBe("provider-metadata");
+			});
+		});
 	});
 });

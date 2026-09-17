@@ -2,6 +2,7 @@
 // This is the runtime-facing layer for starting, looking up, resuming, and
 // stopping native Cline sessions without exposing SDK details upstream.
 import type { RuntimeClineReasoningEffort, RuntimeTaskImage, RuntimeTaskSessionMode } from "../core/api-contract";
+import type { ContextLimitSource } from "./cline-context-policy";
 import { extractClineSessionId } from "./cline-event-adapter";
 import {
 	type ClineMcpRuntimeService,
@@ -101,6 +102,10 @@ export interface StartClineSessionRuntimeRequest {
 	systemPrompt: string;
 	userInstructionService?: ClineSdkUserInstructionService;
 	requestToolApproval?: (request: ClineSdkToolApprovalRequest) => Promise<ClineSdkToolApprovalResult>;
+	/** B-2.2: resolved effective context limit (tokens) for the session-start diagnostic. */
+	contextWindowTokens?: number;
+	/** Which tier supplied the resolved effective context limit. */
+	contextWindowSource?: ContextLimitSource;
 }
 
 export interface StartClineSessionRuntimeResult {
@@ -200,6 +205,8 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			taskTitle: request.taskTitle,
 			userInstructionService: request.userInstructionService,
 			requestToolApproval: request.requestToolApproval,
+			contextWindowTokens: request.contextWindowTokens,
+			contextWindowSource: request.contextWindowSource,
 		});
 		this.bindTaskSession(request.taskId, requestedSessionId);
 
@@ -225,6 +232,8 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		// B-2.1 diagnostic: record the effective model-context configuration for
 		// every session start (restarts reuse this path). Gated behind
 		// CLINE_LOG_ENABLED like the rest of the Cline runtime logs.
+		// B-2.2: resolveLaunchConfig supplies the resolved limit + source;
+		// callers without a resolver keep the unconfigured-SDK-default values.
 		createKanbanClineLogger({
 			runtime: "kanban",
 			taskId: request.taskId,
@@ -232,8 +241,8 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			modelId: request.modelId,
 		}).log("Cline session start: effective context metadata", {
 			baseUrlHost: resolveSessionStartLogHost(request.baseUrl),
-			contextLimitTokens: CLINE_SDK_DEFAULT_CONTEXT_WINDOW_TOKENS,
-			contextLimitSource: "unconfigured-sdk-default",
+			contextLimitTokens: request.contextWindowTokens ?? CLINE_SDK_DEFAULT_CONTEXT_WINDOW_TOKENS,
+			contextLimitSource: request.contextWindowSource ?? "unconfigured-sdk-default",
 			clineCoreVersion: getClineCorePackageVersion(),
 		});
 		try {

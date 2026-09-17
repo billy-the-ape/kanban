@@ -21,6 +21,7 @@ import type {
 	RuntimeClineReasoningEffort,
 } from "../core/api-contract";
 import { openInBrowser } from "../server/browser";
+import { type ContextLimitSource, resolveEffectiveContextLimit } from "./cline-context-policy";
 import { createKanbanClineLogger } from "./cline-runtime-logger";
 import {
 	addSdkCustomProvider,
@@ -89,6 +90,10 @@ export interface ResolvedClineLaunchConfig {
 	apiKey: string | null;
 	baseUrl: string | null;
 	reasoningEffort?: RuntimeClineReasoningEffort | null;
+	/** B-2.2: effective context limit in tokens (override → provider metadata → fallback). */
+	contextWindowTokens: number;
+	/** Which tier supplied the effective context limit. */
+	contextWindowSource: ContextLimitSource;
 }
 
 export interface AddCustomClineProviderInput {
@@ -352,6 +357,22 @@ async function fetchLiteLlmBaseUrlModels(settings: SdkProviderSettings | null): 
 	return [];
 }
 
+// Shared model-list source for getProviderModels and getProviderModelContextWindow:
+// SDK local + refreshed-catalog models, merged with the LiteLLM bounded
+// /models and /model/info fetch for the litellm provider. Callers apply their
+// own fallbacks; failures inside listSdkProviderModels never reject here.
+async function listProviderRuntimeModels(providerId: string): Promise<RuntimeClineProviderModel[]> {
+	let providerModels = await listSdkProviderModels(providerId)
+		.then((sdkModels) => sdkModels.map((model) => toRuntimeProviderModel(model)))
+		.catch(() => []);
+	if (providerId === "litellm") {
+		const liteLlmModels = await fetchLiteLlmBaseUrlModels(getSdkProviderSettings(providerId));
+		const existingModelIds = new Set(providerModels.map((model) => model.id));
+		providerModels = [...providerModels, ...liteLlmModels.filter((model) => !existingModelIds.has(model.id))];
+	}
+	return providerModels;
+}
+
 function createEmptyProviderSettingsSummary(): RuntimeClineProviderSettings {
 	return {
 		providerId: null,
@@ -525,6 +546,43 @@ export function createClineProviderService() {
 			}
 		});
 		return promise;
+	}
+
+	// B-2.2 short cache for getProviderModelContextWindow: resolveLaunchConfig
+	// runs on every session start, and the metadata lookup (SDK catalog
+	// refresh + bounded LiteLLM /model/info fetch) is diagnostic input, so
+	// repeated starts share one lookup instead of re-fetching per launch.
+	const PROVIDER_MODEL_CONTEXT_WINDOW_CACHE_TTL_MS = 30_000;
+	const providerModelContextWindowCache = new Map<string, { value: number | null; fetchedAt: number }>();
+
+	// Context capacity (tokens) reported by provider metadata for a model.
+	// Unknown capacity is null, never an error: the context-limit resolver
+	// falls back to the documented conservative limit instead.
+	async function fetchProviderModelContextWindow(providerId: string, modelId: string | null): Promise<number | null> {
+		const normalizedProviderId = providerId.trim().toLowerCase();
+		const normalizedModelId = modelId?.trim() ?? "";
+		if (!normalizedProviderId || !normalizedModelId) {
+			return null;
+		}
+		const cacheKey = `${normalizedProviderId}::${normalizedModelId}`;
+		const now = Date.now();
+		const cached = providerModelContextWindowCache.get(cacheKey);
+		if (cached && now - cached.fetchedAt < PROVIDER_MODEL_CONTEXT_WINDOW_CACHE_TTL_MS) {
+			return cached.value;
+		}
+		let value: number | null;
+		try {
+			const providerModels = await listProviderRuntimeModels(normalizedProviderId);
+			const matched = providerModels.find((model) => model.id === normalizedModelId);
+			// toContextWindow keeps only positive integers; absent, invalid, or
+			// explicit null all mean "unknown" and never "unlimited".
+			value = toContextWindow(matched?.contextWindow) ?? null;
+		} catch {
+			// Unknown capacity is never a launch error; the resolver falls back.
+			value = null;
+		}
+		providerModelContextWindowCache.set(cacheKey, { value, fetchedAt: now });
+		return value;
 	}
 
 	return {
@@ -851,6 +909,14 @@ export function createClineProviderService() {
 				overrides?.modelIdOverride?.trim() ||
 				resolvedSettings.model?.trim() ||
 				(await resolveDefaultModelIdForProvider(normalizedProviderId));
+			// B-2.2: effective context limit = most restrictive known value over
+			// the override tier (persisted provider settings) and the
+			// provider-metadata tier (model list); the documented conservative
+			// fallback applies when neither tier is known.
+			const effectiveContextLimit = resolveEffectiveContextLimit({
+				overrideTokens: resolvedSettings.contextWindow ?? null,
+				metadataTokens: await fetchProviderModelContextWindow(normalizedProviderId, modelId),
+			});
 			return {
 				providerId: normalizedProviderId,
 				modelId,
@@ -860,6 +926,8 @@ export function createClineProviderService() {
 					overrides && "reasoningEffortOverride" in overrides
 						? (overrides.reasoningEffortOverride ?? null)
 						: (toRuntimeReasoningEffort(resolvedSettings.reasoning?.effort) ?? undefined),
+				contextWindowTokens: effectiveContextLimit.limitTokens,
+				contextWindowSource: effectiveContextLimit.source,
 			};
 		},
 
@@ -911,21 +979,9 @@ export function createClineProviderService() {
 
 		async getProviderModels(providerId: string): Promise<RuntimeClineProviderModelsResponse> {
 			const normalizedProviderId = providerId.trim().toLowerCase();
-			let providerModels =
-				normalizedProviderId.length > 0
-					? await listSdkProviderModels(normalizedProviderId)
-							.then((sdkModels) => sdkModels.map((model) => toRuntimeProviderModel(model)))
-							.then((sdkModels) => sdkModels.sort((left, right) => left.name.localeCompare(right.name)))
-							.catch(() => [])
-					: [];
-			if (normalizedProviderId === "litellm") {
-				const liteLlmModels = await fetchLiteLlmBaseUrlModels(getSdkProviderSettings(normalizedProviderId));
-				const existingModelIds = new Set(providerModels.map((model) => model.id));
-				providerModels = [
-					...providerModels,
-					...liteLlmModels.filter((model) => !existingModelIds.has(model.id)),
-				].sort((left, right) => left.name.localeCompare(right.name));
-			}
+			const providerModels = (
+				normalizedProviderId.length > 0 ? await listProviderRuntimeModels(normalizedProviderId).catch(() => []) : []
+			).sort((left, right) => left.name.localeCompare(right.name));
 
 			if (providerModels.length > 0) {
 				return {
@@ -946,6 +1002,13 @@ export function createClineProviderService() {
 				providerId: normalizedProviderId || providerId,
 				models: [],
 			};
+		},
+
+		// B-2.2: context capacity (tokens) reported by provider metadata for a
+		// model; null when unknown. Never throws — capacity is diagnostic
+		// input for the context-limit resolver, not a launch requirement.
+		getProviderModelContextWindow(providerId: string, modelId: string | null): Promise<number | null> {
+			return fetchProviderModelContextWindow(providerId, modelId);
 		},
 
 		async addCustomProvider(input: AddCustomClineProviderInput): Promise<RuntimeClineProviderSettings> {

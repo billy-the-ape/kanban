@@ -243,6 +243,8 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 						apiKey: clineLaunchConfig.apiKey,
 						baseUrl: clineLaunchConfig.baseUrl,
 						reasoningEffort: clineLaunchConfig.reasoningEffort,
+						contextWindowTokens: clineLaunchConfig.contextWindowTokens,
+						contextWindowSource: clineLaunchConfig.contextWindowSource,
 					});
 
 					let nextSummary = summary;
@@ -435,6 +437,8 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 						apiKey: clineLaunchConfig.apiKey,
 						baseUrl: clineLaunchConfig.baseUrl,
 						reasoningEffort: clineLaunchConfig.reasoningEffort,
+						contextWindowTokens: clineLaunchConfig.contextWindowTokens,
+						contextWindowSource: clineLaunchConfig.contextWindowSource,
 					});
 				}
 				if (!summary) {
@@ -638,6 +642,8 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 							apiKey: clineLaunchConfig.apiKey,
 							baseUrl: clineLaunchConfig.baseUrl,
 							reasoningEffort: clineLaunchConfig.reasoningEffort,
+							contextWindowTokens: clineLaunchConfig.contextWindowTokens,
+							contextWindowSource: clineLaunchConfig.contextWindowSource,
 						});
 					}
 				}
