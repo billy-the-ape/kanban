@@ -700,6 +700,10 @@ export const runtimeClineProviderModelSchema = z.object({
 	supportsVision: z.boolean().optional(),
 	supportsAttachments: z.boolean().optional(),
 	supportsReasoningEffort: z.boolean().optional(),
+	// Optional context capacity in tokens, reported by the model's source
+	// (SDK catalog or LiteLLM /model/info). Absent (undefined) and null both
+	// mean "unknown" — never "unlimited".
+	contextWindow: z.number().int().positive().nullable().optional(),
 });
 export type RuntimeClineProviderModel = z.infer<typeof runtimeClineProviderModelSchema>;
 

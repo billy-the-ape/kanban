@@ -46,6 +46,7 @@ import {
 	saveSdkProviderSettings,
 	startClineDeviceAuth as startSdkDeviceAuth,
 	switchSdkClineAccount,
+	toContextWindow,
 	updateSdkCustomProvider,
 } from "./sdk-provider-boundary";
 
@@ -60,7 +61,18 @@ const CLINE_REMOTE_CONFIG_SCHEMA = z.object({
 	kanbanEnabled: z.boolean().optional(),
 });
 const LITELLM_MODELS_RESPONSE_SCHEMA = z.object({
-	data: z.array(z.object({ id: z.string().optional(), model_name: z.string().optional() }).passthrough()).optional(),
+	data: z
+		.array(
+			z
+				.object({
+					id: z.string().optional(),
+					model_name: z.string().optional(),
+					// LiteLLM /model/info reports input capacity; /models usually does not.
+					max_input_tokens: z.number().optional(),
+				})
+				.passthrough(),
+		)
+		.optional(),
 });
 const LITELLM_MODEL_LIST_PATHNAMES = ["/models", "/model/info"] as const;
 const LITELLM_MODEL_LIST_TIMEOUT_MS = 2_500;
@@ -233,6 +245,9 @@ function toRuntimeProviderModel(model: RuntimeClineProviderModel): RuntimeClineP
 		supportsVision: model.supportsVision || undefined,
 		supportsAttachments: model.supportsAttachments || undefined,
 		supportsReasoningEffort: model.supportsReasoningEffort || undefined,
+		// Sources normalize capacity before reaching here (toContextWindow);
+		// absent or null both mean "unknown", never "unlimited".
+		contextWindow: model.contextWindow,
 	};
 }
 
@@ -260,6 +275,26 @@ function resolveLiteLlmModelListHeaders(settings: SdkProviderSettings): Record<s
 function resolveLiteLlmModelListItemId(item: LiteLlmModelListItem, pathname: LiteLlmModelListPathname): string {
 	const modelId = pathname === "/model/info" ? (item.model_name ?? item.id) : item.id;
 	return modelId?.trim() ?? "";
+}
+
+function resolveLiteLlmModelListItem(
+	item: LiteLlmModelListItem,
+	pathname: LiteLlmModelListPathname,
+): RuntimeClineProviderModel | null {
+	const modelId = resolveLiteLlmModelListItemId(item, pathname);
+	if (modelId.length === 0) {
+		return null;
+	}
+	const model: RuntimeClineProviderModel = { id: modelId, name: modelId };
+	// Only the detailed /model/info route is trusted to report capacity; a
+	// /models listing leaves contextWindow absent (unknown, never unlimited).
+	if (pathname === "/model/info") {
+		const contextWindow = toContextWindow(item.max_input_tokens);
+		if (contextWindow !== undefined) {
+			model.contextWindow = contextWindow;
+		}
+	}
+	return model;
 }
 
 async function fetchLiteLlmBaseUrlModels(settings: SdkProviderSettings | null): Promise<RuntimeClineProviderModel[]> {
@@ -296,12 +331,16 @@ async function fetchLiteLlmBaseUrlModels(settings: SdkProviderSettings | null): 
 				continue;
 			}
 
-			const modelIds =
+			const models =
 				parsed.data.data
-					?.map((item) => resolveLiteLlmModelListItemId(item, pathname))
-					.filter((modelId) => modelId.length > 0) ?? [];
-			if (modelIds.length > 0) {
-				return [...new Set(modelIds)].map((id) => ({ id, name: id }));
+					?.map((item) => resolveLiteLlmModelListItem(item, pathname))
+					.filter((model): model is RuntimeClineProviderModel => model !== null) ?? [];
+			if (models.length > 0) {
+				const uniqueModels = new Map<string, RuntimeClineProviderModel>();
+				for (const model of models) {
+					uniqueModels.set(model.id, model);
+				}
+				return [...uniqueModels.values()];
 			}
 		} catch (error) {
 			logLiteLlmModelListWarning("LiteLLM model list request failed.", {

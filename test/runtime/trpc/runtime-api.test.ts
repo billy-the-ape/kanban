@@ -1923,6 +1923,7 @@ describe("createRuntimeApi startTaskSession", () => {
 				"deepseek-v4-pro": {
 					id: "deepseek-v4-pro",
 					name: "DeepSeek V4 Pro",
+					contextWindow: 131072,
 					capabilities: ["tools", "reasoning"],
 				},
 			},
@@ -1953,6 +1954,7 @@ describe("createRuntimeApi startTaskSession", () => {
 					id: "deepseek-v4-pro",
 					name: "DeepSeek V4 Pro",
 					supportsReasoningEffort: true,
+					contextWindow: 131072,
 				}),
 				expect.objectContaining({
 					id: "deepseek-chat",

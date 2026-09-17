@@ -76,6 +76,10 @@ export interface SdkProviderModel {
 	supportsVision?: boolean;
 	supportsAttachments?: boolean;
 	supportsReasoningEffort?: boolean;
+	// Optional context capacity in tokens. Undefined when the SDK source does
+	// not report one; null is reserved for an explicit "unknown". Absence and
+	// null never mean "unlimited".
+	contextWindow?: number | null;
 }
 
 export interface SdkUserRemoteConfigResponse {
@@ -318,6 +322,19 @@ export async function listSdkProviderCatalog(): Promise<SdkProviderCatalogItem[]
 	return await ClineCore.Llms.getAllProviders();
 }
 
+// Catalog and server capacity values are only trusted when they are a
+// positive integer token count; anything else becomes absent (unknown),
+// never unlimited and never a value that breaks the runtime contract.
+export function toContextWindow(value: number | null | undefined): number | null | undefined {
+	if (value === null) {
+		return null;
+	}
+	if (typeof value === "number" && Number.isInteger(value) && value > 0) {
+		return value;
+	}
+	return undefined;
+}
+
 function toSdkProviderModel(model: SdkLocalProviderModel): SdkProviderModel {
 	return {
 		id: model.id,
@@ -336,6 +353,7 @@ function toSdkProviderModelFromCatalog(modelId: string, model: SdkResolvedProvid
 		supportsVision: capabilities.includes("images") || undefined,
 		supportsAttachments: capabilities.includes("files") || undefined,
 		supportsReasoningEffort: capabilities.includes("reasoning") || model.thinkingConfig !== undefined || undefined,
+		contextWindow: toContextWindow(model.contextWindow),
 	};
 }
 
