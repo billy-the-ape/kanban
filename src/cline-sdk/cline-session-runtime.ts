@@ -12,6 +12,7 @@ import { createKanbanClineLogger } from "./cline-runtime-logger";
 import { buildSessionIdPrefix, createSessionId } from "./cline-session-state";
 import { CLINE_MODEL_CATALOG_DEFAULTS } from "./sdk-provider-boundary";
 import {
+	CLINE_SDK_DEFAULT_CONTEXT_WINDOW_TOKENS,
 	type ClineSdkPersistedMessage,
 	type ClineSdkSessionHost,
 	type ClineSdkSessionRecord,
@@ -20,6 +21,7 @@ import {
 	type ClineSdkToolApprovalResult,
 	type ClineSdkUserInstructionService,
 	createClineSdkSessionHost,
+	getClineCorePackageVersion,
 } from "./sdk-runtime-boundary";
 
 export { CLINE_MODEL_CATALOG_DEFAULTS } from "./sdk-provider-boundary";
@@ -62,6 +64,24 @@ function toSdkUserImages(images?: RuntimeTaskImage[]): string[] | undefined {
 		})
 		.filter((image): image is string => image !== null);
 	return userImages.length > 0 ? userImages : undefined;
+}
+
+/**
+ * Resolves the host (host:port) of a configured provider base URL for
+ * diagnostics. Never returns a full URL, path, or credentials.
+ */
+function resolveSessionStartLogHost(baseUrl?: string | null): string | null {
+	const normalized = baseUrl?.trim();
+	if (!normalized) {
+		return null;
+	}
+	try {
+		return new URL(normalized).host;
+	} catch {
+		// Malformed URLs are skipped rather than logged verbatim, since they
+		// may embed credentials.
+		return null;
+	}
 }
 
 export interface StartClineSessionRuntimeRequest {
@@ -202,6 +222,20 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		const userImages = toSdkUserImages(request.images);
 		const shouldSendInitialTurn = request.prompt.trim().length > 0 || Boolean(userImages?.length);
 		let startResult: Awaited<ReturnType<ClineSessionHostBoundary["start"]>>;
+		// B-2.1 diagnostic: record the effective model-context configuration for
+		// every session start (restarts reuse this path). Gated behind
+		// CLINE_LOG_ENABLED like the rest of the Cline runtime logs.
+		createKanbanClineLogger({
+			runtime: "kanban",
+			taskId: request.taskId,
+			providerId: request.providerId,
+			modelId: request.modelId,
+		}).log("Cline session start: effective context metadata", {
+			baseUrlHost: resolveSessionStartLogHost(request.baseUrl),
+			contextLimitTokens: CLINE_SDK_DEFAULT_CONTEXT_WINDOW_TOKENS,
+			contextLimitSource: "unconfigured-sdk-default",
+			clineCoreVersion: getClineCorePackageVersion(),
+		});
 		try {
 			// Hub-backed SDK hosts create the interactive session in start; the first turn runs through send.
 			startResult = await sessionHost.start({

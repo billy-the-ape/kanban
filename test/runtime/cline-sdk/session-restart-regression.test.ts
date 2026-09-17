@@ -16,6 +16,10 @@
 // green; REMOVE the skip when B-4 reconstructs restart configuration and the
 // tests pass. See the evidence report in docs/plans/B-1.md.
 
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	createTaskSessionServiceHarness,
@@ -178,5 +182,67 @@ describe("service restart with a persisted session (B-1.7)", () => {
 		expect(host.startedConfigs.length).toBe(2);
 		expect(host.sentPrompts.at(-1)?.prompt).toBe("Follow up in process");
 		expect(service.getSummary(RESTART_TASK_ID)?.reviewReason).not.toBe("error");
+	});
+
+	it("emits a session-start diagnostic log line with the effective context metadata (B-2.1)", async () => {
+		const harness = createTaskSessionServiceHarness();
+		services.push(harness);
+		const { service, host } = harness;
+
+		const logDir = mkdtempSync(join(tmpdir(), "kanban-b2-0-logs-"));
+		const logPath = join(logDir, "kanban.log");
+		const previousEnabled = process.env.CLINE_LOG_ENABLED;
+		const previousPath = process.env.CLINE_LOG_PATH;
+		process.env.CLINE_LOG_ENABLED = "1";
+		process.env.CLINE_LOG_PATH = logPath;
+		try {
+			await service.startTaskSession({
+				taskId: RESTART_TASK_ID,
+				cwd: "/tmp/worktree",
+				prompt: "Effective context metadata turn",
+				systemPrompt: "test system prompt",
+				providerId: "litellm",
+				modelId: "qwen3-32b",
+				apiKey: "sk-log-leak-canary",
+				baseUrl: "http://llama-swap.local:8080/v1",
+			});
+			// The diagnostic line is written before the host start, so by the
+			// time the fake host records the start config the log exists.
+			await vi.waitFor(() => {
+				expect(host.startedConfigs.length).toBe(1);
+			});
+
+			const raw = readFileSync(logPath, "utf8");
+			const lines = raw
+				.split("\n")
+				.filter((line) => line.trim().length > 0)
+				.map((line) => JSON.parse(line) as { message: string; metadata?: Record<string, unknown> });
+			const startLines = lines.filter(
+				(entry) => entry.message === "Cline session start: effective context metadata",
+			);
+			expect(startLines.length).toBe(1);
+			const metadata = startLines[0]?.metadata ?? {};
+			expect(metadata.providerId).toBe("litellm");
+			expect(metadata.modelId).toBe("qwen3-32b");
+			expect(metadata.baseUrlHost).toBe("llama-swap.local:8080");
+			expect(metadata.contextLimitTokens).toBe(200000);
+			expect(metadata.contextLimitSource).toBe("unconfigured-sdk-default");
+			expect(metadata.clineCoreVersion).toMatch(/^\d+\.\d+\.\d+/);
+			// No credentials or URL paths may leak into the log.
+			expect(raw).not.toContain("sk-log-leak-canary");
+			expect(raw).not.toContain("/v1");
+		} finally {
+			if (previousEnabled === undefined) {
+				delete process.env.CLINE_LOG_ENABLED;
+			} else {
+				process.env.CLINE_LOG_ENABLED = previousEnabled;
+			}
+			if (previousPath === undefined) {
+				delete process.env.CLINE_LOG_PATH;
+			} else {
+				process.env.CLINE_LOG_PATH = previousPath;
+			}
+			rmSync(logDir, { recursive: true, force: true });
+		}
 	});
 });

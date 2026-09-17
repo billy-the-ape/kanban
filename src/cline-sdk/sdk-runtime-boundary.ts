@@ -3,6 +3,10 @@
 // flow through this boundary so the rest of Kanban stays decoupled from the
 // SDK package layout.
 
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import {
 	type AgentEvent,
 	type BasicLogger,
@@ -26,6 +30,55 @@ import { CLINE_BUILTIN_SLASH_COMMANDS } from "./cline-slash-commands";
 import { getCliTelemetryService } from "./cline-telemetry-service";
 
 export { TelemetryLoggerSink, TelemetryService } from "@clinebot/core";
+/**
+ * Mirrors DEFAULT_CONTEXT_WINDOW_TOKENS from @clinebot/core 0.0.38
+ * (dist/extensions/context/compaction-shared.d.ts). The constant is not part
+ * of the package's public exports, so it is mirrored here. Kanban currently
+ * does not pass CoreSessionConfig.compaction to the SDK, so this is the
+ * effective context window for every session until B-2-2 wires an explicit
+ * limit through.
+ */
+export const CLINE_SDK_DEFAULT_CONTEXT_WINDOW_TOKENS = 200000;
+
+let clineCorePackageVersion: string | null = null;
+
+/**
+ * Best-effort runtime version of the installed @clinebot/core package.
+ *
+ * The SDK does not export a version constant, and its exports map only
+ * defines ESM conditions (no `require`/`default`), so require.resolve
+ * cannot find the entry point either. Walk up from this boundary file and
+ * look for the package in ancestor node_modules directories (works with
+ * npm and pnpm hoisting). Falls back to "unknown" in packaged layouts
+ * where the package cannot be located.
+ */
+export function getClineCorePackageVersion(): string {
+	if (clineCorePackageVersion) {
+		return clineCorePackageVersion;
+	}
+	try {
+		let dir = dirname(fileURLToPath(import.meta.url));
+		for (;;) {
+			const candidate = join(dir, "node_modules", "@clinebot", "core", "package.json");
+			if (existsSync(candidate)) {
+				const packageJson = JSON.parse(readFileSync(candidate, "utf8")) as { version?: unknown };
+				if (typeof packageJson.version === "string" && packageJson.version.trim().length > 0) {
+					clineCorePackageVersion = packageJson.version;
+					return packageJson.version;
+				}
+				break;
+			}
+			const parent = dirname(dir);
+			if (parent === dir) {
+				break;
+			}
+			dir = parent;
+		}
+	} catch {
+		// Best effort: diagnostics must never break session startup.
+	}
+	return "unknown";
+}
 
 export type ClineSdkSessionHost = ClineCore;
 export type ClineSdkBasicLogger = BasicLogger;
