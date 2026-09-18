@@ -117,6 +117,13 @@ export type ClineSdkAgentHooks = AgentHooks;
 export type ClineSdkAgentBeforeModelHook = NonNullable<AgentHooks["beforeModel"]>;
 export type ClineSdkAgentBeforeModelContext = Parameters<ClineSdkAgentBeforeModelHook>[0];
 export type ClineSdkAgentBeforeModelResult = Exclude<Awaited<ReturnType<ClineSdkAgentBeforeModelHook>>, undefined>;
+
+// B-2.6: the agent runtime (@clinebot/agents) also invokes `afterTool` after every tool
+// execution; a returned `result` replaces the tool result before the `tool-result` message
+// is persisted. Derived from the SDK's AgentHooks, like the beforeModel aliases above.
+export type ClineSdkAgentAfterToolHook = NonNullable<AgentHooks["afterTool"]>;
+export type ClineSdkAgentAfterToolContext = Parameters<ClineSdkAgentAfterToolHook>[0];
+export type ClineSdkAgentAfterToolResult = Exclude<Awaited<ReturnType<ClineSdkAgentAfterToolHook>>, undefined>;
 // The agent-runtime message shape (distinct from the persisted
 // MessageWithMetadata shape): derived from the hook context so Kanban tracks
 // the SDK's types instead of redefining them.

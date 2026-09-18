@@ -15,6 +15,7 @@ import {
 } from "./cline-mcp-runtime-service";
 import { createKanbanClineLogger } from "./cline-runtime-logger";
 import { buildSessionIdPrefix, createSessionId } from "./cline-session-state";
+import { createClineToolResultBoundingHook } from "./cline-tool-result-bounding-hook";
 import { CLINE_MODEL_CATALOG_DEFAULTS } from "./sdk-provider-boundary";
 import {
 	CLINE_SDK_DEFAULT_CONTEXT_WINDOW_TOKENS,
@@ -292,16 +293,26 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		// assembled request and rewrites its messages to stay within the same
 		// calibrated budget. `hooks` is a local-only config key, so in hub
 		// mode the compact capability takes over instead.
-		let compactionHooks: ClineSdkAgentHooks | undefined;
+		// B-2.6: the afterTool hook bounds oversized read-family tool results
+		// at ingestion time (see cline-tool-result-bounding-hook.ts) and
+		// preserves the full content as a local artifact. It complements the
+		// SDK's own 50k request-assembly truncation, which is request-scoped
+		// only and leaves the persisted transcript unbounded.
+		let agentHooks: ClineSdkAgentHooks | undefined;
 		if (
 			request.compaction &&
 			typeof request.compaction.contextWindowTokens === "number" &&
 			request.compaction.contextWindowTokens > 0
 		) {
-			compactionHooks = {
+			agentHooks = {
 				beforeModel: createClineCompactionBeforeModelHook({
 					limitTokens: request.compaction.contextWindowTokens,
 					outputReserveTokens: request.compaction.reserveTokens ?? CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT,
+					logger: sessionLogger,
+				}),
+				afterTool: createClineToolResultBoundingHook({
+					taskId: request.taskId,
+					limitTokens: request.compaction.contextWindowTokens,
 					logger: sessionLogger,
 				}),
 			};
@@ -335,7 +346,8 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 					// and reserve calibrated for the assembled request above.
 					compaction: effectiveCompaction,
 					// B-2.5: local-mode proactive compaction guard (see above).
-					...(compactionHooks ? { hooks: compactionHooks } : {}),
+					// B-2.6: ingestion-time tool-result bounding (see above).
+					...(agentHooks ? { hooks: agentHooks } : {}),
 				},
 				initialMessages: request.initialMessages,
 				interactive: true,
