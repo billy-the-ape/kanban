@@ -80,6 +80,10 @@ export interface SdkProviderModel {
 	// not report one; null is reserved for an explicit "unknown". Absence and
 	// null never mean "unlimited".
 	contextWindow?: number | null;
+	// Optional max output tokens (catalog ModelInfo.maxTokens). Local provider
+	// model lists do not report it, so it is absent for those. Same unknown
+	// semantics as contextWindow.
+	maxTokens?: number | null;
 }
 
 export interface SdkUserRemoteConfigResponse {
@@ -354,6 +358,9 @@ function toSdkProviderModelFromCatalog(modelId: string, model: SdkResolvedProvid
 		supportsAttachments: capabilities.includes("files") || undefined,
 		supportsReasoningEffort: capabilities.includes("reasoning") || model.thinkingConfig !== undefined || undefined,
 		contextWindow: toContextWindow(model.contextWindow),
+		// toContextWindow is the shared positive-integer token-count
+		// normalizer; unknown stays unknown (never unlimited).
+		maxTokens: toContextWindow(model.maxTokens),
 	};
 }
 

@@ -12,6 +12,7 @@ import type {
 import { isHomeAgentSessionId } from "../core/home-agent-session";
 import { resolveHomeAgentAppendSystemPrompt } from "../prompts/append-system-prompt";
 import { captureTaskTurnCheckpoint, deleteTaskTurnCheckpointRef } from "../workspace/turn-checkpoints";
+import type { ClineCompactionConfig } from "./cline-compaction-config";
 import {
 	compactPersistedMessagesForContextOverflow,
 	isContextOverflowError,
@@ -79,6 +80,8 @@ export interface StartClineTaskSessionRequest {
 	contextWindowTokens?: number;
 	/** Which tier supplied the resolved effective context limit. */
 	contextWindowSource?: ContextLimitSource;
+	/** B-2.4: explicit SDK compaction config built from the resolved launch config. */
+	compaction?: ClineCompactionConfig;
 }
 
 export interface ClineTaskSessionService {
@@ -438,6 +441,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					requestToolApproval: runtimeSetup.requestToolApproval,
 					contextWindowTokens: request.contextWindowTokens,
 					contextWindowSource: request.contextWindowSource,
+					compaction: request.compaction,
 				});
 				const warningMessage = formatStartWarnings(startResult.warnings);
 				if (warningMessage) {

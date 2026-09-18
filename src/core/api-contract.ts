@@ -704,6 +704,10 @@ export const runtimeClineProviderModelSchema = z.object({
 	// (SDK catalog or LiteLLM /model/info). Absent (undefined) and null both
 	// mean "unknown" — never "unlimited".
 	contextWindow: z.number().int().positive().nullable().optional(),
+	// Optional max output tokens per model (SDK catalog ModelInfo.maxTokens
+	// or LiteLLM /model/info max_output_tokens). B-2.4: feeds the SDK
+	// compaction reserve. Same unknown semantics as contextWindow.
+	maxTokens: z.number().int().positive().nullable().optional(),
 });
 export type RuntimeClineProviderModel = z.infer<typeof runtimeClineProviderModelSchema>;
 

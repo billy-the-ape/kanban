@@ -70,6 +70,8 @@ const LITELLM_MODELS_RESPONSE_SCHEMA = z.object({
 					model_name: z.string().optional(),
 					// LiteLLM /model/info reports input capacity; /models usually does not.
 					max_input_tokens: z.number().optional(),
+					// B-2.4: max completion tokens for the compaction reserve.
+					max_output_tokens: z.number().optional(),
 				})
 				.passthrough(),
 		)
@@ -84,6 +86,16 @@ type LiteLlmModelListPathname = (typeof LITELLM_MODEL_LIST_PATHNAMES)[number];
 type LiteLlmModelListItem = NonNullable<z.infer<typeof LITELLM_MODELS_RESPONSE_SCHEMA>["data"]>[number];
 type SdkReasoningEffort = NonNullable<NonNullable<SdkProviderSettings["reasoning"]>["effort"]>;
 
+/**
+ * Model capacity reported by provider metadata: the context window (max
+ * input tokens) and max output tokens per completion (B-2.4 compaction
+ * reserve). Both are null when unknown — never "unlimited", never an error.
+ */
+export interface ProviderModelCapacity {
+	contextWindowTokens: number | null;
+	maxTokens: number | null;
+}
+
 export interface ResolvedClineLaunchConfig {
 	providerId: string;
 	modelId: string | null;
@@ -94,6 +106,12 @@ export interface ResolvedClineLaunchConfig {
 	contextWindowTokens: number;
 	/** Which tier supplied the effective context limit. */
 	contextWindowSource: ContextLimitSource;
+	/**
+	 * Max output tokens per completion from model metadata (B-2.4). Feeds the
+	 * SDK compaction reserve via buildClineCompactionConfig; null when the
+	 * provider does not report them (the builder falls back to a default).
+	 */
+	maxTokens: number | null;
 }
 
 export interface AddCustomClineProviderInput {
@@ -253,6 +271,7 @@ function toRuntimeProviderModel(model: RuntimeClineProviderModel): RuntimeClineP
 		// Sources normalize capacity before reaching here (toContextWindow);
 		// absent or null both mean "unknown", never "unlimited".
 		contextWindow: model.contextWindow,
+		maxTokens: model.maxTokens,
 	};
 }
 
@@ -292,11 +311,17 @@ function resolveLiteLlmModelListItem(
 	}
 	const model: RuntimeClineProviderModel = { id: modelId, name: modelId };
 	// Only the detailed /model/info route is trusted to report capacity; a
-	// /models listing leaves contextWindow absent (unknown, never unlimited).
+	// /models listing leaves contextWindow and maxTokens absent (unknown,
+	// never unlimited).
 	if (pathname === "/model/info") {
 		const contextWindow = toContextWindow(item.max_input_tokens);
 		if (contextWindow !== undefined) {
 			model.contextWindow = contextWindow;
+		}
+		// B-2.4: max completion tokens feed the SDK compaction reserve.
+		const maxTokens = toContextWindow(item.max_output_tokens);
+		if (maxTokens !== undefined) {
+			model.maxTokens = maxTokens;
 		}
 	}
 	return model;
@@ -552,36 +577,47 @@ export function createClineProviderService() {
 	// runs on every session start, and the metadata lookup (SDK catalog
 	// refresh + bounded LiteLLM /model/info fetch) is diagnostic input, so
 	// repeated starts share one lookup instead of re-fetching per launch.
-	const PROVIDER_MODEL_CONTEXT_WINDOW_CACHE_TTL_MS = 30_000;
-	const providerModelContextWindowCache = new Map<string, { value: number | null; fetchedAt: number }>();
+	// B-2.4 extends the cached value to max output tokens (compaction
+	// reserve) so the same single lookup feeds both.
+	const PROVIDER_MODEL_CAPACITY_CACHE_TTL_MS = 30_000;
+	const providerModelCapacityCache = new Map<string, { value: ProviderModelCapacity; fetchedAt: number }>();
 
-	// Context capacity (tokens) reported by provider metadata for a model.
-	// Unknown capacity is null, never an error: the context-limit resolver
-	// falls back to the documented conservative limit instead.
-	async function fetchProviderModelContextWindow(providerId: string, modelId: string | null): Promise<number | null> {
+	// Model capacity reported by provider metadata: context window (max
+	// input tokens) and max output tokens. Unknown capacity is null, never
+	// an error: the context-limit resolver falls back to the documented
+	// conservative limit, and the compaction builder uses a documented
+	// default reserve.
+	async function fetchProviderModelCapacity(
+		providerId: string,
+		modelId: string | null,
+	): Promise<ProviderModelCapacity> {
+		const unknown: ProviderModelCapacity = { contextWindowTokens: null, maxTokens: null };
 		const normalizedProviderId = providerId.trim().toLowerCase();
 		const normalizedModelId = modelId?.trim() ?? "";
 		if (!normalizedProviderId || !normalizedModelId) {
-			return null;
+			return unknown;
 		}
 		const cacheKey = `${normalizedProviderId}::${normalizedModelId}`;
 		const now = Date.now();
-		const cached = providerModelContextWindowCache.get(cacheKey);
-		if (cached && now - cached.fetchedAt < PROVIDER_MODEL_CONTEXT_WINDOW_CACHE_TTL_MS) {
+		const cached = providerModelCapacityCache.get(cacheKey);
+		if (cached && now - cached.fetchedAt < PROVIDER_MODEL_CAPACITY_CACHE_TTL_MS) {
 			return cached.value;
 		}
-		let value: number | null;
+		let value: ProviderModelCapacity = unknown;
 		try {
 			const providerModels = await listProviderRuntimeModels(normalizedProviderId);
 			const matched = providerModels.find((model) => model.id === normalizedModelId);
-			// toContextWindow keeps only positive integers; absent, invalid, or
-			// explicit null all mean "unknown" and never "unlimited".
-			value = toContextWindow(matched?.contextWindow) ?? null;
+			// toContextWindow keeps only positive integers; absent, invalid,
+			// or explicit null all mean "unknown" and never "unlimited".
+			value = {
+				contextWindowTokens: toContextWindow(matched?.contextWindow) ?? null,
+				maxTokens: toContextWindow(matched?.maxTokens) ?? null,
+			};
 		} catch {
 			// Unknown capacity is never a launch error; the resolver falls back.
-			value = null;
+			value = unknown;
 		}
-		providerModelContextWindowCache.set(cacheKey, { value, fetchedAt: now });
+		providerModelCapacityCache.set(cacheKey, { value, fetchedAt: now });
 		return value;
 	}
 
@@ -912,10 +948,12 @@ export function createClineProviderService() {
 			// B-2.2: effective context limit = most restrictive known value over
 			// the override tier (persisted provider settings) and the
 			// provider-metadata tier (model list); the documented conservative
-			// fallback applies when neither tier is known.
+			// fallback applies when neither tier is known. B-2.4: the same single
+			// lookup also supplies maxTokens for the compaction reserve.
+			const modelCapacity = await fetchProviderModelCapacity(normalizedProviderId, modelId);
 			const effectiveContextLimit = resolveEffectiveContextLimit({
 				overrideTokens: resolvedSettings.contextWindow ?? null,
-				metadataTokens: await fetchProviderModelContextWindow(normalizedProviderId, modelId),
+				metadataTokens: modelCapacity.contextWindowTokens,
 			});
 			return {
 				providerId: normalizedProviderId,
@@ -928,6 +966,7 @@ export function createClineProviderService() {
 						: (toRuntimeReasoningEffort(resolvedSettings.reasoning?.effort) ?? undefined),
 				contextWindowTokens: effectiveContextLimit.limitTokens,
 				contextWindowSource: effectiveContextLimit.source,
+				maxTokens: modelCapacity.maxTokens,
 			};
 		},
 
@@ -1008,7 +1047,7 @@ export function createClineProviderService() {
 		// model; null when unknown. Never throws — capacity is diagnostic
 		// input for the context-limit resolver, not a launch requirement.
 		getProviderModelContextWindow(providerId: string, modelId: string | null): Promise<number | null> {
-			return fetchProviderModelContextWindow(providerId, modelId);
+			return fetchProviderModelCapacity(providerId, modelId).then((capacity) => capacity.contextWindowTokens);
 		},
 
 		async addCustomProvider(input: AddCustomClineProviderInput): Promise<RuntimeClineProviderSettings> {

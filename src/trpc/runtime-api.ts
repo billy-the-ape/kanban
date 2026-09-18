@@ -7,6 +7,7 @@ import { rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { TRPCError } from "@trpc/server";
+import { buildClineCompactionConfig } from "../cline-sdk/cline-compaction-config";
 import { createClineMcpRuntimeService } from "../cline-sdk/cline-mcp-runtime-service";
 import { createClineMcpSettingsService } from "../cline-sdk/cline-mcp-settings-service";
 import { createClineProviderService } from "../cline-sdk/cline-provider-service";
@@ -245,6 +246,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 						reasoningEffort: clineLaunchConfig.reasoningEffort,
 						contextWindowTokens: clineLaunchConfig.contextWindowTokens,
 						contextWindowSource: clineLaunchConfig.contextWindowSource,
+						compaction: buildClineCompactionConfig({ launchConfig: clineLaunchConfig }),
 					});
 
 					let nextSummary = summary;
@@ -439,6 +441,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 						reasoningEffort: clineLaunchConfig.reasoningEffort,
 						contextWindowTokens: clineLaunchConfig.contextWindowTokens,
 						contextWindowSource: clineLaunchConfig.contextWindowSource,
+						compaction: buildClineCompactionConfig({ launchConfig: clineLaunchConfig }),
 					});
 				}
 				if (!summary) {
@@ -644,6 +647,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 							reasoningEffort: clineLaunchConfig.reasoningEffort,
 							contextWindowTokens: clineLaunchConfig.contextWindowTokens,
 							contextWindowSource: clineLaunchConfig.contextWindowSource,
+							compaction: buildClineCompactionConfig({ launchConfig: clineLaunchConfig }),
 						});
 					}
 				}

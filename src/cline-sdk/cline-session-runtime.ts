@@ -2,6 +2,7 @@
 // This is the runtime-facing layer for starting, looking up, resuming, and
 // stopping native Cline sessions without exposing SDK details upstream.
 import type { RuntimeClineReasoningEffort, RuntimeTaskImage, RuntimeTaskSessionMode } from "../core/api-contract";
+import type { ClineCompactionConfig } from "./cline-compaction-config";
 import type { ContextLimitSource } from "./cline-context-policy";
 import { extractClineSessionId } from "./cline-event-adapter";
 import {
@@ -106,6 +107,8 @@ export interface StartClineSessionRuntimeRequest {
 	contextWindowTokens?: number;
 	/** Which tier supplied the resolved effective context limit. */
 	contextWindowSource?: ContextLimitSource;
+	/** B-2.4: explicit SDK compaction config (window, threshold, reserve, local summarizer). */
+	compaction?: ClineCompactionConfig;
 }
 
 export interface StartClineSessionRuntimeResult {
@@ -207,6 +210,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			requestToolApproval: request.requestToolApproval,
 			contextWindowTokens: request.contextWindowTokens,
 			contextWindowSource: request.contextWindowSource,
+			compaction: request.compaction,
 		});
 		this.bindTaskSession(request.taskId, requestedSessionId);
 
@@ -268,6 +272,10 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 						maxConsecutiveMistakes: DEFAULT_CLINE_MAX_CONSECUTIVE_MISTAKES,
 					},
 					systemPrompt: request.systemPrompt,
+					// B-2.4: explicit compaction config so the SDK uses the
+					// resolved effective window, reserve, and the same local
+					// summarizer instead of its built-in defaults.
+					compaction: request.compaction,
 				},
 				initialMessages: request.initialMessages,
 				interactive: true,

@@ -13,6 +13,9 @@ import {
 	buildWorkspaceMetadata,
 	ClineCore,
 	type ClineCoreStartInput,
+	type CoreCompactionConfig,
+	type CoreCompactionStrategy,
+	type CoreCompactionSummarizerConfig,
 	type CoreSessionEvent,
 	createUserInstructionConfigService,
 	formatRulesForSystemPrompt,
@@ -33,10 +36,10 @@ export { TelemetryLoggerSink, TelemetryService } from "@clinebot/core";
 /**
  * Mirrors DEFAULT_CONTEXT_WINDOW_TOKENS from @clinebot/core 0.0.38
  * (dist/extensions/context/compaction-shared.d.ts). The constant is not part
- * of the package's public exports, so it is mirrored here. Kanban currently
- * does not pass CoreSessionConfig.compaction to the SDK, so this is the
- * effective context window for every session until B-2-2 wires an explicit
- * limit through.
+ * of the package's public exports, so it is mirrored here. Used as the
+ * fallback cap when a provider does not report a context window (B-2-2), and
+ * as the effective window passed into the explicit compaction config
+ * (B-2-4).
  */
 export const CLINE_SDK_DEFAULT_CONTEXT_WINDOW_TOKENS = 200000;
 
@@ -90,6 +93,12 @@ export type ClineSdkStartSessionInput = ClineCoreStartInput;
 export type ClineSdkSessionRecord = SessionHistoryRecord;
 export type ClineSdkPersistedMessage = MessageWithMetadata;
 export type ClineSdkUserInstructionService = UserInstructionConfigService;
+// B-2.4: Kanban passes an explicit compaction config on every session start.
+// The `compact` callback is only set on the SDK's local runtime compaction
+// object, never on start input, so Kanban builds Omit<..., "compact">.
+export type ClineSdkCompactionConfig = CoreCompactionConfig;
+export type ClineSdkCompactionStrategy = CoreCompactionStrategy;
+export type ClineSdkCompactionSummarizerConfig = CoreCompactionSummarizerConfig;
 export interface ClineSdkSlashCommand {
 	name: string;
 	instructions: string;

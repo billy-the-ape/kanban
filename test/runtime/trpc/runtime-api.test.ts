@@ -127,6 +127,7 @@ vi.mock("../../../src/server/browser.js", () => ({
 	openInBrowser: browserMocks.openInBrowser,
 }));
 
+import { buildClineCompactionConfig } from "../../../src/cline-sdk/cline-compaction-config";
 import type { RuntimeTrpcContext } from "../../../src/trpc/app-router";
 import { type CreateRuntimeApiDependencies, createRuntimeApi } from "../../../src/trpc/runtime-api";
 
@@ -1602,6 +1603,17 @@ describe("createRuntimeApi startTaskSession", () => {
 			reasoningEffort: undefined,
 			contextWindowTokens: 200_000,
 			contextWindowSource: "fallback",
+			compaction: buildClineCompactionConfig({
+				launchConfig: {
+					providerId: "openrouter",
+					modelId: "openrouter/auto",
+					apiKey: "sk-or-test",
+					baseUrl: "https://openrouter.ai/api/v1",
+					contextWindowTokens: 200_000,
+					contextWindowSource: "fallback",
+					maxTokens: null,
+				},
+			}),
 		});
 	});
 
