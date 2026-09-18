@@ -10,10 +10,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	buildClineCompactionConfig,
+	CLINE_COMPACTION_MIN_CALIBRATED_WINDOW_TOKENS,
 	CLINE_COMPACTION_PRESERVE_RECENT_TOKENS,
 	CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT,
 	CLINE_COMPACTION_SUMMARY_MAX_OUTPUT_TOKENS,
 	CLINE_COMPACTION_THRESHOLD_RATIO,
+	computeClineCompactionSafetyMarginTokens,
 } from "../../../src/cline-sdk/cline-compaction-config";
 import type { ResolvedClineLaunchConfig } from "../../../src/cline-sdk/cline-provider-service";
 import {
@@ -92,12 +94,15 @@ describe("B-2.4 — compaction config wiring", () => {
 		});
 
 		const startedCompaction = host.startedConfigs[0]?.compaction;
-		expect(startedCompaction).toEqual({
+		// B-2.5: the runtime calibrates the window/reserve against the
+		// assembled request (system prompt + tool schemas + safety margin)
+		// before the config reaches the SDK, so assert the calibrated shape:
+		// unchanged fields, window reduced by the measured overhead, and the
+		// reserve carrying the B-2.4 output reservation plus the margin.
+		expect(startedCompaction).toMatchObject({
 			enabled: true,
-			contextWindowTokens: 32_768,
 			strategy: "basic",
 			thresholdRatio: CLINE_COMPACTION_THRESHOLD_RATIO,
-			reserveTokens: 4_096,
 			preserveRecentTokens: CLINE_COMPACTION_PRESERVE_RECENT_TOKENS,
 			summarizer: {
 				providerId: "openrouter",
@@ -107,6 +112,9 @@ describe("B-2.4 — compaction config wiring", () => {
 				maxOutputTokens: CLINE_COMPACTION_SUMMARY_MAX_OUTPUT_TOKENS,
 			},
 		});
+		expect(startedCompaction?.contextWindowTokens).toBeLessThan(32_768);
+		expect(startedCompaction?.contextWindowTokens).toBeGreaterThan(CLINE_COMPACTION_MIN_CALIBRATED_WINDOW_TOKENS);
+		expect(startedCompaction?.reserveTokens).toBe(4_096 + computeClineCompactionSafetyMarginTokens(32_768));
 	});
 
 	it("falls back to the default reserve and omits absent credentials when metadata is unknown", async () => {
@@ -133,8 +141,13 @@ describe("B-2.4 — compaction config wiring", () => {
 		});
 
 		const startedCompaction = host.startedConfigs[0]?.compaction;
-		expect(startedCompaction?.contextWindowTokens).toBe(128_000);
-		expect(startedCompaction?.reserveTokens).toBe(CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT);
+		// B-2.5 calibration: window reduced by the assembled-request
+		// overhead; the default output reservation carries the margin on top.
+		expect(startedCompaction?.contextWindowTokens).toBeLessThan(128_000);
+		expect(startedCompaction?.contextWindowTokens).toBeGreaterThan(CLINE_COMPACTION_MIN_CALIBRATED_WINDOW_TOKENS);
+		expect(startedCompaction?.reserveTokens).toBe(
+			CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT + computeClineCompactionSafetyMarginTokens(128_000),
+		);
 		expect(startedCompaction?.summarizer).toMatchObject({
 			providerId: "openrouter",
 			modelId: "local/test-model",
@@ -220,8 +233,18 @@ describe("B-2.4 — compaction config wiring", () => {
 		});
 
 		expect(host.startedConfigs.length).toBe(2);
-		expect(host.startedConfigs[0]?.compaction).toEqual(compaction);
-		expect(host.startedConfigs[1]?.compaction).toEqual(compaction);
+		// The restart re-sends the captured UNCALIBRATED config and the
+		// runtime re-derives the same calibration (no double subtraction).
+		expect(host.startedConfigs[1]?.compaction).toEqual(host.startedConfigs[0]?.compaction);
+		expect(host.startedConfigs[0]?.compaction).toMatchObject({
+			enabled: true,
+			strategy: "basic",
+			summarizer: { providerId: "openrouter", modelId: "local/test-model" },
+		});
+		expect(host.startedConfigs[0]?.compaction?.contextWindowTokens).toBeLessThan(32_768);
+		expect(host.startedConfigs[0]?.compaction?.reserveTokens).toBe(
+			4_096 + computeClineCompactionSafetyMarginTokens(32_768),
+		);
 		expect(service.getSummary("task-compaction-restart")?.reviewReason).not.toBe("error");
 	});
 });

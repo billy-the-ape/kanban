@@ -9,11 +9,14 @@ import { fileURLToPath } from "node:url";
 
 import {
 	type AgentEvent,
+	type AgentHooks,
 	type BasicLogger,
 	buildWorkspaceMetadata,
 	ClineCore,
 	type ClineCoreStartInput,
 	type CoreCompactionConfig,
+	type CoreCompactionContext,
+	type CoreCompactionResult,
 	type CoreCompactionStrategy,
 	type CoreCompactionSummarizerConfig,
 	type CoreSessionEvent,
@@ -99,6 +102,26 @@ export type ClineSdkUserInstructionService = UserInstructionConfigService;
 export type ClineSdkCompactionConfig = CoreCompactionConfig;
 export type ClineSdkCompactionStrategy = CoreCompactionStrategy;
 export type ClineSdkCompactionSummarizerConfig = CoreCompactionSummarizerConfig;
+// B-2.5: the SDK's compaction trigger hands the calibrated window, the trigger
+// point, and the current messages to the host `compact` callback registered on
+// localRuntime.compaction. These boundary aliases keep the callback decoupled
+// from the SDK package layout like the other compaction types above.
+export type ClineSdkCompactionContext = CoreCompactionContext;
+export type ClineSdkCompactionResult = CoreCompactionResult;
+// B-2.5: the agent-runtime beforeModel hook is the local-mode integration
+// point for proactive compaction on @clinebot/core 0.0.38, where the SDK's
+// own prepare-turn compaction pipeline is never invoked (upstream bug, see
+// docs/plans/B-2-5.md). These types are derived from the SDK's AgentHooks so
+// Kanban tracks the hook contract instead of redefining it.
+export type ClineSdkAgentHooks = AgentHooks;
+export type ClineSdkAgentBeforeModelHook = NonNullable<AgentHooks["beforeModel"]>;
+export type ClineSdkAgentBeforeModelContext = Parameters<ClineSdkAgentBeforeModelHook>[0];
+export type ClineSdkAgentBeforeModelResult = Exclude<Awaited<ReturnType<ClineSdkAgentBeforeModelHook>>, undefined>;
+// The agent-runtime message shape (distinct from the persisted
+// MessageWithMetadata shape): derived from the hook context so Kanban tracks
+// the SDK's types instead of redefining them.
+export type ClineSdkAgentMessage = ClineSdkAgentBeforeModelContext["request"]["messages"][number];
+export type ClineSdkAgentMessagePart = ClineSdkAgentMessage["content"][number];
 export interface ClineSdkSlashCommand {
 	name: string;
 	instructions: string;
@@ -117,6 +140,8 @@ export async function createClineSdkSessionHost(): Promise<ClineSdkSessionHost> 
 export function resolveClineSdkDataDir(): string {
 	return resolveClineDataDir();
 }
+/** B-2.5: exposed so compaction calibration can estimate the SDK's default system prompt. */
+export { getClineDefaultSystemPrompt };
 export async function buildClineSdkWorkspaceMetadata(cwd: string): Promise<string> {
 	return await buildWorkspaceMetadata(cwd);
 }

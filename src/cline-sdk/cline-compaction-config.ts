@@ -17,9 +17,38 @@
 //
 // The `compact` callback is only set on the SDK's local runtime compaction
 // object, never on session start input, so the builder omits it.
+//
+// B-2.5 — Calibration of that config for the ASSEMBLED request.
+//
+// The SDK trigger (verified against the @clinebot/core 0.0.38 bundle) counts
+// only the conversation's apiMessages — the system prompt and tool schemas
+// are excluded — and, whenever `reserveTokens` is a number (including 0),
+// ignores `thresholdRatio` entirely, firing at `window - reserveTokens`.
+// (Both behaviors are recorded as upstream SDK bugs in docs/plans/B-2-5.md.)
+//
+// So to make the message-only trigger effectively evaluate the full
+// assembled request (system prompt + tools + messages + expected output
+// <= limit), calibrateClineCompactionConfig rewrites two fields:
+//
+// - contextWindowTokens := limit - est(systemPrompt) - est(toolSchemas)
+//   (the SDK's built-in tools plus any Kanban MCP tools; every estimate is a
+//   chars/4 ESTIMATE, so a safety margin absorbs estimator drift)
+// - reserveTokens := (B-2.4 output reservation) + safetyMargin
+//
+// The trigger then fires at messages > limit - sys - tools - output - margin,
+// i.e. once the full assembled request would reach `limit - margin`. The
+// output reservation stays the single place expected output is subtracted
+// (B-2.3 double-count rule). The (currently inert) thresholdRatio field is
+// left in place for upstream parity.
+
+import { estimateTextTokens } from "./cline-context-budget";
 import type { ResolvedClineLaunchConfig } from "./cline-provider-service";
 import { SDK_DEFAULT_MODEL_ID } from "./sdk-provider-boundary";
-import type { ClineSdkCompactionConfig, ClineSdkCompactionStrategy } from "./sdk-runtime-boundary";
+import {
+	type ClineSdkCompactionConfig,
+	type ClineSdkCompactionStrategy,
+	getClineDefaultSystemPrompt,
+} from "./sdk-runtime-boundary";
 
 /** Compaction fires once the context usage reaches this fraction of the window. */
 export const CLINE_COMPACTION_THRESHOLD_RATIO = 0.8;
@@ -77,5 +106,185 @@ export function buildClineCompactionConfig(input: BuildClineCompactionConfigInpu
 			...(baseUrl ? { baseUrl } : {}),
 			maxOutputTokens: CLINE_COMPACTION_SUMMARY_MAX_OUTPUT_TOKENS,
 		},
+	};
+}
+
+// ---------------------------------------------------------------------------
+// B-2.5 — Assembled-request calibration
+// ---------------------------------------------------------------------------
+
+/**
+ * Estimated token cost of the SDK's built-in tool schemas (5 tools:
+ * read_files, search_codebase, run_commands, fetch_web_content, editor) as
+ * measured from the serialized JSON of a real @clinebot/core 0.0.38 session
+ * request: 5,186 chars → 1,297 tokens at chars/4. Re-measure when the SDK
+ * version or its built-in tool set changes (see docs/plans/B-2-5.md).
+ */
+export const CLINE_BUILTIN_TOOLS_ESTIMATED_TOKENS = 1_297;
+/**
+ * Fixed floor for the safety margin. Estimator (chars/4) error does not
+ * shrink proportionally, so small windows still get this absolute margin.
+ */
+export const CLINE_COMPACTION_SAFETY_MARGIN_MIN_TOKENS = 4_096;
+/**
+ * Proportional safety margin, applied to the effective limit. chars/4
+ * under-counts dense JSON (tool schemas) by a noticeable margin, and
+ * provider tokenizers disagree with the estimate; the margin absorbs that
+ * drift so the calibrated trigger fires before the provider's real limit.
+ */
+export const CLINE_COMPACTION_SAFETY_MARGIN_RATIO = 0.1;
+/**
+ * Floor for the calibrated window so the trigger always has a positive
+ * target even when the non-message overhead (system prompt + tools) already
+ * approaches the limit. Below that, no compaction can make the request fit
+ * and the B-2.2 context-overflow recovery restart remains the backstop.
+ */
+export const CLINE_COMPACTION_MIN_CALIBRATED_WINDOW_TOKENS = 1_024;
+/** Floor for the message-token trigger point (the SDK clamps it to >= 0). */
+export const CLINE_COMPACTION_MIN_TRIGGER_TOKENS = 256;
+
+/**
+ * Minimal tool definition shape for schema-size estimation. Structurally
+ * compatible with the SDK's `AgentTool`/`SdkMcpTool` values that carry an
+ * `execute` function.
+ */
+export interface ClineCompactionToolSchema {
+	name: string;
+	description?: string;
+	inputSchema?: Record<string, unknown>;
+}
+
+/**
+ * Safety margin for a given effective limit: max of the fixed floor and the
+ * proportional ratio (see the constants above). Shared by the compaction
+ * config calibration and the beforeModel compaction hook so both use the same
+ * margin.
+ */
+export function computeClineCompactionSafetyMarginTokens(limitTokens: number): number {
+	return Math.max(
+		CLINE_COMPACTION_SAFETY_MARGIN_MIN_TOKENS,
+		Math.round(limitTokens * CLINE_COMPACTION_SAFETY_MARGIN_RATIO),
+	);
+}
+
+/**
+ * Estimates the system prompt's token size (chars/4 ESTIMATE). Falls back to
+ * the SDK's default Cline prompt for the provider when the caller does not
+ * supply one — the session runtime receives an already-resolved prompt, but
+ * direct runtime consumers may not.
+ */
+export function estimateClineSystemPromptTokens(systemPrompt: string | null | undefined, providerId: string): number {
+	const prompt = systemPrompt?.trim()
+		? systemPrompt
+		: getClineDefaultSystemPrompt({
+				ide: "Kanban",
+				rootPath: "<workspace>",
+				providerId,
+				metadata: "",
+				rules: "",
+			});
+	return estimateTextTokens(prompt);
+}
+
+/**
+ * Estimates the serialized tool-schema JSON token size (chars/4 ESTIMATE).
+ * The serialization mirrors the provider wire shape (type/function wrappers)
+ * so the estimate tracks what is actually sent.
+ */
+export function estimateClineToolSchemaTokens(tools: readonly ClineCompactionToolSchema[] = []): number {
+	const serialized = JSON.stringify(
+		tools.map((tool) => ({
+			type: "function",
+			function: {
+				name: tool.name,
+				description: tool.description ?? "",
+				parameters: tool.inputSchema ?? {},
+			},
+		})),
+	);
+	return estimateTextTokens(serialized);
+}
+
+/** Breakdown of a calibrated compaction config (all values are estimates). */
+export interface ClineCompactionCalibrationBreakdown {
+	/** The effective limit the config was calibrated from (uncalibrated window). */
+	limitTokens: number;
+	/** Estimated system prompt tokens (chars/4 estimate). */
+	systemPromptTokens: number;
+	/** Estimated total tool schema tokens, built-in + extra (chars/4 estimate). */
+	toolSchemaTokens: number;
+	/** Safety margin applied (max of fixed floor and proportional ratio). */
+	safetyMarginTokens: number;
+	/** Calibrated window the SDK trigger sees: limit - system - tools. */
+	contextWindowTokens: number;
+	/** SDK reserve: B-2.4 output reservation + safety margin. */
+	reserveTokens: number;
+	/** Message token count at which compaction fires: window - reserve. */
+	triggerTokens: number;
+}
+
+export interface CalibrateClineCompactionConfigInput {
+	/** Pre-calibration config (typically from buildClineCompactionConfig). */
+	config: ClineCompactionConfig;
+	/** Assembled system prompt for this session (SDK default when omitted). */
+	systemPrompt?: string | null;
+	/** Provider id, used to estimate the SDK default prompt when omitted. */
+	providerId?: string;
+	/** Kanban MCP tools added to the SDK's built-in tool set. */
+	extraTools?: readonly ClineCompactionToolSchema[];
+}
+
+export interface ClineCompactionCalibrationResult {
+	config: ClineCompactionConfig;
+	/**
+	 * null when no calibration was possible (the config carried no positive
+	 * explicit window, so the SDK would fall back to model metadata / its 200k
+	 * default and there is no limit to calibrate against). The config is then
+	 * returned unchanged.
+	 */
+	breakdown: ClineCompactionCalibrationBreakdown | null;
+}
+
+/**
+ * Rewrites a compaction config's window and reserve so the SDK's message-only
+ * trigger fires when the full assembled request would reach
+ * `limit - safetyMargin`. See the module header for the full derivation.
+ *
+ * Pure function: no SDK, provider, or filesystem involvement.
+ */
+export function calibrateClineCompactionConfig(
+	input: CalibrateClineCompactionConfigInput,
+): ClineCompactionCalibrationResult {
+	const limit = input.config.contextWindowTokens;
+	if (typeof limit !== "number" || !Number.isFinite(limit) || limit <= 0) {
+		return { config: input.config, breakdown: null };
+	}
+
+	const systemPromptTokens = estimateClineSystemPromptTokens(input.systemPrompt, input.providerId ?? "");
+	const toolSchemaTokens = CLINE_BUILTIN_TOOLS_ESTIMATED_TOKENS + estimateClineToolSchemaTokens(input.extraTools);
+	const safetyMarginTokens = computeClineCompactionSafetyMarginTokens(limit);
+	const contextWindowTokens = Math.max(
+		CLINE_COMPACTION_MIN_CALIBRATED_WINDOW_TOKENS,
+		limit - systemPromptTokens - toolSchemaTokens,
+	);
+	const outputReserve = input.config.reserveTokens ?? CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT;
+	const reserveTokens = Math.max(
+		0,
+		Math.min(outputReserve + safetyMarginTokens, contextWindowTokens - CLINE_COMPACTION_MIN_TRIGGER_TOKENS),
+	);
+	const triggerTokens = Math.max(CLINE_COMPACTION_MIN_TRIGGER_TOKENS, contextWindowTokens - reserveTokens);
+
+	const breakdown: ClineCompactionCalibrationBreakdown = {
+		limitTokens: limit,
+		systemPromptTokens,
+		toolSchemaTokens,
+		safetyMarginTokens,
+		contextWindowTokens,
+		reserveTokens,
+		triggerTokens,
+	};
+	return {
+		config: { ...input.config, contextWindowTokens, reserveTokens },
+		breakdown,
 	};
 }

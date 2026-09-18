@@ -2,7 +2,10 @@
 // This is the runtime-facing layer for starting, looking up, resuming, and
 // stopping native Cline sessions without exposing SDK details upstream.
 import type { RuntimeClineReasoningEffort, RuntimeTaskImage, RuntimeTaskSessionMode } from "../core/api-contract";
+import { createClineCompactionBeforeModelHook } from "./cline-compaction-before-model-hook";
+import { createClineCompactionCompactCallback } from "./cline-compaction-callback";
 import type { ClineCompactionConfig } from "./cline-compaction-config";
+import { CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT, calibrateClineCompactionConfig } from "./cline-compaction-config";
 import type { ContextLimitSource } from "./cline-context-policy";
 import { extractClineSessionId } from "./cline-event-adapter";
 import {
@@ -15,6 +18,7 @@ import { buildSessionIdPrefix, createSessionId } from "./cline-session-state";
 import { CLINE_MODEL_CATALOG_DEFAULTS } from "./sdk-provider-boundary";
 import {
 	CLINE_SDK_DEFAULT_CONTEXT_WINDOW_TOKENS,
+	type ClineSdkAgentHooks,
 	type ClineSdkPersistedMessage,
 	type ClineSdkSessionHost,
 	type ClineSdkSessionRecord,
@@ -233,22 +237,75 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		const userImages = toSdkUserImages(request.images);
 		const shouldSendInitialTurn = request.prompt.trim().length > 0 || Boolean(userImages?.length);
 		let startResult: Awaited<ReturnType<ClineSessionHostBoundary["start"]>>;
+		const sessionLogger = createKanbanClineLogger({
+			runtime: "kanban",
+			taskId: request.taskId,
+			requestedSessionId,
+			providerId: request.providerId,
+			modelId: request.modelId,
+		});
 		// B-2.1 diagnostic: record the effective model-context configuration for
 		// every session start (restarts reuse this path). Gated behind
 		// CLINE_LOG_ENABLED like the rest of the Cline runtime logs.
 		// B-2.2: resolveLaunchConfig supplies the resolved limit + source;
 		// callers without a resolver keep the unconfigured-SDK-default values.
-		createKanbanClineLogger({
-			runtime: "kanban",
-			taskId: request.taskId,
-			providerId: request.providerId,
-			modelId: request.modelId,
-		}).log("Cline session start: effective context metadata", {
+		sessionLogger.log("Cline session start: effective context metadata", {
 			baseUrlHost: resolveSessionStartLogHost(request.baseUrl),
 			contextLimitTokens: request.contextWindowTokens ?? CLINE_SDK_DEFAULT_CONTEXT_WINDOW_TOKENS,
 			contextLimitSource: request.contextWindowSource ?? "unconfigured-sdk-default",
 			clineCoreVersion: getClineCorePackageVersion(),
 		});
+		// B-2.5: calibrate the compaction window against the assembled request.
+		// The SDK trigger counts only conversation messages, so subtract the
+		// estimated system-prompt and tool-schema overhead from the window and
+		// fold the safety margin into the reserve (see cline-compaction-config
+		// for the derivation). Runs here — not in the tRPC layer — because the
+		// resolved system prompt and the MCP tool bundle only exist at this
+		// point. The captured start request keeps the UNCALIBRATED config, so
+		// restarts re-derive the same calibration instead of double-subtracting.
+		let effectiveCompaction = request.compaction;
+		if (request.compaction) {
+			const calibration = calibrateClineCompactionConfig({
+				config: request.compaction,
+				systemPrompt: request.systemPrompt,
+				providerId: request.providerId,
+				extraTools: hasMcpExtraTools ? (mcpToolBundle?.tools ?? []) : [],
+			});
+			effectiveCompaction = calibration.config;
+			if (calibration.breakdown) {
+				sessionLogger.log("Cline compaction calibrated for the assembled request (token values are estimates)", {
+					limitTokens: calibration.breakdown.limitTokens,
+					systemPromptTokens: calibration.breakdown.systemPromptTokens,
+					toolSchemaTokens: calibration.breakdown.toolSchemaTokens,
+					safetyMarginTokens: calibration.breakdown.safetyMarginTokens,
+					calibratedWindowTokens: calibration.breakdown.contextWindowTokens,
+					reserveTokens: calibration.breakdown.reserveTokens,
+					triggerTokens: calibration.breakdown.triggerTokens,
+				});
+			}
+		}
+		// B-2.5: in @clinebot/core 0.0.38 local mode the SDK's own compaction
+		// pipeline (the calibrated trigger above + the compact callback below)
+		// is never executed — the agent config's prepareTurn is set but never
+		// invoked by the agent runtime (upstream bug, see docs/plans/B-2-5.md).
+		// The beforeModel hook is the local-mode guard: it evaluates the real
+		// assembled request and rewrites its messages to stay within the same
+		// calibrated budget. `hooks` is a local-only config key, so in hub
+		// mode the compact capability takes over instead.
+		let compactionHooks: ClineSdkAgentHooks | undefined;
+		if (
+			request.compaction &&
+			typeof request.compaction.contextWindowTokens === "number" &&
+			request.compaction.contextWindowTokens > 0
+		) {
+			compactionHooks = {
+				beforeModel: createClineCompactionBeforeModelHook({
+					limitTokens: request.compaction.contextWindowTokens,
+					outputReserveTokens: request.compaction.reserveTokens ?? CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT,
+					logger: sessionLogger,
+				}),
+			};
+		}
 		try {
 			// Hub-backed SDK hosts create the interactive session in start; the first turn runs through send.
 			startResult = await sessionHost.start({
@@ -274,21 +331,25 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 					systemPrompt: request.systemPrompt,
 					// B-2.4: explicit compaction config so the SDK uses the
 					// resolved effective window, reserve, and the same local
-					// summarizer instead of its built-in defaults.
-					compaction: request.compaction,
+					// summarizer instead of its built-in defaults. B-2.5: window
+					// and reserve calibrated for the assembled request above.
+					compaction: effectiveCompaction,
+					// B-2.5: local-mode proactive compaction guard (see above).
+					...(compactionHooks ? { hooks: compactionHooks } : {}),
 				},
 				initialMessages: request.initialMessages,
 				interactive: true,
 				localRuntime: {
 					modelCatalogDefaults: CLINE_MODEL_CATALOG_DEFAULTS,
 					...(request.userInstructionService ? { userInstructionService: request.userInstructionService } : {}),
-					logger: createKanbanClineLogger({
-						runtime: "kanban",
-						taskId: request.taskId,
-						requestedSessionId,
-						providerId: request.providerId,
-						modelId: request.modelId,
-					}),
+					logger: sessionLogger,
+					// B-2.5: deterministic, model-free compaction callback. It
+					// completely replaces the SDK's built-in strategy (returning
+					// undefined would mean NO compaction), and is registered as a
+					// session capability so it also applies in hub mode.
+					...(effectiveCompaction
+						? { compaction: { compact: createClineCompactionCompactCallback(sessionLogger) } }
+						: {}),
 					...(hasMcpExtraTools ? { extraTools: mcpToolBundle?.tools ?? [] } : {}),
 				},
 				...(request.requestToolApproval
