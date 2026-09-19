@@ -25,14 +25,23 @@
 // of the window, even when prior usage is zero. All values are char-based, matching the
 // chars/4 estimator convention from B-2.3.
 //
-// Scope: read-family tools only (B-2.6). B-2.7 extends CLINE_TOOL_RESULT_BOUND_TOOL_NAMES
-// with command output / diff producers once their artifact semantics are defined.
+// Scope (B-2.6 + B-2.7): read-family results (read_files, read, search,
+// search_codebase) and command results (run_commands, bash). Read-family
+// results are bounded to a head+tail char excerpt; command results (B-2.7)
+// are bounded to a line-based excerpt (see cline-command-output-excerpt.ts)
+// that keeps each command's `Command i/N:` + `Exit status` lines in the
+// head, preserves the first N / last M lines, prepends a per-file stat
+// summary for large diffs, and ends with
+// `... [truncated K lines; full output: <artifact path>]`. Command results
+// that do not match the SDK's structured shape fall back to the char-based
+// excerpt.
 //
 // Failure mode: if the artifact write fails, the result is still bounded (excerpt without
 // the reference line) so the session never breaks; the failure is logged.
 
 import type { WriteTaskContextArtifactInput } from "../workspace/task-artifacts";
 import { writeTaskContextArtifact } from "../workspace/task-artifacts";
+import { buildCommandOutputExcerpt, parseCommandOutputEntries } from "./cline-command-output-excerpt";
 import type { ClineSdkAgentAfterToolHook, ClineSdkBasicLogger } from "./sdk-runtime-boundary";
 import { CLINE_SDK_DEFAULT_CONTEXT_WINDOW_TOKENS } from "./sdk-runtime-boundary";
 
@@ -48,8 +57,20 @@ export const CLINE_TOOL_RESULT_BOUND_MIN_CHARS = 4_000;
 export const CLINE_TOOL_RESULT_BOUND_WINDOW_RATIO = 0.1;
 /** Chars per token estimate (B-2.3 chars/4 convention). */
 const ESTIMATED_CHARS_PER_TOKEN = 4;
-/** Tool names bounded by this hook (B-2.6 scope: file reads). */
-export const CLINE_TOOL_RESULT_BOUND_TOOL_NAMES = ["read_files", "read"] as const;
+/** Read-family tool names bounded by this hook (B-2.6 scope: file reads + searches). */
+export const CLINE_READ_RESULT_BOUND_TOOL_NAMES = ["read_files", "read", "search", "search_codebase"] as const;
+/**
+ * Command tool names bounded by this hook (B-2.7 scope: command output + diffs). Their
+ * results get the structured line-based excerpt (exit status in the head, first N / last M
+ * lines, diff stat summary); `bash` is included for SDK rename compatibility — the current
+ * SDK tool name is `run_commands`.
+ */
+export const CLINE_COMMAND_OUTPUT_BOUND_TOOL_NAMES = ["run_commands", "bash"] as const;
+/** All tool names whose oversized results are bounded at ingestion (B-2.6 + B-2.7). */
+export const CLINE_TOOL_RESULT_BOUND_TOOL_NAMES = [
+	...CLINE_READ_RESULT_BOUND_TOOL_NAMES,
+	...CLINE_COMMAND_OUTPUT_BOUND_TOOL_NAMES,
+] as const;
 
 /**
  * Computes the per-result bound in chars for a session with the given effective
@@ -122,16 +143,17 @@ export interface CreateClineToolResultBoundingHookOptions {
 	limitTokens?: number;
 	/** Session logger; diagnostics only, never fatal. */
 	logger?: ClineSdkBasicLogger;
-	/** Tool names to bound; defaults to the read-family tools. */
+	/** Tool names to bound; defaults to the read-family + command tools (CLINE_TOOL_RESULT_BOUND_TOOL_NAMES). */
 	toolNames?: readonly string[];
 	/** Artifact writer override (tests); defaults to writeTaskContextArtifact. */
 	writeArtifact?: (input: WriteTaskContextArtifactInput) => Promise<string>;
 }
 
 /**
- * Creates the agent-runtime `afterTool` hook that bounds oversized read-family tool results
- * at ingestion time and preserves the full content as a local artifact (module header for
- * the investigation findings and bound derivation).
+ * Creates the agent-runtime `afterTool` hook that bounds oversized tool results
+ * (read-family char excerpts + B-2.7 command line excerpts) at ingestion time and
+ * preserves the full content as a local artifact (module header for the
+ * investigation findings and bound derivation).
  */
 export function createClineToolResultBoundingHook(
 	options: CreateClineToolResultBoundingHookOptions,
@@ -167,14 +189,39 @@ export function createClineToolResultBoundingHook(
 				},
 			);
 		}
-		const excerpt = buildBoundedToolResultExcerpt(fullText, boundChars, artifactPath);
+		let excerpt = "";
+		let excerptKind: "command-lines" | "chars" = "chars";
+		let excerptStats: { headLines: number; tailLines: number; omittedLines: number } | null = null;
+		if (CLINE_COMMAND_OUTPUT_BOUND_TOOL_NAMES.some((name) => name === toolName)) {
+			// B-2.7: command output / diffs get the structured line-based excerpt
+			// (exit status in the head, first N / last M lines, diff stat
+			// summary). Malformed output falls through to the char-based path.
+			const entries = parseCommandOutputEntries(context.result.output);
+			const structured = entries
+				? buildCommandOutputExcerpt(entries, { budgetChars: boundChars, artifactPath })
+				: null;
+			if (structured) {
+				excerpt = structured.text;
+				excerptKind = "command-lines";
+				excerptStats = {
+					headLines: structured.headLines,
+					tailLines: structured.tailLines,
+					omittedLines: structured.omittedLines,
+				};
+			}
+		}
+		if (!excerpt) {
+			excerpt = buildBoundedToolResultExcerpt(fullText, boundChars, artifactPath);
+		}
 		options.logger?.log("Bounded oversized tool result at ingestion (full content preserved as a local artifact)", {
 			toolName,
 			toolCallId,
 			originalChars: fullText.length,
 			boundedChars: excerpt.length,
 			boundChars,
+			excerptKind,
 			artifactPath: artifactPath ?? null,
+			...(excerptStats ? { ...excerptStats } : {}),
 		});
 		return {
 			result: { ...context.result, output: excerpt },

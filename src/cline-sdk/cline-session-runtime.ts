@@ -293,11 +293,13 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		// assembled request and rewrites its messages to stay within the same
 		// calibrated budget. `hooks` is a local-only config key, so in hub
 		// mode the compact capability takes over instead.
-		// B-2.6: the afterTool hook bounds oversized read-family tool results
-		// at ingestion time (see cline-tool-result-bounding-hook.ts) and
-		// preserves the full content as a local artifact. It complements the
-		// SDK's own 50k request-assembly truncation, which is request-scoped
-		// only and leaves the persisted transcript unbounded.
+		// B-2.6/B-2.7: the afterTool hook bounds oversized tool results at
+		// ingestion time (read-family char excerpts; command output / diff
+		// line excerpts with the exit status kept in the head — see
+		// cline-tool-result-bounding-hook.ts) and preserves the full content
+		// as a local artifact. It complements the SDK's own 50k
+		// request-assembly truncation, which is request-scoped only and
+		// leaves the persisted transcript unbounded.
 		let agentHooks: ClineSdkAgentHooks | undefined;
 		if (
 			request.compaction &&

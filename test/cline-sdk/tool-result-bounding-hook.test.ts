@@ -1,9 +1,12 @@
-// B-2.6 — unit tests for the ingestion-time tool-result bound: the window-scaled cap math,
-// the head+tail excerpt builder (hard budget), and the afterTool hook behavior.
+// B-2.6 + B-2.7 — unit tests for the ingestion-time tool-result bound: the window-scaled
+// cap math, the head+tail char excerpt builder (hard budget), command-output routing
+// (structured line excerpt with char fallback), and the afterTool hook behavior.
 import { describe, expect, it, vi } from "vitest";
 
 import {
 	buildBoundedToolResultExcerpt,
+	CLINE_COMMAND_OUTPUT_BOUND_TOOL_NAMES,
+	CLINE_READ_RESULT_BOUND_TOOL_NAMES,
 	CLINE_TOOL_RESULT_BOUND_MAX_CHARS,
 	CLINE_TOOL_RESULT_BOUND_MIN_CHARS,
 	CLINE_TOOL_RESULT_BOUND_TOOL_NAMES,
@@ -147,7 +150,7 @@ describe("buildBoundedToolResultExcerpt", () => {
 			);
 		});
 
-		it("serializes structured tool outputs before bounding", async () => {
+		it("serializes structured read-family outputs before bounding (char path)", async () => {
 			const payload = { entries: [{ query: "big-file.txt", result: "w".repeat(boundChars + 100), success: true }] };
 			const { hook, writeArtifact } = createHook({ output: payload });
 			const result = await hook(createContext({ output: payload }));
@@ -179,24 +182,126 @@ describe("buildBoundedToolResultExcerpt", () => {
 		});
 
 		it("ignores tools outside the bound set", async () => {
-			const { hook, writeArtifact } = createHook({ toolName: "run_commands", output: "r".repeat(boundChars + 500) });
+			const { hook, writeArtifact } = createHook({
+				toolName: "write_to_file",
+				output: "r".repeat(boundChars + 500),
+			});
 			expect(
-				await hook(createContext({ toolName: "run_commands", output: "r".repeat(boundChars + 500) })),
+				await hook(createContext({ toolName: "write_to_file", output: "r".repeat(boundChars + 500) })),
 			).toBeUndefined();
 			expect(writeArtifact).not.toHaveBeenCalled();
 		});
 
-		it("honors a custom tool-name set and defaults to the read-family tools", async () => {
+		it("honors a custom tool-name set and defaults to read-family + command tools", async () => {
 			expect(CLINE_TOOL_RESULT_BOUND_TOOL_NAMES).toContain("read_files");
-			expect(CLINE_TOOL_RESULT_BOUND_TOOL_NAMES).toContain("read");
+			expect(CLINE_READ_RESULT_BOUND_TOOL_NAMES).toContain("read");
+			expect(CLINE_COMMAND_OUTPUT_BOUND_TOOL_NAMES).toContain("run_commands");
+			expect(CLINE_COMMAND_OUTPUT_BOUND_TOOL_NAMES).toContain("bash");
 			const { hook, writeArtifact } = createHook({
-				toolNames: ["run_commands"],
-				toolName: "run_commands",
+				toolNames: ["my_tool"],
+				toolName: "my_tool",
 				output: "r".repeat(boundChars + 10),
 			});
-			const result = await hook(createContext({ toolName: "run_commands", output: "r".repeat(boundChars + 10) }));
+			const result = await hook(createContext({ toolName: "my_tool", output: "r".repeat(boundChars + 10) }));
 			expect(result?.result?.output).not.toBeUndefined();
 			expect(writeArtifact).toHaveBeenCalledTimes(1);
+		});
+
+		it("routes structured command results to the line-based excerpt with the artifact marker", async () => {
+			const output = [
+				{
+					query: "seq 1 100000",
+					result: Array.from({ length: 100_000 }, (_, i) => `${i + 1}:${"x".repeat(58)}`).join("\n"),
+					success: true,
+				},
+			];
+			const { hook, writeArtifact, logger } = createHook({ toolName: "run_commands", output });
+			const result = await hook(createContext({ toolName: "run_commands", output }));
+			expect(result?.result?.output).toBeTypeOf("string");
+			const excerpt = result!.result!.output as string;
+			expect(excerpt.length).toBeLessThanOrEqual(boundChars);
+			expect(excerpt).toContain("Command 1/1: seq 1 100000");
+			expect(excerpt).toContain("Exit status: success");
+			expect(excerpt).toMatch(/\.\.\. \[truncated \d+ lines; full output: fake-artifact\.txt\]/);
+			expect(excerpt).toContain("1:" + "x".repeat(58));
+			expect(excerpt).toContain("100000:" + "x".repeat(58));
+			expect(writeArtifact).toHaveBeenCalledWith({
+				taskId: "task-1",
+				toolCallId: "call-1",
+				content: JSON.stringify(output),
+			});
+			expect(logger.log).toHaveBeenCalledWith(
+				expect.stringContaining("Bounded oversized tool result"),
+				expect.objectContaining({ excerptKind: "command-lines", artifactPath: "fake-artifact.txt" }),
+			);
+		});
+
+		it("preserves a failed exit status in the head of the line excerpt (SDK failure shape)", async () => {
+			// The SDK reports a non-zero exit as result: "" plus an error string
+			// ("Command failed: " + stderr / exit code text); the stderr IS the body.
+			const stderr = Array.from({ length: 5_000 }, (_, i) => `step ${i + 1}`);
+			const output = [
+				{
+					query: "bash -lc 'seq 1 5000 >&2; echo ERR-TAIL-MARK >&2; exit 1'",
+					result: "",
+					success: false,
+					error: `Command failed: ${stderr.join("\n")}\nERR-TAIL-MARK`,
+				},
+			];
+			const { hook, writeArtifact } = createHook({ toolName: "run_commands", output });
+			const result = await hook(createContext({ toolName: "run_commands", output }));
+			const excerpt = result!.result!.output as string;
+			const lines = excerpt.split("\n");
+			expect(lines[0]).toBe("Command 1/1: bash -lc 'seq 1 5000 >&2; echo ERR-TAIL-MARK >&2; exit 1'");
+			expect(lines[1]).toBe("Exit status: failed — Command failed: step 1");
+			// The tail of the stderr survives, the middle is bounded away.
+			expect(excerpt).toContain("ERR-TAIL-MARK");
+			expect(excerpt).not.toContain("step 2500");
+			expect(excerpt.length).toBeLessThanOrEqual(boundChars);
+			// The full structured output (incl. the full stderr) is persisted as the artifact.
+			expect(writeArtifact).toHaveBeenCalledWith({
+				taskId: "task-1",
+				toolCallId: "call-1",
+				content: JSON.stringify(output),
+			});
+		});
+
+		it("prepends a per-file stat summary for diff command output", async () => {
+			const body = [
+				"diff --git a/src/large.ts b/src/large.ts",
+				"--- a/src/large.ts",
+				"+++ b/src/large.ts",
+				"@@ -1,1 +1,4901 @@",
+				"-old",
+				...Array.from({ length: 4_900 }, (_, i) => `+line ${i + 1}`),
+				"diff --git a/src/small.ts b/src/small.ts",
+				"--- a/src/small.ts",
+				"+++ b/src/small.ts",
+				"@@ -1,1 +1,2 @@",
+				"-old",
+				"+new",
+			].join("\n");
+			const output = [{ query: "git diff --cached", result: body, success: true }];
+			const { hook } = createHook({ toolName: "run_commands", output });
+			const result = await hook(createContext({ toolName: "run_commands", output }));
+			const excerpt = result!.result!.output as string;
+			expect(excerpt.length).toBeLessThanOrEqual(boundChars);
+			const summaryIndex = excerpt.indexOf("Diff summary (2 files):");
+			expect(summaryIndex).toBeGreaterThan(-1);
+			expect(excerpt).toContain("  src/large.ts | +4901 -1");
+			expect(excerpt).toContain("  src/small.ts | +2 -1");
+			// The summary sits in the head, before the diff body.
+			expect(summaryIndex).toBeLessThan(excerpt.indexOf("diff --git"));
+			expect(excerpt).toMatch(/\.\.\. \[truncated \d+ lines; full output: fake-artifact\.txt\]/);
+		});
+
+		it("falls back to the char-based excerpt for unstructured command output", async () => {
+			const output = "r".repeat(boundChars + 10);
+			const { hook } = createHook({ toolName: "bash", output });
+			const result = await hook(createContext({ toolName: "bash", output }));
+			const excerpt = result!.result!.output as string;
+			expect(excerpt.length).toBeLessThanOrEqual(boundChars);
+			expect(excerpt).toContain("Full content: fake-artifact.txt");
 		});
 	});
 });
