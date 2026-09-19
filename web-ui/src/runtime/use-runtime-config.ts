@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { fetchRuntimeConfig, saveRuntimeConfig } from "@/runtime/runtime-config-query";
-import type { RuntimeAgentId, RuntimeConfigResponse, RuntimeProjectShortcut } from "@/runtime/types";
+import type {
+	RuntimeAgentId,
+	RuntimeConfigResponse,
+	RuntimeContextBudgetSave,
+	RuntimeProjectShortcut,
+} from "@/runtime/types";
 import { useTrpcQuery } from "@/runtime/use-trpc-query";
 
 export interface UseRuntimeConfigResult {
@@ -17,6 +22,8 @@ export interface UseRuntimeConfigResult {
 		readyForReviewNotificationsEnabled?: boolean;
 		commitPromptTemplate?: string;
 		openPrPromptTemplate?: string;
+		/** B-2.9: `null` fields clear the setting to its default. */
+		contextBudget?: RuntimeContextBudgetSave;
 	}) => Promise<RuntimeConfigResponse | null>;
 }
 

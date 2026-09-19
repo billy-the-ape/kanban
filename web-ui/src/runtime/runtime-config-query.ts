@@ -26,6 +26,7 @@ import type {
 	RuntimeClineReasoningEffort,
 	RuntimeClineUpdateProviderResponse,
 	RuntimeConfigResponse,
+	RuntimeContextBudgetSave,
 	RuntimeDebugResetAllStateResponse,
 	RuntimeFeaturebaseTokenResponse,
 	RuntimeProjectShortcut,
@@ -48,6 +49,8 @@ export async function saveRuntimeConfig(
 		readyForReviewNotificationsEnabled?: boolean;
 		commitPromptTemplate?: string;
 		openPrPromptTemplate?: string;
+		/** B-2.9: `null` fields clear the setting to its default. */
+		contextBudget?: RuntimeContextBudgetSave;
 	},
 ): Promise<RuntimeConfigResponse> {
 	const trpcClient = getRuntimeTrpcClient(workspaceId);

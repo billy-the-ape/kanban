@@ -247,4 +247,84 @@ describe("B-2.4 — compaction config wiring", () => {
 		);
 		expect(service.getSummary("task-compaction-restart")?.reviewReason).not.toBe("error");
 	});
+
+	it("applies the context budget settings through calibration to the SDK config (B-2.9)", async () => {
+		const harness = createTaskSessionServiceHarness();
+		services.push(harness);
+		const { service, host } = harness;
+		// Large window so the calibrated reserve (user reserve + user margin)
+		// is not clamped by the window floor.
+		const launchConfig = makeLaunchConfig({
+			contextWindowTokens: 131_072,
+			contextWindowSource: "override",
+			compactionSettings: {
+				strategy: "agentic",
+				thresholdRatio: 0.7,
+				reserveTokens: 8_192,
+				safetyMarginTokens: 6_000,
+			},
+		});
+		const compaction = buildClineCompactionConfig({ launchConfig });
+
+		await service.startTaskSession({
+			taskId: "task-budget-compaction",
+			cwd: "/tmp/worktree",
+			prompt: "First turn prompt",
+			providerId: launchConfig.providerId,
+			modelId: launchConfig.modelId,
+			apiKey: launchConfig.apiKey,
+			baseUrl: launchConfig.baseUrl,
+			contextWindowTokens: launchConfig.contextWindowTokens,
+			contextWindowSource: launchConfig.contextWindowSource,
+			compaction,
+			compactionSafetyMarginTokens: launchConfig.compactionSettings?.safetyMarginTokens,
+		});
+		await vi.waitFor(() => {
+			expect(host.startedConfigs.length).toBe(1);
+		});
+
+		const startedCompaction = host.startedConfigs[0]?.compaction;
+		// The budget's strategy and threshold reach the SDK config unchanged.
+		expect(startedCompaction?.strategy).toBe("agentic");
+		expect(startedCompaction?.thresholdRatio).toBe(0.7);
+		// Calibration folds the USER margin (6_000) into the USER reserve
+		// (8_192), not the computed margin (4_096 floor at 131_072).
+		expect(startedCompaction?.reserveTokens).toBe(8_192 + 6_000);
+		expect(service.getSummary("task-budget-compaction")?.reviewReason).not.toBe("error");
+	});
+});
+
+describe("B-2.9 — context budget compaction settings on the launch config", () => {
+	it("applies the budget's strategy, threshold, and reserve from the launch config", () => {
+		const launchConfig = makeLaunchConfig({
+			compactionSettings: {
+				strategy: "agentic",
+				thresholdRatio: 0.7,
+				reserveTokens: 8_192,
+				safetyMarginTokens: 6_000,
+			},
+		});
+		const compaction = buildClineCompactionConfig({ launchConfig });
+		expect(compaction.strategy).toBe("agentic");
+		expect(compaction.thresholdRatio).toBe(0.7);
+		// The user's budget reserve wins over the model's maxTokens.
+		expect(compaction.reserveTokens).toBe(8_192);
+	});
+
+	it("keeps the documented defaults when the launch config carries no budget", () => {
+		const compaction = buildClineCompactionConfig({ launchConfig: makeLaunchConfig() });
+		expect(compaction.strategy).toBe("basic");
+		expect(compaction.thresholdRatio).toBe(CLINE_COMPACTION_THRESHOLD_RATIO);
+		// Model maxTokens feeds the reserve when no budget reserve is set.
+		expect(compaction.reserveTokens).toBe(4_096);
+	});
+
+	it("lets explicit per-call settings win over the launch-config budget", () => {
+		const launchConfig = makeLaunchConfig({
+			compactionSettings: { strategy: "agentic", thresholdRatio: 0.7 },
+		});
+		const compaction = buildClineCompactionConfig({ launchConfig, settings: { strategy: "basic" } });
+		expect(compaction.strategy).toBe("basic");
+		expect(compaction.thresholdRatio).toBe(0.7);
+	});
 });

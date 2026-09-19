@@ -20,6 +20,16 @@ const localProviderMocks = vi.hoisted(() => ({
 	getLocalProviderModels: vi.fn(),
 }));
 
+const runtimeConfigMocks = vi.hoisted(() => ({
+	readGlobalRuntimeContextBudget: vi.fn(),
+}));
+
+// B-2.9: resolveLaunchConfig reads the global context budget from the
+// runtime config; keep the test hermetic (no real HOME reads).
+vi.mock("../../../src/config/runtime-config", () => ({
+	readGlobalRuntimeContextBudget: runtimeConfigMocks.readGlobalRuntimeContextBudget,
+}));
+
 vi.mock("@clinebot/core", () => ({
 	addLocalProvider: vi.fn(),
 	completeClineDeviceAuth: vi.fn(),
@@ -141,10 +151,12 @@ describe("runtimeClineProviderModelSchema contextWindow", () => {
 			localProviderMocks.getLocalProviderModels.mockReset();
 			llmsModelMocks.resolveProviderConfig.mockReset();
 			llmsModelMocks.resolveProviderModelCatalogKeys.mockReset();
+			runtimeConfigMocks.readGlobalRuntimeContextBudget.mockReset();
 			localProviderMocks.getLocalProviderModels.mockResolvedValue({ providerId: "", models: [] });
 			llmsModelMocks.resolveProviderConfig.mockResolvedValue(undefined);
 			llmsModelMocks.resolveProviderModelCatalogKeys.mockImplementation((providerId: string) => [providerId]);
 			oauthMocks.getLastUsedProviderSettings.mockReturnValue(undefined);
+			runtimeConfigMocks.readGlobalRuntimeContextBudget.mockResolvedValue(undefined);
 			setProviderSettings(null);
 		});
 
@@ -474,6 +486,154 @@ describe("runtimeClineProviderModelSchema contextWindow", () => {
 
 				expect(config.contextWindowTokens).toBe(131072);
 				expect(config.contextWindowSource).toBe("provider-metadata");
+			});
+		});
+
+		describe("resolveLaunchConfig context budget (B-2.9 tier 0)", () => {
+			function setLastUsedLitellmSettings(settings: { model: string; contextWindow?: number }): void {
+				const providerSettings = {
+					provider: "litellm",
+					model: settings.model,
+					apiKey: "litellm-key",
+					baseUrl: "http://127.0.0.1:4000",
+					...(settings.contextWindow !== undefined ? { contextWindow: settings.contextWindow } : {}),
+				};
+				setProviderSettings(providerSettings);
+				oauthMocks.getLastUsedProviderSettings.mockReturnValue(providerSettings);
+			}
+
+			it("lets the global budget override win over every other tier", async () => {
+				const service = createClineProviderService();
+				setLastUsedLitellmSettings({ model: "qwen3-32b", contextWindow: 128_000 });
+				stubLiteLlmFetch({
+					"/model/info": {
+						json: { data: [{ model_name: "qwen3-32b", max_input_tokens: 262144 }] },
+					},
+				});
+				runtimeConfigMocks.readGlobalRuntimeContextBudget.mockResolvedValue({
+					contextWindowOverrideTokens: 64_000,
+					compactionStrategy: "agentic",
+					triggerThresholdRatio: 0.75,
+					outputReserveTokens: 8_192,
+					safetyMarginTokens: 6_000,
+				});
+
+				const config = await service.resolveLaunchConfig();
+
+				// The user's explicit budget wins outright (tier 0), even when
+				// the persisted provider-settings override is smaller.
+				expect(config.contextWindowTokens).toBe(64_000);
+				expect(config.contextWindowSource).toBe("override");
+				expect(config.compactionSettings).toEqual({
+					strategy: "agentic",
+					thresholdRatio: 0.75,
+					reserveTokens: 8_192,
+					safetyMarginTokens: 6_000,
+				});
+			});
+
+			it("carries the budget's compaction fields when no window override is set", async () => {
+				const service = createClineProviderService();
+				setLastUsedLitellmSettings({ model: "qwen3-32b" });
+				stubLiteLlmFetch({
+					"/model/info": {
+						json: { data: [{ model_name: "qwen3-32b", max_input_tokens: 131072 }] },
+					},
+				});
+				runtimeConfigMocks.readGlobalRuntimeContextBudget.mockResolvedValue({
+					compactionStrategy: "agentic",
+				});
+
+				const config = await service.resolveLaunchConfig();
+
+				expect(config.contextWindowTokens).toBe(131072);
+				expect(config.contextWindowSource).toBe("provider-metadata");
+				expect(config.compactionSettings).toEqual({ strategy: "agentic" });
+			});
+
+			it("carries no compaction settings when the budget is unset", async () => {
+				const service = createClineProviderService();
+				setLastUsedLitellmSettings({ model: "qwen3-32b" });
+				stubLiteLlmFetch({
+					"/model/info": {
+						json: { data: [{ model_name: "qwen3-32b", max_input_tokens: 131072 }] },
+					},
+				});
+
+				const config = await service.resolveLaunchConfig();
+
+				expect(config.compactionSettings).toBeUndefined();
+			});
+
+			it("treats an invalid budget override as unset", async () => {
+				const service = createClineProviderService();
+				setLastUsedLitellmSettings({ model: "qwen3-32b" });
+				stubLiteLlmFetch({
+					"/model/info": {
+						json: { data: [{ model_name: "qwen3-32b", max_input_tokens: 131072 }] },
+					},
+				});
+				runtimeConfigMocks.readGlobalRuntimeContextBudget.mockResolvedValue({
+					// Impossible from a validated config; defense in depth.
+					contextWindowOverrideTokens: -1,
+				});
+
+				const config = await service.resolveLaunchConfig();
+
+				expect(config.contextWindowTokens).toBe(131072);
+				expect(config.contextWindowSource).toBe("provider-metadata");
+			});
+		});
+
+		describe("resolveEffectiveContextWindow (B-2.9)", () => {
+			it("returns the budget override without needing a selected provider", async () => {
+				const service = createClineProviderService();
+				setProviderSettings(null);
+
+				expect(await service.resolveEffectiveContextWindow(64_000)).toEqual({
+					limitTokens: 64_000,
+					source: "override",
+				});
+			});
+
+			it("resolves provider settings and metadata for the selected provider", async () => {
+				const service = createClineProviderService();
+				setProviderSettings({
+					provider: "litellm",
+					model: "qwen3-32b",
+					baseUrl: "http://127.0.0.1:4000",
+					apiKey: "litellm-key",
+				});
+				oauthMocks.getLastUsedProviderSettings.mockReturnValue({
+					provider: "litellm",
+					model: "qwen3-32b",
+					baseUrl: "http://127.0.0.1:4000",
+					apiKey: "litellm-key",
+				});
+				stubLiteLlmFetch({
+					"/model/info": {
+						json: { data: [{ model_name: "qwen3-32b", max_input_tokens: 131072 }] },
+					},
+				});
+
+				expect(await service.resolveEffectiveContextWindow(null)).toEqual({
+					limitTokens: 131072,
+					source: "provider-metadata",
+				});
+			});
+
+			it("resolves the documented fallback when the selected provider has no known model capacity", async () => {
+				const service = createClineProviderService();
+				setProviderSettings(null);
+
+				// No budget override and no explicitly selected provider: the
+				// selection falls back to the SDK default provider with an
+				// unknown model capacity, matching resolveLaunchConfig's
+				// documented fallback.
+				expect(await service.resolveEffectiveContextWindow(null)).toEqual({
+					limitTokens: 200_000,
+					source: "fallback",
+				});
 			});
 		});
 	});

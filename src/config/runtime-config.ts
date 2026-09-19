@@ -5,7 +5,12 @@ import { readFile, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { getRuntimeAgentCatalogEntry, isRuntimeAgentLaunchSupported } from "../core/agent-catalog";
-import type { RuntimeAgentId, RuntimeProjectShortcut } from "../core/api-contract";
+import type {
+	RuntimeAgentId,
+	RuntimeContextBudget,
+	RuntimeContextBudgetSave,
+	RuntimeProjectShortcut,
+} from "../core/api-contract";
 import { type LockRequest, lockedFileSystem } from "../fs/locked-file-system";
 import { detectInstalledCommands } from "../terminal/agent-registry";
 import { areRuntimeProjectShortcutsEqual } from "./shortcut-utils";
@@ -17,6 +22,7 @@ interface RuntimeGlobalConfigFileShape {
 	readyForReviewNotificationsEnabled?: boolean;
 	commitPromptTemplate?: string;
 	openPrPromptTemplate?: string;
+	contextBudget?: RuntimeContextBudget;
 }
 
 interface RuntimeProjectConfigFileShape {
@@ -35,6 +41,8 @@ export interface RuntimeConfigState {
 	openPrPromptTemplate: string;
 	commitPromptTemplateDefault: string;
 	openPrPromptTemplateDefault: string;
+	/** B-2.9: global context budget settings; absent means all defaults. */
+	contextBudget?: RuntimeContextBudget;
 }
 
 export interface RuntimeConfigUpdateInput {
@@ -45,6 +53,8 @@ export interface RuntimeConfigUpdateInput {
 	shortcuts?: RuntimeProjectShortcut[];
 	commitPromptTemplate?: string;
 	openPrPromptTemplate?: string;
+	/** B-2.9: `null` clears all context budget settings; `undefined` leaves them untouched. */
+	contextBudget?: RuntimeContextBudgetSave | null;
 }
 
 const RUNTIME_HOME_PARENT_DIR = ".cline";
@@ -193,6 +203,136 @@ function normalizeShortcutLabel(value: unknown): string | null {
 	return normalized.length > 0 ? normalized : null;
 }
 
+function normalizeContextBudgetTokenField(value: unknown): number | undefined {
+	if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+		return undefined;
+	}
+	return value;
+}
+
+function normalizeContextBudgetRatio(value: unknown): number | undefined {
+	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0 || value > 1) {
+		return undefined;
+	}
+	return value;
+}
+
+function normalizeContextBudgetStrategy(value: unknown): "basic" | "agentic" | undefined {
+	if (value === "basic" || value === "agentic") {
+		return value;
+	}
+	return undefined;
+}
+
+/** B-2.9: drop invalid/empty fields so corrupted config files degrade to defaults instead of failing to load. */
+function normalizeContextBudget(value: unknown): RuntimeContextBudget | undefined {
+	if (!value || typeof value !== "object") {
+		return undefined;
+	}
+	const raw = value as Record<string, unknown>;
+	const budget: RuntimeContextBudget = {};
+	const contextWindowOverrideTokens = normalizeContextBudgetTokenField(raw.contextWindowOverrideTokens);
+	if (contextWindowOverrideTokens !== undefined) {
+		budget.contextWindowOverrideTokens = contextWindowOverrideTokens;
+	}
+	const compactionStrategy = normalizeContextBudgetStrategy(raw.compactionStrategy);
+	if (compactionStrategy !== undefined) {
+		budget.compactionStrategy = compactionStrategy;
+	}
+	const triggerThresholdRatio = normalizeContextBudgetRatio(raw.triggerThresholdRatio);
+	if (triggerThresholdRatio !== undefined) {
+		budget.triggerThresholdRatio = triggerThresholdRatio;
+	}
+	const outputReserveTokens = normalizeContextBudgetTokenField(raw.outputReserveTokens);
+	if (outputReserveTokens !== undefined) {
+		budget.outputReserveTokens = outputReserveTokens;
+	}
+	const safetyMarginTokens = normalizeContextBudgetTokenField(raw.safetyMarginTokens);
+	if (safetyMarginTokens !== undefined) {
+		budget.safetyMarginTokens = safetyMarginTokens;
+	}
+	return Object.keys(budget).length > 0 ? budget : undefined;
+}
+
+const CONTEXT_BUDGET_TOKEN_FIELDS = [
+	["contextWindowOverrideTokens", "contextWindowOverrideTokens"] as const,
+	["outputReserveTokens", "outputReserveTokens"] as const,
+	["safetyMarginTokens", "safetyMarginTokens"] as const,
+];
+
+/**
+ * B-2.9: strict validation for save-time input (the API boundary already
+ * validates via zod; this is defense in depth for direct callers). `null`
+ * clears a field (resets it to the default), so null is valid for every
+ * field.
+ */
+function validateContextBudget(budget: RuntimeContextBudgetSave | null | undefined): void {
+	if (budget === null || budget === undefined) {
+		return;
+	}
+	for (const [key, label] of CONTEXT_BUDGET_TOKEN_FIELDS) {
+		const value = budget[key];
+		if (value !== null && value !== undefined && (!Number.isInteger(value) || value <= 0)) {
+			throw new Error(`${label} must be a positive integer token count.`);
+		}
+	}
+	if (
+		budget.compactionStrategy !== null &&
+		budget.compactionStrategy !== undefined &&
+		budget.compactionStrategy !== "basic" &&
+		budget.compactionStrategy !== "agentic"
+	) {
+		throw new Error("compactionStrategy must be either 'basic' or 'agentic'.");
+	}
+	if (
+		budget.triggerThresholdRatio !== null &&
+		budget.triggerThresholdRatio !== undefined &&
+		(budget.triggerThresholdRatio <= 0 || budget.triggerThresholdRatio > 1)
+	) {
+		throw new Error("triggerThresholdRatio must be a number between 0 and 1 (exclusive of 0).");
+	}
+}
+
+// Accepts the save shape (nullable fields): null and undefined both mean
+// "unset" for comparison purposes.
+function areRuntimeContextBudgetsEqual(
+	left: RuntimeContextBudgetSave | null | undefined,
+	right: RuntimeContextBudgetSave | null | undefined,
+): boolean {
+	if (!left && !right) {
+		return true;
+	}
+	if (!left || !right) {
+		return false;
+	}
+	return (
+		(left.contextWindowOverrideTokens ?? null) === (right.contextWindowOverrideTokens ?? null) &&
+		(left.compactionStrategy ?? null) === (right.compactionStrategy ?? null) &&
+		(left.triggerThresholdRatio ?? null) === (right.triggerThresholdRatio ?? null) &&
+		(left.outputReserveTokens ?? null) === (right.outputReserveTokens ?? null) &&
+		(left.safetyMarginTokens ?? null) === (right.safetyMarginTokens ?? null)
+	);
+}
+
+/**
+ * B-2.9: merges a save-shape context budget update against the stored budget
+ * so per-field nulls (clear-to-default) survive normalization: an undefined
+ * update leaves the stored budget untouched, a null clears everything, and an
+ * object update applies each field — null clears that field, a value sets it.
+ */
+function mergeContextBudgetUpdates(
+	stored: RuntimeContextBudget | undefined,
+	updates: RuntimeContextBudgetSave | null | undefined,
+): RuntimeContextBudgetSave | null | undefined {
+	if (updates === undefined) {
+		return undefined;
+	}
+	if (updates === null) {
+		return null;
+	}
+	return { ...(stored ?? {}), ...updates };
+}
+
 function hasOwnKey<T extends object>(value: T | null, key: keyof T): boolean {
 	if (!value) {
 		return false;
@@ -291,6 +431,7 @@ function toRuntimeConfigState({
 		),
 		commitPromptTemplateDefault: DEFAULT_COMMIT_PROMPT_TEMPLATE,
 		openPrPromptTemplateDefault: DEFAULT_OPEN_PR_PROMPT_TEMPLATE,
+		contextBudget: normalizeContextBudget(globalConfig?.contextBudget),
 	};
 }
 
@@ -312,6 +453,8 @@ async function writeRuntimeGlobalConfigFile(
 		readyForReviewNotificationsEnabled?: boolean;
 		commitPromptTemplate?: string;
 		openPrPromptTemplate?: string;
+		/** B-2.9: `null` clears the stored context budget; `undefined` preserves the existing one. Null fields clear individual settings (normalized before write). */
+		contextBudget?: RuntimeContextBudgetSave | null;
 	},
 ): Promise<void> {
 	const existing = await readRuntimeConfigFile<RuntimeGlobalConfigFileShape>(configPath);
@@ -373,6 +516,16 @@ async function writeRuntimeGlobalConfigFile(
 	}
 	if (hasOwnKey(existing, "openPrPromptTemplate") || openPrPromptTemplate !== DEFAULT_OPEN_PR_PROMPT_TEMPLATE) {
 		payload.openPrPromptTemplate = openPrPromptTemplate;
+	}
+	if (config.contextBudget !== undefined) {
+		if (config.contextBudget !== null) {
+			const normalizedContextBudget = normalizeContextBudget(config.contextBudget);
+			if (normalizedContextBudget) {
+				payload.contextBudget = normalizedContextBudget;
+			}
+		}
+	} else if (existing?.contextBudget) {
+		payload.contextBudget = normalizeContextBudget(existing.contextBudget);
 	}
 
 	await lockedFileSystem.writeJsonFileAtomic(configPath, payload, {
@@ -456,6 +609,7 @@ function createRuntimeConfigStateFromValues(input: {
 	shortcuts: RuntimeProjectShortcut[];
 	commitPromptTemplate: string;
 	openPrPromptTemplate: string;
+	contextBudget?: RuntimeContextBudgetSave | null;
 }): RuntimeConfigState {
 	return {
 		globalConfigPath: input.globalConfigPath,
@@ -475,7 +629,18 @@ function createRuntimeConfigStateFromValues(input: {
 		openPrPromptTemplate: normalizePromptTemplate(input.openPrPromptTemplate, DEFAULT_OPEN_PR_PROMPT_TEMPLATE),
 		commitPromptTemplateDefault: DEFAULT_COMMIT_PROMPT_TEMPLATE,
 		openPrPromptTemplateDefault: DEFAULT_OPEN_PR_PROMPT_TEMPLATE,
+		contextBudget: normalizeContextBudget(input.contextBudget),
 	};
+}
+
+/**
+ * B-2.9: reads only the context budget from the global runtime config without
+ * the agent auto-selection side effects of loadGlobalRuntimeConfig, so it is
+ * safe to call on hot paths (per-session launch config resolution).
+ */
+export async function readGlobalRuntimeContextBudget(): Promise<RuntimeContextBudget | undefined> {
+	const globalConfig = await readRuntimeConfigFile<RuntimeGlobalConfigFileShape>(getRuntimeGlobalConfigPath());
+	return normalizeContextBudget(globalConfig?.contextBudget);
 }
 
 export function toGlobalRuntimeConfigState(current: RuntimeConfigState): RuntimeConfigState {
@@ -489,6 +654,7 @@ export function toGlobalRuntimeConfigState(current: RuntimeConfigState): Runtime
 		shortcuts: [],
 		commitPromptTemplate: current.commitPromptTemplate,
 		openPrPromptTemplate: current.openPrPromptTemplate,
+		contextBudget: current.contextBudget,
 	});
 }
 
@@ -524,8 +690,10 @@ export async function saveRuntimeConfig(
 		shortcuts: RuntimeProjectShortcut[];
 		commitPromptTemplate: string;
 		openPrPromptTemplate: string;
+		contextBudget?: RuntimeContextBudgetSave | null;
 	},
 ): Promise<RuntimeConfigState> {
+	validateContextBudget(config.contextBudget);
 	const { globalConfigPath, projectConfigPath } = resolveRuntimeConfigPaths(cwd);
 	return await lockedFileSystem.withLocks(getRuntimeConfigLockRequests(cwd), async () => {
 		await writeRuntimeGlobalConfigFile(globalConfigPath, {
@@ -535,6 +703,7 @@ export async function saveRuntimeConfig(
 			readyForReviewNotificationsEnabled: config.readyForReviewNotificationsEnabled,
 			commitPromptTemplate: config.commitPromptTemplate,
 			openPrPromptTemplate: config.openPrPromptTemplate,
+			contextBudget: config.contextBudget,
 		});
 		await writeRuntimeProjectConfigFile(projectConfigPath, { shortcuts: config.shortcuts });
 		return createRuntimeConfigStateFromValues({
@@ -547,17 +716,20 @@ export async function saveRuntimeConfig(
 			shortcuts: config.shortcuts,
 			commitPromptTemplate: config.commitPromptTemplate,
 			openPrPromptTemplate: config.openPrPromptTemplate,
+			contextBudget: config.contextBudget,
 		});
 	});
 }
 
 export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpdateInput): Promise<RuntimeConfigState> {
+	validateContextBudget(updates.contextBudget);
 	const { globalConfigPath, projectConfigPath } = resolveRuntimeConfigPaths(cwd);
 	return await lockedFileSystem.withLocks(getRuntimeConfigLockRequests(cwd), async () => {
 		const current = await loadRuntimeConfigLocked(cwd);
 		if (projectConfigPath === null && normalizeShortcuts(updates.shortcuts).length > 0) {
 			throw new Error("Cannot save project shortcuts without a selected project.");
 		}
+		const mergedContextBudget = mergeContextBudgetUpdates(current.contextBudget, updates.contextBudget);
 		const nextConfig = {
 			selectedAgentId: updates.selectedAgentId ?? current.selectedAgentId,
 			selectedShortcutLabel:
@@ -568,6 +740,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			shortcuts: projectConfigPath ? (updates.shortcuts ?? current.shortcuts) : current.shortcuts,
 			commitPromptTemplate: updates.commitPromptTemplate ?? current.commitPromptTemplate,
 			openPrPromptTemplate: updates.openPrPromptTemplate ?? current.openPrPromptTemplate,
+			contextBudget: mergedContextBudget === undefined ? current.contextBudget : mergedContextBudget,
 		};
 
 		const hasChanges =
@@ -577,7 +750,8 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			nextConfig.readyForReviewNotificationsEnabled !== current.readyForReviewNotificationsEnabled ||
 			nextConfig.commitPromptTemplate !== current.commitPromptTemplate ||
 			nextConfig.openPrPromptTemplate !== current.openPrPromptTemplate ||
-			!areRuntimeProjectShortcutsEqual(nextConfig.shortcuts, current.shortcuts);
+			!areRuntimeProjectShortcutsEqual(nextConfig.shortcuts, current.shortcuts) ||
+			!areRuntimeContextBudgetsEqual(nextConfig.contextBudget, current.contextBudget);
 
 		if (!hasChanges) {
 			return current;
@@ -590,6 +764,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			readyForReviewNotificationsEnabled: nextConfig.readyForReviewNotificationsEnabled,
 			commitPromptTemplate: nextConfig.commitPromptTemplate,
 			openPrPromptTemplate: nextConfig.openPrPromptTemplate,
+			contextBudget: updates.contextBudget === undefined ? undefined : mergedContextBudget,
 		});
 		await writeRuntimeProjectConfigFile(projectConfigPath, {
 			shortcuts: nextConfig.shortcuts,
@@ -604,6 +779,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			shortcuts: nextConfig.shortcuts,
 			commitPromptTemplate: nextConfig.commitPromptTemplate,
 			openPrPromptTemplate: nextConfig.openPrPromptTemplate,
+			contextBudget: nextConfig.contextBudget,
 		});
 	});
 }
@@ -612,6 +788,7 @@ export async function updateGlobalRuntimeConfig(
 	current: RuntimeConfigState,
 	updates: RuntimeConfigUpdateInput,
 ): Promise<RuntimeConfigState> {
+	validateContextBudget(updates.contextBudget);
 	const globalConfigPath = getRuntimeGlobalConfigPath();
 	return await lockedFileSystem.withLocks(
 		[
@@ -621,6 +798,7 @@ export async function updateGlobalRuntimeConfig(
 			},
 		],
 		async () => {
+			const mergedContextBudget = mergeContextBudgetUpdates(current.contextBudget, updates.contextBudget);
 			const nextConfig = {
 				selectedAgentId: updates.selectedAgentId ?? current.selectedAgentId,
 				selectedShortcutLabel:
@@ -633,6 +811,7 @@ export async function updateGlobalRuntimeConfig(
 				shortcuts: current.shortcuts,
 				commitPromptTemplate: updates.commitPromptTemplate ?? current.commitPromptTemplate,
 				openPrPromptTemplate: updates.openPrPromptTemplate ?? current.openPrPromptTemplate,
+				contextBudget: mergedContextBudget === undefined ? current.contextBudget : mergedContextBudget,
 			};
 
 			const hasChanges =
@@ -641,7 +820,8 @@ export async function updateGlobalRuntimeConfig(
 				nextConfig.agentAutonomousModeEnabled !== current.agentAutonomousModeEnabled ||
 				nextConfig.readyForReviewNotificationsEnabled !== current.readyForReviewNotificationsEnabled ||
 				nextConfig.commitPromptTemplate !== current.commitPromptTemplate ||
-				nextConfig.openPrPromptTemplate !== current.openPrPromptTemplate;
+				nextConfig.openPrPromptTemplate !== current.openPrPromptTemplate ||
+				!areRuntimeContextBudgetsEqual(nextConfig.contextBudget, current.contextBudget);
 
 			if (!hasChanges) {
 				return current;
@@ -654,6 +834,7 @@ export async function updateGlobalRuntimeConfig(
 				readyForReviewNotificationsEnabled: nextConfig.readyForReviewNotificationsEnabled,
 				commitPromptTemplate: nextConfig.commitPromptTemplate,
 				openPrPromptTemplate: nextConfig.openPrPromptTemplate,
+				contextBudget: updates.contextBudget === undefined ? undefined : mergedContextBudget,
 			});
 
 			return createRuntimeConfigStateFromValues({
@@ -666,6 +847,7 @@ export async function updateGlobalRuntimeConfig(
 				shortcuts: nextConfig.shortcuts,
 				commitPromptTemplate: nextConfig.commitPromptTemplate,
 				openPrPromptTemplate: nextConfig.openPrPromptTemplate,
+				contextBudget: nextConfig.contextBudget,
 			});
 		},
 	);

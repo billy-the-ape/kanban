@@ -30,6 +30,7 @@
 // label them as such.
 import { computeClineCompactionSafetyMarginTokens, estimateClineToolSchemaTokens } from "./cline-compaction-config";
 import { estimateTextTokens } from "./cline-context-budget";
+import { toPositiveTokenCount } from "./cline-context-policy";
 import type {
 	ClineSdkAgentBeforeModelContext,
 	ClineSdkAgentBeforeModelHook,
@@ -303,6 +304,13 @@ export interface CreateClineCompactionBeforeModelHookInput {
 	 * output reservation, per the B-2.3 double-count rule).
 	 */
 	outputReserveTokens: number;
+	/**
+	 * B-2.9: user-set safety margin in tokens. Wins over the computed margin
+	 * (fixed floor + proportional ratio); invalid/absent values fall back to
+	 * the computed margin so both this hook and the config calibration keep
+	 * using the same margin.
+	 */
+	safetyMarginTokens?: number;
 	logger?: ClineSdkBasicLogger;
 }
 
@@ -315,7 +323,10 @@ export function createClineCompactionBeforeModelHook(
 	input: CreateClineCompactionBeforeModelHookInput,
 ): ClineSdkAgentBeforeModelHook {
 	const { limitTokens, outputReserveTokens, logger } = input;
-	const safetyMarginTokens = computeClineCompactionSafetyMarginTokens(limitTokens);
+	// B-2.9: the user's context budget safety margin wins when set; the
+	// computed margin (fixed floor + proportional ratio) is the default.
+	const safetyMarginTokens =
+		toPositiveTokenCount(input.safetyMarginTokens) ?? computeClineCompactionSafetyMarginTokens(limitTokens);
 	const requestBudgetTokens = limitTokens - outputReserveTokens - safetyMarginTokens;
 
 	return function compactClineModelRequest(

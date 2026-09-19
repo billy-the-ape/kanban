@@ -10,6 +10,8 @@ import type {
 	RuntimeTaskClineSettings,
 } from "@/runtime/types";
 
+type ControllerState = ReturnType<typeof useRuntimeSettingsClineController>;
+
 const fetchClineProviderCatalogMock = vi.hoisted(() => vi.fn());
 const fetchClineProviderModelsMock = vi.hoisted(() => vi.fn());
 const addClineProviderMock = vi.hoisted(() => vi.fn());
@@ -49,11 +51,25 @@ interface HookSnapshot {
 	oauthConfigured: boolean;
 	oauthAccountId: string;
 	hasUnsavedChanges: boolean;
+	contextWindowOverrideTokens: string;
+	compactionStrategy: ControllerState["compactionStrategy"];
+	triggerThresholdRatio: string;
+	outputReserveTokens: string;
+	safetyMarginTokens: string;
+	contextBudgetError: string | null;
+	contextBudget: ControllerState["contextBudget"];
+	hasUnsavedContextBudgetChanges: boolean;
+	effectiveContextWindow: ControllerState["effectiveContextWindow"];
 	setProviderId: (value: string) => void;
 	setModelId: (value: string) => void;
 	setApiKey: (value: string) => void;
 	setBaseUrl: (value: string) => void;
 	setReasoningEffort: (value: string) => void;
+	setContextWindowOverrideTokens: (value: string) => void;
+	setCompactionStrategy: (value: ControllerState["compactionStrategy"]) => void;
+	setTriggerThresholdRatio: (value: string) => void;
+	setOutputReserveTokens: (value: string) => void;
+	setSafetyMarginTokens: (value: string) => void;
 	saveProviderSettings: (
 		overrides?: Parameters<ReturnType<typeof useRuntimeSettingsClineController>["saveProviderSettings"]>[0],
 	) => Promise<{ ok: boolean; message?: string }>;
@@ -105,6 +121,8 @@ function createRuntimeConfigResponse(
 		openPrPromptTemplate: "",
 		commitPromptTemplateDefault: "",
 		openPrPromptTemplateDefault: "",
+		contextBudget: null,
+		effectiveContextWindow: null,
 	};
 }
 
@@ -177,6 +195,15 @@ function HookHarness({
 			oauthConfigured: state.oauthConfigured,
 			oauthAccountId: state.oauthAccountId,
 			hasUnsavedChanges: state.hasUnsavedChanges,
+			contextWindowOverrideTokens: state.contextWindowOverrideTokens,
+			compactionStrategy: state.compactionStrategy,
+			triggerThresholdRatio: state.triggerThresholdRatio,
+			outputReserveTokens: state.outputReserveTokens,
+			safetyMarginTokens: state.safetyMarginTokens,
+			contextBudgetError: state.contextBudgetError,
+			contextBudget: state.contextBudget,
+			hasUnsavedContextBudgetChanges: state.hasUnsavedContextBudgetChanges,
+			effectiveContextWindow: state.effectiveContextWindow,
 			setProviderId: (value) => {
 				state.setProviderId(value);
 			},
@@ -191,6 +218,21 @@ function HookHarness({
 			},
 			setReasoningEffort: (value) => {
 				state.setReasoningEffort(value as RuntimeClineReasoningEffort | "");
+			},
+			setContextWindowOverrideTokens: (value) => {
+				state.setContextWindowOverrideTokens(value);
+			},
+			setCompactionStrategy: (value) => {
+				state.setCompactionStrategy(value);
+			},
+			setTriggerThresholdRatio: (value) => {
+				state.setTriggerThresholdRatio(value);
+			},
+			setOutputReserveTokens: (value) => {
+				state.setOutputReserveTokens(value);
+			},
+			setSafetyMarginTokens: (value) => {
+				state.setSafetyMarginTokens(value);
 			},
 			saveProviderSettings: state.saveProviderSettings,
 			refreshProviderModels: state.refreshProviderModels,
@@ -1413,5 +1455,110 @@ describe("useRuntimeSettingsClineController", () => {
 		expect(runClineProviderOauthLoginMock).not.toHaveBeenCalled();
 		expect(requireSnapshot(latestSnapshot).oauthConfigured).toBe(true);
 		expect(requireSnapshot(latestSnapshot).oauthAccountId).toBe("acct-device");
+	});
+
+	describe("B-2.9 — context budget drafts", () => {
+		async function renderBudgetHarness(config: RuntimeConfigResponse): Promise<{
+			latestSnapshot: () => HookSnapshot;
+		}> {
+			let latest: HookSnapshot | null = null;
+			await act(async () => {
+				root.render(
+					<HookHarness
+						open={true}
+						workspaceId={null}
+						selectedAgentId="cline"
+						config={config}
+						onSnapshot={(snapshot) => {
+							latest = snapshot;
+						}}
+					/>,
+				);
+				await flushAsyncWork();
+			});
+			return {
+				latestSnapshot: () => requireSnapshot(latest),
+			};
+		}
+
+		it("initializes the drafts from the stored budget and exposes the effective window", async () => {
+			const config: RuntimeConfigResponse = {
+				...createRuntimeConfigResponse(),
+				contextBudget: {
+					contextWindowOverrideTokens: 131_072,
+					compactionStrategy: "agentic",
+					triggerThresholdRatio: 0.75,
+					outputReserveTokens: 8_192,
+					safetyMarginTokens: 6_000,
+				},
+				effectiveContextWindow: { limitTokens: 131_072, source: "override" },
+			};
+			const { latestSnapshot } = await renderBudgetHarness(config);
+
+			const snapshot = latestSnapshot();
+			expect(snapshot.contextWindowOverrideTokens).toBe("131072");
+			expect(snapshot.compactionStrategy).toBe("agentic");
+			expect(snapshot.triggerThresholdRatio).toBe("0.75");
+			expect(snapshot.outputReserveTokens).toBe("8192");
+			expect(snapshot.safetyMarginTokens).toBe("6000");
+			expect(snapshot.contextBudgetError).toBeNull();
+			expect(snapshot.hasUnsavedContextBudgetChanges).toBe(false);
+			expect(snapshot.effectiveContextWindow).toEqual({ limitTokens: 131_072, source: "override" });
+		});
+
+		it("detects changes and maps empty drafts to null (clear-to-default) in the save payload", async () => {
+			const config: RuntimeConfigResponse = {
+				...createRuntimeConfigResponse(),
+				contextBudget: { contextWindowOverrideTokens: 131_072 },
+			};
+			const { latestSnapshot } = await renderBudgetHarness(config);
+
+			await act(async () => {
+				latestSnapshot().setContextWindowOverrideTokens("64000");
+			});
+			let snapshot = latestSnapshot();
+			expect(snapshot.hasUnsavedContextBudgetChanges).toBe(true);
+			expect(snapshot.contextBudget).toEqual({
+				contextWindowOverrideTokens: 64_000,
+				compactionStrategy: null,
+				triggerThresholdRatio: null,
+				outputReserveTokens: null,
+				safetyMarginTokens: null,
+			});
+
+			// Emptying the override maps to null (clear the stored value).
+			await act(async () => {
+				latestSnapshot().setContextWindowOverrideTokens("");
+			});
+			snapshot = latestSnapshot();
+			expect(snapshot.hasUnsavedContextBudgetChanges).toBe(true);
+			expect(snapshot.contextBudget?.contextWindowOverrideTokens).toBeNull();
+		});
+
+		it("flags an invalid draft as an error and suppresses the save payload", async () => {
+			const config: RuntimeConfigResponse = {
+				...createRuntimeConfigResponse(),
+				contextBudget: null,
+			};
+			const { latestSnapshot } = await renderBudgetHarness(config);
+
+			await act(async () => {
+				latestSnapshot().setTriggerThresholdRatio("1.5");
+			});
+			let snapshot = latestSnapshot();
+			expect(snapshot.contextBudgetError).toBe(
+				"Compaction trigger threshold must be a number between 0 and 1 (exclusive of 0).",
+			);
+			expect(snapshot.contextBudget).toBeUndefined();
+			expect(snapshot.hasUnsavedContextBudgetChanges).toBe(false);
+
+			await act(async () => {
+				latestSnapshot().setTriggerThresholdRatio("0.9");
+				latestSnapshot().setSafetyMarginTokens("not-a-number");
+			});
+			snapshot = latestSnapshot();
+			expect(snapshot.contextBudgetError).toBe("Safety margin must be a positive integer token count.");
+			expect(snapshot.contextBudget).toBeUndefined();
+		});
 	});
 });

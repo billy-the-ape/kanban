@@ -298,4 +298,61 @@ describe("service restart with a persisted session (B-1.7)", () => {
 			rmSync(logDir, { recursive: true, force: true });
 		}
 	});
+
+	it("logs the global context budget override as the effective limit (B-2.9)", async () => {
+		const harness = createTaskSessionServiceHarness();
+		services.push(harness);
+		const { service, host } = harness;
+
+		const logDir = mkdtempSync(join(tmpdir(), "kanban-b2-9-logs-"));
+		const logPath = join(logDir, "kanban.log");
+		const previousEnabled = process.env.CLINE_LOG_ENABLED;
+		const previousPath = process.env.CLINE_LOG_PATH;
+		process.env.CLINE_LOG_ENABLED = "1";
+		process.env.CLINE_LOG_PATH = logPath;
+		try {
+			// resolveLaunchConfig with a global context budget override
+			// (verified in provider-model-context-window.test.ts) produces this
+			// request shape: the budget value + source "override", capping the
+			// model below its served limit.
+			await service.startTaskSession({
+				taskId: RESTART_TASK_ID,
+				cwd: "/tmp/worktree",
+				prompt: "Context budget override turn",
+				systemPrompt: "test system prompt",
+				providerId: "litellm",
+				modelId: "qwen3-32b",
+				contextWindowTokens: 64_000,
+				contextWindowSource: "override",
+			});
+			await vi.waitFor(() => {
+				expect(host.startedConfigs.length).toBe(1);
+			});
+
+			const raw = readFileSync(logPath, "utf8");
+			const lines = raw
+				.split("\n")
+				.filter((line) => line.trim().length > 0)
+				.map((line) => JSON.parse(line) as { message: string; metadata?: Record<string, unknown> });
+			const startLines = lines.filter(
+				(entry) => entry.message === "Cline session start: effective context metadata",
+			);
+			expect(startLines.length).toBe(1);
+			const metadata = startLines[0]?.metadata ?? {};
+			expect(metadata.contextLimitTokens).toBe(64_000);
+			expect(metadata.contextLimitSource).toBe("override");
+		} finally {
+			if (previousEnabled === undefined) {
+				delete process.env.CLINE_LOG_ENABLED;
+			} else {
+				process.env.CLINE_LOG_ENABLED = previousEnabled;
+			}
+			if (previousPath === undefined) {
+				delete process.env.CLINE_LOG_PATH;
+			} else {
+				process.env.CLINE_LOG_PATH = previousPath;
+			}
+			rmSync(logDir, { recursive: true, force: true });
+		}
+	});
 });

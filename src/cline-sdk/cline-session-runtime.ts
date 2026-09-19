@@ -119,6 +119,12 @@ export interface StartClineSessionRuntimeRequest {
 	contextWindowSource?: ContextLimitSource;
 	/** B-2.4: explicit SDK compaction config (window, threshold, reserve, local summarizer). */
 	compaction?: ClineCompactionConfig;
+	/**
+	 * B-2.9: user-set safety margin (tokens) from the global context budget.
+	 * Wins over the computed margin in both the config calibration and the
+	 * beforeModel compaction hook; absent falls back to the computed margin.
+	 */
+	compactionSafetyMarginTokens?: number;
 }
 
 export interface StartClineSessionRuntimeResult {
@@ -241,6 +247,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			contextWindowTokens: request.contextWindowTokens,
 			contextWindowSource: request.contextWindowSource,
 			compaction: request.compaction,
+			compactionSafetyMarginTokens: request.compactionSafetyMarginTokens,
 		});
 		this.bindTaskSession(request.taskId, requestedSessionId);
 
@@ -299,6 +306,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 				systemPrompt: request.systemPrompt,
 				providerId: request.providerId,
 				extraTools: hasMcpExtraTools ? (mcpToolBundle?.tools ?? []) : [],
+				safetyMarginTokens: request.compactionSafetyMarginTokens,
 			});
 			effectiveCompaction = calibration.config;
 			if (calibration.breakdown) {
@@ -338,6 +346,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 				beforeModel: createClineCompactionBeforeModelHook({
 					limitTokens: request.compaction.contextWindowTokens,
 					outputReserveTokens: request.compaction.reserveTokens ?? CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT,
+					safetyMarginTokens: request.compactionSafetyMarginTokens,
 					logger: sessionLogger,
 				}),
 				afterTool: createClineToolResultBoundingHook({
@@ -506,6 +515,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			contextWindowTokens: launchConfig.contextWindowTokens,
 			contextWindowSource: launchConfig.contextWindowSource,
 			compaction: buildClineCompactionConfig({ launchConfig }),
+			compactionSafetyMarginTokens: launchConfig.compactionSettings?.safetyMarginTokens,
 		};
 	}
 

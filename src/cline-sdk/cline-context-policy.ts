@@ -21,8 +21,9 @@ export interface EffectiveContextLimit {
 }
 
 // Only positive integers count as "known". Zero, negative, fractional, or
-// non-numeric values are treated as unknown — never as "unlimited".
-function toPositiveTokenCount(value: number | null | undefined): number | null {
+// non-numeric values are treated as unknown — never as "unlimited". B-2.9
+// reuses this for user-supplied context budget token fields.
+export function toPositiveTokenCount(value: number | null | undefined): number | null {
 	if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
 		return null;
 	}
@@ -48,4 +49,18 @@ export function resolveEffectiveContextLimit(input: {
 	// The 262k figure in B-2.md is a reported operational ceiling and is never
 	// used as the fallback.
 	return { limitTokens: CONTEXT_LIMIT_FALLBACK_TOKENS, source: "fallback" };
+}
+
+/**
+ * B-2.9: tier-0 context budget override from the user's global context
+ * budget settings. Unlike the persisted provider-settings override (which is
+ * reconciled against provider metadata by the most-restrictive rule), the
+ * user's explicit budget wins outright over every other tier.
+ * Returns null when no positive-integer override is set.
+ */
+export function resolveContextBudgetOverride(
+	budgetOverrideTokens: number | null | undefined,
+): EffectiveContextLimit | null {
+	const limitTokens = toPositiveTokenCount(budgetOverrideTokens);
+	return limitTokens === null ? null : { limitTokens, source: "override" };
 }

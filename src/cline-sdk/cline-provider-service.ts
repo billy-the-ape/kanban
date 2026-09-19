@@ -3,6 +3,7 @@
 // config without leaking SDK details into runtime-api.ts or the UI.
 
 import { z } from "zod";
+import { readGlobalRuntimeContextBudget } from "../config/runtime-config";
 import type {
 	RuntimeClineAccountBalanceResponse,
 	RuntimeClineAccountOrganizationsResponse,
@@ -19,9 +20,16 @@ import type {
 	RuntimeClineProviderSettings,
 	RuntimeClineProviderSettingsSaveResponse,
 	RuntimeClineReasoningEffort,
+	RuntimeContextBudget,
+	RuntimeEffectiveContextWindow,
 } from "../core/api-contract";
 import { openInBrowser } from "../server/browser";
-import { type ContextLimitSource, resolveEffectiveContextLimit } from "./cline-context-policy";
+import type { ClineCompactionSettings } from "./cline-compaction-config";
+import {
+	type ContextLimitSource,
+	resolveContextBudgetOverride,
+	resolveEffectiveContextLimit,
+} from "./cline-context-policy";
 import { createKanbanClineLogger } from "./cline-runtime-logger";
 import {
 	addSdkCustomProvider,
@@ -112,6 +120,12 @@ export interface ResolvedClineLaunchConfig {
 	 * provider does not report them (the builder falls back to a default).
 	 */
 	maxTokens: number | null;
+	/**
+	 * B-2.9: compaction fields from the user's global context budget
+	 * (strategy, trigger threshold, output reserve, safety margin). Absent
+	 * when the budget is unset — the builder's documented defaults apply.
+	 */
+	compactionSettings?: ClineCompactionSettings;
 }
 
 export interface AddCustomClineProviderInput {
@@ -544,6 +558,34 @@ async function refreshManagedOauthSettings(
 	};
 }
 
+/**
+ * B-2.9: maps the global runtime context budget's compaction fields onto the
+ * SDK-facing launch-config settings. `undefined` means "no budget configured"
+ * — the compaction builder's documented defaults apply. Field names mirror
+ * CoreCompactionConfig (strategy / thresholdRatio / reserveTokens).
+ */
+function toClineCompactionSettings(
+	budget: RuntimeContextBudget | null | undefined,
+): ClineCompactionSettings | undefined {
+	if (!budget) {
+		return undefined;
+	}
+	const settings: ClineCompactionSettings = {};
+	if (budget.compactionStrategy !== undefined) {
+		settings.strategy = budget.compactionStrategy;
+	}
+	if (budget.triggerThresholdRatio !== undefined) {
+		settings.thresholdRatio = budget.triggerThresholdRatio;
+	}
+	if (budget.outputReserveTokens !== undefined) {
+		settings.reserveTokens = budget.outputReserveTokens;
+	}
+	if (budget.safetyMarginTokens !== undefined) {
+		settings.safetyMarginTokens = budget.safetyMarginTokens;
+	}
+	return Object.keys(settings).length > 0 ? settings : undefined;
+}
+
 export function createClineProviderService() {
 	const getProviderSettingsSummary = (): RuntimeClineProviderSettings =>
 		toProviderSettingsSummary(getSelectedProviderSettings());
@@ -950,11 +992,19 @@ export function createClineProviderService() {
 			// provider-metadata tier (model list); the documented conservative
 			// fallback applies when neither tier is known. B-2.4: the same single
 			// lookup also supplies maxTokens for the compaction reserve.
+			// B-2.9: tier 0 of the resolution — the user's global context budget
+			// override wins outright over every other tier (read from the global
+			// runtime config without the agent auto-selection side effects of a
+			// full config load).
 			const modelCapacity = await fetchProviderModelCapacity(normalizedProviderId, modelId);
-			const effectiveContextLimit = resolveEffectiveContextLimit({
-				overrideTokens: resolvedSettings.contextWindow ?? null,
-				metadataTokens: modelCapacity.contextWindowTokens,
-			});
+			const contextBudget = await readGlobalRuntimeContextBudget();
+			const budgetOverride = resolveContextBudgetOverride(contextBudget?.contextWindowOverrideTokens);
+			const effectiveContextLimit =
+				budgetOverride ??
+				resolveEffectiveContextLimit({
+					overrideTokens: resolvedSettings.contextWindow ?? null,
+					metadataTokens: modelCapacity.contextWindowTokens,
+				});
 			return {
 				providerId: normalizedProviderId,
 				modelId,
@@ -967,6 +1017,7 @@ export function createClineProviderService() {
 				contextWindowTokens: effectiveContextLimit.limitTokens,
 				contextWindowSource: effectiveContextLimit.source,
 				maxTokens: modelCapacity.maxTokens,
+				compactionSettings: toClineCompactionSettings(contextBudget),
 			};
 		},
 
@@ -1048,6 +1099,39 @@ export function createClineProviderService() {
 		// input for the context-limit resolver, not a launch requirement.
 		getProviderModelContextWindow(providerId: string, modelId: string | null): Promise<number | null> {
 			return fetchProviderModelCapacity(providerId, modelId).then((capacity) => capacity.contextWindowTokens);
+		},
+
+		/**
+		 * B-2.9: the effective context window for the currently selected
+		 * provider and model, including the tier-0 global context budget
+		 * override. Feeds the runtime config response so the settings UI can
+		 * display the limit the resolver will actually apply at session
+		 * start. Mirrors resolveLaunchConfig's resolution (the selected
+		 * provider falls back to the SDK default provider, and unknown model
+		 * capacity resolves to the documented fallback). Shares the short
+		 * capacity cache with resolveLaunchConfig and never throws.
+		 */
+		async resolveEffectiveContextWindow(
+			budgetOverrideTokens?: number | null,
+		): Promise<RuntimeEffectiveContextWindow | null> {
+			const budgetOverride = resolveContextBudgetOverride(budgetOverrideTokens);
+			if (budgetOverride) {
+				return budgetOverride;
+			}
+			const selectedSettings = getSelectedProviderSettings();
+			if (!selectedSettings) {
+				return null;
+			}
+			const normalizedProviderId = selectedSettings.provider.trim().toLowerCase();
+			if (!normalizedProviderId) {
+				return null;
+			}
+			const modelId = selectedSettings.model?.trim() ?? "";
+			const modelCapacity = await fetchProviderModelCapacity(normalizedProviderId, modelId);
+			return resolveEffectiveContextLimit({
+				overrideTokens: selectedSettings.contextWindow ?? null,
+				metadataTokens: modelCapacity.contextWindowTokens,
+			});
 		},
 
 		async addCustomProvider(input: AddCustomClineProviderInput): Promise<RuntimeClineProviderSettings> {

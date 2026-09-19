@@ -150,4 +150,54 @@ describe("buildRuntimeConfigResponse", () => {
 		});
 		expect(response.debugModeEnabled).toBe(true);
 	});
+
+	it("surfaces the stored context budget and caller-computed effective window (B-2.9)", () => {
+		const config = createRuntimeConfigState({
+			contextBudget: {
+				contextWindowOverrideTokens: 131_072,
+				compactionStrategy: "agentic",
+			},
+		});
+
+		const response = buildRuntimeConfigResponse(
+			config,
+			{
+				providerId: "litellm",
+				modelId: "qwen3-32b",
+				baseUrl: "http://127.0.0.1:4000",
+				apiKeyConfigured: true,
+				oauthProvider: null,
+				oauthAccessTokenConfigured: false,
+				oauthRefreshTokenConfigured: false,
+				oauthAccountId: null,
+				oauthExpiresAt: null,
+			},
+			{
+				effectiveContextWindow: { limitTokens: 131_072, source: "override" },
+			},
+		);
+
+		expect(response.contextBudget).toEqual({
+			contextWindowOverrideTokens: 131_072,
+			compactionStrategy: "agentic",
+		});
+		expect(response.effectiveContextWindow).toEqual({ limitTokens: 131_072, source: "override" });
+	});
+
+	it("defaults the context budget fields to null when unset", () => {
+		const response = buildRuntimeConfigResponse(createRuntimeConfigState(), {
+			providerId: null,
+			modelId: null,
+			baseUrl: null,
+			apiKeyConfigured: false,
+			oauthProvider: null,
+			oauthAccessTokenConfigured: false,
+			oauthRefreshTokenConfigured: false,
+			oauthAccountId: null,
+			oauthExpiresAt: null,
+		});
+
+		expect(response.contextBudget).toBeNull();
+		expect(response.effectiveContextWindow).toBeNull();
+	});
 });

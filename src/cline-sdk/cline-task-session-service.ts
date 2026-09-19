@@ -83,6 +83,11 @@ export interface StartClineTaskSessionRequest {
 	contextWindowSource?: ContextLimitSource;
 	/** B-2.4: explicit SDK compaction config built from the resolved launch config. */
 	compaction?: ClineCompactionConfig;
+	/**
+	 * B-2.9: user-set safety margin (tokens) from the global context budget;
+	 * forwarded to the session runtime for calibration + beforeModel hook.
+	 */
+	compactionSafetyMarginTokens?: number;
 }
 
 export interface ClineTaskSessionService {
@@ -450,6 +455,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					contextWindowTokens: request.contextWindowTokens,
 					contextWindowSource: request.contextWindowSource,
 					compaction: request.compaction,
+					compactionSafetyMarginTokens: request.compactionSafetyMarginTokens,
 				});
 				const warningMessage = formatStartWarnings(startResult.warnings);
 				if (warningMessage) {

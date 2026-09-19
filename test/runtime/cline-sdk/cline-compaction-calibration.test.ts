@@ -135,3 +135,49 @@ describe("B-2.5 — compaction calibration math", () => {
 		expect(breakdown?.reserveTokens).toBe(CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT + 4_096);
 	});
 });
+
+describe("B-2.9 — calibration safety margin override", () => {
+	const systemPrompt = "x".repeat(4_000); // 1,000 estimated tokens
+
+	it("uses the user-set margin instead of the computed one", () => {
+		// limit 32_768: computed margin is the 4_096 floor (10% = 3_276.8).
+		const { breakdown } = calibrateClineCompactionConfig({
+			config: makeConfig(),
+			systemPrompt,
+			providerId: "openrouter",
+			extraTools: [],
+			safetyMarginTokens: 1_000,
+		});
+		const b = breakdown as NonNullable<typeof breakdown>;
+		expect(b.safetyMarginTokens).toBe(1_000);
+		expect(b.reserveTokens).toBe(4_096 + 1_000);
+		expect(b.triggerTokens).toBe(b.contextWindowTokens - b.reserveTokens);
+	});
+
+	it("applies a larger user-set margin to both the reserve and the trigger", () => {
+		const { breakdown } = calibrateClineCompactionConfig({
+			config: makeConfig(),
+			systemPrompt,
+			providerId: "openrouter",
+			extraTools: [],
+			safetyMarginTokens: 8_000,
+		});
+		const b = breakdown as NonNullable<typeof breakdown>;
+		expect(b.safetyMarginTokens).toBe(8_000);
+		expect(b.reserveTokens).toBe(4_096 + 8_000);
+	});
+
+	it.each([[0], [-1], [Number.NaN], [1.5]] as const)(
+		"falls back to the computed margin for an invalid override (%s)",
+		(margin) => {
+			const { breakdown } = calibrateClineCompactionConfig({
+				config: makeConfig(),
+				systemPrompt,
+				providerId: "openrouter",
+				extraTools: [],
+				safetyMarginTokens: margin,
+			});
+			expect(breakdown?.safetyMarginTokens).toBe(computeClineCompactionSafetyMarginTokens(32_768));
+		},
+	);
+});

@@ -42,6 +42,7 @@
 // left in place for upstream parity.
 
 import { estimateTextTokens } from "./cline-context-budget";
+import { toPositiveTokenCount } from "./cline-context-policy";
 import type { ResolvedClineLaunchConfig } from "./cline-provider-service";
 import { SDK_DEFAULT_MODEL_ID } from "./sdk-provider-boundary";
 import {
@@ -67,34 +68,50 @@ export const CLINE_COMPACTION_SUMMARY_MAX_OUTPUT_TOKENS = 1_024;
 export type ClineCompactionConfig = Omit<ClineSdkCompactionConfig, "compact">;
 
 /**
- * Kanban-level compaction overrides. B-2-9 will surface a persisted strategy
- * choice here; until then only the default ("basic") applies.
+ * Kanban-level compaction overrides. B-2.9: resolved from the user's global
+ * context budget settings (runtimeConfig.contextBudget) and carried on the
+ * launch config, so every session start picks up the persisted strategy,
+ * trigger threshold, output reserve, and safety margin. Field names mirror
+ * `CoreCompactionConfig` (strategy / thresholdRatio / reserveTokens);
+ * safetyMarginTokens has no SDK field and only feeds the Kanban-side
+ * calibration and beforeModel hook. Explicit per-call `settings` win over
+ * these.
  */
 export interface ClineCompactionSettings {
 	strategy?: ClineSdkCompactionStrategy;
+	/** Compaction trigger as a fraction of the effective context window (0, 1]. */
+	thresholdRatio?: number;
+	/** Output reserve in tokens. */
+	reserveTokens?: number;
+	/** Safety margin in tokens (compaction trigger budget headroom). */
+	safetyMarginTokens?: number;
 }
 
 export interface BuildClineCompactionConfigInput {
 	/**
 	 * B-2.2 resolved launch config. Carries the effective context limit
-	 * (`contextWindowTokens`), max output tokens (`maxTokens`), and the local
+	 * (`contextWindowTokens`), max output tokens (`maxTokens`), the context
+	 * budget compaction settings (B-2.9, `compactionSettings`), and the local
 	 * provider credentials for the summarizer.
 	 */
 	launchConfig: ResolvedClineLaunchConfig;
-	/** Optional Kanban-level overrides (defaults until B-2-9 persists settings). */
+	/** Optional per-call overrides that win over the launch-config budget. */
 	settings?: ClineCompactionSettings;
 }
 
 export function buildClineCompactionConfig(input: BuildClineCompactionConfigInput): ClineCompactionConfig {
-	const { launchConfig, settings } = input;
+	const { launchConfig } = input;
+	// B-2.9: the global context budget (resolved on the launch config) feeds
+	// strategy / threshold / reserve; explicit per-call settings win.
+	const settings: ClineCompactionSettings = { ...launchConfig.compactionSettings, ...input.settings };
 	const apiKey = launchConfig.apiKey?.trim() ?? "";
 	const baseUrl = launchConfig.baseUrl?.trim() ?? "";
 	return {
 		enabled: true,
 		contextWindowTokens: launchConfig.contextWindowTokens,
-		strategy: settings?.strategy ?? "basic",
-		thresholdRatio: CLINE_COMPACTION_THRESHOLD_RATIO,
-		reserveTokens: launchConfig.maxTokens ?? CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT,
+		strategy: settings.strategy ?? "basic",
+		thresholdRatio: settings.thresholdRatio ?? CLINE_COMPACTION_THRESHOLD_RATIO,
+		reserveTokens: settings.reserveTokens ?? launchConfig.maxTokens ?? CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT,
 		preserveRecentTokens: CLINE_COMPACTION_PRESERVE_RECENT_TOKENS,
 		summarizer: {
 			// Same local provider and model as the session itself: normalization
@@ -232,6 +249,12 @@ export interface CalibrateClineCompactionConfigInput {
 	providerId?: string;
 	/** Kanban MCP tools added to the SDK's built-in tool set. */
 	extraTools?: readonly ClineCompactionToolSchema[];
+	/**
+	 * B-2.9: user-set safety margin in tokens. Wins over the computed margin
+	 * (fixed floor + proportional ratio); invalid/absent values fall back to
+	 * the computed margin.
+	 */
+	safetyMarginTokens?: number;
 }
 
 export interface ClineCompactionCalibrationResult {
@@ -262,7 +285,10 @@ export function calibrateClineCompactionConfig(
 
 	const systemPromptTokens = estimateClineSystemPromptTokens(input.systemPrompt, input.providerId ?? "");
 	const toolSchemaTokens = CLINE_BUILTIN_TOOLS_ESTIMATED_TOKENS + estimateClineToolSchemaTokens(input.extraTools);
-	const safetyMarginTokens = computeClineCompactionSafetyMarginTokens(limit);
+	// B-2.9: the user's context budget safety margin wins when set; the
+	// computed margin (fixed floor + proportional ratio) is the default.
+	const safetyMarginTokens =
+		toPositiveTokenCount(input.safetyMarginTokens) ?? computeClineCompactionSafetyMarginTokens(limit);
 	const contextWindowTokens = Math.max(
 		CLINE_COMPACTION_MIN_CALIBRATED_WINDOW_TOKENS,
 		limit - systemPromptTokens - toolSchemaTokens,

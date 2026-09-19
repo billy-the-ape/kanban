@@ -8,6 +8,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	CONTEXT_LIMIT_FALLBACK_TOKENS,
+	resolveContextBudgetOverride,
 	resolveEffectiveContextLimit,
 } from "../../../src/cline-sdk/cline-context-policy";
 
@@ -92,4 +93,22 @@ describe("resolveEffectiveContextLimit", () => {
 			source: "fallback",
 		});
 	});
+});
+
+describe("resolveContextBudgetOverride (B-2.9 tier 0)", () => {
+	it("returns an override-sourced limit for a positive integer budget override", () => {
+		expect(resolveContextBudgetOverride(131_072)).toEqual({ limitTokens: 131_072, source: "override" });
+	});
+
+	it("returns null when no budget override is set", () => {
+		expect(resolveContextBudgetOverride(null)).toBeNull();
+		expect(resolveContextBudgetOverride(undefined)).toBeNull();
+	});
+
+	it.each([[0], [-5], [1.5], [Number.POSITIVE_INFINITY], [Number.NaN]] as const)(
+		"treats an invalid budget override (%s) as unset",
+		(value) => {
+			expect(resolveContextBudgetOverride(value)).toBeNull();
+		},
+	);
 });

@@ -178,3 +178,59 @@ describe("B-2.5 — createClineCompactionBeforeModelHook", () => {
 		expect(await hook(context)).toBeUndefined();
 	});
 });
+
+describe("B-2.9 — beforeModel hook safety margin override", () => {
+	const limit = 6_000;
+	const outputReserve = 500;
+	// 16 messages x 200 estimated tokens = 3_200 tokens of conversation.
+	function makeOversizedMessages(): ClineSdkAgentMessage[] {
+		const messages: ClineSdkAgentMessage[] = [];
+		for (let i = 0; i < 8; i += 1) {
+			messages.push(agentMessage("user", [sizedTextPart(200)]));
+			messages.push(agentMessage("assistant", [sizedTextPart(200)]));
+		}
+		return messages;
+	}
+
+	it("uses the user-set margin instead of the computed one when it is smaller", async () => {
+		// margin 100 → request budget 6_000 - 500 - 100 = 5_400 > 3_200: fits.
+		// The computed margin (4_096) would give a budget of only 1_404 and
+		// would have rewritten the request.
+		const hook = createClineCompactionBeforeModelHook({
+			limitTokens: limit,
+			outputReserveTokens: outputReserve,
+			safetyMarginTokens: 100,
+		});
+		const context = makeRequest(makeOversizedMessages(), { systemPrompt: "system", tools: [] });
+		expect(await hook(context)).toBeUndefined();
+	});
+
+	it("compacts earlier when the user-set margin is larger than the computed one", async () => {
+		// margin 5_000 → request budget 6_000 - 500 - 5_000 = 500 < 3_200.
+		const hook = createClineCompactionBeforeModelHook({
+			limitTokens: limit,
+			outputReserveTokens: outputReserve,
+			safetyMarginTokens: 5_000,
+		});
+		const messages = makeOversizedMessages();
+		const context = makeRequest(messages, { systemPrompt: "system", tools: [] });
+		const result = await hook(context);
+		expect(result).toBeDefined();
+		expect(result?.messages?.length ?? 0).toBeLessThan(messages.length);
+	});
+
+	it.each([[0], [-1], [Number.NaN]] as const)(
+		"falls back to the computed margin for an invalid override (%s)",
+		async (margin) => {
+			// Invalid margin → computed 4_096 → request budget 1_404 < 3_200:
+			// the same oversized request is rewritten.
+			const hook = createClineCompactionBeforeModelHook({
+				limitTokens: limit,
+				outputReserveTokens: outputReserve,
+				safetyMarginTokens: margin,
+			});
+			const context = makeRequest(makeOversizedMessages(), { systemPrompt: "system", tools: [] });
+			expect(await hook(context)).toBeDefined();
+		},
+	);
+});
