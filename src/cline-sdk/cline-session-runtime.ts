@@ -5,7 +5,11 @@ import type { RuntimeClineReasoningEffort, RuntimeTaskImage, RuntimeTaskSessionM
 import { createClineCompactionBeforeModelHook } from "./cline-compaction-before-model-hook";
 import { createClineCompactionCompactCallback } from "./cline-compaction-callback";
 import type { ClineCompactionConfig } from "./cline-compaction-config";
-import { CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT, calibrateClineCompactionConfig } from "./cline-compaction-config";
+import {
+	buildClineCompactionConfig,
+	CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT,
+	calibrateClineCompactionConfig,
+} from "./cline-compaction-config";
 import type { ContextLimitSource } from "./cline-context-policy";
 import { extractClineSessionId } from "./cline-event-adapter";
 import {
@@ -13,6 +17,7 @@ import {
 	type ClineMcpToolBundle,
 	createClineMcpRuntimeService,
 } from "./cline-mcp-runtime-service";
+import type { ResolvedClineLaunchConfig } from "./cline-provider-service";
 import { createKanbanClineLogger } from "./cline-runtime-logger";
 import { buildSessionIdPrefix, createSessionId } from "./cline-session-state";
 import { createClineToolResultBoundingHook } from "./cline-tool-result-bounding-hook";
@@ -154,10 +159,27 @@ export interface ClineSessionRuntime {
 	dispose(): Promise<void>;
 }
 
+/**
+ * B-2.8: re-resolves the launch config for a restart. The provider and model
+ * are pinned to the saved start request so the conversation continues with
+ * the same model; credentials, context limit, and compaction policy come
+ * from the provider settings in force at restart time.
+ */
+export type ClineLaunchConfigResolver = (overrides: {
+	providerIdOverride?: string;
+	modelIdOverride?: string;
+}) => Promise<ResolvedClineLaunchConfig>;
+
 export interface CreateInMemoryClineSessionRuntimeOptions {
 	onTaskEvent?: (taskId: string, event: unknown) => void;
 	createSessionHost?: () => Promise<ClineSessionHostBoundary>;
 	createMcpRuntimeService?: () => ClineMcpRuntimeService;
+	/**
+	 * B-2.8: on restart, re-resolve the launch config (credentials, context
+	 * limit, compaction policy) instead of replaying the start-time snapshot.
+	 * When omitted, restart replays the stored request unchanged.
+	 */
+	resolveClineLaunchConfig?: ClineLaunchConfigResolver;
 }
 
 // Best-effort: write the Kanban task title to the SDK session metadata so external session
@@ -188,16 +210,19 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		Omit<StartClineSessionRuntimeRequest, "prompt" | "images" | "initialMessages">
 	>();
 	private readonly mcpToolBundleByTaskId = new Map<string, ClineMcpToolBundle>();
+	private readonly resolveClineLaunchConfig: ClineLaunchConfigResolver | null;
 	private sessionHostPromise: Promise<ClineSessionHostBoundary> | null = null;
 
 	constructor(options: CreateInMemoryClineSessionRuntimeOptions = {}) {
 		this.onTaskEvent = options.onTaskEvent ?? null;
 		this.createSessionHost = options.createSessionHost ?? createClineSdkSessionHost;
+		this.resolveClineLaunchConfig = options.resolveClineLaunchConfig ?? null;
 		const createMcpRuntimeService = options.createMcpRuntimeService ?? createClineMcpRuntimeService;
 		this.clineMcpRuntimeService = createMcpRuntimeService();
 	}
 
 	async startTaskSession(request: StartClineSessionRuntimeRequest): Promise<StartClineSessionRuntimeResult> {
+		this.assertSingleActiveClineSession(request.taskId);
 		const requestedSessionId = createSessionId(request.taskId);
 		const resolvedMode: RuntimeTaskSessionMode = request.mode ?? "act";
 		this.lastStartRequestByTaskId.set(request.taskId, {
@@ -264,6 +289,9 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		// resolved system prompt and the MCP tool bundle only exist at this
 		// point. The captured start request keeps the UNCALIBRATED config, so
 		// restarts re-derive the same calibration instead of double-subtracting.
+		// B-2.8: restarts first re-resolve the uncalibrated config from the
+		// current launch config (resolveClineLaunchConfig) when a resolver is
+		// wired in, then this calibration runs again on the fresh config.
 		let effectiveCompaction = request.compaction;
 		if (request.compaction) {
 			const calibration = calibrateClineCompactionConfig({
@@ -405,6 +433,28 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		};
 	}
 
+	/**
+	 * B-2.8 single-worker guard: at most one live Cline session per workspace
+	 * runtime — the default target workflow runs a single model worker
+	 * (typically a local model), and concurrent sessions would overload it.
+	 * The check is race-free: startTaskSession binds the requested session
+	 * synchronously before its first await, so overlapping starts for distinct
+	 * tasks can never both pass. A blocked start runs before any state write,
+	 * so it leaves no orphaned bindings or start-request snapshots.
+	 * Same-task starts (replace / resume-from-trash) are unaffected. Queuing
+	 * or parallel scheduling is B-11.
+	 */
+	private assertSingleActiveClineSession(requestTaskId: string): void {
+		for (const [taskId] of this.sessionIdByTaskId) {
+			if (taskId !== requestTaskId) {
+				throw new Error(
+					`Another Cline session is already active (task "${taskId}"). ` +
+						`Cline sessions run one at a time by default: stop that session before starting this one.`,
+				);
+			}
+		}
+	}
+
 	async restartTaskSession(input: {
 		taskId: string;
 		prompt: string;
@@ -416,14 +466,47 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		if (!lastStartRequest) {
 			throw new Error(`No previous Cline session config is available for task ${input.taskId}.`);
 		}
+		const launchPolicy = await this.resolveRestartedLaunchPolicy(lastStartRequest);
 
 		return await this.startTaskSession({
 			...lastStartRequest,
+			...launchPolicy,
 			prompt: input.prompt,
 			initialMessages: input.initialMessages,
 			images: input.images,
 			mode: input.mode ?? lastStartRequest.mode,
 		});
+	}
+
+	/**
+	 * B-2.8: restarts re-resolve the launch policy from the current provider
+	 * settings instead of cache-and-replay of the start-time snapshot —
+	 * credentials may have rotated (OAuth refresh) and the context limit +
+	 * compaction config must reflect the settings in force at restart time.
+	 * The provider and model stay pinned to the saved request so the
+	 * conversation continues with the same model. Without a resolver the
+	 * stored snapshot is replayed unchanged (unit tests, embedded hosts).
+	 */
+	private async resolveRestartedLaunchPolicy(
+		lastStartRequest: Omit<StartClineSessionRuntimeRequest, "prompt" | "images" | "initialMessages">,
+	): Promise<Partial<StartClineSessionRuntimeRequest>> {
+		if (!this.resolveClineLaunchConfig) {
+			return {};
+		}
+		const launchConfig = await this.resolveClineLaunchConfig({
+			providerIdOverride: lastStartRequest.providerId,
+			modelIdOverride: lastStartRequest.modelId ?? undefined,
+		});
+		return {
+			providerId: launchConfig.providerId,
+			modelId: launchConfig.modelId ?? lastStartRequest.modelId,
+			apiKey: launchConfig.apiKey,
+			baseUrl: launchConfig.baseUrl,
+			reasoningEffort: launchConfig.reasoningEffort ?? lastStartRequest.reasoningEffort,
+			contextWindowTokens: launchConfig.contextWindowTokens,
+			contextWindowSource: launchConfig.contextWindowSource,
+			compaction: buildClineCompactionConfig({ launchConfig }),
+		};
 	}
 
 	async sendTaskSessionInput(

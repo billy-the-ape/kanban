@@ -26,6 +26,7 @@ import {
 } from "./cline-message-repository";
 import { type ClineRuntimeSetup, createClineRuntimeSetup } from "./cline-runtime-setup";
 import {
+	type ClineLaunchConfigResolver,
 	type ClineSessionRuntime,
 	type CreateInMemoryClineSessionRuntimeOptions,
 	createInMemoryClineSessionRuntime,
@@ -114,6 +115,12 @@ export interface CreateInMemoryClineTaskSessionServiceOptions {
 	createMessageRepository?: () => ClineMessageRepository;
 	createRuntimeSetup?: (workspacePath: string) => Promise<ClineRuntimeSetup>;
 	watcherRegistry?: ClineWatcherRegistry;
+	/**
+	 * B-2.8: forwarded to the session runtime so restarts re-resolve the
+	 * launch config (context limit, compaction policy, credentials) from the
+	 * current provider settings instead of replaying the start-time snapshot.
+	 */
+	resolveClineLaunchConfig?: ClineLaunchConfigResolver;
 }
 
 function toErrorMessage(error: unknown): string {
@@ -187,6 +194,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			onTaskEvent: (taskId: string, event: unknown) => {
 				this.handleTaskEvent(taskId, event);
 			},
+			resolveClineLaunchConfig: options.resolveClineLaunchConfig,
 		});
 		this.messageRepository = createMessageRepository();
 	}

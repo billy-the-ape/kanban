@@ -9,7 +9,10 @@
 import type { ToolApprovalRequest, ToolApprovalResult } from "@clinebot/core";
 import type { ClineMcpRuntimeService } from "../../src/cline-sdk/cline-mcp-runtime-service";
 import type { ClineRuntimeSetup } from "../../src/cline-sdk/cline-runtime-setup";
-import { createInMemoryClineSessionRuntime } from "../../src/cline-sdk/cline-session-runtime";
+import {
+	type ClineLaunchConfigResolver,
+	createInMemoryClineSessionRuntime,
+} from "../../src/cline-sdk/cline-session-runtime";
 import type { ClineTaskSessionService } from "../../src/cline-sdk/cline-task-session-service";
 import { createInMemoryClineTaskSessionService } from "../../src/cline-sdk/cline-task-session-service";
 import {
@@ -65,6 +68,11 @@ export interface CreateTaskSessionServiceHarnessOptions extends CreateFakeClineS
 	 * reading the same persisted session data (service restart, B-1.7).
 	 */
 	store?: FakeClineSessionStore;
+	/**
+	 * B-2.8: launch-config resolver forwarded to the session runtime so
+	 * restarts re-resolve the policy instead of replaying the snapshot.
+	 */
+	resolveClineLaunchConfig?: ClineLaunchConfigResolver;
 }
 
 export interface TaskSessionServiceHarness {
@@ -80,6 +88,7 @@ export function createTaskSessionServiceHarness(
 	const host = createFakeClineSessionHost(store);
 	const setup = createFakeRuntimeSetup();
 	const service = createInMemoryClineTaskSessionService({
+		resolveClineLaunchConfig: options.resolveClineLaunchConfig,
 		createSessionRuntime: (runtimeOptions) =>
 			createInMemoryClineSessionRuntime({
 				...runtimeOptions,

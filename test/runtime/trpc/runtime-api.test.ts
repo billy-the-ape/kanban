@@ -573,6 +573,19 @@ describe("createRuntimeApi startTaskSession", () => {
 				apiKey: "anthropic-api-key",
 				contextWindowTokens: 200_000,
 				contextWindowSource: "fallback",
+				// B-2.8: the board start entry carries the resolved compaction
+				// policy built from the same launch config.
+				compaction: buildClineCompactionConfig({
+					launchConfig: {
+						providerId: "anthropic",
+						modelId: "claude-sonnet-4-6",
+						apiKey: "anthropic-api-key",
+						baseUrl: null,
+						contextWindowTokens: 200_000,
+						contextWindowSource: "fallback",
+						maxTokens: null,
+					},
+				}),
 				mode: "act",
 				startInPlanMode: true,
 				resumeFromTrash: undefined,
@@ -1712,6 +1725,13 @@ describe("createRuntimeApi startTaskSession", () => {
 				prompt: "hello home",
 				providerId: "cline",
 				apiKey: "workos:oauth-access",
+				// B-2.8: the home-agent auto-start entry carries the resolved
+				// compaction policy (model id is catalog-resolved, so assert
+				// the provider-bound summarizer instead of the full object).
+				compaction: expect.objectContaining({
+					enabled: true,
+					summarizer: expect.objectContaining({ providerId: "cline" }),
+				}),
 			}),
 		);
 		expect(oauthMocks.getValidClineCredentials).toHaveBeenCalledWith(
