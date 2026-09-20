@@ -25,6 +25,7 @@ import {
 	createTaskSessionServiceHarness,
 	type TaskSessionServiceHarness,
 } from "../../utilities/cline-session-service-harness";
+import type { FakeClineSessionStartConfig } from "../../utilities/fake-cline-session-host";
 
 const turnCheckpointMocks = vi.hoisted(() => ({
 	captureTaskTurnCheckpoint: vi.fn(),
@@ -354,5 +355,86 @@ describe("service restart with a persisted session (B-1.7)", () => {
 			}
 			rmSync(logDir, { recursive: true, force: true });
 		}
+	});
+});
+
+// B-3.6 — the context-overflow recovery restart must reuse the FULL saved
+// session config (provider, model, credentials, cwd, mode, execution
+// policy, resolved system prompt with rules, calibrated compaction) instead
+// of a degraded fallback, so the restarted turn behaves like the original
+// session. The canceled-turn half of B-3.6 lives in
+// context-overflow-regression.test.ts.
+describe("overflow recovery restart preserves the saved session config (B-3.6)", () => {
+	const B36_TASK_ID = "task-b36-config";
+
+	it("restarts with the same provider, model, credentials, policy, and compaction config", async () => {
+		const harness = createTaskSessionServiceHarness({
+			onTurn: (context) => {
+				if (context.turnCount === 2) {
+					throw new Error(
+						"This model's maximum context length is 8192 tokens. However, your messages resulted in 9000 tokens (7000 in the messages, 2000 in the completion). Please shorten the messages or completion.",
+					);
+				}
+				return `reply ${context.turnCount}`;
+			},
+		});
+		services.push(harness);
+		const { service, host } = harness;
+
+		await service.startTaskSession({
+			taskId: B36_TASK_ID,
+			cwd: "/tmp/worktree-b36",
+			prompt: "First turn prompt",
+			providerId: "openai",
+			modelId: "gpt-test-4o",
+			apiKey: "sk-test-12345",
+			baseUrl: "http://localhost:4321/v1",
+			reasoningEffort: "high",
+			systemPrompt: "test system prompt + rules",
+			taskTitle: "B-3.6 config preservation",
+			compaction: { contextWindowTokens: 8_192, reserveTokens: 1_024 },
+		});
+		await vi.waitFor(() => {
+			expect(host.sentPrompts.length).toBe(1);
+		});
+		await service.sendTaskSessionInput(B36_TASK_ID, "Follow up prompt");
+		await vi.waitFor(() => {
+			expect(host.sentPrompts.length).toBe(3);
+		});
+
+		// The recovery restart creates a NEW session...
+		expect(host.startedConfigs.length).toBe(2);
+		const firstConfig = host.startedConfigs[0];
+		const restartedConfig = host.startedConfigs[1];
+		expect(firstConfig).toBeDefined();
+		expect(restartedConfig).toBeDefined();
+		if (!firstConfig || !restartedConfig) {
+			throw new Error("expected two start configs");
+		}
+		expect(restartedConfig.sessionId).not.toBe(firstConfig.sessionId);
+
+		// ...but with the same full session config (minus the session id and
+		// the function-valued hooks). Calibrated compaction included: both
+		// starts derive the same calibration from the same saved request.
+		const pickComparableConfig = (config: FakeClineSessionStartConfig) => ({
+			providerId: config.providerId,
+			modelId: config.modelId,
+			apiKey: config.apiKey,
+			baseUrl: config.baseUrl,
+			reasoningEffort: config.reasoningEffort,
+			cwd: config.cwd,
+			mode: config.mode,
+			enableTools: config.enableTools,
+			enableSpawnAgent: config.enableSpawnAgent,
+			enableAgentTeams: config.enableAgentTeams,
+			execution: config.execution,
+			systemPrompt: config.systemPrompt,
+			compaction: config.compaction,
+		});
+		expect(pickComparableConfig(restartedConfig)).toEqual(pickComparableConfig(firstConfig));
+
+		// The follow-up reached the restarted session and the task recovered.
+		expect(host.sentPrompts.at(-1)?.prompt).toBe("Follow up prompt");
+		expect(service.getSummary(B36_TASK_ID)?.reviewReason).not.toBe("error");
 	});
 });
