@@ -70,6 +70,8 @@ function createRuntimeConfigResponse(
 		openPrPromptTemplate: "",
 		commitPromptTemplateDefault: "",
 		openPrPromptTemplateDefault: "",
+		contextBudget: null,
+		effectiveContextWindow: null,
 	};
 }
 

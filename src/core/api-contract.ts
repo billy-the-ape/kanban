@@ -700,6 +700,14 @@ export const runtimeClineProviderModelSchema = z.object({
 	supportsVision: z.boolean().optional(),
 	supportsAttachments: z.boolean().optional(),
 	supportsReasoningEffort: z.boolean().optional(),
+	// Optional context capacity in tokens, reported by the model's source
+	// (SDK catalog or LiteLLM /model/info). Absent (undefined) and null both
+	// mean "unknown" — never "unlimited".
+	contextWindow: z.number().int().positive().nullable().optional(),
+	// Optional max output tokens per model (SDK catalog ModelInfo.maxTokens
+	// or LiteLLM /model/info max_output_tokens). B-2.4: feeds the SDK
+	// compaction reserve. Same unknown semantics as contextWindow.
+	maxTokens: z.number().int().positive().nullable().optional(),
 });
 export type RuntimeClineProviderModel = z.infer<typeof runtimeClineProviderModelSchema>;
 
@@ -938,6 +946,71 @@ export const runtimeAgentDefinitionSchema = z.object({
 });
 export type RuntimeAgentDefinition = z.infer<typeof runtimeAgentDefinitionSchema>;
 
+// B-2.9: user-facing context budget settings (global scope, stored in the
+// global runtime config). All fields are optional — absent/null means "use
+// the default" for that setting.
+export const runtimeCompactionStrategySchema = z.enum(["basic", "agentic"]);
+export type RuntimeCompactionStrategy = z.infer<typeof runtimeCompactionStrategySchema>;
+
+export const runtimeContextBudgetSchema = z.object({
+	contextWindowOverrideTokens: z.number().int().positive().optional(),
+	compactionStrategy: runtimeCompactionStrategySchema.optional(),
+	triggerThresholdRatio: z.number().gt(0).max(1).optional(),
+	outputReserveTokens: z.number().int().positive().optional(),
+	safetyMarginTokens: z.number().int().positive().optional(),
+});
+export type RuntimeContextBudget = z.infer<typeof runtimeContextBudgetSchema>;
+
+const CONTEXT_WINDOW_OVERRIDE_TOKENS_ERROR = "contextWindowOverrideTokens must be a positive integer token count.";
+const OUTPUT_RESERVE_TOKENS_ERROR = "outputReserveTokens must be a positive integer token count.";
+const SAFETY_MARGIN_TOKENS_ERROR = "safetyMarginTokens must be a positive integer token count.";
+const TRIGGER_THRESHOLD_RATIO_ERROR = "triggerThresholdRatio must be a number between 0 and 1 (exclusive of 0).";
+const COMPACTION_STRATEGY_ERROR = "compactionStrategy must be either 'basic' or 'agentic'.";
+
+/**
+ * B-2.9: save variant of the context budget. `null` clears a field (resets
+ * it to the default); `undefined` leaves the stored value untouched.
+ */
+export const runtimeContextBudgetSaveSchema = z.object({
+	contextWindowOverrideTokens: z
+		.number({ message: CONTEXT_WINDOW_OVERRIDE_TOKENS_ERROR })
+		.int(CONTEXT_WINDOW_OVERRIDE_TOKENS_ERROR)
+		.positive(CONTEXT_WINDOW_OVERRIDE_TOKENS_ERROR)
+		.nullable()
+		.optional(),
+	compactionStrategy: z.enum(["basic", "agentic"], { message: COMPACTION_STRATEGY_ERROR }).nullable().optional(),
+	triggerThresholdRatio: z
+		.number({ message: TRIGGER_THRESHOLD_RATIO_ERROR })
+		.gt(0, TRIGGER_THRESHOLD_RATIO_ERROR)
+		.max(1, TRIGGER_THRESHOLD_RATIO_ERROR)
+		.nullable()
+		.optional(),
+	outputReserveTokens: z
+		.number({ message: OUTPUT_RESERVE_TOKENS_ERROR })
+		.int(OUTPUT_RESERVE_TOKENS_ERROR)
+		.positive(OUTPUT_RESERVE_TOKENS_ERROR)
+		.nullable()
+		.optional(),
+	safetyMarginTokens: z
+		.number({ message: SAFETY_MARGIN_TOKENS_ERROR })
+		.int(SAFETY_MARGIN_TOKENS_ERROR)
+		.positive(SAFETY_MARGIN_TOKENS_ERROR)
+		.nullable()
+		.optional(),
+});
+export type RuntimeContextBudgetSave = z.infer<typeof runtimeContextBudgetSaveSchema>;
+
+/** B-2.9: which tier supplied the effective context window shown in settings. */
+export const runtimeContextLimitSourceSchema = z.enum(["override", "provider-metadata", "fallback"]);
+export type RuntimeContextLimitSource = z.infer<typeof runtimeContextLimitSourceSchema>;
+
+/** B-2.9: the effective context window for the selected provider/model, including the user budget override. */
+export const runtimeEffectiveContextWindowSchema = z.object({
+	limitTokens: z.number().int().positive(),
+	source: runtimeContextLimitSourceSchema,
+});
+export type RuntimeEffectiveContextWindow = z.infer<typeof runtimeEffectiveContextWindowSchema>;
+
 export const runtimeConfigResponseSchema = z.object({
 	selectedAgentId: runtimeAgentIdSchema,
 	selectedShortcutLabel: z.string().nullable(),
@@ -955,6 +1028,8 @@ export const runtimeConfigResponseSchema = z.object({
 	openPrPromptTemplate: z.string(),
 	commitPromptTemplateDefault: z.string(),
 	openPrPromptTemplateDefault: z.string(),
+	contextBudget: runtimeContextBudgetSchema.nullable(),
+	effectiveContextWindow: runtimeEffectiveContextWindowSchema.nullable(),
 });
 export type RuntimeConfigResponse = z.infer<typeof runtimeConfigResponseSchema>;
 
@@ -966,6 +1041,7 @@ export const runtimeConfigSaveRequestSchema = z.object({
 	readyForReviewNotificationsEnabled: z.boolean().optional(),
 	commitPromptTemplate: z.string().optional(),
 	openPrPromptTemplate: z.string().optional(),
+	contextBudget: runtimeContextBudgetSaveSchema.optional(),
 });
 export type RuntimeConfigSaveRequest = z.infer<typeof runtimeConfigSaveRequestSchema>;
 

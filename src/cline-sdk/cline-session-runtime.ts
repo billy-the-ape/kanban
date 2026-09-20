@@ -2,16 +2,29 @@
 // This is the runtime-facing layer for starting, looking up, resuming, and
 // stopping native Cline sessions without exposing SDK details upstream.
 import type { RuntimeClineReasoningEffort, RuntimeTaskImage, RuntimeTaskSessionMode } from "../core/api-contract";
+import { createClineCompactionBeforeModelHook } from "./cline-compaction-before-model-hook";
+import { createClineCompactionCompactCallback } from "./cline-compaction-callback";
+import type { ClineCompactionConfig } from "./cline-compaction-config";
+import {
+	buildClineCompactionConfig,
+	CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT,
+	calibrateClineCompactionConfig,
+} from "./cline-compaction-config";
+import type { ContextLimitSource } from "./cline-context-policy";
 import { extractClineSessionId } from "./cline-event-adapter";
 import {
 	type ClineMcpRuntimeService,
 	type ClineMcpToolBundle,
 	createClineMcpRuntimeService,
 } from "./cline-mcp-runtime-service";
+import type { ResolvedClineLaunchConfig } from "./cline-provider-service";
 import { createKanbanClineLogger } from "./cline-runtime-logger";
 import { buildSessionIdPrefix, createSessionId } from "./cline-session-state";
+import { createClineToolResultBoundingHook } from "./cline-tool-result-bounding-hook";
 import { CLINE_MODEL_CATALOG_DEFAULTS } from "./sdk-provider-boundary";
 import {
+	CLINE_SDK_DEFAULT_CONTEXT_WINDOW_TOKENS,
+	type ClineSdkAgentHooks,
 	type ClineSdkPersistedMessage,
 	type ClineSdkSessionHost,
 	type ClineSdkSessionRecord,
@@ -20,6 +33,7 @@ import {
 	type ClineSdkToolApprovalResult,
 	type ClineSdkUserInstructionService,
 	createClineSdkSessionHost,
+	getClineCorePackageVersion,
 } from "./sdk-runtime-boundary";
 
 export { CLINE_MODEL_CATALOG_DEFAULTS } from "./sdk-provider-boundary";
@@ -64,6 +78,24 @@ function toSdkUserImages(images?: RuntimeTaskImage[]): string[] | undefined {
 	return userImages.length > 0 ? userImages : undefined;
 }
 
+/**
+ * Resolves the host (host:port) of a configured provider base URL for
+ * diagnostics. Never returns a full URL, path, or credentials.
+ */
+function resolveSessionStartLogHost(baseUrl?: string | null): string | null {
+	const normalized = baseUrl?.trim();
+	if (!normalized) {
+		return null;
+	}
+	try {
+		return new URL(normalized).host;
+	} catch {
+		// Malformed URLs are skipped rather than logged verbatim, since they
+		// may embed credentials.
+		return null;
+	}
+}
+
 export interface StartClineSessionRuntimeRequest {
 	taskId: string;
 	cwd: string;
@@ -81,6 +113,18 @@ export interface StartClineSessionRuntimeRequest {
 	systemPrompt: string;
 	userInstructionService?: ClineSdkUserInstructionService;
 	requestToolApproval?: (request: ClineSdkToolApprovalRequest) => Promise<ClineSdkToolApprovalResult>;
+	/** B-2.2: resolved effective context limit (tokens) for the session-start diagnostic. */
+	contextWindowTokens?: number;
+	/** Which tier supplied the resolved effective context limit. */
+	contextWindowSource?: ContextLimitSource;
+	/** B-2.4: explicit SDK compaction config (window, threshold, reserve, local summarizer). */
+	compaction?: ClineCompactionConfig;
+	/**
+	 * B-2.9: user-set safety margin (tokens) from the global context budget.
+	 * Wins over the computed margin in both the config calibration and the
+	 * beforeModel compaction hook; absent falls back to the computed margin.
+	 */
+	compactionSafetyMarginTokens?: number;
 }
 
 export interface StartClineSessionRuntimeResult {
@@ -121,10 +165,27 @@ export interface ClineSessionRuntime {
 	dispose(): Promise<void>;
 }
 
+/**
+ * B-2.8: re-resolves the launch config for a restart. The provider and model
+ * are pinned to the saved start request so the conversation continues with
+ * the same model; credentials, context limit, and compaction policy come
+ * from the provider settings in force at restart time.
+ */
+export type ClineLaunchConfigResolver = (overrides: {
+	providerIdOverride?: string;
+	modelIdOverride?: string;
+}) => Promise<ResolvedClineLaunchConfig>;
+
 export interface CreateInMemoryClineSessionRuntimeOptions {
 	onTaskEvent?: (taskId: string, event: unknown) => void;
 	createSessionHost?: () => Promise<ClineSessionHostBoundary>;
 	createMcpRuntimeService?: () => ClineMcpRuntimeService;
+	/**
+	 * B-2.8: on restart, re-resolve the launch config (credentials, context
+	 * limit, compaction policy) instead of replaying the start-time snapshot.
+	 * When omitted, restart replays the stored request unchanged.
+	 */
+	resolveClineLaunchConfig?: ClineLaunchConfigResolver;
 }
 
 // Best-effort: write the Kanban task title to the SDK session metadata so external session
@@ -155,16 +216,19 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		Omit<StartClineSessionRuntimeRequest, "prompt" | "images" | "initialMessages">
 	>();
 	private readonly mcpToolBundleByTaskId = new Map<string, ClineMcpToolBundle>();
+	private readonly resolveClineLaunchConfig: ClineLaunchConfigResolver | null;
 	private sessionHostPromise: Promise<ClineSessionHostBoundary> | null = null;
 
 	constructor(options: CreateInMemoryClineSessionRuntimeOptions = {}) {
 		this.onTaskEvent = options.onTaskEvent ?? null;
 		this.createSessionHost = options.createSessionHost ?? createClineSdkSessionHost;
+		this.resolveClineLaunchConfig = options.resolveClineLaunchConfig ?? null;
 		const createMcpRuntimeService = options.createMcpRuntimeService ?? createClineMcpRuntimeService;
 		this.clineMcpRuntimeService = createMcpRuntimeService();
 	}
 
 	async startTaskSession(request: StartClineSessionRuntimeRequest): Promise<StartClineSessionRuntimeResult> {
+		this.assertSingleActiveClineSession(request.taskId);
 		const requestedSessionId = createSessionId(request.taskId);
 		const resolvedMode: RuntimeTaskSessionMode = request.mode ?? "act";
 		this.lastStartRequestByTaskId.set(request.taskId, {
@@ -180,6 +244,10 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			taskTitle: request.taskTitle,
 			userInstructionService: request.userInstructionService,
 			requestToolApproval: request.requestToolApproval,
+			contextWindowTokens: request.contextWindowTokens,
+			contextWindowSource: request.contextWindowSource,
+			compaction: request.compaction,
+			compactionSafetyMarginTokens: request.compactionSafetyMarginTokens,
 		});
 		this.bindTaskSession(request.taskId, requestedSessionId);
 
@@ -202,6 +270,92 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		const userImages = toSdkUserImages(request.images);
 		const shouldSendInitialTurn = request.prompt.trim().length > 0 || Boolean(userImages?.length);
 		let startResult: Awaited<ReturnType<ClineSessionHostBoundary["start"]>>;
+		const sessionLogger = createKanbanClineLogger({
+			runtime: "kanban",
+			taskId: request.taskId,
+			requestedSessionId,
+			providerId: request.providerId,
+			modelId: request.modelId,
+		});
+		// B-2.1 diagnostic: record the effective model-context configuration for
+		// every session start (restarts reuse this path). Gated behind
+		// CLINE_LOG_ENABLED like the rest of the Cline runtime logs.
+		// B-2.2: resolveLaunchConfig supplies the resolved limit + source;
+		// callers without a resolver keep the unconfigured-SDK-default values.
+		sessionLogger.log("Cline session start: effective context metadata", {
+			baseUrlHost: resolveSessionStartLogHost(request.baseUrl),
+			contextLimitTokens: request.contextWindowTokens ?? CLINE_SDK_DEFAULT_CONTEXT_WINDOW_TOKENS,
+			contextLimitSource: request.contextWindowSource ?? "unconfigured-sdk-default",
+			clineCoreVersion: getClineCorePackageVersion(),
+		});
+		// B-2.5: calibrate the compaction window against the assembled request.
+		// The SDK trigger counts only conversation messages, so subtract the
+		// estimated system-prompt and tool-schema overhead from the window and
+		// fold the safety margin into the reserve (see cline-compaction-config
+		// for the derivation). Runs here — not in the tRPC layer — because the
+		// resolved system prompt and the MCP tool bundle only exist at this
+		// point. The captured start request keeps the UNCALIBRATED config, so
+		// restarts re-derive the same calibration instead of double-subtracting.
+		// B-2.8: restarts first re-resolve the uncalibrated config from the
+		// current launch config (resolveClineLaunchConfig) when a resolver is
+		// wired in, then this calibration runs again on the fresh config.
+		let effectiveCompaction = request.compaction;
+		if (request.compaction) {
+			const calibration = calibrateClineCompactionConfig({
+				config: request.compaction,
+				systemPrompt: request.systemPrompt,
+				providerId: request.providerId,
+				extraTools: hasMcpExtraTools ? (mcpToolBundle?.tools ?? []) : [],
+				safetyMarginTokens: request.compactionSafetyMarginTokens,
+			});
+			effectiveCompaction = calibration.config;
+			if (calibration.breakdown) {
+				sessionLogger.log("Cline compaction calibrated for the assembled request (token values are estimates)", {
+					limitTokens: calibration.breakdown.limitTokens,
+					systemPromptTokens: calibration.breakdown.systemPromptTokens,
+					toolSchemaTokens: calibration.breakdown.toolSchemaTokens,
+					safetyMarginTokens: calibration.breakdown.safetyMarginTokens,
+					calibratedWindowTokens: calibration.breakdown.contextWindowTokens,
+					reserveTokens: calibration.breakdown.reserveTokens,
+					triggerTokens: calibration.breakdown.triggerTokens,
+				});
+			}
+		}
+		// B-2.5: in @clinebot/core 0.0.38 local mode the SDK's own compaction
+		// pipeline (the calibrated trigger above + the compact callback below)
+		// is never executed — the agent config's prepareTurn is set but never
+		// invoked by the agent runtime (upstream bug, see docs/plans/B-2-5.md).
+		// The beforeModel hook is the local-mode guard: it evaluates the real
+		// assembled request and rewrites its messages to stay within the same
+		// calibrated budget. `hooks` is a local-only config key, so in hub
+		// mode the compact capability takes over instead.
+		// B-2.6/B-2.7: the afterTool hook bounds oversized tool results at
+		// ingestion time (read-family char excerpts; command output / diff
+		// line excerpts with the exit status kept in the head — see
+		// cline-tool-result-bounding-hook.ts) and preserves the full content
+		// as a local artifact. It complements the SDK's own 50k
+		// request-assembly truncation, which is request-scoped only and
+		// leaves the persisted transcript unbounded.
+		let agentHooks: ClineSdkAgentHooks | undefined;
+		if (
+			request.compaction &&
+			typeof request.compaction.contextWindowTokens === "number" &&
+			request.compaction.contextWindowTokens > 0
+		) {
+			agentHooks = {
+				beforeModel: createClineCompactionBeforeModelHook({
+					limitTokens: request.compaction.contextWindowTokens,
+					outputReserveTokens: request.compaction.reserveTokens ?? CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT,
+					safetyMarginTokens: request.compactionSafetyMarginTokens,
+					logger: sessionLogger,
+				}),
+				afterTool: createClineToolResultBoundingHook({
+					taskId: request.taskId,
+					limitTokens: request.compaction.contextWindowTokens,
+					logger: sessionLogger,
+				}),
+			};
+		}
 		try {
 			// Hub-backed SDK hosts create the interactive session in start; the first turn runs through send.
 			startResult = await sessionHost.start({
@@ -225,19 +379,28 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 						maxConsecutiveMistakes: DEFAULT_CLINE_MAX_CONSECUTIVE_MISTAKES,
 					},
 					systemPrompt: request.systemPrompt,
+					// B-2.4: explicit compaction config so the SDK uses the
+					// resolved effective window, reserve, and the same local
+					// summarizer instead of its built-in defaults. B-2.5: window
+					// and reserve calibrated for the assembled request above.
+					compaction: effectiveCompaction,
+					// B-2.5: local-mode proactive compaction guard (see above).
+					// B-2.6: ingestion-time tool-result bounding (see above).
+					...(agentHooks ? { hooks: agentHooks } : {}),
 				},
 				initialMessages: request.initialMessages,
 				interactive: true,
 				localRuntime: {
 					modelCatalogDefaults: CLINE_MODEL_CATALOG_DEFAULTS,
 					...(request.userInstructionService ? { userInstructionService: request.userInstructionService } : {}),
-					logger: createKanbanClineLogger({
-						runtime: "kanban",
-						taskId: request.taskId,
-						requestedSessionId,
-						providerId: request.providerId,
-						modelId: request.modelId,
-					}),
+					logger: sessionLogger,
+					// B-2.5: deterministic, model-free compaction callback. It
+					// completely replaces the SDK's built-in strategy (returning
+					// undefined would mean NO compaction), and is registered as a
+					// session capability so it also applies in hub mode.
+					...(effectiveCompaction
+						? { compaction: { compact: createClineCompactionCompactCallback(sessionLogger) } }
+						: {}),
 					...(hasMcpExtraTools ? { extraTools: mcpToolBundle?.tools ?? [] } : {}),
 				},
 				...(request.requestToolApproval
@@ -279,6 +442,28 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		};
 	}
 
+	/**
+	 * B-2.8 single-worker guard: at most one live Cline session per workspace
+	 * runtime — the default target workflow runs a single model worker
+	 * (typically a local model), and concurrent sessions would overload it.
+	 * The check is race-free: startTaskSession binds the requested session
+	 * synchronously before its first await, so overlapping starts for distinct
+	 * tasks can never both pass. A blocked start runs before any state write,
+	 * so it leaves no orphaned bindings or start-request snapshots.
+	 * Same-task starts (replace / resume-from-trash) are unaffected. Queuing
+	 * or parallel scheduling is B-11.
+	 */
+	private assertSingleActiveClineSession(requestTaskId: string): void {
+		for (const [taskId] of this.sessionIdByTaskId) {
+			if (taskId !== requestTaskId) {
+				throw new Error(
+					`Another Cline session is already active (task "${taskId}"). ` +
+						`Cline sessions run one at a time by default: stop that session before starting this one.`,
+				);
+			}
+		}
+	}
+
 	async restartTaskSession(input: {
 		taskId: string;
 		prompt: string;
@@ -290,14 +475,48 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		if (!lastStartRequest) {
 			throw new Error(`No previous Cline session config is available for task ${input.taskId}.`);
 		}
+		const launchPolicy = await this.resolveRestartedLaunchPolicy(lastStartRequest);
 
 		return await this.startTaskSession({
 			...lastStartRequest,
+			...launchPolicy,
 			prompt: input.prompt,
 			initialMessages: input.initialMessages,
 			images: input.images,
 			mode: input.mode ?? lastStartRequest.mode,
 		});
+	}
+
+	/**
+	 * B-2.8: restarts re-resolve the launch policy from the current provider
+	 * settings instead of cache-and-replay of the start-time snapshot —
+	 * credentials may have rotated (OAuth refresh) and the context limit +
+	 * compaction config must reflect the settings in force at restart time.
+	 * The provider and model stay pinned to the saved request so the
+	 * conversation continues with the same model. Without a resolver the
+	 * stored snapshot is replayed unchanged (unit tests, embedded hosts).
+	 */
+	private async resolveRestartedLaunchPolicy(
+		lastStartRequest: Omit<StartClineSessionRuntimeRequest, "prompt" | "images" | "initialMessages">,
+	): Promise<Partial<StartClineSessionRuntimeRequest>> {
+		if (!this.resolveClineLaunchConfig) {
+			return {};
+		}
+		const launchConfig = await this.resolveClineLaunchConfig({
+			providerIdOverride: lastStartRequest.providerId,
+			modelIdOverride: lastStartRequest.modelId ?? undefined,
+		});
+		return {
+			providerId: launchConfig.providerId,
+			modelId: launchConfig.modelId ?? lastStartRequest.modelId,
+			apiKey: launchConfig.apiKey,
+			baseUrl: launchConfig.baseUrl,
+			reasoningEffort: launchConfig.reasoningEffort ?? lastStartRequest.reasoningEffort,
+			contextWindowTokens: launchConfig.contextWindowTokens,
+			contextWindowSource: launchConfig.contextWindowSource,
+			compaction: buildClineCompactionConfig({ launchConfig }),
+			compactionSafetyMarginTokens: launchConfig.compactionSettings?.safetyMarginTokens,
+		};
 	}
 
 	async sendTaskSessionInput(

@@ -5,6 +5,7 @@ import type {
 	RuntimeAgentId,
 	RuntimeClineProviderSettings,
 	RuntimeConfigResponse,
+	RuntimeEffectiveContextWindow,
 } from "../core/api-contract";
 import { isBinaryAvailableOnPath } from "./command-discovery";
 
@@ -101,6 +102,10 @@ export function resolveAgentCommand(runtimeConfig: RuntimeConfigState): Resolved
 export function buildRuntimeConfigResponse(
 	runtimeConfig: RuntimeConfigState,
 	clineProviderSettings: RuntimeClineProviderSettings,
+	// B-2.9: the effective context window is computed by the caller (it needs
+	// the provider service for the metadata tier); null when no provider is
+	// selected and no context budget override is set.
+	extra: { effectiveContextWindow?: RuntimeEffectiveContextWindow | null } = {},
 ): RuntimeConfigResponse {
 	const detectedCommands = detectInstalledCommands();
 	const agents = getCuratedDefinitions(runtimeConfig, detectedCommands);
@@ -124,5 +129,7 @@ export function buildRuntimeConfigResponse(
 		openPrPromptTemplate: runtimeConfig.openPrPromptTemplate,
 		commitPromptTemplateDefault: runtimeConfig.commitPromptTemplateDefault,
 		openPrPromptTemplateDefault: runtimeConfig.openPrPromptTemplateDefault,
+		contextBudget: runtimeConfig.contextBudget ?? null,
+		effectiveContextWindow: extra.effectiveContextWindow ?? null,
 	};
 }

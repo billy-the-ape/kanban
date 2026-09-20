@@ -22,7 +22,10 @@ import type {
 	RuntimeClineProviderModel,
 	RuntimeClineProviderSettings,
 	RuntimeClineReasoningEffort,
+	RuntimeCompactionStrategy,
 	RuntimeConfigResponse,
+	RuntimeContextBudgetSave,
+	RuntimeEffectiveContextWindow,
 	RuntimeTaskClineSettings,
 } from "@/runtime/types";
 import { isLocalhostAccess } from "@/utils/localhost-detection";
@@ -135,6 +138,26 @@ export interface UseRuntimeSettingsClineControllerResult {
 	oauthExpiresAt: string;
 	selectedModelSupportsReasoningEffort: boolean;
 	hasUnsavedChanges: boolean;
+	// B-2.9: context budget (global scope). Text drafts use "" for "default",
+	// which maps to null ("clear to default") in the save payload.
+	contextWindowOverrideTokens: string;
+	setContextWindowOverrideTokens: Dispatch<SetStateAction<string>>;
+	compactionStrategy: RuntimeCompactionStrategy | "";
+	setCompactionStrategy: Dispatch<SetStateAction<RuntimeCompactionStrategy | "">>;
+	triggerThresholdRatio: string;
+	setTriggerThresholdRatio: Dispatch<SetStateAction<string>>;
+	outputReserveTokens: string;
+	setOutputReserveTokens: Dispatch<SetStateAction<string>>;
+	safetyMarginTokens: string;
+	setSafetyMarginTokens: Dispatch<SetStateAction<string>>;
+	/** Client-side validation error for the context budget draft (blocks save). */
+	contextBudgetError: string | null;
+	/** Save-ready context budget (null = field cleared); undefined when invalid. */
+	contextBudget: RuntimeContextBudgetSave | undefined;
+	/** True when the draft differs from the stored context budget. */
+	hasUnsavedContextBudgetChanges: boolean;
+	/** Effective context window (limit + source) for the selected provider/model. */
+	effectiveContextWindow: RuntimeEffectiveContextWindow | null;
 	saveProviderSettings: (overrides?: SaveProviderSettingsOverrides) => Promise<SaveResult>;
 	refreshProviderModels: () => Promise<SaveResult>;
 	addCustomProvider: (input: AddClineProviderInput) => Promise<SaveResult>;
@@ -217,6 +240,12 @@ export function useRuntimeSettingsClineController(
 	const [awsEndpoint, setAwsEndpoint] = useState("");
 	const [gcpProjectId, setGcpProjectId] = useState("");
 	const [gcpRegion, setGcpRegion] = useState("");
+	// B-2.9: context budget drafts (global scope; empty string = default).
+	const [contextWindowOverrideTokens, setContextWindowOverrideTokens] = useState("");
+	const [compactionStrategy, setCompactionStrategy] = useState<RuntimeCompactionStrategy | "">("");
+	const [triggerThresholdRatio, setTriggerThresholdRatio] = useState("");
+	const [outputReserveTokens, setOutputReserveTokens] = useState("");
+	const [safetyMarginTokens, setSafetyMarginTokens] = useState("");
 	const [providerSettingsOverride, setProviderSettingsOverride] = useState<RuntimeClineProviderSettings | null>(null);
 	const [providerCatalog, setProviderCatalog] = useState<RuntimeClineProviderCatalogItem[]>([]);
 	const [providerModels, setProviderModels] = useState<RuntimeClineProviderModel[]>([]);
@@ -253,6 +282,9 @@ export function useRuntimeSettingsClineController(
 	const oauthConfigured = effectiveProviderSettings?.oauthAccessTokenConfigured ?? false;
 	const oauthAccountId = effectiveProviderSettings?.oauthAccountId ?? "";
 	const oauthExpiresAt = effectiveProviderSettings?.oauthExpiresAt?.toString() ?? "";
+	// B-2.9: stored context budget + effective window from the config response.
+	const storedContextBudget = config?.contextBudget ?? null;
+	const effectiveContextWindow = config?.effectiveContextWindow ?? null;
 	const currentProviderSettings = useMemo<RuntimeClineProviderSettings>(() => {
 		const baseSettings = effectiveProviderSettings ?? getRuntimeClineProviderSettings(null);
 		const isSelectedManagedOauthProvider =
@@ -327,6 +359,82 @@ export function useRuntimeSettingsClineController(
 		reasoningEffort,
 	]);
 
+	// B-2.9: validate the context budget draft. Empty inputs mean "default"
+	// and are valid; non-empty inputs must be a positive integer (token
+	// fields) or a number in (0, 1] (the trigger threshold).
+	const contextBudgetError = useMemo<string | null>(() => {
+		const checkTokenField = (raw: string, label: string): string | null => {
+			const trimmed = raw.trim();
+			if (!trimmed) {
+				return null;
+			}
+			const parsed = Number(trimmed);
+			if (!Number.isInteger(parsed) || parsed <= 0) {
+				return `${label} must be a positive integer token count.`;
+			}
+			return null;
+		};
+		const tokenError =
+			checkTokenField(contextWindowOverrideTokens, "Context window override") ??
+			checkTokenField(outputReserveTokens, "Output reserve") ??
+			checkTokenField(safetyMarginTokens, "Safety margin");
+		if (tokenError) {
+			return tokenError;
+		}
+		const trimmedRatio = triggerThresholdRatio.trim();
+		if (trimmedRatio) {
+			const parsedRatio = Number(trimmedRatio);
+			if (!Number.isFinite(parsedRatio) || parsedRatio <= 0 || parsedRatio > 1) {
+				return "Compaction trigger threshold must be a number between 0 and 1 (exclusive of 0).";
+			}
+		}
+		return null;
+	}, [contextWindowOverrideTokens, outputReserveTokens, safetyMarginTokens, triggerThresholdRatio]);
+
+	// B-2.9: the save-ready context budget. Empty drafts map to null ("clear
+	// to default") so the payload is always complete — the server treats null
+	// as "reset this field" and undefined (field absent from the payload) as
+	// "leave untouched".
+	const contextBudget = useMemo<RuntimeContextBudgetSave | undefined>(() => {
+		if (contextBudgetError) {
+			return undefined;
+		}
+		const toTokenValue = (raw: string): number | null => {
+			const trimmed = raw.trim();
+			if (!trimmed) {
+				return null;
+			}
+			return Number(trimmed);
+		};
+		return {
+			contextWindowOverrideTokens: toTokenValue(contextWindowOverrideTokens),
+			compactionStrategy: compactionStrategy === "" ? null : compactionStrategy,
+			triggerThresholdRatio: triggerThresholdRatio.trim() === "" ? null : Number(triggerThresholdRatio.trim()),
+			outputReserveTokens: toTokenValue(outputReserveTokens),
+			safetyMarginTokens: toTokenValue(safetyMarginTokens),
+		};
+	}, [
+		compactionStrategy,
+		contextBudgetError,
+		contextWindowOverrideTokens,
+		outputReserveTokens,
+		safetyMarginTokens,
+		triggerThresholdRatio,
+	]);
+
+	const hasUnsavedContextBudgetChanges = useMemo(() => {
+		if (!config || contextBudgetError) {
+			return false;
+		}
+		return (
+			(storedContextBudget?.contextWindowOverrideTokens ?? null) !== contextBudget?.contextWindowOverrideTokens ||
+			(storedContextBudget?.compactionStrategy ?? null) !== contextBudget?.compactionStrategy ||
+			(storedContextBudget?.triggerThresholdRatio ?? null) !== contextBudget?.triggerThresholdRatio ||
+			(storedContextBudget?.outputReserveTokens ?? null) !== contextBudget?.outputReserveTokens ||
+			(storedContextBudget?.safetyMarginTokens ?? null) !== contextBudget?.safetyMarginTokens
+		);
+	}, [config, contextBudget, contextBudgetError, storedContextBudget]);
+
 	useEffect(() => {
 		if (!open) {
 			return;
@@ -353,6 +461,11 @@ export function useRuntimeSettingsClineController(
 		setAwsEndpoint("");
 		setGcpProjectId("");
 		setGcpRegion("");
+		setContextWindowOverrideTokens(storedContextBudget?.contextWindowOverrideTokens?.toString() ?? "");
+		setCompactionStrategy(storedContextBudget?.compactionStrategy ?? "");
+		setTriggerThresholdRatio(storedContextBudget?.triggerThresholdRatio?.toString() ?? "");
+		setOutputReserveTokens(storedContextBudget?.outputReserveTokens?.toString() ?? "");
+		setSafetyMarginTokens(storedContextBudget?.safetyMarginTokens?.toString() ?? "");
 		setProviderSettingsOverride(null);
 	}, [
 		configProviderSettings.baseUrl,
@@ -362,6 +475,11 @@ export function useRuntimeSettingsClineController(
 		configProviderSettings.reasoningEffort,
 		hasTaskClineSettingsOverride,
 		open,
+		storedContextBudget?.compactionStrategy,
+		storedContextBudget?.contextWindowOverrideTokens,
+		storedContextBudget?.outputReserveTokens,
+		storedContextBudget?.safetyMarginTokens,
+		storedContextBudget?.triggerThresholdRatio,
 		taskClineSettings,
 	]);
 
@@ -800,6 +918,20 @@ export function useRuntimeSettingsClineController(
 		oauthExpiresAt,
 		selectedModelSupportsReasoningEffort,
 		hasUnsavedChanges,
+		contextWindowOverrideTokens,
+		setContextWindowOverrideTokens,
+		compactionStrategy,
+		setCompactionStrategy,
+		triggerThresholdRatio,
+		setTriggerThresholdRatio,
+		outputReserveTokens,
+		setOutputReserveTokens,
+		safetyMarginTokens,
+		setSafetyMarginTokens,
+		contextBudgetError,
+		contextBudget,
+		hasUnsavedContextBudgetChanges,
+		effectiveContextWindow,
 		saveProviderSettings: saveProviderSettingsDraft,
 		refreshProviderModels,
 		addCustomProvider,

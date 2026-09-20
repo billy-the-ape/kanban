@@ -3,12 +3,22 @@
 // flow through this boundary so the rest of Kanban stays decoupled from the
 // SDK package layout.
 
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import {
 	type AgentEvent,
+	type AgentHooks,
 	type BasicLogger,
 	buildWorkspaceMetadata,
 	ClineCore,
 	type ClineCoreStartInput,
+	type CoreCompactionConfig,
+	type CoreCompactionContext,
+	type CoreCompactionResult,
+	type CoreCompactionStrategy,
+	type CoreCompactionSummarizerConfig,
 	type CoreSessionEvent,
 	createUserInstructionConfigService,
 	formatRulesForSystemPrompt,
@@ -26,6 +36,55 @@ import { CLINE_BUILTIN_SLASH_COMMANDS } from "./cline-slash-commands";
 import { getCliTelemetryService } from "./cline-telemetry-service";
 
 export { TelemetryLoggerSink, TelemetryService } from "@clinebot/core";
+/**
+ * Mirrors DEFAULT_CONTEXT_WINDOW_TOKENS from @clinebot/core 0.0.38
+ * (dist/extensions/context/compaction-shared.d.ts). The constant is not part
+ * of the package's public exports, so it is mirrored here. Used as the
+ * fallback cap when a provider does not report a context window (B-2-2), and
+ * as the effective window passed into the explicit compaction config
+ * (B-2-4).
+ */
+export const CLINE_SDK_DEFAULT_CONTEXT_WINDOW_TOKENS = 200000;
+
+let clineCorePackageVersion: string | null = null;
+
+/**
+ * Best-effort runtime version of the installed @clinebot/core package.
+ *
+ * The SDK does not export a version constant, and its exports map only
+ * defines ESM conditions (no `require`/`default`), so require.resolve
+ * cannot find the entry point either. Walk up from this boundary file and
+ * look for the package in ancestor node_modules directories (works with
+ * npm and pnpm hoisting). Falls back to "unknown" in packaged layouts
+ * where the package cannot be located.
+ */
+export function getClineCorePackageVersion(): string {
+	if (clineCorePackageVersion) {
+		return clineCorePackageVersion;
+	}
+	try {
+		let dir = dirname(fileURLToPath(import.meta.url));
+		for (;;) {
+			const candidate = join(dir, "node_modules", "@clinebot", "core", "package.json");
+			if (existsSync(candidate)) {
+				const packageJson = JSON.parse(readFileSync(candidate, "utf8")) as { version?: unknown };
+				if (typeof packageJson.version === "string" && packageJson.version.trim().length > 0) {
+					clineCorePackageVersion = packageJson.version;
+					return packageJson.version;
+				}
+				break;
+			}
+			const parent = dirname(dir);
+			if (parent === dir) {
+				break;
+			}
+			dir = parent;
+		}
+	} catch {
+		// Best effort: diagnostics must never break session startup.
+	}
+	return "unknown";
+}
 
 export type ClineSdkSessionHost = ClineCore;
 export type ClineSdkBasicLogger = BasicLogger;
@@ -37,6 +96,39 @@ export type ClineSdkStartSessionInput = ClineCoreStartInput;
 export type ClineSdkSessionRecord = SessionHistoryRecord;
 export type ClineSdkPersistedMessage = MessageWithMetadata;
 export type ClineSdkUserInstructionService = UserInstructionConfigService;
+// B-2.4: Kanban passes an explicit compaction config on every session start.
+// The `compact` callback is only set on the SDK's local runtime compaction
+// object, never on start input, so Kanban builds Omit<..., "compact">.
+export type ClineSdkCompactionConfig = CoreCompactionConfig;
+export type ClineSdkCompactionStrategy = CoreCompactionStrategy;
+export type ClineSdkCompactionSummarizerConfig = CoreCompactionSummarizerConfig;
+// B-2.5: the SDK's compaction trigger hands the calibrated window, the trigger
+// point, and the current messages to the host `compact` callback registered on
+// localRuntime.compaction. These boundary aliases keep the callback decoupled
+// from the SDK package layout like the other compaction types above.
+export type ClineSdkCompactionContext = CoreCompactionContext;
+export type ClineSdkCompactionResult = CoreCompactionResult;
+// B-2.5: the agent-runtime beforeModel hook is the local-mode integration
+// point for proactive compaction on @clinebot/core 0.0.38, where the SDK's
+// own prepare-turn compaction pipeline is never invoked (upstream bug, see
+// docs/plans/B-2-5.md). These types are derived from the SDK's AgentHooks so
+// Kanban tracks the hook contract instead of redefining it.
+export type ClineSdkAgentHooks = AgentHooks;
+export type ClineSdkAgentBeforeModelHook = NonNullable<AgentHooks["beforeModel"]>;
+export type ClineSdkAgentBeforeModelContext = Parameters<ClineSdkAgentBeforeModelHook>[0];
+export type ClineSdkAgentBeforeModelResult = Exclude<Awaited<ReturnType<ClineSdkAgentBeforeModelHook>>, undefined>;
+
+// B-2.6: the agent runtime (@clinebot/agents) also invokes `afterTool` after every tool
+// execution; a returned `result` replaces the tool result before the `tool-result` message
+// is persisted. Derived from the SDK's AgentHooks, like the beforeModel aliases above.
+export type ClineSdkAgentAfterToolHook = NonNullable<AgentHooks["afterTool"]>;
+export type ClineSdkAgentAfterToolContext = Parameters<ClineSdkAgentAfterToolHook>[0];
+export type ClineSdkAgentAfterToolResult = Exclude<Awaited<ReturnType<ClineSdkAgentAfterToolHook>>, undefined>;
+// The agent-runtime message shape (distinct from the persisted
+// MessageWithMetadata shape): derived from the hook context so Kanban tracks
+// the SDK's types instead of redefining them.
+export type ClineSdkAgentMessage = ClineSdkAgentBeforeModelContext["request"]["messages"][number];
+export type ClineSdkAgentMessagePart = ClineSdkAgentMessage["content"][number];
 export interface ClineSdkSlashCommand {
 	name: string;
 	instructions: string;
@@ -55,6 +147,8 @@ export async function createClineSdkSessionHost(): Promise<ClineSdkSessionHost> 
 export function resolveClineSdkDataDir(): string {
 	return resolveClineDataDir();
 }
+/** B-2.5: exposed so compaction calibration can estimate the SDK's default system prompt. */
+export { getClineDefaultSystemPrompt };
 export async function buildClineSdkWorkspaceMetadata(cwd: string): Promise<string> {
 	return await buildWorkspaceMetadata(cwd);
 }

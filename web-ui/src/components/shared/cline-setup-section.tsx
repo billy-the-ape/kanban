@@ -22,9 +22,16 @@ import type {
 } from "@/hooks/use-runtime-settings-cline-controller";
 import type { UseRuntimeSettingsClineMcpControllerResult } from "@/hooks/use-runtime-settings-cline-mcp-controller";
 import { openFileOnHost } from "@/runtime/runtime-config-query";
-import type { RuntimeClineMcpServer, RuntimeClineReasoningEffort } from "@/runtime/types";
+import type { RuntimeClineMcpServer, RuntimeClineReasoningEffort, RuntimeContextLimitSource } from "@/runtime/types";
 import { formatPathForDisplay } from "@/utils/path-display";
 import { useCopyToClipboard } from "@/utils/react-use";
+
+// B-2.9: display names for the effective context window source tier.
+const CONTEXT_LIMIT_SOURCE_LABELS: Record<RuntimeContextLimitSource, string> = {
+	override: "override",
+	"provider-metadata": "provider metadata",
+	fallback: "fallback default",
+};
 
 function formatExpiry(value: string): string {
 	const trimmed = value.trim();
@@ -642,6 +649,83 @@ export function ClineSetupSection({
 				</div>
 				{controller.isLoadingProviderModels ? (
 					<p className="text-text-secondary text-[12px] mt-1 mb-0">Fetching Cline models...</p>
+				) : null}
+			</div>
+
+			<div className="mt-4">
+				<p className="text-text-primary font-semibold text-[12px] mt-0 mb-2">Context budget</p>
+				<p className="text-text-secondary text-[12px] mt-0 mb-2">
+					Applies to all Cline sessions. Empty fields use the default for that setting.
+				</p>
+				<div className="grid gap-2" style={{ gridTemplateColumns: "1fr 1fr" }}>
+					<div className="min-w-0">
+						<p className="text-text-secondary text-[12px] mt-0 mb-1">Context window override (tokens)</p>
+						<input
+							value={controller.contextWindowOverrideTokens}
+							onChange={(event) => controller.setContextWindowOverrideTokens(event.target.value)}
+							placeholder="Default (provider metadata)"
+							inputMode="numeric"
+							disabled={controlsDisabled}
+							className="h-8 w-full rounded-md border border-border bg-surface-2 px-2 text-[13px] text-text-primary placeholder:text-text-tertiary focus:border-border-focus focus:outline-none"
+						/>
+					</div>
+					<div className="min-w-0">
+						<p className="text-text-secondary text-[12px] mt-0 mb-1">Compaction strategy</p>
+						<NativeSelect
+							fill
+							value={controller.compactionStrategy}
+							onChange={(event) =>
+								controller.setCompactionStrategy(event.target.value as "" | "basic" | "agentic")
+							}
+							disabled={controlsDisabled}
+						>
+							<option value="">Default (basic)</option>
+							<option value="basic">Basic</option>
+							<option value="agentic">Agentic</option>
+						</NativeSelect>
+					</div>
+					<div className="min-w-0">
+						<p className="text-text-secondary text-[12px] mt-0 mb-1">Compaction trigger threshold (0-1)</p>
+						<input
+							value={controller.triggerThresholdRatio}
+							onChange={(event) => controller.setTriggerThresholdRatio(event.target.value)}
+							placeholder="Default (0.8)"
+							inputMode="decimal"
+							disabled={controlsDisabled}
+							className="h-8 w-full rounded-md border border-border bg-surface-2 px-2 text-[13px] text-text-primary placeholder:text-text-tertiary focus:border-border-focus focus:outline-none"
+						/>
+					</div>
+					<div className="min-w-0">
+						<p className="text-text-secondary text-[12px] mt-0 mb-1">Output reserve (tokens)</p>
+						<input
+							value={controller.outputReserveTokens}
+							onChange={(event) => controller.setOutputReserveTokens(event.target.value)}
+							placeholder="Default (model max output)"
+							inputMode="numeric"
+							disabled={controlsDisabled}
+							className="h-8 w-full rounded-md border border-border bg-surface-2 px-2 text-[13px] text-text-primary placeholder:text-text-tertiary focus:border-border-focus focus:outline-none"
+						/>
+					</div>
+					<div className="min-w-0">
+						<p className="text-text-secondary text-[12px] mt-0 mb-1">Safety margin (tokens)</p>
+						<input
+							value={controller.safetyMarginTokens}
+							onChange={(event) => controller.setSafetyMarginTokens(event.target.value)}
+							placeholder="Default (computed)"
+							inputMode="numeric"
+							disabled={controlsDisabled}
+							className="h-8 w-full rounded-md border border-border bg-surface-2 px-2 text-[13px] text-text-primary placeholder:text-text-tertiary focus:border-border-focus focus:outline-none"
+						/>
+					</div>
+				</div>
+				{controller.contextBudgetError ? (
+					<p className="text-status-red text-[12px] mt-2 mb-0">{controller.contextBudgetError}</p>
+				) : null}
+				{controller.effectiveContextWindow ? (
+					<p className="text-text-secondary text-[12px] mt-2 mb-0">
+						Effective context window: {controller.effectiveContextWindow.limitTokens.toLocaleString()} tokens (
+						{CONTEXT_LIMIT_SOURCE_LABELS[controller.effectiveContextWindow.source]})
+					</p>
 				) : null}
 			</div>
 

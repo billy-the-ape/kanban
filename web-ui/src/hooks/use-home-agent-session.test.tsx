@@ -114,6 +114,8 @@ function createRuntimeConfig(overrides: Partial<RuntimeConfigResponse> = {}): Ru
 		openPrPromptTemplate: "pr",
 		commitPromptTemplateDefault: "commit",
 		openPrPromptTemplateDefault: "pr",
+		contextBudget: null,
+		effectiveContextWindow: null,
 		...overrides,
 	};
 }

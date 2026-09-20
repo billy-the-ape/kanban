@@ -12,10 +12,12 @@ import type {
 import { isHomeAgentSessionId } from "../core/home-agent-session";
 import { resolveHomeAgentAppendSystemPrompt } from "../prompts/append-system-prompt";
 import { captureTaskTurnCheckpoint, deleteTaskTurnCheckpointRef } from "../workspace/turn-checkpoints";
+import type { ClineCompactionConfig } from "./cline-compaction-config";
 import {
 	compactPersistedMessagesForContextOverflow,
 	isContextOverflowError,
 } from "./cline-context-overflow-compaction";
+import type { ContextLimitSource } from "./cline-context-policy";
 import { applyClineSessionEvent } from "./cline-event-adapter";
 import {
 	type ClineMessageRepository,
@@ -24,6 +26,7 @@ import {
 } from "./cline-message-repository";
 import { type ClineRuntimeSetup, createClineRuntimeSetup } from "./cline-runtime-setup";
 import {
+	type ClineLaunchConfigResolver,
 	type ClineSessionRuntime,
 	type CreateInMemoryClineSessionRuntimeOptions,
 	createInMemoryClineSessionRuntime,
@@ -74,6 +77,17 @@ export interface StartClineTaskSessionRequest {
 	baseUrl?: string | null;
 	reasoningEffort?: RuntimeClineReasoningEffort | null;
 	systemPrompt?: string | null;
+	/** B-2.2: resolved effective context limit in tokens (override → metadata → fallback). */
+	contextWindowTokens?: number;
+	/** Which tier supplied the resolved effective context limit. */
+	contextWindowSource?: ContextLimitSource;
+	/** B-2.4: explicit SDK compaction config built from the resolved launch config. */
+	compaction?: ClineCompactionConfig;
+	/**
+	 * B-2.9: user-set safety margin (tokens) from the global context budget;
+	 * forwarded to the session runtime for calibration + beforeModel hook.
+	 */
+	compactionSafetyMarginTokens?: number;
 }
 
 export interface ClineTaskSessionService {
@@ -106,6 +120,12 @@ export interface CreateInMemoryClineTaskSessionServiceOptions {
 	createMessageRepository?: () => ClineMessageRepository;
 	createRuntimeSetup?: (workspacePath: string) => Promise<ClineRuntimeSetup>;
 	watcherRegistry?: ClineWatcherRegistry;
+	/**
+	 * B-2.8: forwarded to the session runtime so restarts re-resolve the
+	 * launch config (context limit, compaction policy, credentials) from the
+	 * current provider settings instead of replaying the start-time snapshot.
+	 */
+	resolveClineLaunchConfig?: ClineLaunchConfigResolver;
 }
 
 function toErrorMessage(error: unknown): string {
@@ -179,6 +199,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			onTaskEvent: (taskId: string, event: unknown) => {
 				this.handleTaskEvent(taskId, event);
 			},
+			resolveClineLaunchConfig: options.resolveClineLaunchConfig,
 		});
 		this.messageRepository = createMessageRepository();
 	}
@@ -431,6 +452,10 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					systemPrompt,
 					userInstructionService: runtimeSetup.userInstructionService,
 					requestToolApproval: runtimeSetup.requestToolApproval,
+					contextWindowTokens: request.contextWindowTokens,
+					contextWindowSource: request.contextWindowSource,
+					compaction: request.compaction,
+					compactionSafetyMarginTokens: request.compactionSafetyMarginTokens,
 				});
 				const warningMessage = formatStartWarnings(startResult.warnings);
 				if (warningMessage) {

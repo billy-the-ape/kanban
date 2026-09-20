@@ -127,6 +127,7 @@ vi.mock("../../../src/server/browser.js", () => ({
 	openInBrowser: browserMocks.openInBrowser,
 }));
 
+import { buildClineCompactionConfig } from "../../../src/cline-sdk/cline-compaction-config";
 import type { RuntimeTrpcContext } from "../../../src/trpc/app-router";
 import { type CreateRuntimeApiDependencies, createRuntimeApi } from "../../../src/trpc/runtime-api";
 
@@ -570,6 +571,21 @@ describe("createRuntimeApi startTaskSession", () => {
 				],
 				providerId: "anthropic",
 				apiKey: "anthropic-api-key",
+				contextWindowTokens: 200_000,
+				contextWindowSource: "fallback",
+				// B-2.8: the board start entry carries the resolved compaction
+				// policy built from the same launch config.
+				compaction: buildClineCompactionConfig({
+					launchConfig: {
+						providerId: "anthropic",
+						modelId: "claude-sonnet-4-6",
+						apiKey: "anthropic-api-key",
+						baseUrl: null,
+						contextWindowTokens: 200_000,
+						contextWindowSource: "fallback",
+						maxTokens: null,
+					},
+				}),
 				mode: "act",
 				startInPlanMode: true,
 				resumeFromTrash: undefined,
@@ -1598,6 +1614,19 @@ describe("createRuntimeApi startTaskSession", () => {
 			apiKey: "sk-or-test",
 			baseUrl: "https://openrouter.ai/api/v1",
 			reasoningEffort: undefined,
+			contextWindowTokens: 200_000,
+			contextWindowSource: "fallback",
+			compaction: buildClineCompactionConfig({
+				launchConfig: {
+					providerId: "openrouter",
+					modelId: "openrouter/auto",
+					apiKey: "sk-or-test",
+					baseUrl: "https://openrouter.ai/api/v1",
+					contextWindowTokens: 200_000,
+					contextWindowSource: "fallback",
+					maxTokens: null,
+				},
+			}),
 		});
 	});
 
@@ -1696,6 +1725,13 @@ describe("createRuntimeApi startTaskSession", () => {
 				prompt: "hello home",
 				providerId: "cline",
 				apiKey: "workos:oauth-access",
+				// B-2.8: the home-agent auto-start entry carries the resolved
+				// compaction policy (model id is catalog-resolved, so assert
+				// the provider-bound summarizer instead of the full object).
+				compaction: expect.objectContaining({
+					enabled: true,
+					summarizer: expect.objectContaining({ providerId: "cline" }),
+				}),
 			}),
 		);
 		expect(oauthMocks.getValidClineCredentials).toHaveBeenCalledWith(
@@ -1923,6 +1959,7 @@ describe("createRuntimeApi startTaskSession", () => {
 				"deepseek-v4-pro": {
 					id: "deepseek-v4-pro",
 					name: "DeepSeek V4 Pro",
+					contextWindow: 131072,
 					capabilities: ["tools", "reasoning"],
 				},
 			},
@@ -1953,6 +1990,7 @@ describe("createRuntimeApi startTaskSession", () => {
 					id: "deepseek-v4-pro",
 					name: "DeepSeek V4 Pro",
 					supportsReasoningEffort: true,
+					contextWindow: 131072,
 				}),
 				expect.objectContaining({
 					id: "deepseek-chat",

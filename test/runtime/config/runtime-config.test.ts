@@ -472,3 +472,209 @@ describe.sequential("runtime-config auto agent selection", () => {
 		}
 	});
 });
+
+describe("B-2.9 — context budget settings", () => {
+	it("round-trips a full context budget through the global config file", async () => {
+		const { path: tempHome, cleanup: cleanupHome } = createTempDir("kanban-home-runtime-config-budget-roundtrip-");
+		const { path: tempProject, cleanup: cleanupProject } = createTempDir(
+			"kanban-project-runtime-config-budget-roundtrip-",
+		);
+
+		try {
+			await withTemporaryEnv({ home: tempHome }, async () => {
+				await loadRuntimeConfig(tempProject);
+				const updated = await updateRuntimeConfig(tempProject, {
+					contextBudget: {
+						contextWindowOverrideTokens: 131_072,
+						compactionStrategy: "agentic",
+						triggerThresholdRatio: 0.75,
+						outputReserveTokens: 8_192,
+						safetyMarginTokens: 6_000,
+					},
+				});
+				expect(updated.contextBudget).toEqual({
+					contextWindowOverrideTokens: 131_072,
+					compactionStrategy: "agentic",
+					triggerThresholdRatio: 0.75,
+					outputReserveTokens: 8_192,
+					safetyMarginTokens: 6_000,
+				});
+
+				const filePayload = JSON.parse(readFileSync(join(tempHome, ".cline", "kanban", "config.json"), "utf8")) as {
+					contextBudget?: Record<string, unknown>;
+				};
+				expect(filePayload.contextBudget).toEqual({
+					contextWindowOverrideTokens: 131_072,
+					compactionStrategy: "agentic",
+					triggerThresholdRatio: 0.75,
+					outputReserveTokens: 8_192,
+					safetyMarginTokens: 6_000,
+				});
+
+				const reloaded = await loadRuntimeConfig(tempProject);
+				expect(reloaded.contextBudget).toEqual({
+					contextWindowOverrideTokens: 131_072,
+					compactionStrategy: "agentic",
+					triggerThresholdRatio: 0.75,
+					outputReserveTokens: 8_192,
+					safetyMarginTokens: 6_000,
+				});
+			});
+		} finally {
+			cleanupProject();
+			cleanupHome();
+		}
+	});
+	it("treats null fields as clear-to-default and undefined fields as untouched", async () => {
+		const { path: tempHome, cleanup: cleanupHome } = createTempDir("kanban-home-runtime-config-budget-clear-");
+		const { path: tempProject, cleanup: cleanupProject } = createTempDir(
+			"kanban-project-runtime-config-budget-clear-",
+		);
+
+		try {
+			await withTemporaryEnv({ home: tempHome }, async () => {
+				await loadRuntimeConfig(tempProject);
+				await updateRuntimeConfig(tempProject, {
+					contextBudget: {
+						contextWindowOverrideTokens: 131_072,
+						compactionStrategy: "basic",
+						triggerThresholdRatio: 0.9,
+						outputReserveTokens: 4_096,
+						safetyMarginTokens: 8_000,
+					},
+				});
+
+				// Null clears a field; an absent (undefined) field leaves the
+				// stored value in place.
+				const cleared = await updateRuntimeConfig(tempProject, {
+					contextBudget: {
+						contextWindowOverrideTokens: null,
+						triggerThresholdRatio: null,
+						safetyMarginTokens: null,
+					},
+				});
+				expect(cleared.contextBudget).toEqual({
+					compactionStrategy: "basic",
+					outputReserveTokens: 4_096,
+				});
+
+				// A whole-object null clears every setting.
+				const clearedAll = await updateRuntimeConfig(tempProject, { contextBudget: null });
+				expect(clearedAll.contextBudget).toBeUndefined();
+				const filePayload = JSON.parse(readFileSync(join(tempHome, ".cline", "kanban", "config.json"), "utf8")) as {
+					contextBudget?: unknown;
+				};
+				expect(filePayload.contextBudget).toBeUndefined();
+			});
+		} finally {
+			cleanupProject();
+			cleanupHome();
+		}
+	});
+
+	it("leaves a stored context budget untouched when the update omits it", async () => {
+		const { path: tempHome, cleanup: cleanupHome } = createTempDir("kanban-home-runtime-config-budget-preserve-");
+		const { path: tempProject, cleanup: cleanupProject } = createTempDir(
+			"kanban-project-runtime-config-budget-preserve-",
+		);
+
+		try {
+			await withTemporaryEnv({ home: tempHome }, async () => {
+				await loadRuntimeConfig(tempProject);
+				await updateRuntimeConfig(tempProject, {
+					contextBudget: { outputReserveTokens: 2_048 },
+				});
+				const updated = await updateRuntimeConfig(tempProject, {
+					readyForReviewNotificationsEnabled: false,
+				});
+				expect(updated.contextBudget).toEqual({ outputReserveTokens: 2_048 });
+			});
+		} finally {
+			cleanupProject();
+			cleanupHome();
+		}
+	});
+
+	it("rejects invalid context budget values on save", async () => {
+		const { path: tempHome, cleanup: cleanupHome } = createTempDir("kanban-home-runtime-config-budget-invalid-");
+		const { path: tempProject, cleanup: cleanupProject } = createTempDir(
+			"kanban-project-runtime-config-budget-invalid-",
+		);
+
+		try {
+			await withTemporaryEnv({ home: tempHome }, async () => {
+				await loadRuntimeConfig(tempProject);
+				await expect(
+					updateRuntimeConfig(tempProject, {
+						contextBudget: { contextWindowOverrideTokens: -5 },
+					}),
+				).rejects.toThrow("contextWindowOverrideTokens must be a positive integer token count.");
+				await expect(
+					updateRuntimeConfig(tempProject, {
+						contextBudget: { triggerThresholdRatio: 1.5 },
+					}),
+				).rejects.toThrow("triggerThresholdRatio must be a number between 0 and 1 (exclusive of 0).");
+				await expect(
+					updateRuntimeConfig(tempProject, {
+						contextBudget: { compactionStrategy: "aggressive" as never },
+					}),
+				).rejects.toThrow("compactionStrategy must be either 'basic' or 'agentic'.");
+				await expect(
+					updateRuntimeConfig(tempProject, {
+						contextBudget: { triggerThresholdRatio: 0 },
+					}),
+				).rejects.toThrow("triggerThresholdRatio must be a number between 0 and 1 (exclusive of 0).");
+				await expect(
+					updateRuntimeConfig(tempProject, {
+						contextBudget: { triggerThresholdRatio: 1.2 },
+					}),
+				).rejects.toThrow("triggerThresholdRatio must be a number between 0 and 1 (exclusive of 0).");
+				await expect(
+					updateRuntimeConfig(tempProject, {
+						contextBudget: { outputReserveTokens: 1.5 },
+					}),
+				).rejects.toThrow("outputReserveTokens must be a positive integer token count.");
+				await expect(
+					updateRuntimeConfig(tempProject, {
+						contextBudget: { safetyMarginTokens: -1 },
+					}),
+				).rejects.toThrow("safetyMarginTokens must be a positive integer token count.");
+			});
+		} finally {
+			cleanupProject();
+			cleanupHome();
+		}
+	});
+
+	it("drops corrupted context budget fields when loading instead of failing", async () => {
+		const { path: tempHome, cleanup: cleanupHome } = createTempDir("kanban-home-runtime-config-budget-corrupt-");
+		const { path: tempProject, cleanup: cleanupProject } = createTempDir(
+			"kanban-project-runtime-config-budget-corrupt-",
+		);
+
+		try {
+			await withTemporaryEnv({ home: tempHome }, async () => {
+				mkdirSync(join(tempHome, ".cline", "kanban"), { recursive: true });
+				writeFileSync(
+					join(tempHome, ".cline", "kanban", "config.json"),
+					JSON.stringify({
+						contextBudget: {
+							contextWindowOverrideTokens: "big",
+							compactionStrategy: "aggressive",
+							triggerThresholdRatio: 1.5,
+							outputReserveTokens: 4_096,
+							safetyMarginTokens: 0,
+						},
+					}),
+					"utf8",
+				);
+				const state = await loadRuntimeConfig(tempProject);
+				// Only the valid field survives normalization.
+				expect(state.contextBudget).toEqual({ outputReserveTokens: 4_096 });
+			});
+		} finally {
+			cleanupProject();
+			cleanupHome();
+		}
+	});
+});

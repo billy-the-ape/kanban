@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import { createHTTPHandler } from "@trpc/server/adapters/standalone";
 import { handleClineMcpOauthCallback } from "../cline-sdk/cline-mcp-runtime-service";
+import { createClineProviderService } from "../cline-sdk/cline-provider-service";
 import {
 	type ClineTaskSessionService,
 	createInMemoryClineTaskSessionService,
@@ -143,6 +144,9 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		await deps.ensureTerminalManagerForWorkspace(scope.workspaceId, scope.workspacePath);
 	const clineTaskSessionServiceByWorkspaceId = new Map<string, ClineTaskSessionService>();
 	const clineWatcherRegistry = createClineWatcherRegistry();
+	// B-2.8: one provider service per runtime server so the model-capacity
+	// cache is shared across all session starts/restarts in this process.
+	const clineProviderService = createClineProviderService();
 	const getScopedClineTaskSessionService = async (
 		scope: RuntimeTrpcWorkspaceScope,
 	): Promise<ClineTaskSessionService> => {
@@ -150,6 +154,10 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		if (!service) {
 			service = createInMemoryClineTaskSessionService({
 				watcherRegistry: clineWatcherRegistry,
+				// B-2.8: restarts re-resolve the launch config (context limit,
+				// compaction policy, credentials) from the current provider
+				// settings instead of replaying the start-time snapshot.
+				resolveClineLaunchConfig: (overrides) => clineProviderService.resolveLaunchConfig(overrides),
 			});
 			clineTaskSessionServiceByWorkspaceId.set(scope.workspaceId, service);
 			deps.runtimeStateHub.trackClineTaskSessionService(scope.workspaceId, scope.workspacePath, service);

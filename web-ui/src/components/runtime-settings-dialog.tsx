@@ -473,6 +473,10 @@ export function RuntimeSettingsDialog({
 		if (clineSettings.hasUnsavedChanges) {
 			return true;
 		}
+		// B-2.9: context budget is global scope, only editable for the Cline agent.
+		if (selectedAgentId === "cline" && clineSettings.hasUnsavedContextBudgetChanges) {
+			return true;
+		}
 		if (clineMcpSettings.hasUnsavedChanges) {
 			return true;
 		}
@@ -496,6 +500,7 @@ export function RuntimeSettingsDialog({
 		agentAutonomousModeEnabled,
 		clineMcpSettings.hasUnsavedChanges,
 		clineSettings.hasUnsavedChanges,
+		clineSettings.hasUnsavedContextBudgetChanges,
 		commitPromptTemplate,
 		config,
 		draftThemeId,
@@ -685,6 +690,11 @@ export function RuntimeSettingsDialog({
 			setSaveError("Choose a Cline provider before saving.");
 			return;
 		}
+		// B-2.9: an invalid context budget draft blocks the whole save.
+		if (selectedAgentId === "cline" && clineSettings.contextBudgetError) {
+			setSaveError(clineSettings.contextBudgetError);
+			return;
+		}
 		if (selectedAgentId === "cline") {
 			const clineProviderSaveResult = await clineSettings.saveProviderSettings();
 			if (!clineProviderSaveResult.ok) {
@@ -704,6 +714,12 @@ export function RuntimeSettingsDialog({
 			shortcuts,
 			commitPromptTemplate,
 			openPrPromptTemplate,
+			// B-2.9: only send the context budget when the Cline agent is
+			// selected and the draft actually changed (empty fields send null,
+			// which clears them to the default).
+			...(selectedAgentId === "cline" && clineSettings.hasUnsavedContextBudgetChanges && clineSettings.contextBudget
+				? { contextBudget: clineSettings.contextBudget }
+				: {}),
 		});
 		if (!saved) {
 			setSaveError("Could not save runtime settings. Check runtime logs and try again.");

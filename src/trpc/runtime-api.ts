@@ -7,6 +7,7 @@ import { rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { TRPCError } from "@trpc/server";
+import { buildClineCompactionConfig } from "../cline-sdk/cline-compaction-config";
 import { createClineMcpRuntimeService } from "../cline-sdk/cline-mcp-runtime-service";
 import { createClineMcpSettingsService } from "../cline-sdk/cline-mcp-settings-service";
 import { createClineProviderService } from "../cline-sdk/cline-provider-service";
@@ -16,6 +17,7 @@ import type { RuntimeConfigState } from "../config/runtime-config";
 import { updateGlobalRuntimeConfig, updateRuntimeConfig } from "../config/runtime-config";
 import type {
 	RuntimeCommandRunResponse,
+	RuntimeEffectiveContextWindow,
 	RuntimeRunUpdateResponse,
 	RuntimeUpdateStatusResponse,
 } from "../core/api-contract";
@@ -105,8 +107,21 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		join(homedir(), ".cline", "worktrees"),
 	] as const;
 
-	const buildConfigResponse = (runtimeConfig: RuntimeConfigState) =>
-		buildRuntimeConfigResponse(runtimeConfig, clineProviderService.getProviderSettingsSummary());
+	// B-2.9: the effective context window (budget override → provider-settings
+	// override → provider metadata → fallback) is diagnostic input for the
+	// settings UI; a lookup failure must never fail the whole config read.
+	const buildConfigResponse = async (runtimeConfig: RuntimeConfigState) => {
+		const clineProviderSettings = clineProviderService.getProviderSettingsSummary();
+		let effectiveContextWindow: RuntimeEffectiveContextWindow | null = null;
+		try {
+			effectiveContextWindow = await clineProviderService.resolveEffectiveContextWindow(
+				runtimeConfig.contextBudget?.contextWindowOverrideTokens,
+			);
+		} catch {
+			effectiveContextWindow = null;
+		}
+		return buildRuntimeConfigResponse(runtimeConfig, clineProviderSettings, { effectiveContextWindow });
+	};
 
 	return {
 		loadConfig: async (workspaceScope) => {
@@ -243,6 +258,10 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 						apiKey: clineLaunchConfig.apiKey,
 						baseUrl: clineLaunchConfig.baseUrl,
 						reasoningEffort: clineLaunchConfig.reasoningEffort,
+						contextWindowTokens: clineLaunchConfig.contextWindowTokens,
+						contextWindowSource: clineLaunchConfig.contextWindowSource,
+						compaction: buildClineCompactionConfig({ launchConfig: clineLaunchConfig }),
+						compactionSafetyMarginTokens: clineLaunchConfig.compactionSettings?.safetyMarginTokens,
 					});
 
 					let nextSummary = summary;
@@ -435,6 +454,10 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 						apiKey: clineLaunchConfig.apiKey,
 						baseUrl: clineLaunchConfig.baseUrl,
 						reasoningEffort: clineLaunchConfig.reasoningEffort,
+						contextWindowTokens: clineLaunchConfig.contextWindowTokens,
+						contextWindowSource: clineLaunchConfig.contextWindowSource,
+						compaction: buildClineCompactionConfig({ launchConfig: clineLaunchConfig }),
+						compactionSafetyMarginTokens: clineLaunchConfig.compactionSettings?.safetyMarginTokens,
 					});
 				}
 				if (!summary) {
@@ -638,6 +661,10 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 							apiKey: clineLaunchConfig.apiKey,
 							baseUrl: clineLaunchConfig.baseUrl,
 							reasoningEffort: clineLaunchConfig.reasoningEffort,
+							contextWindowTokens: clineLaunchConfig.contextWindowTokens,
+							contextWindowSource: clineLaunchConfig.contextWindowSource,
+							compaction: buildClineCompactionConfig({ launchConfig: clineLaunchConfig }),
+							compactionSafetyMarginTokens: clineLaunchConfig.compactionSettings?.safetyMarginTokens,
 						});
 					}
 				}
