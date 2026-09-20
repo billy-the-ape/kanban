@@ -5,7 +5,7 @@
 // real model endpoint:
 //
 // - GET  /v1/models           -> model catalog
-// - POST /v1/chat/completions -> scripted replies, streaming or not
+// - POST /v1/chat/completions -> scripted replies (text or tool calls), streaming or not
 //
 // `contextLimitTokens` makes overflow deterministic: when the estimated token
 // count of a request exceeds the limit the server rejects it with the exact
@@ -27,6 +27,15 @@ export interface FakeOpenAiProviderRequest {
 	exceededContextLimit: boolean;
 }
 
+/**
+ * Scripted per-request reply. `tool-call` makes the client execute the tool
+ * and send the result back as the next request, so a real SDK client can be
+ * driven through multi-turn tool flows (B-2-10 acceptance S5).
+ */
+export type FakeOpenAiScriptedReply =
+	| { kind: "text"; text: string }
+	| { kind: "tool-call"; toolName: string; arguments: unknown; toolCallId?: string };
+
 export interface FakeOpenAiProviderOptions {
 	/** Model id advertised by /v1/models and echoed in completions. */
 	modelId?: string;
@@ -41,6 +50,12 @@ export interface FakeOpenAiProviderOptions {
 	countTokens?: (body: { messages?: unknown[]; model?: string }) => number;
 	/** Produce the assistant reply for an accepted request. */
 	respondWith?: (request: FakeOpenAiProviderRequest) => string;
+	/**
+	 * Scripted per-request reply; takes precedence over `respondWith`.
+	 * Return `{ kind: "tool-call" }` to make the client execute the tool and
+	 * send the result back on the next request.
+	 */
+	replyWith?: (request: FakeOpenAiProviderRequest) => FakeOpenAiScriptedReply;
 	/** When set, requests with a different Bearer token get a 401. */
 	apiKey?: string;
 }
@@ -154,9 +169,59 @@ export function createFakeOpenAiProvider(options: FakeOpenAiProviderOptions = {}
 				return;
 			}
 
-			const content = options.respondWith
-				? options.respondWith(providerRequest)
-				: `ok (${providerRequest.messageCount} messages)`;
+			const scripted = options.replyWith ? options.replyWith(providerRequest) : undefined;
+			if (scripted && scripted.kind === "tool-call") {
+				const toolCall = {
+					index: 0,
+					id: scripted.toolCallId ?? `call-fake-${requests.length}`,
+					type: "function",
+					function: { name: scripted.toolName, arguments: JSON.stringify(scripted.arguments) },
+				};
+				if (body.stream) {
+					// The full call (id, name, arguments) in one delta, then
+					// finish_reason "tool_calls" — the shape the Vercel AI SDK
+					// openai-compatible provider parses (see
+					// tool-output-bounds.test.ts).
+					res.writeHead(200, { "content-type": "text/event-stream" });
+					const base = { id: "chatcmpl-fake", object: "chat.completion.chunk", model: providerRequest.model };
+					res.write(
+						`data: ${JSON.stringify({
+							...base,
+							choices: [{ index: 0, delta: { role: "assistant", content: "", tool_calls: [toolCall] } }],
+						})}\n\n`,
+					);
+					res.write(
+						`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`,
+					);
+					res.write("data: [DONE]\n\n");
+					res.end();
+					return;
+				}
+				sendJson(res, 200, {
+					id: "chatcmpl-fake",
+					object: "chat.completion",
+					model: providerRequest.model,
+					choices: [
+						{
+							index: 0,
+							message: { role: "assistant", content: null, tool_calls: [toolCall] },
+							finish_reason: "tool_calls",
+						},
+					],
+					usage: {
+						prompt_tokens: providerRequest.tokenCount,
+						completion_tokens: 0,
+						total_tokens: providerRequest.tokenCount,
+					},
+				});
+				return;
+			}
+			const content =
+				scripted && scripted.kind === "text"
+					? scripted.text
+					: options.respondWith
+						? options.respondWith(providerRequest)
+						: `ok (${providerRequest.messageCount} messages)`;
 			if (body.stream) {
 				res.writeHead(200, { "content-type": "text/event-stream" });
 				const chunk = {

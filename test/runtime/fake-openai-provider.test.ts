@@ -158,4 +158,104 @@ describe("fake OpenAI-compatible provider (B-1.4)", () => {
 			expect(accepted.status).toBe(200);
 		});
 	});
+
+	describe("scripted tool-call replies (replyWith)", () => {
+		it("streams an SSE tool call for the first request and text afterwards", async () => {
+			const provider = createFakeOpenAiProvider({
+				replyWith: (request) =>
+					request.lastMessage === "run the tool"
+						? {
+								kind: "tool-call",
+								toolCallId: "call-scripted-1",
+								toolName: "run_commands",
+								arguments: { commands: ["echo hi"] },
+							}
+						: { kind: "text", text: "tool done" },
+			});
+			await withProvider(provider, async (p) => {
+				const post = (body: unknown) =>
+					fetch(`${p.baseUrl}/chat/completions`, {
+						method: "POST",
+						headers: { "content-type": "application/json" },
+						body: JSON.stringify(body),
+					});
+
+				const first = await post({
+					model: "fake-local-model",
+					stream: true,
+					messages: [{ role: "user", content: "run the tool" }],
+				});
+				expect(first.status).toBe(200);
+				const firstText = await first.text();
+				expect(firstText).toContain('"name":"run_commands"');
+				expect(firstText).toContain('"call-scripted-1"');
+				expect(firstText).toContain('"finish_reason":"tool_calls"');
+				expect(firstText.trimEnd().endsWith("data: [DONE]")).toBe(true);
+
+				const second = await post({
+					model: "fake-local-model",
+					stream: true,
+					messages: [{ role: "tool", content: "hi" }],
+				});
+				expect(second.status).toBe(200);
+				const secondText = await second.text();
+				expect(secondText).toContain('"content":"tool done"');
+
+				expect(provider.requests).toHaveLength(2);
+			});
+		});
+
+		it("answers non-streaming tool-call replies with the OpenAI tool_calls shape", async () => {
+			const provider = createFakeOpenAiProvider({
+				replyWith: () => ({ kind: "tool-call", toolName: "read_files", arguments: { path: "/x" } }),
+			});
+			await withProvider(provider, async (p) => {
+				const response = await fetch(`${p.baseUrl}/chat/completions`, {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ model: "fake-local-model", messages: [{ role: "user", content: "read it" }] }),
+				});
+				expect(response.status).toBe(200);
+				const payload = (await response.json()) as {
+					choices: Array<{
+						message: {
+							content: string | null;
+							tool_calls?: Array<{ id: string; type: string; function: { name: string; arguments: string } }>;
+						};
+						finish_reason: string;
+					}>;
+				};
+				expect(payload.choices[0]?.finish_reason).toBe("tool_calls");
+				expect(payload.choices[0]?.message.content).toBeNull();
+				expect(payload.choices[0]?.message.tool_calls?.[0]).toMatchObject({
+					id: "call-fake-1",
+					type: "function",
+					function: { name: "read_files", arguments: JSON.stringify({ path: "/x" }) },
+				});
+			});
+		});
+
+		it("enforces the context limit before scripted replies run", async () => {
+			const provider = createFakeOpenAiProvider({
+				contextLimitTokens: 1,
+				countTokens: (body) => (body.messages ?? []).length,
+				replyWith: () => ({ kind: "tool-call", toolName: "run_commands", arguments: { commands: ["echo hi"] } }),
+			});
+			await withProvider(provider, async (p) => {
+				const response = await fetch(`${p.baseUrl}/chat/completions`, {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({
+						model: "fake-local-model",
+						messages: [
+							{ role: "user", content: "a" },
+							{ role: "user", content: "b" },
+						],
+					}),
+				});
+				expect(response.status).toBe(400);
+				expect(provider.requests[0]?.exceededContextLimit).toBe(true);
+			});
+		});
+	});
 });
