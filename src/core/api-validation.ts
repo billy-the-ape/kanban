@@ -23,6 +23,7 @@ import {
 	type RuntimeTaskChatMessagesRequest,
 	type RuntimeTaskChatReloadRequest,
 	type RuntimeTaskChatSendRequest,
+	type RuntimeTaskPreservationRequest,
 	type RuntimeTaskSessionInputRequest,
 	type RuntimeTaskSessionStartRequest,
 	type RuntimeTaskSessionStopRequest,
@@ -55,6 +56,7 @@ import {
 	runtimeTaskChatMessagesRequestSchema,
 	runtimeTaskChatReloadRequestSchema,
 	runtimeTaskChatSendRequestSchema,
+	runtimeTaskPreservationRequestSchema,
 	runtimeTaskSessionInputRequestSchema,
 	runtimeTaskSessionStartRequestSchema,
 	runtimeTaskSessionStopRequestSchema,
@@ -168,6 +170,17 @@ export function parseWorktreeDeleteRequest(value: unknown): RuntimeWorktreeDelet
 	const taskId = parsed.taskId.trim();
 	if (!taskId) {
 		throw new Error("Invalid worktree delete payload.");
+	}
+	return {
+		taskId,
+	};
+}
+
+export function parseTaskPreservationRequest(value: unknown): RuntimeTaskPreservationRequest {
+	const parsed = parseWithSchema(runtimeTaskPreservationRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Invalid task preservation payload.");
 	}
 	return {
 		taskId,

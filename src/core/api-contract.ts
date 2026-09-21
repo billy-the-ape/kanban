@@ -74,11 +74,12 @@ export type RuntimeSlashCommandsResponse = z.infer<typeof runtimeSlashCommandsRe
 export const runtimeAgentIdSchema = z.enum(["claude", "codex", "gemini", "opencode", "droid", "kiro", "cline"]);
 export type RuntimeAgentId = z.infer<typeof runtimeAgentIdSchema>;
 
-const runtimeBoardColumnIdEnum = z.enum(["backlog", "in_progress", "review", "trash"]);
-export const runtimeBoardColumnIdSchema = z.preprocess(
-	(val) => (val === "done" ? "trash" : val),
-	runtimeBoardColumnIdEnum,
-);
+// Board columns are split into a distinct "done" column (completed work,
+// workspace retained) and a "trash" column (discarded work, safety-gated
+// cleanup). Legacy persisted boards that only have a "trash" column are
+// migrated by workspace-state normalization (trash cards -> done).
+const runtimeBoardColumnIdEnum = z.enum(["backlog", "in_progress", "review", "done", "trash"]);
+export const runtimeBoardColumnIdSchema = runtimeBoardColumnIdEnum;
 export type RuntimeBoardColumnId = z.infer<typeof runtimeBoardColumnIdEnum>;
 
 const runtimeTaskAutoReviewModeEnum = z.enum(["commit", "pr"]);
@@ -331,6 +332,7 @@ export const runtimeProjectTaskCountsSchema = z.object({
 	backlog: z.number(),
 	in_progress: z.number(),
 	review: z.number(),
+	done: z.number(),
 	trash: z.number(),
 });
 export type RuntimeProjectTaskCounts = z.infer<typeof runtimeProjectTaskCountsSchema>;
@@ -551,6 +553,7 @@ export const runtimeWorktreeEnsureResponseSchema = z.union([
 		baseCommit: z.string(),
 		warning: z.string().optional(),
 		error: z.string().optional(),
+		restoredFromPreservation: z.boolean().default(false),
 	}),
 	z.object({
 		ok: z.literal(false),
@@ -570,9 +573,65 @@ export type RuntimeWorktreeDeleteRequest = z.infer<typeof runtimeWorktreeDeleteR
 export const runtimeWorktreeDeleteResponseSchema = z.object({
 	ok: z.boolean(),
 	removed: z.boolean(),
+	// Whether the task work was durably preserved (ref + patch + archive)
+	// before the worktree was removed. When cleanup is blocked, removed is
+	// false and the worktree is retained as-is.
+	preserved: z.boolean().default(false),
+	blockedReason: z.string().nullable().default(null),
 	error: z.string().optional(),
 });
 export type RuntimeWorktreeDeleteResponse = z.infer<typeof runtimeWorktreeDeleteResponseSchema>;
+
+export const runtimeTaskPreservationRecordSchema = z.object({
+	taskId: z.string(),
+	worktreePath: z.string(),
+	repoPath: z.string(),
+	// Commit the worktree was created from (the task's starting point).
+	startingCommit: z.string().nullable().default(null),
+	// Latest commit observed at the worktree HEAD during the last
+	// preservation/reconciliation pass.
+	latestCommit: z.string().nullable().default(null),
+	status: z.enum(["active", "preserved", "blocked"]),
+	blockedReasons: z.array(z.string()).default([]),
+	patchPath: z.string().nullable().default(null),
+	archivePath: z.string().nullable().default(null),
+	// refs/kanban/tasks/<taskId> captured in the repository object store.
+	refName: z.string().nullable().default(null),
+	preservedAt: z.number().nullable().default(null),
+	updatedAt: z.number(),
+});
+export type RuntimeTaskPreservationRecord = z.infer<typeof runtimeTaskPreservationRecordSchema>;
+
+export const runtimeTaskPreservationRecordStoreSchema = z.record(z.string(), runtimeTaskPreservationRecordSchema);
+export type RuntimeTaskPreservationRecordStore = z.infer<typeof runtimeTaskPreservationRecordStoreSchema>;
+
+export const runtimeTaskPreservationRequestSchema = z.object({
+	taskId: z.string(),
+});
+export type RuntimeTaskPreservationRequest = z.infer<typeof runtimeTaskPreservationRequestSchema>;
+
+export const runtimeTaskPreservationInfoResponseSchema = z.object({
+	ok: z.boolean(),
+	worktreeExists: z.boolean(),
+	worktreePath: z.string(),
+	headCommit: z.string().nullable().default(null),
+	dirty: z.boolean(),
+	changedFiles: z.array(z.string()).default([]),
+	commitsAheadOfBase: z.number().int().min(0).default(0),
+	preservation: runtimeTaskPreservationRecordSchema.nullable().default(null),
+	error: z.string().optional(),
+});
+export type RuntimeTaskPreservationInfoResponse = z.infer<typeof runtimeTaskPreservationInfoResponseSchema>;
+
+export const runtimeTaskWorktreeRecoverResponseSchema = z.object({
+	ok: z.boolean(),
+	restored: z.boolean(),
+	path: z.string().nullable(),
+	headCommit: z.string().nullable().default(null),
+	warning: z.string().optional(),
+	error: z.string().optional(),
+});
+export type RuntimeTaskWorktreeRecoverResponse = z.infer<typeof runtimeTaskWorktreeRecoverResponseSchema>;
 
 export const runtimeTaskWorkspaceInfoRequestSchema = z.object({
 	taskId: z.string(),

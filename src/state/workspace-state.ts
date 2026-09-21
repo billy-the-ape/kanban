@@ -31,11 +31,16 @@ const META_FILENAME = "meta.json";
 const INDEX_VERSION = 1;
 const WORKSPACE_ID_COLLISION_SUFFIX_LENGTH = 4;
 
+// Board columns are split into a distinct "done" column (completed work,
+// workspace retained) and a "trash" column (discarded work, safety-gated
+// cleanup). Legacy persisted boards that only have a "trash" column are
+// migrated by migrateLegacyTrashBoard (trash cards -> done).
 const BOARD_COLUMNS: Array<{ id: RuntimeBoardColumnId; title: string }> = [
 	{ id: "backlog", title: "Backlog" },
 	{ id: "in_progress", title: "In Progress" },
 	{ id: "review", title: "Review" },
-	{ id: "trash", title: "Done" },
+	{ id: "done", title: "Done" },
+	{ id: "trash", title: "Trash" },
 ];
 
 interface WorkspaceIndexEntry {
@@ -147,6 +152,34 @@ function createEmptyBoard(): RuntimeBoardData {
 			cards: [],
 		})),
 		dependencies: [],
+	};
+}
+
+// Legacy boards pre-date the done/trash split and only have a "trash" column
+// (titled "Done") that mixed completed and discarded cards. Those cards were
+// completed work, so they migrate into the new "done" column and the "trash"
+// column is left empty for future disposals.
+export function migrateLegacyTrashBoard(board: RuntimeBoardData): RuntimeBoardData {
+	if (board.columns.some((column) => column.id === "done")) {
+		return board;
+	}
+	const legacyTrashColumn = board.columns.find((column) => column.id === "trash");
+	const columns: RuntimeBoardData["columns"] = [];
+	for (const column of board.columns) {
+		if (column.id === "trash") {
+			columns.push({ id: "done", title: "Done", cards: column.cards });
+			columns.push({ ...column, cards: [] });
+		} else {
+			columns.push(column);
+		}
+	}
+	if (!legacyTrashColumn) {
+		columns.push({ id: "done", title: "Done", cards: [] });
+		columns.push({ id: "trash", title: "Trash", cards: [] });
+	}
+	return {
+		...board,
+		columns,
 	};
 }
 
@@ -295,9 +328,14 @@ function parseWorkspaceStateSavePayload(payload: RuntimeWorkspaceStateSaveReques
 async function readWorkspaceBoard(workspaceId: string): Promise<RuntimeBoardData> {
 	const boardPath = getWorkspaceBoardPath(workspaceId);
 	const rawBoard = await readJsonFile(boardPath);
-	return updateTaskDependencies(
-		parsePersistedStateFile(boardPath, BOARD_FILENAME, rawBoard, runtimeBoardDataSchema, createEmptyBoard()),
+	const parsed = parsePersistedStateFile(
+		boardPath,
+		BOARD_FILENAME,
+		rawBoard,
+		runtimeBoardDataSchema,
+		createEmptyBoard(),
 	);
+	return updateTaskDependencies(migrateLegacyTrashBoard(parsed));
 }
 
 export async function loadWorkspaceBoardById(workspaceId: string): Promise<RuntimeBoardData> {

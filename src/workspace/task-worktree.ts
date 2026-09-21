@@ -2,21 +2,30 @@ import { access, lstat, mkdir, readdir, readFile, rm, symlink } from "node:fs/pr
 import { dirname, isAbsolute, join } from "node:path";
 
 import type {
+	RuntimeTaskPreservationInfoResponse,
+	RuntimeTaskPreservationRecord,
 	RuntimeTaskWorkspaceInfoResponse,
+	RuntimeTaskWorktreeRecoverResponse,
 	RuntimeWorktreeDeleteResponse,
 	RuntimeWorktreeEnsureResponse,
 } from "../core/api-contract";
 import { type LockRequest, lockedFileSystem } from "../fs/locked-file-system";
-import { getRuntimeHomePath, getTaskWorktreesHomePath, loadWorkspaceContext } from "../state/workspace-state";
+import { getTaskWorktreesHomePath, loadWorkspaceContext } from "../state/workspace-state";
 import { getGitCommandErrorMessage, getGitStdout, readGitHeadInfo, runGit } from "./git-utils";
+import { applyTaskPatch, findTaskPatch } from "./task-patch";
+import {
+	applyPreservedWorktreeContent,
+	preserveTaskWorktree,
+	readTaskPreservationRecord,
+	resolveTaskPreservationRestoreTarget,
+	syncTaskPreservationActivity,
+} from "./task-preservation";
 import { getWorkspaceFolderLabelForWorktreePath, normalizeTaskIdForWorktreePath } from "./task-worktree-path";
 import { listTurbopackNodeModulesSymlinkSkipPaths } from "./task-worktree-turbopack";
 
 const KANBAN_MANAGED_EXCLUDE_BLOCK_START = "# kanban-managed-symlinked-ignored-paths:start";
 const KANBAN_MANAGED_EXCLUDE_BLOCK_END = "# kanban-managed-symlinked-ignored-paths:end";
-const KANBAN_TRASHED_TASK_PATCHES_DIR_NAME = "trashed-task-patches";
 const KANBAN_TASK_WORKTREE_SETUP_LOCKFILE_NAME = "kanban-task-worktree-setup.lock";
-const TASK_PATCH_FILE_SUFFIX = ".patch";
 
 const SYMLINK_PATH_SEGMENT_BLACKLIST = new Set([
 	".git",
@@ -124,117 +133,9 @@ function getWorktreesBaseRootPath(): string {
 	return getTaskWorktreesHomePath();
 }
 
-function getTrashedTaskPatchesRootPath(): string {
-	return join(getRuntimeHomePath(), KANBAN_TRASHED_TASK_PATCHES_DIR_NAME);
-}
-
 function getTaskWorktreePath(repoPath: string, taskId: string): string {
 	const workspaceLabel = getWorkspaceFolderLabelForWorktreePath(repoPath);
 	return join(getWorktreesRootPath(taskId), workspaceLabel);
-}
-
-function getTaskPatchFilePrefix(taskId: string): string {
-	return `${normalizeTaskIdForWorktreePath(taskId)}.`;
-}
-
-function parseTaskPatchCommit(taskId: string, filename: string): string | null {
-	const prefix = getTaskPatchFilePrefix(taskId);
-	if (!filename.startsWith(prefix) || !filename.endsWith(TASK_PATCH_FILE_SUFFIX)) {
-		return null;
-	}
-	const commit = filename.slice(prefix.length, -TASK_PATCH_FILE_SUFFIX.length).trim();
-	return commit.length > 0 ? commit : null;
-}
-
-async function listTaskPatchFiles(taskId: string): Promise<string[]> {
-	const patchesRootPath = getTrashedTaskPatchesRootPath();
-	try {
-		const entries = await readdir(patchesRootPath);
-		return entries.filter((entry) => parseTaskPatchCommit(taskId, entry) !== null);
-	} catch {
-		return [];
-	}
-}
-
-async function deleteTaskPatchFiles(taskId: string): Promise<void> {
-	const patchesRootPath = getTrashedTaskPatchesRootPath();
-	const filenames = await listTaskPatchFiles(taskId);
-	await Promise.all(filenames.map((filename) => rm(join(patchesRootPath, filename), { force: true })));
-}
-
-async function findTaskPatch(taskId: string): Promise<{ path: string; commit: string } | null> {
-	const patchesRootPath = getTrashedTaskPatchesRootPath();
-	const filenames = await listTaskPatchFiles(taskId);
-	const filename = filenames.sort().at(-1);
-	if (!filename) {
-		return null;
-	}
-	const commit = parseTaskPatchCommit(taskId, filename);
-	if (!commit) {
-		return null;
-	}
-	return {
-		path: join(patchesRootPath, filename),
-		commit,
-	};
-}
-
-function ensureTrailingNewline(value: string): string {
-	return value.endsWith("\n") ? value : `${value}\n`;
-}
-
-async function listUntrackedPaths(worktreePath: string): Promise<string[]> {
-	// Original used runGitRaw (throws on failure).
-	const output = await getGitStdout(["ls-files", "--others", "--exclude-standard", "-z"], worktreePath, {
-		trimStdout: false,
-	});
-	return output
-		.split("\0")
-		.map((path) => path.trim())
-		.filter((path) => path.length > 0);
-}
-
-async function captureTaskPatch(options: { repoPath: string; taskId: string; worktreePath: string }): Promise<void> {
-	const headCommit = await getGitStdout(["rev-parse", "--verify", "HEAD"], options.worktreePath);
-
-	const trackedResult = await runGit(options.worktreePath, ["diff", "--binary", "HEAD", "--"], { trimStdout: false });
-	if (!trackedResult.ok && trackedResult.exitCode !== 1) {
-		throw new Error(trackedResult.error ?? "Failed to capture tracked diff.");
-	}
-	const trackedPatch = trackedResult.stdout;
-	const patchChunks = trackedPatch.trim().length > 0 ? [ensureTrailingNewline(trackedPatch)] : [];
-
-	for (const relativePath of await listUntrackedPaths(options.worktreePath)) {
-		const untrackedResult = await runGit(
-			options.worktreePath,
-			["diff", "--binary", "--no-index", "--", "/dev/null", relativePath],
-			{ trimStdout: false },
-		);
-		if (!untrackedResult.ok && untrackedResult.exitCode !== 1) {
-			throw new Error(untrackedResult.error ?? "Failed to capture untracked diff.");
-		}
-		const untrackedPatch = untrackedResult.stdout;
-		if (untrackedPatch.trim().length > 0) {
-			patchChunks.push(ensureTrailingNewline(untrackedPatch));
-		}
-	}
-
-	await deleteTaskPatchFiles(options.taskId);
-	if (patchChunks.length === 0) {
-		return;
-	}
-
-	const patchesRootPath = getTrashedTaskPatchesRootPath();
-	await mkdir(patchesRootPath, { recursive: true });
-	const patchPath = join(
-		patchesRootPath,
-		`${normalizeTaskIdForWorktreePath(options.taskId)}.${headCommit}${TASK_PATCH_FILE_SUFFIX}`,
-	);
-	await lockedFileSystem.writeTextFileAtomic(patchPath, patchChunks.join(""));
-}
-
-async function applyTaskPatch(patchPath: string, worktreePath: string): Promise<void> {
-	await getGitStdout(["apply", "--binary", "--whitespace=nowarn", patchPath], worktreePath);
 }
 
 function shouldSkipSymlink(relativePath: string): boolean {
@@ -450,11 +351,18 @@ export async function ensureTaskWorktreeIfDoesntExist(options: {
 		const existingResult = await runGit(worktreePath, ["rev-parse", "HEAD"]);
 		if (existingResult.ok && existingResult.stdout) {
 			await syncIgnoredPathsIntoWorktree(context.repoPath, worktreePath);
+			await syncTaskPreservationActivity({
+				repoPath: context.repoPath,
+				taskId,
+				worktreePath,
+				headCommit: existingResult.stdout,
+			});
 			return {
 				ok: true,
 				path: worktreePath,
 				baseRef: options.baseRef.trim(),
 				baseCommit: existingResult.stdout,
+				restoredFromPreservation: false,
 			};
 		}
 
@@ -462,11 +370,18 @@ export async function ensureTaskWorktreeIfDoesntExist(options: {
 			const lockedExistingCommit = await tryRunGit(worktreePath, ["rev-parse", "HEAD"]);
 			if (lockedExistingCommit) {
 				await syncIgnoredPathsIntoWorktree(context.repoPath, worktreePath);
+				await syncTaskPreservationActivity({
+					repoPath: context.repoPath,
+					taskId,
+					worktreePath,
+					headCommit: lockedExistingCommit,
+				});
 				return {
 					ok: true,
 					path: worktreePath,
 					baseRef: options.baseRef.trim(),
 					baseCommit: lockedExistingCommit,
+					restoredFromPreservation: false,
 				};
 			}
 
@@ -499,6 +414,50 @@ export async function ensureTaskWorktreeIfDoesntExist(options: {
 				};
 			}
 			const requestedBaseCommit = baseRefResult.stdout;
+
+			// B-5: if this task's work was durably preserved (trashed, or the runtime
+			// was interrupted), restore from that preserved revision rather than the
+			// current base ref so prior work is not lost or reset.
+			const restoreTarget = await resolveTaskPreservationRestoreTarget({
+				repoPath: context.repoPath,
+				taskId,
+			});
+			if (restoreTarget?.commit) {
+				const restoreAddResult = await runGit(context.repoPath, [
+					"worktree",
+					"add",
+					"--detach",
+					worktreePath,
+					restoreTarget.commit,
+				]);
+				if (restoreAddResult.ok) {
+					await prepareNewTaskWorktree(context.repoPath, worktreePath);
+					const preserveWarning = await applyPreservedWorktreeContent({
+						taskId,
+						worktreePath,
+						checkedOutCommit: restoreTarget.commit,
+						patch: restoreTarget.patch,
+						archivePath: restoreTarget.archivePath,
+					});
+					await syncTaskPreservationActivity({
+						repoPath: context.repoPath,
+						taskId,
+						worktreePath,
+						headCommit: restoreTarget.commit,
+						startingCommit: restoreTarget.commit,
+					});
+					return {
+						ok: true,
+						path: worktreePath,
+						baseRef: requestedBaseRef,
+						baseCommit: restoreTarget.commit,
+						restoredFromPreservation: true,
+						warning: preserveWarning,
+					};
+				}
+				// The preserved commit may no longer exist (e.g. gc'd objects).
+				// Fall through to the base-ref path below.
+			}
 
 			const storedPatch = await findTaskPatch(taskId);
 			let baseCommit = storedPatch?.commit ?? requestedBaseCommit;
@@ -547,6 +506,7 @@ export async function ensureTaskWorktreeIfDoesntExist(options: {
 				path: worktreePath,
 				baseRef: requestedBaseRef,
 				baseCommit,
+				restoredFromPreservation: false,
 				warning,
 			};
 		});
@@ -571,36 +531,235 @@ export async function deleteTaskWorktree(options: {
 		const rootPath = getWorktreesBaseRootPath();
 		const worktreePath = getTaskWorktreePath(options.repoPath, taskId);
 		if (!(await pathExists(worktreePath))) {
-			await deleteTaskPatchFiles(taskId);
+			// B-5: the worktree is already gone. Keep any patch/archive
+			// preservation assets so previously preserved work stays restorable.
 			await pruneEmptyParents(rootPath, dirname(worktreePath));
 			return {
 				ok: true,
 				removed: false,
+				preserved: true,
+				blockedReason: null,
 			};
 		}
 
-		try {
-			await captureTaskPatch({
-				repoPath: options.repoPath,
-				taskId,
-				worktreePath,
-			});
-		} catch {
-			// Patch capture is best-effort. A corrupted or partially-created
-			// worktree (e.g. plain directory, no git init) should still be removed.
+		// B-5.2/3: the task work must be durably preserved before the worktree
+		// is removed. If preservation fails, stop cleanup and keep the worktree
+		// rather than risk losing uncommitted, untracked, or unpushed work.
+		const preservation = await preserveTaskWorktree({
+			repoPath: options.repoPath,
+			taskId,
+			worktreePath,
+		});
+		if (!preservation.preserved) {
+			const blockedReason = preservation.blockedReasons.join("; ") || "Task work could not be preserved.";
+			return {
+				ok: false,
+				removed: false,
+				preserved: false,
+				blockedReason,
+				error: `Task work could not be preserved before worktree removal; cleanup was blocked. ${blockedReason}`,
+			};
 		}
+
 		const removed = await removeTaskWorktreeInternal(options.repoPath, worktreePath);
 		await pruneEmptyParents(rootPath, dirname(worktreePath));
 
 		return {
 			ok: true,
 			removed,
+			preserved: true,
+			blockedReason: null,
 		};
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		return {
 			ok: false,
 			removed: false,
+			preserved: false,
+			blockedReason: null,
+			error: message,
+		};
+	}
+}
+
+/**
+ * Read-only snapshot of a task's recoverable work state: live worktree stats
+ * (HEAD, dirty state, changed files, commits ahead of the preserved starting
+ * point) plus the durable preservation record. B-5: backs `kanban task
+ * locate` and the UI's preserved-work affordances.
+ */
+export async function getTaskPreservationInfo(options: {
+	repoPath: string;
+	taskId: string;
+}): Promise<RuntimeTaskPreservationInfoResponse> {
+	const taskId = normalizeTaskIdForWorktreePath(options.taskId);
+	const worktreePath = getTaskWorktreePath(options.repoPath, taskId);
+	const worktreeExists = await pathExists(worktreePath);
+	let headCommit: string | null = null;
+	let dirty = false;
+	let commitsAheadOfBase = 0;
+	const changedFiles: string[] = [];
+	let preservation: RuntimeTaskPreservationRecord | null = null;
+	try {
+		if (worktreeExists) {
+			const headResult = await runGit(worktreePath, ["rev-parse", "--verify", "HEAD^{commit}"]);
+			if (headResult.ok && headResult.stdout) {
+				headCommit = headResult.stdout;
+			}
+			const statusResult = await runGit(worktreePath, ["status", "--porcelain"]);
+			if (statusResult.ok) {
+				for (const line of statusResult.stdout.split("\n")) {
+					const trimmed = line.trim();
+					if (!trimmed) {
+						continue;
+					}
+					dirty = true;
+					const target = trimmed.slice(3).trim();
+					changedFiles.push(target.includes(" -> ") ? (target.split(" -> ").pop()?.trim() ?? target) : target);
+				}
+			}
+		}
+		preservation = await readTaskPreservationRecord(taskId);
+		if (headCommit && preservation?.startingCommit && preservation.startingCommit !== headCommit) {
+			const aheadResult = await runGit(options.repoPath, [
+				"rev-list",
+				"--count",
+				`${preservation.startingCommit}..${headCommit}`,
+			]);
+			if (aheadResult.ok) {
+				commitsAheadOfBase = Number.parseInt(aheadResult.stdout, 10) || 0;
+			}
+		}
+		return {
+			ok: true,
+			worktreeExists,
+			worktreePath,
+			headCommit,
+			dirty,
+			changedFiles,
+			commitsAheadOfBase,
+			preservation,
+		};
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return {
+			ok: false,
+			worktreeExists,
+			worktreePath,
+			headCommit,
+			dirty,
+			changedFiles,
+			commitsAheadOfBase,
+			preservation,
+			error: message,
+		};
+	}
+}
+
+/**
+ * Restores a removed task worktree from its durable preservation state
+ * (recovery ref, binary patch, and full archive). The restored worktree is
+ * detached at the preserved commit with preserved uncommitted content
+ * reapplied. B-5: backs `kanban task recover` and the UI's "Recover
+ * worktree" action.
+ */
+export async function recoverTaskWorktree(options: {
+	repoPath: string;
+	taskId: string;
+}): Promise<RuntimeTaskWorktreeRecoverResponse> {
+	const taskId = normalizeTaskIdForWorktreePath(options.taskId);
+	const worktreePath = getTaskWorktreePath(options.repoPath, taskId);
+	try {
+		const existingCommit = await tryRunGit(worktreePath, ["rev-parse", "HEAD^{commit}"]);
+		if (existingCommit) {
+			return {
+				ok: true,
+				restored: false,
+				path: worktreePath,
+				headCommit: existingCommit,
+			};
+		}
+
+		return await withTaskWorktreeSetupLock(options.repoPath, async () => {
+			const lockedCommit = await tryRunGit(worktreePath, ["rev-parse", "HEAD^{commit}"]);
+			if (lockedCommit) {
+				return {
+					ok: true,
+					restored: false,
+					path: worktreePath,
+					headCommit: lockedCommit,
+				};
+			}
+
+			const restoreTarget = await resolveTaskPreservationRestoreTarget({
+				repoPath: options.repoPath,
+				taskId,
+			});
+			if (!restoreTarget?.commit) {
+				return {
+					ok: false,
+					restored: false,
+					path: null,
+					headCommit: null,
+					error: `No preserved task state with a recoverable commit was found for task "${taskId}".`,
+				};
+			}
+
+			if (await pathExists(worktreePath)) {
+				// A stale directory without a valid worktree would block `git worktree add`.
+				await removeTaskWorktreeInternal(options.repoPath, worktreePath);
+			}
+			await runGit(options.repoPath, ["worktree", "prune"]);
+			await mkdir(dirname(worktreePath), { recursive: true });
+
+			const addResult = await runGit(options.repoPath, [
+				"worktree",
+				"add",
+				"--detach",
+				worktreePath,
+				restoreTarget.commit,
+			]);
+			if (!addResult.ok) {
+				return {
+					ok: false,
+					restored: false,
+					path: null,
+					headCommit: null,
+					error: addResult.stderr || addResult.output || "Could not restore the task worktree.",
+				};
+			}
+
+			await prepareNewTaskWorktree(options.repoPath, worktreePath);
+			const warning = await applyPreservedWorktreeContent({
+				taskId,
+				worktreePath,
+				checkedOutCommit: restoreTarget.commit,
+				patch: restoreTarget.patch,
+				archivePath: restoreTarget.archivePath,
+			});
+			const restoredHead = (await tryRunGit(worktreePath, ["rev-parse", "HEAD^{commit}"])) ?? restoreTarget.commit;
+			await syncTaskPreservationActivity({
+				repoPath: options.repoPath,
+				taskId,
+				worktreePath,
+				headCommit: restoredHead,
+				startingCommit: restoreTarget.commit,
+			});
+			return {
+				ok: true,
+				restored: true,
+				path: worktreePath,
+				headCommit: restoredHead,
+				warning,
+			};
+		});
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return {
+			ok: false,
+			restored: false,
+			path: null,
+			headCommit: null,
 			error: message,
 		};
 	}

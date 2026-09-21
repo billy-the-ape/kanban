@@ -96,6 +96,7 @@ function createEmptyProjectTaskCounts(): RuntimeProjectTaskCounts {
 		backlog: 0,
 		in_progress: 0,
 		review: 0,
+		done: 0,
 		trash: 0,
 	};
 }
@@ -113,6 +114,9 @@ function countTasksByColumn(board: RuntimeBoardData): RuntimeProjectTaskCounts {
 				break;
 			case "review":
 				counts.review += count;
+				break;
+			case "done":
+				counts.done += count;
 				break;
 			case "trash":
 				counts.trash += count;
@@ -157,12 +161,10 @@ function applyLiveSessionStateToProjectTaskCounts(
 		if (summary.state === "awaiting_review" && columnId === "in_progress") {
 			next.in_progress = Math.max(0, next.in_progress - 1);
 			next.review += 1;
-			continue;
 		}
-		if (summary.state === "interrupted" && columnId !== "trash") {
-			next[columnId] = Math.max(0, next[columnId] - 1);
-			next.trash += 1;
-		}
+		// B-5: interrupted cards stay in their current column (work is
+		// preserved, not discarded), so the persisted board already reflects
+		// the correct counts.
 	}
 	return next;
 }

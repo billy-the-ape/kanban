@@ -332,6 +332,7 @@ export function CardDetailView({
 	onAgentCommitTask,
 	onAgentOpenPrTask,
 	onMoveReviewCardToTrash,
+	onCompleteReviewCard,
 	onRestoreTaskFromTrash,
 	onCancelAutomaticTaskAction,
 	commitTaskLoadingById,
@@ -339,6 +340,7 @@ export function CardDetailView({
 	agentCommitTaskLoadingById,
 	agentOpenPrTaskLoadingById,
 	moveToTrashLoadingById,
+	completeTaskLoadingById,
 	onAddReviewComments,
 	onSendReviewComments,
 	onSendClineChatMessage,
@@ -347,7 +349,9 @@ export function CardDetailView({
 	latestClineChatMessage,
 	streamedClineChatMessages,
 	onMoveToTrash,
+	onComplete,
 	isMoveToTrashLoading,
+	isCompleteLoading,
 	gitHistoryPanel,
 	onCloseGitHistory,
 	bottomTerminalOpen,
@@ -390,6 +394,7 @@ export function CardDetailView({
 	onAgentCommitTask?: (taskId: string) => void;
 	onAgentOpenPrTask?: (taskId: string) => void;
 	onMoveReviewCardToTrash?: (taskId: string) => void;
+	onCompleteReviewCard?: (taskId: string) => void;
 	onRestoreTaskFromTrash?: (taskId: string) => void;
 	onCancelAutomaticTaskAction?: (taskId: string) => void;
 	commitTaskLoadingById?: Record<string, boolean>;
@@ -397,6 +402,7 @@ export function CardDetailView({
 	agentCommitTaskLoadingById?: Record<string, boolean>;
 	agentOpenPrTaskLoadingById?: Record<string, boolean>;
 	moveToTrashLoadingById?: Record<string, boolean>;
+	completeTaskLoadingById?: Record<string, boolean>;
 	onAddReviewComments?: (taskId: string, text: string) => void;
 	onSendReviewComments?: (taskId: string, text: string) => void;
 	onSendClineChatMessage?: (
@@ -409,7 +415,9 @@ export function CardDetailView({
 	latestClineChatMessage?: ClineChatMessage | null;
 	streamedClineChatMessages?: ClineChatMessage[] | null;
 	onMoveToTrash: () => void;
+	onComplete?: () => void;
 	isMoveToTrashLoading?: boolean;
+	isCompleteLoading?: boolean;
 	gitHistoryPanel?: ReactNode;
 	onCloseGitHistory?: () => void;
 	bottomTerminalOpen: boolean;
@@ -511,6 +519,7 @@ export function CardDetailView({
 	const detailDiffContentPanelPercent = `${((1 - detailDiffFileTreeRatio) * 100).toFixed(1)}%`;
 	const detailDiffFileTreePanelFlex = `0 0 ${detailDiffFileTreePanelPercent}`;
 	const showMoveToTrashActions = selection.column.id === "review" || selection.column.id === "in_progress";
+	const showCompleteActions = selection.column.id === "review";
 	const isTaskTerminalEnabled = selection.column.id === "in_progress" || selection.column.id === "review";
 	const effectiveTaskAgentId = sessionSummary?.agentId ?? selection.card.agentId ?? selectedAgentId;
 	const showClineAgentChatPanel = isNativeClineAgentSelected(effectiveTaskAgentId);
@@ -657,6 +666,9 @@ export function CardDetailView({
 			showMoveToTrash={showMoveToTrashActions}
 			onMoveToTrash={onMoveToTrash}
 			isMoveToTrashLoading={isMoveToTrashLoading}
+			showComplete={showCompleteActions}
+			onComplete={onComplete}
+			isCompleteLoading={isCompleteLoading}
 			onCancelAutomaticAction={
 				selection.card.autoReviewEnabled === true && onCancelAutomaticTaskAction
 					? () => onCancelAutomaticTaskAction(selection.card.id)
@@ -684,6 +696,9 @@ export function CardDetailView({
 			showMoveToTrash={showMoveToTrashActions}
 			onMoveToTrash={onMoveToTrash}
 			isMoveToTrashLoading={isMoveToTrashLoading}
+			showComplete={showCompleteActions}
+			onComplete={onComplete}
+			isCompleteLoading={isCompleteLoading}
 			onCancelAutomaticAction={
 				selection.card.autoReviewEnabled === true && onCancelAutomaticTaskAction
 					? () => onCancelAutomaticTaskAction(selection.card.id)
@@ -816,10 +831,12 @@ export function CardDetailView({
 							onCommitTask={onCommitTask}
 							onOpenPrTask={onOpenPrTask}
 							onMoveToTrashTask={onMoveReviewCardToTrash}
+							onCompleteTask={onCompleteReviewCard}
 							onRestoreFromTrashTask={onRestoreTaskFromTrash}
 							commitTaskLoadingById={commitTaskLoadingById}
 							openPrTaskLoadingById={openPrTaskLoadingById}
 							moveToTrashLoadingById={moveToTrashLoadingById}
+							completeTaskLoadingById={completeTaskLoadingById}
 							panelWidth="100%"
 							defaultClineModelId={runtimeConfig?.clineProviderSettings?.modelId ?? null}
 						/>

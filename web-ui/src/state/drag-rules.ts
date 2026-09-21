@@ -33,7 +33,10 @@ export function isAllowedCrossColumnCardMove(
 	if (fromColumnId === "backlog" && toColumnId === "in_progress") {
 		return true;
 	}
-	if (toColumnId === "trash" && fromColumnId !== "trash") {
+	if (fromColumnId === "review" && toColumnId === "done") {
+		return true;
+	}
+	if (toColumnId === "trash" && fromColumnId !== "trash" && fromColumnId !== "done") {
 		return true;
 	}
 	if (fromColumnId === "trash" && toColumnId === "review") {
@@ -91,8 +94,14 @@ export function isCardDropDisabled(
 			programmaticCardMoveInFlight: options?.programmaticCardMoveInFlight,
 		});
 	}
+	if (columnId === "done") {
+		return !isAllowedCrossColumnCardMove(activeDragSourceColumnId, columnId, {
+			taskId: options?.activeDragTaskId,
+			programmaticCardMoveInFlight: options?.programmaticCardMoveInFlight,
+		});
+	}
 	if (columnId === "trash") {
-		return activeDragSourceColumnId === "trash";
+		return activeDragSourceColumnId === "trash" || activeDragSourceColumnId === "done";
 	}
 	return false;
 }

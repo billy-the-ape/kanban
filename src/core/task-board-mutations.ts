@@ -186,7 +186,12 @@ function resolveDependencyEndpoints(
 	if (!firstColumnId || !secondColumnId) {
 		return { reason: "missing_task" };
 	}
-	if (firstColumnId === "trash" || secondColumnId === "trash") {
+	if (
+		firstColumnId === "trash" ||
+		firstColumnId === "done" ||
+		secondColumnId === "trash" ||
+		secondColumnId === "done"
+	) {
 		return { reason: "trash_task" };
 	}
 	const firstIsBacklog = firstColumnId === "backlog";
@@ -205,12 +210,15 @@ function resolveDependencyEndpoints(
 		: { backlogTaskId: secondTaskId, linkedTaskId: firstTaskId };
 }
 
-function getLinkedBacklogTaskIdsReadyAfterTaskTrashed(
+function getLinkedBacklogTaskIdsReadyAfterTaskCompleted(
 	board: RuntimeBoardData,
 	taskId: string,
-	fromColumnId: RuntimeBoardColumnId | null,
+	toColumnId: RuntimeBoardColumnId | null,
 ): string[] {
-	if (!taskId || board.dependencies.length === 0 || fromColumnId !== "review") {
+	// Completing a task (move to the done column) unblocks its linked backlog
+	// tasks. Discarding a task (move to trash) never does: failed or thrown
+	// away work must not start dependent work.
+	if (!taskId || board.dependencies.length === 0 || toColumnId !== "done") {
 		return [];
 	}
 	const readyTaskIds = new Set<string>();
@@ -410,21 +418,35 @@ export function removeTaskDependency(board: RuntimeBoardData, dependencyId: stri
 	};
 }
 
-export function getReadyLinkedTaskIdsForTaskInTrash(board: RuntimeBoardData, taskId: string): string[] {
-	return getLinkedBacklogTaskIdsReadyAfterTaskTrashed(board, taskId, getTaskColumnId(board, taskId));
+export function getReadyLinkedTaskIdsForTaskInDone(board: RuntimeBoardData, taskId: string): string[] {
+	return getLinkedBacklogTaskIdsReadyAfterTaskCompleted(board, taskId, getTaskColumnId(board, taskId));
 }
 
+// Discarding a task (move to trash) does not unblock linked tasks, so the
+// ready list is always empty. The move itself still happens so the card is
+// persisted before any cleanup side effects run.
 export function trashTaskAndGetReadyLinkedTaskIds(
 	board: RuntimeBoardData,
 	taskId: string,
 	now: number = Date.now(),
 ): RuntimeTrashTaskResult {
-	const fromColumnId = getTaskColumnId(board, taskId);
-	const readyTaskIds = getLinkedBacklogTaskIdsReadyAfterTaskTrashed(board, taskId, fromColumnId);
 	const movedToTrash = moveTaskToColumn(board, taskId, "trash", now);
 	return {
 		...movedToTrash,
-		readyTaskIds: movedToTrash.moved ? readyTaskIds : [],
+		readyTaskIds: [],
+	};
+}
+
+export function completeTaskAndGetReadyLinkedTaskIds(
+	board: RuntimeBoardData,
+	taskId: string,
+	now: number = Date.now(),
+): RuntimeTrashTaskResult {
+	const readyTaskIds = getLinkedBacklogTaskIdsReadyAfterTaskCompleted(board, taskId, "done");
+	const movedToDone = moveTaskToColumn(board, taskId, "done", now);
+	return {
+		...movedToDone,
+		readyTaskIds: movedToDone.moved ? readyTaskIds : [],
 	};
 }
 
@@ -545,7 +567,9 @@ export function moveTaskToColumn(
 		updatedAt: now,
 	};
 	const targetCards =
-		targetColumnId === "trash" ? [movedTask, ...targetColumn.cards] : [...targetColumn.cards, movedTask];
+		targetColumnId === "trash" || targetColumnId === "done"
+			? [movedTask, ...targetColumn.cards]
+			: [...targetColumn.cards, movedTask];
 
 	const columns = board.columns.map((column, index) => {
 		if (index === found.columnIndex) {

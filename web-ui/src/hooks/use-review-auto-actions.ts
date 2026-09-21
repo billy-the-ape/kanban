@@ -17,7 +17,7 @@ interface TaskGitActionLoadingStateLike {
 	prSource: string | null;
 }
 
-interface RequestMoveTaskToTrashOptions {
+interface RequestCompleteTaskOptions {
 	skipWorkingChangeWarning?: boolean;
 }
 
@@ -25,10 +25,10 @@ interface UseReviewAutoActionsOptions {
 	board: BoardData;
 	taskGitActionLoadingByTaskId: Record<string, TaskGitActionLoadingStateLike>;
 	runAutoReviewGitAction: (taskId: string, action: TaskGitAction) => Promise<boolean>;
-	requestMoveTaskToTrash: (
+	requestCompleteTask: (
 		taskId: string,
 		fromColumnId: BoardColumnId,
-		options?: RequestMoveTaskToTrashOptions,
+		options?: RequestCompleteTaskOptions,
 	) => Promise<void>;
 	resetKey?: string | null;
 }
@@ -37,17 +37,17 @@ export function useReviewAutoActions({
 	board,
 	taskGitActionLoadingByTaskId,
 	runAutoReviewGitAction,
-	requestMoveTaskToTrash,
+	requestCompleteTask,
 	resetKey,
 }: UseReviewAutoActionsOptions): void {
 	const boardRef = useRef<BoardData>(board);
 	const runAutoReviewGitActionRef = useRef(runAutoReviewGitAction);
-	const requestMoveTaskToTrashRef = useRef(requestMoveTaskToTrash);
+	const requestCompleteTaskRef = useRef(requestCompleteTask);
 	const awaitingCleanActionByTaskIdRef = useRef<Record<string, TaskGitAction>>({});
 	const timerByTaskIdRef = useRef<Record<string, number>>({});
 	type ScheduledAutoReviewAction = TaskAutoReviewMode | "move_to_done_after_git_action";
 	const scheduledActionByTaskIdRef = useRef<Record<string, ScheduledAutoReviewAction>>({});
-	const moveToTrashInFlightTaskIdsRef = useRef<Set<string>>(new Set());
+	const completeTaskInFlightTaskIdsRef = useRef<Set<string>>(new Set());
 
 	useEffect(() => {
 		boardRef.current = board;
@@ -58,8 +58,8 @@ export function useReviewAutoActions({
 	}, [runAutoReviewGitAction]);
 
 	useEffect(() => {
-		requestMoveTaskToTrashRef.current = requestMoveTaskToTrash;
-	}, [requestMoveTaskToTrash]);
+		requestCompleteTaskRef.current = requestCompleteTask;
+	}, [requestCompleteTask]);
 
 	const clearAutoReviewTimer = useCallback((taskId: string) => {
 		const timer = timerByTaskIdRef.current[taskId];
@@ -77,7 +77,7 @@ export function useReviewAutoActions({
 		awaitingCleanActionByTaskIdRef.current = {};
 		timerByTaskIdRef.current = {};
 		scheduledActionByTaskIdRef.current = {};
-		moveToTrashInFlightTaskIdsRef.current.clear();
+		completeTaskInFlightTaskIdsRef.current.clear();
 	}, []);
 
 	const scheduleAutoReviewAction = useCallback(
@@ -125,16 +125,16 @@ export function useReviewAutoActions({
 
 			for (const taskId of Object.keys(awaitingCleanActionByTaskIdRef.current)) {
 				const columnId = columnByTaskId.get(taskId);
-				if (!columnId || columnId === "trash") {
+				if (!columnId || columnId === "trash" || columnId === "done") {
 					delete awaitingCleanActionByTaskIdRef.current[taskId];
 					clearAutoReviewTimer(taskId);
-					moveToTrashInFlightTaskIdsRef.current.delete(taskId);
+					completeTaskInFlightTaskIdsRef.current.delete(taskId);
 				}
 			}
 
-			for (const taskId of moveToTrashInFlightTaskIdsRef.current) {
+			for (const taskId of completeTaskInFlightTaskIdsRef.current) {
 				if (columnByTaskId.get(taskId) !== "review") {
-					moveToTrashInFlightTaskIdsRef.current.delete(taskId);
+					completeTaskInFlightTaskIdsRef.current.delete(taskId);
 				}
 			}
 
@@ -172,7 +172,7 @@ export function useReviewAutoActions({
 					if (
 						changedFiles === 0 &&
 						!isGitActionInFlight &&
-						!moveToTrashInFlightTaskIdsRef.current.has(reviewTask.id)
+						!completeTaskInFlightTaskIdsRef.current.has(reviewTask.id)
 					) {
 						scheduleAutoReviewAction(reviewTask.id, "move_to_done_after_git_action", () => {
 							const latestSelection = findCardSelection(boardRef.current, reviewTask.id);
@@ -186,14 +186,14 @@ export function useReviewAutoActions({
 							if (latestMode !== autoReviewMode) {
 								return;
 							}
-							moveToTrashInFlightTaskIdsRef.current.add(reviewTask.id);
-							void requestMoveTaskToTrashRef
+							completeTaskInFlightTaskIdsRef.current.add(reviewTask.id);
+							void requestCompleteTaskRef
 								.current(reviewTask.id, "review", {
 									skipWorkingChangeWarning: true,
 								})
 								.finally(() => {
 									delete awaitingCleanActionByTaskIdRef.current[reviewTask.id];
-									moveToTrashInFlightTaskIdsRef.current.delete(reviewTask.id);
+									completeTaskInFlightTaskIdsRef.current.delete(reviewTask.id);
 								});
 						});
 					} else {

@@ -75,6 +75,8 @@ import type {
 	RuntimeTaskChatReloadResponse,
 	RuntimeTaskChatSendRequest,
 	RuntimeTaskChatSendResponse,
+	RuntimeTaskPreservationInfoResponse,
+	RuntimeTaskPreservationRequest,
 	RuntimeTaskSessionInputRequest,
 	RuntimeTaskSessionInputResponse,
 	RuntimeTaskSessionStartRequest,
@@ -83,6 +85,7 @@ import type {
 	RuntimeTaskSessionStopResponse,
 	RuntimeTaskWorkspaceInfoRequest,
 	RuntimeTaskWorkspaceInfoResponse,
+	RuntimeTaskWorktreeRecoverResponse,
 	RuntimeUpdateStatusResponse,
 	RuntimeWorkspaceChangesRequest,
 	RuntimeWorkspaceChangesResponse,
@@ -166,6 +169,8 @@ import {
 	runtimeTaskChatReloadResponseSchema,
 	runtimeTaskChatSendRequestSchema,
 	runtimeTaskChatSendResponseSchema,
+	runtimeTaskPreservationInfoResponseSchema,
+	runtimeTaskPreservationRequestSchema,
 	runtimeTaskSessionInputRequestSchema,
 	runtimeTaskSessionInputResponseSchema,
 	runtimeTaskSessionStartRequestSchema,
@@ -174,6 +179,7 @@ import {
 	runtimeTaskSessionStopResponseSchema,
 	runtimeTaskWorkspaceInfoRequestSchema,
 	runtimeTaskWorkspaceInfoResponseSchema,
+	runtimeTaskWorktreeRecoverResponseSchema,
 	runtimeUpdateStatusResponseSchema,
 	runtimeWorkspaceChangesRequestSchema,
 	runtimeWorkspaceChangesResponseSchema,
@@ -326,6 +332,14 @@ export interface RuntimeTrpcContext {
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeWorktreeDeleteRequest,
 		) => Promise<RuntimeWorktreeDeleteResponse>;
+		getTaskPreservationInfo: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskPreservationRequest,
+		) => Promise<RuntimeTaskPreservationInfoResponse>;
+		recoverTaskWorktree: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskPreservationRequest,
+		) => Promise<RuntimeTaskWorktreeRecoverResponse>;
 		loadTaskContext: (
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskWorkspaceInfoRequest,
@@ -641,6 +655,18 @@ export const runtimeAppRouter = t.router({
 			.output(runtimeWorktreeDeleteResponseSchema)
 			.mutation(async ({ ctx, input }) => {
 				return await ctx.workspaceApi.deleteWorktree(ctx.workspaceScope, input);
+			}),
+		getTaskPreservationInfo: workspaceProcedure
+			.input(runtimeTaskPreservationRequestSchema)
+			.output(runtimeTaskPreservationInfoResponseSchema)
+			.query(async ({ ctx, input }) => {
+				return await ctx.workspaceApi.getTaskPreservationInfo(ctx.workspaceScope, input);
+			}),
+		recoverTaskWorktree: workspaceProcedure
+			.input(runtimeTaskPreservationRequestSchema)
+			.output(runtimeTaskWorktreeRecoverResponseSchema)
+			.mutation(async ({ ctx, input }) => {
+				return await ctx.workspaceApi.recoverTaskWorktree(ctx.workspaceScope, input);
 			}),
 		getTaskContext: workspaceProcedure
 			.input(runtimeTaskWorkspaceInfoRequestSchema)

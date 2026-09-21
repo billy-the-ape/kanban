@@ -13,6 +13,7 @@ import type {
 } from "../core/api-contract";
 import {
 	parseGitCheckoutRequest,
+	parseTaskPreservationRequest,
 	parseWorktreeDeleteRequest,
 	parseWorktreeEnsureRequest,
 } from "../core/api-validation";
@@ -30,7 +31,9 @@ import { searchWorkspaceFiles } from "../workspace/search-workspace-files";
 import {
 	deleteTaskWorktree,
 	ensureTaskWorktreeIfDoesntExist,
+	getTaskPreservationInfo,
 	getTaskWorkspaceInfo,
+	recoverTaskWorktree,
 	resolveTaskCwd,
 } from "../workspace/task-worktree";
 import type { RuntimeTrpcContext } from "./app-router";
@@ -329,6 +332,20 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 		deleteWorktree: async (workspaceScope, input) => {
 			const body = parseWorktreeDeleteRequest(input);
 			return await deleteTaskWorktree({
+				repoPath: workspaceScope.workspacePath,
+				taskId: body.taskId,
+			});
+		},
+		getTaskPreservationInfo: async (workspaceScope, input) => {
+			const body = parseTaskPreservationRequest(input);
+			return await getTaskPreservationInfo({
+				repoPath: workspaceScope.workspacePath,
+				taskId: body.taskId,
+			});
+		},
+		recoverTaskWorktree: async (workspaceScope, input) => {
+			const body = parseTaskPreservationRequest(input);
+			return await recoverTaskWorktree({
 				repoPath: workspaceScope.workspacePath,
 				taskId: body.taskId,
 			});

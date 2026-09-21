@@ -33,11 +33,11 @@ export function ClearTrashDialog({
 			}}
 		>
 			<AlertDialogHeader>
-				<AlertDialogTitle>Clear done items permanently?</AlertDialogTitle>
+				<AlertDialogTitle>Clear trash permanently?</AlertDialogTitle>
 			</AlertDialogHeader>
 			<AlertDialogBody>
 				<AlertDialogDescription>
-					This will permanently delete {taskCount} {taskLabel} from Done.
+					This will permanently delete {taskCount} {taskLabel} from Trash.
 				</AlertDialogDescription>
 				<p className="text-text-primary">This action cannot be undone.</p>
 			</AlertDialogBody>
@@ -49,7 +49,7 @@ export function ClearTrashDialog({
 				</AlertDialogCancel>
 				<AlertDialogAction asChild>
 					<Button variant="danger" onClick={onConfirm}>
-						Clear Done
+						Clear Trash
 					</Button>
 				</AlertDialogAction>
 			</AlertDialogFooter>

@@ -217,8 +217,11 @@ export function createProjectsApi(deps: CreateProjectsApiDependencies): RuntimeT
 							if (deleted.ok) {
 								continue;
 							}
+							const blockedReason = deleted.blockedReason
+								? ` Task work could not be preserved, so the worktree was kept: ${deleted.blockedReason}`
+								: "";
 							const message = deleted.error ?? `Could not delete task workspace for task "${taskId}".`;
-							deps.warn(message);
+							deps.warn(`${message}${blockedReason}`);
 						}
 					})();
 				}

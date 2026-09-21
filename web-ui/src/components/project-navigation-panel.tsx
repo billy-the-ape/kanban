@@ -97,6 +97,7 @@ export function ProjectNavigationPanel({
 		? pendingProjectRemoval.taskCounts.backlog +
 			pendingProjectRemoval.taskCounts.in_progress +
 			pendingProjectRemoval.taskCounts.review +
+			pendingProjectRemoval.taskCounts.done +
 			pendingProjectRemoval.taskCounts.trash
 		: 0;
 
@@ -728,9 +729,16 @@ function ProjectRow({
 			count: project.taskCounts.review,
 		},
 		{
-			id: "trash",
+			id: "done",
 			title: "Done",
 			shortLabel: "D",
+			toneClassName: "bg-status-green/20 text-status-green",
+			count: project.taskCounts.done,
+		},
+		{
+			id: "trash",
+			title: "Trash",
+			shortLabel: "T",
 			toneClassName: "bg-status-red/20 text-status-red",
 			count: project.taskCounts.trash,
 		},

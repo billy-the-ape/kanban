@@ -2,7 +2,7 @@ import { Draggable } from "@hello-pangea/dnd";
 import { getRuntimeAgentCatalogEntry } from "@runtime-agent-catalog";
 import { formatClineToolCallLabel } from "@runtime-cline-tool-call-display";
 import { buildTaskWorktreeDisplayPath } from "@runtime-task-worktree-path";
-import { AlertCircle, AlertTriangle, Bot, GitBranch, Pencil, Play, RotateCcw, Trash2 } from "lucide-react";
+import { AlertCircle, AlertTriangle, Bot, Check, GitBranch, Pencil, Play, RotateCcw, Trash2 } from "lucide-react";
 import type { KeyboardEvent, MouseEvent } from "react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
@@ -219,6 +219,7 @@ export function BoardCard({
 	onClick,
 	onStart,
 	onMoveToTrash,
+	onComplete,
 	onRestoreFromTrash,
 	onSaveTitle,
 	onCommit,
@@ -227,6 +228,7 @@ export function BoardCard({
 	isCommitLoading = false,
 	isOpenPrLoading = false,
 	isMoveToTrashLoading = false,
+	isCompleteLoading = false,
 	onDependencyPointerDown,
 	onDependencyPointerEnter,
 	isDependencySource = false,
@@ -243,6 +245,7 @@ export function BoardCard({
 	onClick?: () => void;
 	onStart?: (taskId: string) => void;
 	onMoveToTrash?: (taskId: string) => void;
+	onComplete?: (taskId: string) => void;
 	onRestoreFromTrash?: (taskId: string) => void;
 	onSaveTitle?: (taskId: string, title: string) => void;
 	onCommit?: (taskId: string) => void;
@@ -251,6 +254,7 @@ export function BoardCard({
 	isCommitLoading?: boolean;
 	isOpenPrLoading?: boolean;
 	isMoveToTrashLoading?: boolean;
+	isCompleteLoading?: boolean;
 	onDependencyPointerDown?: (taskId: string, event: MouseEvent<HTMLElement>) => void;
 	onDependencyPointerEnter?: (taskId: string) => void;
 	isDependencySource?: boolean;
@@ -271,7 +275,8 @@ export function BoardCard({
 	const [isDescriptionExpanded, setIsDescriptionExpanded] = useState(false);
 	const reviewWorkspaceSnapshot = useTaskWorkspaceSnapshotValue(card.id);
 	const isTrashCard = columnId === "trash";
-	const isCardInteractive = !isTrashCard;
+	const isDoneCard = columnId === "done";
+	const isCardInteractive = !isTrashCard && !isDoneCard;
 	const descriptionWidth = descriptionRect.width > 0 ? descriptionRect.width : descriptionWidthFallback;
 	const rawSessionActivity = useMemo(() => getCardSessionActivity(sessionSummary), [sessionSummary]);
 	const lastSessionActivityRef = useRef<CardSessionActivity | null>(null);
@@ -429,7 +434,9 @@ export function BoardCard({
 	const showReviewGitActions = columnId === "review" && (reviewWorkspaceSnapshot?.changedFiles ?? 0) > 0;
 	const isAnyGitActionLoading = isCommitLoading || isOpenPrLoading;
 	const cancelAutomaticActionLabel =
-		!isTrashCard && card.autoReviewEnabled ? getTaskAutoReviewCancelButtonLabel(card.autoReviewMode) : null;
+		!isTrashCard && !isDoneCard && card.autoReviewEnabled
+			? getTaskAutoReviewCancelButtonLabel(card.autoReviewMode)
+			: null;
 	const agentOverrideLabel = useMemo(
 		() => (card.agentId ? (getRuntimeAgentCatalogEntry(card.agentId)?.label ?? card.agentId) : null),
 		[card.agentId],
@@ -615,18 +622,33 @@ export function BoardCard({
 										}}
 									/>
 								) : columnId === "review" ? (
-									<Button
-										icon={isMoveToTrashLoading ? <Spinner size={13} /> : <Trash2 size={13} />}
-										variant="ghost"
-										size="sm"
-										disabled={isMoveToTrashLoading}
-										aria-label="Move task to done"
-										onMouseDown={stopEvent}
-										onClick={(event) => {
-											stopEvent(event);
-											onMoveToTrash?.(card.id);
-										}}
-									/>
+									<div className="flex items-center">
+										<Button
+											icon={isCompleteLoading ? <Spinner size={13} /> : <Check size={13} />}
+											variant="ghost"
+											size="sm"
+											className="text-status-green hover:text-status-green"
+											disabled={isCompleteLoading}
+											aria-label="Complete task"
+											onMouseDown={stopEvent}
+											onClick={(event) => {
+												stopEvent(event);
+												onComplete?.(card.id);
+											}}
+										/>
+										<Button
+											icon={isMoveToTrashLoading ? <Spinner size={13} /> : <Trash2 size={13} />}
+											variant="ghost"
+											size="sm"
+											disabled={isMoveToTrashLoading}
+											aria-label="Discard task"
+											onMouseDown={stopEvent}
+											onClick={(event) => {
+												stopEvent(event);
+												onMoveToTrash?.(card.id);
+											}}
+										/>
+									</div>
 								) : columnId === "trash" ? (
 									<Tooltip
 										side="bottom"

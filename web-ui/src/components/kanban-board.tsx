@@ -19,7 +19,7 @@ import { canCreateTaskDependency } from "@/state/board-state";
 import { findCardColumnId, type ProgrammaticCardMoveInFlight } from "@/state/drag-rules";
 import type { BoardCard, BoardColumnId, BoardData, BoardDependency } from "@/types";
 
-const BOARD_COLUMN_ORDER: BoardColumnId[] = ["backlog", "in_progress", "review", "trash"];
+const BOARD_COLUMN_ORDER: BoardColumnId[] = ["backlog", "in_progress", "review", "done", "trash"];
 
 export type RequestProgrammaticCardMove = (move: ProgrammaticCardMoveInFlight) => boolean;
 
@@ -43,10 +43,12 @@ export function KanbanBoard({
 	onOpenPrTask,
 	onCancelAutomaticTaskAction,
 	onMoveToTrashTask,
+	onCompleteTask,
 	onRestoreFromTrashTask,
 	commitTaskLoadingById,
 	openPrTaskLoadingById,
 	moveToTrashLoadingById,
+	completeTaskLoadingById,
 	dependencies,
 	onCreateDependency,
 	onDeleteDependency,
@@ -70,10 +72,12 @@ export function KanbanBoard({
 	onOpenPrTask?: (taskId: string) => void;
 	onCancelAutomaticTaskAction?: (taskId: string) => void;
 	onMoveToTrashTask?: (taskId: string) => void;
+	onCompleteTask?: (taskId: string) => void;
 	onRestoreFromTrashTask?: (taskId: string) => void;
 	commitTaskLoadingById?: Record<string, boolean>;
 	openPrTaskLoadingById?: Record<string, boolean>;
 	moveToTrashLoadingById?: Record<string, boolean>;
+	completeTaskLoadingById?: Record<string, boolean>;
 	dependencies: BoardDependency[];
 	onCreateDependency?: (fromTaskId: string, toTaskId: string) => void;
 	onDeleteDependency?: (dependencyId: string) => void;
@@ -392,15 +396,17 @@ export function KanbanBoard({
 						editingTaskId={column.id === "backlog" ? editingTaskId : null}
 						inlineTaskEditor={column.id === "backlog" ? inlineTaskEditor : undefined}
 						onEditTask={column.id === "backlog" ? onEditTask : undefined}
-						onSaveTitle={column.id !== "trash" ? onSaveTaskTitle : undefined}
+						onSaveTitle={column.id !== "trash" && column.id !== "done" ? onSaveTaskTitle : undefined}
 						onCommitTask={column.id === "review" ? onCommitTask : undefined}
 						onOpenPrTask={column.id === "review" ? onOpenPrTask : undefined}
 						onCancelAutomaticTaskAction={onCancelAutomaticTaskAction}
 						onMoveToTrashTask={column.id === "review" ? onMoveToTrashTask : undefined}
+						onCompleteTask={column.id === "review" ? onCompleteTask : undefined}
 						onRestoreFromTrashTask={column.id === "trash" ? onRestoreFromTrashTask : undefined}
 						commitTaskLoadingById={column.id === "review" ? commitTaskLoadingById : undefined}
 						openPrTaskLoadingById={column.id === "review" ? openPrTaskLoadingById : undefined}
 						moveToTrashLoadingById={column.id === "review" ? moveToTrashLoadingById : undefined}
+						completeTaskLoadingById={column.id === "review" ? completeTaskLoadingById : undefined}
 						activeDragTaskId={activeDragTaskId}
 						activeDragSourceColumnId={activeDragSourceColumnId}
 						programmaticCardMoveInFlight={programmaticCardMoveInFlight}

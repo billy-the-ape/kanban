@@ -8,6 +8,7 @@ import {
 	applyTaskDetailClineSettingsChange,
 	applyTaskDetailClineSettingsSelection,
 	clearColumnTasks,
+	completeTaskAndGetReadyLinkedTaskIds,
 	disableTaskAutoReview,
 	getTaskColumnId,
 	moveTaskToColumn,
@@ -139,7 +140,7 @@ describe("board dependency state", () => {
 		]);
 	});
 
-	it("only unlocks backlog cards when a review card is trashed", () => {
+	it("does not unlock backlog cards when a review card is trashed", () => {
 		const fixture = createBacklogBoard(["Task A", "Task B", "Task C"]);
 		const taskA = requireTaskId(fixture.taskIdByPrompt["Task A"], "Task A");
 		const taskB = requireTaskId(fixture.taskIdByPrompt["Task B"], "Task B");
@@ -157,11 +158,36 @@ describe("board dependency state", () => {
 		const moveATrash = trashTaskAndGetReadyLinkedTaskIds(dependencyB.board, taskA);
 		expect(moveATrash.moved).toBe(true);
 		expect(moveATrash.board.dependencies).toHaveLength(1);
-		expect(moveATrash.readyTaskIds).toEqual([taskC]);
+		expect(moveATrash.readyTaskIds).toEqual([]);
 
 		const moveBTrash = trashTaskAndGetReadyLinkedTaskIds(dependencyB.board, taskB);
 		expect(moveBTrash.moved).toBe(true);
-		expect(moveBTrash.readyTaskIds).toEqual([taskC]);
+		expect(moveBTrash.readyTaskIds).toEqual([]);
+	});
+
+	it("unlocks backlog cards when a review card is completed", () => {
+		const fixture = createBacklogBoard(["Task A", "Task B", "Task C"]);
+		const taskA = requireTaskId(fixture.taskIdByPrompt["Task A"], "Task A");
+		const taskB = requireTaskId(fixture.taskIdByPrompt["Task B"], "Task B");
+		const taskC = requireTaskId(fixture.taskIdByPrompt["Task C"], "Task C");
+		const movedA = moveTaskToColumn(fixture.board, taskA, "review");
+		expect(movedA.moved).toBe(true);
+		const movedB = moveTaskToColumn(movedA.board, taskB, "review");
+		expect(movedB.moved).toBe(true);
+
+		const dependencyA = addTaskDependency(movedB.board, taskC, taskA);
+		expect(dependencyA.added).toBe(true);
+		const dependencyB = addTaskDependency(dependencyA.board, taskC, taskB);
+		expect(dependencyB.added).toBe(true);
+
+		const completeA = completeTaskAndGetReadyLinkedTaskIds(dependencyB.board, taskA);
+		expect(completeA.moved).toBe(true);
+		expect(completeA.board.dependencies).toHaveLength(1);
+		expect(completeA.readyTaskIds).toEqual([taskC]);
+
+		const completeB = completeTaskAndGetReadyLinkedTaskIds(completeA.board, taskB);
+		expect(completeB.moved).toBe(true);
+		expect(completeB.readyTaskIds).toEqual([taskC]);
 	});
 
 	it("does not unlock backlog cards when an in-progress card is trashed", () => {
@@ -212,7 +238,7 @@ describe("board dependency state", () => {
 		expect(movedB.board.dependencies).toHaveLength(0);
 	});
 
-	it("drops links automatically when an unlocked backlog card starts", () => {
+	it("drops links automatically when a backlog card starts", () => {
 		const fixture = createBacklogBoard(["Task A", "Task B", "Task C"]);
 		const taskA = requireTaskId(fixture.taskIdByPrompt["Task A"], "Task A");
 		const taskB = requireTaskId(fixture.taskIdByPrompt["Task B"], "Task B");
@@ -226,7 +252,7 @@ describe("board dependency state", () => {
 		expect(trashA.readyTaskIds).toEqual([]);
 
 		const trashB = trashTaskAndGetReadyLinkedTaskIds(trashA.board, taskB);
-		expect(trashB.readyTaskIds).toEqual([taskC]);
+		expect(trashB.readyTaskIds).toEqual([]);
 
 		const autoStarted = moveTaskToColumn(trashB.board, taskC, "in_progress");
 		expect(autoStarted.moved).toBe(true);
