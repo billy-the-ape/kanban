@@ -231,6 +231,17 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 				this.handleTaskEvent(taskId, event);
 			},
 			resolveClineLaunchConfig: options.resolveClineLaunchConfig,
+			// B-4.8: when a start request is reconstructed from the durable
+			// session record after a process restart, the workspace services
+			// (rules, tool approval) must come from the live per-workspace
+			// runtime setup — the same lease path startTaskSession uses.
+			resolveWorkspaceRuntime: async ({ cwd }) => {
+				const runtimeSetup = await this.ensureRuntimeSetup(cwd);
+				return {
+					userInstructionService: runtimeSetup.userInstructionService,
+					requestToolApproval: runtimeSetup.requestToolApproval,
+				};
+			},
 		});
 		this.messageRepository = createMessageRepository();
 	}

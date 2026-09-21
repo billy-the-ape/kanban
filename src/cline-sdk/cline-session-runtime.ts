@@ -20,8 +20,13 @@ import {
 import type { ResolvedClineLaunchConfig } from "./cline-provider-service";
 import { createKanbanClineLogger } from "./cline-runtime-logger";
 import { buildSessionIdPrefix, createSessionId } from "./cline-session-state";
+import {
+	buildPersistedTaskLaunchConfig,
+	mergeTaskLaunchConfigIntoMetadata,
+	readPersistedTaskLaunchConfig,
+} from "./cline-task-launch-config";
 import { createClineToolResultBoundingHook } from "./cline-tool-result-bounding-hook";
-import { CLINE_MODEL_CATALOG_DEFAULTS } from "./sdk-provider-boundary";
+import { CLINE_MODEL_CATALOG_DEFAULTS, SDK_DEFAULT_MODEL_ID, SDK_DEFAULT_PROVIDER_ID } from "./sdk-provider-boundary";
 import {
 	CLINE_SDK_DEFAULT_CONTEXT_WINDOW_TOKENS,
 	type ClineSdkAgentHooks,
@@ -176,6 +181,23 @@ export type ClineLaunchConfigResolver = (overrides: {
 	modelIdOverride?: string;
 }) => Promise<ResolvedClineLaunchConfig>;
 
+/**
+ * B-4.8: live workspace services for a task whose start request is
+ * reconstructed from durable session metadata after a process restart. The
+ * runtime cannot construct these itself (they belong to the per-workspace
+ * runtime setup owned by the task session service), so the service wires a
+ * resolver here.
+ */
+export type ClineWorkspaceRuntimeResolver = (input: {
+	taskId: string;
+	cwd: string;
+}) => Promise<ClineRestoredWorkspaceRuntime | null> | ClineRestoredWorkspaceRuntime | null;
+
+export interface ClineRestoredWorkspaceRuntime {
+	userInstructionService?: ClineSdkUserInstructionService;
+	requestToolApproval?: (request: ClineSdkToolApprovalRequest) => Promise<ClineSdkToolApprovalResult>;
+}
+
 export interface CreateInMemoryClineSessionRuntimeOptions {
 	onTaskEvent?: (taskId: string, event: unknown) => void;
 	createSessionHost?: () => Promise<ClineSessionHostBoundary>;
@@ -186,6 +208,13 @@ export interface CreateInMemoryClineSessionRuntimeOptions {
 	 * When omitted, restart replays the stored request unchanged.
 	 */
 	resolveClineLaunchConfig?: ClineLaunchConfigResolver;
+	/**
+	 * B-4.8: resolves live workspace services (rules, tool approval) when a
+	 * start request is reconstructed from the durable session record after a
+	 * process restart. When omitted, a restored session starts without the
+	 * workspace user-instruction service and custom tool approval.
+	 */
+	resolveWorkspaceRuntime?: ClineWorkspaceRuntimeResolver;
 }
 
 // Best-effort: write the Kanban task title to the SDK session metadata so external session
@@ -217,12 +246,14 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 	>();
 	private readonly mcpToolBundleByTaskId = new Map<string, ClineMcpToolBundle>();
 	private readonly resolveClineLaunchConfig: ClineLaunchConfigResolver | null;
+	private readonly resolveWorkspaceRuntime: ClineWorkspaceRuntimeResolver | null;
 	private sessionHostPromise: Promise<ClineSessionHostBoundary> | null = null;
 
 	constructor(options: CreateInMemoryClineSessionRuntimeOptions = {}) {
 		this.onTaskEvent = options.onTaskEvent ?? null;
 		this.createSessionHost = options.createSessionHost ?? createClineSdkSessionHost;
 		this.resolveClineLaunchConfig = options.resolveClineLaunchConfig ?? null;
+		this.resolveWorkspaceRuntime = options.resolveWorkspaceRuntime ?? null;
 		const createMcpRuntimeService = options.createMcpRuntimeService ?? createClineMcpRuntimeService;
 		this.clineMcpRuntimeService = createMcpRuntimeService();
 	}
@@ -418,6 +449,15 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			this.taskIdBySessionId.delete(requestedSessionId);
 		}
 
+		// B-4.8: persist the credential-free launch configuration into the
+		// SDK session record before the initial turn starts, so a process
+		// crash cannot leave the task unrestorable after a Kanban restart.
+		// The title write runs first and the launch-config write last because
+		// SDK session updates replace `metadata` wholesale — the read-merge-
+		// write in persistTaskLaunchConfig preserves both.
+		await persistKanbanTitleToClineSessionMetadata(sessionHost, startResult.sessionId, request.taskTitle);
+		await this.persistTaskLaunchConfig(sessionHost, startResult.sessionId, request);
+
 		let result: unknown = startResult.result ?? null;
 		if (shouldSendInitialTurn) {
 			try {
@@ -432,8 +472,6 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 				throw error;
 			}
 		}
-
-		await persistKanbanTitleToClineSessionMetadata(sessionHost, startResult.sessionId, request.taskTitle);
 
 		return {
 			sessionId: startResult.sessionId,
@@ -471,9 +509,18 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		images?: RuntimeTaskImage[];
 		mode?: RuntimeTaskSessionMode;
 	}): Promise<StartClineSessionRuntimeResult> {
-		const lastStartRequest = this.lastStartRequestByTaskId.get(input.taskId);
+		let lastStartRequest:
+			| Omit<StartClineSessionRuntimeRequest, "prompt" | "images" | "initialMessages">
+			| null
+			| undefined = this.lastStartRequestByTaskId.get(input.taskId);
 		if (!lastStartRequest) {
-			throw new Error(`No previous Cline session config is available for task ${input.taskId}.`);
+			// B-4.8: after a Kanban process restart the in-memory start-request
+			// map is empty; reconstruct the request from the durable session
+			// record (persisted launch config plus provider/model/cwd).
+			lastStartRequest = await this.restoreStartRequestFromPersistence(input.taskId);
+			if (!lastStartRequest) {
+				throw new Error(`No previous Cline session config is available for task ${input.taskId}.`);
+			}
 		}
 		const launchPolicy = await this.resolveRestartedLaunchPolicy(lastStartRequest);
 
@@ -516,6 +563,90 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			contextWindowSource: launchConfig.contextWindowSource,
 			compaction: buildClineCompactionConfig({ launchConfig }),
 			compactionSafetyMarginTokens: launchConfig.compactionSettings?.safetyMarginTokens,
+		};
+	}
+
+	/**
+	 * B-4.8: best-effort persistence of the credential-free launch config
+	 * into the SDK session record's metadata. Runs in startTaskSession before
+	 * the initial turn is sent (and again on every restart, which reuses
+	 * startTaskSession), so the latest session record always carries the
+	 * configuration that a process restart needs to rebuild the start
+	 * request. The SDK replaces `metadata` wholesale on update, so the
+	 * record's existing metadata is read back and merged first (this
+	 * preserves e.g. the Kanban title). A failed write degrades restart
+	 * recovery to the in-memory-only behavior; the live session is unaffected.
+	 */
+	private async persistTaskLaunchConfig(
+		sessionHost: ClineSessionHostBoundary,
+		sessionId: string,
+		request: StartClineSessionRuntimeRequest,
+	): Promise<void> {
+		if (!sessionHost.update) {
+			return;
+		}
+		try {
+			const launchConfig = buildPersistedTaskLaunchConfig({
+				mode: request.mode,
+				systemPrompt: request.systemPrompt,
+				taskTitle: request.taskTitle,
+				reasoningEffort: request.reasoningEffort,
+			});
+			const record = await sessionHost.get(sessionId);
+			const metadata = mergeTaskLaunchConfigIntoMetadata(record?.metadata, launchConfig);
+			await sessionHost.update(sessionId, { metadata });
+		} catch {
+			// Best-effort persistence; see the method docs.
+		}
+	}
+
+	/**
+	 * B-4.8: reconstructs a start request for a task that has a persisted
+	 * session record but no in-memory start request (i.e. the Kanban process
+	 * restarted). Provider, model, and cwd come from the session record;
+	 * mode, system prompt, task title, and reasoning effort come from the
+	 * persisted launch config (mode/system prompt/task title carry the
+	 * workspace rules baked in at start time); credentials and the
+	 * context/compaction policy are re-resolved live by
+	 * `resolveRestartedLaunchPolicy` (B-2.8) — secrets are never read back
+	 * from the record. Workspace services (user instructions, tool approval)
+	 * come from `resolveWorkspaceRuntime`, which the task session service
+	 * wires to the per-workspace runtime setup. Returns null when the record
+	 * has no usable launch config (pre-B-4 records) so the caller can
+	 * surface the baseline error.
+	 */
+	private async restoreStartRequestFromPersistence(
+		taskId: string,
+	): Promise<Omit<StartClineSessionRuntimeRequest, "prompt" | "images" | "initialMessages"> | null> {
+		const sessionHost = await this.ensureSessionHost();
+		const record = await this.findPersistedTaskSessionRecord(taskId, sessionHost);
+		if (!record) {
+			return null;
+		}
+		const launchConfig = readPersistedTaskLaunchConfig(record);
+		if (!launchConfig) {
+			return null;
+		}
+		const cwd = typeof record.cwd === "string" ? record.cwd.trim() : "";
+		if (!cwd) {
+			return null;
+		}
+		const workspaceRuntime = (await this.resolveWorkspaceRuntime?.({ taskId, cwd })) ?? null;
+		return {
+			taskId,
+			cwd,
+			providerId: (typeof record.provider === "string" ? record.provider.trim() : "") || SDK_DEFAULT_PROVIDER_ID,
+			modelId: (typeof record.model === "string" ? record.model.trim() : "") || SDK_DEFAULT_MODEL_ID,
+			mode: launchConfig.mode,
+			reasoningEffort: launchConfig.reasoningEffort,
+			systemPrompt: launchConfig.systemPrompt,
+			...(launchConfig.taskTitle ? { taskTitle: launchConfig.taskTitle } : {}),
+			...(workspaceRuntime?.userInstructionService
+				? { userInstructionService: workspaceRuntime.userInstructionService }
+				: {}),
+			...(workspaceRuntime?.requestToolApproval
+				? { requestToolApproval: workspaceRuntime.requestToolApproval }
+				: {}),
 		};
 	}
 

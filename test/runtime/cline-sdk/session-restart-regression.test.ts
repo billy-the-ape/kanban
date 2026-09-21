@@ -11,16 +11,19 @@
 // InMemoryClineTaskSessionService surfaces the failure instead of
 // reconstructing configuration from the persisted session record + task state.
 //
-// Tests marked "[B-1 repro]" assert the DESIRED behavior and FAIL on baseline
-// abd4912. They are skipped on the baseline (it.skip) so the suite stays
-// green; REMOVE the skip when B-4 reconstructs restart configuration and the
-// tests pass. See the evidence report in docs/plans/B-1.md.
+// The tests marked "[B-1 repro]" assert the desired behavior. B-4.8 makes
+// the session runtime persist the credential-free launch configuration into
+// the SDK session record (metadata) and reconstruct the start request from
+// it after a process restart, so these tests now pass without skips. See
+// docs/plans/B-4.md (B-4.8) and the evidence report in docs/plans/B-1.md.
 
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { buildSessionIdPrefix } from "../../../src/cline-sdk/cline-session-state";
+import { readPersistedTaskLaunchConfig } from "../../../src/cline-sdk/cline-task-launch-config";
 import {
 	createTaskSessionServiceHarness,
 	type TaskSessionServiceHarness,
@@ -99,7 +102,7 @@ describe("service restart with a persisted session (B-1.7)", () => {
 		expect(messages.map((message) => message.content)).toContain("First turn before restart");
 	});
 
-	it.skip("[B-1 repro] board reload after restart does not surface the missing session config error", async () => {
+	it("[B-1 repro] board reload after restart does not surface the missing session config error", async () => {
 		const first = createTaskSessionServiceHarness();
 		services.push(first);
 		const { after } = await restartService(first);
@@ -113,7 +116,7 @@ describe("service restart with a persisted session (B-1.7)", () => {
 		expect(summary?.warningMessage ?? "").not.toContain("No previous Cline session config");
 	});
 
-	it.skip("[B-1 repro] a follow-up sent after restart reaches the session instead of failing", async () => {
+	it("[B-1 repro] a follow-up sent after restart reaches the session instead of failing", async () => {
 		const first = createTaskSessionServiceHarness();
 		services.push(first);
 		const { after } = await restartService(first);
@@ -134,20 +137,43 @@ describe("service restart with a persisted session (B-1.7)", () => {
 		expect(after.service.getSummary(RESTART_TASK_ID)?.reviewReason).not.toBe("error");
 	});
 
-	it("characterization: on baseline the reload fails with the missing session config error", async () => {
-		const first = createTaskSessionServiceHarness();
-		services.push(first);
-		const { after } = await restartService(first);
+	it("persists the credential-free launch config to the session record (B-4.8)", async () => {
+		const harness = createTaskSessionServiceHarness();
+		services.push(harness);
+		const { service } = harness;
 
-		const summary = await after.service.reloadTaskSession(RESTART_TASK_ID);
+		await service.startTaskSession({
+			taskId: RESTART_TASK_ID,
+			cwd: "/tmp/worktree",
+			prompt: "Turn before restart",
+			systemPrompt: "test system prompt",
+			taskTitle: "B-4.8 launch config",
+			providerId: "litellm",
+			modelId: "qwen3-32b",
+			apiKey: "sk-restart-leak-canary",
+			baseUrl: "http://llama-swap.local:8080/v1",
+		});
+		// The service start is fire-and-forget; wait for the runtime start
+		// (and with it the metadata writes) to land in the store.
+		await vi.waitFor(() => {
+			expect(harness.host.startedConfigs.length).toBe(1);
+		});
 
-		// Observed baseline behavior (the deployed restart defect): the fresh
-		// runtime has no lastStartRequestByTaskId entry, so the restart path
-		// throws and the reload lands in an error state.
-		expect(summary?.reviewReason).toBe("error");
-		expect(summary?.warningMessage).toContain(
-			`No previous Cline session config is available for task ${RESTART_TASK_ID}`,
+		const record = [...harness.store.records.values()].find((entry) =>
+			entry.sessionId.startsWith(buildSessionIdPrefix(RESTART_TASK_ID)),
 		);
+		expect(record).toBeDefined();
+		// The launch config is durable so a process restart can rebuild the
+		// start request from the record (B-4.8 / B-1.7).
+		const persisted = readPersistedTaskLaunchConfig(record);
+		expect(persisted?.version).toBe(1);
+		expect(persisted?.mode).toBe("act");
+		expect(persisted?.systemPrompt).toBe("test system prompt");
+		expect(persisted?.taskTitle).toBe("B-4.8 launch config");
+		// Credentials and URL paths must never be copied into the record.
+		const serialized = JSON.stringify(record);
+		expect(serialized).not.toContain("sk-restart-leak-canary");
+		expect(serialized).not.toContain("/v1");
 	});
 
 	it("characterization: follow-ups in the same process still restart with the in-memory config", async () => {
