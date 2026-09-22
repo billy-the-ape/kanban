@@ -20,6 +20,8 @@ import type {
 	RuntimeCommandRunResponse,
 	RuntimeEffectiveContextWindow,
 	RuntimeRunUpdateResponse,
+	RuntimeTaskDeliveryInfoResponse,
+	RuntimeTaskDeliveryStartResponse,
 	RuntimeUpdateStatusResponse,
 } from "../core/api-contract";
 import {
@@ -40,6 +42,8 @@ import {
 	parseTaskChatMessagesRequest,
 	parseTaskChatReloadRequest,
 	parseTaskChatSendRequest,
+	parseTaskDeliveryInfoRequest,
+	parseTaskDeliveryStartRequest,
 	parseTaskReviewInfoRequest,
 	parseTaskReviewStartRequest,
 	parseTaskSessionInputRequest,
@@ -51,6 +55,8 @@ import { resolveTaskTitle } from "../core/task-title.js";
 import { openInBrowser } from "../server/browser";
 import { buildRuntimeConfigResponse, resolveAgentCommand } from "../terminal/agent-registry";
 import type { TerminalSessionManager } from "../terminal/session-manager";
+import { getGitDeliveryService } from "../workspace/git-delivery";
+import { findTaskBaseRef } from "../workspace/task-review-handoff";
 import { resolveTaskCwd } from "../workspace/task-worktree";
 import { captureTaskTurnCheckpoint } from "../workspace/turn-checkpoints";
 import type { RuntimeTrpcContext, RuntimeTrpcWorkspaceScope } from "./app-router";
@@ -404,6 +410,74 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					warnings: [],
 					verification: null,
 				};
+			}
+		},
+		// B-8: deterministic git delivery — the application controls commit,
+		// integration, push, remote verification, and the durable receipt,
+		// independent of model availability.
+		startTaskDelivery: async (workspaceScope, input): Promise<RuntimeTaskDeliveryStartResponse> => {
+			try {
+				const body = parseTaskDeliveryStartRequest(input);
+				const scopedRuntimeConfig = await deps.loadScopedRuntimeConfig(workspaceScope);
+				const policy = scopedRuntimeConfig.gitDeliveryPolicy;
+				if (!policy?.enabled) {
+					return {
+						ok: false,
+						receipt: null,
+						error: "Git delivery is not enabled; enable gitDeliveryPolicy in the runtime settings first.",
+					};
+				}
+				const baseRef = await findTaskBaseRef(workspaceScope.workspaceId, body.taskId);
+				if (!baseRef) {
+					return {
+						ok: false,
+						receipt: null,
+						error: "Task has no base ref; its worktree cannot be resolved for delivery.",
+					};
+				}
+				let worktreePath: string;
+				try {
+					worktreePath = await resolveTaskCwd({
+						cwd: workspaceScope.workspacePath,
+						taskId: body.taskId,
+						baseRef,
+						ensure: false,
+					});
+				} catch {
+					return {
+						ok: false,
+						receipt: null,
+						error: `Task worktree for "${body.taskId}" was not found; start the task session before delivery.`,
+					};
+				}
+				return await getGitDeliveryService().startDelivery({
+					taskId: body.taskId,
+					workspaceId: workspaceScope.workspaceId,
+					repoPath: workspaceScope.workspacePath,
+					worktreePath,
+					baseRef,
+					policy,
+					commitMessage: body.commitMessage,
+				});
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return { ok: false, receipt: null, error: message };
+			}
+		},
+		// B-8.8: read the durable delivery receipt for a task. The receipt is
+		// keyed by task id only, so a receipt from another workspace is not
+		// surfaced here.
+		getTaskDeliveryInfo: async (workspaceScope, input): Promise<RuntimeTaskDeliveryInfoResponse> => {
+			try {
+				const body = parseTaskDeliveryInfoRequest(input);
+				const info = await getGitDeliveryService().getDeliveryInfo(body.taskId);
+				if (info.receipt && info.receipt.workspaceId !== workspaceScope.workspaceId) {
+					return { ok: true, receipt: null, error: null };
+				}
+				return info;
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return { ok: false, receipt: null, error: message };
 			}
 		},
 		stopTaskSession: async (workspaceScope, input) => {

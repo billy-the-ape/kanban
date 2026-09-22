@@ -23,6 +23,8 @@ import {
 	type RuntimeTaskChatMessagesRequest,
 	type RuntimeTaskChatReloadRequest,
 	type RuntimeTaskChatSendRequest,
+	type RuntimeTaskDeliveryInfoRequest,
+	type RuntimeTaskDeliveryStartRequest,
 	type RuntimeTaskPreservationRequest,
 	type RuntimeTaskReviewInfoRequest,
 	type RuntimeTaskReviewStartRequest,
@@ -58,6 +60,8 @@ import {
 	runtimeTaskChatMessagesRequestSchema,
 	runtimeTaskChatReloadRequestSchema,
 	runtimeTaskChatSendRequestSchema,
+	runtimeTaskDeliveryInfoRequestSchema,
+	runtimeTaskDeliveryStartRequestSchema,
 	runtimeTaskPreservationRequestSchema,
 	runtimeTaskReviewInfoRequestSchema,
 	runtimeTaskReviewStartRequestSchema,
@@ -300,6 +304,34 @@ export function parseTaskReviewInfoRequest(value: unknown): RuntimeTaskReviewInf
 	const taskId = parsed.taskId.trim();
 	if (!taskId) {
 		throw new Error("Task review taskId cannot be empty.");
+	}
+	return {
+		taskId,
+	};
+}
+
+// --- B-8: deterministic git delivery ----------------------------------------
+
+export function parseTaskDeliveryStartRequest(value: unknown): RuntimeTaskDeliveryStartRequest {
+	const parsed = parseWithSchema(runtimeTaskDeliveryStartRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Task delivery taskId cannot be empty.");
+	}
+	// B-8.2: the model-supplied message is optional; blank-only values fall back
+	// to the deterministic task-title message.
+	const commitMessage = parsed.commitMessage?.trim() || undefined;
+	return {
+		taskId,
+		commitMessage,
+	};
+}
+
+export function parseTaskDeliveryInfoRequest(value: unknown): RuntimeTaskDeliveryInfoRequest {
+	const parsed = parseWithSchema(runtimeTaskDeliveryInfoRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Task delivery taskId cannot be empty.");
 	}
 	return {
 		taskId,

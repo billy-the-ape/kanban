@@ -75,6 +75,10 @@ import type {
 	RuntimeTaskChatReloadResponse,
 	RuntimeTaskChatSendRequest,
 	RuntimeTaskChatSendResponse,
+	RuntimeTaskDeliveryInfoRequest,
+	RuntimeTaskDeliveryInfoResponse,
+	RuntimeTaskDeliveryStartRequest,
+	RuntimeTaskDeliveryStartResponse,
 	RuntimeTaskPreservationInfoResponse,
 	RuntimeTaskPreservationRequest,
 	RuntimeTaskReviewInfoRequest,
@@ -173,6 +177,10 @@ import {
 	runtimeTaskChatReloadResponseSchema,
 	runtimeTaskChatSendRequestSchema,
 	runtimeTaskChatSendResponseSchema,
+	runtimeTaskDeliveryInfoRequestSchema,
+	runtimeTaskDeliveryInfoResponseSchema,
+	runtimeTaskDeliveryStartRequestSchema,
+	runtimeTaskDeliveryStartResponseSchema,
 	runtimeTaskPreservationInfoResponseSchema,
 	runtimeTaskPreservationRequestSchema,
 	runtimeTaskReviewInfoRequestSchema,
@@ -240,6 +248,14 @@ export interface RuntimeTrpcContext {
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskReviewInfoRequest,
 		) => Promise<RuntimeTaskReviewInfoResponse>;
+		startTaskDelivery: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskDeliveryStartRequest,
+		) => Promise<RuntimeTaskDeliveryStartResponse>;
+		getTaskDeliveryInfo: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskDeliveryInfoRequest,
+		) => Promise<RuntimeTaskDeliveryInfoResponse>;
 		stopTaskSession: (
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskSessionStopRequest,
@@ -502,6 +518,20 @@ export const runtimeAppRouter = t.router({
 			.output(runtimeTaskReviewInfoResponseSchema)
 			.query(async ({ ctx, input }) => {
 				return await ctx.runtimeApi.getTaskReviewInfo(ctx.workspaceScope, input);
+			}),
+		// B-8: deterministic git delivery (commit → integrate → push → verify →
+		// receipt), application-controlled and independent of model availability.
+		startTaskDelivery: workspaceProcedure
+			.input(runtimeTaskDeliveryStartRequestSchema)
+			.output(runtimeTaskDeliveryStartResponseSchema)
+			.mutation(async ({ ctx, input }) => {
+				return await ctx.runtimeApi.startTaskDelivery(ctx.workspaceScope, input);
+			}),
+		getTaskDeliveryInfo: workspaceProcedure
+			.input(runtimeTaskDeliveryInfoRequestSchema)
+			.output(runtimeTaskDeliveryInfoResponseSchema)
+			.query(async ({ ctx, input }) => {
+				return await ctx.runtimeApi.getTaskDeliveryInfo(ctx.workspaceScope, input);
 			}),
 		stopTaskSession: workspaceProcedure
 			.input(runtimeTaskSessionStopRequestSchema)

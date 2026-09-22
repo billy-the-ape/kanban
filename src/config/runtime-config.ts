@@ -9,6 +9,8 @@ import type {
 	RuntimeAgentId,
 	RuntimeContextBudget,
 	RuntimeContextBudgetSave,
+	RuntimeGitDeliveryPolicy,
+	RuntimeGitDeliveryPolicySave,
 	RuntimeProjectShortcut,
 	RuntimeReviewPolicy,
 	RuntimeReviewPolicySave,
@@ -29,6 +31,8 @@ interface RuntimeGlobalConfigFileShape {
 	contextBudget?: RuntimeContextBudget;
 	reviewPolicy?: RuntimeReviewPolicySave;
 	verification?: RuntimeVerificationConfigSave;
+	/** B-8: stored in save-shape (partial); normalized to the full policy on read. */
+	gitDeliveryPolicy?: RuntimeGitDeliveryPolicySave;
 }
 
 interface RuntimeProjectConfigFileShape {
@@ -53,6 +57,8 @@ export interface RuntimeConfigState {
 	reviewPolicy?: RuntimeReviewPolicy;
 	/** B-7: global verification gate; absent means the gate is inactive (off, no checks). */
 	verification?: RuntimeVerificationConfig;
+	/** B-8: global git delivery policy; absent means model-driven git behavior (delivery off). */
+	gitDeliveryPolicy?: RuntimeGitDeliveryPolicy;
 }
 
 export interface RuntimeConfigUpdateInput {
@@ -69,6 +75,8 @@ export interface RuntimeConfigUpdateInput {
 	reviewPolicy?: RuntimeReviewPolicySave | null;
 	/** B-7: `null` clears all verification gate settings; `undefined` leaves them untouched. */
 	verification?: RuntimeVerificationConfigSave | null;
+	/** B-8: `null` clears all git delivery settings; `undefined` leaves them untouched. */
+	gitDeliveryPolicy?: RuntimeGitDeliveryPolicySave | null;
 }
 
 const RUNTIME_HOME_PARENT_DIR = ".cline";
@@ -620,6 +628,143 @@ function areRuntimeVerificationConfigsEqual(
 	);
 }
 
+// --- B-8: deterministic git delivery ----------------------------------------
+
+const DEFAULT_GIT_DELIVERY_ENABLED = false;
+const DEFAULT_GIT_DELIVERY_REMOTE = "origin";
+const DEFAULT_GIT_DELIVERY_PUSH_REQUIRED = true;
+const DEFAULT_GIT_DELIVERY_PROTECTED_BRANCHES: string[] = ["main", "master"];
+const DEFAULT_GIT_DELIVERY_INTEGRATION_STRATEGY: RuntimeGitDeliveryPolicy["integrationStrategy"] = "fast_forward";
+const DEFAULT_GIT_DELIVERY_REQUIRE_PULL_REQUEST = false;
+
+/** Conservative git-check-refname(1) check for config-supplied remote/branch names. */
+function isValidGitDeliveryRefName(value: string): boolean {
+	if (value.length === 0 || value.length > 255 || value === "@" || value.startsWith("@{")) {
+		return false;
+	}
+	if (value.startsWith("/") || value.endsWith("/") || value.includes("//")) {
+		return false;
+	}
+	if (/[~^:?*[\]\\]/.test(value)) {
+		return false;
+	}
+	for (const character of value) {
+		const code = character.codePointAt(0);
+		if (code === undefined || code < 0x20 || code === 0x7f) {
+			return false;
+		}
+	}
+	for (const component of value.split("/")) {
+		if (
+			!component ||
+			component === "." ||
+			component.startsWith(".") ||
+			component.endsWith(".") ||
+			component.includes("..") ||
+			!/^[\w.-]+$/.test(component) ||
+			!/[\w]/.test(component)
+		) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * B-8.3: normalize a stored/partial git delivery policy. Returns undefined when
+ * the value is absent; invalid fields degrade to defaults so a corrupted config
+ * file never breaks config load (same contract as the other policy normalizers).
+ */
+export function normalizeGitDeliveryPolicy(value: unknown): RuntimeGitDeliveryPolicy | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return undefined;
+	}
+	const raw = value as Record<string, unknown>;
+	const remote =
+		typeof raw.remote === "string" && isValidGitDeliveryRefName(raw.remote)
+			? raw.remote
+			: DEFAULT_GIT_DELIVERY_REMOTE;
+	const destinationBranchRaw = raw.destinationBranch;
+	const destinationBranch =
+		destinationBranchRaw === null
+			? null
+			: typeof destinationBranchRaw === "string" && isValidGitDeliveryRefName(destinationBranchRaw)
+				? destinationBranchRaw
+				: null;
+	const protectedBranches = Array.isArray(raw.protectedBranches)
+		? raw.protectedBranches.filter(
+				(branch): branch is string => typeof branch === "string" && isValidGitDeliveryRefName(branch),
+			)
+		: DEFAULT_GIT_DELIVERY_PROTECTED_BRANCHES;
+	return {
+		enabled: typeof raw.enabled === "boolean" ? raw.enabled : DEFAULT_GIT_DELIVERY_ENABLED,
+		remote,
+		destinationBranch,
+		pushRequired: typeof raw.pushRequired === "boolean" ? raw.pushRequired : DEFAULT_GIT_DELIVERY_PUSH_REQUIRED,
+		protectedBranches,
+		integrationStrategy: raw.integrationStrategy === "merge" ? "merge" : DEFAULT_GIT_DELIVERY_INTEGRATION_STRATEGY,
+		requirePullRequest:
+			typeof raw.requirePullRequest === "boolean"
+				? raw.requirePullRequest
+				: DEFAULT_GIT_DELIVERY_REQUIRE_PULL_REQUEST,
+	};
+}
+
+/**
+ * B-8: strict validation for save-time input (defense in depth; the API
+ * boundary already runs the zod save schema). Throws on ref names the delivery
+ * pipeline could not safely use.
+ */
+function validateGitDeliveryPolicy(policy: RuntimeGitDeliveryPolicySave | null | undefined): void {
+	if (policy === null || policy === undefined) {
+		return;
+	}
+	if (typeof policy.remote === "string" && policy.remote.length > 0 && !isValidGitDeliveryRefName(policy.remote)) {
+		throw new Error("gitDeliveryPolicy.remote is not a valid git ref name.");
+	}
+	if (
+		typeof policy.destinationBranch === "string" &&
+		policy.destinationBranch.length > 0 &&
+		!isValidGitDeliveryRefName(policy.destinationBranch)
+	) {
+		throw new Error("gitDeliveryPolicy.destinationBranch is not a valid git ref name.");
+	}
+	if (policy.protectedBranches?.some((branch) => !isValidGitDeliveryRefName(branch))) {
+		throw new Error("gitDeliveryPolicy.protectedBranches contains an invalid git ref name.");
+	}
+}
+
+/** B-8: merge a save-shape update (null clears, undefined leaves as-is). */
+function mergeGitDeliveryPolicyUpdates(
+	stored: RuntimeGitDeliveryPolicy | undefined,
+	updates: RuntimeGitDeliveryPolicySave | null | undefined,
+): RuntimeGitDeliveryPolicySave | null | undefined {
+	if (updates === undefined) {
+		return undefined;
+	}
+	if (updates === null) {
+		return null;
+	}
+	return { ...(stored ?? {}), ...updates };
+}
+
+function areRuntimeGitDeliveryPoliciesEqual(
+	left: RuntimeGitDeliveryPolicySave | null | undefined,
+	right: RuntimeGitDeliveryPolicySave | null | undefined,
+): boolean {
+	// Compare normalized forms: key order in saved objects is not guaranteed,
+	// and normalization drops the same invalid data both sides would carry.
+	const normalizedLeft = normalizeGitDeliveryPolicy(left);
+	const normalizedRight = normalizeGitDeliveryPolicy(right);
+	if (!normalizedLeft && !normalizedRight) {
+		return true;
+	}
+	if (!normalizedLeft || !normalizedRight) {
+		return false;
+	}
+	return JSON.stringify(normalizedLeft) === JSON.stringify(normalizedRight);
+}
+
 function hasOwnKey<T extends object>(value: T | null, key: keyof T): boolean {
 	if (!value) {
 		return false;
@@ -721,6 +866,7 @@ function toRuntimeConfigState({
 		contextBudget: normalizeContextBudget(globalConfig?.contextBudget),
 		reviewPolicy: normalizeReviewPolicy(globalConfig?.reviewPolicy),
 		verification: normalizeVerificationConfig(globalConfig?.verification),
+		gitDeliveryPolicy: normalizeGitDeliveryPolicy(globalConfig?.gitDeliveryPolicy),
 	};
 }
 
@@ -748,6 +894,8 @@ async function writeRuntimeGlobalConfigFile(
 		reviewPolicy?: RuntimeReviewPolicySave | null;
 		/** B-7: `null` clears the stored verification gate; `undefined` preserves the existing one. */
 		verification?: RuntimeVerificationConfigSave | null;
+		/** B-8: `null` clears the stored git delivery policy; `undefined` preserves the existing one. */
+		gitDeliveryPolicy?: RuntimeGitDeliveryPolicySave | null;
 	},
 ): Promise<void> {
 	const existing = await readRuntimeConfigFile<RuntimeGlobalConfigFileShape>(configPath);
@@ -840,6 +988,16 @@ async function writeRuntimeGlobalConfigFile(
 	} else if (existing?.verification) {
 		payload.verification = normalizeVerificationConfig(existing.verification);
 	}
+	if (config.gitDeliveryPolicy !== undefined) {
+		if (config.gitDeliveryPolicy !== null) {
+			const normalizedGitDeliveryPolicy = normalizeGitDeliveryPolicy(config.gitDeliveryPolicy);
+			if (normalizedGitDeliveryPolicy) {
+				payload.gitDeliveryPolicy = normalizedGitDeliveryPolicy;
+			}
+		}
+	} else if (existing?.gitDeliveryPolicy) {
+		payload.gitDeliveryPolicy = normalizeGitDeliveryPolicy(existing.gitDeliveryPolicy);
+	}
 
 	await lockedFileSystem.writeJsonFileAtomic(configPath, payload, {
 		lock: null,
@@ -925,6 +1083,7 @@ function createRuntimeConfigStateFromValues(input: {
 	contextBudget?: RuntimeContextBudgetSave | null;
 	reviewPolicy?: RuntimeReviewPolicySave | null;
 	verification?: RuntimeVerificationConfigSave | null;
+	gitDeliveryPolicy?: RuntimeGitDeliveryPolicySave | null;
 }): RuntimeConfigState {
 	return {
 		globalConfigPath: input.globalConfigPath,
@@ -947,6 +1106,7 @@ function createRuntimeConfigStateFromValues(input: {
 		contextBudget: normalizeContextBudget(input.contextBudget),
 		reviewPolicy: normalizeReviewPolicy(input.reviewPolicy),
 		verification: normalizeVerificationConfig(input.verification),
+		gitDeliveryPolicy: normalizeGitDeliveryPolicy(input.gitDeliveryPolicy),
 	};
 }
 
@@ -994,6 +1154,7 @@ export function toGlobalRuntimeConfigState(current: RuntimeConfigState): Runtime
 		contextBudget: current.contextBudget,
 		reviewPolicy: current.reviewPolicy,
 		verification: current.verification,
+		gitDeliveryPolicy: current.gitDeliveryPolicy,
 	});
 }
 
@@ -1032,11 +1193,13 @@ export async function saveRuntimeConfig(
 		contextBudget?: RuntimeContextBudgetSave | null;
 		reviewPolicy?: RuntimeReviewPolicySave | null;
 		verification?: RuntimeVerificationConfigSave | null;
+		gitDeliveryPolicy?: RuntimeGitDeliveryPolicySave | null;
 	},
 ): Promise<RuntimeConfigState> {
 	validateContextBudget(config.contextBudget);
 	validateReviewPolicy(config.reviewPolicy);
 	validateVerificationConfig(config.verification);
+	validateGitDeliveryPolicy(config.gitDeliveryPolicy);
 	const { globalConfigPath, projectConfigPath } = resolveRuntimeConfigPaths(cwd);
 	return await lockedFileSystem.withLocks(getRuntimeConfigLockRequests(cwd), async () => {
 		await writeRuntimeGlobalConfigFile(globalConfigPath, {
@@ -1049,6 +1212,7 @@ export async function saveRuntimeConfig(
 			contextBudget: config.contextBudget,
 			reviewPolicy: config.reviewPolicy,
 			verification: config.verification,
+			gitDeliveryPolicy: config.gitDeliveryPolicy,
 		});
 		await writeRuntimeProjectConfigFile(projectConfigPath, { shortcuts: config.shortcuts });
 		return createRuntimeConfigStateFromValues({
@@ -1064,6 +1228,7 @@ export async function saveRuntimeConfig(
 			contextBudget: config.contextBudget,
 			reviewPolicy: config.reviewPolicy,
 			verification: config.verification,
+			gitDeliveryPolicy: config.gitDeliveryPolicy,
 		});
 	});
 }
@@ -1072,6 +1237,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 	validateContextBudget(updates.contextBudget);
 	validateReviewPolicy(updates.reviewPolicy);
 	validateVerificationConfig(updates.verification);
+	validateGitDeliveryPolicy(updates.gitDeliveryPolicy);
 	const { globalConfigPath, projectConfigPath } = resolveRuntimeConfigPaths(cwd);
 	return await lockedFileSystem.withLocks(getRuntimeConfigLockRequests(cwd), async () => {
 		const current = await loadRuntimeConfigLocked(cwd);
@@ -1081,6 +1247,10 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 		const mergedContextBudget = mergeContextBudgetUpdates(current.contextBudget, updates.contextBudget);
 		const mergedReviewPolicy = mergeReviewPolicyUpdates(current.reviewPolicy, updates.reviewPolicy);
 		const mergedVerification = mergeVerificationUpdates(current.verification, updates.verification);
+		const mergedGitDeliveryPolicy = mergeGitDeliveryPolicyUpdates(
+			current.gitDeliveryPolicy,
+			updates.gitDeliveryPolicy,
+		);
 		const nextConfig = {
 			selectedAgentId: updates.selectedAgentId ?? current.selectedAgentId,
 			selectedShortcutLabel:
@@ -1094,6 +1264,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			contextBudget: mergedContextBudget === undefined ? current.contextBudget : mergedContextBudget,
 			reviewPolicy: mergedReviewPolicy === undefined ? current.reviewPolicy : mergedReviewPolicy,
 			verification: mergedVerification === undefined ? current.verification : mergedVerification,
+			gitDeliveryPolicy: mergedGitDeliveryPolicy === undefined ? current.gitDeliveryPolicy : mergedGitDeliveryPolicy,
 		};
 
 		const hasChanges =
@@ -1106,7 +1277,8 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			!areRuntimeProjectShortcutsEqual(nextConfig.shortcuts, current.shortcuts) ||
 			!areRuntimeContextBudgetsEqual(nextConfig.contextBudget, current.contextBudget) ||
 			!areRuntimeReviewPoliciesEqual(nextConfig.reviewPolicy, current.reviewPolicy) ||
-			!areRuntimeVerificationConfigsEqual(nextConfig.verification, current.verification);
+			!areRuntimeVerificationConfigsEqual(nextConfig.verification, current.verification) ||
+			!areRuntimeGitDeliveryPoliciesEqual(nextConfig.gitDeliveryPolicy, current.gitDeliveryPolicy);
 
 		if (!hasChanges) {
 			return current;
@@ -1122,6 +1294,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			contextBudget: updates.contextBudget === undefined ? undefined : mergedContextBudget,
 			reviewPolicy: updates.reviewPolicy === undefined ? undefined : mergedReviewPolicy,
 			verification: updates.verification === undefined ? undefined : mergedVerification,
+			gitDeliveryPolicy: updates.gitDeliveryPolicy === undefined ? undefined : mergedGitDeliveryPolicy,
 		});
 		await writeRuntimeProjectConfigFile(projectConfigPath, {
 			shortcuts: nextConfig.shortcuts,
@@ -1139,6 +1312,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			contextBudget: nextConfig.contextBudget,
 			reviewPolicy: nextConfig.reviewPolicy,
 			verification: nextConfig.verification,
+			gitDeliveryPolicy: nextConfig.gitDeliveryPolicy,
 		});
 	});
 }
@@ -1150,6 +1324,7 @@ export async function updateGlobalRuntimeConfig(
 	validateContextBudget(updates.contextBudget);
 	validateReviewPolicy(updates.reviewPolicy);
 	validateVerificationConfig(updates.verification);
+	validateGitDeliveryPolicy(updates.gitDeliveryPolicy);
 	const globalConfigPath = getRuntimeGlobalConfigPath();
 	return await lockedFileSystem.withLocks(
 		[
@@ -1162,6 +1337,10 @@ export async function updateGlobalRuntimeConfig(
 			const mergedContextBudget = mergeContextBudgetUpdates(current.contextBudget, updates.contextBudget);
 			const mergedReviewPolicy = mergeReviewPolicyUpdates(current.reviewPolicy, updates.reviewPolicy);
 			const mergedVerification = mergeVerificationUpdates(current.verification, updates.verification);
+			const mergedGitDeliveryPolicy = mergeGitDeliveryPolicyUpdates(
+				current.gitDeliveryPolicy,
+				updates.gitDeliveryPolicy,
+			);
 			const nextConfig = {
 				selectedAgentId: updates.selectedAgentId ?? current.selectedAgentId,
 				selectedShortcutLabel:
@@ -1177,6 +1356,8 @@ export async function updateGlobalRuntimeConfig(
 				contextBudget: mergedContextBudget === undefined ? current.contextBudget : mergedContextBudget,
 				reviewPolicy: mergedReviewPolicy === undefined ? current.reviewPolicy : mergedReviewPolicy,
 				verification: mergedVerification === undefined ? current.verification : mergedVerification,
+				gitDeliveryPolicy:
+					mergedGitDeliveryPolicy === undefined ? current.gitDeliveryPolicy : mergedGitDeliveryPolicy,
 			};
 
 			const hasChanges =
@@ -1188,7 +1369,8 @@ export async function updateGlobalRuntimeConfig(
 				nextConfig.openPrPromptTemplate !== current.openPrPromptTemplate ||
 				!areRuntimeContextBudgetsEqual(nextConfig.contextBudget, current.contextBudget) ||
 				!areRuntimeReviewPoliciesEqual(nextConfig.reviewPolicy, current.reviewPolicy) ||
-				!areRuntimeVerificationConfigsEqual(nextConfig.verification, current.verification);
+				!areRuntimeVerificationConfigsEqual(nextConfig.verification, current.verification) ||
+				!areRuntimeGitDeliveryPoliciesEqual(nextConfig.gitDeliveryPolicy, current.gitDeliveryPolicy);
 
 			if (!hasChanges) {
 				return current;
@@ -1204,6 +1386,7 @@ export async function updateGlobalRuntimeConfig(
 				contextBudget: updates.contextBudget === undefined ? undefined : mergedContextBudget,
 				reviewPolicy: updates.reviewPolicy === undefined ? undefined : mergedReviewPolicy,
 				verification: updates.verification === undefined ? undefined : mergedVerification,
+				gitDeliveryPolicy: updates.gitDeliveryPolicy === undefined ? undefined : mergedGitDeliveryPolicy,
 			});
 
 			return createRuntimeConfigStateFromValues({
@@ -1219,6 +1402,7 @@ export async function updateGlobalRuntimeConfig(
 				contextBudget: nextConfig.contextBudget,
 				reviewPolicy: nextConfig.reviewPolicy,
 				verification: nextConfig.verification,
+				gitDeliveryPolicy: nextConfig.gitDeliveryPolicy,
 			});
 		},
 	);

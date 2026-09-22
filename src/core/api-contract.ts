@@ -1193,6 +1193,148 @@ export const runtimeVerificationReceiptSchema = z.object({
 });
 export type RuntimeVerificationReceipt = z.infer<typeof runtimeVerificationReceiptSchema>;
 
+// --- B-8: deterministic git delivery -----------------------------------------
+
+/** B-8.4: how the task commit is integrated into the destination branch. */
+export const runtimeGitDeliveryIntegrationStrategySchema = z.enum(["fast_forward", "merge"]);
+export type RuntimeGitDeliveryIntegrationStrategy = z.infer<typeof runtimeGitDeliveryIntegrationStrategySchema>;
+
+/**
+ * B-8.3: global git delivery policy (trusted, operator-managed). When
+ * `enabled`, commit/integrate/push/delivery are application-controlled and
+ * independent of model availability (B-8.1..B-8.9).
+ */
+export const runtimeGitDeliveryPolicySchema = z.object({
+	enabled: z.boolean(),
+	/** Remote name used for the explicit-refspec push (B-8.6). */
+	remote: z.string().min(1),
+	/**
+	 * Delivery destination branch. `null` means "the task's base ref" (the
+	 * branch the task worktree was based on).
+	 */
+	destinationBranch: z.string().nullable(),
+	/** True when delivery is incomplete until the remote contains the commit (B-8.6/B-8.7). */
+	pushRequired: z.boolean(),
+	/** B-8.3: branches that direct push/integration must never target. */
+	protectedBranches: z.array(z.string()),
+	integrationStrategy: runtimeGitDeliveryIntegrationStrategySchema,
+	/** B-8.9: open a PR from the destination branch to the first protected branch after delivery. */
+	requirePullRequest: z.boolean(),
+});
+export type RuntimeGitDeliveryPolicy = z.infer<typeof runtimeGitDeliveryPolicySchema>;
+
+/** Partial save request for git delivery; `undefined` leaves the stored policy untouched. */
+export const runtimeGitDeliveryPolicySaveSchema = z.object({
+	enabled: z.boolean().optional(),
+	remote: z.string().optional(),
+	destinationBranch: z.string().nullable().optional(),
+	pushRequired: z.boolean().optional(),
+	protectedBranches: z.array(z.string()).optional(),
+	integrationStrategy: runtimeGitDeliveryIntegrationStrategySchema.optional(),
+	requirePullRequest: z.boolean().optional(),
+});
+export type RuntimeGitDeliveryPolicySave = z.infer<typeof runtimeGitDeliveryPolicySaveSchema>;
+
+export const runtimeTaskDeliveryStartRequestSchema = z.object({
+	taskId: z.string(),
+	/** Optional model-supplied commit message; sanitized to a subject/body (B-8.2). */
+	commitMessage: z.string().max(5000).optional(),
+});
+export type RuntimeTaskDeliveryStartRequest = z.infer<typeof runtimeTaskDeliveryStartRequestSchema>;
+
+export const runtimeTaskDeliveryInfoRequestSchema = z.object({
+	taskId: z.string(),
+});
+export type RuntimeTaskDeliveryInfoRequest = z.infer<typeof runtimeTaskDeliveryInfoRequestSchema>;
+
+/** B-8.8: terminal delivery status. */
+export const runtimeGitDeliveryStatusSchema = z.enum(["delivered", "no_op", "paused", "failed"]);
+export type RuntimeGitDeliveryStatus = z.infer<typeof runtimeGitDeliveryStatusSchema>;
+
+/** B-8.8: last pipeline stage completed successfully. */
+export const runtimeGitDeliveryStageSchema = z.enum([
+	"validated",
+	"staged",
+	"committed",
+	"integrated",
+	"pushed",
+	"verified",
+	"pr",
+]);
+export type RuntimeGitDeliveryStage = z.infer<typeof runtimeGitDeliveryStageSchema>;
+
+export const runtimeGitDeliveryPrStatusSchema = z.enum(["not_required", "created", "existing", "skipped", "failed"]);
+export type RuntimeGitDeliveryPrStatus = z.infer<typeof runtimeGitDeliveryPrStatusSchema>;
+
+export const runtimeGitDeliveryEvidenceSchema = z.object({
+	stage: z.string().min(1),
+	detail: z.string(),
+});
+export type RuntimeGitDeliveryEvidence = z.infer<typeof runtimeGitDeliveryEvidenceSchema>;
+
+/**
+ * B-8.8: durable per-task delivery receipt — the single source of truth for
+ * whether a task's work was delivered (and the evidence for how).
+ */
+export const runtimeGitDeliveryReceiptSchema = z.object({
+	taskId: z.string(),
+	workspaceId: z.string().min(1),
+	repoPath: z.string().min(1),
+	worktreePath: z.string().min(1),
+	/** The task's base ref from the card (null when unknown). */
+	baseRef: z.string().nullable(),
+	/** The recorded starting commit (review handoff; null when unrecorded). */
+	baseSha: z.string().nullable(),
+	destinationBranch: z.string().min(1),
+	remote: z.string().min(1),
+	/** Remote branch sha verified to contain the delivery (null when unverified). */
+	remoteBranchSha: z.string().nullable(),
+	/** The task commit (null for no-op deliveries). */
+	taskCommitSha: z.string().nullable(),
+	/** Destination branch sha after integration (null for no-op deliveries). */
+	integratedSha: z.string().nullable(),
+	status: runtimeGitDeliveryStatusSchema,
+	stage: runtimeGitDeliveryStageSchema,
+	/** Policy snapshot under which this delivery ran. */
+	policy: runtimeGitDeliveryPolicySchema,
+	commitMessageSource: z.enum(["model", "fallback", "reused"]).nullable(),
+	stagedPaths: z.array(z.string()),
+	excludedPaths: z.array(z.string()),
+	/** Review gate status observed at delivery start (null when never checked). */
+	reviewOutcome: z.enum(["ready", "not_ready", "absent"]).nullable(),
+	/** Verification gate outcome from the stored receipt (null when no receipt). */
+	verificationPassed: z.boolean().nullable(),
+	pr: z
+		.object({
+			status: runtimeGitDeliveryPrStatusSchema,
+			number: z.number().int().nullable(),
+			url: z.string().nullable(),
+			error: z.string().nullable(),
+		})
+		.nullable(),
+	/** Bounded evidence trail (most recent last); carries divergence detail when paused. */
+	evidence: z.array(runtimeGitDeliveryEvidenceSchema),
+	/** 1-based delivery attempt counter (crash + retry diagnostics). */
+	attempt: z.number().int().min(1),
+	startedAt: z.number().int(),
+	updatedAt: z.number().int(),
+});
+export type RuntimeGitDeliveryReceipt = z.infer<typeof runtimeGitDeliveryReceiptSchema>;
+
+export const runtimeTaskDeliveryStartResponseSchema = z.object({
+	ok: z.boolean(),
+	receipt: runtimeGitDeliveryReceiptSchema.nullable(),
+	error: z.string().nullable(),
+});
+export type RuntimeTaskDeliveryStartResponse = z.infer<typeof runtimeTaskDeliveryStartResponseSchema>;
+
+export const runtimeTaskDeliveryInfoResponseSchema = z.object({
+	ok: z.boolean(),
+	receipt: runtimeGitDeliveryReceiptSchema.nullable(),
+	error: z.string().nullable(),
+});
+export type RuntimeTaskDeliveryInfoResponse = z.infer<typeof runtimeTaskDeliveryInfoResponseSchema>;
+
 export const runtimeConfigResponseSchema = z.object({
 	selectedAgentId: runtimeAgentIdSchema,
 	selectedShortcutLabel: z.string().nullable(),
@@ -1215,6 +1357,8 @@ export const runtimeConfigResponseSchema = z.object({
 	reviewPolicy: runtimeReviewPolicySchema.nullable(),
 	/** B-7: global verification gate; null means the gate is inactive (off, no checks). */
 	verification: runtimeVerificationConfigSchema.nullable(),
+	/** B-8: global git delivery policy; null means delivery is disabled (model-driven git flow). */
+	gitDeliveryPolicy: runtimeGitDeliveryPolicySchema.nullable(),
 	effectiveContextWindow: runtimeEffectiveContextWindowSchema.nullable(),
 });
 export type RuntimeConfigResponse = z.infer<typeof runtimeConfigResponseSchema>;
@@ -1232,6 +1376,8 @@ export const runtimeConfigSaveRequestSchema = z.object({
 	reviewPolicy: runtimeReviewPolicySaveSchema.optional(),
 	/** B-7: verification gate; `undefined` leaves it untouched. */
 	verification: runtimeVerificationConfigSaveSchema.optional(),
+	/** B-8: git delivery policy; `null` clears the stored policy, `undefined` leaves it untouched. */
+	gitDeliveryPolicy: runtimeGitDeliveryPolicySaveSchema.optional(),
 });
 export type RuntimeConfigSaveRequest = z.infer<typeof runtimeConfigSaveRequestSchema>;
 
