@@ -1,5 +1,5 @@
-// B-6.2 / B-6.4 / B-6.5 / B-6.7 — integration tests for the bounded review
-// session orchestrator (ClineReviewSessionService).
+// B-6.2 / B-6.4 / B-6.5 / B-6.7 / B-7.2 / B-7.5 — integration tests for the
+// bounded review session orchestrator (ClineReviewSessionService).
 //
 // Drives the REAL InMemoryClineTaskSessionService through the real
 // InMemoryClineSessionRuntime against the in-memory fake session host (the
@@ -17,7 +17,14 @@ import {
 	reviewSessionIdForTask,
 } from "../../src/cline-sdk/cline-review-session-service";
 import type { ClineLaunchConfigResolver } from "../../src/cline-sdk/cline-session-runtime";
-import type { RuntimeReviewHandoffArtifact, RuntimeReviewOutcomeFile } from "../../src/core/api-contract";
+import type {
+	RuntimeReviewHandoffArtifact,
+	RuntimeReviewOutcomeFile,
+	RuntimeVerificationCheckResult,
+	RuntimeVerificationConfig,
+	RuntimeVerificationReceipt,
+} from "../../src/core/api-contract";
+import type { VerificationRunInput, VerificationRunner } from "../../src/verification/verification-service";
 import type { BuildReviewHandoffInput } from "../../src/workspace/task-review-handoff";
 import {
 	createTaskSessionServiceHarness,
@@ -171,14 +178,85 @@ function scriptTurns(harness: TaskSessionServiceHarness, scripts: Array<{ reply:
 	};
 }
 
-function createReviewService(harness: TaskSessionServiceHarness, evidence: ClineReviewEvidencePort) {
+function createReviewService(
+	harness: TaskSessionServiceHarness,
+	evidence: ClineReviewEvidencePort,
+	verificationRunner?: VerificationRunner,
+) {
 	return createClineReviewSessionService({
 		clineTaskSessionService: harness.service,
 		resolveClineLaunchConfig: makeResolver(),
 		workspaceId: "ws-1",
 		repoPath: "/tmp/repo",
 		evidence,
+		verificationRunner,
 	});
+}
+
+/** B-7.1: the gate config the tests drive through the orchestrator. */
+const GATE_CONFIG: RuntimeVerificationConfig = {
+	enabled: "required",
+	checks: [{ id: "lint", command: "npm", args: ["run", "lint"], successExitCodes: [0], required: true }],
+};
+
+function passedLintCheck(): RuntimeVerificationCheckResult {
+	return {
+		id: "lint",
+		command: "npm",
+		args: ["run", "lint"],
+		status: "passed",
+		exitCode: 0,
+		emptyOutput: false,
+		outputExcerpt: "0 problems",
+		logPath: "/tmp/verification/lint.log",
+		startedAt: 1,
+		finishedAt: 2,
+		error: null,
+	};
+}
+
+function failedLintCheck(): RuntimeVerificationCheckResult {
+	return {
+		...passedLintCheck(),
+		status: "failed",
+		exitCode: 1,
+		outputExcerpt: "src/a.ts:10: error TS2322",
+	};
+}
+
+/** A receipt bound to the reviewed tree; overrides stand in for a specific gate outcome. */
+function makeReceipt(overrides: Partial<RuntimeVerificationReceipt> = {}): RuntimeVerificationReceipt {
+	return {
+		treeHashBefore: "tree-hash-1",
+		treeHashAfter: "tree-hash-1",
+		treeIdentityPreserved: true,
+		matchesCandidate: true,
+		checks: [passedLintCheck()],
+		passed: true,
+		error: null,
+		startedAt: 1,
+		finishedAt: 2,
+		...overrides,
+	};
+}
+
+/** Scripted verification runner: serves receipts in order (the last one repeats). */
+function createFakeVerificationRunner(
+	receipts: RuntimeVerificationReceipt[],
+	onRun?: (callIndex: number) => void,
+): { runner: VerificationRunner; calls: VerificationRunInput[] } {
+	const calls: VerificationRunInput[] = [];
+	return {
+		calls,
+		runner: {
+			async run(_config, input) {
+				const callIndex = calls.length;
+				calls.push(input);
+				onRun?.(callIndex);
+				return receipts[Math.min(callIndex, receipts.length - 1)];
+			},
+		},
+	};
 }
 
 describe("ClineReviewSessionService.startTaskReview", () => {
@@ -367,5 +445,198 @@ describe("ClineReviewSessionService.dispose", () => {
 		await reviewService.dispose();
 
 		await vi.waitFor(() => expect(harness.service.getSummary(sessionId)?.state).toBe("interrupted"));
+	});
+});
+
+describe("ClineReviewSessionService.startTaskReview — B-7 verification gate", () => {
+	it("gates a clean review as ready when the checks pass, persisting the receipt", async () => {
+		const harness = createTaskSessionServiceHarness({ resolveClineLaunchConfig: makeResolver() });
+		services.push(harness);
+		const evidence = createFakeEvidencePort();
+		const fake = createFakeVerificationRunner([makeReceipt()]);
+		const reviewService = createReviewService(harness, evidence, fake.runner);
+		scriptTurns(harness, [{ reply: reviewResultBlock(CLEAN_RESULT), reason: "completed" }]);
+
+		const response = await reviewService.startTaskReview({
+			taskId: "task-1",
+			description: "Implement feature X",
+			verification: GATE_CONFIG,
+		});
+
+		expect(response.ok).toBe(true);
+		expect(response.status).toBe("ready");
+		expect(response.error).toBeNull();
+		expect(response.verification?.passed).toBe(true);
+		expect(response.verification?.matchesCandidate).toBe(true);
+		expect(response.verification?.treeHashBefore).toBe("tree-hash-1");
+		// The gate runs against the exact reviewed candidate in the task worktree.
+		expect(fake.calls).toEqual([
+			{ taskId: "task-1", worktreePath: "/tmp/review-worktree", candidateTreeHash: "tree-hash-1" },
+		]);
+		// The receipt is bound into the durable outcome.
+		const outcome = await evidence.readOutcome("task-1");
+		expect(outcome?.verification?.passed).toBe(true);
+		expect(outcome?.verification?.checks?.[0]?.id).toBe("lint");
+	});
+
+	it("blocks delivery on a failing receipt even when the reviewer reports clean", async () => {
+		const harness = createTaskSessionServiceHarness({ resolveClineLaunchConfig: makeResolver() });
+		services.push(harness);
+		const failing = makeReceipt({
+			passed: false,
+			error: "required check failed: lint (exit 1)",
+			checks: [failedLintCheck()],
+		});
+		const fake = createFakeVerificationRunner([failing]);
+		const reviewService = createReviewService(harness, createFakeEvidencePort(), fake.runner);
+		scriptTurns(harness, [{ reply: reviewResultBlock(CLEAN_RESULT), reason: "completed" }]);
+
+		const response = await reviewService.startTaskReview({
+			taskId: "task-1",
+			description: "Implement feature X",
+			reviewPolicy: { enabled: "required", instructions: "", modelOverride: null, maxRepairRounds: 1 },
+			verification: GATE_CONFIG,
+		});
+
+		// The reviewer's narrative is clean, but the deterministic gate blocks.
+		expect(response.ok).toBe(true);
+		expect(response.status).toBe("blocked");
+		expect(response.result?.blocking).toBe(false);
+		expect(response.error).toBe("required check failed: lint (exit 1)");
+		expect(response.verification?.passed).toBe(false);
+		expect(response.verification?.checks?.[0]?.status).toBe("failed");
+		// Initial gate run + one (unsuccessful) verification repair round.
+		expect(fake.calls.length).toBe(2);
+	});
+
+	it("re-runs the gate after a verification repair round and rebinds to the mutated tree", async () => {
+		const harness = createTaskSessionServiceHarness({ resolveClineLaunchConfig: makeResolver() });
+		services.push(harness);
+		let treeHash = "tree-hash-1";
+		const evidence = createFakeEvidencePort({ treeHash: () => treeHash });
+		const failing = makeReceipt({
+			passed: false,
+			error: "required check failed: lint (exit 1)",
+			checks: [failedLintCheck()],
+		});
+		const fake = createFakeVerificationRunner(
+			[failing, makeReceipt({ treeHashBefore: "tree-hash-2", treeHashAfter: "tree-hash-2" })],
+			(callIndex) => {
+				if (callIndex === 0) {
+					// The repair agent fixes the lint error: the tree moves.
+					treeHash = "tree-hash-2";
+				}
+			},
+		);
+		const reviewService = createReviewService(harness, evidence, fake.runner);
+		scriptTurns(harness, [{ reply: reviewResultBlock(CLEAN_RESULT), reason: "completed" }]);
+
+		const response = await reviewService.startTaskReview({
+			taskId: "task-1",
+			description: "Implement feature X",
+			reviewPolicy: { enabled: "required", instructions: "", modelOverride: null, maxRepairRounds: 1 },
+			verification: GATE_CONFIG,
+		});
+
+		expect(response.ok).toBe(true);
+		expect(response.status).toBe("ready");
+		// The outcome is bound to the post-repair tree, not the original candidate.
+		expect(response.candidateTreeHash).toBe("tree-hash-2");
+		expect(response.verification?.treeHashBefore).toBe("tree-hash-2");
+		expect(fake.calls.map((call) => call.candidateTreeHash)).toEqual(["tree-hash-1", "tree-hash-2"]);
+		// Initial review + one verification repair prompt.
+		await vi.waitFor(() => expect(harness.host.sentPrompts.length).toBe(2));
+	});
+
+	it("reports blocked when the gate keeps failing until the repair budget is exhausted", async () => {
+		const harness = createTaskSessionServiceHarness({ resolveClineLaunchConfig: makeResolver() });
+		services.push(harness);
+		const failing = makeReceipt({
+			passed: false,
+			error: "required check failed: lint (exit 1)",
+			checks: [failedLintCheck()],
+		});
+		const fake = createFakeVerificationRunner([failing]);
+		const reviewService = createReviewService(harness, createFakeEvidencePort(), fake.runner);
+		scriptTurns(harness, [{ reply: reviewResultBlock(CLEAN_RESULT), reason: "completed" }]);
+
+		const response = await reviewService.startTaskReview({
+			taskId: "task-1",
+			description: "Implement feature X",
+			reviewPolicy: { enabled: "required", instructions: "", modelOverride: null, maxRepairRounds: 2 },
+			verification: GATE_CONFIG,
+		});
+
+		expect(response.ok).toBe(true);
+		expect(response.status).toBe("blocked");
+		expect(response.error).toBe("required check failed: lint (exit 1)");
+		// Initial gate run + two repair rounds (the full budget).
+		expect(fake.calls.length).toBe(3);
+		await vi.waitFor(() => expect(harness.host.sentPrompts.length).toBe(3));
+	});
+
+	it("shares the repair budget between review repairs and verification repairs", async () => {
+		const harness = createTaskSessionServiceHarness({ resolveClineLaunchConfig: makeResolver() });
+		services.push(harness);
+		const failing = makeReceipt({
+			passed: false,
+			error: "required check failed: lint (exit 1)",
+			checks: [failedLintCheck()],
+		});
+		const fake = createFakeVerificationRunner([failing]);
+		const reviewService = createReviewService(harness, createFakeEvidencePort(), fake.runner);
+		scriptTurns(harness, [
+			{ reply: reviewResultBlock(BLOCKED_RESULT), reason: "completed" }, // turn 1: findings
+			{ reply: reviewResultBlock(CLEAN_RESULT), reason: "completed" }, // turn 2 (review repair): resolved
+			// turn 3 (verification repair): the fallback reply, then the gate fails again.
+		]);
+
+		const response = await reviewService.startTaskReview({
+			taskId: "task-1",
+			description: "Implement feature X",
+			reviewPolicy: { enabled: "required", instructions: "", modelOverride: null, maxRepairRounds: 2 },
+			verification: GATE_CONFIG,
+		});
+
+		// One round went to the review findings, leaving one for the gate — exhausted.
+		expect(response.status).toBe("blocked");
+		expect(response.result?.blocking).toBe(false);
+		expect(response.error).toBe("required check failed: lint (exit 1)");
+		expect(fake.calls.length).toBe(2);
+		await vi.waitFor(() => expect(harness.host.sentPrompts.length).toBe(3));
+	});
+
+	it("never runs the gate when the review itself blocks or the gate config is absent", async () => {
+		const harness = createTaskSessionServiceHarness({ resolveClineLaunchConfig: makeResolver() });
+		services.push(harness);
+		const fake = createFakeVerificationRunner([makeReceipt()]);
+		const reviewService = createReviewService(harness, createFakeEvidencePort(), fake.runner);
+		scriptTurns(harness, [
+			{ reply: reviewResultBlock(BLOCKED_RESULT), reason: "completed" },
+			{ reply: reviewResultBlock(BLOCKED_RESULT), reason: "completed" },
+		]);
+
+		const blockedResponse = await reviewService.startTaskReview({
+			taskId: "task-1",
+			description: "Implement feature X",
+			reviewPolicy: { enabled: "required", instructions: "", modelOverride: null, maxRepairRounds: 1 },
+			verification: GATE_CONFIG,
+		});
+		expect(blockedResponse.status).toBe("blocked");
+		expect(blockedResponse.verification).toBeNull();
+
+		// A second, gateless review on a fresh session: the runner must stay untouched.
+		const secondHarness = createTaskSessionServiceHarness({ resolveClineLaunchConfig: makeResolver() });
+		services.push(secondHarness);
+		const secondReviewService = createReviewService(secondHarness, createFakeEvidencePort(), fake.runner);
+		scriptTurns(secondHarness, [{ reply: reviewResultBlock(CLEAN_RESULT), reason: "completed" }]);
+
+		const noGateResponse = await secondReviewService.startTaskReview({
+			taskId: "task-2",
+			description: "Implement feature Y",
+		});
+		expect(noGateResponse.status).toBe("ready");
+		expect(noGateResponse.verification).toBeNull();
+		expect(fake.calls.length).toBe(0);
 	});
 });

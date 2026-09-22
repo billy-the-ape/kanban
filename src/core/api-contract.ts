@@ -1102,6 +1102,97 @@ export const runtimeReviewPolicySaveSchema = z.object({
 });
 export type RuntimeReviewPolicySave = z.infer<typeof runtimeReviewPolicySaveSchema>;
 
+// --- B-7: deterministic verification gate ------------------------------------
+
+/** B-7.1: one operator-configured verification check (trusted executable config). */
+export const runtimeVerificationCheckSchema = z.object({
+	/** Stable identifier used in receipts and logs (unique within the config). */
+	id: z.string().min(1),
+	/** Executable invoked directly (never through a shell). */
+	command: z.string().min(1),
+	/** Arguments passed verbatim to the executable. */
+	args: z.array(z.string()).default([]),
+	/** Working directory relative to the task worktree root (defaults to the root). */
+	cwd: z.string().min(1).optional(),
+	/** Per-check timeout in milliseconds (the service default applies when omitted). */
+	timeoutMs: z.number().int().positive().max(86_400_000).optional(),
+	/** Explicit environment values handed to the check (on top of the minimal base env). */
+	env: z.record(z.string(), z.string()).optional(),
+	/** Exit codes that count as success — the only configured exit semantics. */
+	successExitCodes: z.array(z.number().int().min(0).max(255)).min(1).default([0]),
+	/** Required checks gate delivery; optional checks are informational only. */
+	required: z.boolean().default(true),
+});
+export type RuntimeVerificationCheck = z.infer<typeof runtimeVerificationCheckSchema>;
+
+/** B-7.1: the global verification gate config (trusted, operator-managed). */
+export const runtimeVerificationConfigSchema = z.object({
+	/** "required" gates delivery on the checks; "off" leaves the gate inactive. */
+	enabled: z.enum(["required", "off"]),
+	checks: z.array(runtimeVerificationCheckSchema),
+});
+export type RuntimeVerificationConfig = z.infer<typeof runtimeVerificationConfigSchema>;
+
+/** B-7.1: partial save request for one check; provided entries replace the stored check. */
+export const runtimeVerificationCheckSaveSchema = z.object({
+	id: z.string().min(1),
+	command: z.string().min(1),
+	args: z.array(z.string()).optional(),
+	cwd: z.string().min(1).optional(),
+	timeoutMs: z.number().int().positive().max(86_400_000).optional(),
+	env: z.record(z.string(), z.string()).optional(),
+	successExitCodes: z.array(z.number().int().min(0).max(255)).min(1).optional(),
+	required: z.boolean().optional(),
+});
+export type RuntimeVerificationCheckSave = z.infer<typeof runtimeVerificationCheckSaveSchema>;
+
+/** Partial save request for the verification gate; `undefined` leaves it untouched. */
+export const runtimeVerificationConfigSaveSchema = z.object({
+	enabled: z.enum(["required", "off"]).optional(),
+	checks: z.array(runtimeVerificationCheckSaveSchema).optional(),
+});
+export type RuntimeVerificationConfigSave = z.infer<typeof runtimeVerificationConfigSaveSchema>;
+
+/** B-7.3: outcome of one verification check run (decided by exit semantics only). */
+export const runtimeVerificationCheckResultSchema = z.object({
+	id: z.string().min(1),
+	command: z.string().min(1),
+	args: z.array(z.string()),
+	status: z.enum(["passed", "failed", "timeout", "missing_executable", "cancelled", "error"]),
+	exitCode: z.number().int().nullable(),
+	/** True when the check produced no stdout/stderr at all (never a pass by itself). */
+	emptyOutput: z.boolean(),
+	/** Bounded head excerpt of the combined stdout/stderr. */
+	outputExcerpt: z.string(),
+	/** Absolute path to the full log artifact (null when unavailable). */
+	logPath: z.string().nullable(),
+	startedAt: z.number().int(),
+	finishedAt: z.number().int(),
+	/** Operational error detail (spawn failure, bad cwd, cancellation, ...). */
+	error: z.string().nullable(),
+});
+export type RuntimeVerificationCheckResult = z.infer<typeof runtimeVerificationCheckResultSchema>;
+
+/** B-7.2/B-7.3/B-7.6: durable receipt binding the check results to an exact tree identity. */
+export const runtimeVerificationReceiptSchema = z.object({
+	/** Tree identity recorded before the checks ran. */
+	treeHashBefore: z.string().nullable(),
+	/** Tree identity recorded after the checks ran. */
+	treeHashAfter: z.string().nullable(),
+	/** True only when before === after (checks did not mutate the tree). */
+	treeIdentityPreserved: z.boolean(),
+	/** True only when the checks ran on the exact candidate that was reviewed. */
+	matchesCandidate: z.boolean(),
+	checks: z.array(runtimeVerificationCheckResultSchema),
+	/** Delivery gate: all required checks passed and the tree identity is bound. */
+	passed: z.boolean(),
+	/** Non-empty when the gate failed for a configured or operational reason. */
+	error: z.string().nullable(),
+	startedAt: z.number().int(),
+	finishedAt: z.number().int(),
+});
+export type RuntimeVerificationReceipt = z.infer<typeof runtimeVerificationReceiptSchema>;
+
 export const runtimeConfigResponseSchema = z.object({
 	selectedAgentId: runtimeAgentIdSchema,
 	selectedShortcutLabel: z.string().nullable(),
@@ -1122,6 +1213,8 @@ export const runtimeConfigResponseSchema = z.object({
 	contextBudget: runtimeContextBudgetSchema.nullable(),
 	/** B-6: global review lifecycle policy; null means all defaults (off, 2 repair rounds). */
 	reviewPolicy: runtimeReviewPolicySchema.nullable(),
+	/** B-7: global verification gate; null means the gate is inactive (off, no checks). */
+	verification: runtimeVerificationConfigSchema.nullable(),
 	effectiveContextWindow: runtimeEffectiveContextWindowSchema.nullable(),
 });
 export type RuntimeConfigResponse = z.infer<typeof runtimeConfigResponseSchema>;
@@ -1137,6 +1230,8 @@ export const runtimeConfigSaveRequestSchema = z.object({
 	contextBudget: runtimeContextBudgetSaveSchema.optional(),
 	/** B-6: `null` clears the stored review policy; `undefined` leaves it untouched. */
 	reviewPolicy: runtimeReviewPolicySaveSchema.optional(),
+	/** B-7: verification gate; `undefined` leaves it untouched. */
+	verification: runtimeVerificationConfigSaveSchema.optional(),
 });
 export type RuntimeConfigSaveRequest = z.infer<typeof runtimeConfigSaveRequestSchema>;
 
@@ -1223,6 +1318,8 @@ export const runtimeReviewOutcomeFileSchema = z.object({
 	error: z.string().nullable(),
 	sessionId: z.string().nullable(),
 	warnings: z.array(z.string()),
+	/** B-7.2: durable verification receipt bound to the candidate tree (null when the gate is off or failed before running). Optional in the durable file so pre-B-7 stored outcomes keep loading; readers normalize to null. */
+	verification: runtimeVerificationReceiptSchema.nullable().optional(),
 	updatedAt: z.number().int(),
 });
 export type RuntimeReviewOutcomeFile = z.infer<typeof runtimeReviewOutcomeFileSchema>;
@@ -1296,6 +1393,8 @@ export const runtimeTaskReviewStartResponseSchema = z.object({
 	sessionId: z.string().nullable(),
 	error: z.string().nullable(),
 	warnings: z.array(z.string()),
+	/** B-7: the verification receipt for this run (null when the gate is off or never ran). */
+	verification: runtimeVerificationReceiptSchema.nullable(),
 });
 export type RuntimeTaskReviewStartResponse = z.infer<typeof runtimeTaskReviewStartResponseSchema>;
 
@@ -1320,6 +1419,8 @@ export const runtimeTaskReviewInfoResponseSchema = z.object({
 	resultMatchesTree: z.boolean().nullable(),
 	error: z.string().nullable(),
 	warnings: z.array(z.string()),
+	/** B-7: the stored verification receipt (null when the gate never ran). */
+	verification: runtimeVerificationReceiptSchema.nullable(),
 });
 export type RuntimeTaskReviewInfoResponse = z.infer<typeof runtimeTaskReviewInfoResponseSchema>;
 

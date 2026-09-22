@@ -131,6 +131,7 @@ export function buildRuntimeConfigResponse(
 		openPrPromptTemplateDefault: runtimeConfig.openPrPromptTemplateDefault,
 		contextBudget: runtimeConfig.contextBudget ?? null,
 		reviewPolicy: runtimeConfig.reviewPolicy ?? null,
+		verification: runtimeConfig.verification ?? null,
 		effectiveContextWindow: extra.effectiveContextWindow ?? null,
 	};
 }

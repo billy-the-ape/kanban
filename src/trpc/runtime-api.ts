@@ -368,6 +368,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				return await reviewService.startTaskReview({
 					...body,
 					reviewPolicy: scopedRuntimeConfig.reviewPolicy,
+					verification: scopedRuntimeConfig.verification,
 				});
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
@@ -380,6 +381,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					sessionId: null,
 					error: message,
 					warnings: [],
+					verification: null,
 				};
 			}
 		},
@@ -400,6 +402,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					resultMatchesTree: null,
 					error: message,
 					warnings: [],
+					verification: null,
 				};
 			}
 		},

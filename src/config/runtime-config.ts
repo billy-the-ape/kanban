@@ -12,6 +12,8 @@ import type {
 	RuntimeProjectShortcut,
 	RuntimeReviewPolicy,
 	RuntimeReviewPolicySave,
+	RuntimeVerificationConfig,
+	RuntimeVerificationConfigSave,
 } from "../core/api-contract";
 import { type LockRequest, lockedFileSystem } from "../fs/locked-file-system";
 import { detectInstalledCommands } from "../terminal/agent-registry";
@@ -26,6 +28,7 @@ interface RuntimeGlobalConfigFileShape {
 	openPrPromptTemplate?: string;
 	contextBudget?: RuntimeContextBudget;
 	reviewPolicy?: RuntimeReviewPolicySave;
+	verification?: RuntimeVerificationConfigSave;
 }
 
 interface RuntimeProjectConfigFileShape {
@@ -48,6 +51,8 @@ export interface RuntimeConfigState {
 	contextBudget?: RuntimeContextBudget;
 	/** B-6: global review lifecycle policy; absent means all defaults (off, 2 repair rounds). */
 	reviewPolicy?: RuntimeReviewPolicy;
+	/** B-7: global verification gate; absent means the gate is inactive (off, no checks). */
+	verification?: RuntimeVerificationConfig;
 }
 
 export interface RuntimeConfigUpdateInput {
@@ -62,6 +67,8 @@ export interface RuntimeConfigUpdateInput {
 	contextBudget?: RuntimeContextBudgetSave | null;
 	/** B-6: `null` clears all review policy settings; `undefined` leaves them untouched. */
 	reviewPolicy?: RuntimeReviewPolicySave | null;
+	/** B-7: `null` clears all verification gate settings; `undefined` leaves them untouched. */
+	verification?: RuntimeVerificationConfigSave | null;
 }
 
 const RUNTIME_HOME_PARENT_DIR = ".cline";
@@ -446,6 +453,173 @@ function areRuntimeReviewPoliciesEqual(
 	);
 }
 
+const DEFAULT_VERIFICATION_ENABLED: "required" | "off" = "off";
+
+/** B-7.1: a check working directory must stay inside the task worktree root. */
+function isSafeVerificationCwd(value: string): boolean {
+	const trimmed = value.trim();
+	if (!trimmed || trimmed.startsWith("/") || trimmed.startsWith("\\")) {
+		return false;
+	}
+	// Reject absolute Windows paths (C:\) and any segment that traverses upward.
+	if (/^[a-zA-Z]:/.test(trimmed) || trimmed.split(/[\\/]+/).includes("..")) {
+		return false;
+	}
+	return true;
+}
+
+/** B-7.1: normalize one stored check; malformed entries are dropped (load-time defense in depth). */
+function normalizeVerificationCheck(value: unknown): RuntimeVerificationConfig["checks"][number] | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return undefined;
+	}
+	const record = value as Record<string, unknown>;
+	const id = typeof record.id === "string" ? record.id.trim() : "";
+	const command = typeof record.command === "string" ? record.command.trim() : "";
+	if (!id || !command) {
+		return undefined;
+	}
+	const args = Array.isArray(record.args) ? record.args.filter((arg): arg is string => typeof arg === "string") : [];
+	const cwd = typeof record.cwd === "string" && isSafeVerificationCwd(record.cwd) ? record.cwd.trim() : undefined;
+	const timeoutMs =
+		typeof record.timeoutMs === "number" && Number.isInteger(record.timeoutMs) && record.timeoutMs > 0
+			? record.timeoutMs
+			: undefined;
+	const env =
+		record.env && typeof record.env === "object" && !Array.isArray(record.env)
+			? Object.fromEntries(
+					Object.entries(record.env as Record<string, unknown>).filter(
+						(entry): entry is [string, string] => typeof entry[1] === "string",
+					),
+				)
+			: undefined;
+	const successExitCodes = Array.isArray(record.successExitCodes)
+		? record.successExitCodes.filter(
+				(code): code is number => typeof code === "number" && Number.isInteger(code) && code >= 0 && code <= 255,
+			)
+		: [];
+	return {
+		id,
+		command,
+		args,
+		...(cwd ? { cwd } : {}),
+		...(timeoutMs ? { timeoutMs } : {}),
+		...(env && Object.keys(env).length > 0 ? { env } : {}),
+		successExitCodes: successExitCodes.length > 0 ? successExitCodes : [0],
+		required: typeof record.required === "boolean" ? record.required : true,
+	};
+}
+
+/** B-7.1: normalize a stored verification config; undefined means the gate is inactive. */
+function normalizeVerificationConfig(value: unknown): RuntimeVerificationConfig | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return undefined;
+	}
+	const record = value as Record<string, unknown>;
+	const enabled: "required" | "off" =
+		record.enabled === "required" || record.enabled === "off" ? record.enabled : DEFAULT_VERIFICATION_ENABLED;
+	const checks: RuntimeVerificationConfig["checks"] = [];
+	const seenIds = new Set<string>();
+	if (Array.isArray(record.checks)) {
+		for (const item of record.checks) {
+			const check = normalizeVerificationCheck(item);
+			if (!check || seenIds.has(check.id.toLowerCase())) {
+				continue;
+			}
+			seenIds.add(check.id.toLowerCase());
+			checks.push(check);
+		}
+	}
+	return { enabled, checks };
+}
+
+/**
+ * B-7.1: strict save-time validation of the operator-managed verification config
+ * (the API boundary already validates via zod; this is defense in depth for direct callers).
+ */
+function validateVerificationConfig(config: RuntimeVerificationConfigSave | null | undefined): void {
+	if (config === null || config === undefined) {
+		return;
+	}
+	if (config.enabled !== undefined && config.enabled !== "required" && config.enabled !== "off") {
+		throw new Error("verification.enabled must be either 'required' or 'off'.");
+	}
+	if (config.checks !== undefined && !Array.isArray(config.checks)) {
+		throw new Error("verification.checks must be an array.");
+	}
+	const seenIds = new Set<string>();
+	(config.checks ?? []).forEach((check, index) => {
+		const label = check?.id?.trim() || `index ${index}`;
+		if (!check || typeof check !== "object" || Array.isArray(check)) {
+			throw new Error(`verification.checks[${index}] must be an object.`);
+		}
+		if (!check.id?.trim() || !check.command?.trim()) {
+			throw new Error(`verification check "${label}" requires non-empty id and command.`);
+		}
+		if (seenIds.has(check.id.trim().toLowerCase())) {
+			throw new Error(`verification config has duplicate check id "${check.id.trim()}".`);
+		}
+		seenIds.add(check.id.trim().toLowerCase());
+		if (
+			check.args !== undefined &&
+			(!Array.isArray(check.args) || check.args.some((arg) => typeof arg !== "string"))
+		) {
+			throw new Error(`verification check "${label}" args must be strings.`);
+		}
+		if (check.cwd !== undefined && !isSafeVerificationCwd(check.cwd)) {
+			throw new Error(`verification check "${label}" cwd must be a relative path inside the worktree.`);
+		}
+		if (check.timeoutMs !== undefined && (!Number.isInteger(check.timeoutMs) || check.timeoutMs <= 0)) {
+			throw new Error(`verification check "${label}" timeoutMs must be a positive integer.`);
+		}
+		if (check.env !== undefined && Object.values(check.env).some((value) => typeof value !== "string")) {
+			throw new Error(`verification check "${label}" env values must be strings.`);
+		}
+		if (
+			check.successExitCodes !== undefined &&
+			(!Array.isArray(check.successExitCodes) ||
+				check.successExitCodes.length === 0 ||
+				check.successExitCodes.some((code) => !Number.isInteger(code) || code < 0 || code > 255))
+		) {
+			throw new Error(`verification check "${label}" successExitCodes must be a non-empty array of 0-255 integers.`);
+		}
+	});
+}
+
+/** B-7.1: merges a save-shape verification update (null clears everything, undefined leaves it untouched). */
+function mergeVerificationUpdates(
+	stored: RuntimeVerificationConfig | undefined,
+	updates: RuntimeVerificationConfigSave | null | undefined,
+): RuntimeVerificationConfigSave | null | undefined {
+	if (updates === undefined) {
+		return undefined;
+	}
+	if (updates === null) {
+		return null;
+	}
+	return { ...(stored ?? {}), ...updates };
+}
+
+function areRuntimeVerificationConfigsEqual(
+	left: RuntimeVerificationConfigSave | null | undefined,
+	right: RuntimeVerificationConfigSave | null | undefined,
+): boolean {
+	// Compare normalized forms: key order in saved objects is not guaranteed,
+	// and normalization drops the same invalid data both sides would carry.
+	const normalizedLeft = normalizeVerificationConfig(left);
+	const normalizedRight = normalizeVerificationConfig(right);
+	if (!normalizedLeft && !normalizedRight) {
+		return true;
+	}
+	if (!normalizedLeft || !normalizedRight) {
+		return false;
+	}
+	return (
+		normalizedLeft.enabled === normalizedRight.enabled &&
+		JSON.stringify(normalizedLeft.checks) === JSON.stringify(normalizedRight.checks)
+	);
+}
+
 function hasOwnKey<T extends object>(value: T | null, key: keyof T): boolean {
 	if (!value) {
 		return false;
@@ -546,6 +720,7 @@ function toRuntimeConfigState({
 		openPrPromptTemplateDefault: DEFAULT_OPEN_PR_PROMPT_TEMPLATE,
 		contextBudget: normalizeContextBudget(globalConfig?.contextBudget),
 		reviewPolicy: normalizeReviewPolicy(globalConfig?.reviewPolicy),
+		verification: normalizeVerificationConfig(globalConfig?.verification),
 	};
 }
 
@@ -571,6 +746,8 @@ async function writeRuntimeGlobalConfigFile(
 		contextBudget?: RuntimeContextBudgetSave | null;
 		/** B-6: `null` clears the stored review policy; `undefined` preserves the existing one. */
 		reviewPolicy?: RuntimeReviewPolicySave | null;
+		/** B-7: `null` clears the stored verification gate; `undefined` preserves the existing one. */
+		verification?: RuntimeVerificationConfigSave | null;
 	},
 ): Promise<void> {
 	const existing = await readRuntimeConfigFile<RuntimeGlobalConfigFileShape>(configPath);
@@ -652,6 +829,16 @@ async function writeRuntimeGlobalConfigFile(
 		}
 	} else if (existing?.reviewPolicy) {
 		payload.reviewPolicy = normalizeReviewPolicy(existing.reviewPolicy);
+	}
+	if (config.verification !== undefined) {
+		if (config.verification !== null) {
+			const normalizedVerification = normalizeVerificationConfig(config.verification);
+			if (normalizedVerification) {
+				payload.verification = normalizedVerification;
+			}
+		}
+	} else if (existing?.verification) {
+		payload.verification = normalizeVerificationConfig(existing.verification);
 	}
 
 	await lockedFileSystem.writeJsonFileAtomic(configPath, payload, {
@@ -737,6 +924,7 @@ function createRuntimeConfigStateFromValues(input: {
 	openPrPromptTemplate: string;
 	contextBudget?: RuntimeContextBudgetSave | null;
 	reviewPolicy?: RuntimeReviewPolicySave | null;
+	verification?: RuntimeVerificationConfigSave | null;
 }): RuntimeConfigState {
 	return {
 		globalConfigPath: input.globalConfigPath,
@@ -758,6 +946,7 @@ function createRuntimeConfigStateFromValues(input: {
 		openPrPromptTemplateDefault: DEFAULT_OPEN_PR_PROMPT_TEMPLATE,
 		contextBudget: normalizeContextBudget(input.contextBudget),
 		reviewPolicy: normalizeReviewPolicy(input.reviewPolicy),
+		verification: normalizeVerificationConfig(input.verification),
 	};
 }
 
@@ -781,6 +970,16 @@ export async function readGlobalRuntimeReviewPolicy(): Promise<RuntimeReviewPoli
 	return normalizeReviewPolicy(globalConfig?.reviewPolicy);
 }
 
+/**
+ * B-7.1: reads only the verification gate from the global runtime config without the
+ * agent auto-selection side effects of loadGlobalRuntimeConfig, so it is safe
+ * to call on hot paths (per-task review session startup).
+ */
+export async function readGlobalRuntimeVerificationConfig(): Promise<RuntimeVerificationConfig | undefined> {
+	const globalConfig = await readRuntimeConfigFile<RuntimeGlobalConfigFileShape>(getRuntimeGlobalConfigPath());
+	return normalizeVerificationConfig(globalConfig?.verification);
+}
+
 export function toGlobalRuntimeConfigState(current: RuntimeConfigState): RuntimeConfigState {
 	return createRuntimeConfigStateFromValues({
 		globalConfigPath: current.globalConfigPath,
@@ -794,6 +993,7 @@ export function toGlobalRuntimeConfigState(current: RuntimeConfigState): Runtime
 		openPrPromptTemplate: current.openPrPromptTemplate,
 		contextBudget: current.contextBudget,
 		reviewPolicy: current.reviewPolicy,
+		verification: current.verification,
 	});
 }
 
@@ -831,10 +1031,12 @@ export async function saveRuntimeConfig(
 		openPrPromptTemplate: string;
 		contextBudget?: RuntimeContextBudgetSave | null;
 		reviewPolicy?: RuntimeReviewPolicySave | null;
+		verification?: RuntimeVerificationConfigSave | null;
 	},
 ): Promise<RuntimeConfigState> {
 	validateContextBudget(config.contextBudget);
 	validateReviewPolicy(config.reviewPolicy);
+	validateVerificationConfig(config.verification);
 	const { globalConfigPath, projectConfigPath } = resolveRuntimeConfigPaths(cwd);
 	return await lockedFileSystem.withLocks(getRuntimeConfigLockRequests(cwd), async () => {
 		await writeRuntimeGlobalConfigFile(globalConfigPath, {
@@ -846,6 +1048,7 @@ export async function saveRuntimeConfig(
 			openPrPromptTemplate: config.openPrPromptTemplate,
 			contextBudget: config.contextBudget,
 			reviewPolicy: config.reviewPolicy,
+			verification: config.verification,
 		});
 		await writeRuntimeProjectConfigFile(projectConfigPath, { shortcuts: config.shortcuts });
 		return createRuntimeConfigStateFromValues({
@@ -860,6 +1063,7 @@ export async function saveRuntimeConfig(
 			openPrPromptTemplate: config.openPrPromptTemplate,
 			contextBudget: config.contextBudget,
 			reviewPolicy: config.reviewPolicy,
+			verification: config.verification,
 		});
 	});
 }
@@ -867,6 +1071,7 @@ export async function saveRuntimeConfig(
 export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpdateInput): Promise<RuntimeConfigState> {
 	validateContextBudget(updates.contextBudget);
 	validateReviewPolicy(updates.reviewPolicy);
+	validateVerificationConfig(updates.verification);
 	const { globalConfigPath, projectConfigPath } = resolveRuntimeConfigPaths(cwd);
 	return await lockedFileSystem.withLocks(getRuntimeConfigLockRequests(cwd), async () => {
 		const current = await loadRuntimeConfigLocked(cwd);
@@ -875,6 +1080,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 		}
 		const mergedContextBudget = mergeContextBudgetUpdates(current.contextBudget, updates.contextBudget);
 		const mergedReviewPolicy = mergeReviewPolicyUpdates(current.reviewPolicy, updates.reviewPolicy);
+		const mergedVerification = mergeVerificationUpdates(current.verification, updates.verification);
 		const nextConfig = {
 			selectedAgentId: updates.selectedAgentId ?? current.selectedAgentId,
 			selectedShortcutLabel:
@@ -887,6 +1093,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			openPrPromptTemplate: updates.openPrPromptTemplate ?? current.openPrPromptTemplate,
 			contextBudget: mergedContextBudget === undefined ? current.contextBudget : mergedContextBudget,
 			reviewPolicy: mergedReviewPolicy === undefined ? current.reviewPolicy : mergedReviewPolicy,
+			verification: mergedVerification === undefined ? current.verification : mergedVerification,
 		};
 
 		const hasChanges =
@@ -898,7 +1105,8 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			nextConfig.openPrPromptTemplate !== current.openPrPromptTemplate ||
 			!areRuntimeProjectShortcutsEqual(nextConfig.shortcuts, current.shortcuts) ||
 			!areRuntimeContextBudgetsEqual(nextConfig.contextBudget, current.contextBudget) ||
-			!areRuntimeReviewPoliciesEqual(nextConfig.reviewPolicy, current.reviewPolicy);
+			!areRuntimeReviewPoliciesEqual(nextConfig.reviewPolicy, current.reviewPolicy) ||
+			!areRuntimeVerificationConfigsEqual(nextConfig.verification, current.verification);
 
 		if (!hasChanges) {
 			return current;
@@ -913,6 +1121,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			openPrPromptTemplate: nextConfig.openPrPromptTemplate,
 			contextBudget: updates.contextBudget === undefined ? undefined : mergedContextBudget,
 			reviewPolicy: updates.reviewPolicy === undefined ? undefined : mergedReviewPolicy,
+			verification: updates.verification === undefined ? undefined : mergedVerification,
 		});
 		await writeRuntimeProjectConfigFile(projectConfigPath, {
 			shortcuts: nextConfig.shortcuts,
@@ -929,6 +1138,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			openPrPromptTemplate: nextConfig.openPrPromptTemplate,
 			contextBudget: nextConfig.contextBudget,
 			reviewPolicy: nextConfig.reviewPolicy,
+			verification: nextConfig.verification,
 		});
 	});
 }
@@ -939,6 +1149,7 @@ export async function updateGlobalRuntimeConfig(
 ): Promise<RuntimeConfigState> {
 	validateContextBudget(updates.contextBudget);
 	validateReviewPolicy(updates.reviewPolicy);
+	validateVerificationConfig(updates.verification);
 	const globalConfigPath = getRuntimeGlobalConfigPath();
 	return await lockedFileSystem.withLocks(
 		[
@@ -950,6 +1161,7 @@ export async function updateGlobalRuntimeConfig(
 		async () => {
 			const mergedContextBudget = mergeContextBudgetUpdates(current.contextBudget, updates.contextBudget);
 			const mergedReviewPolicy = mergeReviewPolicyUpdates(current.reviewPolicy, updates.reviewPolicy);
+			const mergedVerification = mergeVerificationUpdates(current.verification, updates.verification);
 			const nextConfig = {
 				selectedAgentId: updates.selectedAgentId ?? current.selectedAgentId,
 				selectedShortcutLabel:
@@ -964,6 +1176,7 @@ export async function updateGlobalRuntimeConfig(
 				openPrPromptTemplate: updates.openPrPromptTemplate ?? current.openPrPromptTemplate,
 				contextBudget: mergedContextBudget === undefined ? current.contextBudget : mergedContextBudget,
 				reviewPolicy: mergedReviewPolicy === undefined ? current.reviewPolicy : mergedReviewPolicy,
+				verification: mergedVerification === undefined ? current.verification : mergedVerification,
 			};
 
 			const hasChanges =
@@ -974,7 +1187,8 @@ export async function updateGlobalRuntimeConfig(
 				nextConfig.commitPromptTemplate !== current.commitPromptTemplate ||
 				nextConfig.openPrPromptTemplate !== current.openPrPromptTemplate ||
 				!areRuntimeContextBudgetsEqual(nextConfig.contextBudget, current.contextBudget) ||
-				!areRuntimeReviewPoliciesEqual(nextConfig.reviewPolicy, current.reviewPolicy);
+				!areRuntimeReviewPoliciesEqual(nextConfig.reviewPolicy, current.reviewPolicy) ||
+				!areRuntimeVerificationConfigsEqual(nextConfig.verification, current.verification);
 
 			if (!hasChanges) {
 				return current;
@@ -989,6 +1203,7 @@ export async function updateGlobalRuntimeConfig(
 				openPrPromptTemplate: nextConfig.openPrPromptTemplate,
 				contextBudget: updates.contextBudget === undefined ? undefined : mergedContextBudget,
 				reviewPolicy: updates.reviewPolicy === undefined ? undefined : mergedReviewPolicy,
+				verification: updates.verification === undefined ? undefined : mergedVerification,
 			});
 
 			return createRuntimeConfigStateFromValues({
@@ -1003,6 +1218,7 @@ export async function updateGlobalRuntimeConfig(
 				openPrPromptTemplate: nextConfig.openPrPromptTemplate,
 				contextBudget: nextConfig.contextBudget,
 				reviewPolicy: nextConfig.reviewPolicy,
+				verification: nextConfig.verification,
 			});
 		},
 	);

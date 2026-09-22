@@ -34,12 +34,18 @@ import { readTaskPreservationRecord } from "./task-preservation";
 import { normalizeTaskIdForWorktreePath } from "./task-worktree-path";
 
 const REVIEW_ARTIFACTS_DIR_NAME = "review";
+const VERIFICATION_ARTIFACTS_DIR_NAME = "verification";
 const REVIEW_HANDOFF_FILENAME = "handoff.json";
 const REVIEW_OUTCOME_FILENAME = "outcome.json";
 
 /** Per-task directory for review handoff + outcome artifacts (created on demand). */
 export function getTaskReviewDir(taskId: string): string {
 	return join(getTaskWorktreesHomePath(), normalizeTaskIdForWorktreePath(taskId), REVIEW_ARTIFACTS_DIR_NAME);
+}
+
+/** B-7.3: per-task directory for the deterministic verification log artifacts. */
+export function getTaskVerificationDir(taskId: string): string {
+	return join(getTaskWorktreesHomePath(), normalizeTaskIdForWorktreePath(taskId), VERIFICATION_ARTIFACTS_DIR_NAME);
 }
 
 function getTaskReviewHandoffPath(taskId: string): string {
@@ -353,7 +359,8 @@ export async function readReviewOutcome(taskId: string): Promise<RuntimeReviewOu
 	}
 	try {
 		const parsed = runtimeReviewOutcomeFileSchema.safeParse(JSON.parse(raw));
-		return parsed.success ? parsed.data : null;
+		// Pre-B-7 stored outcomes have no verification field; normalize to null.
+		return parsed.success ? { ...parsed.data, verification: parsed.data.verification ?? null } : null;
 	} catch {
 		return null;
 	}

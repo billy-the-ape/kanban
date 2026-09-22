@@ -23,8 +23,11 @@ import type {
 	RuntimeTaskReviewStartRequest,
 	RuntimeTaskReviewStartResponse,
 	RuntimeTaskSessionSummary,
+	RuntimeVerificationConfig,
+	RuntimeVerificationReceipt,
 } from "../core/api-contract";
 import { runtimeReviewResultOutputSchema } from "../core/api-contract";
+import { createVerificationRunner, type VerificationRunner } from "../verification/verification-service";
 import {
 	type BuildReviewHandoffInput,
 	buildReviewHandoffArtifact,
@@ -43,7 +46,7 @@ import { buildClineCompactionConfig } from "./cline-compaction-config";
 import type { ResolvedClineLaunchConfig } from "./cline-provider-service";
 import type { ClineLaunchConfigResolver } from "./cline-session-runtime";
 import type { ClineTaskSessionService } from "./cline-task-session-service";
-import { buildReviewInitialPrompt, buildReviewRepairPrompt } from "./review-prompt";
+import { buildReviewInitialPrompt, buildReviewRepairPrompt, buildVerificationRepairPrompt } from "./review-prompt";
 import { createReviewToolPolicy } from "./review-tool-policy";
 
 /** Suffix that makes the review session id distinct from the task's working session. */
@@ -74,6 +77,8 @@ export interface ClineReviewEvidencePort {
 export interface ClineReviewStartInput extends RuntimeTaskReviewStartRequest {
 	/** Effective review policy; absent means all defaults (off, 2 repair rounds). */
 	reviewPolicy?: RuntimeReviewPolicy;
+	/** B-7.1: effective verification gate config; absent/null means the gate is inactive. */
+	verification?: RuntimeVerificationConfig | null;
 }
 
 export interface ClineReviewSessionService {
@@ -93,6 +98,8 @@ export interface CreateClineReviewSessionServiceOptions {
 	repoPath: string;
 	/** Injectable evidence port (defaults to the real git/FS implementation). */
 	evidence?: ClineReviewEvidencePort;
+	/** B-7: injectable deterministic verification runner (defaults to the spawned-check service). */
+	verificationRunner?: VerificationRunner;
 }
 
 function createDefaultReviewEvidencePort(workspaceId: string, repoPath: string): ClineReviewEvidencePort {
@@ -130,7 +137,7 @@ function isFailedTerminal(summary: RuntimeTaskSessionSummary): boolean {
 }
 
 function terminalFailureReason(summary: RuntimeTaskSessionSummary): string | null {
-	if (summary.warningMessage && summary.warningMessage.trim()) {
+	if (summary.warningMessage?.trim()) {
 		return summary.warningMessage.trim();
 	}
 	if (summary.state === "interrupted") {
@@ -157,17 +164,20 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 	private readonly resolveLaunchConfig: ClineLaunchConfigResolver;
 	private readonly repoPath: string;
 	private readonly evidence: ClineReviewEvidencePort;
+	private readonly verificationRunner: VerificationRunner;
 
 	constructor(
 		sessionService: ClineTaskSessionService,
 		resolveLaunchConfig: ClineLaunchConfigResolver,
 		repoPath: string,
 		evidence: ClineReviewEvidencePort,
+		verificationRunner: VerificationRunner,
 	) {
 		this.sessionService = sessionService;
 		this.resolveLaunchConfig = resolveLaunchConfig;
 		this.repoPath = repoPath;
 		this.evidence = evidence;
+		this.verificationRunner = verificationRunner;
 	}
 
 	async startTaskReview(input: ClineReviewStartInput): Promise<RuntimeTaskReviewStartResponse> {
@@ -302,10 +312,11 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 		let sessionFailed = isFailedTerminal(firstTerminal);
 		let failureReason = terminalFailureReason(firstTerminal);
 		let result: RuntimeReviewResultOutput | null = sessionFailed ? null : this.extractResult(sessionId);
+		// B-7.5: the repair-round budget is shared between review repairs and verification repairs.
+		let round = 0;
 
 		// B-6.5: bounded repair rounds for the findings the reviewer left open.
 		if (!sessionFailed) {
-			let round = 0;
 			while (result && result.findings.length > 0 && round < reviewPolicy.maxRepairRounds) {
 				round += 1;
 				const repairPrompt = buildReviewRepairPrompt({
@@ -330,7 +341,48 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 		}
 
 		// B-6.7: bind the verdict to the candidate content tree (after any fixes).
-		const candidateTreeHash = await this.evidence.computeTreeHash(worktreePath).catch(() => null);
+		let candidateTreeHash = await this.evidence.computeTreeHash(worktreePath).catch(() => null);
+
+		// B-7.2/B-7.5: the deterministic verification gate runs after the review
+		// is frozen and only gates the "ready" path (a blocked/failed review
+		// never reaches delivery). It is independent of the reviewer's narrative,
+		// and verification repairs share the review policy's repair budget.
+		let verification: RuntimeVerificationReceipt | null = null;
+		const verificationConfig = input.verification ?? null;
+		if (!sessionFailed && result && !result.blocking && verificationConfig) {
+			let receipt = await this.verificationRunner
+				.run(verificationConfig, { taskId, worktreePath, candidateTreeHash })
+				.catch((error: unknown) => this.unrunnableReceipt(toErrorMessage(error), candidateTreeHash));
+			while (!receipt.passed && round < reviewPolicy.maxRepairRounds) {
+				round += 1;
+				const repairPrompt = buildVerificationRepairPrompt({
+					artifact,
+					receipt,
+					round,
+					maxRounds: reviewPolicy.maxRepairRounds,
+				});
+				await this.sessionService.sendTaskSessionInput(sessionId, repairPrompt);
+				const terminal = await this.waitForTerminalState(sessionId);
+				if (isFailedTerminal(terminal)) {
+					sessionFailed = true;
+					failureReason = terminalFailureReason(terminal);
+					result = null;
+					break;
+				}
+				// The agent edited the worktree: re-bind to the new tree and re-run
+				// the gate (B-7.2 tree-identity binding).
+				candidateTreeHash = await this.evidence.computeTreeHash(worktreePath).catch(() => null);
+				receipt = await this.verificationRunner
+					.run(verificationConfig, { taskId, worktreePath, candidateTreeHash })
+					.catch((error: unknown) => this.unrunnableReceipt(toErrorMessage(error), candidateTreeHash));
+			}
+			verification = receipt;
+			// When the final gate run mutated the tree, bind the outcome to the
+			// actual post-run state (the receipt's after-hash).
+			if (!receipt.treeIdentityPreserved && receipt.treeHashAfter !== null) {
+				candidateTreeHash = receipt.treeHashAfter;
+			}
+		}
 
 		const outcome = this.buildOutcome({
 			taskId,
@@ -339,6 +391,7 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 			failureReason,
 			result,
 			candidateTreeHash,
+			verification,
 			warnings,
 		});
 		await this.evidence.persistOutcome(taskId, outcome).catch(() => {});
@@ -377,6 +430,7 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 			resultMatchesTree,
 			error: outcome?.error ?? null,
 			warnings,
+			verification: outcome?.verification ?? null,
 		};
 	}
 
@@ -448,9 +502,11 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 		failureReason: string | null;
 		result: RuntimeReviewResultOutput | null;
 		candidateTreeHash: string | null;
+		verification: RuntimeVerificationReceipt | null;
 		warnings: string[];
 	}): RuntimeReviewOutcomeFile {
-		const { taskId, sessionId, sessionFailed, failureReason, result, candidateTreeHash, warnings } = input;
+		const { taskId, sessionId, sessionFailed, failureReason, result, candidateTreeHash, verification, warnings } =
+			input;
 		const updatedAt = Date.now();
 		if (sessionFailed) {
 			return {
@@ -459,6 +515,7 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 				error: failureReason ?? "The review session failed before producing a result.",
 				sessionId,
 				warnings,
+				verification,
 				updatedAt,
 			};
 		}
@@ -469,9 +526,13 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 				error: "The reviewer did not submit a valid kanban-review-result block.",
 				sessionId,
 				warnings,
+				verification,
 				updatedAt,
 			};
 		}
+		// B-7.2: the gate is independent of the reviewer's narrative — a clean
+		// verdict with a failing receipt still blocks delivery.
+		const gateFailed = verification !== null && !verification.passed;
 		const stamped: RuntimeReviewResult = {
 			...result,
 			taskId,
@@ -479,12 +540,29 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 			reviewedAt: updatedAt,
 		};
 		return {
-			status: result.blocking ? "blocked" : "ready",
+			status: result.blocking || gateFailed ? "blocked" : "ready",
 			result: stamped,
-			error: null,
+			error: gateFailed ? (verification?.error ?? "The verification gate failed.") : null,
 			sessionId,
 			warnings,
+			verification,
 			updatedAt,
+		};
+	}
+
+	/** B-7.2: a runner that cannot execute at all still blocks delivery. */
+	private unrunnableReceipt(error: string, candidateTreeHash: string | null): RuntimeVerificationReceipt {
+		const now = Date.now();
+		return {
+			treeHashBefore: candidateTreeHash,
+			treeHashAfter: candidateTreeHash,
+			treeIdentityPreserved: false,
+			matchesCandidate: false,
+			checks: [],
+			passed: false,
+			error: `Verification could not run: ${error}`,
+			startedAt: now,
+			finishedAt: now,
 		};
 	}
 
@@ -503,6 +581,7 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 			sessionId,
 			error,
 			warnings,
+			verification: null,
 		};
 	}
 
@@ -523,6 +602,7 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 			sessionId,
 			error: outcome.error,
 			warnings,
+			verification: outcome.verification ?? null,
 		};
 	}
 }
@@ -531,10 +611,12 @@ export function createClineReviewSessionService(
 	options: CreateClineReviewSessionServiceOptions,
 ): ClineReviewSessionService {
 	const evidence = options.evidence ?? createDefaultReviewEvidencePort(options.workspaceId, options.repoPath);
+	const verificationRunner = options.verificationRunner ?? createVerificationRunner();
 	return new ClineReviewSessionServiceImpl(
 		options.clineTaskSessionService,
 		options.resolveClineLaunchConfig,
 		options.repoPath,
 		evidence,
+		verificationRunner,
 	);
 }

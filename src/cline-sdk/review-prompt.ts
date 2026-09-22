@@ -7,7 +7,11 @@
 // mandate. The reviewer must end its session by submitting a fenced
 // `kanban-review-result` JSON block; Kanban parses it and treats a missing
 // or malformed block as `parse_failed`, never as a pass.
-import type { RuntimeReviewFinding, RuntimeReviewHandoffArtifact } from "../core/api-contract";
+import type {
+	RuntimeReviewFinding,
+	RuntimeReviewHandoffArtifact,
+	RuntimeVerificationReceipt,
+} from "../core/api-contract";
 
 /** Hard cap on the diff embedded in a review prompt (large diffs: reviewer paginates via git). */
 const MAX_DIFF_CHARS = 20000;
@@ -113,16 +117,16 @@ export function buildReviewInitialPrompt(input: {
 function artifactNotes(artifact: RuntimeReviewHandoffArtifact): string | null {
 	const sections: string[] = [];
 	if (artifact.designDecisions.length > 0) {
-		sections.push("Design decisions:\n" + renderList(artifact.designDecisions));
+		sections.push(`Design decisions:\n${renderList(artifact.designDecisions)}`);
 	}
 	if (artifact.testsAttempted.length > 0) {
-		sections.push("Tests attempted:\n" + renderList(artifact.testsAttempted));
+		sections.push(`Tests attempted:\n${renderList(artifact.testsAttempted)}`);
 	}
 	if (artifact.knownLimitations.length > 0) {
-		sections.push("Known limitations:\n" + renderList(artifact.knownLimitations));
+		sections.push(`Known limitations:\n${renderList(artifact.knownLimitations)}`);
 	}
 	if (artifact.unresolvedQuestions.length > 0) {
-		sections.push("Unresolved questions:\n" + renderList(artifact.unresolvedQuestions));
+		sections.push(`Unresolved questions:\n${renderList(artifact.unresolvedQuestions)}`);
 	}
 	if (sections.length === 0) {
 		return null;
@@ -157,4 +161,56 @@ export function buildReviewRepairPrompt(input: {
 		"",
 		"You may not commit or push. When you are done (or if a finding cannot be fixed within scope), submit a final message containing the same fenced ```kanban-review-result block as before, with the remaining open findings in `findings` and everything still unresolved in `unresolvedItems`.",
 	].join("\n");
+}
+
+/**
+ * B-7.5: builds the verification-repair prompt: re-enters the same review
+ * session with the deterministic check failures from the last gate receipt.
+ * Verification repairs share the review policy's maxRepairRounds budget.
+ */
+export function buildVerificationRepairPrompt(input: {
+	artifact: RuntimeReviewHandoffArtifact;
+	/** The deterministic verification receipt from the last gate run (its required checks did not all pass). */
+	receipt: RuntimeVerificationReceipt;
+	/** 1-based repair round number (shared with review repairs). */
+	round: number;
+	maxRounds: number;
+}): string {
+	const { artifact, receipt, round, maxRounds } = input;
+	const failed = receipt.checks.filter((check) => check.status !== "passed");
+	const checkLines =
+		failed.length === 0
+			? "(all configured checks passed — the gate failed for a tree-identity reason below)"
+			: failed
+					.map((check) => {
+						const detail =
+							check.error ?? (check.exitCode !== null ? `exit code ${check.exitCode}` : "no exit code");
+						const excerpt = check.outputExcerpt.trim().slice(0, 4000);
+						const excerptBlock = excerpt
+							? `\n   Output (head):\n${excerpt
+									.split("\n")
+									.map((line) => `   ${line}`)
+									.join("\n")}`
+							: "";
+						return `- "${check.id}" (${check.status}): ${detail}${excerptBlock}`;
+					})
+					.join("\n");
+	const sections: string[] = [
+		"### Verification repair round",
+		`Repair round ${round} of at most ${maxRounds} for task ${artifact.taskId}. The deterministic verification gate FAILED — the results below are authoritative and override any earlier assessment. Fix ONLY what is needed to make the failing checks pass, with the smallest scoped changes. Do not modify, weaken, or remove the checks themselves, and do not commit, push, or run any Git publication command.`,
+		"",
+		"Failed checks:",
+		checkLines,
+	];
+	if (!receipt.treeIdentityPreserved) {
+		sections.push(
+			"",
+			"The worktree changed while the checks ran (tree identity not preserved). If a check writes generated files into the worktree, keep them gitignored or write them outside the worktree.",
+		);
+	}
+	sections.push(
+		"",
+		"When you are done (or if the failure cannot be fixed within scope), stop and briefly report what you changed and why the checks now pass (or why they cannot).",
+	);
+	return sections.join("\n");
 }
