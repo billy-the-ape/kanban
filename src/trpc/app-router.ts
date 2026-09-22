@@ -77,6 +77,10 @@ import type {
 	RuntimeTaskChatSendResponse,
 	RuntimeTaskPreservationInfoResponse,
 	RuntimeTaskPreservationRequest,
+	RuntimeTaskReviewInfoRequest,
+	RuntimeTaskReviewInfoResponse,
+	RuntimeTaskReviewStartRequest,
+	RuntimeTaskReviewStartResponse,
 	RuntimeTaskSessionInputRequest,
 	RuntimeTaskSessionInputResponse,
 	RuntimeTaskSessionStartRequest,
@@ -171,6 +175,10 @@ import {
 	runtimeTaskChatSendResponseSchema,
 	runtimeTaskPreservationInfoResponseSchema,
 	runtimeTaskPreservationRequestSchema,
+	runtimeTaskReviewInfoRequestSchema,
+	runtimeTaskReviewInfoResponseSchema,
+	runtimeTaskReviewStartRequestSchema,
+	runtimeTaskReviewStartResponseSchema,
 	runtimeTaskSessionInputRequestSchema,
 	runtimeTaskSessionInputResponseSchema,
 	runtimeTaskSessionStartRequestSchema,
@@ -224,6 +232,14 @@ export interface RuntimeTrpcContext {
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskSessionStartRequest,
 		) => Promise<RuntimeTaskSessionStartResponse>;
+		startTaskReview: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskReviewStartRequest,
+		) => Promise<RuntimeTaskReviewStartResponse>;
+		getTaskReviewInfo: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskReviewInfoRequest,
+		) => Promise<RuntimeTaskReviewInfoResponse>;
 		stopTaskSession: (
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskSessionStopRequest,
@@ -474,6 +490,18 @@ export const runtimeAppRouter = t.router({
 			.output(runtimeTaskSessionStartResponseSchema)
 			.mutation(async ({ ctx, input }) => {
 				return await ctx.runtimeApi.startTaskSession(ctx.workspaceScope, input);
+			}),
+		startTaskReview: workspaceProcedure
+			.input(runtimeTaskReviewStartRequestSchema)
+			.output(runtimeTaskReviewStartResponseSchema)
+			.mutation(async ({ ctx, input }) => {
+				return await ctx.runtimeApi.startTaskReview(ctx.workspaceScope, input);
+			}),
+		getTaskReviewInfo: workspaceProcedure
+			.input(runtimeTaskReviewInfoRequestSchema)
+			.output(runtimeTaskReviewInfoResponseSchema)
+			.query(async ({ ctx, input }) => {
+				return await ctx.runtimeApi.getTaskReviewInfo(ctx.workspaceScope, input);
 			}),
 		stopTaskSession: workspaceProcedure
 			.input(runtimeTaskSessionStopRequestSchema)

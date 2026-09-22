@@ -11,6 +11,7 @@ import { buildClineCompactionConfig } from "../cline-sdk/cline-compaction-config
 import { createClineMcpRuntimeService } from "../cline-sdk/cline-mcp-runtime-service";
 import { createClineMcpSettingsService } from "../cline-sdk/cline-mcp-settings-service";
 import { createClineProviderService } from "../cline-sdk/cline-provider-service";
+import type { ClineReviewSessionService } from "../cline-sdk/cline-review-session-service";
 import { isClineClearSlashCommand } from "../cline-sdk/cline-slash-commands";
 import type { ClineTaskSessionService } from "../cline-sdk/cline-task-session-service";
 import type { RuntimeConfigState } from "../config/runtime-config";
@@ -39,6 +40,8 @@ import {
 	parseTaskChatMessagesRequest,
 	parseTaskChatReloadRequest,
 	parseTaskChatSendRequest,
+	parseTaskReviewInfoRequest,
+	parseTaskReviewStartRequest,
 	parseTaskSessionInputRequest,
 	parseTaskSessionStartRequest,
 	parseTaskSessionStopRequest,
@@ -59,6 +62,8 @@ export interface CreateRuntimeApiDependencies {
 	setActiveRuntimeConfig: (config: RuntimeConfigState) => void;
 	getScopedTerminalManager: (scope: RuntimeTrpcWorkspaceScope) => Promise<TerminalSessionManager>;
 	getScopedClineTaskSessionService: (scope: RuntimeTrpcWorkspaceScope) => Promise<ClineTaskSessionService>;
+	/** B-6: the per-workspace bounded review session service (its own Cline session instance). */
+	getScopedReviewSessionService?: (scope: RuntimeTrpcWorkspaceScope) => Promise<ClineReviewSessionService>;
 	resolveInteractiveShellCommand: () => { binary: string; args: string[] };
 	runCommand: (command: string, cwd: string) => Promise<RuntimeCommandRunResponse>;
 	broadcastClineMcpAuthStatusesUpdated?: (
@@ -110,6 +115,17 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 	// B-2.9: the effective context window (budget override → provider-settings
 	// override → provider metadata → fallback) is diagnostic input for the
 	// settings UI; a lookup failure must never fail the whole config read.
+	// B-6: the review session service is wired per-workspace by the server; a
+	// missing binding (e.g. a partial test harness) is a clear, recoverable error.
+	const requireReviewSessionService = (): ((
+		scope: RuntimeTrpcWorkspaceScope,
+	) => Promise<ClineReviewSessionService>) => {
+		if (!deps.getScopedReviewSessionService) {
+			throw new Error("The review session service is not configured for this workspace.");
+		}
+		return deps.getScopedReviewSessionService;
+	};
+
 	const buildConfigResponse = async (runtimeConfig: RuntimeConfigState) => {
 		const clineProviderSettings = clineProviderService.getProviderSettingsSummary();
 		let effectiveContextWindow: RuntimeEffectiveContextWindow | null = null;
@@ -337,6 +353,53 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					ok: false,
 					summary: null,
 					error: message,
+				};
+			}
+		},
+		// B-6.2: start a bounded, fresh-context review session for a task. The
+		// effective review policy comes from the scoped runtime config; the service
+		// resolves the worktree, builds the handoff, runs the session (with the
+		// review tool policy), and persists the durable, tree-bound verdict.
+		startTaskReview: async (workspaceScope, input) => {
+			try {
+				const body = parseTaskReviewStartRequest(input);
+				const scopedRuntimeConfig = await deps.loadScopedRuntimeConfig(workspaceScope);
+				const reviewService = await requireReviewSessionService()(workspaceScope);
+				return await reviewService.startTaskReview({
+					...body,
+					reviewPolicy: scopedRuntimeConfig.reviewPolicy,
+				});
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return {
+					ok: false,
+					status: "failed",
+					handoff: null,
+					result: null,
+					candidateTreeHash: null,
+					sessionId: null,
+					error: message,
+					warnings: [],
+				};
+			}
+		},
+		// B-6.7: read the durable review verdict + the live candidate tree hash.
+		getTaskReviewInfo: async (workspaceScope, input) => {
+			try {
+				const body = parseTaskReviewInfoRequest(input);
+				const reviewService = await requireReviewSessionService()(workspaceScope);
+				return await reviewService.getReviewInfo(body.taskId);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return {
+					ok: false,
+					status: null,
+					handoff: null,
+					result: null,
+					candidateTreeHash: null,
+					resultMatchesTree: null,
+					error: message,
+					warnings: [],
 				};
 			}
 		},

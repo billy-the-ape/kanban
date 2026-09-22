@@ -24,6 +24,8 @@ import {
 	type RuntimeTaskChatReloadRequest,
 	type RuntimeTaskChatSendRequest,
 	type RuntimeTaskPreservationRequest,
+	type RuntimeTaskReviewInfoRequest,
+	type RuntimeTaskReviewStartRequest,
 	type RuntimeTaskSessionInputRequest,
 	type RuntimeTaskSessionStartRequest,
 	type RuntimeTaskSessionStopRequest,
@@ -57,6 +59,8 @@ import {
 	runtimeTaskChatReloadRequestSchema,
 	runtimeTaskChatSendRequestSchema,
 	runtimeTaskPreservationRequestSchema,
+	runtimeTaskReviewInfoRequestSchema,
+	runtimeTaskReviewStartRequestSchema,
 	runtimeTaskSessionInputRequestSchema,
 	runtimeTaskSessionStartRequestSchema,
 	runtimeTaskSessionStopRequestSchema,
@@ -267,6 +271,37 @@ export function parseTaskSessionInputRequest(value: unknown): RuntimeTaskSession
 	}
 	return {
 		...parsed,
+		taskId,
+	};
+}
+
+/** B-6: validates the review-session start payload. */
+export function parseTaskReviewStartRequest(value: unknown): RuntimeTaskReviewStartRequest {
+	const parsed = parseWithSchema(runtimeTaskReviewStartRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Task review taskId cannot be empty.");
+	}
+	const description = parsed.description.trim();
+	if (!description) {
+		throw new Error("Task review requires a non-empty task description.");
+	}
+	return {
+		...parsed,
+		taskId,
+		description,
+		planDocumentPaths: parsed.planDocumentPaths?.map((path) => path.trim()).filter((path) => path.length > 0),
+	};
+}
+
+/** B-6: validates the review-info (status + tree binding) payload. */
+export function parseTaskReviewInfoRequest(value: unknown): RuntimeTaskReviewInfoRequest {
+	const parsed = parseWithSchema(runtimeTaskReviewInfoRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Task review taskId cannot be empty.");
+	}
+	return {
 		taskId,
 	};
 }

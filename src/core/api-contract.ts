@@ -1070,6 +1070,38 @@ export const runtimeEffectiveContextWindowSchema = z.object({
 });
 export type RuntimeEffectiveContextWindow = z.infer<typeof runtimeEffectiveContextWindowSchema>;
 
+/** B-6: review lifecycle policy — global settings for the review/repair phase. */
+export const runtimeReviewPolicySchema = z.object({
+	/** "required" gates delivery on a review; "off" leaves review opt-in. */
+	enabled: z.enum(["required", "off"]),
+	/** Free-form reviewer instructions injected into every review prompt. */
+	instructions: z.string(),
+	/** Explicit model override for review sessions; null means reuse the card's model. */
+	modelOverride: z
+		.object({
+			providerId: z.string().min(1),
+			modelId: z.string().min(1),
+		})
+		.nullable(),
+	/** Bounded repair rounds a review session may apply before it must stop and report. */
+	maxRepairRounds: z.number().int().min(1).max(10),
+});
+export type RuntimeReviewPolicy = z.infer<typeof runtimeReviewPolicySchema>;
+
+export const runtimeReviewPolicySaveSchema = z.object({
+	enabled: z.enum(["required", "off"]).optional(),
+	instructions: z.string().optional(),
+	modelOverride: z
+		.object({
+			providerId: z.string().min(1),
+			modelId: z.string().min(1),
+		})
+		.nullable()
+		.optional(),
+	maxRepairRounds: z.number().int().min(1).max(10).optional(),
+});
+export type RuntimeReviewPolicySave = z.infer<typeof runtimeReviewPolicySaveSchema>;
+
 export const runtimeConfigResponseSchema = z.object({
 	selectedAgentId: runtimeAgentIdSchema,
 	selectedShortcutLabel: z.string().nullable(),
@@ -1088,6 +1120,8 @@ export const runtimeConfigResponseSchema = z.object({
 	commitPromptTemplateDefault: z.string(),
 	openPrPromptTemplateDefault: z.string(),
 	contextBudget: runtimeContextBudgetSchema.nullable(),
+	/** B-6: global review lifecycle policy; null means all defaults (off, 2 repair rounds). */
+	reviewPolicy: runtimeReviewPolicySchema.nullable(),
 	effectiveContextWindow: runtimeEffectiveContextWindowSchema.nullable(),
 });
 export type RuntimeConfigResponse = z.infer<typeof runtimeConfigResponseSchema>;
@@ -1101,6 +1135,8 @@ export const runtimeConfigSaveRequestSchema = z.object({
 	commitPromptTemplate: z.string().optional(),
 	openPrPromptTemplate: z.string().optional(),
 	contextBudget: runtimeContextBudgetSaveSchema.optional(),
+	/** B-6: `null` clears the stored review policy; `undefined` leaves it untouched. */
+	reviewPolicy: runtimeReviewPolicySaveSchema.optional(),
 });
 export type RuntimeConfigSaveRequest = z.infer<typeof runtimeConfigSaveRequestSchema>;
 
@@ -1127,6 +1163,165 @@ export const runtimeTaskSessionStartResponseSchema = z.object({
 	error: z.string().optional(),
 });
 export type RuntimeTaskSessionStartResponse = z.infer<typeof runtimeTaskSessionStartResponseSchema>;
+
+// ---------------------------------------------------------------------------
+// B-6: task review lifecycle (handoff artifact, structured findings, result).
+// ---------------------------------------------------------------------------
+
+/**
+ * B-6.4: one structured review finding. `evidence` is mandatory so every
+ * finding carries file/line or diff evidence instead of a bare claim.
+ */
+export const runtimeReviewFindingSchema = z.object({
+	severity: z.enum(["blocking", "non-blocking"]),
+	/** Worktree-relative file path the finding points at; null for whole-change findings. */
+	file: z.string().nullable(),
+	line: z.number().int().positive().nullable(),
+	description: z.string().min(1),
+	evidence: z.string().min(1),
+});
+export type RuntimeReviewFinding = z.infer<typeof runtimeReviewFindingSchema>;
+
+/**
+ * B-6.4: the JSON payload the reviewer must emit in its final message
+ * (inside a fenced `kanban-review-result` block). Kanban stamps taskId,
+ * candidateTreeHash, and reviewedAt when persisting the full result.
+ */
+export const runtimeReviewResultOutputSchema = z.object({
+	findings: z.array(runtimeReviewFindingSchema),
+	/** True when an acceptance criterion is unmet or a required fix could not complete. */
+	blocking: z.boolean(),
+	/** Human-readable summary of each scoped fix the reviewer applied. */
+	fixesApplied: z.array(z.string()),
+	/** Acceptance criteria / changed paths the reviewer explicitly covered. */
+	requirementsCovered: z.array(z.string()),
+	/** Items the reviewer could not resolve within its repair-round budget. */
+	unresolvedItems: z.array(z.string()),
+});
+export type RuntimeReviewResultOutput = z.infer<typeof runtimeReviewResultOutputSchema>;
+
+/** B-6.4/B-6.7: persisted review result, bound to the candidate content tree. */
+export const runtimeReviewResultSchema = runtimeReviewResultOutputSchema.extend({
+	taskId: z.string().min(1),
+	/** Git tree hash of the whole worktree (tracked + untracked) at review time (B-6.7). */
+	candidateTreeHash: z.string().nullable(),
+	reviewedAt: z.number().int(),
+});
+export type RuntimeReviewResult = z.infer<typeof runtimeReviewResultSchema>;
+
+/**
+ * B-6.4: terminal status of a review run. A missing/malformed result block is
+ * `parse_failed` and never treated as a pass.
+ */
+export const runtimeTaskReviewStatusSchema = z.enum(["ready", "blocked", "failed", "parse_failed"]);
+export type RuntimeTaskReviewStatus = z.infer<typeof runtimeTaskReviewStatusSchema>;
+
+/** B-6.7: durable per-task review outcome (status + result or failure detail). */
+export const runtimeReviewOutcomeFileSchema = z.object({
+	status: runtimeTaskReviewStatusSchema,
+	result: runtimeReviewResultSchema.nullable(),
+	error: z.string().nullable(),
+	sessionId: z.string().nullable(),
+	warnings: z.array(z.string()),
+	updatedAt: z.number().int(),
+});
+export type RuntimeReviewOutcomeFile = z.infer<typeof runtimeReviewOutcomeFileSchema>;
+
+/** B-6.1: authoritative plan document referenced by a review handoff. */
+export const runtimeReviewHandoffPlanDocumentSchema = z.object({
+	/** Worktree-relative path. */
+	path: z.string().min(1),
+	/** SHA-256 of the current file content (null when the file is missing). */
+	sha256: z.string().nullable(),
+	/** Last commit that touched the path (null when untracked or unknown). */
+	revision: z.string().nullable(),
+	exists: z.boolean(),
+});
+export type RuntimeReviewHandoffPlanDocument = z.infer<typeof runtimeReviewHandoffPlanDocumentSchema>;
+
+/**
+ * B-6.1: the implementation handoff — everything a fresh review session needs
+ * without the implementation transcript: authoritative description criteria,
+ * plan documents, recorded starting revision, and the exact change set.
+ */
+export const runtimeReviewHandoffArtifactSchema = z.object({
+	taskId: z.string().min(1),
+	worktreePath: z.string().min(1),
+	repoPath: z.string().min(1),
+	/** Recorded starting revision (null when no baseline was recorded). */
+	startingCommit: z.string().nullable(),
+	/** Worktree HEAD at handoff time (null for a repository without commits). */
+	latestCommit: z.string().nullable(),
+	/** Worktree-relative paths changed vs the starting revision (committed + uncommitted). */
+	changedPaths: z.array(z.string()),
+	/** Worktree-relative untracked files. */
+	untrackedPaths: z.array(z.string()),
+	planDocuments: z.array(runtimeReviewHandoffPlanDocumentSchema),
+	acceptanceCriteria: z.array(z.string()),
+	designDecisions: z.array(z.string()),
+	testsAttempted: z.array(z.string()),
+	knownLimitations: z.array(z.string()),
+	unresolvedQuestions: z.array(z.string()),
+	createdAt: z.number().int(),
+});
+export type RuntimeReviewHandoffArtifact = z.infer<typeof runtimeReviewHandoffArtifactSchema>;
+
+export const runtimeTaskReviewStartRequestSchema = z.object({
+	taskId: z.string().min(1),
+	/** Authoritative task description the review is judged against. */
+	description: z.string().min(1),
+	taskTitle: z.string().optional(),
+	planDocumentPaths: z.array(z.string().min(1)).optional(),
+	/** Structured self-report from the implementation session (unverified claims). */
+	agentNotes: z
+		.object({
+			designDecisions: z.array(z.string()).optional(),
+			testsAttempted: z.array(z.string()).optional(),
+			knownLimitations: z.array(z.string()).optional(),
+			unresolvedQuestions: z.array(z.string()).optional(),
+		})
+		.nullable()
+		.optional(),
+	/** Recorded starting revision; falls back to the preservation record. */
+	startingCommit: z.string().nullable().optional(),
+});
+export type RuntimeTaskReviewStartRequest = z.infer<typeof runtimeTaskReviewStartRequestSchema>;
+
+export const runtimeTaskReviewStartResponseSchema = z.object({
+	ok: z.boolean(),
+	status: runtimeTaskReviewStatusSchema,
+	handoff: runtimeReviewHandoffArtifactSchema.nullable(),
+	result: runtimeReviewResultSchema.nullable(),
+	candidateTreeHash: z.string().nullable(),
+	sessionId: z.string().nullable(),
+	error: z.string().nullable(),
+	warnings: z.array(z.string()),
+});
+export type RuntimeTaskReviewStartResponse = z.infer<typeof runtimeTaskReviewStartResponseSchema>;
+
+export const runtimeTaskReviewInfoRequestSchema = z.object({
+	taskId: z.string().min(1),
+});
+export type RuntimeTaskReviewInfoRequest = z.infer<typeof runtimeTaskReviewInfoRequestSchema>;
+
+/**
+ * B-6.7: review status for a card, including the live candidate tree hash so
+ * callers can tell whether later edits invalidated the stored result.
+ */
+export const runtimeTaskReviewInfoResponseSchema = z.object({
+	ok: z.boolean(),
+	/** null when no review handoff exists for the task yet. */
+	status: runtimeTaskReviewStatusSchema.nullable(),
+	handoff: runtimeReviewHandoffArtifactSchema.nullable(),
+	result: runtimeReviewResultSchema.nullable(),
+	/** Current worktree tree hash (recomputed on read). */
+	candidateTreeHash: z.string().nullable(),
+	/** True only when the stored result was bound to the current tree hash. */
+	resultMatchesTree: z.boolean().nullable(),
+	error: z.string().nullable(),
+	warnings: z.array(z.string()),
+});
+export type RuntimeTaskReviewInfoResponse = z.infer<typeof runtimeTaskReviewInfoResponseSchema>;
 
 export const runtimeTaskSessionStopRequestSchema = z.object({
 	taskId: z.string(),

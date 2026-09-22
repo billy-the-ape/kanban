@@ -130,6 +130,7 @@ export function buildRuntimeConfigResponse(
 		commitPromptTemplateDefault: runtimeConfig.commitPromptTemplateDefault,
 		openPrPromptTemplateDefault: runtimeConfig.openPrPromptTemplateDefault,
 		contextBudget: runtimeConfig.contextBudget ?? null,
+		reviewPolicy: runtimeConfig.reviewPolicy ?? null,
 		effectiveContextWindow: extra.effectiveContextWindow ?? null,
 	};
 }

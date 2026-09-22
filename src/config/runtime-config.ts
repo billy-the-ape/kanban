@@ -10,6 +10,8 @@ import type {
 	RuntimeContextBudget,
 	RuntimeContextBudgetSave,
 	RuntimeProjectShortcut,
+	RuntimeReviewPolicy,
+	RuntimeReviewPolicySave,
 } from "../core/api-contract";
 import { type LockRequest, lockedFileSystem } from "../fs/locked-file-system";
 import { detectInstalledCommands } from "../terminal/agent-registry";
@@ -23,6 +25,7 @@ interface RuntimeGlobalConfigFileShape {
 	commitPromptTemplate?: string;
 	openPrPromptTemplate?: string;
 	contextBudget?: RuntimeContextBudget;
+	reviewPolicy?: RuntimeReviewPolicySave;
 }
 
 interface RuntimeProjectConfigFileShape {
@@ -43,6 +46,8 @@ export interface RuntimeConfigState {
 	openPrPromptTemplateDefault: string;
 	/** B-2.9: global context budget settings; absent means all defaults. */
 	contextBudget?: RuntimeContextBudget;
+	/** B-6: global review lifecycle policy; absent means all defaults (off, 2 repair rounds). */
+	reviewPolicy?: RuntimeReviewPolicy;
 }
 
 export interface RuntimeConfigUpdateInput {
@@ -55,6 +60,8 @@ export interface RuntimeConfigUpdateInput {
 	openPrPromptTemplate?: string;
 	/** B-2.9: `null` clears all context budget settings; `undefined` leaves them untouched. */
 	contextBudget?: RuntimeContextBudgetSave | null;
+	/** B-6: `null` clears all review policy settings; `undefined` leaves them untouched. */
+	reviewPolicy?: RuntimeReviewPolicySave | null;
 }
 
 const RUNTIME_HOME_PARENT_DIR = ".cline";
@@ -67,6 +74,8 @@ const DEFAULT_AGENT_ID: RuntimeAgentId = "cline";
 const AUTO_SELECT_AGENT_PRIORITY: readonly RuntimeAgentId[] = ["claude", "codex", "droid", "kiro"];
 const DEFAULT_AGENT_AUTONOMOUS_MODE_ENABLED = true;
 const DEFAULT_READY_FOR_REVIEW_NOTIFICATIONS_ENABLED = true;
+const DEFAULT_REVIEW_POLICY_ENABLED: "required" | "off" = "off";
+const DEFAULT_REVIEW_POLICY_MAX_REPAIR_ROUNDS = 2;
 const DEFAULT_COMMIT_PROMPT_TEMPLATE = `You are in a worktree on a detached HEAD. When you are finished with the task, commit the working changes onto {{base_ref}}.
 
 - Do not run destructive commands: git reset --hard, git clean -fdx, git worktree remove, rm/mv on repository paths.
@@ -333,6 +342,110 @@ function mergeContextBudgetUpdates(
 	return { ...(stored ?? {}), ...updates };
 }
 
+/** B-6: drop invalid/empty fields so corrupted config files degrade to defaults. */
+function normalizeReviewPolicyValue(
+	value: unknown,
+	field: keyof RuntimeReviewPolicy,
+): RuntimeReviewPolicy[keyof RuntimeReviewPolicy] | undefined {
+	if (field === "enabled") {
+		return value === "required" || value === "off" ? value : undefined;
+	}
+	if (field === "instructions") {
+		return typeof value === "string" ? value : undefined;
+	}
+	if (field === "modelOverride") {
+		if (value === null) {
+			return null;
+		}
+		if (value && typeof value === "object") {
+			const candidate = value as { providerId?: unknown; modelId?: unknown };
+			if (typeof candidate.providerId === "string" && candidate.providerId.trim()) {
+				if (typeof candidate.modelId === "string" && candidate.modelId.trim()) {
+					return { providerId: candidate.providerId, modelId: candidate.modelId };
+				}
+			}
+			return undefined;
+		}
+		return undefined;
+	}
+	if (typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 10) {
+		return value;
+	}
+	return undefined;
+}
+
+/** B-6: normalize a stored/partial review policy; undefined means all defaults. */
+function normalizeReviewPolicy(value: unknown): RuntimeReviewPolicy | undefined {
+	if (!value || typeof value !== "object") {
+		return undefined;
+	}
+	const raw = value as Record<string, unknown>;
+	const policy: RuntimeReviewPolicy = {
+		enabled:
+			(normalizeReviewPolicyValue(raw.enabled, "enabled") as "required" | "off") ?? DEFAULT_REVIEW_POLICY_ENABLED,
+		instructions: (normalizeReviewPolicyValue(raw.instructions, "instructions") as string | undefined) ?? "",
+		modelOverride:
+			(normalizeReviewPolicyValue(raw.modelOverride, "modelOverride") as RuntimeReviewPolicy["modelOverride"]) ??
+			null,
+		maxRepairRounds:
+			(normalizeReviewPolicyValue(raw.maxRepairRounds, "maxRepairRounds") as number) ??
+			DEFAULT_REVIEW_POLICY_MAX_REPAIR_ROUNDS,
+	};
+	return policy;
+}
+
+/**
+ * B-6: strict validation for save-time input (the API boundary already
+ * validates via zod; this is defense in depth for direct callers).
+ */
+function validateReviewPolicy(policy: RuntimeReviewPolicySave | null | undefined): void {
+	if (policy === null || policy === undefined) {
+		return;
+	}
+	if (policy.enabled !== undefined && policy.enabled !== "required" && policy.enabled !== "off") {
+		throw new Error("reviewPolicy.enabled must be either 'required' or 'off'.");
+	}
+	if (
+		policy.maxRepairRounds !== undefined &&
+		(!Number.isInteger(policy.maxRepairRounds) || policy.maxRepairRounds < 1 || policy.maxRepairRounds > 10)
+	) {
+		throw new Error("reviewPolicy.maxRepairRounds must be an integer between 1 and 10.");
+	}
+}
+
+/** B-6: merges a save-shape review policy update (null clears everything, undefined leaves it untouched). */
+function mergeReviewPolicyUpdates(
+	stored: RuntimeReviewPolicy | undefined,
+	updates: RuntimeReviewPolicySave | null | undefined,
+): RuntimeReviewPolicySave | null | undefined {
+	if (updates === undefined) {
+		return undefined;
+	}
+	if (updates === null) {
+		return null;
+	}
+	return { ...(stored ?? {}), ...updates };
+}
+
+function areRuntimeReviewPoliciesEqual(
+	left: RuntimeReviewPolicySave | null | undefined,
+	right: RuntimeReviewPolicySave | null | undefined,
+): boolean {
+	if (!left && !right) {
+		return true;
+	}
+	if (!left || !right) {
+		return false;
+	}
+	return (
+		left.enabled === right.enabled &&
+		left.instructions === right.instructions &&
+		left.maxRepairRounds === right.maxRepairRounds &&
+		(left.modelOverride?.providerId ?? null) === (right.modelOverride?.providerId ?? null) &&
+		(left.modelOverride?.modelId ?? null) === (right.modelOverride?.modelId ?? null)
+	);
+}
+
 function hasOwnKey<T extends object>(value: T | null, key: keyof T): boolean {
 	if (!value) {
 		return false;
@@ -432,6 +545,7 @@ function toRuntimeConfigState({
 		commitPromptTemplateDefault: DEFAULT_COMMIT_PROMPT_TEMPLATE,
 		openPrPromptTemplateDefault: DEFAULT_OPEN_PR_PROMPT_TEMPLATE,
 		contextBudget: normalizeContextBudget(globalConfig?.contextBudget),
+		reviewPolicy: normalizeReviewPolicy(globalConfig?.reviewPolicy),
 	};
 }
 
@@ -455,6 +569,8 @@ async function writeRuntimeGlobalConfigFile(
 		openPrPromptTemplate?: string;
 		/** B-2.9: `null` clears the stored context budget; `undefined` preserves the existing one. Null fields clear individual settings (normalized before write). */
 		contextBudget?: RuntimeContextBudgetSave | null;
+		/** B-6: `null` clears the stored review policy; `undefined` preserves the existing one. */
+		reviewPolicy?: RuntimeReviewPolicySave | null;
 	},
 ): Promise<void> {
 	const existing = await readRuntimeConfigFile<RuntimeGlobalConfigFileShape>(configPath);
@@ -526,6 +642,16 @@ async function writeRuntimeGlobalConfigFile(
 		}
 	} else if (existing?.contextBudget) {
 		payload.contextBudget = normalizeContextBudget(existing.contextBudget);
+	}
+	if (config.reviewPolicy !== undefined) {
+		if (config.reviewPolicy !== null) {
+			const normalizedReviewPolicy = normalizeReviewPolicy(config.reviewPolicy);
+			if (normalizedReviewPolicy) {
+				payload.reviewPolicy = normalizedReviewPolicy;
+			}
+		}
+	} else if (existing?.reviewPolicy) {
+		payload.reviewPolicy = normalizeReviewPolicy(existing.reviewPolicy);
 	}
 
 	await lockedFileSystem.writeJsonFileAtomic(configPath, payload, {
@@ -610,6 +736,7 @@ function createRuntimeConfigStateFromValues(input: {
 	commitPromptTemplate: string;
 	openPrPromptTemplate: string;
 	contextBudget?: RuntimeContextBudgetSave | null;
+	reviewPolicy?: RuntimeReviewPolicySave | null;
 }): RuntimeConfigState {
 	return {
 		globalConfigPath: input.globalConfigPath,
@@ -630,6 +757,7 @@ function createRuntimeConfigStateFromValues(input: {
 		commitPromptTemplateDefault: DEFAULT_COMMIT_PROMPT_TEMPLATE,
 		openPrPromptTemplateDefault: DEFAULT_OPEN_PR_PROMPT_TEMPLATE,
 		contextBudget: normalizeContextBudget(input.contextBudget),
+		reviewPolicy: normalizeReviewPolicy(input.reviewPolicy),
 	};
 }
 
@@ -641,6 +769,16 @@ function createRuntimeConfigStateFromValues(input: {
 export async function readGlobalRuntimeContextBudget(): Promise<RuntimeContextBudget | undefined> {
 	const globalConfig = await readRuntimeConfigFile<RuntimeGlobalConfigFileShape>(getRuntimeGlobalConfigPath());
 	return normalizeContextBudget(globalConfig?.contextBudget);
+}
+
+/**
+ * B-6: reads only the review policy from the global runtime config without the
+ * agent auto-selection side effects of loadGlobalRuntimeConfig, so it is safe
+ * to call on hot paths (per-task review session startup).
+ */
+export async function readGlobalRuntimeReviewPolicy(): Promise<RuntimeReviewPolicy | undefined> {
+	const globalConfig = await readRuntimeConfigFile<RuntimeGlobalConfigFileShape>(getRuntimeGlobalConfigPath());
+	return normalizeReviewPolicy(globalConfig?.reviewPolicy);
 }
 
 export function toGlobalRuntimeConfigState(current: RuntimeConfigState): RuntimeConfigState {
@@ -655,6 +793,7 @@ export function toGlobalRuntimeConfigState(current: RuntimeConfigState): Runtime
 		commitPromptTemplate: current.commitPromptTemplate,
 		openPrPromptTemplate: current.openPrPromptTemplate,
 		contextBudget: current.contextBudget,
+		reviewPolicy: current.reviewPolicy,
 	});
 }
 
@@ -691,9 +830,11 @@ export async function saveRuntimeConfig(
 		commitPromptTemplate: string;
 		openPrPromptTemplate: string;
 		contextBudget?: RuntimeContextBudgetSave | null;
+		reviewPolicy?: RuntimeReviewPolicySave | null;
 	},
 ): Promise<RuntimeConfigState> {
 	validateContextBudget(config.contextBudget);
+	validateReviewPolicy(config.reviewPolicy);
 	const { globalConfigPath, projectConfigPath } = resolveRuntimeConfigPaths(cwd);
 	return await lockedFileSystem.withLocks(getRuntimeConfigLockRequests(cwd), async () => {
 		await writeRuntimeGlobalConfigFile(globalConfigPath, {
@@ -704,6 +845,7 @@ export async function saveRuntimeConfig(
 			commitPromptTemplate: config.commitPromptTemplate,
 			openPrPromptTemplate: config.openPrPromptTemplate,
 			contextBudget: config.contextBudget,
+			reviewPolicy: config.reviewPolicy,
 		});
 		await writeRuntimeProjectConfigFile(projectConfigPath, { shortcuts: config.shortcuts });
 		return createRuntimeConfigStateFromValues({
@@ -717,12 +859,14 @@ export async function saveRuntimeConfig(
 			commitPromptTemplate: config.commitPromptTemplate,
 			openPrPromptTemplate: config.openPrPromptTemplate,
 			contextBudget: config.contextBudget,
+			reviewPolicy: config.reviewPolicy,
 		});
 	});
 }
 
 export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpdateInput): Promise<RuntimeConfigState> {
 	validateContextBudget(updates.contextBudget);
+	validateReviewPolicy(updates.reviewPolicy);
 	const { globalConfigPath, projectConfigPath } = resolveRuntimeConfigPaths(cwd);
 	return await lockedFileSystem.withLocks(getRuntimeConfigLockRequests(cwd), async () => {
 		const current = await loadRuntimeConfigLocked(cwd);
@@ -730,6 +874,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			throw new Error("Cannot save project shortcuts without a selected project.");
 		}
 		const mergedContextBudget = mergeContextBudgetUpdates(current.contextBudget, updates.contextBudget);
+		const mergedReviewPolicy = mergeReviewPolicyUpdates(current.reviewPolicy, updates.reviewPolicy);
 		const nextConfig = {
 			selectedAgentId: updates.selectedAgentId ?? current.selectedAgentId,
 			selectedShortcutLabel:
@@ -741,6 +886,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			commitPromptTemplate: updates.commitPromptTemplate ?? current.commitPromptTemplate,
 			openPrPromptTemplate: updates.openPrPromptTemplate ?? current.openPrPromptTemplate,
 			contextBudget: mergedContextBudget === undefined ? current.contextBudget : mergedContextBudget,
+			reviewPolicy: mergedReviewPolicy === undefined ? current.reviewPolicy : mergedReviewPolicy,
 		};
 
 		const hasChanges =
@@ -751,7 +897,8 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			nextConfig.commitPromptTemplate !== current.commitPromptTemplate ||
 			nextConfig.openPrPromptTemplate !== current.openPrPromptTemplate ||
 			!areRuntimeProjectShortcutsEqual(nextConfig.shortcuts, current.shortcuts) ||
-			!areRuntimeContextBudgetsEqual(nextConfig.contextBudget, current.contextBudget);
+			!areRuntimeContextBudgetsEqual(nextConfig.contextBudget, current.contextBudget) ||
+			!areRuntimeReviewPoliciesEqual(nextConfig.reviewPolicy, current.reviewPolicy);
 
 		if (!hasChanges) {
 			return current;
@@ -765,6 +912,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			commitPromptTemplate: nextConfig.commitPromptTemplate,
 			openPrPromptTemplate: nextConfig.openPrPromptTemplate,
 			contextBudget: updates.contextBudget === undefined ? undefined : mergedContextBudget,
+			reviewPolicy: updates.reviewPolicy === undefined ? undefined : mergedReviewPolicy,
 		});
 		await writeRuntimeProjectConfigFile(projectConfigPath, {
 			shortcuts: nextConfig.shortcuts,
@@ -780,6 +928,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			commitPromptTemplate: nextConfig.commitPromptTemplate,
 			openPrPromptTemplate: nextConfig.openPrPromptTemplate,
 			contextBudget: nextConfig.contextBudget,
+			reviewPolicy: nextConfig.reviewPolicy,
 		});
 	});
 }
@@ -789,6 +938,7 @@ export async function updateGlobalRuntimeConfig(
 	updates: RuntimeConfigUpdateInput,
 ): Promise<RuntimeConfigState> {
 	validateContextBudget(updates.contextBudget);
+	validateReviewPolicy(updates.reviewPolicy);
 	const globalConfigPath = getRuntimeGlobalConfigPath();
 	return await lockedFileSystem.withLocks(
 		[
@@ -799,6 +949,7 @@ export async function updateGlobalRuntimeConfig(
 		],
 		async () => {
 			const mergedContextBudget = mergeContextBudgetUpdates(current.contextBudget, updates.contextBudget);
+			const mergedReviewPolicy = mergeReviewPolicyUpdates(current.reviewPolicy, updates.reviewPolicy);
 			const nextConfig = {
 				selectedAgentId: updates.selectedAgentId ?? current.selectedAgentId,
 				selectedShortcutLabel:
@@ -812,6 +963,7 @@ export async function updateGlobalRuntimeConfig(
 				commitPromptTemplate: updates.commitPromptTemplate ?? current.commitPromptTemplate,
 				openPrPromptTemplate: updates.openPrPromptTemplate ?? current.openPrPromptTemplate,
 				contextBudget: mergedContextBudget === undefined ? current.contextBudget : mergedContextBudget,
+				reviewPolicy: mergedReviewPolicy === undefined ? current.reviewPolicy : mergedReviewPolicy,
 			};
 
 			const hasChanges =
@@ -821,7 +973,8 @@ export async function updateGlobalRuntimeConfig(
 				nextConfig.readyForReviewNotificationsEnabled !== current.readyForReviewNotificationsEnabled ||
 				nextConfig.commitPromptTemplate !== current.commitPromptTemplate ||
 				nextConfig.openPrPromptTemplate !== current.openPrPromptTemplate ||
-				!areRuntimeContextBudgetsEqual(nextConfig.contextBudget, current.contextBudget);
+				!areRuntimeContextBudgetsEqual(nextConfig.contextBudget, current.contextBudget) ||
+				!areRuntimeReviewPoliciesEqual(nextConfig.reviewPolicy, current.reviewPolicy);
 
 			if (!hasChanges) {
 				return current;
@@ -835,6 +988,7 @@ export async function updateGlobalRuntimeConfig(
 				commitPromptTemplate: nextConfig.commitPromptTemplate,
 				openPrPromptTemplate: nextConfig.openPrPromptTemplate,
 				contextBudget: updates.contextBudget === undefined ? undefined : mergedContextBudget,
+				reviewPolicy: updates.reviewPolicy === undefined ? undefined : mergedReviewPolicy,
 			});
 
 			return createRuntimeConfigStateFromValues({
@@ -848,6 +1002,7 @@ export async function updateGlobalRuntimeConfig(
 				commitPromptTemplate: nextConfig.commitPromptTemplate,
 				openPrPromptTemplate: nextConfig.openPrPromptTemplate,
 				contextBudget: nextConfig.contextBudget,
+				reviewPolicy: nextConfig.reviewPolicy,
 			});
 		},
 	);

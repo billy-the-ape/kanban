@@ -56,6 +56,8 @@ import { SDK_DEFAULT_MODEL_ID, SDK_DEFAULT_PROVIDER_ID } from "./sdk-provider-bo
 import {
 	type ClineSdkPersistedMessage,
 	type ClineSdkSlashCommand,
+	type ClineSdkToolApprovalRequest,
+	type ClineSdkToolApprovalResult,
 	listClineSdkWorkflowSlashCommands,
 	resolveClineSdkSystemPrompt,
 } from "./sdk-runtime-boundary.js";
@@ -91,6 +93,11 @@ export interface StartClineTaskSessionRequest {
 	 * forwarded to the session runtime for calibration + beforeModel hook.
 	 */
 	compactionSafetyMarginTokens?: number;
+	/**
+	 * B-6.6: per-session tool-approval override (e.g. the bounded review tool
+	 * policy). When omitted, the workspace runtime setup's policy applies.
+	 */
+	requestToolApproval?: (request: ClineSdkToolApprovalRequest) => Promise<ClineSdkToolApprovalResult>;
 }
 
 export interface ClineTaskSessionService {
@@ -606,7 +613,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					reasoningEffort: request.reasoningEffort,
 					systemPrompt,
 					userInstructionService: runtimeSetup.userInstructionService,
-					requestToolApproval: runtimeSetup.requestToolApproval,
+					requestToolApproval: request.requestToolApproval ?? runtimeSetup.requestToolApproval,
 					contextWindowTokens: request.contextWindowTokens,
 					contextWindowSource: request.contextWindowSource,
 					compaction: request.compaction,

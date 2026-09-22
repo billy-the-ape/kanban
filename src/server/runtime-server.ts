@@ -7,6 +7,10 @@ import { createHTTPHandler } from "@trpc/server/adapters/standalone";
 import { handleClineMcpOauthCallback } from "../cline-sdk/cline-mcp-runtime-service";
 import { createClineProviderService } from "../cline-sdk/cline-provider-service";
 import {
+	type ClineReviewSessionService,
+	createClineReviewSessionService,
+} from "../cline-sdk/cline-review-session-service";
+import {
 	type ClineTaskSessionService,
 	createInMemoryClineTaskSessionService,
 } from "../cline-sdk/cline-task-session-service";
@@ -175,6 +179,48 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 	const disposeClineTaskSessionService = (workspaceId: string): void => {
 		void disposeClineTaskSessionServiceAsync(workspaceId);
 	};
+	const reviewSessionServiceByWorkspaceId = new Map<
+		string,
+		{ reviewService: ClineReviewSessionService; sessionService: ClineTaskSessionService }
+	>();
+	// B-6: a review runs in its own in-memory Cline session instance so it never
+	// collides with the task's working session (isolated single-session guard) and
+	// starts from a fresh context. It shares the workspace watcher registry and the
+	// shared provider service (so the model-capacity cache is reused).
+	const getScopedReviewSessionService = async (
+		scope: RuntimeTrpcWorkspaceScope,
+	): Promise<ClineReviewSessionService> => {
+		let bundle = reviewSessionServiceByWorkspaceId.get(scope.workspaceId);
+		if (!bundle) {
+			const reviewSessionService = createInMemoryClineTaskSessionService({
+				watcherRegistry: clineWatcherRegistry,
+				resolveClineLaunchConfig: (overrides) => clineProviderService.resolveLaunchConfig(overrides),
+			});
+			const reviewService = createClineReviewSessionService({
+				clineTaskSessionService: reviewSessionService,
+				resolveClineLaunchConfig: (overrides) => clineProviderService.resolveLaunchConfig(overrides),
+				workspaceId: scope.workspaceId,
+				repoPath: scope.workspacePath,
+			});
+			bundle = { reviewService, sessionService: reviewSessionService };
+			reviewSessionServiceByWorkspaceId.set(scope.workspaceId, bundle);
+		}
+		return bundle.reviewService;
+	};
+	const disposeReviewSessionServiceAsync = async (workspaceId: string): Promise<void> => {
+		const bundle = reviewSessionServiceByWorkspaceId.get(workspaceId);
+		if (!bundle) {
+			return;
+		}
+		reviewSessionServiceByWorkspaceId.delete(workspaceId);
+		// Dispose the orchestrator first (stops in-flight review sessions) while the
+		// underlying in-memory service is still alive.
+		await bundle.reviewService.dispose();
+		await bundle.sessionService.dispose();
+	};
+	const disposeReviewSessionService = (workspaceId: string): void => {
+		void disposeReviewSessionServiceAsync(workspaceId);
+	};
 	const prepareForStateReset = async (): Promise<void> => {
 		const workspaceIds = new Set<string>();
 		for (const { workspaceId } of deps.workspaceRegistry.listManagedWorkspaces()) {
@@ -183,12 +229,16 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		for (const workspaceId of clineTaskSessionServiceByWorkspaceId.keys()) {
 			workspaceIds.add(workspaceId);
 		}
+		for (const workspaceId of reviewSessionServiceByWorkspaceId.keys()) {
+			workspaceIds.add(workspaceId);
+		}
 		const activeWorkspaceId = deps.workspaceRegistry.getActiveWorkspaceId();
 		if (activeWorkspaceId) {
 			workspaceIds.add(activeWorkspaceId);
 		}
 		for (const workspaceId of workspaceIds) {
 			await disposeClineTaskSessionServiceAsync(workspaceId);
+			await disposeReviewSessionServiceAsync(workspaceId);
 			deps.disposeWorkspace(workspaceId, {
 				stopTerminalSessions: true,
 			});
@@ -209,6 +259,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				setActiveRuntimeConfig: deps.workspaceRegistry.setActiveRuntimeConfig,
 				getScopedTerminalManager,
 				getScopedClineTaskSessionService,
+				getScopedReviewSessionService,
 				resolveInteractiveShellCommand: deps.resolveInteractiveShellCommand,
 				runCommand: deps.runCommand,
 				broadcastClineMcpAuthStatusesUpdated: deps.runtimeStateHub.broadcastClineMcpAuthStatusesUpdated,
@@ -240,6 +291,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				getTerminalManagerForWorkspace: deps.workspaceRegistry.getTerminalManagerForWorkspace,
 				disposeWorkspace: (workspaceId, options) => {
 					disposeClineTaskSessionService(workspaceId);
+					disposeReviewSessionService(workspaceId);
 					return deps.disposeWorkspace(workspaceId, options);
 				},
 				collectProjectWorktreeTaskIdsForRemoval: deps.collectProjectWorktreeTaskIdsForRemoval,
