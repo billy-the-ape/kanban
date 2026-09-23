@@ -1314,8 +1314,12 @@ export const runtimeTaskDispatchRecordSchema = z.object({
 	baseRef: z.string(),
 	/** Verified baseline commit the dispatched worktree sits on (null for blocked records without a resolved base). */
 	baseSha: z.string().nullable(),
-	/** 1-based dispatch attempt count; bounds automatic retries. */
-	attempt: z.number().int().min(1),
+	/**
+	 * Launch attempts in the current dispatch cycle; bounds automatic retries.
+	 * 0 for a task that was blocked before any launch; a new cycle (the task
+	 * returns to the backlog after a successful dispatch) starts again at 1.
+	 */
+	attempt: z.number().int().min(0),
 	status: runtimeTaskDispatchStatusSchema,
 	error: z.string().nullable(),
 	prerequisites: z.array(runtimeTaskDispatchPrerequisiteSchema),

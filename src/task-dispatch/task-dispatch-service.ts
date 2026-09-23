@@ -5,7 +5,7 @@
 // column and carry a delivery receipt in {delivered, no_op}. The base SHA is
 // resolved from the delivered prerequisite receipts, a fresh-context prompt is
 // built, the card is moved to in_progress, and a fresh session is launched.
-// One model worker per workspace holds a slot at a time (workerLimit).
+// Up to workerLimit model workers per workspace hold a slot at a time.
 // Dispatch records are persisted before launch so restart reconciliation can
 // recover in-flight work (B-9.6), and failed launches retry with a bounded
 // attempt cap (B-9.7).
@@ -25,13 +25,12 @@ import type {
 	RuntimeTaskDispatchTaskView,
 	RuntimeTaskSessionSummary,
 } from "../core/api-contract";
-import { isHomeAgentSessionId } from "../core/home-agent-session";
 import { getTaskColumnId, moveTaskToColumn } from "../core/task-board-mutations";
 import { lockedFileSystem } from "../fs/locked-file-system";
 import { getWorkspaceDirectoryPath } from "../state/workspace-state";
 import { readGitHeadInfo, runGit } from "../workspace/git-utils";
 import { ensureTaskWorktreeIfDoesntExist, resolveTaskCwd } from "../workspace/task-worktree";
-import { readTaskDispatchRecord, writeTaskDispatchRecord } from "./dispatch-records";
+import { clearTaskDispatchRecord, readTaskDispatchRecord, writeTaskDispatchRecord } from "./dispatch-records";
 
 /** B-9.7: automatic launch/recovery attempts per task before the queue gives up. */
 export const TASK_DISPATCH_RETRY_CAP = 3;
@@ -62,6 +61,39 @@ export interface TaskDispatchWorktreePreparation {
 	error: string | null;
 }
 
+/** A task session as the runtime sees it right now. */
+export interface TaskDispatchSessionSnapshot {
+	summary: RuntimeTaskSessionSummary;
+	/**
+	 * True only when a process or SDK turn is running for the task in this
+	 * runtime. Summaries hydrated from disk after a restart are not live, even
+	 * when their persisted state still reads "running".
+	 */
+	live: boolean;
+}
+
+/**
+ * Build session snapshots from the runtime's two session sources. Terminal
+ * summaries include ones hydrated from disk at startup, which have no process
+ * behind them. Cline summaries only exist in memory, so a running Cline
+ * summary is a turn running in this runtime.
+ */
+export function collectTaskDispatchSessions(input: {
+	terminal: {
+		listSummaries: () => RuntimeTaskSessionSummary[];
+		hasActiveProcess: (taskId: string) => boolean;
+	};
+	clineSummaries: RuntimeTaskSessionSummary[];
+}): TaskDispatchSessionSnapshot[] {
+	return [
+		...input.terminal.listSummaries().map((summary) => ({
+			summary,
+			live: input.terminal.hasActiveProcess(summary.taskId),
+		})),
+		...input.clineSummaries.map((summary) => ({ summary, live: summary.state === "running" })),
+	];
+}
+
 export interface TaskDispatchDeps {
 	workspaceId: string;
 	/** Main repository checkout path. */
@@ -70,8 +102,8 @@ export interface TaskDispatchDeps {
 	loadBoard: () => Promise<RuntimeBoardData>;
 	/** Persist a board transform atomically (revision bump handled by the state layer). */
 	persistBoard: (mutate: (board: RuntimeBoardData) => RuntimeBoardData) => Promise<void>;
-	listTerminalSummaries: () => Promise<RuntimeTaskSessionSummary[]>;
-	listClineSummaries: () => Promise<RuntimeTaskSessionSummary[]>;
+	/** Every task session known to this runtime (terminal and Cline), with liveness. */
+	listSessions: () => Promise<TaskDispatchSessionSnapshot[]>;
 	/** Read a task's durable delivery receipt (null when absent). */
 	readReceipt: (taskId: string) => Promise<RuntimeGitDeliveryReceipt | null>;
 	/** Start a fresh task session (agent/model resolution happens inside). */
@@ -93,7 +125,7 @@ export type TaskDispatchReadinessCode =
 	| "prerequisite_delivery_missing"
 	| "prerequisite_delivery_paused"
 	| "prerequisite_delivery_failed"
-	| "prerequisite_cycle";
+	| "prerequisite_discarded";
 
 export type TaskDispatchReadiness =
 	| {
@@ -113,6 +145,12 @@ export type TaskDispatchReadiness =
 export interface TaskDispatchReadinessInput {
 	board: RuntimeBoardData;
 	workspaceId: string;
+	/**
+	 * Whether deterministic delivery can write receipts. When it is off, a
+	 * "no receipt" block will never clear on its own, so the reason says so.
+	 * Defaults to true.
+	 */
+	deliveryEnabled?: boolean;
 	prereqStatus: (taskId: string) => {
 		columnId: RuntimeBoardColumnId | null;
 		receipt: RuntimeGitDeliveryReceipt | null;
@@ -188,7 +226,8 @@ function getTaskDispatchLockRequest(workspaceId: string) {
  * prerequisite sits in the done column and has a durable delivery receipt with
  * status delivered or no_op. The receipt (not the live board graph alone) is
  * the source of truth for "prerequisite satisfied"; the board edge only names
- * the prerequisite. paused/failed receipts and not-done prerequisites block.
+ * the prerequisite. paused/failed receipts, not-done prerequisites, and
+ * prerequisites moved to trash block.
  */
 export function resolveReadyTasks(input: TaskDispatchReadinessInput): TaskDispatchReadiness[] {
 	const results: TaskDispatchReadiness[] = [];
@@ -204,28 +243,17 @@ export function resolveReadyTasks(input: TaskDispatchReadinessInput): TaskDispat
 
 function resolveTaskReadiness(card: RuntimeBoardCard, input: TaskDispatchReadinessInput): TaskDispatchReadiness {
 	const name = cardTitle(card);
-	const dependencies = input.board.dependencies.filter((dependency) => dependency.fromTaskId === card.id);
+	const prereqIds = new Set(
+		input.board.dependencies
+			.filter((dependency) => dependency.fromTaskId === card.id)
+			.map((dependency) => dependency.toTaskId),
+	);
 	const prerequisites: RuntimeTaskDispatchPrerequisite[] = [];
 	const columnIds = new Map<string, RuntimeBoardColumnId | null>();
-	const visited = new Set<string>();
-	for (const dependency of dependencies) {
-		const prereqId = dependency.toTaskId;
-		if (visited.has(prereqId)) {
-			// Defensive: board invariants (edges always backlog → non-backlog)
-			// make cycles impossible; corrupted data must never dispatch.
-			return {
-				taskId: card.id,
-				ready: false,
-				code: "prerequisite_cycle",
-				reason: `Task "${name}" has a circular dependency chain; resolve the links manually.`,
-				prerequisites,
-			};
-		}
-		visited.add(prereqId);
+	for (const prereqId of prereqIds) {
 		const status = input.prereqStatus(prereqId);
-		const columnId = status?.columnId ?? null;
 		const receipt = status?.receipt && status.receipt.workspaceId === input.workspaceId ? status.receipt : null;
-		columnIds.set(prereqId, columnId);
+		columnIds.set(prereqId, status?.columnId ?? null);
 		prerequisites.push({
 			taskId: prereqId,
 			integratedSha: receipt?.integratedSha ?? null,
@@ -233,54 +261,58 @@ function resolveTaskReadiness(card: RuntimeBoardCard, input: TaskDispatchReadine
 			deliveryStatus: receipt?.status ?? null,
 		});
 	}
-	if (prerequisites.length === 0) {
-		return { taskId: card.id, ready: true, reason: null, prerequisites };
-	}
+	const blocked = (code: TaskDispatchReadinessCode, reason: string): TaskDispatchReadiness => ({
+		taskId: card.id,
+		ready: false,
+		code,
+		reason,
+		prerequisites,
+	});
 	for (const prereq of prerequisites) {
-		const prereqName = cardTitle({ id: prereq.taskId, title: "" });
+		const prereqName = cardTitle(findBoardCard(input.board, prereq.taskId) ?? { id: prereq.taskId, title: "" });
 		const columnId = columnIds.get(prereq.taskId) ?? null;
+		if (columnId === "trash") {
+			return blocked(
+				"prerequisite_discarded",
+				`Prerequisite "${prereqName}" was moved to trash; restore it, or remove the link, before "${name}" can start.`,
+			);
+		}
 		if (columnId !== "done") {
-			return {
-				taskId: card.id,
-				ready: false,
-				code: "prerequisite_in_progress",
-				reason: `Prerequisite "${prereqName}" is not done (currently in ${columnId ?? "an unknown column"}); it must complete first.`,
-				prerequisites,
-			};
+			return blocked(
+				"prerequisite_in_progress",
+				`Prerequisite "${prereqName}" is not done (currently in ${columnId ?? "an unknown column"}); it must complete first.`,
+			);
 		}
 		if (!prereq.deliveryStatus) {
-			return {
-				taskId: card.id,
-				ready: false,
-				code: "prerequisite_delivery_missing",
-				reason: `Prerequisite "${prereqName}" is done but has no delivery receipt; deliver it before "${name}" can start.`,
-				prerequisites,
-			};
+			const hint =
+				input.deliveryEnabled === false
+					? " Deterministic delivery (gitDeliveryPolicy) is disabled, so no receipt will be written; enable it to use the task queue."
+					: "";
+			return blocked(
+				"prerequisite_delivery_missing",
+				`Prerequisite "${prereqName}" is done but has no delivery receipt; deliver it before "${name}" can start.${hint}`,
+			);
 		}
 		if (prereq.deliveryStatus === "paused") {
-			return {
-				taskId: card.id,
-				ready: false,
-				code: "prerequisite_delivery_paused",
-				reason: `Prerequisite "${prereqName}" delivery is paused; resume and finish it before "${name}" can start.`,
-				prerequisites,
-			};
+			return blocked(
+				"prerequisite_delivery_paused",
+				`Prerequisite "${prereqName}" delivery is paused; resume and finish it before "${name}" can start.`,
+			);
 		}
 		if (prereq.deliveryStatus === "failed") {
-			return {
-				taskId: card.id,
-				ready: false,
-				code: "prerequisite_delivery_failed",
-				reason: `Prerequisite "${prereqName}" delivery failed; fix and re-deliver it before "${name}" can start.`,
-				prerequisites,
-			};
+			return blocked(
+				"prerequisite_delivery_failed",
+				`Prerequisite "${prereqName}" delivery failed; fix and re-deliver it before "${name}" can start.`,
+			);
 		}
 	}
 	return { taskId: card.id, ready: true, reason: null, prerequisites };
 }
+
 async function buildReadinessInput(
 	deps: TaskDispatchDeps,
 	board: RuntimeBoardData,
+	config: RuntimeConfigState,
 ): Promise<TaskDispatchReadinessInput> {
 	const prereqIds = new Set<string>();
 	for (const dependency of board.dependencies) {
@@ -295,6 +327,7 @@ async function buildReadinessInput(
 	return {
 		board,
 		workspaceId: deps.workspaceId,
+		deliveryEnabled: config.gitDeliveryPolicy?.enabled === true,
 		prereqStatus: (taskId) => ({
 			columnId: getTaskColumnId(board, taskId),
 			receipt: receipts.get(taskId) ?? null,
@@ -302,16 +335,36 @@ async function buildReadinessInput(
 	};
 }
 
-export function getActiveWorkerTaskIds(
-	summaries: Array<Pick<RuntimeTaskSessionSummary, "taskId" | "state">>,
-): string[] {
-	// A worker slot is held while its model session is actively running or
-	// paused for review input. Home-agent (assistant) sessions are the user's
-	// own chat and never block the queue.
-	return summaries
-		.filter((summary) => !isHomeAgentSessionId(summary.taskId))
-		.filter((summary) => summary.state === "running" || summary.state === "awaiting_review")
-		.map((summary) => summary.taskId);
+/**
+ * Task ids holding a model worker slot. A slot belongs to a board card in
+ * in_progress or review whose session is either running in this runtime or
+ * finished and awaiting review. Sessions that are not board cards (home agent,
+ * home and per-task shell terminals) never hold a slot, and neither do
+ * summaries hydrated from disk that only claim to be running.
+ */
+export function getActiveWorkerTaskIds(sessions: TaskDispatchSessionSnapshot[], board: RuntimeBoardData): string[] {
+	const workerTaskIds = new Set<string>();
+	for (const session of sessions) {
+		const columnId = getTaskColumnId(board, session.summary.taskId);
+		if (columnId !== "in_progress" && columnId !== "review") {
+			continue;
+		}
+		const { state } = session.summary;
+		if ((state === "running" && session.live) || state === "awaiting_review") {
+			workerTaskIds.add(session.summary.taskId);
+		}
+	}
+	return [...workerTaskIds];
+}
+
+/**
+ * Whether a task still has a session that restart reconciliation must not
+ * replace: one running in this runtime, or one that finished and awaits review.
+ */
+function hasRecoverableSession(sessions: TaskDispatchSessionSnapshot[], taskId: string): boolean {
+	return sessions.some(
+		(session) => session.summary.taskId === taskId && (session.live || session.summary.state === "awaiting_review"),
+	);
 }
 
 // --- base SHA resolution (B-9.4) --------------------------------------------
@@ -343,34 +396,29 @@ export async function resolveDispatchBaseSha(options: {
 		};
 	}
 	const baseSha = resolved.stdout.trim();
-	const missingAncestry: string[] = [];
-	for (const ancestorSha of options.requiredAncestors) {
-		const check = await runGit(options.repoPath, ["merge-base", "--is-ancestor", ancestorSha, baseSha]);
-		if (check.ok) {
-			continue;
-		}
-		// git exit code 1 = "not an ancestor" (a deliberate answer, not an error).
-		if (check.exitCode === 1) {
-			missingAncestry.push(ancestorSha);
-			continue;
-		}
-		return {
-			baseSha: null,
-			error: `Ancestry check failed for ${ancestorSha}: ${check.stderr || check.error || "unknown error"}`,
-			missingAncestry,
-		};
+	const ancestry = await findMissingAncestors(options.repoPath, options.requiredAncestors, baseSha);
+	if (ancestry.error) {
+		return { baseSha: null, error: ancestry.error, missingAncestry: ancestry.missing };
 	}
-	if (missingAncestry.length > 0) {
+	if (ancestry.missing.length > 0) {
 		return {
 			baseSha: null,
-			error: `Base ref "${normalizedBaseRef}" does not contain delivered prerequisite work: ${missingAncestry.join(", ")}`,
-			missingAncestry,
+			error: `Base ref "${normalizedBaseRef}" does not contain delivered prerequisite work: ${ancestry.missing.join(", ")}`,
+			missingAncestry: ancestry.missing,
 		};
 	}
 	return { baseSha, error: null, missingAncestry: [] };
 }
-/** git exit code 1 = "not an ancestor"; any other failure returns an error string. */
-async function collectMissingAncestors(repoPath: string, ancestors: string[], headSha: string): Promise<string | null> {
+
+/**
+ * Which of `ancestors` are not ancestors of `headSha`. git exits 1 for "not an
+ * ancestor" (a deliberate answer); any other failure is reported as an error.
+ */
+async function findMissingAncestors(
+	repoPath: string,
+	ancestors: string[],
+	headSha: string,
+): Promise<{ missing: string[]; error: string | null }> {
 	const missing: string[] = [];
 	for (const ancestorSha of ancestors) {
 		const check = await runGit(repoPath, ["merge-base", "--is-ancestor", ancestorSha, headSha]);
@@ -381,10 +429,26 @@ async function collectMissingAncestors(repoPath: string, ancestors: string[], he
 			missing.push(ancestorSha);
 			continue;
 		}
-		return `Ancestry check failed for ${ancestorSha}: ${check.stderr || check.error || "unknown error"}`;
+		return {
+			missing,
+			error: `Ancestry check failed for ${ancestorSha}: ${check.stderr || check.error || "unknown error"}`,
+		};
 	}
-	if (missing.length > 0) {
-		return `Worktree does not contain delivered prerequisite work: ${missing.join(", ")}`;
+	return { missing, error: null };
+}
+
+/** Worktree variant of the ancestry check: null when every delivered prerequisite is present. */
+async function describeMissingWorktreeAncestors(
+	repoPath: string,
+	ancestors: string[],
+	headSha: string,
+): Promise<string | null> {
+	const ancestry = await findMissingAncestors(repoPath, ancestors, headSha);
+	if (ancestry.error) {
+		return ancestry.error;
+	}
+	if (ancestry.missing.length > 0) {
+		return `Worktree does not contain delivered prerequisite work: ${ancestry.missing.join(", ")}`;
 	}
 	return null;
 }
@@ -420,7 +484,7 @@ export async function prepareTaskWorktreeBaseline(options: {
 				error: `Task worktree at ${existingPath} has no readable HEAD; recover or delete the worktree manually.`,
 			};
 		}
-		const missing = await collectMissingAncestors(existingPath, options.requiredAncestors, headSha);
+		const missing = await describeMissingWorktreeAncestors(existingPath, options.requiredAncestors, headSha);
 		if (missing) {
 			return { ok: false, worktreePath: existingPath, baseSha: headSha, error: missing };
 		}
@@ -446,7 +510,7 @@ export async function prepareTaskWorktreeBaseline(options: {
 	// B-5: when preserved work is restored or a stored patch is applied, the
 	// baseline is the recorded commit, not the requested base ref.
 	const baseSha = ensured.baseCommit ?? resolved.baseSha;
-	const missing = await collectMissingAncestors(ensured.path, options.requiredAncestors, baseSha);
+	const missing = await describeMissingWorktreeAncestors(ensured.path, options.requiredAncestors, baseSha);
 	if (missing) {
 		return { ok: false, worktreePath: ensured.path, baseSha, error: missing };
 	}
@@ -511,8 +575,22 @@ export function buildFreshDispatchPrompt(options: {
 
 interface DispatchSingleTaskOutcome {
 	dispatched: boolean;
+	/** The board was persisted, so the browser must be told even when nothing launched. */
+	boardChanged: boolean;
 	/** Set when the task could not be dispatched right now (surfaced in the response). */
 	surfaceReason: string | null;
+}
+
+/**
+ * Launch attempts already spent in the task's current dispatch cycle. A
+ * successful dispatch closes the cycle, so a task that later returns to the
+ * backlog starts counting from zero again.
+ */
+function launchAttemptsInCycle(record: RuntimeTaskDispatchRecord | null): number {
+	if (!record || record.status === "dispatched") {
+		return 0;
+	}
+	return record.attempt;
 }
 
 function moveTaskPreservingBoard(
@@ -535,11 +613,13 @@ async function dispatchSingleTask(
 	deps: TaskDispatchDeps,
 	card: RuntimeBoardCard,
 	entry: ReadyEntry,
+	previousRecord: RuntimeTaskDispatchRecord | null,
 	titleByTaskId: Record<string, string>,
 ): Promise<DispatchSingleTaskOutcome> {
 	const taskId = entry.taskId;
-	const previousRecord = await readTaskDispatchRecord(taskId).catch(() => null);
-	const attempt = (previousRecord?.attempt ?? 0) + 1;
+	const spentAttempts = launchAttemptsInCycle(previousRecord);
+	const attempt = spentAttempts + 1;
+	const cycleStartedAt = previousRecord && spentAttempts > 0 ? previousRecord.dispatchedAt : Date.now();
 	const requiredAncestors = extractRequiredAncestors(entry.prerequisites);
 	const prepare =
 		deps.prepareWorktree ??
@@ -551,21 +631,23 @@ async function dispatchSingleTask(
 		requiredAncestors,
 	});
 	if (!preparation.ok || !preparation.worktreePath || !preparation.baseSha) {
+		const error = preparation.error ?? "Worktree baseline verification failed.";
 		await writeTaskDispatchRecord({
 			taskId,
 			workspaceId: deps.workspaceId,
 			baseRef: card.baseRef,
 			baseSha: preparation.baseSha,
-			attempt: previousRecord?.attempt ?? 1,
+			// Nothing was launched, so no attempt is spent.
+			attempt: spentAttempts,
 			status: "blocked",
-			error: preparation.error ?? "Worktree baseline verification failed.",
+			error,
 			prerequisites: entry.prerequisites,
 			prompt: null,
 			agentId: null,
-			dispatchedAt: previousRecord?.dispatchedAt ?? Date.now(),
+			dispatchedAt: cycleStartedAt,
 			updatedAt: Date.now(),
 		}).catch(() => null);
-		return { dispatched: false, surfaceReason: preparation.error ?? "Worktree baseline verification failed." };
+		return { dispatched: false, boardChanged: false, surfaceReason: error };
 	}
 
 	const prompt = buildFreshDispatchPrompt({
@@ -586,7 +668,7 @@ async function dispatchSingleTask(
 		prerequisites: entry.prerequisites,
 		prompt,
 		agentId: null,
-		dispatchedAt: previousRecord?.dispatchedAt ?? Date.now(),
+		dispatchedAt: cycleStartedAt,
 		updatedAt: Date.now(),
 	};
 	await writeTaskDispatchRecord(record);
@@ -609,7 +691,7 @@ async function dispatchSingleTask(
 		}).catch(() => null);
 		// Return the card to backlog so a later trigger can retry (bounded by the cap).
 		await deps.persistBoard((currentBoard) => moveTaskPreservingBoard(currentBoard, taskId, "backlog"));
-		return { dispatched: false, surfaceReason: error };
+		return { dispatched: false, boardChanged: true, surfaceReason: error };
 	}
 	await writeTaskDispatchRecord({
 		...record,
@@ -617,8 +699,9 @@ async function dispatchSingleTask(
 		agentId: started.summary?.agentId ?? null,
 		updatedAt: Date.now(),
 	}).catch(() => null);
-	return { dispatched: true, surfaceReason: null };
+	return { dispatched: true, boardChanged: true, surfaceReason: null };
 }
+
 /**
  * B-9.1/B-9.3: run one queue pass. Serialized per workspace by a dedicated
  * lock so concurrent triggers (board save, delivery, session stop) cannot
@@ -639,22 +722,20 @@ export async function dispatchReadyTasks(deps: TaskDispatchDeps): Promise<Runtim
 	}
 	return await lockedFileSystem.withLock(getTaskDispatchLockRequest(deps.workspaceId), async () => {
 		const board = await deps.loadBoard();
-		const readinessInput = await buildReadinessInput(deps, board);
-		const readiness = resolveReadyTasks(readinessInput);
+		const readiness = resolveReadyTasks(await buildReadinessInput(deps, board, config));
 		const readyEntries = readiness.filter((entry): entry is ReadyEntry => entry.ready);
 		const blockedViews: RuntimeTaskDispatchTaskView[] = readiness
 			.filter((entry) => !entry.ready)
 			.map((entry) => toTaskView(board, entry, blockedReasonOf(entry)));
 
-		const summaries = [...(await deps.listTerminalSummaries()), ...(await deps.listClineSummaries())];
-		const activeWorkers = getActiveWorkerTaskIds(summaries);
+		const activeWorkers = getActiveWorkerTaskIds(await deps.listSessions(), board);
 		const slotsToFill = policy.workerLimit - activeWorkers.length;
 		const titleByTaskId = collectCardTitles(board);
-		let dispatchedCount = 0;
+		let boardChanged = false;
 		const dispatchedTaskIds: string[] = [];
 		if (slotsToFill > 0) {
 			for (const entry of readyEntries) {
-				if (dispatchedCount >= slotsToFill) {
+				if (dispatchedTaskIds.length >= slotsToFill) {
 					break;
 				}
 				const card = findBoardCard(board, entry.taskId);
@@ -667,21 +748,21 @@ export async function dispatchReadyTasks(deps: TaskDispatchDeps): Promise<Runtim
 						toTaskView(
 							board,
 							entry,
-							`Dispatch retry cap (${TASK_DISPATCH_RETRY_CAP}) exhausted: ${previousRecord.error ?? "session start kept failing."} Clear the dispatch record or start the task manually.`,
+							`Dispatch retry cap (${TASK_DISPATCH_RETRY_CAP}) exhausted: ${previousRecord.error ?? "session start kept failing."} Start the task manually to take it over from the queue.`,
 						),
 					);
 					continue;
 				}
-				const outcome = await dispatchSingleTask(deps, card, entry, titleByTaskId);
+				const outcome = await dispatchSingleTask(deps, card, entry, previousRecord, titleByTaskId);
+				boardChanged ||= outcome.boardChanged;
 				if (outcome.dispatched) {
-					dispatchedCount += 1;
 					dispatchedTaskIds.push(entry.taskId);
 				} else if (outcome.surfaceReason) {
 					blockedViews.push(toTaskView(board, entry, outcome.surfaceReason));
 				}
 			}
 		}
-		if (dispatchedCount > 0) {
+		if (boardChanged) {
 			deps.onStateUpdated?.();
 		}
 		const readyViews = readyEntries
@@ -689,27 +770,37 @@ export async function dispatchReadyTasks(deps: TaskDispatchDeps): Promise<Runtim
 			.map((entry) => toTaskView(board, entry, null));
 		return {
 			dispatchedTaskId: dispatchedTaskIds[0] ?? null,
-			skippedReason:
-				dispatchedCount > 0
-					? null
-					: !policy.enabled
-						? "disabled"
-						: slotsToFill <= 0
-							? "worker_busy"
-							: "no_ready_tasks",
+			skippedReason: dispatchedTaskIds.length > 0 ? null : slotsToFill <= 0 ? "worker_busy" : "no_ready_tasks",
 			readyTasks: readyViews,
 			blockedTasks: blockedViews,
 		};
 	});
 }
+
+/**
+ * A manual start takes a task over from the queue: forget the failed, blocked,
+ * or exhausted dispatch state so the retry cap no longer applies to it and
+ * restart reconciliation leaves it alone. A queue-owned in-flight record
+ * (dispatching/dispatched) is kept, because the queue itself is launching it.
+ */
+export async function releaseTaskFromDispatchQueue(taskId: string): Promise<void> {
+	const record = await readTaskDispatchRecord(taskId);
+	if (!record || record.status === "dispatching" || record.status === "dispatched") {
+		return;
+	}
+	await clearTaskDispatchRecord(taskId);
+}
+
 // --- restart reconciliation (B-9.6) -----------------------------------------
 
 /**
- * B-9.6: after a runtime restart, in_progress tasks that carry a dispatch
- * record but no live session and no delivery receipt are relaunched from
- * their recorded base (fresh session, same verified baseline), with the
- * attempt counter continuing to bound automatic retries. Tasks without a
- * dispatch record were started manually and are left alone.
+ * B-9.6: after a runtime restart, in_progress tasks the queue launched
+ * (record status dispatching/dispatched) that have no live session, no
+ * session awaiting review, and no delivery receipt are relaunched from their
+ * recorded base (fresh session, same verified baseline), with the attempt
+ * counter continuing to bound automatic retries. Session summaries hydrated
+ * from disk do not count as live. Tasks without a queue-owned record were
+ * started manually and are left alone.
  */
 export async function reconcileTaskDispatch(deps: TaskDispatchDeps): Promise<RuntimeTaskDispatchReconcileResponse> {
 	const config = await deps.loadConfig();
@@ -720,8 +811,7 @@ export async function reconcileTaskDispatch(deps: TaskDispatchDeps): Promise<Run
 	return await lockedFileSystem.withLock(getTaskDispatchLockRequest(deps.workspaceId), async () => {
 		const board = await deps.loadBoard();
 		const inProgressColumn = board.columns.find((column) => column.id === "in_progress");
-		const summaries = [...(await deps.listTerminalSummaries()), ...(await deps.listClineSummaries())];
-		const liveTaskIds = new Set(summaries.map((summary) => summary.taskId));
+		const sessions = await deps.listSessions();
 		const titleByTaskId = collectCardTitles(board);
 		const prepare =
 			deps.prepareWorktree ??
@@ -730,11 +820,11 @@ export async function reconcileTaskDispatch(deps: TaskDispatchDeps): Promise<Run
 		const relaunchedTaskIds: string[] = [];
 		const skippedTaskIds: string[] = [];
 		for (const card of inProgressColumn?.cards ?? []) {
-			if (liveTaskIds.has(card.id)) {
+			if (hasRecoverableSession(sessions, card.id)) {
 				continue;
 			}
 			const record = await readTaskDispatchRecord(card.id).catch(() => null);
-			if (!record) {
+			if (!record || (record.status !== "dispatching" && record.status !== "dispatched")) {
 				continue;
 			}
 			const receipt = await deps.readReceipt(card.id).catch(() => null);
@@ -817,6 +907,7 @@ export async function reconcileTaskDispatch(deps: TaskDispatchDeps): Promise<Run
 		return { relaunchedTaskIds, skippedTaskIds };
 	});
 }
+
 // --- diagnostics (B-9.5 / B-10) ----------------------------------------------
 
 /** Read-only queue status for the UI and diagnostics (no dispatch side effects). */
@@ -824,10 +915,8 @@ export async function getTaskDispatchStatus(deps: TaskDispatchDeps): Promise<Run
 	const config = await deps.loadConfig();
 	const policy = config.taskDispatchPolicy ?? TASK_DISPATCH_DEFAULT_POLICY;
 	const board = await deps.loadBoard();
-	const readinessInput = await buildReadinessInput(deps, board);
-	const readiness = resolveReadyTasks(readinessInput);
-	const summaries = [...(await deps.listTerminalSummaries()), ...(await deps.listClineSummaries())];
-	const activeWorkers = getActiveWorkerTaskIds(summaries);
+	const readiness = resolveReadyTasks(await buildReadinessInput(deps, board, config));
+	const activeWorkers = getActiveWorkerTaskIds(await deps.listSessions(), board);
 	const taskIds = new Set<string>();
 	for (const column of board.columns) {
 		for (const card of column.cards) {
