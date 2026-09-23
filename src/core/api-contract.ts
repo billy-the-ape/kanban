@@ -1238,6 +1238,9 @@ export const runtimeGitDeliveryPolicySaveSchema = z.object({
 });
 export type RuntimeGitDeliveryPolicySave = z.infer<typeof runtimeGitDeliveryPolicySaveSchema>;
 
+// B-9: backend-owned sequential task dispatch ("reliable queue"). The backend
+// decides which backlog task is ready (delivery-receipt based), resolves the
+// base SHA, starts a fresh-context session, and records the dispatch durably.
 export const runtimeTaskDeliveryStartRequestSchema = z.object({
 	taskId: z.string(),
 	/** Optional model-supplied commit message; sanitized to a subject/body (B-8.2). */
@@ -1268,6 +1271,97 @@ export const runtimeGitDeliveryStageSchema = z.enum([
 	"pr",
 ]);
 export type RuntimeGitDeliveryStage = z.infer<typeof runtimeGitDeliveryStageSchema>;
+
+// ── B-9: backend-owned sequential task dispatch ("reliable queue") ──────────
+
+export const runtimeTaskDispatchPolicySchema = z.object({
+	/** False: the browser keeps its legacy local auto-start behavior. */
+	enabled: z.boolean(),
+	/** Max concurrent dispatched model workers per workspace (default 1). */
+	workerLimit: z.number().int().min(1).max(4),
+});
+export type RuntimeTaskDispatchPolicy = z.infer<typeof runtimeTaskDispatchPolicySchema>;
+
+export const runtimeTaskDispatchPolicySaveSchema = z.object({
+	enabled: z.boolean().optional(),
+	workerLimit: z.number().int().min(1).max(4).optional(),
+});
+export type RuntimeTaskDispatchPolicySave = z.infer<typeof runtimeTaskDispatchPolicySaveSchema>;
+
+export const runtimeTaskDispatchStatusSchema = z.enum(["dispatching", "dispatched", "failed", "blocked", "exhausted"]);
+export type RuntimeTaskDispatchStatus = z.infer<typeof runtimeTaskDispatchStatusSchema>;
+
+export const runtimeTaskDispatchPrerequisiteSchema = z.object({
+	taskId: z.string(),
+	/** Integrated commit sha for delivered prerequisites (null for no-op / undelivered). */
+	integratedSha: z.string().nullable(),
+	/** The prerequisite's delivery task commit (null for no-op / undelivered). */
+	taskCommitSha: z.string().nullable(),
+	/** null when the prerequisite has no durable delivery receipt yet. */
+	deliveryStatus: runtimeGitDeliveryStatusSchema.nullable(),
+});
+export type RuntimeTaskDispatchPrerequisite = z.infer<typeof runtimeTaskDispatchPrerequisiteSchema>;
+
+/**
+ * Durable per-task dispatch record (B-9.4): what was dispatched, from which
+ * verified base, with which prompt. Written before the session is started and
+ * before the board mutation, so restart reconciliation can always recover.
+ */
+export const runtimeTaskDispatchRecordSchema = z.object({
+	taskId: z.string(),
+	workspaceId: z.string().min(1),
+	/** The card's base ref at dispatch time. */
+	baseRef: z.string(),
+	/** Verified baseline commit the dispatched worktree sits on (null for blocked records without a resolved base). */
+	baseSha: z.string().nullable(),
+	/** 1-based dispatch attempt count; bounds automatic retries. */
+	attempt: z.number().int().min(1),
+	status: runtimeTaskDispatchStatusSchema,
+	error: z.string().nullable(),
+	prerequisites: z.array(runtimeTaskDispatchPrerequisiteSchema),
+	/** The fresh-context prompt handed to the worker (audit + restart reuse). */
+	prompt: z.string().nullable(),
+	agentId: z.string().nullable(),
+	dispatchedAt: z.number().int(),
+	updatedAt: z.number().int(),
+});
+export type RuntimeTaskDispatchRecord = z.infer<typeof runtimeTaskDispatchRecordSchema>;
+
+export const runtimeTaskDispatchTaskViewSchema = z.object({
+	taskId: z.string(),
+	title: z.string(),
+	baseRef: z.string(),
+	/** null when the task can be dispatched right now. */
+	blockedReason: z.string().nullable(),
+	prerequisites: z.array(runtimeTaskDispatchPrerequisiteSchema),
+});
+export type RuntimeTaskDispatchTaskView = z.infer<typeof runtimeTaskDispatchTaskViewSchema>;
+
+export const runtimeTaskDispatchStatusResponseSchema = z.object({
+	enabled: z.boolean(),
+	workerLimit: z.number().int().min(1).max(4),
+	/** Task id currently holding a worker slot (null when free). */
+	activeWorkerTaskId: z.string().nullable(),
+	readyTasks: z.array(runtimeTaskDispatchTaskViewSchema),
+	blockedTasks: z.array(runtimeTaskDispatchTaskViewSchema),
+	records: z.array(runtimeTaskDispatchRecordSchema),
+});
+export type RuntimeTaskDispatchStatusResponse = z.infer<typeof runtimeTaskDispatchStatusResponseSchema>;
+
+export const runtimeTaskDispatchRunResponseSchema = z.object({
+	dispatchedTaskId: z.string().nullable(),
+	/** null when a task was dispatched. */
+	skippedReason: z.enum(["disabled", "worker_busy", "no_ready_tasks", "none"]).nullable(),
+	readyTasks: z.array(runtimeTaskDispatchTaskViewSchema),
+	blockedTasks: z.array(runtimeTaskDispatchTaskViewSchema),
+});
+export type RuntimeTaskDispatchRunResponse = z.infer<typeof runtimeTaskDispatchRunResponseSchema>;
+
+export const runtimeTaskDispatchReconcileResponseSchema = z.object({
+	relaunchedTaskIds: z.array(z.string()),
+	skippedTaskIds: z.array(z.string()),
+});
+export type RuntimeTaskDispatchReconcileResponse = z.infer<typeof runtimeTaskDispatchReconcileResponseSchema>;
 
 export const runtimeGitDeliveryPrStatusSchema = z.enum(["not_required", "created", "existing", "skipped", "failed"]);
 export type RuntimeGitDeliveryPrStatus = z.infer<typeof runtimeGitDeliveryPrStatusSchema>;
@@ -1380,6 +1474,8 @@ export const runtimeConfigResponseSchema = z.object({
 	verification: runtimeVerificationConfigSchema.nullable(),
 	/** B-8: global git delivery policy; null means delivery is disabled (model-driven git flow). */
 	gitDeliveryPolicy: runtimeGitDeliveryPolicySchema.nullable(),
+	/** B-9: global sequential task dispatch policy; null means the queue is off (legacy browser auto-start). */
+	taskDispatchPolicy: runtimeTaskDispatchPolicySchema.nullable(),
 	effectiveContextWindow: runtimeEffectiveContextWindowSchema.nullable(),
 });
 export type RuntimeConfigResponse = z.infer<typeof runtimeConfigResponseSchema>;
@@ -1399,6 +1495,8 @@ export const runtimeConfigSaveRequestSchema = z.object({
 	verification: runtimeVerificationConfigSaveSchema.optional(),
 	/** B-8: git delivery policy; `null` clears the stored policy, `undefined` leaves it untouched. */
 	gitDeliveryPolicy: runtimeGitDeliveryPolicySaveSchema.optional(),
+	/** B-9: sequential task dispatch policy; `null` clears, `undefined` leaves untouched. */
+	taskDispatchPolicy: runtimeTaskDispatchPolicySaveSchema.optional(),
 });
 export type RuntimeConfigSaveRequest = z.infer<typeof runtimeConfigSaveRequestSchema>;
 

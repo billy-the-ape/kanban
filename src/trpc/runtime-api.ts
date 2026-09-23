@@ -22,6 +22,7 @@ import type {
 	RuntimeRunUpdateResponse,
 	RuntimeTaskDeliveryInfoResponse,
 	RuntimeTaskDeliveryStartResponse,
+	RuntimeTaskSessionStartRequest,
 	RuntimeUpdateStatusResponse,
 } from "../core/api-contract";
 import {
@@ -53,9 +54,16 @@ import {
 import { isHomeAgentSessionId } from "../core/home-agent-session";
 import { resolveTaskTitle } from "../core/task-title.js";
 import { openInBrowser } from "../server/browser";
+import { loadWorkspaceBoardById, mutateWorkspaceState } from "../state/workspace-state";
+import {
+	getTaskDispatchStatus,
+	reconcileTaskDispatch,
+	dispatchReadyTasks as runTaskDispatchPass,
+	type TaskDispatchDeps,
+} from "../task-dispatch/task-dispatch-service";
 import { buildRuntimeConfigResponse, resolveAgentCommand } from "../terminal/agent-registry";
 import type { TerminalSessionManager } from "../terminal/session-manager";
-import { evaluateDependentsUnlock, getGitDeliveryService } from "../workspace/git-delivery";
+import { evaluateDependentsUnlock, getGitDeliveryService, readTaskDeliveryReceipt } from "../workspace/git-delivery";
 import { findTaskBaseRef } from "../workspace/task-review-handoff";
 import { resolveTaskCwd } from "../workspace/task-worktree";
 import { captureTaskTurnCheckpoint } from "../workspace/turn-checkpoints";
@@ -80,6 +88,10 @@ export interface CreateRuntimeApiDependencies {
 	prepareForStateReset?: () => Promise<void>;
 	getUpdateStatus: () => RuntimeUpdateStatusResponse;
 	runUpdateNow: () => Promise<RuntimeRunUpdateResponse>;
+	/** B-9: broadcast after dispatch-driven board mutations (fire-and-forget is fine). */
+	broadcastRuntimeWorkspaceStateUpdated?: (workspaceId: string, workspacePath: string) => void;
+	/** B-9: surface fire-and-forget dispatch pass failures (a missed pass is retried by the next trigger). */
+	warnTaskDispatchError?: (error: unknown) => void;
 }
 
 async function resolveExistingTaskCwdOrEnsure(options: {
@@ -145,7 +157,63 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		return buildRuntimeConfigResponse(runtimeConfig, clineProviderSettings, { effectiveContextWindow });
 	};
 
-	return {
+	// B-9: the dispatch layer starts fresh task sessions through the exact same
+	// code path the UI uses, so its deps self-reference the api instance below.
+	// `runtimeApiInstance` is assigned right before the return; handlers cannot
+	// run before that point (the server only serves requests afterwards).
+	let runtimeApiInstance: RuntimeTrpcContext["runtimeApi"] | null = null;
+	const buildTaskDispatchDeps = (workspaceScope: RuntimeTrpcWorkspaceScope): TaskDispatchDeps => {
+		return {
+			workspaceId: workspaceScope.workspaceId,
+			workspacePath: workspaceScope.workspacePath,
+			loadConfig: () => deps.loadScopedRuntimeConfig(workspaceScope),
+			loadBoard: () => loadWorkspaceBoardById(workspaceScope.workspaceId),
+			persistBoard: async (mutate) => {
+				await mutateWorkspaceState<void>(workspaceScope.workspacePath, (state) => ({
+					board: mutate(state.board),
+					value: undefined,
+				}));
+			},
+			listTerminalSummaries: async () => {
+				const terminalManager = await deps.getScopedTerminalManager(workspaceScope);
+				return terminalManager.listSummaries();
+			},
+			listClineSummaries: async () => {
+				const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
+				return clineTaskSessionService.listSummaries();
+			},
+			readReceipt: (taskId) => readTaskDeliveryReceipt(taskId),
+			startSession: async ({ taskId, baseRef, prompt, taskTitle }) => {
+				const api = runtimeApiInstance;
+				if (!api) {
+					return { ok: false, error: "Runtime api is not initialized yet." };
+				}
+				const request: RuntimeTaskSessionStartRequest = {
+					taskId,
+					baseRef,
+					prompt,
+					taskTitle,
+					mode: "act",
+				};
+				const response = await api.startTaskSession(workspaceScope, request);
+				return response.ok && response.summary
+					? { ok: true, summary: response.summary }
+					: { ok: false, error: response.error ?? "Task session start failed." };
+			},
+			onStateUpdated: () => {
+				deps.broadcastRuntimeWorkspaceStateUpdated?.(workspaceScope.workspaceId, workspaceScope.workspacePath);
+			},
+		};
+	};
+	const runTaskDispatchAfterStateChange = (workspaceScope: RuntimeTrpcWorkspaceScope): void => {
+		void runTaskDispatchPass(buildTaskDispatchDeps(workspaceScope)).catch((error) => {
+			// A missed pass is never fatal: the next state change (delivery,
+			// session stop, board save, or explicit trigger) will retry it.
+			deps.warnTaskDispatchError?.(error);
+		});
+	};
+
+	const runtimeApi: RuntimeTrpcContext["runtimeApi"] = {
 		loadConfig: async (workspaceScope) => {
 			const activeRuntimeConfig = deps.getActiveRuntimeConfig?.();
 			if (!workspaceScope && !activeRuntimeConfig) {
@@ -450,21 +518,30 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 						error: `Task worktree for "${body.taskId}" was not found; start the task session before delivery.`,
 					};
 				}
-				return await getGitDeliveryService().startDelivery({
-					taskId: body.taskId,
-					workspaceId: workspaceScope.workspaceId,
-					repoPath: workspaceScope.workspacePath,
-					worktreePath,
-					baseRef,
-					policy,
-					// B-6.7/B-7.6: a required review/verification must be ready and
-					// bound to the exact candidate tree before delivery commits it.
-					gates: {
-						reviewRequired: scopedRuntimeConfig.reviewPolicy?.enabled === "required",
-						verificationRequired: scopedRuntimeConfig.verification?.enabled === "required",
-					},
-					commitMessage: body.commitMessage,
-				});
+				return await getGitDeliveryService()
+					.startDelivery({
+						taskId: body.taskId,
+						workspaceId: workspaceScope.workspaceId,
+						repoPath: workspaceScope.workspacePath,
+						worktreePath,
+						baseRef,
+						policy,
+						// B-6.7/B-7.6: a required review/verification must be ready and
+						// bound to the exact candidate tree before delivery commits it.
+						gates: {
+							reviewRequired: scopedRuntimeConfig.reviewPolicy?.enabled === "required",
+							verificationRequired: scopedRuntimeConfig.verification?.enabled === "required",
+						},
+						commitMessage: body.commitMessage,
+					})
+					.then(async (response) => {
+						// B-9.2: a durable delivery receipt is the only thing that unlocks
+						// dependent tasks — give the queue a pass as soon as one is written.
+						if (response.receipt) {
+							runTaskDispatchAfterStateChange(workspaceScope);
+						}
+						return response;
+					});
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				return { ok: false, receipt: null, error: message };
@@ -499,12 +576,24 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				};
 			}
 		},
+		// B-9: backend-owned sequential task dispatch ("reliable queue").
+		dispatchReadyTasks: async (workspaceScope) => {
+			return await runTaskDispatchPass(buildTaskDispatchDeps(workspaceScope));
+		},
+		getDispatchStatus: async (workspaceScope) => {
+			return await getTaskDispatchStatus(buildTaskDispatchDeps(workspaceScope));
+		},
+		reconcileTaskDispatch: async (workspaceScope) => {
+			return await reconcileTaskDispatch(buildTaskDispatchDeps(workspaceScope));
+		},
 		stopTaskSession: async (workspaceScope, input) => {
 			try {
 				const body = parseTaskSessionStopRequest(input);
 				const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
 				const clineSummary = await clineTaskSessionService.stopTaskSession(body.taskId);
 				if (clineSummary) {
+					// B-9.2: a freed worker slot may unblock the next ready task.
+					runTaskDispatchAfterStateChange(workspaceScope);
 					return {
 						ok: true,
 						summary: clineSummary,
@@ -512,6 +601,9 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				}
 				const terminalManager = await deps.getScopedTerminalManager(workspaceScope);
 				const summary = terminalManager.stopTaskSession(body.taskId);
+				if (summary) {
+					runTaskDispatchAfterStateChange(workspaceScope);
+				}
 				return {
 					ok: Boolean(summary),
 					summary,
@@ -920,4 +1012,6 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			return await deps.runUpdateNow();
 		},
 	};
+	runtimeApiInstance = runtimeApi;
+	return runtimeApi;
 }

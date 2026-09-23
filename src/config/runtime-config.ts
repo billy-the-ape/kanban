@@ -14,6 +14,8 @@ import type {
 	RuntimeProjectShortcut,
 	RuntimeReviewPolicy,
 	RuntimeReviewPolicySave,
+	RuntimeTaskDispatchPolicy,
+	RuntimeTaskDispatchPolicySave,
 	RuntimeVerificationConfig,
 	RuntimeVerificationConfigSave,
 } from "../core/api-contract";
@@ -33,6 +35,8 @@ interface RuntimeGlobalConfigFileShape {
 	verification?: RuntimeVerificationConfigSave;
 	/** B-8: stored in save-shape (partial); normalized to the full policy on read. */
 	gitDeliveryPolicy?: RuntimeGitDeliveryPolicySave;
+	/** B-9: stored in save-shape (partial); normalized to the full policy on read. */
+	taskDispatchPolicy?: RuntimeTaskDispatchPolicySave;
 }
 
 interface RuntimeProjectConfigFileShape {
@@ -59,6 +63,8 @@ export interface RuntimeConfigState {
 	verification?: RuntimeVerificationConfig;
 	/** B-8: global git delivery policy; absent means model-driven git behavior (delivery off). */
 	gitDeliveryPolicy?: RuntimeGitDeliveryPolicy;
+	/** B-9: global sequential task dispatch policy; absent means the queue is off (legacy browser auto-start). */
+	taskDispatchPolicy?: RuntimeTaskDispatchPolicy;
 }
 
 export interface RuntimeConfigUpdateInput {
@@ -77,6 +83,8 @@ export interface RuntimeConfigUpdateInput {
 	verification?: RuntimeVerificationConfigSave | null;
 	/** B-8: `null` clears all git delivery settings; `undefined` leaves them untouched. */
 	gitDeliveryPolicy?: RuntimeGitDeliveryPolicySave | null;
+	/** B-9: `null` clears all task dispatch settings; `undefined` leaves them untouched. */
+	taskDispatchPolicy?: RuntimeTaskDispatchPolicySave | null;
 }
 
 const RUNTIME_HOME_PARENT_DIR = ".cline";
@@ -636,6 +644,11 @@ const DEFAULT_GIT_DELIVERY_PUSH_REQUIRED = true;
 const DEFAULT_GIT_DELIVERY_PROTECTED_BRANCHES: string[] = ["main", "master"];
 const DEFAULT_GIT_DELIVERY_INTEGRATION_STRATEGY: RuntimeGitDeliveryPolicy["integrationStrategy"] = "fast_forward";
 const DEFAULT_GIT_DELIVERY_REQUIRE_PULL_REQUEST = false;
+// B-9: the sequential dispatch queue is opt-in; one model worker per workspace
+// is the default concurrency (parallel workers are a B-11 concern).
+const DEFAULT_TASK_DISPATCH_ENABLED = false;
+const DEFAULT_TASK_DISPATCH_WORKER_LIMIT = 1;
+const MAX_TASK_DISPATCH_WORKER_LIMIT = 4;
 
 /** Conservative git-check-refname(1) check for config-supplied remote/branch names. */
 function isValidGitDeliveryRefName(value: string): boolean {
@@ -777,6 +790,72 @@ function areRuntimeGitDeliveryPoliciesEqual(
 	return JSON.stringify(normalizedLeft) === JSON.stringify(normalizedRight);
 }
 
+/** B-9: normalize the sequential task dispatch policy; invalid values fall back to defaults. */
+export function normalizeTaskDispatchPolicy(value: unknown): RuntimeTaskDispatchPolicy | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return undefined;
+	}
+	const raw = value as Record<string, unknown>;
+	const workerLimitRaw = raw.workerLimit;
+	const workerLimit =
+		typeof workerLimitRaw === "number" &&
+		Number.isInteger(workerLimitRaw) &&
+		workerLimitRaw >= 1 &&
+		workerLimitRaw <= MAX_TASK_DISPATCH_WORKER_LIMIT
+			? workerLimitRaw
+			: DEFAULT_TASK_DISPATCH_WORKER_LIMIT;
+	return {
+		enabled: typeof raw.enabled === "boolean" ? raw.enabled : DEFAULT_TASK_DISPATCH_ENABLED,
+		workerLimit,
+	};
+}
+
+/** B-9: strict validation for save-time input (defense in depth). */
+function validateTaskDispatchPolicy(policy: RuntimeTaskDispatchPolicySave | null | undefined): void {
+	if (policy === null || policy === undefined) {
+		return;
+	}
+	if (
+		typeof policy.workerLimit === "number" &&
+		(!Number.isInteger(policy.workerLimit) ||
+			policy.workerLimit < 1 ||
+			policy.workerLimit > MAX_TASK_DISPATCH_WORKER_LIMIT)
+	) {
+		throw new Error(
+			`taskDispatchPolicy.workerLimit must be an integer between 1 and ${MAX_TASK_DISPATCH_WORKER_LIMIT}.`,
+		);
+	}
+}
+
+/** B-9: merge a save-shape update (null clears, undefined leaves as-is). */
+function mergeTaskDispatchPolicyUpdates(
+	stored: RuntimeTaskDispatchPolicy | undefined,
+	updates: RuntimeTaskDispatchPolicySave | null | undefined,
+): RuntimeTaskDispatchPolicySave | null | undefined {
+	if (updates === undefined) {
+		return undefined;
+	}
+	if (updates === null) {
+		return null;
+	}
+	return { ...(stored ?? {}), ...updates };
+}
+
+function areRuntimeTaskDispatchPoliciesEqual(
+	left: RuntimeTaskDispatchPolicySave | null | undefined,
+	right: RuntimeTaskDispatchPolicySave | null | undefined,
+): boolean {
+	const normalizedLeft = normalizeTaskDispatchPolicy(left);
+	const normalizedRight = normalizeTaskDispatchPolicy(right);
+	if (!normalizedLeft && !normalizedRight) {
+		return true;
+	}
+	if (!normalizedLeft || !normalizedRight) {
+		return false;
+	}
+	return JSON.stringify(normalizedLeft) === JSON.stringify(normalizedRight);
+}
+
 function hasOwnKey<T extends object>(value: T | null, key: keyof T): boolean {
 	if (!value) {
 		return false;
@@ -879,6 +958,7 @@ function toRuntimeConfigState({
 		reviewPolicy: normalizeReviewPolicy(globalConfig?.reviewPolicy),
 		verification: normalizeVerificationConfig(globalConfig?.verification),
 		gitDeliveryPolicy: normalizeGitDeliveryPolicy(globalConfig?.gitDeliveryPolicy),
+		taskDispatchPolicy: normalizeTaskDispatchPolicy(globalConfig?.taskDispatchPolicy),
 	};
 }
 
@@ -908,6 +988,8 @@ async function writeRuntimeGlobalConfigFile(
 		verification?: RuntimeVerificationConfigSave | null;
 		/** B-8: `null` clears the stored git delivery policy; `undefined` preserves the existing one. */
 		gitDeliveryPolicy?: RuntimeGitDeliveryPolicySave | null;
+		/** B-9: `null` clears the stored task dispatch policy; `undefined` preserves the existing one. */
+		taskDispatchPolicy?: RuntimeTaskDispatchPolicySave | null;
 	},
 ): Promise<void> {
 	const existing = await readRuntimeConfigFile<RuntimeGlobalConfigFileShape>(configPath);
@@ -1010,6 +1092,16 @@ async function writeRuntimeGlobalConfigFile(
 	} else if (existing?.gitDeliveryPolicy) {
 		payload.gitDeliveryPolicy = normalizeGitDeliveryPolicy(existing.gitDeliveryPolicy);
 	}
+	if (config.taskDispatchPolicy !== undefined) {
+		if (config.taskDispatchPolicy !== null) {
+			const normalizedTaskDispatchPolicy = normalizeTaskDispatchPolicy(config.taskDispatchPolicy);
+			if (normalizedTaskDispatchPolicy) {
+				payload.taskDispatchPolicy = normalizedTaskDispatchPolicy;
+			}
+		}
+	} else if (existing?.taskDispatchPolicy) {
+		payload.taskDispatchPolicy = normalizeTaskDispatchPolicy(existing.taskDispatchPolicy);
+	}
 
 	await lockedFileSystem.writeJsonFileAtomic(configPath, payload, {
 		lock: null,
@@ -1096,6 +1188,7 @@ function createRuntimeConfigStateFromValues(input: {
 	reviewPolicy?: RuntimeReviewPolicySave | null;
 	verification?: RuntimeVerificationConfigSave | null;
 	gitDeliveryPolicy?: RuntimeGitDeliveryPolicySave | null;
+	taskDispatchPolicy?: RuntimeTaskDispatchPolicySave | null;
 }): RuntimeConfigState {
 	return {
 		globalConfigPath: input.globalConfigPath,
@@ -1119,6 +1212,7 @@ function createRuntimeConfigStateFromValues(input: {
 		reviewPolicy: normalizeReviewPolicy(input.reviewPolicy),
 		verification: normalizeVerificationConfig(input.verification),
 		gitDeliveryPolicy: normalizeGitDeliveryPolicy(input.gitDeliveryPolicy),
+		taskDispatchPolicy: normalizeTaskDispatchPolicy(input.taskDispatchPolicy),
 	};
 }
 
@@ -1250,6 +1344,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 	validateReviewPolicy(updates.reviewPolicy);
 	validateVerificationConfig(updates.verification);
 	validateGitDeliveryPolicy(updates.gitDeliveryPolicy);
+	validateTaskDispatchPolicy(updates.taskDispatchPolicy);
 	const { globalConfigPath, projectConfigPath } = resolveRuntimeConfigPaths(cwd);
 	return await lockedFileSystem.withLocks(getRuntimeConfigLockRequests(cwd), async () => {
 		const current = await loadRuntimeConfigLocked(cwd);
@@ -1262,6 +1357,10 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 		const mergedGitDeliveryPolicy = mergeGitDeliveryPolicyUpdates(
 			current.gitDeliveryPolicy,
 			updates.gitDeliveryPolicy,
+		);
+		const mergedTaskDispatchPolicy = mergeTaskDispatchPolicyUpdates(
+			current.taskDispatchPolicy,
+			updates.taskDispatchPolicy,
 		);
 		const nextConfig = {
 			selectedAgentId: updates.selectedAgentId ?? current.selectedAgentId,
@@ -1277,6 +1376,8 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			reviewPolicy: mergedReviewPolicy === undefined ? current.reviewPolicy : mergedReviewPolicy,
 			verification: mergedVerification === undefined ? current.verification : mergedVerification,
 			gitDeliveryPolicy: mergedGitDeliveryPolicy === undefined ? current.gitDeliveryPolicy : mergedGitDeliveryPolicy,
+			taskDispatchPolicy:
+				mergedTaskDispatchPolicy === undefined ? current.taskDispatchPolicy : mergedTaskDispatchPolicy,
 		};
 
 		const hasChanges =
@@ -1290,7 +1391,8 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			!areRuntimeContextBudgetsEqual(nextConfig.contextBudget, current.contextBudget) ||
 			!areRuntimeReviewPoliciesEqual(nextConfig.reviewPolicy, current.reviewPolicy) ||
 			!areRuntimeVerificationConfigsEqual(nextConfig.verification, current.verification) ||
-			!areRuntimeGitDeliveryPoliciesEqual(nextConfig.gitDeliveryPolicy, current.gitDeliveryPolicy);
+			!areRuntimeGitDeliveryPoliciesEqual(nextConfig.gitDeliveryPolicy, current.gitDeliveryPolicy) ||
+			!areRuntimeTaskDispatchPoliciesEqual(nextConfig.taskDispatchPolicy, current.taskDispatchPolicy);
 
 		if (!hasChanges) {
 			return current;
@@ -1307,6 +1409,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			reviewPolicy: updates.reviewPolicy === undefined ? undefined : mergedReviewPolicy,
 			verification: updates.verification === undefined ? undefined : mergedVerification,
 			gitDeliveryPolicy: updates.gitDeliveryPolicy === undefined ? undefined : mergedGitDeliveryPolicy,
+			taskDispatchPolicy: updates.taskDispatchPolicy === undefined ? undefined : mergedTaskDispatchPolicy,
 		});
 		await writeRuntimeProjectConfigFile(projectConfigPath, {
 			shortcuts: nextConfig.shortcuts,
@@ -1325,6 +1428,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			reviewPolicy: nextConfig.reviewPolicy,
 			verification: nextConfig.verification,
 			gitDeliveryPolicy: nextConfig.gitDeliveryPolicy,
+			taskDispatchPolicy: nextConfig.taskDispatchPolicy,
 		});
 	});
 }
@@ -1337,6 +1441,7 @@ export async function updateGlobalRuntimeConfig(
 	validateReviewPolicy(updates.reviewPolicy);
 	validateVerificationConfig(updates.verification);
 	validateGitDeliveryPolicy(updates.gitDeliveryPolicy);
+	validateTaskDispatchPolicy(updates.taskDispatchPolicy);
 	const globalConfigPath = getRuntimeGlobalConfigPath();
 	return await lockedFileSystem.withLocks(
 		[
@@ -1352,6 +1457,10 @@ export async function updateGlobalRuntimeConfig(
 			const mergedGitDeliveryPolicy = mergeGitDeliveryPolicyUpdates(
 				current.gitDeliveryPolicy,
 				updates.gitDeliveryPolicy,
+			);
+			const mergedTaskDispatchPolicy = mergeTaskDispatchPolicyUpdates(
+				current.taskDispatchPolicy,
+				updates.taskDispatchPolicy,
 			);
 			const nextConfig = {
 				selectedAgentId: updates.selectedAgentId ?? current.selectedAgentId,
@@ -1370,6 +1479,8 @@ export async function updateGlobalRuntimeConfig(
 				verification: mergedVerification === undefined ? current.verification : mergedVerification,
 				gitDeliveryPolicy:
 					mergedGitDeliveryPolicy === undefined ? current.gitDeliveryPolicy : mergedGitDeliveryPolicy,
+				taskDispatchPolicy:
+					mergedTaskDispatchPolicy === undefined ? current.taskDispatchPolicy : mergedTaskDispatchPolicy,
 			};
 
 			const hasChanges =
@@ -1382,7 +1493,8 @@ export async function updateGlobalRuntimeConfig(
 				!areRuntimeContextBudgetsEqual(nextConfig.contextBudget, current.contextBudget) ||
 				!areRuntimeReviewPoliciesEqual(nextConfig.reviewPolicy, current.reviewPolicy) ||
 				!areRuntimeVerificationConfigsEqual(nextConfig.verification, current.verification) ||
-				!areRuntimeGitDeliveryPoliciesEqual(nextConfig.gitDeliveryPolicy, current.gitDeliveryPolicy);
+				!areRuntimeGitDeliveryPoliciesEqual(nextConfig.gitDeliveryPolicy, current.gitDeliveryPolicy) ||
+				!areRuntimeTaskDispatchPoliciesEqual(nextConfig.taskDispatchPolicy, current.taskDispatchPolicy);
 
 			if (!hasChanges) {
 				return current;
@@ -1399,6 +1511,7 @@ export async function updateGlobalRuntimeConfig(
 				reviewPolicy: updates.reviewPolicy === undefined ? undefined : mergedReviewPolicy,
 				verification: updates.verification === undefined ? undefined : mergedVerification,
 				gitDeliveryPolicy: updates.gitDeliveryPolicy === undefined ? undefined : mergedGitDeliveryPolicy,
+				taskDispatchPolicy: updates.taskDispatchPolicy === undefined ? undefined : mergedTaskDispatchPolicy,
 			});
 
 			return createRuntimeConfigStateFromValues({
@@ -1415,6 +1528,7 @@ export async function updateGlobalRuntimeConfig(
 				reviewPolicy: nextConfig.reviewPolicy,
 				verification: nextConfig.verification,
 				gitDeliveryPolicy: nextConfig.gitDeliveryPolicy,
+				taskDispatchPolicy: nextConfig.taskDispatchPolicy,
 			});
 		},
 	);

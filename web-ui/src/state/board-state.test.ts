@@ -182,7 +182,9 @@ describe("board dependency state", () => {
 
 		const completeA = completeTaskAndGetReadyLinkedTaskIds(dependencyB.board, taskA);
 		expect(completeA.moved).toBe(true);
-		expect(completeA.board.dependencies).toHaveLength(1);
+		// B-9: edges to done tasks survive normalization so the backend
+		// dispatch service can resolve prerequisites after completion.
+		expect(completeA.board.dependencies).toHaveLength(2);
 		expect(completeA.readyTaskIds).toEqual([taskC]);
 
 		const completeB = completeTaskAndGetReadyLinkedTaskIds(completeA.board, taskB);

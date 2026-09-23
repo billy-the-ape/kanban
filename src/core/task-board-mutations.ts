@@ -175,6 +175,7 @@ function resolveDependencyEndpoints(
 	board: RuntimeBoardData,
 	firstTaskId: string,
 	secondTaskId: string,
+	options?: { allowDoneEndpoints?: boolean },
 ):
 	| {
 			backlogTaskId: string;
@@ -186,12 +187,10 @@ function resolveDependencyEndpoints(
 	if (!firstColumnId || !secondColumnId) {
 		return { reason: "missing_task" };
 	}
-	if (
-		firstColumnId === "trash" ||
-		firstColumnId === "done" ||
-		secondColumnId === "trash" ||
-		secondColumnId === "done"
-	) {
+	if (firstColumnId === "trash" || secondColumnId === "trash") {
+		return { reason: "trash_task" };
+	}
+	if (!options?.allowDoneEndpoints && (firstColumnId === "done" || secondColumnId === "done")) {
 		return { reason: "trash_task" };
 	}
 	const firstIsBacklog = firstColumnId === "backlog";
@@ -250,7 +249,14 @@ export function updateTaskDependencies(board: RuntimeBoardData): RuntimeBoardDat
 		if (!taskIds.has(firstTaskId) || !taskIds.has(secondTaskId)) {
 			continue;
 		}
-		const resolved = resolveDependencyEndpoints(board, firstTaskId, secondTaskId);
+		const resolved = resolveDependencyEndpoints(board, firstTaskId, secondTaskId, {
+			// B-9: once a prerequisite is done, its edge must survive board
+			// normalization — the backend dispatch service discovers
+			// prerequisites from persisted boards *after* completion (the
+			// delivery receipt then proves satisfaction). New links to done
+			// tasks remain blocked via the default (no-option) path.
+			allowDoneEndpoints: true,
+		});
 		if ("reason" in resolved) {
 			continue;
 		}

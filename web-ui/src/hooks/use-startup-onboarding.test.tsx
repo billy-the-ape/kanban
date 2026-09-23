@@ -56,6 +56,7 @@ function createRuntimeConfigResponse(selectedAgentId: RuntimeConfigResponse["sel
 		reviewPolicy: null,
 		verification: null,
 		gitDeliveryPolicy: null,
+		taskDispatchPolicy: null,
 	};
 }
 

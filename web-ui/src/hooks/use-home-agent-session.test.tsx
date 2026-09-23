@@ -119,6 +119,7 @@ function createRuntimeConfig(overrides: Partial<RuntimeConfigResponse> = {}): Ru
 		reviewPolicy: null,
 		verification: null,
 		gitDeliveryPolicy: null,
+		taskDispatchPolicy: null,
 		...overrides,
 	};
 }
