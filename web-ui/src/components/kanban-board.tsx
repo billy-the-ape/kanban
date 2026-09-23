@@ -400,7 +400,7 @@ export function KanbanBoard({
 						onCommitTask={column.id === "review" ? onCommitTask : undefined}
 						onOpenPrTask={column.id === "review" ? onOpenPrTask : undefined}
 						onCancelAutomaticTaskAction={onCancelAutomaticTaskAction}
-						onMoveToTrashTask={column.id === "review" ? onMoveToTrashTask : undefined}
+						onMoveToTrashTask={column.id === "review" || column.id === "done" ? onMoveToTrashTask : undefined}
 						onCompleteTask={column.id === "review" ? onCompleteTask : undefined}
 						onRestoreFromTrashTask={column.id === "trash" ? onRestoreFromTrashTask : undefined}
 						commitTaskLoadingById={column.id === "review" ? commitTaskLoadingById : undefined}

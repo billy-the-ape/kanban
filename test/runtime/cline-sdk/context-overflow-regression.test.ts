@@ -811,4 +811,75 @@ describe("context overflow recovery through the task session service (B-3)", () 
 		expect(host.sentPrompts.length).toBe(1);
 		expect(service.getSummary(taskId)?.warningMessage).toContain("maximum context length");
 	});
+	it("surfaces an actionable error without blind retries when the context window is unknown", async () => {
+		const harness = createTaskSessionServiceHarness({
+			onTurn: (context) => {
+				if (context.turnCount >= 2) {
+					throw new Error(OPENAI_OVERFLOW_ERROR);
+				}
+				return `reply ${context.turnCount}`;
+			},
+		});
+		services.push(harness);
+		const { service, host } = harness;
+		const taskId = "task-b3-unknown-window";
+
+		// No compaction config: there is no target to compact to.
+		await startFirstTurn(harness, taskId);
+		await service.sendTaskSessionInput(taskId, "Follow up prompt");
+		await vi.waitFor(() => {
+			expect(service.getSummary(taskId)?.reviewReason).toBe("error");
+		});
+
+		expect(host.startedConfigs.length).toBe(1);
+		expect(service.getSummary(taskId)?.warningMessage).toContain("context window is unknown");
+	});
+
+	it("compacts on overflow after a Kanban process restart using the reconstructed session config", async () => {
+		const first = createTaskSessionServiceHarness();
+		services.push(first);
+		const taskId = "task-b3-after-restart";
+		await startFirstTurn(first, taskId, {
+			initialMessages: oversizedSeedMessages(),
+			compaction: SMALL_COMPACTION,
+		});
+		await first.service.stopTaskSession(taskId);
+		await first.service.dispose();
+		services.splice(services.indexOf(first), 1);
+
+		// The restarted process has no in-memory start request; the launch
+		// policy (context window + compaction) is re-resolved live (B-2.8).
+		const after = createTaskSessionServiceHarness({
+			store: first.store,
+			resolveClineLaunchConfig: async () => ({
+				providerId: "cline",
+				modelId: "test-model",
+				apiKey: null,
+				baseUrl: null,
+				contextWindowTokens: SMALL_COMPACTION.contextWindowTokens,
+				contextWindowSource: "provider-metadata",
+				maxTokens: SMALL_COMPACTION.reserveTokens,
+			}),
+		});
+		services.push(after);
+		let overflowed = false;
+		after.store.onTurn = (context) => {
+			if (!overflowed) {
+				overflowed = true;
+				throw new Error(OPENAI_OVERFLOW_ERROR);
+			}
+			return `reply ${context.turnCount}`;
+		};
+
+		await after.service.reloadTaskSession(taskId);
+		await after.service.sendTaskSessionInput(taskId, "Follow up after restart");
+		await vi.waitFor(() => {
+			expect(after.host.sentPrompts.filter((entry) => entry.prompt === "Follow up after restart").length).toBe(2);
+		});
+
+		const restartedId = after.host.startedConfigs.at(-1)?.sessionId ?? "";
+		const restarted = after.store.messagesFor(restartedId);
+		expect(String(restarted[0]?.content ?? "").startsWith(COMPACTION_NOTICE_PREFIX)).toBe(true);
+		expect(after.service.getSummary(taskId)?.reviewReason).not.toBe("error");
+	});
 });

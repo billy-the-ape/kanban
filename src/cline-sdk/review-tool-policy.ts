@@ -1,13 +1,15 @@
 // B-6.6: tool policy for bounded review sessions.
 //
 // A review session may read anything inside the task worktree and run
-// read-only commands, but it must not publish work (`git push`,
-// `git commit`), must not discard worktree state (`git reset --hard`,
-// forced `git clean`, `rm -rf .git`), and may only write files that are
-// part of the reviewed change set (or the task plan doc). Command checks
-// are best-effort scans of the tool input, so the policy is a guardrail,
-// not a sandbox: commands that cannot be classified fall through to the
-// default Kanban approval behavior (approved).
+// read-only commands, but it must not publish or move history (`git push`,
+// `git commit`, merges, ref/branch edits, `gh pr create`), must not discard
+// worktree state (`git reset --hard`, forced `git clean`, `git stash`,
+// checkout/restore of paths, `git worktree remove`, `rm -rf .`/`.git`), and
+// may only write files that are part of the reviewed change set (or the task
+// plan doc). Command checks are best-effort scans of the tool input, so the
+// policy is a guardrail, not a sandbox. It only ever adds denials: anything
+// it does not object to is decided by the workspace's existing approval
+// handler (`delegate`), so project tool approvals stay effective.
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
 import type { ClineSdkToolApprovalRequest, ClineSdkToolApprovalResult } from "./sdk-runtime-boundary";
@@ -19,7 +21,14 @@ export interface CreateReviewToolPolicyOptions {
 	worktreePath: string;
 	/** Worktree-relative paths the review session may create or modify. */
 	allowedWritePaths: readonly string[];
+	/**
+	 * The workspace's existing approval handler; it decides every request the
+	 * review policy does not deny. Defaults to approving (the Kanban default).
+	 */
+	delegate?: ReviewToolApprovalHandler;
 }
+
+const approveByDefault: ReviewToolApprovalHandler = async () => ({ approved: true });
 
 const COMMAND_TOOL_NAMES = new Set(["run_commands", "bash"]);
 const EDITOR_TOOL_NAMES = new Set(["editor", "write_to_file", "replace_in_file"]);
@@ -130,8 +139,22 @@ function splitCommandFragments(command: string): string[] {
 		.filter(Boolean);
 }
 
-/** True for `rm -rf <something ending in .git>` style invocations. */
-function isDestructiveGitRemoval(tokens: string[]): boolean {
+/** Targets whose recursive forced removal would discard the worktree or its repository. */
+function isProtectedRemovalTarget(token: string): boolean {
+	const normalized = token.replace(/\/+$/, "");
+	return (
+		normalized === "" ||
+		normalized === "." ||
+		normalized === ".." ||
+		normalized === "*" ||
+		normalized === "~" ||
+		normalized === ".git" ||
+		normalized.endsWith("/.git")
+	);
+}
+
+/** True for `rm -rf .`, `rm -rf *`, `rm -rf .git` style invocations. */
+function isDestructiveRemoval(tokens: string[]): boolean {
 	let i = 0;
 	while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i] ?? "")) {
 		i += 1; // skip env var assignments such as `FOO=bar rm -rf ...`
@@ -142,8 +165,13 @@ function isDestructiveGitRemoval(tokens: string[]): boolean {
 	}
 	let recursive = false;
 	let force = false;
-	let targetsGitDir = false;
+	let targetsProtected = false;
 	for (const token of tokens.slice(i + 1)) {
+		if (token.startsWith("--")) {
+			recursive ||= token === "--recursive";
+			force ||= token === "--force";
+			continue;
+		}
 		if (token.startsWith("-") && token.length > 1) {
 			if (/[rR]/.test(token)) {
 				recursive = true;
@@ -153,35 +181,96 @@ function isDestructiveGitRemoval(tokens: string[]): boolean {
 			}
 			continue;
 		}
-		if (token === ".git" || token.endsWith("/.git")) {
-			targetsGitDir = true;
+		if (isProtectedRemovalTarget(token)) {
+			targetsProtected = true;
 		}
 	}
-	return recursive && force && targetsGitDir;
+	return recursive && force && targetsProtected;
+}
+
+const DELIVERY_OWNED_GIT_SUBCOMMANDS = new Set([
+	"push",
+	"commit",
+	"merge",
+	"rebase",
+	"cherry-pick",
+	"revert",
+	"am",
+	"pull",
+	"update-ref",
+	"tag",
+]);
+
+/** Returns why a git invocation is forbidden in a review session, else null. */
+function checkGitInvocation(subcommand: string, rest: string[]): string | null {
+	if (DELIVERY_OWNED_GIT_SUBCOMMANDS.has(subcommand)) {
+		return `git ${subcommand} is not allowed in review sessions; Kanban owns commits, integration, and Git delivery.`;
+	}
+	if (
+		subcommand === "reset" &&
+		rest.some((token) => token === "--hard" || token === "--merge" || token === "--keep")
+	) {
+		return "git reset --hard is not allowed in review sessions; review fixes must not discard work.";
+	}
+	if (
+		subcommand === "clean" &&
+		rest.some((token) => token.startsWith("-") && token.length > 1 && /[fF]/.test(token))
+	) {
+		return "forced git clean is not allowed in review sessions; untracked work must not be deleted.";
+	}
+	if (subcommand === "stash" && !["list", "show"].includes(rest[0] ?? "")) {
+		return "git stash is not allowed in review sessions; it removes uncommitted task work from the worktree.";
+	}
+	if (subcommand === "checkout" || subcommand === "switch") {
+		return `git ${subcommand} is not allowed in review sessions; it moves HEAD or discards worktree changes.`;
+	}
+	if (
+		subcommand === "restore" &&
+		!(rest.includes("--staged") && !rest.includes("--worktree") && !rest.includes("-W"))
+	) {
+		return "git restore of worktree files is not allowed in review sessions; it discards task changes.";
+	}
+	if (subcommand === "worktree" && ["remove", "prune", "move"].includes(rest[0] ?? "")) {
+		return `git worktree ${rest[0]} is not allowed in review sessions; worktree cleanup is Kanban's job.`;
+	}
+	if (
+		subcommand === "branch" &&
+		rest.some((token) => ["-d", "-D", "--delete", "-m", "-M", "--move", "-f", "--force"].includes(token))
+	) {
+		return "deleting, moving, or force-updating branches is not allowed in review sessions.";
+	}
+	return null;
+}
+
+/** Returns why a `gh` invocation is forbidden in a review session (publication), else null. */
+function checkGhInvocation(tokens: string[]): string | null {
+	const ghIndex = tokens.indexOf("gh");
+	if (ghIndex === -1) {
+		return null;
+	}
+	const [group, action] = tokens.slice(ghIndex + 1).filter((token) => !token.startsWith("-"));
+	if (
+		(group === "pr" && ["create", "merge", "close", "edit", "ready"].includes(action ?? "")) ||
+		(group === "release" && action === "create")
+	) {
+		return `gh ${group} ${action} is not allowed in review sessions; Kanban owns Git delivery.`;
+	}
+	return null;
 }
 
 function checkCommandFragment(fragment: string): string | null {
 	const tokens = fragment.split(/\s+/).filter(Boolean);
 	const git = locateGitSubcommand(tokens);
-	if (git) {
-		if (git.subcommand === "push") {
-			return "git push is not allowed in review sessions; Kanban owns Git delivery.";
-		}
-		if (git.subcommand === "commit") {
-			return "git commit is not allowed in review sessions; Kanban owns Git delivery.";
-		}
-		if (git.subcommand === "reset" && git.rest.some((token) => token === "--hard" || token === "--merge")) {
-			return "git reset --hard is not allowed in review sessions; review fixes must not discard work.";
-		}
-		if (
-			git.subcommand === "clean" &&
-			git.rest.some((token) => token.startsWith("-") && token.length > 1 && /[fF]/.test(token))
-		) {
-			return "forced git clean is not allowed in review sessions; untracked work must not be deleted.";
-		}
+	const gitDenial = git ? checkGitInvocation(git.subcommand, git.rest) : null;
+	if (gitDenial) {
+		return gitDenial;
 	}
-	if (isDestructiveGitRemoval(tokens)) {
-		return "removing the .git directory is not allowed in review sessions.";
+	const ghDenial = checkGhInvocation(tokens);
+	if (ghDenial) {
+		return ghDenial;
+	}
+	if (isDestructiveRemoval(tokens)) {
+		return "removing the .git directory or the worktree itself (rm -rf) is not allowed in review sessions.";
 	}
 	return null;
 }
@@ -236,13 +325,14 @@ function extractPatchPaths(input: unknown): string[] {
 }
 
 /**
- * Builds the tool approval handler for a review session: unclassified
- * tools and commands are approved (the default Kanban approval behavior),
- * while delivery/destructive git commands and out-of-scope writes are
- * denied with an explanatory reason the reviewer can act on.
+ * Builds the tool approval handler for a review session: delivery/destructive
+ * git commands and out-of-scope writes are denied with an explanatory reason
+ * the reviewer can act on; everything else is decided by `delegate` (the
+ * workspace's existing approval behavior).
  */
 export function createReviewToolPolicy(options: CreateReviewToolPolicyOptions): ReviewToolApprovalHandler {
 	const { worktreePath } = options;
+	const delegate = options.delegate ?? approveByDefault;
 	const allowedWritePaths = new Set(
 		options.allowedWritePaths.map((path) => path.split(sep).join("/")).filter(Boolean),
 	);
@@ -252,7 +342,7 @@ export function createReviewToolPolicy(options: CreateReviewToolPolicyOptions): 
 		const input = isRecord(request.input) ? request.input : {};
 
 		if (toolName === "submit" || READ_TOOL_NAMES.has(toolName)) {
-			return { approved: true };
+			return await delegate(request);
 		}
 
 		if (COMMAND_TOOL_NAMES.has(toolName)) {
@@ -262,13 +352,13 @@ export function createReviewToolPolicy(options: CreateReviewToolPolicyOptions): 
 					return { approved: false, reason: denial };
 				}
 			}
-			return { approved: true };
+			return await delegate(request);
 		}
 
 		if (EDITOR_TOOL_NAMES.has(toolName)) {
 			const relPath = toWorktreeRelative(worktreePath, input.path);
 			if (relPath && allowedWritePaths.has(relPath)) {
-				return { approved: true };
+				return await delegate(request);
 			}
 			return {
 				approved: false,
@@ -288,12 +378,12 @@ export function createReviewToolPolicy(options: CreateReviewToolPolicyOptions): 
 						};
 					}
 				}
-				return { approved: true };
+				return await delegate(request);
 			}
 			return { approved: false, reason: "Review sessions may only modify reviewed files (unparseable patch)." };
 		}
 
-		// Unknown tools (SDK-specific extras): defer to default approval.
-		return { approved: true };
+		// Unknown tools (SDK-specific extras): the workspace approval decides.
+		return await delegate(request);
 	};
 }

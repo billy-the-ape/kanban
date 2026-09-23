@@ -8,7 +8,9 @@ import { useLinkedBacklogTaskActions } from "@/hooks/use-linked-backlog-task-act
 import { useProgrammaticCardMoves } from "@/hooks/use-programmatic-card-moves";
 import { useReviewAutoActions } from "@/hooks/use-review-auto-actions";
 import type { UseTaskSessionsResult } from "@/hooks/use-task-sessions";
+import { fetchTaskDependentsUnlock } from "@/runtime/task-delivery";
 import type {
+	RuntimeTaskDependentsUnlock,
 	RuntimeTaskSessionSummary,
 	RuntimeTaskWorkspaceInfoResponse,
 	RuntimeWorktreeDeleteResponse,
@@ -26,7 +28,6 @@ import { clearTaskWorkspaceInfo, setTaskWorkspaceInfo } from "@/stores/workspace
 import type { SendTerminalInputOptions } from "@/terminal/terminal-input";
 import type { BoardCard, BoardColumnId, BoardData } from "@/types";
 import { resolveTaskAutoReviewMode } from "@/types";
-import { getNextDetailTaskIdAfterTrashMove } from "@/utils/detail-view-task-order";
 import {
 	getBrowserNotificationPermission,
 	hasPromptedForBrowserNotificationPermission,
@@ -81,6 +82,8 @@ interface UseBoardInteractionsInput {
 	readyForReviewNotificationsEnabled: boolean;
 	taskGitActionLoadingByTaskId: Record<string, TaskGitActionLoadingStateLike>;
 	runAutoReviewGitAction: (taskId: string, action: TaskGitAction) => Promise<boolean>;
+	/** B-8: deterministic delivery is enabled, so a delivery receipt (not a clean tree) completes a task. */
+	deterministicDeliveryEnabled?: boolean;
 }
 
 export interface UseBoardInteractionsResult {
@@ -128,6 +131,7 @@ export function useBoardInteractions({
 	readyForReviewNotificationsEnabled,
 	taskGitActionLoadingByTaskId,
 	runAutoReviewGitAction,
+	deterministicDeliveryEnabled = false,
 }: UseBoardInteractionsInput): UseBoardInteractionsResult {
 	const previousSessionsRef = useRef<Record<string, RuntimeTaskSessionSummary>>({});
 	const notificationPermissionPromptInFlightRef = useRef(false);
@@ -479,7 +483,6 @@ export function useBoardInteractions({
 		setBoard((currentBoard) => {
 			let nextBoard = currentBoard;
 			const previousSessions = previousSessionsRef.current;
-			const blockedInterruptedTaskIds = new Set<string>();
 			for (const summary of Object.values(sessions)) {
 				const previous = previousSessions[summary.taskId];
 				if (previous && previous.updatedAt > summary.updatedAt) {
@@ -508,50 +511,23 @@ export function useBoardInteractions({
 					if (moved.moved) {
 						nextBoard = moved.board;
 					}
-					continue;
 				}
-				if (
-					summary.state === "interrupted" &&
-					previous?.state !== "interrupted" &&
-					columnId &&
-					columnId !== "trash" &&
-					columnId !== "done"
-				) {
-					const nextTaskId = getNextDetailTaskIdAfterTrashMove(nextBoard, summary.taskId);
-					const programmaticMoveAttempt = tryProgrammaticCardMove(summary.taskId, columnId, "trash", {
-						skipTrashWorkflow: true,
-					});
-					if (programmaticMoveAttempt === "started" || programmaticMoveAttempt === "blocked") {
-						if (programmaticMoveAttempt === "blocked") {
-							blockedInterruptedTaskIds.add(summary.taskId);
-						}
-						setSelectedTaskId((currentSelectedTaskId) =>
-							currentSelectedTaskId === summary.taskId ? nextTaskId : currentSelectedTaskId,
-						);
-						continue;
-					}
-					const moved = moveTaskToColumn(nextBoard, summary.taskId, "trash", { insertAtTop: true });
-					if (moved.moved) {
-						setSelectedTaskId((currentSelectedTaskId) =>
-							currentSelectedTaskId === summary.taskId ? nextTaskId : currentSelectedTaskId,
-						);
-						nextBoard = moved.board;
-					}
-				}
+				// B-5: an interrupted session leaves its card where it is (matching
+				// the runtime's shutdown handling); its work is preserved, not
+				// discarded, so it never moves to Trash automatically.
 			}
-			const nextPreviousSessions = { ...sessions };
-			for (const taskId of blockedInterruptedTaskIds) {
-				const previousSession = previousSessions[taskId];
-				if (previousSession) {
-					nextPreviousSessions[taskId] = previousSession;
-					continue;
-				}
-				delete nextPreviousSessions[taskId];
-			}
-			previousSessionsRef.current = nextPreviousSessions;
+			previousSessionsRef.current = { ...sessions };
 			return nextBoard;
 		});
-	}, [programmaticCardMoveCycle, sessions, setBoard, setSelectedTaskId, tryProgrammaticCardMove]);
+	}, [programmaticCardMoveCycle, sessions, setBoard, tryProgrammaticCardMove]);
+
+	const checkDependentsUnlock = useCallback(
+		async (taskId: string): Promise<RuntimeTaskDependentsUnlock> =>
+			currentProjectId
+				? await fetchTaskDependentsUnlock(currentProjectId, taskId)
+				: { allowed: false, reason: "No active project." },
+		[currentProjectId],
+	);
 
 	const {
 		confirmMoveTaskToTrash,
@@ -569,6 +545,7 @@ export function useBoardInteractions({
 		kickoffTaskInProgress,
 		startBacklogTaskWithAnimation,
 		waitForBacklogStartAnimationAvailability: waitForProgrammaticCardMoveAvailability,
+		checkDependentsUnlock,
 	});
 
 	useEffect(() => {
@@ -584,6 +561,7 @@ export function useBoardInteractions({
 		taskGitActionLoadingByTaskId,
 		runAutoReviewGitAction,
 		requestCompleteTask: requestCompleteTaskWithAnimation,
+		completeOnGitActionSuccess: deterministicDeliveryEnabled,
 		resetKey: currentProjectId,
 	});
 
@@ -662,10 +640,6 @@ export function useBoardInteractions({
 
 			if (moveEvent.toColumnId === "trash") {
 				setBoard(applied.board);
-				if (programmaticMoveBehavior?.skipTrashWorkflow) {
-					resolvePendingProgrammaticTrashMove(moveEvent.taskId);
-					return;
-				}
 				const requestPromise = requestMoveTaskToTrash(moveEvent.taskId, moveEvent.fromColumnId, {
 					optimisticMoveApplied: true,
 					skipWorkingChangeWarning: programmaticMoveBehavior?.skipWorkingChangeWarning,
@@ -678,10 +652,6 @@ export function useBoardInteractions({
 
 			if (moveEvent.toColumnId === "done") {
 				setBoard(applied.board);
-				if (programmaticMoveBehavior?.skipCompleteWorkflow) {
-					resolvePendingProgrammaticCompleteMove(moveEvent.taskId);
-					return;
-				}
 				const completeRequestPromise = requestCompleteTask(moveEvent.taskId, moveEvent.fromColumnId, {
 					optimisticMoveApplied: true,
 					skipWorkingChangeWarning: programmaticMoveBehavior?.skipWorkingChangeWarning,
@@ -838,11 +808,13 @@ export function useBoardInteractions({
 				return;
 			}
 			setTaskMoveToTrashLoading(taskId, true);
-			void requestMoveTaskToTrashWithAnimation(taskId, "review").finally(() => {
+			// Review cards and completed (done) cards can both be discarded.
+			const fromColumnId = getTaskColumnId(board, taskId) ?? "review";
+			void requestMoveTaskToTrashWithAnimation(taskId, fromColumnId).finally(() => {
 				setTaskMoveToTrashLoading(taskId, false);
 			});
 		},
-		[requestMoveTaskToTrashWithAnimation, setTaskMoveToTrashLoading],
+		[board, requestMoveTaskToTrashWithAnimation, setTaskMoveToTrashLoading],
 	);
 
 	const handleCompleteTask = useCallback(() => {

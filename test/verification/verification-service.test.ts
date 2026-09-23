@@ -3,7 +3,7 @@
 //
 // Runs real spawned `node` checks against temp worktrees. The tree-hash
 // computation is injected for the deterministic receipt semantics, and a real
-// git worktree is used for the tree-identity re-run behaviour (B-7.4).
+// git worktree is used for the tree-identity behaviour (B-7.4).
 
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -146,6 +146,27 @@ describe("VerificationService receipt semantics (injected tree hash)", () => {
 			expect(receipt.checks[1].status).toBe("failed");
 			expect(receipt.passed).toBe(true);
 			expect(receipt.error).toBeNull();
+		} finally {
+			cleanupLog();
+			cleanup();
+		}
+	});
+
+	it("never passes a required gate that has no required check", async () => {
+		const { path: worktree, cleanup } = createTempDir("kanban-verification-empty-");
+		const { path: logDir, cleanup: cleanupLog } = createTempDir("kanban-verification-logs-");
+		try {
+			const service = makeFakeHashService();
+			const empty = await service.run(makeConfig([]), makeInput({ worktreePath: worktree, logDir }));
+			expect(empty.passed).toBe(false);
+			expect(empty.error).toMatch(/no required check is configured/);
+
+			const optionalOnly = await service.run(
+				makeConfig([makeCheck({ required: false })]),
+				makeInput({ worktreePath: worktree, logDir }),
+			);
+			expect(optionalOnly.checks[0]?.status).toBe("passed");
+			expect(optionalOnly.passed).toBe(false);
 		} finally {
 			cleanupLog();
 			cleanup();
@@ -446,7 +467,7 @@ describe("VerificationService tree identity re-run (B-7.4)", () => {
 		execFileSync("git", ["init", "-q"], { cwd: path, env: createGitTestEnv() });
 	}
 
-	it("re-runs once when an idempotent check generates files, then passes", async () => {
+	it("fails (without re-basing onto the mutated tree) when a check generates source files", async () => {
 		const { path: worktree, cleanup } = createTempDir("kanban-verification-mutation-");
 		const { path: logDir, cleanup: cleanupLog } = createTempDir("kanban-verification-logs-");
 		try {
@@ -463,20 +484,49 @@ describe("VerificationService tree identity re-run (B-7.4)", () => {
 				makeInput({ worktreePath: worktree, candidateTreeHash: null, logDir }),
 			);
 
-			expect(receipt.treeIdentityPreserved).toBe(true);
-			expect(receipt.passed).toBe(true);
-			expect(receipt.error).toBeNull();
-			// The first attempt mutated the tree, so both attempt logs exist.
-			const logs = readdirSync(logDir);
-			expect(logs.filter((file) => file.includes("attempt1")).length).toBe(1);
-			expect(logs.filter((file) => file.includes("attempt2")).length).toBe(1);
+			// B-7.4: an idempotent formatter/generator still changed the reviewed
+			// tree, so the evidence cannot be bound to it.
+			expect(receipt.treeIdentityPreserved).toBe(false);
+			expect(receipt.passed).toBe(false);
+			expect(receipt.error).toMatch(/mutated the worktree/);
+			// The checks ran exactly once.
+			expect(readdirSync(logDir).length).toBe(1);
 		} finally {
 			cleanupLog();
 			cleanup();
 		}
 	});
 
-	it("still fails when the re-run mutates the tree again", async () => {
+	it("ignores generated output that .gitignore excludes", async () => {
+		const { path: worktree, cleanup } = createTempDir("kanban-verification-ignored-");
+		const { path: logDir, cleanup: cleanupLog } = createTempDir("kanban-verification-logs-");
+		try {
+			initGitWorktree(worktree);
+			writeFileSync(join(worktree, ".gitignore"), "dist/\n");
+			writeFileSync(join(worktree, "a.txt"), "a");
+			const service = new VerificationService(); // real tree hash
+			const receipt = await service.run(
+				makeConfig([
+					makeCheck({
+						id: "build",
+						args: [
+							"-e",
+							"require('fs').mkdirSync('dist',{recursive:true});require('fs').writeFileSync('dist/out.js','x');",
+						],
+					}),
+				]),
+				makeInput({ worktreePath: worktree, candidateTreeHash: null, logDir }),
+			);
+
+			expect(receipt.treeIdentityPreserved).toBe(true);
+			expect(receipt.passed).toBe(true);
+		} finally {
+			cleanupLog();
+			cleanup();
+		}
+	});
+
+	it("fails when a check writes non-deterministic content", async () => {
 		const { path: worktree, cleanup } = createTempDir("kanban-verification-mutation2-");
 		const { path: logDir, cleanup: cleanupLog } = createTempDir("kanban-verification-logs-");
 		try {

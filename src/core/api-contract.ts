@@ -1218,8 +1218,10 @@ export const runtimeGitDeliveryPolicySchema = z.object({
 	/** B-8.3: branches that direct push/integration must never target. */
 	protectedBranches: z.array(z.string()),
 	integrationStrategy: runtimeGitDeliveryIntegrationStrategySchema,
-	/** B-8.9: open a PR from the destination branch to the first protected branch after delivery. */
+	/** B-8.9: open (or reuse) a PR from the destination branch after delivery. */
 	requirePullRequest: z.boolean(),
+	/** B-8.9: PR base branch; `null` lets the forge use the repository default branch. */
+	pullRequestBaseBranch: z.string().nullable(),
 });
 export type RuntimeGitDeliveryPolicy = z.infer<typeof runtimeGitDeliveryPolicySchema>;
 
@@ -1232,6 +1234,7 @@ export const runtimeGitDeliveryPolicySaveSchema = z.object({
 	protectedBranches: z.array(z.string()).optional(),
 	integrationStrategy: runtimeGitDeliveryIntegrationStrategySchema.optional(),
 	requirePullRequest: z.boolean().optional(),
+	pullRequestBaseBranch: z.string().nullable().optional(),
 });
 export type RuntimeGitDeliveryPolicySave = z.infer<typeof runtimeGitDeliveryPolicySaveSchema>;
 
@@ -1247,8 +1250,11 @@ export const runtimeTaskDeliveryInfoRequestSchema = z.object({
 });
 export type RuntimeTaskDeliveryInfoRequest = z.infer<typeof runtimeTaskDeliveryInfoRequestSchema>;
 
-/** B-8.8: terminal delivery status. */
-export const runtimeGitDeliveryStatusSchema = z.enum(["delivered", "no_op", "paused", "failed"]);
+/**
+ * B-8.8: delivery status. `in_progress` is what a crash mid-pipeline leaves
+ * behind; the next attempt resumes from the recorded stage.
+ */
+export const runtimeGitDeliveryStatusSchema = z.enum(["in_progress", "delivered", "no_op", "paused", "failed"]);
 export type RuntimeGitDeliveryStatus = z.infer<typeof runtimeGitDeliveryStatusSchema>;
 
 /** B-8.8: last pipeline stage completed successfully. */
@@ -1304,6 +1310,8 @@ export const runtimeGitDeliveryReceiptSchema = z.object({
 	reviewOutcome: z.enum(["ready", "not_ready", "absent"]).nullable(),
 	/** Verification gate outcome from the stored receipt (null when no receipt). */
 	verificationPassed: z.boolean().nullable(),
+	/** B-7.6: content hash of the candidate tree that was committed (null when not computed). */
+	candidateTreeHash: z.string().nullable().default(null),
 	pr: z
 		.object({
 			status: runtimeGitDeliveryPrStatusSchema,
@@ -1328,10 +1336,23 @@ export const runtimeTaskDeliveryStartResponseSchema = z.object({
 });
 export type RuntimeTaskDeliveryStartResponse = z.infer<typeof runtimeTaskDeliveryStartResponseSchema>;
 
+/**
+ * B-5.9/B-8.8: whether completing this task may start its linked backlog
+ * tasks. With deterministic delivery enabled only a completed delivery
+ * receipt unlocks dependents; without it the legacy behavior (unlock on
+ * completion) applies.
+ */
+export const runtimeTaskDependentsUnlockSchema = z.object({
+	allowed: z.boolean(),
+	reason: z.string().nullable(),
+});
+export type RuntimeTaskDependentsUnlock = z.infer<typeof runtimeTaskDependentsUnlockSchema>;
+
 export const runtimeTaskDeliveryInfoResponseSchema = z.object({
 	ok: z.boolean(),
 	receipt: runtimeGitDeliveryReceiptSchema.nullable(),
 	error: z.string().nullable(),
+	dependentsUnlock: runtimeTaskDependentsUnlockSchema,
 });
 export type RuntimeTaskDeliveryInfoResponse = z.infer<typeof runtimeTaskDeliveryInfoResponseSchema>;
 

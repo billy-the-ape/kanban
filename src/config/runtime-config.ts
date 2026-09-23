@@ -696,6 +696,10 @@ export function normalizeGitDeliveryPolicy(value: unknown): RuntimeGitDeliveryPo
 				(branch): branch is string => typeof branch === "string" && isValidGitDeliveryRefName(branch),
 			)
 		: DEFAULT_GIT_DELIVERY_PROTECTED_BRANCHES;
+	const pullRequestBaseBranch =
+		typeof raw.pullRequestBaseBranch === "string" && isValidGitDeliveryRefName(raw.pullRequestBaseBranch)
+			? raw.pullRequestBaseBranch
+			: null;
 	return {
 		enabled: typeof raw.enabled === "boolean" ? raw.enabled : DEFAULT_GIT_DELIVERY_ENABLED,
 		remote,
@@ -707,6 +711,7 @@ export function normalizeGitDeliveryPolicy(value: unknown): RuntimeGitDeliveryPo
 			typeof raw.requirePullRequest === "boolean"
 				? raw.requirePullRequest
 				: DEFAULT_GIT_DELIVERY_REQUIRE_PULL_REQUEST,
+		pullRequestBaseBranch,
 	};
 }
 
@@ -731,6 +736,13 @@ function validateGitDeliveryPolicy(policy: RuntimeGitDeliveryPolicySave | null |
 	}
 	if (policy.protectedBranches?.some((branch) => !isValidGitDeliveryRefName(branch))) {
 		throw new Error("gitDeliveryPolicy.protectedBranches contains an invalid git ref name.");
+	}
+	if (
+		typeof policy.pullRequestBaseBranch === "string" &&
+		policy.pullRequestBaseBranch.length > 0 &&
+		!isValidGitDeliveryRefName(policy.pullRequestBaseBranch)
+	) {
+		throw new Error("gitDeliveryPolicy.pullRequestBaseBranch is not a valid git ref name.");
 	}
 }
 

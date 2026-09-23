@@ -29,6 +29,7 @@ import {
 import { type ClineRuntimeSetup, createClineRuntimeSetup } from "./cline-runtime-setup";
 import {
 	type ClineLaunchConfigResolver,
+	type ClineSessionRestartStartRequest,
 	type ClineSessionRuntime,
 	type CreateInMemoryClineSessionRuntimeOptions,
 	createInMemoryClineSessionRuntime,
@@ -64,6 +65,8 @@ import {
 
 export type { ClineTaskMessage } from "./cline-session-state";
 
+type ClineSdkToolApprovalHandler = (request: ClineSdkToolApprovalRequest) => Promise<ClineSdkToolApprovalResult>;
+
 export interface StartClineTaskSessionRequest {
 	taskId: string;
 	cwd: string;
@@ -94,10 +97,12 @@ export interface StartClineTaskSessionRequest {
 	 */
 	compactionSafetyMarginTokens?: number;
 	/**
-	 * B-6.6: per-session tool-approval override (e.g. the bounded review tool
-	 * policy). When omitted, the workspace runtime setup's policy applies.
+	 * B-6.6: per-session tool-approval layer (e.g. the bounded review tool
+	 * policy). It receives the workspace runtime setup's approval handler and
+	 * must delegate to it for anything it does not deny, so existing project
+	 * approvals stay effective. When omitted, the workspace handler applies.
 	 */
-	requestToolApproval?: (request: ClineSdkToolApprovalRequest) => Promise<ClineSdkToolApprovalResult>;
+	wrapToolApproval?: (workspaceApproval: ClineSdkToolApprovalHandler) => ClineSdkToolApprovalHandler;
 }
 
 export interface ClineTaskSessionService {
@@ -206,12 +211,6 @@ const DEFAULT_CONTEXT_RECOVERY_MAX_ATTEMPTS = 3;
 export class InMemoryClineTaskSessionService implements ClineTaskSessionService {
 	private readonly pendingTurnCancelTaskIds = new Set<string>();
 	private readonly providerIdByTaskId = new Map<string, string>();
-	/**
-	 * B-3.4/B-3.7: the last start request passed to the session runtime per
-	 * task (resolved system prompt, compaction config, safety margin), used
-	 * to evaluate whether overflow recovery can possibly fit the turn.
-	 */
-	private readonly lastStartRequestByTaskId = new Map<string, StartClineSessionRuntimeRequest>();
 	private readonly contextRecoveryMaxAttempts: number;
 	private readonly sessionRuntime: ClineSessionRuntime;
 	private readonly messageRepository: ClineMessageRepository;
@@ -394,15 +393,22 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			return null;
 		}
 
+		// The request the restart will use — including after a Kanban process
+		// restart, when it is reconstructed from the durable session record
+		// (B-4.8) with the live context/compaction policy (B-2.8).
+		const startRequest = await this.sessionRuntime.resolveRestartStartRequest(input.taskId).catch(() => null);
+		if (!startRequest) {
+			return null;
+		}
+
 		// B-3.7: the restart prompt is pinned material — if system prompt +
 		// prompt + images alone exceed the effective input budget, no amount
 		// of history compaction can make this turn fit.
-		const startRequest = this.lastStartRequestByTaskId.get(input.taskId);
 		const budget = evaluateClineContextRecoveryBudget({
-			contextWindowTokens: startRequest?.compaction?.contextWindowTokens,
-			reserveTokens: startRequest?.compaction?.reserveTokens,
-			safetyMarginTokens: startRequest?.compactionSafetyMarginTokens,
-			systemPrompt: startRequest?.systemPrompt,
+			contextWindowTokens: startRequest.compaction?.contextWindowTokens,
+			reserveTokens: startRequest.compaction?.reserveTokens,
+			safetyMarginTokens: startRequest.compactionSafetyMarginTokens,
+			systemPrompt: startRequest.systemPrompt,
 			prompt: input.prompt,
 			images: input.images,
 		});
@@ -417,7 +423,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 				const persistedSnapshot = await this.sessionRuntime
 					.readPersistedTaskSession(input.taskId)
 					.catch(() => null);
-				const messages = this.compactTranscriptForRecovery(input.taskId, persistedSnapshot?.messages ?? []);
+				const messages = this.compactTranscriptForRecovery(startRequest, persistedSnapshot?.messages ?? []);
 				await this.sessionRuntime.stopTaskSession(input.taskId).catch(() => null);
 				const restartedSession = await this.sessionRuntime.restartTaskSession({
 					taskId: input.taskId,
@@ -459,20 +465,21 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 	 * original task requirements can survive compaction.
 	 */
 	private compactTranscriptForRecovery(
-		taskId: string,
+		startRequest: ClineSessionRestartStartRequest,
 		persistedMessages: ClineSdkPersistedMessage[],
 	): ClineSdkPersistedMessage[] {
-		const startRequest = this.lastStartRequestByTaskId.get(taskId);
-		const compaction = startRequest?.compaction;
+		const compaction = startRequest.compaction;
 		if (
 			!compaction ||
 			typeof compaction.contextWindowTokens !== "number" ||
 			!Number.isFinite(compaction.contextWindowTokens) ||
 			compaction.contextWindowTokens <= 0
 		) {
-			// No known context window: nothing to compact against. The
-			// bounded attempt limit still prevents an unbounded retry loop.
-			return persistedMessages;
+			// No known context window: there is no target to compact to, and
+			// resending the same transcript can only overflow again.
+			throw new Error(
+				"Context overflow recovery cannot compact this conversation: the model's context window is unknown. Set a context budget for the model in the runtime settings, then retry.",
+			);
 		}
 		const calibration = calibrateClineCompactionConfig({
 			config: compaction,
@@ -483,7 +490,9 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		});
 		const targetTokens = calibration.breakdown?.triggerTokens;
 		if (typeof targetTokens !== "number" || targetTokens <= 0) {
-			return persistedMessages;
+			throw new Error(
+				"Context overflow recovery cannot compact this conversation: no usable compaction target could be derived from the context budget.",
+			);
 		}
 		const requirements = evaluateClineRecoveryRequirements({
 			messages: persistedMessages,
@@ -594,10 +603,6 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					systemPrompt = `${systemPrompt}\n\n${appendedSystemPrompt}`;
 				}
 
-				// B-3.4/B-3.7: keep the exact runtime start request (resolved
-				// system prompt, compaction config, safety margin) so overflow
-				// recovery can evaluate the pinned request material against
-				// the effective context budget.
 				const runtimeStartRequest: StartClineSessionRuntimeRequest = {
 					taskId: request.taskId,
 					cwd: request.cwd,
@@ -613,13 +618,14 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					reasoningEffort: request.reasoningEffort,
 					systemPrompt,
 					userInstructionService: runtimeSetup.userInstructionService,
-					requestToolApproval: request.requestToolApproval ?? runtimeSetup.requestToolApproval,
+					requestToolApproval: request.wrapToolApproval
+						? request.wrapToolApproval(runtimeSetup.requestToolApproval)
+						: runtimeSetup.requestToolApproval,
 					contextWindowTokens: request.contextWindowTokens,
 					contextWindowSource: request.contextWindowSource,
 					compaction: request.compaction,
 					compactionSafetyMarginTokens: request.compactionSafetyMarginTokens,
 				};
-				this.lastStartRequestByTaskId.set(request.taskId, runtimeStartRequest);
 				const startResult = await this.sessionRuntime.startTaskSession(runtimeStartRequest);
 				const warningMessage = formatStartWarnings(startResult.warnings);
 				if (warningMessage) {
@@ -892,7 +898,6 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		const existingEntry = this.messageRepository.getTaskEntry(taskId);
 		this.pendingTurnCancelTaskIds.delete(taskId);
 		this.providerIdByTaskId.delete(taskId);
-		this.lastStartRequestByTaskId.delete(taskId);
 		await this.sessionRuntime.clearTaskSessions(taskId).catch(() => undefined);
 		this.messageRepository.clearHydratedTaskMessages(taskId);
 		if (!existingEntry) {
@@ -988,7 +993,6 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 	async dispose(): Promise<void> {
 		await this.sessionRuntime.dispose();
 		this.pendingTurnCancelTaskIds.clear();
-		this.lastStartRequestByTaskId.clear();
 		for (const leasePromise of this.runtimeSetupLeaseByWorkspacePath.values()) {
 			try {
 				const lease = await leasePromise;

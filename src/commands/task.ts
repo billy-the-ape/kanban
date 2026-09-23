@@ -791,6 +791,8 @@ interface CompleteTaskExecutionResult {
 	previousColumnId: RuntimeBoardColumnId;
 	readyTaskIds: string[];
 	autoStartedTasks: JsonRecord[];
+	/** B-5.9: why ready linked tasks were not started (no delivery evidence yet). */
+	dependentsBlockedReason: string | null;
 	alreadyInDone: boolean;
 }
 
@@ -857,18 +859,25 @@ async function completeTaskById(input: {
 			previousColumnId: mutation.value.previousColumnId,
 			readyTaskIds: [],
 			autoStartedTasks: [],
+			dependentsBlockedReason: null,
 			alreadyInDone: true,
 		};
 	}
 
-	// B-5.10: completing a task never deletes its worktree. The session is
+	// B-5.5/B-5.8: completing a task never deletes its worktree. The session is
 	// stopped best-effort; the preserved work stays recoverable.
 	if (columnCanHaveLiveTaskSession(mutation.value.previousColumnId)) {
 		await stopTaskRuntimeSession(input.runtimeClient, input.taskId);
 	}
 
+	// B-5.9/B-8.8: dependents start only once delivery evidence exists (when
+	// deterministic delivery is enabled; legacy mode keeps unlock-on-complete).
+	const dependentsBlockedReason =
+		mutation.value.readyTaskIds.length > 0
+			? await readDependentsBlockedReason(input.runtimeClient, input.taskId)
+			: null;
 	const autoStartedTasks: JsonRecord[] = [];
-	for (const readyTaskId of mutation.value.readyTaskIds) {
+	for (const readyTaskId of dependentsBlockedReason === null ? mutation.value.readyTaskIds : []) {
 		const started = await startTask({
 			cwd: input.cwd,
 			taskId: readyTaskId,
@@ -883,8 +892,21 @@ async function completeTaskById(input: {
 		previousColumnId: mutation.value.previousColumnId,
 		readyTaskIds: mutation.value.readyTaskIds,
 		autoStartedTasks,
+		dependentsBlockedReason,
 		alreadyInDone: false,
 	};
+}
+
+async function readDependentsBlockedReason(
+	runtimeClient: ReturnType<typeof createRuntimeTrpcClient>,
+	taskId: string,
+): Promise<string | null> {
+	try {
+		const info = await runtimeClient.runtime.getTaskDeliveryInfo.query({ taskId });
+		return info.dependentsUnlock.allowed ? null : (info.dependentsUnlock.reason ?? "No delivery evidence yet.");
+	} catch (error) {
+		return `Could not read the delivery receipt: ${toErrorMessage(error)}`;
+	}
 }
 
 async function completeTask(input: {
@@ -922,6 +944,7 @@ async function completeTask(input: {
 			workspacePath: workspaceRepoPath,
 			readyTaskIds: completed.readyTaskIds,
 			autoStartedTasks: completed.autoStartedTasks,
+			dependentsBlockedReason: completed.dependentsBlockedReason,
 		};
 	}
 
@@ -964,6 +987,9 @@ async function completeTask(input: {
 		alreadyDoneTasks: alreadyDoneTasks.map((result) => result.task),
 		readyTaskIds: [...new Set(completedTasks.flatMap((result) => result.readyTaskIds))],
 		autoStartedTasks: completedTasks.flatMap((result) => result.autoStartedTasks),
+		dependentsBlocked: completedTasks
+			.filter((result) => result.dependentsBlockedReason !== null)
+			.map((result) => ({ taskId: result.taskId, reason: result.dependentsBlockedReason })),
 		count: completedTasks.length,
 	};
 }
@@ -1153,10 +1179,17 @@ async function trashTask(input: {
 	};
 }
 
-async function locateTaskWorkspace(input: { cwd: string; taskId: string; projectPath?: string }): Promise<JsonRecord> {
+async function connectTaskWorkspace(input: { cwd: string; projectPath?: string }): Promise<{
+	workspaceRepoPath: string;
+	runtimeClient: ReturnType<typeof createRuntimeTrpcClient>;
+}> {
 	const workspaceRepoPath = await resolveWorkspaceRepoPath(input.projectPath, input.cwd);
 	const workspaceId = await ensureRuntimeWorkspace(workspaceRepoPath);
-	const runtimeClient = createRuntimeTrpcClient(workspaceId);
+	return { workspaceRepoPath, runtimeClient: createRuntimeTrpcClient(workspaceId) };
+}
+
+async function locateTaskWorkspace(input: { cwd: string; taskId: string; projectPath?: string }): Promise<JsonRecord> {
+	const { workspaceRepoPath, runtimeClient } = await connectTaskWorkspace(input);
 	const info = await runtimeClient.workspace.getTaskPreservationInfo.query({ taskId: input.taskId });
 	return {
 		...info,
@@ -1166,15 +1199,55 @@ async function locateTaskWorkspace(input: { cwd: string; taskId: string; project
 }
 
 async function recoverTaskCommand(input: { cwd: string; taskId: string; projectPath?: string }): Promise<JsonRecord> {
-	const workspaceRepoPath = await resolveWorkspaceRepoPath(input.projectPath, input.cwd);
-	const workspaceId = await ensureRuntimeWorkspace(workspaceRepoPath);
-	const runtimeClient = createRuntimeTrpcClient(workspaceId);
+	const { workspaceRepoPath, runtimeClient } = await connectTaskWorkspace(input);
 	const recovered = await runtimeClient.workspace.recoverTaskWorktree.mutate({ taskId: input.taskId });
 	return {
 		...recovered,
 		ok: recovered.ok,
 		workspacePath: workspaceRepoPath,
 	};
+}
+
+/** B-6/B-7: run the bounded review (and verification gate, when configured) for a task. */
+async function reviewTaskCommand(input: { cwd: string; taskId: string; projectPath?: string }): Promise<JsonRecord> {
+	const { workspaceRepoPath, runtimeClient } = await connectTaskWorkspace(input);
+	const state = await runtimeClient.workspace.getState.query();
+	const record = findTaskRecord(state, input.taskId);
+	if (!record) {
+		throw new Error(`Task "${input.taskId}" was not found in workspace ${workspaceRepoPath}.`);
+	}
+	const reviewed = await runtimeClient.runtime.startTaskReview.mutate({
+		taskId: input.taskId,
+		description: record.task.prompt,
+		taskTitle: record.task.title ?? undefined,
+	});
+	return { ...reviewed, workspacePath: workspaceRepoPath };
+}
+
+/** B-8: run deterministic delivery (commit, integrate, push, verify, receipt) for a task. */
+async function deliverTaskCommand(input: {
+	cwd: string;
+	taskId: string;
+	projectPath?: string;
+	commitMessage?: string;
+}): Promise<JsonRecord> {
+	const { workspaceRepoPath, runtimeClient } = await connectTaskWorkspace(input);
+	const delivered = await runtimeClient.runtime.startTaskDelivery.mutate({
+		taskId: input.taskId,
+		...(input.commitMessage ? { commitMessage: input.commitMessage } : {}),
+	});
+	return { ...delivered, workspacePath: workspaceRepoPath };
+}
+
+/** B-8.8: show a task's durable delivery receipt and whether its dependents may start. */
+async function deliveryInfoTaskCommand(input: {
+	cwd: string;
+	taskId: string;
+	projectPath?: string;
+}): Promise<JsonRecord> {
+	const { workspaceRepoPath, runtimeClient } = await connectTaskWorkspace(input);
+	const info = await runtimeClient.runtime.getTaskDeliveryInfo.query({ taskId: input.taskId });
+	return { ...info, workspacePath: workspaceRepoPath };
 }
 
 async function deleteTaskCommand(input: {
@@ -1506,6 +1579,60 @@ export function registerTaskCommand(program: Command): void {
 			await runTaskCommand(
 				async () =>
 					await locateTaskWorkspace({
+						cwd: process.cwd(),
+						taskId: options.taskId,
+						projectPath: options.projectPath,
+					}),
+			);
+		});
+
+	task
+		.command("review")
+		.description(
+			"Review a task in a fresh bounded session (and run the verification gate when configured); records a tree-bound verdict.",
+		)
+		.requiredOption("--task-id <id>", "Task ID.")
+		.option("--project-path <path>", "Workspace path. Defaults to current directory workspace.")
+		.action(async (options: { taskId: string; projectPath?: string }) => {
+			await runTaskCommand(
+				async () =>
+					await reviewTaskCommand({
+						cwd: process.cwd(),
+						taskId: options.taskId,
+						projectPath: options.projectPath,
+					}),
+			);
+		});
+
+	task
+		.command("deliver")
+		.description(
+			"Deterministically commit, integrate, push, and verify a task's work (requires gitDeliveryPolicy.enabled).",
+		)
+		.requiredOption("--task-id <id>", "Task ID.")
+		.option("--commit-message <message>", "Commit message (defaults to the task title).")
+		.option("--project-path <path>", "Workspace path. Defaults to current directory workspace.")
+		.action(async (options: { taskId: string; commitMessage?: string; projectPath?: string }) => {
+			await runTaskCommand(
+				async () =>
+					await deliverTaskCommand({
+						cwd: process.cwd(),
+						taskId: options.taskId,
+						commitMessage: options.commitMessage,
+						projectPath: options.projectPath,
+					}),
+			);
+		});
+
+	task
+		.command("delivery")
+		.description("Show a task's delivery receipt and whether its linked tasks may start.")
+		.requiredOption("--task-id <id>", "Task ID.")
+		.option("--project-path <path>", "Workspace path. Defaults to current directory workspace.")
+		.action(async (options: { taskId: string; projectPath?: string }) => {
+			await runTaskCommand(
+				async () =>
+					await deliveryInfoTaskCommand({
 						cwd: process.cwd(),
 						taskId: options.taskId,
 						projectPath: options.projectPath,

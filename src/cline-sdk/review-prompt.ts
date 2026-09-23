@@ -164,8 +164,9 @@ export function buildReviewRepairPrompt(input: {
 }
 
 /**
- * B-7.5: builds the verification-repair prompt: re-enters the same review
- * session with the deterministic check failures from the last gate receipt.
+ * B-7.5: builds the verification-repair prompt for a FRESH bounded repair
+ * session: the task context it needs (acceptance criteria, editable change
+ * set) plus the deterministic check failures from the last gate receipt.
  * Verification repairs share the review policy's maxRepairRounds budget.
  */
 export function buildVerificationRepairPrompt(input: {
@@ -197,7 +198,15 @@ export function buildVerificationRepairPrompt(input: {
 					.join("\n");
 	const sections: string[] = [
 		"### Verification repair round",
-		`Repair round ${round} of at most ${maxRounds} for task ${artifact.taskId}. The deterministic verification gate FAILED — the results below are authoritative and override any earlier assessment. Fix ONLY what is needed to make the failing checks pass, with the smallest scoped changes. Do not modify, weaken, or remove the checks themselves, and do not commit, push, or run any Git publication command.`,
+		`Repair round ${round} of at most ${maxRounds} for task ${artifact.taskId}. You are a fresh repair session: the deterministic verification gate FAILED on this task's reviewed change set, and the results below are authoritative. Fix ONLY what is needed to make the failing checks pass, with the smallest scoped changes. Do not modify, weaken, or remove the checks themselves, and do not commit, push, or run any Git publication command.`,
+		"",
+		"Task acceptance criteria:",
+		...(artifact.acceptanceCriteria.length > 0
+			? artifact.acceptanceCriteria.map((criterion) => `- ${criterion}`)
+			: ["- (none recorded)"]),
+		"",
+		"Files you may edit (the reviewed change set):",
+		...[...artifact.changedPaths, ...artifact.untrackedPaths].map((path) => `- ${path}`),
 		"",
 		"Failed checks:",
 		checkLines,

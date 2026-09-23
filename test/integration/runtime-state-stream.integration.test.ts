@@ -102,7 +102,8 @@ function createReviewBoard(taskId: string, title: string, existingTrashTaskId?: 
 					},
 				],
 			},
-			{ id: "trash", title: "Done", cards: trashCards },
+			{ id: "done", title: "Done", cards: [] },
+			{ id: "trash", title: "Trash", cards: trashCards },
 		],
 		dependencies: [],
 	};
@@ -1133,7 +1134,7 @@ describe.sequential("runtime state stream integration", () => {
 		}
 	}, 45_000);
 
-	it("moves stale completed review cards to trash on shutdown", async () => {
+	it("keeps stale completed review cards in review (interrupted) on shutdown", async () => {
 		const { path: tempHome, cleanup: cleanupHome } = createTempDir("kanban-home-stale-exit-review-");
 		const { path: projectPath, cleanup: cleanupProject } = createTempDir("kanban-project-stale-exit-review-");
 
@@ -1229,8 +1230,10 @@ describe.sequential("runtime state stream integration", () => {
 
 			const reviewCards = finalState.payload.board.columns.find((column) => column.id === "review")?.cards ?? [];
 			const trashCards = finalState.payload.board.columns.find((column) => column.id === "trash")?.cards ?? [];
-			expect(reviewCards.some((card) => card.id === taskId)).toBe(false);
-			expect(trashCards.some((card) => card.id === taskId)).toBe(true);
+			// B-5: an interrupted card stays in its column; its work is preserved,
+			// not discarded, so shutdown never moves it to trash.
+			expect(reviewCards.some((card) => card.id === taskId)).toBe(true);
+			expect(trashCards.some((card) => card.id === taskId)).toBe(false);
 			expect(finalState.payload.sessions[taskId]?.state).toBe("interrupted");
 			expect(finalState.payload.sessions[taskId]?.reviewReason).toBe("interrupted");
 			const workspaceInfo = await requestJson<RuntimeTaskWorkspaceInfoResponse>({

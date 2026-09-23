@@ -600,6 +600,7 @@ export default function App(): ReactElement {
 		readyForReviewNotificationsEnabled,
 		taskGitActionLoadingByTaskId,
 		runAutoReviewGitAction,
+		deterministicDeliveryEnabled: runtimeProjectConfig?.gitDeliveryPolicy?.enabled === true,
 	});
 
 	const {

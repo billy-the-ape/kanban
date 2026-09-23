@@ -36,7 +36,9 @@ export function isAllowedCrossColumnCardMove(
 	if (fromColumnId === "review" && toColumnId === "done") {
 		return true;
 	}
-	if (toColumnId === "trash" && fromColumnId !== "trash" && fromColumnId !== "done") {
+	// Any card may be discarded, including completed ones (their retained
+	// worktrees are cleaned up through the preservation-gated trash path).
+	if (toColumnId === "trash" && fromColumnId !== "trash") {
 		return true;
 	}
 	if (fromColumnId === "trash" && toColumnId === "review") {
@@ -101,7 +103,7 @@ export function isCardDropDisabled(
 		});
 	}
 	if (columnId === "trash") {
-		return activeDragSourceColumnId === "trash" || activeDragSourceColumnId === "done";
+		return activeDragSourceColumnId === "trash";
 	}
 	return false;
 }

@@ -30,6 +30,13 @@ interface UseReviewAutoActionsOptions {
 		fromColumnId: BoardColumnId,
 		options?: RequestCompleteTaskOptions,
 	) => Promise<void>;
+	/**
+	 * B-5.1: true when a successful git action is itself completion evidence
+	 * (deterministic delivery returns success only with a delivered/no-op
+	 * receipt). Otherwise the legacy prompt-driven flow waits for a clean
+	 * worktree after the agent runs the git prompt.
+	 */
+	completeOnGitActionSuccess?: boolean;
 	resetKey?: string | null;
 }
 
@@ -38,11 +45,13 @@ export function useReviewAutoActions({
 	taskGitActionLoadingByTaskId,
 	runAutoReviewGitAction,
 	requestCompleteTask,
+	completeOnGitActionSuccess = false,
 	resetKey,
 }: UseReviewAutoActionsOptions): void {
 	const boardRef = useRef<BoardData>(board);
 	const runAutoReviewGitActionRef = useRef(runAutoReviewGitAction);
 	const requestCompleteTaskRef = useRef(requestCompleteTask);
+	const completeOnGitActionSuccessRef = useRef(completeOnGitActionSuccess);
 	const awaitingCleanActionByTaskIdRef = useRef<Record<string, TaskGitAction>>({});
 	const timerByTaskIdRef = useRef<Record<string, number>>({});
 	type ScheduledAutoReviewAction = TaskAutoReviewMode | "move_to_done_after_git_action";
@@ -60,6 +69,10 @@ export function useReviewAutoActions({
 	useEffect(() => {
 		requestCompleteTaskRef.current = requestCompleteTask;
 	}, [requestCompleteTask]);
+
+	useEffect(() => {
+		completeOnGitActionSuccessRef.current = completeOnGitActionSuccess;
+	}, [completeOnGitActionSuccess]);
 
 	const clearAutoReviewTimer = useCallback((taskId: string) => {
 		const timer = timerByTaskIdRef.current[taskId];
@@ -166,8 +179,14 @@ export function useReviewAutoActions({
 				// - A task is only "armed" for auto-done after we actually see working changes in review and trigger commit/pr.
 				// - Review entries with zero changes (common during start-in-plan-mode planning loops) are intentionally ignored.
 				// - Once armed, a later review state with zero changes is treated as commit/pr success, then we auto-move to done.
+				// - With deterministic delivery the git action's own success (a delivery receipt) completes the
+				//   task directly; a clean worktree is never treated as evidence (B-5.1).
 				const changedFiles = getTaskWorkspaceSnapshot(reviewTask.id)?.changedFiles;
 				const awaitingAction = awaitingCleanActionByTaskIdRef.current[reviewTask.id] ?? null;
+				if (awaitingAction && completeOnGitActionSuccess) {
+					clearAutoReviewTimer(reviewTask.id);
+					continue;
+				}
 				if (awaitingAction) {
 					if (
 						changedFiles === 0 &&
@@ -223,12 +242,22 @@ export function useReviewAutoActions({
 					void runAutoReviewGitActionRef.current(reviewTask.id, latestMode).then((triggered) => {
 						if (!triggered && awaitingCleanActionByTaskIdRef.current[reviewTask.id] === latestMode) {
 							delete awaitingCleanActionByTaskIdRef.current[reviewTask.id];
+							return;
+						}
+						if (triggered && completeOnGitActionSuccessRef.current) {
+							completeTaskInFlightTaskIdsRef.current.add(reviewTask.id);
+							void requestCompleteTaskRef
+								.current(reviewTask.id, "review", { skipWorkingChangeWarning: true })
+								.finally(() => {
+									delete awaitingCleanActionByTaskIdRef.current[reviewTask.id];
+									completeTaskInFlightTaskIdsRef.current.delete(reviewTask.id);
+								});
 						}
 					});
 				});
 			}
 		},
-		[clearAutoReviewTimer, scheduleAutoReviewAction, taskGitActionLoadingByTaskId],
+		[clearAutoReviewTimer, completeOnGitActionSuccess, scheduleAutoReviewAction, taskGitActionLoadingByTaskId],
 	);
 
 	useEffect(() => {

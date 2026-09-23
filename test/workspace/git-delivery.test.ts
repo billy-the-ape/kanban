@@ -9,13 +9,22 @@ import { describe, expect, it } from "vitest";
 
 import type { RuntimeGitDeliveryPolicy, RuntimeReviewHandoffArtifact } from "../../src/core/api-contract";
 import {
+	evaluateDependentsUnlock,
+	type GhCommandResult,
 	type GitDeliveryCommandResult,
 	type GitDeliveryRunner,
 	GitDeliveryService,
+	getTaskDeliveryCommitRefName,
+	parseDeliveryChangeManifest,
 	readTaskDeliveryReceipt,
 } from "../../src/workspace/git-delivery";
 import { runGit } from "../../src/workspace/git-utils";
-import { persistReviewHandoff } from "../../src/workspace/task-review-handoff";
+import { getTaskPreservationRefName } from "../../src/workspace/task-preservation";
+import {
+	computeCandidateTreeHash,
+	persistReviewHandoff,
+	persistReviewOutcome,
+} from "../../src/workspace/task-review-handoff";
 import { createTempDir } from "../utilities/temp-dir";
 
 interface DeliveryFixture {
@@ -113,6 +122,7 @@ function deliveryPolicy(overrides: Partial<RuntimeGitDeliveryPolicy> = {}): Runt
 		protectedBranches: ["main"],
 		integrationStrategy: "fast_forward",
 		requirePullRequest: false,
+		pullRequestBaseBranch: null,
 		...overrides,
 	};
 }
@@ -125,9 +135,11 @@ describe("GitDeliveryService", () => {
 			await persistFixtureHandoff(fixture, "task-1");
 			await writeFile(join(fixture.worktreePath, "task.txt"), "task work\n", "utf8");
 
-			const infoBefore = await new GitDeliveryService().getDeliveryInfo("task-1");
+			const infoBefore = await new GitDeliveryService().getDeliveryInfo("task-1", deliveryPolicy());
 			expect(infoBefore.ok).toBe(true);
 			expect(infoBefore.receipt).toBeNull();
+			// B-5.9: without a receipt, dependents stay locked in delivery mode.
+			expect(infoBefore.dependentsUnlock.allowed).toBe(false);
 
 			const service = new GitDeliveryService();
 			const response = await service.startDelivery({
@@ -157,7 +169,7 @@ describe("GitDeliveryService", () => {
 			expect(destSha).toBe(receipt?.taskCommitSha);
 			// the durable task ref anchors the commit
 			const taskRefSha = (
-				await runGit(fixture.worktreePath, ["rev-parse", "--verify", "refs/kanban/tasks/task-1/commit"])
+				await runGit(fixture.worktreePath, ["rev-parse", "--verify", getTaskDeliveryCommitRefName("task-1")])
 			).stdout;
 			expect(taskRefSha).toBe(receipt?.taskCommitSha);
 			// the remote branch contains the delivered commit (verified ancestry)
@@ -169,6 +181,8 @@ describe("GitDeliveryService", () => {
 			// the receipt is durably persisted and readable
 			const persisted = await readTaskDeliveryReceipt("task-1");
 			expect(persisted?.status).toBe("delivered");
+			const infoAfter = await service.getDeliveryInfo("task-1", deliveryPolicy());
+			expect(infoAfter.dependentsUnlock).toEqual({ allowed: true, reason: null });
 			expect(persisted?.taskCommitSha).toBe(receipt?.taskCommitSha);
 		} finally {
 			fixture.cleanup();
@@ -492,8 +506,8 @@ describe("GitDeliveryService", () => {
 			expect(first.ok).toBe(true);
 			expect(first.receipt?.status).toBe("delivered");
 
-			// no new changes: the retry reuses the existing commit instead of
-			// creating a new one (B-8.8 retry deduplication).
+			// no new changes: the retry returns the stored receipt instead of
+			// creating a new commit (B-8.8 retry deduplication).
 			const second = await service.startDelivery({
 				taskId: "task-retry",
 				workspaceId: "workspace-1",
@@ -505,10 +519,362 @@ describe("GitDeliveryService", () => {
 			expect(second.ok).toBe(true);
 			expect(second.receipt?.status).toBe("delivered");
 			expect(second.receipt?.taskCommitSha).toBe(first.receipt?.taskCommitSha);
-			expect(second.receipt?.commitMessageSource).toBe("reused");
-			expect(second.receipt?.attempt).toBe(2);
+			const remoteSha = (await runGit(fixture.remotePath, ["rev-parse", "refs/heads/feature/b8"])).stdout;
+			expect(remoteSha).toBe(first.receipt?.taskCommitSha);
 		} finally {
 			fixture.cleanup();
 		}
+	});
+	it("stages modified, renamed, deleted, and space-named paths", async () => {
+		const fixture = await createDeliveryFixture();
+		try {
+			await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
+			await persistFixtureHandoff(fixture, "task-kinds");
+			await writeFile(join(fixture.worktreePath, "base.txt"), "base changed\n", "utf8");
+			await writeFile(join(fixture.worktreePath, "with space.txt"), "spaced\n", "utf8");
+			await runGit(fixture.worktreePath, ["mv", "base.txt", "renamed.txt"]);
+
+			const response = await new GitDeliveryService().startDelivery({
+				taskId: "task-kinds",
+				workspaceId: "workspace-1",
+				repoPath: fixture.repoPath,
+				worktreePath: fixture.worktreePath,
+				baseRef: "main",
+				policy: deliveryPolicy(),
+			});
+
+			expect(response.error).toBeNull();
+			expect(response.receipt?.status).toBe("delivered");
+			expect(response.receipt?.stagedPaths).toEqual(["base.txt", "renamed.txt", "with space.txt"]);
+			const lsTree = (await runGit(fixture.repoPath, ["ls-tree", "--name-only", "refs/heads/feature/b8"])).stdout;
+			expect(lsTree.split("\n").sort()).toEqual(["renamed.txt", "with space.txt"]);
+			const renamed = (await runGit(fixture.repoPath, ["show", "refs/heads/feature/b8:renamed.txt"])).stdout;
+			expect(renamed).toBe("base changed");
+		} finally {
+			fixture.cleanup();
+		}
+	});
+
+	it("parses porcelain v2 -z records by field position", () => {
+		const output = [
+			"1 .M N... 100644 100644 100644 aaa aaa src/a file.ts",
+			"2 R. N... 100644 100644 100644 bbb bbb R100 new name.ts",
+			"old name.ts",
+			"u UU N... 100644 100644 100644 100644 ccc ddd eee conflict.ts",
+			"? untracked dir/x.ts",
+			"",
+		].join("\0");
+		expect(parseDeliveryChangeManifest(output)).toEqual([
+			"conflict.ts",
+			"new name.ts",
+			"old name.ts",
+			"src/a file.ts",
+			"untracked dir/x.ts",
+		]);
+	});
+
+	it("delivers alongside the B-5 preservation ref for the same task", async () => {
+		const fixture = await createDeliveryFixture();
+		try {
+			await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
+			await persistFixtureHandoff(fixture, "task-preserved");
+			// B-5 keeps refs/kanban/tasks/<id> updated while the worktree is alive.
+			await runGit(fixture.repoPath, ["update-ref", getTaskPreservationRefName("task-preserved"), fixture.baseSha]);
+			await writeFile(join(fixture.worktreePath, "task.txt"), "task work\n", "utf8");
+
+			const response = await new GitDeliveryService().startDelivery({
+				taskId: "task-preserved",
+				workspaceId: "workspace-1",
+				repoPath: fixture.repoPath,
+				worktreePath: fixture.worktreePath,
+				baseRef: "main",
+				policy: deliveryPolicy(),
+			});
+
+			expect(response.error).toBeNull();
+			expect(response.receipt?.status).toBe("delivered");
+		} finally {
+			fixture.cleanup();
+		}
+	});
+
+	it("delivers commits the agent already made instead of recording a no-op", async () => {
+		const fixture = await createDeliveryFixture();
+		try {
+			await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
+			await persistFixtureHandoff(fixture, "task-agent-commit");
+			await writeFile(join(fixture.worktreePath, "task.txt"), "task work\n", "utf8");
+			await runGit(fixture.worktreePath, ["add", "task.txt"]);
+			await runGit(fixture.worktreePath, ["commit", "-m", "agent commit"]);
+			const agentSha = (await runGit(fixture.worktreePath, ["rev-parse", "HEAD"])).stdout;
+
+			const response = await new GitDeliveryService().startDelivery({
+				taskId: "task-agent-commit",
+				workspaceId: "workspace-1",
+				repoPath: fixture.repoPath,
+				worktreePath: fixture.worktreePath,
+				baseRef: "main",
+				policy: deliveryPolicy(),
+			});
+
+			expect(response.receipt?.status).toBe("delivered");
+			expect(response.receipt?.taskCommitSha).toBe(agentSha);
+			expect(response.receipt?.commitMessageSource).toBe("reused");
+			const remoteSha = (await runGit(fixture.remotePath, ["rev-parse", "refs/heads/feature/b8"])).stdout;
+			expect(remoteSha).toBe(agentSha);
+		} finally {
+			fixture.cleanup();
+		}
+	});
+
+	it("reuses the commit from a crashed attempt instead of recording a no-op or committing again", async () => {
+		const fixture = await createDeliveryFixture();
+		try {
+			await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
+			await persistFixtureHandoff(fixture, "task-crash");
+			await writeFile(join(fixture.worktreePath, "task.txt"), "task work\n", "utf8");
+
+			// The first attempt commits, then dies before the durable ref is written.
+			const crashingGit: GitDeliveryRunner = {
+				run: async (cwd: string, args: string[]): Promise<GitDeliveryCommandResult> => {
+					if (args[0] === "update-ref" && args[1] === getTaskDeliveryCommitRefName("task-crash")) {
+						return { ok: false, stdout: "", stderr: "simulated crash", output: "", error: "crash", exitCode: 1 };
+					}
+					return await runGit(cwd, args);
+				},
+			};
+			const first = await new GitDeliveryService({ git: crashingGit }).startDelivery({
+				taskId: "task-crash",
+				workspaceId: "workspace-1",
+				repoPath: fixture.repoPath,
+				worktreePath: fixture.worktreePath,
+				baseRef: "main",
+				policy: deliveryPolicy(),
+			});
+			expect(first.receipt?.status).toBe("failed");
+			const crashedCommit = first.receipt?.taskCommitSha;
+			expect(crashedCommit).toMatch(/^[0-9a-f]{40}$/);
+
+			const retry = await new GitDeliveryService().startDelivery({
+				taskId: "task-crash",
+				workspaceId: "workspace-1",
+				repoPath: fixture.repoPath,
+				worktreePath: fixture.worktreePath,
+				baseRef: "main",
+				policy: deliveryPolicy(),
+			});
+			expect(retry.receipt?.status).toBe("delivered");
+			expect(retry.receipt?.taskCommitSha).toBe(crashedCommit);
+			const commitCount = (await runGit(fixture.repoPath, ["rev-list", "--count", "refs/heads/feature/b8"])).stdout;
+			expect(commitCount).toBe("2");
+		} finally {
+			fixture.cleanup();
+		}
+	});
+
+	it("keeps an excluded path out of the commit even when it was already staged", async () => {
+		const fixture = await createDeliveryFixture();
+		try {
+			await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
+			await persistFixtureHandoff(fixture, "task-staged-secret");
+			await writeFile(join(fixture.worktreePath, "task.txt"), "task work\n", "utf8");
+			await writeFile(join(fixture.worktreePath, ".env"), "SECRET=1\n", "utf8");
+			await runGit(fixture.worktreePath, ["add", ".env"]);
+
+			const response = await new GitDeliveryService().startDelivery({
+				taskId: "task-staged-secret",
+				workspaceId: "workspace-1",
+				repoPath: fixture.repoPath,
+				worktreePath: fixture.worktreePath,
+				baseRef: "main",
+				policy: deliveryPolicy(),
+			});
+
+			expect(response.receipt?.status).toBe("delivered");
+			const lsTree = (await runGit(fixture.repoPath, ["ls-tree", "--name-only", "refs/heads/feature/b8"])).stdout;
+			expect(lsTree).not.toContain(".env");
+		} finally {
+			fixture.cleanup();
+		}
+	});
+
+	it("resumes a merge-strategy delivery after a failed push without a second merge commit", async () => {
+		const fixture = await createDeliveryFixture();
+		try {
+			await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
+			await persistFixtureHandoff(fixture, "task-merge-retry");
+			await writeFile(join(fixture.worktreePath, "task.txt"), "task work\n", "utf8");
+
+			const rejectingGit: GitDeliveryRunner = {
+				run: async (cwd: string, args: string[]): Promise<GitDeliveryCommandResult> => {
+					if (args[0] === "push") {
+						return {
+							ok: false,
+							stdout: "",
+							stderr: "network down",
+							output: "",
+							error: "push failed",
+							exitCode: 1,
+						};
+					}
+					return await runGit(cwd, args);
+				},
+			};
+			const first = await new GitDeliveryService({ git: rejectingGit }).startDelivery({
+				taskId: "task-merge-retry",
+				workspaceId: "workspace-1",
+				repoPath: fixture.repoPath,
+				worktreePath: fixture.worktreePath,
+				baseRef: "main",
+				policy: deliveryPolicy({ integrationStrategy: "merge" }),
+			});
+			expect(first.receipt?.status).toBe("failed");
+			const mergeSha = first.receipt?.integratedSha;
+
+			const service = new GitDeliveryService();
+			const retry = await service.startDelivery({
+				taskId: "task-merge-retry",
+				workspaceId: "workspace-1",
+				repoPath: fixture.repoPath,
+				worktreePath: fixture.worktreePath,
+				baseRef: "main",
+				policy: deliveryPolicy({ integrationStrategy: "merge" }),
+			});
+			expect(retry.receipt?.status).toBe("delivered");
+			expect(retry.receipt?.integratedSha).toBe(mergeSha);
+
+			// A no-change retry after success must not build another merge commit.
+			const again = await service.startDelivery({
+				taskId: "task-merge-retry",
+				workspaceId: "workspace-1",
+				repoPath: fixture.repoPath,
+				worktreePath: fixture.worktreePath,
+				baseRef: "main",
+				policy: deliveryPolicy({ integrationStrategy: "merge" }),
+			});
+			expect(again.receipt?.status).toBe("delivered");
+			const destSha = (await runGit(fixture.repoPath, ["rev-parse", "refs/heads/feature/b8"])).stdout;
+			expect(destSha).toBe(mergeSha);
+		} finally {
+			fixture.cleanup();
+		}
+	});
+
+	it("pauses when a required review is missing or bound to a different tree, and delivers once it matches", async () => {
+		const fixture = await createDeliveryFixture();
+		try {
+			await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
+			await persistFixtureHandoff(fixture, "task-gated");
+			await writeFile(join(fixture.worktreePath, "task.txt"), "task work\n", "utf8");
+			const service = new GitDeliveryService();
+			const gates = { reviewRequired: true, verificationRequired: false };
+			const start = () =>
+				service.startDelivery({
+					taskId: "task-gated",
+					workspaceId: "workspace-1",
+					repoPath: fixture.repoPath,
+					worktreePath: fixture.worktreePath,
+					baseRef: "main",
+					policy: deliveryPolicy(),
+					gates,
+				});
+
+			const missing = await start();
+			expect(missing.receipt?.status).toBe("paused");
+			expect(missing.error).toContain("none was recorded");
+
+			const reviewedHash = await computeCandidateTreeHash(fixture.worktreePath);
+			const persistReady = async (candidateTreeHash: string | null) =>
+				await persistReviewOutcome("task-gated", {
+					status: "ready",
+					result: {
+						taskId: "task-gated",
+						candidateTreeHash,
+						reviewedAt: Date.now(),
+						findings: [],
+						blocking: false,
+						fixesApplied: [],
+						requirementsCovered: [],
+						unresolvedItems: [],
+					},
+					error: null,
+					sessionId: "review-session",
+					warnings: [],
+					verification: null,
+					updatedAt: Date.now(),
+				});
+
+			await persistReady(reviewedHash);
+			// An edit after the review invalidates it (B-6.7).
+			await writeFile(join(fixture.worktreePath, "task.txt"), "edited after review\n", "utf8");
+			const stale = await start();
+			expect(stale.receipt?.status).toBe("paused");
+			expect(stale.error).toContain("candidate tree mismatch");
+
+			await persistReady(await computeCandidateTreeHash(fixture.worktreePath));
+			const delivered = await start();
+			expect(delivered.receipt?.status).toBe("delivered");
+			expect(delivered.receipt?.candidateTreeHash).toMatch(/.+/);
+		} finally {
+			fixture.cleanup();
+		}
+	});
+
+	it("deduplicates PRs with gh pr list and runs gh inside the repository", async () => {
+		const fixture = await createDeliveryFixture();
+		try {
+			await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
+			await persistFixtureHandoff(fixture, "task-pr");
+			await writeFile(join(fixture.worktreePath, "task.txt"), "task work\n", "utf8");
+			const calls: Array<{ args: string[]; cwd: string }> = [];
+			let listResult = "[]";
+			const gh = async (args: string[], cwd: string): Promise<GhCommandResult> => {
+				calls.push({ args, cwd });
+				const stdout = args[1] === "list" ? listResult : "https://github.com/o/r/pull/42";
+				return { ok: true, stdout, stderr: "", exitCode: 0, missingBinary: false };
+			};
+			const service = new GitDeliveryService({ gh });
+			const created = await service.startDelivery({
+				taskId: "task-pr",
+				workspaceId: "workspace-1",
+				repoPath: fixture.repoPath,
+				worktreePath: fixture.worktreePath,
+				baseRef: "main",
+				policy: deliveryPolicy({ requirePullRequest: true }),
+			});
+			expect(created.receipt?.pr).toEqual({
+				status: "created",
+				number: 42,
+				url: "https://github.com/o/r/pull/42",
+				error: null,
+			});
+			expect(calls.every((call) => call.cwd === fixture.repoPath)).toBe(true);
+			expect(calls[0]?.args.slice(0, 4)).toEqual(["pr", "list", "--head", "feature/b8"]);
+			// null base: the forge default branch is used (no --base argument).
+			expect(calls.some((call) => call.args.includes("--base"))).toBe(false);
+
+			listResult = JSON.stringify([{ number: 42, url: "https://github.com/o/r/pull/42" }]);
+			await writeFile(join(fixture.worktreePath, "task2.txt"), "more work\n", "utf8");
+			const existing = await service.startDelivery({
+				taskId: "task-pr",
+				workspaceId: "workspace-1",
+				repoPath: fixture.repoPath,
+				worktreePath: fixture.worktreePath,
+				baseRef: "main",
+				policy: deliveryPolicy({ requirePullRequest: true, pullRequestBaseBranch: "main" }),
+			});
+			expect(existing.receipt?.pr?.status).toBe("existing");
+			expect(calls.at(-1)?.args).toContain("--base");
+			expect(calls.filter((call) => call.args[1] === "create")).toHaveLength(1);
+		} finally {
+			fixture.cleanup();
+		}
+	});
+	it("unlocks dependents only on a completed receipt when delivery is enabled", () => {
+		expect(evaluateDependentsUnlock(null, null)).toEqual({ allowed: true, reason: null });
+		expect(evaluateDependentsUnlock(deliveryPolicy({ enabled: false }), null).allowed).toBe(true);
+		const locked = evaluateDependentsUnlock(deliveryPolicy(), null);
+		expect(locked.allowed).toBe(false);
+		expect(locked.reason).toMatch(/not been delivered/);
 	});
 });

@@ -55,7 +55,7 @@ import { resolveTaskTitle } from "../core/task-title.js";
 import { openInBrowser } from "../server/browser";
 import { buildRuntimeConfigResponse, resolveAgentCommand } from "../terminal/agent-registry";
 import type { TerminalSessionManager } from "../terminal/session-manager";
-import { getGitDeliveryService } from "../workspace/git-delivery";
+import { evaluateDependentsUnlock, getGitDeliveryService } from "../workspace/git-delivery";
 import { findTaskBaseRef } from "../workspace/task-review-handoff";
 import { resolveTaskCwd } from "../workspace/task-worktree";
 import { captureTaskTurnCheckpoint } from "../workspace/turn-checkpoints";
@@ -457,6 +457,12 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					worktreePath,
 					baseRef,
 					policy,
+					// B-6.7/B-7.6: a required review/verification must be ready and
+					// bound to the exact candidate tree before delivery commits it.
+					gates: {
+						reviewRequired: scopedRuntimeConfig.reviewPolicy?.enabled === "required",
+						verificationRequired: scopedRuntimeConfig.verification?.enabled === "required",
+					},
 					commitMessage: body.commitMessage,
 				});
 			} catch (error) {
@@ -470,14 +476,27 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		getTaskDeliveryInfo: async (workspaceScope, input): Promise<RuntimeTaskDeliveryInfoResponse> => {
 			try {
 				const body = parseTaskDeliveryInfoRequest(input);
-				const info = await getGitDeliveryService().getDeliveryInfo(body.taskId);
+				const scopedRuntimeConfig = await deps.loadScopedRuntimeConfig(workspaceScope);
+				const info = await getGitDeliveryService().getDeliveryInfo(
+					body.taskId,
+					scopedRuntimeConfig.gitDeliveryPolicy,
+				);
 				if (info.receipt && info.receipt.workspaceId !== workspaceScope.workspaceId) {
-					return { ok: true, receipt: null, error: null };
+					return {
+						...info,
+						receipt: null,
+						dependentsUnlock: evaluateDependentsUnlock(scopedRuntimeConfig.gitDeliveryPolicy, null),
+					};
 				}
 				return info;
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				return { ok: false, receipt: null, error: message };
+				return {
+					ok: false,
+					receipt: null,
+					error: message,
+					dependentsUnlock: { allowed: false, reason: `The delivery receipt could not be read: ${message}` },
+				};
 			}
 		},
 		stopTaskSession: async (workspaceScope, input) => {

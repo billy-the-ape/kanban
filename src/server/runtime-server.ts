@@ -201,6 +201,16 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				resolveClineLaunchConfig: (overrides) => clineProviderService.resolveLaunchConfig(overrides),
 				workspaceId: scope.workspaceId,
 				repoPath: scope.workspacePath,
+				// B-6.2: the implementation writer is the task's native Cline session
+				// or its terminal agent session.
+				isTaskWriterActive: async (taskId) => {
+					const clineService = await getScopedClineTaskSessionService(scope);
+					const terminalManager = await getScopedTerminalManager(scope);
+					return (
+						clineService.getSummary(taskId)?.state === "running" ||
+						terminalManager.getSummary(taskId)?.state === "running"
+					);
+				},
 			});
 			bundle = { reviewService, sessionService: reviewSessionService };
 			reviewSessionServiceByWorkspaceId.set(scope.workspaceId, bundle);

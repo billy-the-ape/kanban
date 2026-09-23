@@ -67,7 +67,13 @@ describe("normalizeGitDeliveryPolicy", () => {
 			protectedBranches: ["main", "master"],
 			integrationStrategy: "fast_forward",
 			requirePullRequest: false,
+			pullRequestBaseBranch: null,
 		});
+	});
+
+	it("keeps a valid pullRequestBaseBranch and drops an invalid one", () => {
+		expect(normalizeGitDeliveryPolicy({ pullRequestBaseBranch: "develop" })?.pullRequestBaseBranch).toBe("develop");
+		expect(normalizeGitDeliveryPolicy({ pullRequestBaseBranch: "bad name" })?.pullRequestBaseBranch).toBeNull();
 	});
 
 	it("keeps valid values and degrades invalid ref names to defaults", () => {
@@ -111,6 +117,7 @@ describe("git delivery policy persistence", () => {
 					protectedBranches: ["main", "master"],
 					integrationStrategy: "fast_forward",
 					requirePullRequest: false,
+					pullRequestBaseBranch: null,
 				});
 
 				const payload = readGlobalPayload(tempHome);

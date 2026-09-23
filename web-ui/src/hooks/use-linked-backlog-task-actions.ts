@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef } from "react";
 
 import { showAppToast } from "@/components/app-toaster";
 import { getDetailTerminalTaskId } from "@/hooks/use-terminal-panels";
-import type { RuntimeWorktreeDeleteResponse } from "@/runtime/types";
+import type { RuntimeTaskDependentsUnlock, RuntimeWorktreeDeleteResponse } from "@/runtime/types";
 import {
 	addTaskDependency,
 	completeTaskAndGetReadyLinkedTaskIds,
@@ -32,6 +32,7 @@ export function useLinkedBacklogTaskActions({
 	kickoffTaskInProgress,
 	startBacklogTaskWithAnimation,
 	waitForBacklogStartAnimationAvailability,
+	checkDependentsUnlock,
 }: {
 	board: BoardData;
 	setBoard: Dispatch<SetStateAction<BoardData>>;
@@ -47,6 +48,8 @@ export function useLinkedBacklogTaskActions({
 	) => Promise<boolean>;
 	startBacklogTaskWithAnimation?: (task: BoardCard) => Promise<boolean>;
 	waitForBacklogStartAnimationAvailability?: () => Promise<void>;
+	/** B-5.9: whether a completed task's dependents may start (delivery evidence); absent means always. */
+	checkDependentsUnlock?: (taskId: string) => Promise<RuntimeTaskDependentsUnlock>;
 }): {
 	handleCreateDependency: (fromTaskId: string, toTaskId: string) => void;
 	handleDeleteDependency: (dependencyId: string) => void;
@@ -232,13 +235,27 @@ export function useLinkedBacklogTaskActions({
 						findCardSelection(completed.moved ? completed.board : boardBeforeComplete, readyTaskId)?.card ?? null,
 				)
 				.filter((readyTask): readyTask is BoardCard => readyTask !== null);
-			await startReadyLinkedTasks(readyTasks);
+			// B-5.9/B-8.8: dependents start only once delivery evidence exists.
+			const unlock =
+				readyTasks.length > 0 && checkDependentsUnlock
+					? await checkDependentsUnlock(task.id)
+					: { allowed: true, reason: null };
+			if (unlock.allowed) {
+				await startReadyLinkedTasks(readyTasks);
+			} else {
+				showAppToast({
+					intent: "warning",
+					icon: "warning-sign",
+					message: `Linked tasks were not started: ${unlock.reason ?? "no delivery evidence yet."}`,
+					timeout: 7000,
+				});
+			}
 
 			// Completing a task never deletes its worktree. Stop the session
 			// best-effort so no live session lingers behind a terminal card.
 			await Promise.all([stopTaskSession(task.id), stopTaskSession(getDetailTerminalTaskId(task.id))]);
 		},
-		[setBoard, setSelectedTaskId, startReadyLinkedTasks, stopTaskSession],
+		[checkDependentsUnlock, setBoard, setSelectedTaskId, startReadyLinkedTasks, stopTaskSession],
 	);
 
 	const requestMoveTaskToTrash = useCallback(

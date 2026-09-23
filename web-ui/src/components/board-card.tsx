@@ -649,6 +649,19 @@ export function BoardCard({
 											}}
 										/>
 									</div>
+								) : columnId === "done" ? (
+									<Button
+										icon={isMoveToTrashLoading ? <Spinner size={13} /> : <Trash2 size={13} />}
+										variant="ghost"
+										size="sm"
+										disabled={isMoveToTrashLoading}
+										aria-label="Discard completed task"
+										onMouseDown={stopEvent}
+										onClick={(event) => {
+											stopEvent(event);
+											onMoveToTrash?.(card.id);
+										}}
+									/>
 								) : columnId === "trash" ? (
 									<Tooltip
 										side="bottom"
@@ -664,7 +677,7 @@ export function BoardCard({
 											icon={<RotateCcw size={12} />}
 											variant="ghost"
 											size="sm"
-											aria-label="Restore task from done"
+											aria-label="Restore task from trash"
 											onMouseDown={stopEvent}
 											onClick={(event) => {
 												stopEvent(event);

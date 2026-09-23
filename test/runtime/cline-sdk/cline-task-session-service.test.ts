@@ -134,18 +134,8 @@ function createFakeClineSessionRuntime(): FakeClineSessionRuntimeController {
 		return {
 			async startTaskSession(request: StartClineSessionRuntimeRequest): Promise<StartClineSessionRuntimeResult> {
 				const requestedSessionId = createSessionId(request.taskId);
-				lastStartRequestByTaskId.set(request.taskId, {
-					taskId: request.taskId,
-					cwd: request.cwd,
-					providerId: request.providerId,
-					modelId: request.modelId,
-					mode: request.mode ?? "act",
-					apiKey: request.apiKey,
-					baseUrl: request.baseUrl,
-					systemPrompt: request.systemPrompt,
-					userInstructionService: request.userInstructionService,
-					requestToolApproval: request.requestToolApproval,
-				});
+				const { prompt: _prompt, images: _images, initialMessages: _initialMessages, ...restartRequest } = request;
+				lastStartRequestByTaskId.set(request.taskId, { ...restartRequest, mode: request.mode ?? "act" });
 				bindTaskSession(request.taskId, requestedSessionId);
 
 				let startResult: StartClineSessionRuntimeResult;
@@ -223,6 +213,9 @@ function createFakeClineSessionRuntime(): FakeClineSessionRuntimeController {
 			},
 			canRestartTaskSession(taskId: string): boolean {
 				return lastStartRequestByTaskId.has(taskId);
+			},
+			async resolveRestartStartRequest(taskId: string) {
+				return lastStartRequestByTaskId.get(taskId) ?? null;
 			},
 			async readPersistedTaskSession(taskId: string): Promise<ClinePersistedTaskSessionSnapshot | null> {
 				return await readPersistedTaskSessionMock(taskId);

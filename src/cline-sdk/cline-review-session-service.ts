@@ -45,14 +45,18 @@ import { resolveTaskCwd } from "../workspace/task-worktree";
 import { buildClineCompactionConfig } from "./cline-compaction-config";
 import type { ResolvedClineLaunchConfig } from "./cline-provider-service";
 import type { ClineLaunchConfigResolver } from "./cline-session-runtime";
-import type { ClineTaskSessionService } from "./cline-task-session-service";
+import type { ClineTaskSessionService, StartClineTaskSessionRequest } from "./cline-task-session-service";
 import { buildReviewInitialPrompt, buildReviewRepairPrompt, buildVerificationRepairPrompt } from "./review-prompt";
 import { createReviewToolPolicy } from "./review-tool-policy";
 
 /** Suffix that makes the review session id distinct from the task's working session. */
 const REVIEW_SESSION_SUFFIX = "::review";
+/** B-7.5: each verification repair round runs in its own fresh session. */
+const VERIFICATION_REPAIR_SESSION_SUFFIX = "::verification-repair-";
 /** B-6.5: default bounded repair-round budget (initial evaluation value is two). */
 const DEFAULT_MAX_REPAIR_ROUNDS = 2;
+/** B-6: a single review/repair turn that runs longer than this is stopped and reported as failed. */
+const DEFAULT_REVIEW_TURN_TIMEOUT_MS = 30 * 60_000;
 
 /** B-6.2: the review session id is derived from (and distinct from) the task id. */
 export function reviewSessionIdForTask(taskId: string): string {
@@ -100,6 +104,14 @@ export interface CreateClineReviewSessionServiceOptions {
 	evidence?: ClineReviewEvidencePort;
 	/** B-7: injectable deterministic verification runner (defaults to the spawned-check service). */
 	verificationRunner?: VerificationRunner;
+	/**
+	 * B-6.2: true while the task's implementation writer (its own agent
+	 * session) is still running; a review must not start against a worktree
+	 * that is still being written.
+	 */
+	isTaskWriterActive?: (taskId: string) => Promise<boolean>;
+	/** Upper bound for one review/repair turn (default 30 minutes). */
+	turnTimeoutMs?: number;
 }
 
 function createDefaultReviewEvidencePort(workspaceId: string, repoPath: string): ClineReviewEvidencePort {
@@ -159,30 +171,56 @@ function resolveEffectiveReviewPolicy(policy: RuntimeReviewPolicy | undefined): 
 	return { enabled: "off", instructions: "", modelOverride: null, maxRepairRounds: DEFAULT_MAX_REPAIR_ROUNDS };
 }
 
+interface ReviewTurnOutcome {
+	failed: boolean;
+	failureReason: string | null;
+}
+
 class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 	private readonly sessionService: ClineTaskSessionService;
 	private readonly resolveLaunchConfig: ClineLaunchConfigResolver;
 	private readonly repoPath: string;
 	private readonly evidence: ClineReviewEvidencePort;
 	private readonly verificationRunner: VerificationRunner;
+	private readonly isTaskWriterActive: (taskId: string) => Promise<boolean>;
+	private readonly turnTimeoutMs: number;
+	private readonly inFlightTaskIds = new Set<string>();
 
-	constructor(
-		sessionService: ClineTaskSessionService,
-		resolveLaunchConfig: ClineLaunchConfigResolver,
-		repoPath: string,
-		evidence: ClineReviewEvidencePort,
-		verificationRunner: VerificationRunner,
-	) {
-		this.sessionService = sessionService;
-		this.resolveLaunchConfig = resolveLaunchConfig;
-		this.repoPath = repoPath;
-		this.evidence = evidence;
-		this.verificationRunner = verificationRunner;
+	constructor(options: {
+		sessionService: ClineTaskSessionService;
+		resolveLaunchConfig: ClineLaunchConfigResolver;
+		repoPath: string;
+		evidence: ClineReviewEvidencePort;
+		verificationRunner: VerificationRunner;
+		isTaskWriterActive: (taskId: string) => Promise<boolean>;
+		turnTimeoutMs: number;
+	}) {
+		this.sessionService = options.sessionService;
+		this.resolveLaunchConfig = options.resolveLaunchConfig;
+		this.repoPath = options.repoPath;
+		this.evidence = options.evidence;
+		this.verificationRunner = options.verificationRunner;
+		this.isTaskWriterActive = options.isTaskWriterActive;
+		this.turnTimeoutMs = options.turnTimeoutMs;
 	}
 
 	async startTaskReview(input: ClineReviewStartInput): Promise<RuntimeTaskReviewStartResponse> {
+		const sessionId = reviewSessionIdForTask(input.taskId);
+		// One review owner per task: a double-click or second tab must not start
+		// a competing session against the same worktree.
+		if (this.inFlightTaskIds.has(input.taskId)) {
+			return this.failureResponse(sessionId, "A review is already running for this task.", []);
+		}
+		this.inFlightTaskIds.add(input.taskId);
+		try {
+			return await this.runReview(input, sessionId);
+		} finally {
+			this.inFlightTaskIds.delete(input.taskId);
+		}
+	}
+
+	private async runReview(input: ClineReviewStartInput, sessionId: string): Promise<RuntimeTaskReviewStartResponse> {
 		const taskId = input.taskId;
-		const sessionId = reviewSessionIdForTask(taskId);
 		const reviewPolicy = resolveEffectiveReviewPolicy(input.reviewPolicy);
 		const warnings: string[] = [];
 
@@ -208,6 +246,15 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 			return this.failureResponse(
 				sessionId,
 				`Could not resolve the task worktree: ${toErrorMessage(error)}`,
+				warnings,
+			);
+		}
+
+		// B-6.2: review only after the implementation writer has stopped.
+		if (await this.isTaskWriterActive(taskId).catch(() => false)) {
+			return this.failureResponse(
+				sessionId,
+				"The task's implementation session is still running; wait for it to finish (or stop it) before starting a review.",
 				warnings,
 			);
 		}
@@ -258,7 +305,14 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 			...artifact.untrackedPaths,
 			...planDocumentPaths,
 		]);
-		const requestToolApproval = createReviewToolPolicy({ worktreePath, allowedWritePaths: [...allowedWritePaths] });
+		// The review policy only adds denials; everything else goes through the
+		// workspace's existing approval handler (existing tool approvals stay effective).
+		const wrapToolApproval: StartClineTaskSessionRequest["wrapToolApproval"] = (workspaceApproval) =>
+			createReviewToolPolicy({
+				worktreePath,
+				allowedWritePaths: [...allowedWritePaths],
+				delegate: workspaceApproval,
+			});
 
 		// B-6: honor an explicit model override; never silently switch to a cloud model.
 		let launchConfig: ResolvedClineLaunchConfig;
@@ -281,12 +335,13 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 		}
 
 		// B-6.2: a fresh, bounded review session (own session id + context).
-		try {
+		const startBoundedSession = async (id: string, prompt: string): Promise<void> => {
+			await this.resetSession(id);
 			await this.sessionService.startTaskSession({
-				taskId: sessionId,
+				taskId: id,
 				cwd: worktreePath,
-				prompt: initialPrompt,
-				requestToolApproval,
+				prompt,
+				wrapToolApproval,
 				providerId: launchConfig.providerId,
 				modelId: launchConfig.modelId,
 				apiKey: launchConfig.apiKey,
@@ -297,6 +352,9 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 				compaction: buildClineCompactionConfig({ launchConfig }),
 				compactionSafetyMarginTokens: launchConfig.compactionSettings?.safetyMarginTokens,
 			});
+		};
+		try {
+			await startBoundedSession(sessionId, initialPrompt);
 		} catch (error) {
 			return this.failureResponse(
 				sessionId,
@@ -308,9 +366,9 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 
 		// B-6.4: the session service dispatches turns fire-and-forget, so await the
 		// terminal state before inspecting the result.
-		const firstTerminal = await this.waitForTerminalState(sessionId);
-		let sessionFailed = isFailedTerminal(firstTerminal);
-		let failureReason = terminalFailureReason(firstTerminal);
+		const firstTurn = await this.awaitTurn(sessionId);
+		let sessionFailed = firstTurn.failed;
+		let failureReason = firstTurn.failureReason;
 		let result: RuntimeReviewResultOutput | null = sessionFailed ? null : this.extractResult(sessionId);
 		// B-7.5: the repair-round budget is shared between review repairs and verification repairs.
 		let round = 0;
@@ -326,10 +384,10 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 					maxRounds: reviewPolicy.maxRepairRounds,
 				});
 				await this.sessionService.sendTaskSessionInput(sessionId, repairPrompt);
-				const terminal = await this.waitForTerminalState(sessionId);
-				if (isFailedTerminal(terminal)) {
+				const turn = await this.awaitTurn(sessionId);
+				if (turn.failed) {
 					sessionFailed = true;
-					failureReason = terminalFailureReason(terminal);
+					failureReason = turn.failureReason;
 					result = null;
 					break;
 				}
@@ -345,43 +403,50 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 
 		// B-7.2/B-7.5: the deterministic verification gate runs after the review
 		// is frozen and only gates the "ready" path (a blocked/failed review
-		// never reaches delivery). It is independent of the reviewer's narrative,
-		// and verification repairs share the review policy's repair budget.
+		// never reaches delivery). It is independent of the reviewer's narrative.
+		// Each failed run feeds a FRESH bounded repair session (write-scoped to
+		// the reviewed change set), and repairs share the review's round budget.
 		let verification: RuntimeVerificationReceipt | null = null;
-		const verificationConfig = input.verification ?? null;
+		const verificationConfig = input.verification?.enabled === "required" ? input.verification : null;
 		if (!sessionFailed && result && !result.blocking && verificationConfig) {
 			let receipt = await this.verificationRunner
 				.run(verificationConfig, { taskId, worktreePath, candidateTreeHash })
 				.catch((error: unknown) => this.unrunnableReceipt(toErrorMessage(error), candidateTreeHash));
 			while (!receipt.passed && round < reviewPolicy.maxRepairRounds) {
 				round += 1;
+				const repairSessionId = `${sessionId}${VERIFICATION_REPAIR_SESSION_SUFFIX}${round}`;
 				const repairPrompt = buildVerificationRepairPrompt({
 					artifact,
 					receipt,
 					round,
 					maxRounds: reviewPolicy.maxRepairRounds,
 				});
-				await this.sessionService.sendTaskSessionInput(sessionId, repairPrompt);
-				const terminal = await this.waitForTerminalState(sessionId);
-				if (isFailedTerminal(terminal)) {
+				try {
+					await startBoundedSession(repairSessionId, repairPrompt);
+				} catch (error) {
 					sessionFailed = true;
-					failureReason = terminalFailureReason(terminal);
+					failureReason = `Failed to start the verification repair session: ${toErrorMessage(error)}`;
 					result = null;
 					break;
 				}
-				// The agent edited the worktree: re-bind to the new tree and re-run
+				const turn = await this.awaitTurn(repairSessionId);
+				if (turn.failed) {
+					sessionFailed = true;
+					failureReason = turn.failureReason;
+					result = null;
+					break;
+				}
+				// The repair edited the worktree: re-bind to the new tree and re-run
 				// the gate (B-7.2 tree-identity binding).
 				candidateTreeHash = await this.evidence.computeTreeHash(worktreePath).catch(() => null);
 				receipt = await this.verificationRunner
 					.run(verificationConfig, { taskId, worktreePath, candidateTreeHash })
 					.catch((error: unknown) => this.unrunnableReceipt(toErrorMessage(error), candidateTreeHash));
 			}
+			// The verdict stays bound to the tree the checks started from; a run that
+			// mutated the tree has already failed the gate (B-7.4), so nothing
+			// unreviewed can be marked ready.
 			verification = receipt;
-			// When the final gate run mutated the tree, bind the outcome to the
-			// actual post-run state (the receipt's after-hash).
-			if (!receipt.treeIdentityPreserved && receipt.treeHashAfter !== null) {
-				candidateTreeHash = receipt.treeHashAfter;
-			}
 		}
 
 		const outcome = this.buildOutcome({
@@ -444,25 +509,56 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 		}
 	}
 
+	/** Clears a previous (non-running) session with this id so the next start is a fresh context. */
+	private async resetSession(sessionId: string): Promise<void> {
+		if (!this.sessionService.getSummary(sessionId)) {
+			return;
+		}
+		await this.sessionService.stopTaskSession(sessionId).catch(() => null);
+		await this.sessionService.clearTaskSession(sessionId).catch(() => null);
+	}
+
 	/**
-	 * Resolves once the session leaves the running state. Checks the current
-	 * summary first so a turn that finished before the subscription is set up is
-	 * not missed (the session service dispatches turns fire-and-forget).
+	 * Awaits the end of the current turn. A turn that exceeds the turn timeout
+	 * is stopped and reported as a failure instead of hanging the caller.
 	 */
-	private async waitForTerminalState(sessionId: string): Promise<RuntimeTaskSessionSummary> {
+	private async awaitTurn(sessionId: string): Promise<ReviewTurnOutcome> {
+		const summary = await this.waitForTerminalState(sessionId, this.turnTimeoutMs);
+		if (!summary) {
+			await this.sessionService.stopTaskSession(sessionId).catch(() => null);
+			return {
+				failed: true,
+				failureReason: `The review turn exceeded the ${Math.round(this.turnTimeoutMs / 60_000)}-minute limit and was stopped.`,
+			};
+		}
+		return isFailedTerminal(summary)
+			? { failed: true, failureReason: terminalFailureReason(summary) }
+			: { failed: false, failureReason: null };
+	}
+
+	/**
+	 * Resolves once the session leaves the running state (null on timeout).
+	 * Checks the current summary first so a turn that finished before the
+	 * subscription is set up is not missed (the session service dispatches
+	 * turns fire-and-forget).
+	 */
+	private async waitForTerminalState(sessionId: string, timeoutMs: number): Promise<RuntimeTaskSessionSummary | null> {
 		const current = this.sessionService.getSummary(sessionId);
 		if (current && current.state !== "running") {
 			return current;
 		}
-		return await new Promise<RuntimeTaskSessionSummary>((resolve) => {
+		return await new Promise<RuntimeTaskSessionSummary | null>((resolve) => {
+			const timer = setTimeout(() => {
+				unsubscribe();
+				resolve(null);
+			}, timeoutMs);
 			const unsubscribe = this.sessionService.onSummary((summary) => {
-				if (summary.taskId !== sessionId) {
+				if (summary.taskId !== sessionId || summary.state === "running") {
 					return;
 				}
-				if (summary.state !== "running") {
-					unsubscribe();
-					resolve(summary);
-				}
+				clearTimeout(timer);
+				unsubscribe();
+				resolve(summary);
 			});
 		});
 	}
@@ -612,11 +708,13 @@ export function createClineReviewSessionService(
 ): ClineReviewSessionService {
 	const evidence = options.evidence ?? createDefaultReviewEvidencePort(options.workspaceId, options.repoPath);
 	const verificationRunner = options.verificationRunner ?? createVerificationRunner();
-	return new ClineReviewSessionServiceImpl(
-		options.clineTaskSessionService,
-		options.resolveClineLaunchConfig,
-		options.repoPath,
+	return new ClineReviewSessionServiceImpl({
+		sessionService: options.clineTaskSessionService,
+		resolveLaunchConfig: options.resolveClineLaunchConfig,
+		repoPath: options.repoPath,
 		evidence,
 		verificationRunner,
-	);
+		isTaskWriterActive: options.isTaskWriterActive ?? (async () => false),
+		turnTimeoutMs: options.turnTimeoutMs ?? DEFAULT_REVIEW_TURN_TIMEOUT_MS,
+	});
 }

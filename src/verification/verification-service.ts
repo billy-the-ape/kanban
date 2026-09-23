@@ -9,9 +9,12 @@
 //   the configured `successExitCodes` (default [0]) — success-looking output
 //   never counts.
 // - The tree identity (the B-6.7 candidate content hash) is recorded before
-//   and after the run; any mutation invalidates the receipt. A mutating run
-//   is re-run once so one-off generated files do not permanently block
-//   delivery (B-7.4); a run that mutates again still fails.
+//   and after the run; any mutation invalidates the receipt (B-7.4). The run
+//   is never re-based onto the mutated tree: that would bless formatter
+//   rewrites or generated sources nobody reviewed. Generated build output
+//   belongs in .gitignore (ignored files are outside the tree identity).
+// - A "required" gate with no required check fails: an empty gate must be an
+//   explicit "off", never a silent pass.
 // - The receipt binds to the candidate tree hash the review verdict used
 //   (`matchesCandidate`), and `passed` requires every required check to pass
 //   AND the tree identity to be bound. Missing executables, uncomputable
@@ -127,24 +130,17 @@ export class VerificationService implements VerificationRunner {
 		const startedAt = Date.now();
 		const logDir = input.logDir ?? getTaskVerificationDir(input.taskId);
 
-		let treeHashBefore = await this.computeTreeHash(input.worktreePath).catch(() => null);
-		let checkResults = await this.runChecks(config, input, logDir, 0);
-		let treeHashAfter = await this.computeTreeHash(input.worktreePath).catch(() => null);
-
-		// B-7.4: a run that mutated the tree produced unbindable evidence.
-		// Re-run once so one-off generated files (build output, caches) do not
-		// permanently block delivery; a run that mutates again still fails.
-		if (!this.isIdentityPreserved(treeHashBefore, treeHashAfter) && !input.signal?.aborted) {
-			treeHashBefore = treeHashAfter;
-			checkResults = await this.runChecks(config, input, logDir, 1);
-			treeHashAfter = await this.computeTreeHash(input.worktreePath).catch(() => null);
-		}
+		const treeHashBefore = await this.computeTreeHash(input.worktreePath).catch(() => null);
+		const checkResults = await this.runChecks(config, input, logDir, 0);
+		const treeHashAfter = await this.computeTreeHash(input.worktreePath).catch(() => null);
 
 		const treeIdentityPreserved = this.isIdentityPreserved(treeHashBefore, treeHashAfter);
 		const matchesCandidate =
 			input.candidateTreeHash !== null && treeHashBefore !== null && treeHashBefore === input.candidateTreeHash;
+		const hasRequiredCheck = config.checks.some((check) => check.required);
 		const passed =
 			treeIdentityPreserved &&
+			hasRequiredCheck &&
 			config.checks.every((check, index) => !check.required || checkResults[index]?.status === "passed");
 		return {
 			treeHashBefore,
@@ -170,10 +166,15 @@ export class VerificationService implements VerificationRunner {
 		checkResults: RuntimeVerificationCheckResult[],
 	): string {
 		const reasons: string[] = [];
+		if (!config.checks.some((check) => check.required)) {
+			reasons.push('no required check is configured (set verification.enabled to "off" to disable the gate)');
+		}
 		if (treeHashBefore === null || treeHashAfter === null) {
 			reasons.push("the worktree tree identity could not be computed, so the run cannot be bound");
 		} else if (treeHashBefore !== treeHashAfter) {
-			reasons.push("the checks mutated the worktree (tree identity not preserved)");
+			reasons.push(
+				"the checks mutated the worktree (tree identity not preserved); checks must not rewrite sources, and generated output belongs in .gitignore",
+			);
 		}
 		config.checks.forEach((check, index) => {
 			const result = checkResults[index];

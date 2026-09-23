@@ -85,6 +85,7 @@ function HookHarness({
 	waitForBacklogStartAnimationAvailability,
 	stopTaskSession,
 	cleanupTaskWorkspace,
+	checkDependentsUnlock,
 }: {
 	boardFactory?: () => BoardData;
 	onSnapshot: (snapshot: HookSnapshot) => void;
@@ -98,6 +99,7 @@ function HookHarness({
 	waitForBacklogStartAnimationAvailability?: () => Promise<void>;
 	stopTaskSession?: (taskId: string) => Promise<void>;
 	cleanupTaskWorkspace?: (taskId: string) => Promise<RuntimeWorktreeDeleteResponse | null>;
+	checkDependentsUnlock?: (taskId: string) => Promise<{ allowed: boolean; reason: string | null }>;
 }): null {
 	const [board, setBoard] = useState<BoardData>(() => (boardFactory ? boardFactory() : createBoard()));
 	const actions = useLinkedBacklogTaskActions({
@@ -110,6 +112,7 @@ function HookHarness({
 		kickoffTaskInProgress: kickoffTaskInProgress ?? (async (_task: BoardCard, _taskId: string) => true),
 		startBacklogTaskWithAnimation,
 		waitForBacklogStartAnimationAvailability,
+		checkDependentsUnlock,
 	});
 
 	useEffect(() => {
@@ -231,6 +234,44 @@ describe("useLinkedBacklogTaskActions", () => {
 		if (latestSnapshot === null) {
 			throw new Error("Expected an updated hook snapshot.");
 		}
+		const nextSnapshot = latestSnapshot as HookSnapshot;
+		expect(nextSnapshot.board.columns.find((column) => column.id === "done")?.cards[0]?.id).toBe("task-2");
+	});
+
+	it("keeps linked tasks in backlog when the completed task has no delivery evidence", async () => {
+		let latestSnapshot: HookSnapshot | null = null;
+		const kickoffTaskInProgress = vi.fn(async () => true);
+		const checkDependentsUnlock = vi.fn(async () => ({ allowed: false, reason: "not delivered yet" }));
+		const boardFactory = () =>
+			createBoard([
+				{ id: "dep-1", fromTaskId: "task-1", toTaskId: "task-2", createdAt: 10 },
+				{ id: "dep-2", fromTaskId: "task-3", toTaskId: "task-2", createdAt: 11 },
+			]);
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					boardFactory={boardFactory}
+					kickoffTaskInProgress={kickoffTaskInProgress}
+					checkDependentsUnlock={checkDependentsUnlock}
+					onSnapshot={(snapshot) => {
+						latestSnapshot = snapshot;
+					}}
+				/>,
+			);
+		});
+		if (latestSnapshot === null) {
+			throw new Error("Expected a hook snapshot.");
+		}
+		const initialSnapshot = latestSnapshot as HookSnapshot;
+
+		await act(async () => {
+			await initialSnapshot.requestCompleteTask("task-2", "review");
+		});
+
+		// B-5.9: the task still completes, but its dependents do not start.
+		expect(checkDependentsUnlock).toHaveBeenCalledWith("task-2");
+		expect(kickoffTaskInProgress).not.toHaveBeenCalled();
 		const nextSnapshot = latestSnapshot as HookSnapshot;
 		expect(nextSnapshot.board.columns.find((column) => column.id === "done")?.cards[0]?.id).toBe("task-2");
 	});

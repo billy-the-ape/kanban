@@ -182,6 +182,7 @@ function createReviewService(
 	harness: TaskSessionServiceHarness,
 	evidence: ClineReviewEvidencePort,
 	verificationRunner?: VerificationRunner,
+	extra: { isTaskWriterActive?: (taskId: string) => Promise<boolean>; turnTimeoutMs?: number } = {},
 ) {
 	return createClineReviewSessionService({
 		clineTaskSessionService: harness.service,
@@ -190,6 +191,7 @@ function createReviewService(
 		repoPath: "/tmp/repo",
 		evidence,
 		verificationRunner,
+		...extra,
 	});
 }
 
@@ -638,5 +640,109 @@ describe("ClineReviewSessionService.startTaskReview — B-7 verification gate", 
 		expect(noGateResponse.status).toBe("ready");
 		expect(noGateResponse.verification).toBeNull();
 		expect(fake.calls.length).toBe(0);
+	});
+});
+
+describe("ClineReviewSessionService.startTaskReview — ownership, freshness, and bounds", () => {
+	it("skips the verification gate when verification.enabled is off", async () => {
+		const harness = createTaskSessionServiceHarness({ resolveClineLaunchConfig: makeResolver() });
+		services.push(harness);
+		const fake = createFakeVerificationRunner([makeReceipt({ passed: false, error: "should not run" })]);
+		const reviewService = createReviewService(harness, createFakeEvidencePort(), fake.runner);
+		scriptTurns(harness, [{ reply: reviewResultBlock(CLEAN_RESULT), reason: "completed" }]);
+
+		const response = await reviewService.startTaskReview({
+			taskId: "task-1",
+			description: "Implement feature X",
+			verification: { ...GATE_CONFIG, enabled: "off" },
+		});
+
+		expect(response.status).toBe("ready");
+		expect(response.verification).toBeNull();
+		expect(fake.calls.length).toBe(0);
+	});
+
+	it("refuses to review while the implementation writer is still running", async () => {
+		const harness = createTaskSessionServiceHarness({ resolveClineLaunchConfig: makeResolver() });
+		services.push(harness);
+		const reviewService = createReviewService(harness, createFakeEvidencePort(), undefined, {
+			isTaskWriterActive: async () => true,
+		});
+
+		const response = await reviewService.startTaskReview({ taskId: "task-1", description: "Implement feature X" });
+
+		expect(response.ok).toBe(false);
+		expect(response.error).toMatch(/implementation session is still running/);
+		expect(harness.host.sentPrompts.length).toBe(0);
+	});
+
+	it("rejects a concurrent review of the same task", async () => {
+		const harness = createTaskSessionServiceHarness({ resolveClineLaunchConfig: makeResolver() });
+		services.push(harness);
+		const reviewService = createReviewService(harness, createFakeEvidencePort());
+		scriptTurns(harness, [{ reply: reviewResultBlock(CLEAN_RESULT), reason: "completed" }]);
+
+		const first = reviewService.startTaskReview({ taskId: "task-1", description: "Implement feature X" });
+		const second = await reviewService.startTaskReview({ taskId: "task-1", description: "Implement feature X" });
+
+		expect(second.ok).toBe(false);
+		expect(second.error).toMatch(/already running/);
+		expect((await first).status).toBe("ready");
+	});
+
+	it("starts every review run from a fresh session instead of reusing the finished one", async () => {
+		const harness = createTaskSessionServiceHarness({ resolveClineLaunchConfig: makeResolver() });
+		services.push(harness);
+		const reviewService = createReviewService(harness, createFakeEvidencePort());
+		scriptTurns(harness, [
+			{ reply: reviewResultBlock(CLEAN_RESULT), reason: "completed" },
+			{ reply: reviewResultBlock(CLEAN_RESULT), reason: "completed" },
+		]);
+
+		const first = await reviewService.startTaskReview({ taskId: "task-1", description: "Implement feature X" });
+		expect(first.status).toBe("ready");
+
+		// A second run must send a new initial prompt, not return the old summary.
+		const promptsBefore = harness.host.sentPrompts.length;
+		const second = await reviewService.startTaskReview({ taskId: "task-1", description: "Implement feature X" });
+		expect(second.status).toBe("ready");
+		expect(harness.host.sentPrompts.length).toBeGreaterThan(promptsBefore);
+	});
+
+	it("stops a turn that exceeds the turn timeout and reports the review as failed", async () => {
+		const harness = createTaskSessionServiceHarness({ resolveClineLaunchConfig: makeResolver() });
+		services.push(harness);
+		// No "ended" event is scripted, so the turn never finishes on its own.
+		const reviewService = createReviewService(harness, createFakeEvidencePort(), undefined, { turnTimeoutMs: 50 });
+
+		const response = await reviewService.startTaskReview({ taskId: "task-1", description: "Implement feature X" });
+
+		expect(response.status).toBe("failed");
+		expect(response.error).toMatch(/exceeded the .*limit and was stopped/);
+	});
+
+	it("runs verification repairs in a fresh session scoped to the change set", async () => {
+		const harness = createTaskSessionServiceHarness({ resolveClineLaunchConfig: makeResolver() });
+		services.push(harness);
+		const failing = makeReceipt({ passed: false, error: "lint failed", checks: [failedLintCheck()] });
+		const fake = createFakeVerificationRunner([failing, makeReceipt()]);
+		const reviewService = createReviewService(harness, createFakeEvidencePort(), fake.runner);
+		scriptTurns(harness, [{ reply: reviewResultBlock(CLEAN_RESULT), reason: "completed" }]);
+
+		const response = await reviewService.startTaskReview({
+			taskId: "task-1",
+			description: "Implement feature X",
+			reviewPolicy: { enabled: "required", instructions: "", modelOverride: null, maxRepairRounds: 1 },
+			verification: GATE_CONFIG,
+		});
+
+		expect(response.status).toBe("ready");
+		const repairSessionId = `${reviewSessionIdForTask("task-1")}::verification-repair-1`;
+		expect(harness.service.getSummary(repairSessionId)).not.toBeNull();
+		const repairPrompt = harness.service
+			.listMessages(repairSessionId)
+			.find((message) => message.role === "user")?.content;
+		expect(repairPrompt).toContain("fresh repair session");
+		expect(repairPrompt).toContain("src/a.ts");
 	});
 });

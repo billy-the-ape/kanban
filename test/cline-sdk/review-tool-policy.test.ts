@@ -209,3 +209,72 @@ describe("createReviewToolPolicy — apply_patch scoping", () => {
 		expect(result.reason).toMatch(/unparseable patch/);
 	});
 });
+
+describe("createReviewToolPolicy — history, cleanup, and publication commands", () => {
+	it("denies commands that move history, discard work, or publish", async () => {
+		const policy = createPolicy();
+		for (const command of [
+			"git merge feature",
+			"git rebase main",
+			"git cherry-pick abc123",
+			"git pull",
+			"git update-ref refs/heads/main HEAD",
+			"git tag v1",
+			"git stash",
+			"git stash push -m wip",
+			"git checkout -- .",
+			"git checkout main",
+			"git switch main",
+			"git restore src/a.ts",
+			"git worktree remove ../other",
+			"git worktree prune",
+			"git branch -D feature",
+			"gh pr create --fill",
+			"gh pr merge 3",
+			"rm -rf .",
+			"rm -rf ./",
+			"rm --recursive --force *",
+		]) {
+			const result = await policy(makeRequest("run_commands", { commands: [command] }));
+			expect(result.approved, command).toBe(false);
+		}
+	});
+
+	it("still allows read-only and index-only variants", async () => {
+		const policy = createPolicy();
+		for (const command of [
+			"git stash list",
+			"git restore --staged src/a.ts",
+			"git branch --list",
+			"git worktree list",
+			"gh pr view 3",
+			"rm -rf build",
+		]) {
+			const result = await policy(makeRequest("run_commands", { commands: [command] }));
+			expect(result.approved, command).toBe(true);
+		}
+	});
+});
+
+describe("createReviewToolPolicy — workspace approval delegation", () => {
+	it("defers every non-denied request to the workspace approval handler", async () => {
+		const delegated: string[] = [];
+		const policy = createReviewToolPolicy({
+			worktreePath: WORKTREE,
+			allowedWritePaths: ALLOWED_WRITE_PATHS,
+			delegate: async (request) => {
+				delegated.push(request.toolName);
+				return { approved: false, reason: "workspace policy says no" };
+			},
+		});
+
+		const read = await policy(makeRequest("read_files", { path: "src/a.ts" }));
+		expect(read).toEqual({ approved: false, reason: "workspace policy says no" });
+		const edit = await policy(makeRequest("editor", { path: "src/a.ts" }));
+		expect(edit.reason).toBe("workspace policy says no");
+		// A review denial never reaches the workspace handler.
+		const push = await policy(makeRequest("run_commands", { commands: ["git push"] }));
+		expect(push.reason).toMatch(/git push/);
+		expect(delegated).toEqual(["read_files", "editor"]);
+	});
+});

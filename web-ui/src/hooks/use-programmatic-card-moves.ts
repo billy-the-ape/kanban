@@ -23,8 +23,6 @@ type RequestCompleteTask = (
 
 export interface ProgrammaticCardMoveBehavior {
 	skipKickoff?: boolean;
-	skipTrashWorkflow?: boolean;
-	skipCompleteWorkflow?: boolean;
 	skipWorkingChangeWarning?: boolean;
 	insertAtTop?: boolean;
 }

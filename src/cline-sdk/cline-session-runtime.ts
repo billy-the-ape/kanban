@@ -143,6 +143,11 @@ export interface ClinePersistedTaskSessionSnapshot {
 	messages: ClineSdkPersistedMessage[];
 }
 
+export type ClineSessionRestartStartRequest = Omit<
+	StartClineSessionRuntimeRequest,
+	"prompt" | "images" | "initialMessages"
+>;
+
 export interface ClineSessionRuntime {
 	startTaskSession(request: StartClineSessionRuntimeRequest): Promise<StartClineSessionRuntimeResult>;
 	restartTaskSession(input: {
@@ -166,6 +171,13 @@ export interface ClineSessionRuntime {
 	getTaskSessionId(taskId: string): string | null;
 	getTaskProviderId(taskId: string): string | null;
 	canRestartTaskSession(taskId: string): boolean;
+	/**
+	 * The start request a restart of this task would use: the in-memory one,
+	 * or (after a process restart) the one reconstructed from the durable
+	 * session record (B-4.8) with the live launch policy (B-2.8). Null when
+	 * neither is available. Overflow recovery budgets against this (B-3).
+	 */
+	resolveRestartStartRequest(taskId: string): Promise<ClineSessionRestartStartRequest | null>;
 	readPersistedTaskSession(taskId: string): Promise<ClinePersistedTaskSessionSnapshot | null>;
 	dispose(): Promise<void>;
 }
@@ -509,29 +521,30 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		images?: RuntimeTaskImage[];
 		mode?: RuntimeTaskSessionMode;
 	}): Promise<StartClineSessionRuntimeResult> {
-		let lastStartRequest:
-			| Omit<StartClineSessionRuntimeRequest, "prompt" | "images" | "initialMessages">
-			| null
-			| undefined = this.lastStartRequestByTaskId.get(input.taskId);
-		if (!lastStartRequest) {
-			// B-4.8: after a Kanban process restart the in-memory start-request
-			// map is empty; reconstruct the request from the durable session
-			// record (persisted launch config plus provider/model/cwd).
-			lastStartRequest = await this.restoreStartRequestFromPersistence(input.taskId);
-			if (!lastStartRequest) {
-				throw new Error(`No previous Cline session config is available for task ${input.taskId}.`);
-			}
+		const restartRequest = await this.resolveRestartStartRequest(input.taskId);
+		if (!restartRequest) {
+			throw new Error(`No previous Cline session config is available for task ${input.taskId}.`);
 		}
-		const launchPolicy = await this.resolveRestartedLaunchPolicy(lastStartRequest);
-
 		return await this.startTaskSession({
-			...lastStartRequest,
-			...launchPolicy,
+			...restartRequest,
 			prompt: input.prompt,
 			initialMessages: input.initialMessages,
 			images: input.images,
-			mode: input.mode ?? lastStartRequest.mode,
+			mode: input.mode ?? restartRequest.mode,
 		});
+	}
+
+	async resolveRestartStartRequest(taskId: string): Promise<ClineSessionRestartStartRequest | null> {
+		// B-4.8: after a Kanban process restart the in-memory start-request map
+		// is empty; reconstruct the request from the durable session record
+		// (persisted launch config plus provider/model/cwd).
+		const lastStartRequest =
+			this.lastStartRequestByTaskId.get(taskId) ?? (await this.restoreStartRequestFromPersistence(taskId));
+		if (!lastStartRequest) {
+			return null;
+		}
+		const launchPolicy = await this.resolveRestartedLaunchPolicy(lastStartRequest);
+		return { ...lastStartRequest, ...launchPolicy };
 	}
 
 	/**
