@@ -8,6 +8,7 @@ import type {
 	RuntimeBoardDependency,
 	RuntimeClineReasoningEffort,
 	RuntimeTaskClineSettings,
+	RuntimeTaskDispatchRunResponse,
 	RuntimeWorkspaceStateResponse,
 } from "../core/api-contract";
 import { runtimeAgentIdSchema, runtimeClineReasoningEffortSchema } from "../core/api-contract";
@@ -793,7 +794,15 @@ interface CompleteTaskExecutionResult {
 	autoStartedTasks: JsonRecord[];
 	/** B-5.9: why ready linked tasks were not started (no delivery evidence yet). */
 	dependentsBlockedReason: string | null;
+	/** B-9: the backend queue pass run after completion (null when the queue is disabled). */
+	taskDispatch: CliTaskDispatchResult | null;
 	alreadyInDone: boolean;
+}
+
+interface CliTaskDispatchResult {
+	dispatchedTaskId: string | null;
+	skippedReason: RuntimeTaskDispatchRunResponse["skippedReason"];
+	error: string | null;
 }
 
 interface CompleteTaskMutationValue {
@@ -860,6 +869,7 @@ async function completeTaskById(input: {
 			readyTaskIds: [],
 			autoStartedTasks: [],
 			dependentsBlockedReason: null,
+			taskDispatch: null,
 			alreadyInDone: true,
 		};
 	}
@@ -870,14 +880,22 @@ async function completeTaskById(input: {
 		await stopTaskRuntimeSession(input.runtimeClient, input.taskId);
 	}
 
+	// B-9: with the backend task queue enabled, the queue launches ready
+	// dependents (fresh context, dispatch record, worker limit); the CLI must
+	// not start them itself. A completion may also free a worker slot, so the
+	// pass runs even when this task had no dependents.
+	const taskDispatch = await runBackendTaskDispatch(input.runtimeClient);
+
 	// B-5.9/B-8.8: dependents start only once delivery evidence exists (when
 	// deterministic delivery is enabled; legacy mode keeps unlock-on-complete).
 	const dependentsBlockedReason =
-		mutation.value.readyTaskIds.length > 0
+		taskDispatch === null && mutation.value.readyTaskIds.length > 0
 			? await readDependentsBlockedReason(input.runtimeClient, input.taskId)
 			: null;
 	const autoStartedTasks: JsonRecord[] = [];
-	for (const readyTaskId of dependentsBlockedReason === null ? mutation.value.readyTaskIds : []) {
+	const legacyStartTaskIds =
+		taskDispatch === null && dependentsBlockedReason === null ? mutation.value.readyTaskIds : [];
+	for (const readyTaskId of legacyStartTaskIds) {
 		const started = await startTask({
 			cwd: input.cwd,
 			taskId: readyTaskId,
@@ -893,8 +911,40 @@ async function completeTaskById(input: {
 		readyTaskIds: mutation.value.readyTaskIds,
 		autoStartedTasks,
 		dependentsBlockedReason,
+		taskDispatch,
 		alreadyInDone: false,
 	};
+}
+
+/**
+ * B-9: run one backend queue pass. Returns null when the queue is disabled, so
+ * the caller keeps the legacy auto-start. A failed call is reported rather
+ * than falling back to a direct start, which would bypass the queue.
+ */
+async function runBackendTaskDispatch(
+	runtimeClient: ReturnType<typeof createRuntimeTrpcClient>,
+): Promise<CliTaskDispatchResult | null> {
+	try {
+		const response = await runtimeClient.runtime.dispatchReadyTasks.mutate();
+		if (response.skippedReason === "disabled") {
+			return null;
+		}
+		return { dispatchedTaskId: response.dispatchedTaskId, skippedReason: response.skippedReason, error: null };
+	} catch (error) {
+		return {
+			dispatchedTaskId: null,
+			skippedReason: null,
+			error: `Could not run the task queue: ${toErrorMessage(error)}`,
+		};
+	}
+}
+
+/**
+ * B-5.7: after completing tasks, let the runtime dispose delivered worktrees
+ * and apply retention. Best-effort — the runtime also runs it at startup.
+ */
+async function requestWorkspaceMaintenance(runtimeClient: ReturnType<typeof createRuntimeTrpcClient>): Promise<void> {
+	await runtimeClient.workspace.runTaskWorkspaceMaintenance.mutate().catch(() => undefined);
 }
 
 async function readDependentsBlockedReason(
@@ -938,6 +988,7 @@ async function completeTask(input: {
 				autoStartedTasks: [],
 			};
 		}
+		await requestWorkspaceMaintenance(runtimeClient);
 		return {
 			ok: true,
 			task: completed.task,
@@ -945,6 +996,7 @@ async function completeTask(input: {
 			readyTaskIds: completed.readyTaskIds,
 			autoStartedTasks: completed.autoStartedTasks,
 			dependentsBlockedReason: completed.dependentsBlockedReason,
+			taskDispatch: completed.taskDispatch,
 		};
 	}
 
@@ -978,6 +1030,9 @@ async function completeTask(input: {
 
 	const completedTasks = results.filter((result) => !result.alreadyInDone);
 	const alreadyDoneTasks = results.filter((result) => result.alreadyInDone);
+	if (completedTasks.length > 0) {
+		await requestWorkspaceMaintenance(runtimeClient);
+	}
 
 	return {
 		ok: true,
@@ -990,6 +1045,9 @@ async function completeTask(input: {
 		dependentsBlocked: completedTasks
 			.filter((result) => result.dependentsBlockedReason !== null)
 			.map((result) => ({ taskId: result.taskId, reason: result.dependentsBlockedReason })),
+		taskDispatch: completedTasks.flatMap((result) =>
+			result.taskDispatch ? [{ taskId: result.taskId, ...result.taskDispatch }] : [],
+		),
 		count: completedTasks.length,
 	};
 }
@@ -1237,6 +1295,16 @@ async function deliverTaskCommand(input: {
 		...(input.commitMessage ? { commitMessage: input.commitMessage } : {}),
 	});
 	return { ...delivered, workspacePath: workspaceRepoPath };
+}
+
+/**
+ * B-5.7/B-5.9: retry blocked trash cleanups, dispose delivered Done worktrees,
+ * and apply preservation retention; prints what was done and what is blocked.
+ */
+async function cleanupTaskWorkspacesCommand(input: { cwd: string; projectPath?: string }): Promise<JsonRecord> {
+	const { workspaceRepoPath, runtimeClient } = await connectTaskWorkspace(input);
+	const report = await runtimeClient.workspace.runTaskWorkspaceMaintenance.mutate();
+	return { ok: true, ...report, workspacePath: workspaceRepoPath };
 }
 
 /** B-8.8: show a task's durable delivery receipt and whether its dependents may start. */
@@ -1663,6 +1731,18 @@ export function registerTaskCommand(program: Command): void {
 						taskId: options.taskId,
 						projectPath: options.projectPath,
 					}),
+			);
+		});
+
+	task
+		.command("cleanup")
+		.description(
+			"Retry blocked worktree cleanups, remove delivered Done worktrees, and prune preserved work past retention.",
+		)
+		.option("--project-path <path>", "Workspace path. Defaults to current directory workspace.")
+		.action(async (options: { projectPath?: string }) => {
+			await runTaskCommand(
+				async () => await cleanupTaskWorkspacesCommand({ cwd: process.cwd(), projectPath: options.projectPath }),
 			);
 		});
 

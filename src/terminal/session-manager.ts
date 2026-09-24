@@ -267,6 +267,15 @@ export class TerminalSessionManager implements TerminalSessionService {
 		return Array.from(this.entries.values()).map((entry) => cloneSummary(entry.summary));
 	}
 
+	/**
+	 * Whether a process is running for this task in this runtime. Summaries
+	 * hydrated from disk after a restart have no process behind them, even when
+	 * their persisted state still reads "running".
+	 */
+	hasActiveProcess(taskId: string): boolean {
+		return Boolean(this.entries.get(taskId)?.active);
+	}
+
 	attach(taskId: string, listener: TerminalSessionListener): (() => void) | null {
 		const entry = this.ensureEntry(taskId);
 

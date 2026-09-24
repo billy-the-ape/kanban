@@ -52,6 +52,8 @@ import { createWorkspaceApi } from "../trpc/workspace-api";
 import { getWebUiDir, normalizeRequestPath, readAsset } from "./assets";
 import { handleHttpRequest, handleSocketUpgrade } from "./middleware";
 import type { RuntimeStateHub } from "./runtime-state-hub";
+import { runStartupTaskWorkspaceMaintenance } from "./startup-maintenance";
+import { isTaskWriterActive } from "./task-writer-activity";
 import type { WorkspaceRegistry } from "./workspace-registry";
 
 interface DisposeTrackedWorkspaceResult {
@@ -203,14 +205,11 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				repoPath: scope.workspacePath,
 				// B-6.2: the implementation writer is the task's native Cline session
 				// or its terminal agent session.
-				isTaskWriterActive: async (taskId) => {
-					const clineService = await getScopedClineTaskSessionService(scope);
-					const terminalManager = await getScopedTerminalManager(scope);
-					return (
-						clineService.getSummary(taskId)?.state === "running" ||
-						terminalManager.getSummary(taskId)?.state === "running"
-					);
-				},
+				isTaskWriterActive: async (taskId) =>
+					isTaskWriterActive(taskId, {
+						clineTaskSessionService: await getScopedClineTaskSessionService(scope),
+						terminalManager: await getScopedTerminalManager(scope),
+					}),
 			});
 			bundle = { reviewService, sessionService: reviewSessionService };
 			reviewSessionServiceByWorkspaceId.set(scope.workspaceId, bundle);
@@ -599,6 +598,9 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			});
 	}
 
+	// B-5.7/B-5.9: background maintenance; close() waits for it so no git
+	// subprocess outlives the server.
+	const startupMaintenance = runStartupTaskWorkspaceMaintenance(deps.warn);
 	const activeWorkspaceId = deps.workspaceRegistry.getActiveWorkspaceId();
 	const url = activeWorkspaceId
 		? buildKanbanRuntimeUrl(`/${encodeURIComponent(activeWorkspaceId)}`)
@@ -607,6 +609,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 	return {
 		url,
 		close: async () => {
+			await startupMaintenance;
 			await Promise.all(
 				Array.from(clineTaskSessionServiceByWorkspaceId.values()).map(async (service) => {
 					await service.dispose();

@@ -284,3 +284,50 @@ export function evaluateClineRecoveryRequirements(
 		: `Context overflow recovery cannot preserve the original task requirements: they need ~${firstUserMessageTokens} tokens, but the compaction target is ${input.targetTokens} tokens. Shorten the task requirements or increase the context budget — recovery will not silently truncate the original requirements.`;
 	return { checked: true, fits, firstUserMessageTokens, targetTokens: input.targetTokens, reason };
 }
+
+// ---------------------------------------------------------------------------
+// B-3.5 — Uncertain tool completion
+// ---------------------------------------------------------------------------
+
+export interface ClineUnresolvedToolCall {
+	id: string;
+	name: string;
+}
+
+/**
+ * Tool calls in the persisted transcript that have no recorded result. Such
+ * a call may or may not have run (and changed files) before the session was
+ * interrupted, so recovery must not resend the turn as if it had not: the
+ * compactor would drop the dangling call and the model would decide again.
+ */
+export function findClineUnresolvedToolCalls(messages: readonly ClineSdkPersistedMessage[]): ClineUnresolvedToolCall[] {
+	const resolvedIds = new Set<string>();
+	for (const message of messages) {
+		if (message.role !== "user" || typeof message.content === "string") {
+			continue;
+		}
+		for (const block of message.content) {
+			if (block.type === "tool_result") {
+				resolvedIds.add(block.tool_use_id);
+			}
+		}
+	}
+	const unresolved: ClineUnresolvedToolCall[] = [];
+	for (const message of messages) {
+		if (message.role !== "assistant" || typeof message.content === "string") {
+			continue;
+		}
+		for (const block of message.content) {
+			if (block.type === "tool_use" && !resolvedIds.has(block.id)) {
+				unresolved.push({ id: block.id, name: block.name });
+			}
+		}
+	}
+	return unresolved;
+}
+
+/** The actionable pause reason for unresolved tool calls (B-3.5). */
+export function describeClineUnresolvedToolCalls(unresolved: readonly ClineUnresolvedToolCall[]): string {
+	const names = [...new Set(unresolved.map((call) => call.name))].join(", ");
+	return `Context overflow recovery paused: ${unresolved.length} tool call(s) (${names}) have no recorded result, so it is unknown whether they ran. Check the task worktree for their effects, then send a follow-up to continue — recovery will not re-run or discard them automatically.`;
+}

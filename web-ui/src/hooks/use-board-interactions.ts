@@ -8,7 +8,7 @@ import { useLinkedBacklogTaskActions } from "@/hooks/use-linked-backlog-task-act
 import { useProgrammaticCardMoves } from "@/hooks/use-programmatic-card-moves";
 import { useReviewAutoActions } from "@/hooks/use-review-auto-actions";
 import type { UseTaskSessionsResult } from "@/hooks/use-task-sessions";
-import { fetchTaskDependentsUnlock } from "@/runtime/task-delivery";
+import { fetchTaskDependentsUnlock, requestTaskWorkspaceMaintenance } from "@/runtime/task-delivery";
 import type {
 	RuntimeTaskDependentsUnlock,
 	RuntimeTaskSessionSummary,
@@ -532,6 +532,16 @@ export function useBoardInteractions({
 		[currentProjectId],
 	);
 
+	const handleTaskCompleted = useCallback(
+		(_taskId: string) => {
+			// B-5.7: a delivered task's worktree is disposed by runtime maintenance.
+			if (deterministicDeliveryEnabled && currentProjectId) {
+				void requestTaskWorkspaceMaintenance(currentProjectId);
+			}
+		},
+		[currentProjectId, deterministicDeliveryEnabled],
+	);
+
 	const {
 		confirmMoveTaskToTrash,
 		handleCreateDependency,
@@ -550,6 +560,7 @@ export function useBoardInteractions({
 		waitForBacklogStartAnimationAvailability: waitForProgrammaticCardMoveAvailability,
 		checkDependentsUnlock,
 		isBackendTaskDispatchEnabled: backendTaskDispatchEnabled,
+		onTaskCompleted: handleTaskCompleted,
 	});
 
 	useEffect(() => {

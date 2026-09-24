@@ -18,3 +18,16 @@ export async function fetchTaskDependentsUnlock(
 		return { allowed: false, reason: `Could not read the delivery receipt: ${message}` };
 	}
 }
+
+/**
+ * B-5.7: after a completion, let the runtime dispose a delivered task's
+ * worktree and apply retention. Best-effort: the runtime also runs it at
+ * startup, and blocked cleanups surface on their cards.
+ */
+export async function requestTaskWorkspaceMaintenance(workspaceId: string): Promise<void> {
+	try {
+		await getRuntimeTrpcClient(workspaceId).workspace.runTaskWorkspaceMaintenance.mutate();
+	} catch {
+		// Retried at the next runtime start.
+	}
+}
