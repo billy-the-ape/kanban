@@ -20,6 +20,7 @@ import type {
 	RuntimeCommandRunResponse,
 	RuntimeEffectiveContextWindow,
 	RuntimeRunUpdateResponse,
+	RuntimeTaskCompletionResponse,
 	RuntimeTaskDeliveryInfoResponse,
 	RuntimeTaskDeliveryStartResponse,
 	RuntimeUpdateStatusResponse,
@@ -42,6 +43,7 @@ import {
 	parseTaskChatMessagesRequest,
 	parseTaskChatReloadRequest,
 	parseTaskChatSendRequest,
+	parseTaskCompletionRequest,
 	parseTaskDeliveryInfoRequest,
 	parseTaskDeliveryStartRequest,
 	parseTaskReviewInfoRequest,
@@ -53,6 +55,7 @@ import {
 import { isHomeAgentSessionId } from "../core/home-agent-session";
 import { resolveTaskTitle } from "../core/task-title.js";
 import { openInBrowser } from "../server/browser";
+import type { TaskCompletionCoordinator } from "../task-completion/completion-coordinator";
 import { buildRuntimeConfigResponse, resolveAgentCommand } from "../terminal/agent-registry";
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { evaluateDependentsUnlock, getGitDeliveryService } from "../workspace/git-delivery";
@@ -70,6 +73,8 @@ export interface CreateRuntimeApiDependencies {
 	getScopedClineTaskSessionService: (scope: RuntimeTrpcWorkspaceScope) => Promise<ClineTaskSessionService>;
 	/** B-6: the per-workspace bounded review session service (its own Cline session instance). */
 	getScopedReviewSessionService?: (scope: RuntimeTrpcWorkspaceScope) => Promise<ClineReviewSessionService>;
+	/** B-4: the backend completion coordinator (reliable mode). */
+	completionCoordinator?: TaskCompletionCoordinator;
 	resolveInteractiveShellCommand: () => { binary: string; args: string[] };
 	runCommand: (command: string, cwd: string) => Promise<RuntimeCommandRunResponse>;
 	broadcastClineMcpAuthStatusesUpdated?: (
@@ -130,6 +135,21 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			throw new Error("The review session service is not configured for this workspace.");
 		}
 		return deps.getScopedReviewSessionService;
+	};
+
+	// B-4: completion commands share one error contract; a missing coordinator
+	// (e.g. a partial test harness) is a clear, recoverable error.
+	const runCompletionCommand = async (
+		command: (coordinator: TaskCompletionCoordinator) => Promise<RuntimeTaskCompletionResponse>,
+	): Promise<RuntimeTaskCompletionResponse> => {
+		try {
+			if (!deps.completionCoordinator) {
+				throw new Error("The completion coordinator is not configured for this runtime.");
+			}
+			return await command(deps.completionCoordinator);
+		} catch (error) {
+			return { ok: false, attempt: null, error: error instanceof Error ? error.message : String(error) };
+		}
 	};
 
 	const buildConfigResponse = async (runtimeConfig: RuntimeConfigState) => {
@@ -499,6 +519,21 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				};
 			}
 		},
+		startTaskCompletion: async (workspaceScope, input) =>
+			await runCompletionCommand(async (coordinator) => {
+				const body = parseTaskCompletionRequest(input);
+				return await coordinator.start(workspaceScope, body.taskId);
+			}),
+		getTaskCompletion: async (_workspaceScope, input) =>
+			await runCompletionCommand(async (coordinator) => {
+				const body = parseTaskCompletionRequest(input);
+				return await coordinator.get(body.taskId);
+			}),
+		cancelTaskCompletion: async (workspaceScope, input) =>
+			await runCompletionCommand(async (coordinator) => {
+				const body = parseTaskCompletionRequest(input);
+				return await coordinator.cancel(workspaceScope, body.taskId);
+			}),
 		stopTaskSession: async (workspaceScope, input) => {
 			try {
 				const body = parseTaskSessionStopRequest(input);

@@ -24,6 +24,7 @@ import {
 	computeCandidateTreeHash,
 	persistReviewHandoff,
 	persistReviewOutcome,
+	persistVerificationReceipt,
 } from "../../src/workspace/task-review-handoff";
 import { createTempDir } from "../utilities/temp-dir";
 
@@ -876,5 +877,44 @@ describe("GitDeliveryService", () => {
 		const locked = evaluateDependentsUnlock(deliveryPolicy(), null);
 		expect(locked.allowed).toBe(false);
 		expect(locked.reason).toMatch(/not been delivered/);
+	});
+	it("accepts a standalone verification receipt bound to the tree when review is off", async () => {
+		const fixture = await createDeliveryFixture();
+		try {
+			await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
+			await persistFixtureHandoff(fixture, "task-verify-only");
+			await writeFile(join(fixture.worktreePath, "task.txt"), "task work\n", "utf8");
+			const service = new GitDeliveryService();
+			const start = () =>
+				service.startDelivery({
+					taskId: "task-verify-only",
+					workspaceId: "workspace-1",
+					repoPath: fixture.repoPath,
+					worktreePath: fixture.worktreePath,
+					baseRef: "main",
+					policy: deliveryPolicy(),
+					gates: { reviewRequired: false, verificationRequired: true },
+				});
+
+			const unverified = await start();
+			expect(unverified.receipt?.status).toBe("paused");
+
+			const treeHash = await computeCandidateTreeHash(fixture.worktreePath);
+			await persistVerificationReceipt("task-verify-only", {
+				treeHashBefore: treeHash,
+				treeHashAfter: treeHash,
+				treeIdentityPreserved: true,
+				matchesCandidate: true,
+				checks: [],
+				passed: true,
+				error: null,
+				startedAt: 1,
+				finishedAt: 2,
+			});
+			const verified = await start();
+			expect(verified.receipt?.status).toBe("delivered");
+		} finally {
+			fixture.cleanup();
+		}
 	});
 });

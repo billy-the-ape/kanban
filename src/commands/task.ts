@@ -1261,6 +1261,43 @@ async function cleanupTaskWorkspacesCommand(input: { cwd: string; projectPath?: 
 	return { ok: true, ...report, workspacePath: workspaceRepoPath };
 }
 
+const COMPLETION_POLL_MS = 1500;
+
+/**
+ * B-4.4: start (or join, or resume) the task's backend completion attempt and
+ * wait until it stops. The attempt is owned by the runtime, so interrupting
+ * this command does not stop it.
+ */
+async function finishTaskCommand(input: { cwd: string; taskId: string; projectPath?: string }): Promise<JsonRecord> {
+	const { workspaceRepoPath, runtimeClient } = await connectTaskWorkspace(input);
+	let response = await runtimeClient.runtime.startTaskCompletion.mutate({ taskId: input.taskId });
+	while (response.ok && response.attempt?.status === "running") {
+		await new Promise((resolve) => setTimeout(resolve, COMPLETION_POLL_MS));
+		response = await runtimeClient.runtime.getTaskCompletion.query({ taskId: input.taskId });
+	}
+	return { ...response, ok: response.ok && response.attempt?.status === "complete", workspacePath: workspaceRepoPath };
+}
+
+async function completionInfoTaskCommand(input: {
+	cwd: string;
+	taskId: string;
+	projectPath?: string;
+}): Promise<JsonRecord> {
+	const { workspaceRepoPath, runtimeClient } = await connectTaskWorkspace(input);
+	const response = await runtimeClient.runtime.getTaskCompletion.query({ taskId: input.taskId });
+	return { ...response, workspacePath: workspaceRepoPath };
+}
+
+async function cancelCompletionTaskCommand(input: {
+	cwd: string;
+	taskId: string;
+	projectPath?: string;
+}): Promise<JsonRecord> {
+	const { workspaceRepoPath, runtimeClient } = await connectTaskWorkspace(input);
+	const response = await runtimeClient.runtime.cancelTaskCompletion.mutate({ taskId: input.taskId });
+	return { ...response, workspacePath: workspaceRepoPath };
+}
+
 /** B-8.8: show a task's durable delivery receipt and whether its dependents may start. */
 async function deliveryInfoTaskCommand(input: {
 	cwd: string;
@@ -1671,6 +1708,58 @@ export function registerTaskCommand(program: Command): void {
 		.action(async (options: { projectPath?: string }) => {
 			await runTaskCommand(
 				async () => await cleanupTaskWorkspacesCommand({ cwd: process.cwd(), projectPath: options.projectPath }),
+			);
+		});
+
+	task
+		.command("finish")
+		.description(
+			"Run (or resume) the task's reliable completion: review, verification, commit, integrate, push, and remote verification. Waits until it stops.",
+		)
+		.requiredOption("--task-id <id>", "Task ID.")
+		.option("--project-path <path>", "Workspace path. Defaults to current directory workspace.")
+		.action(async (options: { taskId: string; projectPath?: string }) => {
+			await runTaskCommand(
+				async () =>
+					await finishTaskCommand({
+						cwd: process.cwd(),
+						taskId: options.taskId,
+						projectPath: options.projectPath,
+					}),
+			);
+		});
+
+	task
+		.command("completion")
+		.description("Show the task's completion attempt: phase, status, evidence, and history.")
+		.requiredOption("--task-id <id>", "Task ID.")
+		.option("--project-path <path>", "Workspace path. Defaults to current directory workspace.")
+		.action(async (options: { taskId: string; projectPath?: string }) => {
+			await runTaskCommand(
+				async () =>
+					await completionInfoTaskCommand({
+						cwd: process.cwd(),
+						taskId: options.taskId,
+						projectPath: options.projectPath,
+					}),
+			);
+		});
+
+	task
+		.command("cancel-completion")
+		.description(
+			"Cancel the task's running completion attempt (review stops now; Git phases stop at the next phase boundary).",
+		)
+		.requiredOption("--task-id <id>", "Task ID.")
+		.option("--project-path <path>", "Workspace path. Defaults to current directory workspace.")
+		.action(async (options: { taskId: string; projectPath?: string }) => {
+			await runTaskCommand(
+				async () =>
+					await cancelCompletionTaskCommand({
+						cwd: process.cwd(),
+						taskId: options.taskId,
+						projectPath: options.projectPath,
+					}),
 			);
 		});
 

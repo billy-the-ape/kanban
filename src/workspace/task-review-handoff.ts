@@ -25,8 +25,13 @@ import type {
 	RuntimeReviewHandoffArtifact,
 	RuntimeReviewHandoffPlanDocument,
 	RuntimeReviewOutcomeFile,
+	RuntimeVerificationReceipt,
 } from "../core/api-contract";
-import { runtimeReviewHandoffArtifactSchema, runtimeReviewOutcomeFileSchema } from "../core/api-contract";
+import {
+	runtimeReviewHandoffArtifactSchema,
+	runtimeReviewOutcomeFileSchema,
+	runtimeVerificationReceiptSchema,
+} from "../core/api-contract";
 import { lockedFileSystem } from "../fs/locked-file-system";
 import { getTaskWorktreesHomePath, loadWorkspaceBoardById } from "../state/workspace-state";
 import { readGitHeadInfo, runGit } from "./git-utils";
@@ -365,6 +370,37 @@ export async function readReviewOutcome(taskId: string): Promise<RuntimeReviewOu
 		return null;
 	}
 }
+const VERIFICATION_RECEIPT_FILENAME = "receipt.json";
+
+function getTaskVerificationReceiptPath(taskId: string): string {
+	return join(getTaskVerificationDir(taskId), VERIFICATION_RECEIPT_FILENAME);
+}
+
+/**
+ * B-7: durably stores a verification receipt from a run outside a review
+ * (verification required while review is off). It is bound to the tree it
+ * started from (`treeHashBefore`).
+ */
+export async function persistVerificationReceipt(taskId: string, receipt: RuntimeVerificationReceipt): Promise<string> {
+	const path = getTaskVerificationReceiptPath(taskId);
+	await lockedFileSystem.writeJsonFileAtomic(path, runtimeVerificationReceiptSchema.parse(receipt));
+	return path;
+}
+
+/** B-7: reads the standalone verification receipt (null when absent or corrupt). */
+export async function readVerificationReceipt(taskId: string): Promise<RuntimeVerificationReceipt | null> {
+	const raw = await readFile(getTaskVerificationReceiptPath(taskId), "utf8").catch(() => null);
+	if (!raw) {
+		return null;
+	}
+	try {
+		const parsed = runtimeVerificationReceiptSchema.safeParse(JSON.parse(raw));
+		return parsed.success ? parsed.data : null;
+	} catch {
+		return null;
+	}
+}
+
 // ---------------------------------------------------------------------------
 // B-6.2: implementation self-report (unverified input, read permissively).
 // ---------------------------------------------------------------------------
