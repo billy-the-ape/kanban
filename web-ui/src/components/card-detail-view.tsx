@@ -8,6 +8,7 @@ import { ClineAgentChatPanel, type ClineAgentChatPanelHandle } from "@/component
 import { ColumnContextPanel } from "@/components/detail-panels/column-context-panel";
 import { type DiffLineComment, DiffViewerPanel } from "@/components/detail-panels/diff-viewer-panel";
 import { FileTreePanel } from "@/components/detail-panels/file-tree-panel";
+import { TaskReviewControl } from "@/components/detail-panels/task-review-control";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/components/ui/cn";
 import type { ClineChatActionResult } from "@/hooks/use-cline-chat-runtime-actions";
@@ -267,12 +268,15 @@ function DiffToolbar({
 	isExpanded,
 	onToggleExpand,
 	hideExpand,
+	reviewControl,
 }: {
 	mode: RuntimeWorkspaceChangesMode;
 	onModeChange: (mode: RuntimeWorkspaceChangesMode) => void;
 	isExpanded: boolean;
 	onToggleExpand: () => void;
 	hideExpand?: boolean;
+	/** B-6: review action + verdict, shown for Review-column tasks. */
+	reviewControl?: ReactNode;
 }): React.ReactElement {
 	return (
 		<div className="flex items-center gap-1 border-b border-divider px-2 py-1">
@@ -294,13 +298,14 @@ function DiffToolbar({
 					Last Turn
 				</DiffModeButton>
 			</div>
+			{reviewControl ? <div className="ml-auto">{reviewControl}</div> : null}
 			{!hideExpand ? (
 				<Button
 					variant="ghost"
 					size="sm"
 					icon={isExpanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
 					onClick={onToggleExpand}
-					className="ml-auto h-5"
+					className={cn("h-5", !reviewControl && "ml-auto")}
 					aria-label={isExpanded ? "Collapse split diff view" : "Expand split diff view"}
 				/>
 			) : null}
@@ -520,6 +525,15 @@ export function CardDetailView({
 	const detailDiffFileTreePanelFlex = `0 0 ${detailDiffFileTreePanelPercent}`;
 	const showMoveToTrashActions = selection.column.id === "review" || selection.column.id === "in_progress";
 	const showCompleteActions = selection.column.id === "review";
+	const reviewControl =
+		selection.column.id === "review" ? (
+			<TaskReviewControl
+				workspaceId={currentProjectId}
+				taskId={selection.card.id}
+				description={selection.card.prompt}
+				taskTitle={selection.card.title ?? null}
+			/>
+		) : null;
 	const isTaskTerminalEnabled = selection.column.id === "in_progress" || selection.column.id === "review";
 	const effectiveTaskAgentId = sessionSummary?.agentId ?? selection.card.agentId ?? selectedAgentId;
 	const showClineAgentChatPanel = isNativeClineAgentSelected(effectiveTaskAgentId);
@@ -741,6 +755,7 @@ export function CardDetailView({
 									isExpanded={false}
 									onToggleExpand={handleToggleDiffExpand}
 									hideExpand
+									reviewControl={reviewControl}
 								/>
 							) : null}
 							<div className="flex min-h-0 flex-1">
@@ -882,6 +897,7 @@ export function CardDetailView({
 										onModeChange={setDiffMode}
 										isExpanded={isDiffExpanded}
 										onToggleExpand={handleToggleDiffExpand}
+										reviewControl={reviewControl}
 									/>
 								) : null}
 								<div className="flex min-h-0 flex-1">

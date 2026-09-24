@@ -38,6 +38,7 @@ import { compactClineConversationMessages } from "../../../src/cline-sdk/cline-c
 import {
 	evaluateClineContextRecoveryBudget,
 	evaluateClineRecoveryRequirements,
+	findClineUnresolvedToolCalls,
 	isContextOverflowError,
 } from "../../../src/cline-sdk/cline-context-recovery";
 import type { ClineSdkPersistedMessage } from "../../../src/cline-sdk/sdk-runtime-boundary";
@@ -301,6 +302,24 @@ describe("B-3.2 compactClineConversationMessages", () => {
 		expect(orphanToolResultIds(result.messages)).toEqual([]);
 	});
 });
+describe("B-3.5 unresolved tool calls (pure)", () => {
+	it("reports tool_use blocks without a matching tool_result", () => {
+		const messages: ClineSdkPersistedMessage[] = [
+			{ role: "user", content: "Requirements" },
+			{
+				role: "assistant",
+				content: [
+					{ type: "tool_use", id: "done", name: "read_files", input: {} },
+					{ type: "tool_use", id: "pending", name: "run_commands", input: {} },
+				],
+			},
+			{ role: "user", content: [{ type: "tool_result", tool_use_id: "done", content: "ok" }] },
+		];
+		expect(findClineUnresolvedToolCalls(messages)).toEqual([{ id: "pending", name: "run_commands" }]);
+		expect(findClineUnresolvedToolCalls(messages.slice(0, 1))).toEqual([]);
+	});
+});
+
 describe("B-3.4/B-3.7 recovery budget verdicts (pure)", () => {
 	describe("evaluateClineRecoveryRequirements (B-3.4)", () => {
 		it("skips the check when the transcript carries no user message", () => {
@@ -881,5 +900,37 @@ describe("context overflow recovery through the task session service (B-3)", () 
 		const restarted = after.store.messagesFor(restartedId);
 		expect(String(restarted[0]?.content ?? "").startsWith(COMPACTION_NOTICE_PREFIX)).toBe(true);
 		expect(after.service.getSummary(taskId)?.reviewReason).not.toBe("error");
+	});
+	it("pauses instead of resending when a tool call's completion is unknown (B-3.5)", async () => {
+		const harness = createTaskSessionServiceHarness({
+			onTurn: (context) => {
+				if (context.turnCount >= 2) {
+					throw new Error(OPENAI_OVERFLOW_ERROR);
+				}
+				return `reply ${context.turnCount}`;
+			},
+		});
+		services.push(harness);
+		const { service, host } = harness;
+		const taskId = "task-b3-unresolved-tool";
+
+		await startFirstTurn(harness, taskId, {
+			compaction: SMALL_COMPACTION,
+			initialMessages: [
+				{ role: "user", content: "Requirements" },
+				{
+					role: "assistant",
+					content: [{ type: "tool_use", id: "t-pending", name: "run_commands", input: { commands: ["make"] } }],
+				},
+			],
+		});
+		await service.sendTaskSessionInput(taskId, "Follow up prompt");
+		await vi.waitFor(() => {
+			expect(service.getSummary(taskId)?.reviewReason).toBe("error");
+		});
+
+		expect(host.startedConfigs.length).toBe(1);
+		expect(service.getSummary(taskId)?.warningMessage).toContain("no recorded result");
+		expect(service.getSummary(taskId)?.warningMessage).toContain("run_commands");
 	});
 });

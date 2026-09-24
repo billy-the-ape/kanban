@@ -4,6 +4,7 @@ import type { RuntimeTaskSessionSummary, RuntimeWorkspaceChangesResponse } from 
 
 const workspaceTaskWorktreeMocks = vi.hoisted(() => ({
 	resolveTaskCwd: vi.fn(),
+	deleteTaskWorktree: vi.fn(),
 }));
 
 const workspaceChangesMocks = vi.hoisted(() => ({
@@ -14,7 +15,7 @@ const workspaceChangesMocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../../../src/workspace/task-worktree.js", () => ({
-	deleteTaskWorktree: vi.fn(),
+	deleteTaskWorktree: workspaceTaskWorktreeMocks.deleteTaskWorktree,
 	ensureTaskWorktreeIfDoesntExist: vi.fn(),
 	getTaskWorkspaceInfo: vi.fn(),
 	resolveTaskCwd: workspaceTaskWorktreeMocks.resolveTaskCwd,
@@ -323,5 +324,66 @@ describe("createWorkspaceApi loadChanges", () => {
 		expect(response).toBe(emptyResponse);
 		expect(workspaceChangesMocks.createEmptyWorkspaceChangesResponse).toHaveBeenCalledWith("/tmp/repo");
 		expect(workspaceChangesMocks.getWorkspaceChanges).not.toHaveBeenCalled();
+	});
+});
+
+describe("createWorkspaceApi deleteWorktree (B-5.5)", () => {
+	const scope = { workspaceId: "workspace-1", workspacePath: "/tmp/repo" };
+
+	function createApi(states: {
+		cline: RuntimeTaskSessionSummary["state"] | null;
+		terminal: RuntimeTaskSessionSummary["state"] | null;
+	}) {
+		return createWorkspaceApi({
+			ensureTerminalManagerForWorkspace: vi.fn(
+				async () =>
+					({
+						getSummary: vi.fn(() => (states.terminal ? createSummary({ state: states.terminal }) : null)),
+					}) as never,
+			),
+			getScopedClineTaskSessionService: vi.fn(
+				async () =>
+					({
+						getSummary: vi.fn(() => (states.cline ? createSummary({ state: states.cline }) : null)),
+					}) as never,
+			),
+			broadcastRuntimeWorkspaceStateUpdated: vi.fn(),
+			broadcastRuntimeProjectsUpdated: vi.fn(),
+			buildWorkspaceStateSnapshot: vi.fn(),
+		});
+	}
+
+	beforeEach(() => {
+		workspaceTaskWorktreeMocks.deleteTaskWorktree.mockReset();
+		workspaceTaskWorktreeMocks.deleteTaskWorktree.mockResolvedValue({
+			ok: true,
+			removed: true,
+			preserved: true,
+			blockedReason: null,
+		});
+	});
+
+	it("refuses to remove a worktree while the task's agent session is running", async () => {
+		for (const states of [
+			{ cline: "running" as const, terminal: null },
+			{ cline: null, terminal: "running" as const },
+		]) {
+			const response = await createApi(states).deleteWorktree(scope, { taskId: "task-1" });
+			expect(response.ok).toBe(false);
+			expect(response.removed).toBe(false);
+			expect(response.blockedReason).toMatch(/still running/);
+		}
+		expect(workspaceTaskWorktreeMocks.deleteTaskWorktree).not.toHaveBeenCalled();
+	});
+
+	it("removes the worktree once no writer is active", async () => {
+		const response = await createApi({ cline: "interrupted", terminal: null }).deleteWorktree(scope, {
+			taskId: "task-1",
+		});
+		expect(response.removed).toBe(true);
+		expect(workspaceTaskWorktreeMocks.deleteTaskWorktree).toHaveBeenCalledWith({
+			repoPath: "/tmp/repo",
+			taskId: "task-1",
+		});
 	});
 });

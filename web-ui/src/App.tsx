@@ -35,6 +35,7 @@ import { createIdleTaskSession } from "@/hooks/app-utils";
 import { KanbanAccessBlockedFallback } from "@/hooks/kanban-access-blocked-fallback";
 import { RuntimeDisconnectedFallback } from "@/hooks/runtime-disconnected-fallback";
 import { useAppHotkeys } from "@/hooks/use-app-hotkeys";
+import { useBlockedTaskCleanups } from "@/hooks/use-blocked-task-cleanups";
 import { useBoardInteractions } from "@/hooks/use-board-interactions";
 import { useDebugTools } from "@/hooks/use-debug-tools";
 import { useDetailTaskNavigation } from "@/hooks/use-detail-task-navigation";
@@ -603,6 +604,7 @@ export default function App(): ReactElement {
 		deterministicDeliveryEnabled: runtimeProjectConfig?.gitDeliveryPolicy?.enabled === true,
 		backendTaskDispatchEnabled: runtimeProjectConfig?.taskDispatchPolicy?.enabled === true,
 	});
+	const cleanupBlockedReasonByTaskId = useBlockedTaskCleanups(currentProjectId, board);
 
 	const {
 		handleCreateAndStartTask,
@@ -956,6 +958,7 @@ export default function App(): ReactElement {
 												openPrTaskLoadingById={openPrTaskLoadingById}
 												moveToTrashLoadingById={moveToTrashLoadingById}
 												completeTaskLoadingById={completeTaskLoadingById}
+												cleanupBlockedReasonByTaskId={cleanupBlockedReasonByTaskId}
 												onMoveToTrashTask={handleMoveReviewCardToTrash}
 												onCompleteTask={handleCompleteReviewCard}
 												onRestoreFromTrashTask={handleRestoreTaskFromTrash}
