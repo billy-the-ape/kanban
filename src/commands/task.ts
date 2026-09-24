@@ -1250,6 +1250,32 @@ async function deliveryInfoTaskCommand(input: {
 	return { ...info, workspacePath: workspaceRepoPath };
 }
 
+// B-10: operational controls & diagnostics.
+
+async function taskStatusCommand(input: { cwd: string; taskId: string; projectPath?: string }): Promise<JsonRecord> {
+	const { workspaceRepoPath, runtimeClient } = await connectTaskWorkspace(input);
+	const diagnostics = await runtimeClient.runtime.getTaskDiagnostics.query({ taskId: input.taskId });
+	return { ...diagnostics, workspacePath: workspaceRepoPath };
+}
+
+async function taskQueueCommand(input: { cwd: string; projectPath?: string }): Promise<JsonRecord> {
+	const { workspaceRepoPath, runtimeClient } = await connectTaskWorkspace(input);
+	const state = await runtimeClient.workspace.getState.query();
+	const taskIds = state.board.columns.flatMap((column) => column.cards.map((card) => card.id));
+	const phases = await runtimeClient.runtime.getTaskPhases.query({ taskIds });
+	return { ...phases, workspacePath: workspaceRepoPath };
+}
+
+async function taskExportDiagnosticsCommand(input: {
+	cwd: string;
+	taskId: string;
+	projectPath?: string;
+}): Promise<JsonRecord> {
+	const { workspaceRepoPath, runtimeClient } = await connectTaskWorkspace(input);
+	const result = await runtimeClient.runtime.exportTaskDiagnostics.mutate({ taskId: input.taskId });
+	return { ...result, workspacePath: workspaceRepoPath };
+}
+
 async function deleteTaskCommand(input: {
 	cwd: string;
 	taskId?: string;
@@ -1649,6 +1675,54 @@ export function registerTaskCommand(program: Command): void {
 			await runTaskCommand(
 				async () =>
 					await recoverTaskCommand({
+						cwd: process.cwd(),
+						taskId: options.taskId,
+						projectPath: options.projectPath,
+					}),
+			);
+		});
+
+	task
+		.command("status")
+		.description(
+			"Show aggregated task diagnostics: pipeline phase, delivery/review/dispatch state, preserved work, and context usage.",
+		)
+		.requiredOption("--task-id <id>", "Task ID.")
+		.option("--project-path <path>", "Workspace path. Defaults to current directory workspace.")
+		.action(async (options: { taskId: string; projectPath?: string }) => {
+			await runTaskCommand(
+				async () =>
+					await taskStatusCommand({
+						cwd: process.cwd(),
+						taskId: options.taskId,
+						projectPath: options.projectPath,
+					}),
+			);
+		});
+
+	task
+		.command("queue")
+		.description("Show every task's reliable-completion phase (board chip data).")
+		.option("--project-path <path>", "Workspace path. Defaults to current directory workspace.")
+		.action(async (options: { projectPath?: string }) => {
+			await runTaskCommand(
+				async () =>
+					await taskQueueCommand({
+						cwd: process.cwd(),
+						projectPath: options.projectPath,
+					}),
+			);
+		});
+
+	task
+		.command("export-diag")
+		.description("Write the task's redacted diagnostic bundle to ~/.cline/kanban/diagnostics/ and print its path.")
+		.requiredOption("--task-id <id>", "Task ID.")
+		.option("--project-path <path>", "Workspace path. Defaults to current directory workspace.")
+		.action(async (options: { taskId: string; projectPath?: string }) => {
+			await runTaskCommand(
+				async () =>
+					await taskExportDiagnosticsCommand({
 						cwd: process.cwd(),
 						taskId: options.taskId,
 						projectPath: options.projectPath,

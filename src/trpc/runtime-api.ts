@@ -7,7 +7,11 @@ import { rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { TRPCError } from "@trpc/server";
-import { buildClineCompactionConfig } from "../cline-sdk/cline-compaction-config";
+import {
+	buildClineCompactionConfig,
+	CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT,
+} from "../cline-sdk/cline-compaction-config";
+import { buildTaskContextUsage } from "../cline-sdk/cline-context-usage";
 import { createClineMcpRuntimeService } from "../cline-sdk/cline-mcp-runtime-service";
 import { createClineMcpSettingsService } from "../cline-sdk/cline-mcp-settings-service";
 import { createClineProviderService } from "../cline-sdk/cline-provider-service";
@@ -22,7 +26,15 @@ import type {
 	RuntimeRunUpdateResponse,
 	RuntimeTaskDeliveryInfoResponse,
 	RuntimeTaskDeliveryStartResponse,
+	RuntimeTaskDiagnosticsActionResponse,
+	RuntimeTaskDiagnosticsResponse,
+	RuntimeTaskDispatchRecord,
+	RuntimeTaskPhaseSummary,
+	RuntimeTaskPhasesResponse,
+	RuntimeTaskPreservationInfoResponse,
+	RuntimeTaskReviewInfoResponse,
 	RuntimeTaskSessionStartRequest,
+	RuntimeTaskSessionSummary,
 	RuntimeUpdateStatusResponse,
 } from "../core/api-contract";
 import {
@@ -36,6 +48,7 @@ import {
 	parseClineProviderSettingsSaveRequest,
 	parseClineUpdateProviderRequest,
 	parseCommandRunRequest,
+	parseDiagnosticsExportRequest,
 	parseRuntimeConfigSaveRequest,
 	parseShellSessionStartRequest,
 	parseTaskChatAbortRequest,
@@ -45,6 +58,9 @@ import {
 	parseTaskChatSendRequest,
 	parseTaskDeliveryInfoRequest,
 	parseTaskDeliveryStartRequest,
+	parseTaskDiagnosticsActionRequest,
+	parseTaskDiagnosticsRequest,
+	parseTaskPhasesRequest,
 	parseTaskReviewInfoRequest,
 	parseTaskReviewStartRequest,
 	parseTaskSessionInputRequest,
@@ -52,9 +68,12 @@ import {
 	parseTaskSessionStopRequest,
 } from "../core/api-validation";
 import { isHomeAgentSessionId } from "../core/home-agent-session";
+import { computeTaskPhase, type TaskPhaseInput } from "../core/task-diagnostics";
 import { resolveTaskTitle } from "../core/task-title.js";
+import { lockedFileSystem } from "../fs/locked-file-system";
 import { openInBrowser } from "../server/browser";
-import { loadWorkspaceBoardById, mutateWorkspaceState } from "../state/workspace-state";
+import { getRuntimeHomePath, loadWorkspaceBoardById, mutateWorkspaceState } from "../state/workspace-state";
+import { readTaskDispatchRecord } from "../task-dispatch/dispatch-records";
 import {
 	getTaskDispatchStatus,
 	reconcileTaskDispatch,
@@ -65,7 +84,7 @@ import { buildRuntimeConfigResponse, resolveAgentCommand } from "../terminal/age
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { evaluateDependentsUnlock, getGitDeliveryService, readTaskDeliveryReceipt } from "../workspace/git-delivery";
 import { findTaskBaseRef } from "../workspace/task-review-handoff";
-import { resolveTaskCwd } from "../workspace/task-worktree";
+import { getTaskPreservationInfo, recoverTaskWorktree, resolveTaskCwd } from "../workspace/task-worktree";
 import { captureTaskTurnCheckpoint } from "../workspace/turn-checkpoints";
 import type { RuntimeTrpcContext, RuntimeTrpcWorkspaceScope } from "./app-router";
 
@@ -213,6 +232,296 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		});
 	};
 
+	// B-10: shared raw-data snapshot for task diagnostics. The core gather is
+	// cheap (durable records + in-memory summaries) so the batched phases
+	// endpoint can afford it per task; the context snapshot (full transcript)
+	// is only fetched for the single-task diagnostics and export paths.
+	type TaskContextSnapshot = Awaited<ReturnType<ClineTaskSessionService["getTaskContextSnapshot"]>>;
+
+	interface TaskDiagnosticsCore {
+		task: { id: string; title: string; columnId: string; updatedAt: number } | null;
+		/** The card's prompt — the authoritative description a review retry needs. */
+		taskPrompt: string | null;
+		baseRef: string | null;
+		delivery: RuntimeTaskDeliveryInfoResponse;
+		review: RuntimeTaskReviewInfoResponse;
+		dispatchRecord: RuntimeTaskDispatchRecord | null;
+		preservation: RuntimeTaskPreservationInfoResponse | null;
+		sessionSummary: RuntimeTaskSessionSummary | null;
+	}
+
+	const gatherTaskDiagnosticsCore = async (
+		workspaceScope: RuntimeTrpcWorkspaceScope,
+		taskId: string,
+	): Promise<TaskDiagnosticsCore> => {
+		const board = await loadWorkspaceBoardById(workspaceScope.workspaceId).catch(() => null);
+		const columnWithTask = board?.columns.find((column) => column.cards.some((card) => card.id === taskId));
+		const card = columnWithTask?.cards.find((c) => c.id === taskId) ?? null;
+		// Reuse the exact procedure behavior (including the cross-workspace
+		// receipt filter) rather than duplicating it here.
+		const [delivery, review, dispatchRecord, preservation, clineTaskSessionService] = await Promise.all([
+			runtimeApi.getTaskDeliveryInfo(workspaceScope, { taskId }),
+			runtimeApi.getTaskReviewInfo(workspaceScope, { taskId }),
+			readTaskDispatchRecord(taskId).catch(() => null),
+			getTaskPreservationInfo({ repoPath: workspaceScope.workspacePath, taskId }).catch(() => null),
+			deps.getScopedClineTaskSessionService(workspaceScope).catch(() => null),
+		]);
+		const sessionSummary = (clineTaskSessionService?.getSummary(taskId) ?? null) as RuntimeTaskSessionSummary | null;
+
+		return {
+			task:
+				card && columnWithTask
+					? {
+							id: card.id,
+							title: card.title,
+							columnId: columnWithTask.id,
+							updatedAt: card.updatedAt,
+						}
+					: null,
+			taskPrompt: card?.prompt ?? null,
+			baseRef: card?.baseRef ?? delivery.receipt?.baseRef ?? null,
+			delivery,
+			review,
+			dispatchRecord,
+			preservation,
+			sessionSummary,
+		};
+	};
+
+	const gatherTaskDiagnosticsSnapshot = async (
+		workspaceScope: RuntimeTrpcWorkspaceScope,
+		taskId: string,
+	): Promise<TaskDiagnosticsCore & { contextSnapshot: TaskContextSnapshot }> => {
+		const core = await gatherTaskDiagnosticsCore(workspaceScope, taskId);
+		const contextSnapshot = core.sessionSummary
+			? await deps
+					.getScopedClineTaskSessionService(workspaceScope)
+					.then((service) => service.getTaskContextSnapshot(taskId))
+					.catch(() => null)
+			: null;
+		return { ...core, contextSnapshot };
+	};
+
+	const isSessionActive = (summary: RuntimeTaskSessionSummary | null): boolean =>
+		summary !== null && (summary.state === "running" || summary.state === "awaiting_review");
+
+	/** Map the raw snapshot onto the pure phase computation's input. */
+	const buildTaskPhaseInput = (core: TaskDiagnosticsCore): TaskPhaseInput => {
+		const receipt = core.delivery.receipt;
+		const preservationRecord = core.preservation?.preservation ?? null;
+		return {
+			sessionActive: isSessionActive(core.sessionSummary),
+			deliveryStatus: receipt?.status ?? null,
+			deliveryStage: receipt?.stage ?? null,
+			deliveryEvidence: receipt?.evidence ?? [],
+			reviewStatus: core.review.status,
+			reviewError: core.review.error,
+			dispatchStatus: core.dispatchRecord?.status ?? null,
+			dispatchError: core.dispatchRecord?.error ?? null,
+			preservationStatus: preservationRecord?.status ?? "none",
+			preservationBlockedReasons: preservationRecord?.blockedReasons ?? [],
+			worktreeExists: core.preservation?.worktreeExists ?? false,
+		};
+	};
+
+	const buildEmptyContextUsage = (error: string | null) => ({
+		ok: error === null,
+		source: "unavailable" as const,
+		messageCount: null,
+		estimatedMessageTokens: null,
+		effectiveCapacityTokens: null,
+		triggerTokens: null,
+		utilizationRatio: null,
+		lastCompaction: null,
+		historyOmitted: false,
+		omittedHistoryNotice: null,
+		error,
+	});
+
+	/**
+	 * B-10.4: assemble the context-usage payload from the transcript snapshot
+	 * and the resolved capacity. Trigger level is the compaction trigger
+	 * (window - output reserve), matching what the session will actually do.
+	 */
+	const buildDiagnosticsContextUsage = async (
+		workspaceScope: RuntimeTrpcWorkspaceScope,
+		snapshot: TaskDiagnosticsCore & { contextSnapshot: TaskContextSnapshot },
+	) => {
+		const scopedRuntimeConfig = await deps.loadScopedRuntimeConfig(workspaceScope);
+		const contextBudget = scopedRuntimeConfig.contextBudget ?? null;
+		const effectiveContextWindow = await clineProviderService
+			.resolveEffectiveContextWindow(contextBudget?.contextWindowOverrideTokens ?? null)
+			.catch(() => null);
+		const effectiveCapacityTokens = effectiveContextWindow?.limitTokens ?? null;
+		const reserveTokens = contextBudget?.outputReserveTokens ?? CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT;
+		const triggerTokens =
+			effectiveCapacityTokens !== null ? Math.max(0, effectiveCapacityTokens - reserveTokens) : null;
+		const { contextSnapshot } = snapshot;
+		return buildTaskContextUsage({
+			messages: contextSnapshot ? contextSnapshot.messages.map((message) => ({ content: message.content })) : null,
+			effectiveCapacityTokens,
+			triggerTokens,
+			lastCompaction: contextSnapshot?.lastCompaction ?? null,
+		});
+	};
+
+	const buildEmptyDiagnosticsResponse = (error: string | null): RuntimeTaskDiagnosticsResponse => ({
+		ok: error === null,
+		task: null,
+		phase: "idle",
+		lastSuccessfulPhase: null,
+		needsAttention: false,
+		blockedReason: null,
+		branch: null,
+		commit: null,
+		baseRef: null,
+		baseSha: null,
+		workspace: { worktreePath: null, exists: false },
+		preservedWork: {
+			status: "none",
+			refName: null,
+			patchPath: null,
+			archivePath: null,
+			latestCommit: null,
+			blockedReasons: [],
+			preservedAt: null,
+		},
+		delivery: {
+			ok: error === null,
+			receipt: null,
+			error,
+			dependentsUnlock: { allowed: false, reason: error ?? "No delivery receipt." },
+		},
+		review: {
+			ok: error === null,
+			status: null,
+			handoff: null,
+			result: null,
+			candidateTreeHash: null,
+			resultMatchesTree: null,
+			error,
+			warnings: [],
+			verification: null,
+		},
+		dispatchRecord: null,
+		session: { summary: null, active: false },
+		context: buildEmptyContextUsage(error),
+		actions: {
+			retry_phase: { enabled: false, reason: error ?? "No failed phase to retry." },
+			resume_repair: { enabled: false, reason: error ?? "No delivery to resume." },
+			cancel: { enabled: false, reason: error ?? "No active session to cancel." },
+			recover_workspace: { enabled: false, reason: error ?? "No preserved work for this task." },
+		},
+		error,
+	});
+
+	/** B-10.2: assemble the aggregated diagnostics response from a snapshot. */
+	const buildTaskDiagnosticsResponse = async (
+		workspaceScope: RuntimeTrpcWorkspaceScope,
+		snapshot: TaskDiagnosticsCore & { contextSnapshot: TaskContextSnapshot },
+	): Promise<RuntimeTaskDiagnosticsResponse> => {
+		const phase = computeTaskPhase(buildTaskPhaseInput(snapshot));
+		const receipt = snapshot.delivery.receipt;
+		const preservation = snapshot.preservation;
+		const preservationRecord = preservation?.preservation ?? null;
+		return {
+			ok: true,
+			task: snapshot.task,
+			phase: phase.phase,
+			lastSuccessfulPhase: phase.lastSuccessfulPhase,
+			needsAttention: phase.needsAttention,
+			blockedReason: phase.blockedReason,
+			branch: receipt?.destinationBranch ?? null,
+			commit: receipt?.taskCommitSha ?? (preservation?.worktreeExists ? preservation.headCommit : null) ?? null,
+			baseRef: snapshot.baseRef,
+			baseSha: receipt?.baseSha ?? preservationRecord?.startingCommit ?? null,
+			workspace: {
+				worktreePath: preservation?.worktreePath ?? null,
+				exists: preservation?.worktreeExists ?? false,
+			},
+			preservedWork: {
+				status: preservationRecord?.status ?? "none",
+				refName: preservationRecord?.refName ?? null,
+				patchPath: preservationRecord?.patchPath ?? null,
+				archivePath: preservationRecord?.archivePath ?? null,
+				latestCommit: preservationRecord?.latestCommit ?? null,
+				blockedReasons: preservationRecord?.blockedReasons ?? [],
+				preservedAt: preservationRecord?.preservedAt
+					? new Date(preservationRecord.preservedAt).toISOString()
+					: null,
+			},
+			delivery: snapshot.delivery,
+			review: snapshot.review,
+			dispatchRecord: snapshot.dispatchRecord,
+			session: {
+				summary: snapshot.sessionSummary,
+				active: isSessionActive(snapshot.sessionSummary),
+			},
+			context: await buildDiagnosticsContextUsage(workspaceScope, snapshot),
+			actions: phase.actions,
+			error: null,
+		};
+	};
+
+	// B-10.3: in-flight dedup for diagnostics actions, keyed by
+	// workspace:task:action so a double-click or a UI+CLI race only runs the
+	// action once. The map holds the promise (never a flag) so concurrent
+	// callers join the same run and all see its outcome.
+	const taskDiagnosticsActionInFlight = new Map<string, Promise<RuntimeTaskDiagnosticsActionResponse>>();
+
+	/**
+	 * B-10.7: build the redacted export bundle. The full session transcript is
+	 * never written (only the aggregate context-usage figures), and the
+	 * dispatch record's fresh-context prompt is replaced by null. The
+	 * `redactions` list names every category of private material excluded so
+	 * the operator knows what is (and is not) in the file.
+	 */
+	const buildDiagnosticsExportBundle = (
+		diagnostics: RuntimeTaskDiagnosticsResponse,
+		contextSnapshot: TaskContextSnapshot,
+	): { bundle: Record<string, unknown>; redactions: string[] } => {
+		const redactions: string[] = [];
+		let dispatchRecord = diagnostics.dispatchRecord;
+		if (dispatchRecord?.prompt) {
+			redactions.push("dispatch_prompt");
+			dispatchRecord = { ...dispatchRecord, prompt: null };
+		}
+		const transcriptAvailable = contextSnapshot !== null && contextSnapshot.messages.length > 0;
+		if (transcriptAvailable) {
+			redactions.push("session_transcript");
+		}
+		return {
+			redactions,
+			bundle: {
+				schemaVersion: 1,
+				exportedAt: new Date().toISOString(),
+				task: diagnostics.task,
+				phase: diagnostics.phase,
+				lastSuccessfulPhase: diagnostics.lastSuccessfulPhase,
+				needsAttention: diagnostics.needsAttention,
+				blockedReason: diagnostics.blockedReason,
+				branch: diagnostics.branch,
+				commit: diagnostics.commit,
+				baseRef: diagnostics.baseRef,
+				baseSha: diagnostics.baseSha,
+				workspace: diagnostics.workspace,
+				preservedWork: diagnostics.preservedWork,
+				delivery: diagnostics.delivery,
+				review: diagnostics.review,
+				dispatchRecord,
+				session: {
+					// The live summary (no transcript content) is kept; the full
+					// message list is the redacted material.
+					summary: diagnostics.session.summary,
+					active: diagnostics.session.active,
+					transcriptRedacted: transcriptAvailable,
+				},
+				context: diagnostics.context,
+				actions: diagnostics.actions,
+			},
+		};
+	};
+
 	const runtimeApi: RuntimeTrpcContext["runtimeApi"] = {
 		loadConfig: async (workspaceScope) => {
 			const activeRuntimeConfig = deps.getActiveRuntimeConfig?.();
@@ -231,6 +540,27 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		},
 		saveConfig: async (workspaceScope, input) => {
 			const parsed = parseRuntimeConfigSaveRequest(input);
+			// B-10.6: the reliable-completion convenience switch expands into
+			// the underlying policies in the same save; any gate explicitly set
+			// in this request wins per-gate. Turning it on without any
+			// verification checks configured still derives as "not fully on" —
+			// the response's reliableCompletion block shows which gate is
+			// missing.
+			if (parsed.reliableCompletion !== undefined) {
+				const enabled = parsed.reliableCompletion;
+				if (parsed.reviewPolicy === undefined) {
+					parsed.reviewPolicy = { enabled: enabled ? "required" : "off" };
+				}
+				if (parsed.verification === undefined) {
+					parsed.verification = { enabled: enabled ? "required" : "off" };
+				}
+				if (parsed.gitDeliveryPolicy === undefined) {
+					parsed.gitDeliveryPolicy = { enabled, pushRequired: enabled };
+				}
+				if (parsed.taskDispatchPolicy === undefined) {
+					parsed.taskDispatchPolicy = { enabled };
+				}
+			}
 			let nextRuntimeConfig: RuntimeConfigState;
 			if (workspaceScope) {
 				nextRuntimeConfig = await updateRuntimeConfig(workspaceScope.workspacePath, parsed);
@@ -576,6 +906,44 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				};
 			}
 		},
+		// B-10: operational controls & diagnostics.
+		getTaskDiagnostics: async (workspaceScope, input): Promise<RuntimeTaskDiagnosticsResponse> => {
+			try {
+				const body = parseTaskDiagnosticsRequest(input);
+				const snapshot = await gatherTaskDiagnosticsSnapshot(workspaceScope, body.taskId);
+				return await buildTaskDiagnosticsResponse(workspaceScope, snapshot);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return buildEmptyDiagnosticsResponse(message);
+			}
+		},
+		// B-10.1: batched phase summaries for board chips. Tasks without any
+		// lifecycle artifact map to `idle` rather than failing the batch.
+		getTaskPhases: async (workspaceScope, input): Promise<RuntimeTaskPhasesResponse> => {
+			try {
+				const body = parseTaskPhasesRequest(input);
+				const phases: Record<string, RuntimeTaskPhaseSummary> = {};
+				await Promise.all(
+					body.taskIds.map(async (taskId) => {
+						try {
+							const core = await gatherTaskDiagnosticsCore(workspaceScope, taskId);
+							const phase = computeTaskPhase(buildTaskPhaseInput(core));
+							phases[taskId] = {
+								phase: phase.phase,
+								needsAttention: phase.needsAttention,
+								blockedReason: phase.blockedReason,
+							};
+						} catch {
+							phases[taskId] = { phase: "idle", needsAttention: false, blockedReason: null };
+						}
+					}),
+				);
+				return { ok: true, phases, error: null };
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return { ok: false, phases: {}, error: message };
+			}
+		},
 		// B-9: backend-owned sequential task dispatch ("reliable queue").
 		dispatchReadyTasks: async (workspaceScope) => {
 			return await runTaskDispatchPass(buildTaskDispatchDeps(workspaceScope));
@@ -585,6 +953,127 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		},
 		reconcileTaskDispatch: async (workspaceScope) => {
 			return await reconcileTaskDispatch(buildTaskDispatchDeps(workspaceScope));
+		},
+		// B-10.3: run an operator action with in-flight dedup. The action is
+		// re-checked against the current snapshot at run time (availability may
+		// have changed since the UI rendered the button), then delegated to the
+		// native handler for that phase.
+		runTaskDiagnosticsAction: async (workspaceScope, input): Promise<RuntimeTaskDiagnosticsActionResponse> => {
+			const body = parseTaskDiagnosticsActionRequest(input);
+			const dedupKey = `${workspaceScope.workspaceId}:${body.taskId}:${body.action}`;
+			const inFlight = taskDiagnosticsActionInFlight.get(dedupKey);
+			if (inFlight) {
+				const prior = await inFlight;
+				return { ...prior, deduplicated: true };
+			}
+			const run: Promise<RuntimeTaskDiagnosticsActionResponse> = (async () => {
+				try {
+					const core = await gatherTaskDiagnosticsCore(workspaceScope, body.taskId);
+					const availability = computeTaskPhase(buildTaskPhaseInput(core)).actions[body.action];
+					if (!availability.enabled) {
+						return {
+							ok: false,
+							action: body.action,
+							deduplicated: false,
+							result: null,
+							error: availability.reason ?? "This action is not available for the task's current state.",
+						};
+					}
+					switch (body.action) {
+						case "retry_phase":
+						case "resume_repair": {
+							// A durable receipt drives the resume from the last
+							// successful stage; a broken review without a receipt
+							// retries the review pass instead.
+							if (core.delivery.receipt) {
+								const response = await runtimeApi.startTaskDelivery(workspaceScope, {
+									taskId: body.taskId,
+								});
+								return {
+									ok: response.ok,
+									action: body.action,
+									deduplicated: false,
+									result: { kind: "delivery" as const, response },
+									error: response.ok ? null : (response.error ?? "Delivery retry failed."),
+								};
+							}
+							if (core.taskPrompt) {
+								const response = await runtimeApi.startTaskReview(workspaceScope, {
+									taskId: body.taskId,
+									description: core.taskPrompt,
+								});
+								return {
+									ok: response.ok,
+									action: body.action,
+									deduplicated: false,
+									result: { kind: "review" as const, response },
+									error: response.ok ? null : (response.error ?? "Review retry failed."),
+								};
+							}
+							return {
+								ok: false,
+								action: body.action,
+								deduplicated: false,
+								result: null,
+								error: "No delivery receipt or task prompt to retry; start the task session first.",
+							};
+						}
+						case "cancel": {
+							const response = await runtimeApi.stopTaskSession(workspaceScope, { taskId: body.taskId });
+							return {
+								ok: response.ok,
+								action: body.action,
+								deduplicated: false,
+								result: { kind: "cancel" as const, response },
+								error: response.ok ? null : (response.error ?? "Session cancel failed."),
+							};
+						}
+						case "recover_workspace": {
+							const response = await recoverTaskWorktree({
+								repoPath: workspaceScope.workspacePath,
+								taskId: body.taskId,
+							});
+							return {
+								ok: response.ok,
+								action: body.action,
+								deduplicated: false,
+								result: { kind: "recover_workspace" as const, response },
+								error: response.ok ? null : (response.error ?? "Workspace recovery failed."),
+							};
+						}
+					}
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					return {
+						ok: false,
+						action: body.action,
+						deduplicated: false,
+						result: null,
+						error: message,
+					};
+				} finally {
+					taskDiagnosticsActionInFlight.delete(dedupKey);
+				}
+			})();
+			taskDiagnosticsActionInFlight.set(dedupKey, run);
+			return await run;
+		},
+		// B-10.7: write the redacted diagnostic bundle for a task to
+		// ~/.cline/kanban/diagnostics/ (never into the workspace itself).
+		exportTaskDiagnostics: async (workspaceScope, input) => {
+			try {
+				const body = parseDiagnosticsExportRequest(input);
+				const snapshot = await gatherTaskDiagnosticsSnapshot(workspaceScope, body.taskId);
+				const diagnostics = await buildTaskDiagnosticsResponse(workspaceScope, snapshot);
+				const { bundle, redactions } = buildDiagnosticsExportBundle(diagnostics, snapshot.contextSnapshot);
+				const safeTaskId = body.taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
+				const bundlePath = join(getRuntimeHomePath(), "diagnostics", `task-${safeTaskId}-${Date.now()}.json`);
+				await lockedFileSystem.writeTextFileAtomic(bundlePath, JSON.stringify(bundle, null, 2));
+				return { ok: true, bundlePath, redactions, error: null };
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return { ok: false, bundlePath: null, redactions: [], error: message };
+			}
 		},
 		stopTaskSession: async (workspaceScope, input) => {
 			try {

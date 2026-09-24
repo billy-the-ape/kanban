@@ -12,6 +12,7 @@ import {
 	type RuntimeClineUpdateProviderRequest,
 	type RuntimeCommandRunRequest,
 	type RuntimeConfigSaveRequest,
+	type RuntimeDiagnosticsExportRequest,
 	type RuntimeDirectoryListRequest,
 	type RuntimeGitCheckoutRequest,
 	type RuntimeHookIngestRequest,
@@ -25,6 +26,9 @@ import {
 	type RuntimeTaskChatSendRequest,
 	type RuntimeTaskDeliveryInfoRequest,
 	type RuntimeTaskDeliveryStartRequest,
+	type RuntimeTaskDiagnosticsActionRequest,
+	type RuntimeTaskDiagnosticsRequest,
+	type RuntimeTaskPhasesRequest,
 	type RuntimeTaskPreservationRequest,
 	type RuntimeTaskReviewInfoRequest,
 	type RuntimeTaskReviewStartRequest,
@@ -49,6 +53,7 @@ import {
 	runtimeClineUpdateProviderRequestSchema,
 	runtimeCommandRunRequestSchema,
 	runtimeConfigSaveRequestSchema,
+	runtimeDiagnosticsExportRequestSchema,
 	runtimeDirectoryListRequestSchema,
 	runtimeGitCheckoutRequestSchema,
 	runtimeHookIngestRequestSchema,
@@ -62,6 +67,9 @@ import {
 	runtimeTaskChatSendRequestSchema,
 	runtimeTaskDeliveryInfoRequestSchema,
 	runtimeTaskDeliveryStartRequestSchema,
+	runtimeTaskDiagnosticsActionRequestSchema,
+	runtimeTaskDiagnosticsRequestSchema,
+	runtimeTaskPhasesRequestSchema,
 	runtimeTaskPreservationRequestSchema,
 	runtimeTaskReviewInfoRequestSchema,
 	runtimeTaskReviewStartRequestSchema,
@@ -332,6 +340,47 @@ export function parseTaskDeliveryInfoRequest(value: unknown): RuntimeTaskDeliver
 	const taskId = parsed.taskId.trim();
 	if (!taskId) {
 		throw new Error("Task delivery taskId cannot be empty.");
+	}
+	return {
+		taskId,
+	};
+}
+
+export function parseTaskDiagnosticsRequest(value: unknown): RuntimeTaskDiagnosticsRequest {
+	const parsed = parseWithSchema(runtimeTaskDiagnosticsRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Task diagnostics taskId cannot be empty.");
+	}
+	return {
+		taskId,
+	};
+}
+
+export function parseTaskDiagnosticsActionRequest(value: unknown): RuntimeTaskDiagnosticsActionRequest {
+	const parsed = parseWithSchema(runtimeTaskDiagnosticsActionRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Task diagnostics action taskId cannot be empty.");
+	}
+	return {
+		taskId,
+		action: parsed.action,
+	};
+}
+
+export function parseTaskPhasesRequest(value: unknown): RuntimeTaskPhasesRequest {
+	const parsed = parseWithSchema(runtimeTaskPhasesRequestSchema, value);
+	return {
+		taskIds: parsed.taskIds.map((taskId) => taskId.trim()).filter((taskId) => taskId.length > 0),
+	};
+}
+
+export function parseDiagnosticsExportRequest(value: unknown): RuntimeDiagnosticsExportRequest {
+	const parsed = parseWithSchema(runtimeDiagnosticsExportRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Diagnostics export taskId cannot be empty.");
 	}
 	return {
 		taskId,

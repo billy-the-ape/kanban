@@ -11,11 +11,12 @@ import {
 	formatClineSelectedModelButtonText,
 	resolveClineModelDisplayName,
 } from "@/components/detail-panels/cline-model-picker-options";
+import { TaskPhaseBadge } from "@/components/task-phase-badge";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/components/ui/cn";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip } from "@/components/ui/tooltip";
-import type { RuntimeTaskSessionSummary } from "@/runtime/types";
+import type { RuntimeTaskPhaseSummary, RuntimeTaskSessionSummary } from "@/runtime/types";
 import { useTaskWorkspaceSnapshotValue } from "@/stores/workspace-metadata-store";
 import type { BoardCard as BoardCardModel, BoardColumnId } from "@/types";
 import { getTaskAutoReviewCancelButtonLabel } from "@/types";
@@ -236,6 +237,7 @@ export function BoardCard({
 	isDependencyLinking = false,
 	workspacePath,
 	defaultClineModelId = null,
+	phaseSummary,
 }: {
 	card: BoardCardModel;
 	index: number;
@@ -262,6 +264,8 @@ export function BoardCard({
 	isDependencyLinking?: boolean;
 	workspacePath?: string | null;
 	defaultClineModelId?: string | null;
+	/** B-10.1: reliable-completion phase for the card chip (null = no phase). */
+	phaseSummary?: RuntimeTaskPhaseSummary;
 }): React.ReactElement {
 	const [isHovered, setIsHovered] = useState(false);
 	const [isEditingTitle, setIsEditingTitle] = useState(false);
@@ -609,6 +613,7 @@ export function BoardCard({
 										</p>
 									)}
 								</div>
+								{columnId !== "trash" ? <TaskPhaseBadge summary={phaseSummary} className="shrink-0" /> : null}
 								{columnId === "backlog" ? (
 									<Button
 										icon={<Play size={14} />}

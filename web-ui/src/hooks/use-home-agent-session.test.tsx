@@ -120,8 +120,16 @@ function createRuntimeConfig(overrides: Partial<RuntimeConfigResponse> = {}): Ru
 		verification: null,
 		gitDeliveryPolicy: null,
 		taskDispatchPolicy: null,
+		reliableCompletion: {
+			enabled: false,
+			reviewRequired: false,
+			checksRequired: false,
+			pushRequired: false,
+			dispatchEnabled: false,
+			workerLimit: 1,
+		},
 		...overrides,
-	};
+	} as RuntimeConfigResponse;
 }
 
 function createLegacyRuntimeConfig(overrides: Partial<RuntimeConfigResponse> = {}): RuntimeConfigResponse {

@@ -369,6 +369,11 @@ export function RuntimeSettingsDialog({
 	const [selectedAgentId, setSelectedAgentId] = useState<RuntimeAgentId>("claude");
 	const [agentAutonomousModeEnabled, setAgentAutonomousModeEnabled] = useState(true);
 	const [readyForReviewNotificationsEnabled, setReadyForReviewNotificationsEnabled] = useState(true);
+	// B-10.6: reliable completion master switch. `null` means "unchanged" so the
+	// save payload only sends the switch when the operator actually toggled it.
+	// The individual gates (review/checks/push/dispatch) are derived state read
+	// from `config.reliableCompletion` and are not edited here.
+	const [reliableCompletionEnabledDraft, setReliableCompletionEnabledDraft] = useState<boolean | null>(null);
 	const [initialThemeId, setInitialThemeId] = useState<ThemeId>(readStoredThemeId);
 	const [draftThemeId, setDraftThemeId] = useState<ThemeId>(readStoredThemeId);
 	const [notificationPermission, setNotificationPermission] = useState<BrowserNotificationPermission>("unsupported");
@@ -524,6 +529,8 @@ export function RuntimeSettingsDialog({
 		setSelectedAgentId(configuredAgentId ?? fallbackAgentId);
 		setAgentAutonomousModeEnabled(config?.agentAutonomousModeEnabled ?? true);
 		setReadyForReviewNotificationsEnabled(config?.readyForReviewNotificationsEnabled ?? true);
+		// B-10.6: reset the reliable completion master switch from saved config.
+		setReliableCompletionEnabledDraft(config?.reliableCompletion ? config.reliableCompletion.enabled : null);
 		setShortcuts(config?.shortcuts ?? []);
 		setCommitPromptTemplate(config?.commitPromptTemplate ?? "");
 		setOpenPrPromptTemplate(config?.openPrPromptTemplate ?? "");
@@ -533,6 +540,7 @@ export function RuntimeSettingsDialog({
 		config?.commitPromptTemplate,
 		config?.openPrPromptTemplate,
 		config?.readyForReviewNotificationsEnabled,
+		config?.reliableCompletion?.enabled,
 		config?.selectedAgentId,
 		config?.shortcuts,
 		fallbackAgentId,
@@ -674,7 +682,7 @@ export function RuntimeSettingsDialog({
 			return;
 		}
 		const selectedAgent = displayedAgents.find((agent) => agent.id === selectedAgentId);
-		if (!selectedAgent || selectedAgent.installed !== true) {
+		if (selectedAgent?.installed !== true) {
 			setSaveError("Selected agent is not installed. Install it first or choose an installed agent.");
 			return;
 		}
@@ -714,6 +722,12 @@ export function RuntimeSettingsDialog({
 			shortcuts,
 			commitPromptTemplate,
 			openPrPromptTemplate,
+			// B-10.6: send the reliable completion master switch only when the
+			// operator toggled it; the runtime expands it into the underlying
+			// review/verification/delivery/dispatch policies in the same save.
+			...(reliableCompletionEnabledDraft !== null && {
+				reliableCompletion: reliableCompletionEnabledDraft,
+			}),
 			// B-2.9: only send the context budget when the Cline agent is
 			// selected and the draft actually changed (empty fields send null,
 			// which clears them to the default).
@@ -828,6 +842,54 @@ export function RuntimeSettingsDialog({
 						<p className="text-text-secondary text-[13px] ml-6 mt-0 mb-0">
 							Allows agents to use tools without stopping for permission. Use at your own risk.
 						</p>
+					</div>
+
+					<div className="rounded-lg border border-border bg-surface-0 px-4 py-3 mb-4">
+						<h6 className="text-[12px] font-semibold uppercase tracking-wider text-text-secondary m-0 mb-1">
+							Reliable completion
+						</h6>
+						<div className="flex items-center gap-2">
+							<RadixSwitch.Root
+								checked={reliableCompletionEnabledDraft ?? config?.reliableCompletion?.enabled ?? false}
+								disabled={controlsDisabled || config === null}
+								onCheckedChange={setReliableCompletionEnabledDraft}
+								className="relative h-5 w-9 rounded-full bg-surface-4 data-[state=checked]:bg-accent cursor-pointer disabled:opacity-40"
+							>
+								<RadixSwitch.Thumb className="block h-4 w-4 rounded-full bg-white shadow-sm transition-transform translate-x-0.5 data-[state=checked]:translate-x-[18px]" />
+							</RadixSwitch.Root>
+							<span className="text-[13px] text-text-primary">Require reliable completion</span>
+						</div>
+						<p className="text-text-secondary text-[13px] mt-1 mb-0">
+							Turns on required review, verification checks, git delivery, and sequential dispatch. Per-task
+							custom prompts keep applying as before.
+						</p>
+						{config?.reliableCompletion ? (
+							<div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1">
+								{(
+									[
+										{ label: "Review required", on: config.reliableCompletion.reviewRequired },
+										{ label: "Checks required", on: config.reliableCompletion.checksRequired },
+										{ label: "Push required", on: config.reliableCompletion.pushRequired },
+										{ label: "Sequential dispatch", on: config.reliableCompletion.dispatchEnabled },
+									] as const
+								).map((gate) => (
+									<div key={gate.label} className="flex items-center gap-2 text-[13px]">
+										{gate.on ? (
+											<CircleDot size={12} className="text-status-green" />
+										) : (
+											<Circle size={12} className="text-text-tertiary" />
+										)}
+										<span className={gate.on ? "text-text-primary" : "text-text-secondary"}>
+											{gate.label}
+										</span>
+									</div>
+								))}
+								<div className="flex items-center gap-2 text-[13px] col-span-2">
+									<span className="text-text-secondary">Worker capacity:</span>
+									<span className="text-text-primary">{config.reliableCompletion.workerLimit}</span>
+								</div>
+							</div>
+						) : null}
 					</div>
 
 					{/* ---- Cline ---- */}

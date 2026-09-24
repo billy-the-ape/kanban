@@ -1450,6 +1450,24 @@ export const runtimeTaskDeliveryInfoResponseSchema = z.object({
 });
 export type RuntimeTaskDeliveryInfoResponse = z.infer<typeof runtimeTaskDeliveryInfoResponseSchema>;
 
+// B-10.6: reliable-completion pipeline status (derived; nothing extra stored).
+
+/**
+ * B-10.6: effective state of the reliable-completion pipeline, derived from
+ * the underlying policies so file edits and the toggle can never disagree.
+ */
+export const runtimeReliableCompletionStatusSchema = z.object({
+	/** True only when every gate is on (review, checks, push, dispatch). */
+	enabled: z.boolean(),
+	reviewRequired: z.boolean(),
+	/** "off" gate or no checks configured both count as not required. */
+	checksRequired: z.boolean(),
+	pushRequired: z.boolean(),
+	dispatchEnabled: z.boolean(),
+	workerLimit: z.number().int().min(1).max(4),
+});
+export type RuntimeReliableCompletionStatus = z.infer<typeof runtimeReliableCompletionStatusSchema>;
+
 export const runtimeConfigResponseSchema = z.object({
 	selectedAgentId: runtimeAgentIdSchema,
 	selectedShortcutLabel: z.string().nullable(),
@@ -1476,6 +1494,8 @@ export const runtimeConfigResponseSchema = z.object({
 	gitDeliveryPolicy: runtimeGitDeliveryPolicySchema.nullable(),
 	/** B-9: global sequential task dispatch policy; null means the queue is off (legacy browser auto-start). */
 	taskDispatchPolicy: runtimeTaskDispatchPolicySchema.nullable(),
+	/** B-10.6: derived reliable-completion pipeline status (no separate storage). */
+	reliableCompletion: runtimeReliableCompletionStatusSchema,
 	effectiveContextWindow: runtimeEffectiveContextWindowSchema.nullable(),
 });
 export type RuntimeConfigResponse = z.infer<typeof runtimeConfigResponseSchema>;
@@ -1497,6 +1517,11 @@ export const runtimeConfigSaveRequestSchema = z.object({
 	gitDeliveryPolicy: runtimeGitDeliveryPolicySaveSchema.optional(),
 	/** B-9: sequential task dispatch policy; `null` clears, `undefined` leaves untouched. */
 	taskDispatchPolicy: runtimeTaskDispatchPolicySaveSchema.optional(),
+	/**
+	 * B-10.6: convenience switch that expands into the underlying policies in
+	 * the same save (explicit fields in this request win per-gate).
+	 */
+	reliableCompletion: z.boolean().optional(),
 });
 export type RuntimeConfigSaveRequest = z.infer<typeof runtimeConfigSaveRequestSchema>;
 
@@ -1971,3 +1996,231 @@ export const runtimeHookIngestResponseSchema = z.object({
 	error: z.string().optional(),
 });
 export type RuntimeHookIngestResponse = z.infer<typeof runtimeHookIngestResponseSchema>;
+
+// ── B-10: operational controls & diagnostics ────────────────────────────────
+
+/**
+ * B-10.1: unified task phase — one read model over the review / delivery /
+ * dispatch lifecycles. Phases describe *what is happening now*, not where the
+ * card sits on the board; the board column stays the task state of record.
+ * `idle` is the no-active-work fallback, `needs_attention` is an overlay
+ * computed together with the concrete phase (a failed delivery is
+ * `needs_attention` with last successful phase `committing`).
+ */
+export const runtimeTaskPhaseSchema = z.enum([
+	"idle",
+	"implementing",
+	"reviewing",
+	"checking",
+	"committing",
+	"integrating",
+	"pushing",
+	"verifying_remote",
+	"done",
+	"needs_attention",
+]);
+export type RuntimeTaskPhase = z.infer<typeof runtimeTaskPhaseSchema>;
+
+/** B-10.3: backend actions exposed on the task detail view. */
+export const runtimeTaskDiagnosticsActionNameSchema = z.enum([
+	"retry_phase",
+	"resume_repair",
+	"cancel",
+	"recover_workspace",
+]);
+export type RuntimeTaskDiagnosticsActionName = z.infer<typeof runtimeTaskDiagnosticsActionNameSchema>;
+
+export const runtimeTaskActionAvailabilitySchema = z.object({
+	enabled: z.boolean(),
+	/** Human-readable reason when disabled (null when enabled). */
+	reason: z.string().nullable(),
+});
+export type RuntimeTaskActionAvailability = z.infer<typeof runtimeTaskActionAvailabilitySchema>;
+
+export const runtimeTaskDiagnosticsActionsSchema = z.object({
+	retry_phase: runtimeTaskActionAvailabilitySchema,
+	resume_repair: runtimeTaskActionAvailabilitySchema,
+	cancel: runtimeTaskActionAvailabilitySchema,
+	recover_workspace: runtimeTaskActionAvailabilitySchema,
+});
+export type RuntimeTaskDiagnosticsActions = z.infer<typeof runtimeTaskDiagnosticsActionsSchema>;
+
+// B-10.4: context usage. Every token figure is a chars/4 estimate — the API
+// never reports exact provider token counts.
+
+/** Durable record of the task's most recent compaction event. */
+export const runtimeClineContextCompactionEventSchema = z.object({
+	/** ISO timestamp of the compaction. */
+	at: z.string().min(1),
+	/** "proactive" = budget compaction, "overflow" = post-overflow recovery. */
+	trigger: z.enum(["proactive", "overflow"]),
+	tokensBefore: z.number().int().min(0),
+	tokensAfter: z.number().int().min(0),
+	messagesBefore: z.number().int().min(0),
+	messagesAfter: z.number().int().min(0),
+});
+export type RuntimeClineContextCompactionEvent = z.infer<typeof runtimeClineContextCompactionEventSchema>;
+
+export const runtimeClineContextUsageResponseSchema = z.object({
+	ok: z.boolean(),
+	/** "estimated" when numbers are available (chars/4), "unavailable" otherwise. */
+	source: z.enum(["estimated", "unavailable"]),
+	messageCount: z.number().int().min(0).nullable(),
+	estimatedMessageTokens: z.number().int().min(0).nullable(),
+	/** Resolved effective context limit (override -> provider window -> fallback). */
+	effectiveCapacityTokens: z.number().int().min(0).nullable(),
+	/** Message-token level at which compaction fires (window - reserve). */
+	triggerTokens: z.number().int().min(0).nullable(),
+	/** estimatedMessageTokens / effectiveCapacityTokens (null when unknown). */
+	utilizationRatio: z.number().min(0).nullable(),
+	lastCompaction: runtimeClineContextCompactionEventSchema.nullable(),
+	/** True when a compaction removed history from what the model can see. */
+	historyOmitted: z.boolean(),
+	/** Explains that compaction is lossy; null when no history was omitted. */
+	omittedHistoryNotice: z.string().nullable(),
+	error: z.string().nullable(),
+});
+export type RuntimeClineContextUsageResponse = z.infer<typeof runtimeClineContextUsageResponseSchema>;
+
+// B-10.2: aggregated task diagnostics.
+
+export const runtimeTaskDiagnosticsRequestSchema = z.object({
+	taskId: z.string().min(1),
+});
+export type RuntimeTaskDiagnosticsRequest = z.infer<typeof runtimeTaskDiagnosticsRequestSchema>;
+
+export const runtimeTaskDiagnosticsActionRequestSchema = z.object({
+	taskId: z.string().min(1),
+	action: runtimeTaskDiagnosticsActionNameSchema,
+});
+export type RuntimeTaskDiagnosticsActionRequest = z.infer<typeof runtimeTaskDiagnosticsActionRequestSchema>;
+
+export const runtimeTaskDiagnosticsTaskInfoSchema = z.object({
+	id: z.string(),
+	title: z.string(),
+	columnId: z.string(),
+	updatedAt: z.number().int(),
+});
+export type RuntimeTaskDiagnosticsTaskInfo = z.infer<typeof runtimeTaskDiagnosticsTaskInfoSchema>;
+
+export const runtimeTaskDiagnosticsWorkspaceSchema = z.object({
+	worktreePath: z.string().nullable(),
+	/** True when the worktree directory currently exists on disk. */
+	exists: z.boolean(),
+});
+export type RuntimeTaskDiagnosticsWorkspace = z.infer<typeof runtimeTaskDiagnosticsWorkspaceSchema>;
+
+/** B-10.2: preserved work (B-5) as surfaced for operators. */
+export const runtimeTaskDiagnosticsPreservedWorkSchema = z.object({
+	/** "none" when no preservation record exists for the task. */
+	status: z.enum(["none", "active", "preserved", "blocked"]),
+	refName: z.string().nullable(),
+	patchPath: z.string().nullable(),
+	archivePath: z.string().nullable(),
+	latestCommit: z.string().nullable(),
+	blockedReasons: z.array(z.string()),
+	preservedAt: z.string().nullable(),
+});
+export type RuntimeTaskDiagnosticsPreservedWork = z.infer<typeof runtimeTaskDiagnosticsPreservedWorkSchema>;
+
+export const runtimeTaskDiagnosticsResponseSchema = z.object({
+	ok: z.boolean(),
+	/** null when the task no longer exists on the board. */
+	task: runtimeTaskDiagnosticsTaskInfoSchema.nullable(),
+	phase: runtimeTaskPhaseSchema,
+	/** Last phase that completed successfully (null before anything ran). */
+	lastSuccessfulPhase: runtimeTaskPhaseSchema.nullable(),
+	needsAttention: z.boolean(),
+	/** Primary operator-facing explanation when needs attention (null otherwise). */
+	blockedReason: z.string().nullable(),
+	/** Task worktree branch (receipt/integration branch; null when unknown). */
+	branch: z.string().nullable(),
+	/** Task commit: receipt task commit when present, else worktree HEAD. */
+	commit: z.string().nullable(),
+	baseRef: z.string().nullable(),
+	baseSha: z.string().nullable(),
+	workspace: runtimeTaskDiagnosticsWorkspaceSchema,
+	preservedWork: runtimeTaskDiagnosticsPreservedWorkSchema,
+	delivery: runtimeTaskDeliveryInfoResponseSchema,
+	review: runtimeTaskReviewInfoResponseSchema,
+	dispatchRecord: runtimeTaskDispatchRecordSchema.nullable(),
+	session: z.object({
+		summary: runtimeTaskSessionSummarySchema.nullable(),
+		/** True when a Cline session is running for the task right now. */
+		active: z.boolean(),
+	}),
+	context: runtimeClineContextUsageResponseSchema,
+	actions: runtimeTaskDiagnosticsActionsSchema,
+	error: z.string().nullable(),
+});
+export type RuntimeTaskDiagnosticsResponse = z.infer<typeof runtimeTaskDiagnosticsResponseSchema>;
+
+/** Per-action result payloads (the action's native response, tagged for the UI). */
+export const runtimeTaskDiagnosticsActionResultSchema = z.discriminatedUnion("kind", [
+	z.object({
+		kind: z.literal("delivery"),
+		response: runtimeTaskDeliveryStartResponseSchema,
+	}),
+	z.object({
+		kind: z.literal("review"),
+		response: runtimeTaskReviewStartResponseSchema,
+	}),
+	z.object({
+		kind: z.literal("cancel"),
+		response: runtimeTaskSessionStopResponseSchema,
+	}),
+	z.object({
+		kind: z.literal("recover_workspace"),
+		response: runtimeTaskWorktreeRecoverResponseSchema,
+	}),
+]);
+export type RuntimeTaskDiagnosticsActionResult = z.infer<typeof runtimeTaskDiagnosticsActionResultSchema>;
+
+export const runtimeTaskDiagnosticsActionResponseSchema = z.object({
+	ok: z.boolean(),
+	action: runtimeTaskDiagnosticsActionNameSchema,
+	/** True when this call joined an identical in-flight request (duplicate suppressed). */
+	deduplicated: z.boolean(),
+	result: runtimeTaskDiagnosticsActionResultSchema.nullable(),
+	error: z.string().nullable(),
+});
+export type RuntimeTaskDiagnosticsActionResponse = z.infer<typeof runtimeTaskDiagnosticsActionResponseSchema>;
+
+// B-10.1: batched phase summaries for board chips.
+
+export const runtimeTaskPhasesRequestSchema = z.object({
+	taskIds: z.array(z.string().min(1)).max(500),
+});
+export type RuntimeTaskPhasesRequest = z.infer<typeof runtimeTaskPhasesRequestSchema>;
+
+export const runtimeTaskPhaseSummarySchema = z.object({
+	phase: runtimeTaskPhaseSchema,
+	needsAttention: z.boolean(),
+	blockedReason: z.string().nullable(),
+});
+export type RuntimeTaskPhaseSummary = z.infer<typeof runtimeTaskPhaseSummarySchema>;
+
+export const runtimeTaskPhasesResponseSchema = z.object({
+	ok: z.boolean(),
+	/** taskId -> summary; ids without any lifecycle artifact map to `idle`. */
+	phases: z.record(z.string(), runtimeTaskPhaseSummarySchema),
+	error: z.string().nullable(),
+});
+export type RuntimeTaskPhasesResponse = z.infer<typeof runtimeTaskPhasesResponseSchema>;
+
+// B-10.7: redacted diagnostic export.
+
+export const runtimeDiagnosticsExportRequestSchema = z.object({
+	taskId: z.string().min(1),
+});
+export type RuntimeDiagnosticsExportRequest = z.infer<typeof runtimeDiagnosticsExportRequestSchema>;
+
+export const runtimeDiagnosticsExportResponseSchema = z.object({
+	ok: z.boolean(),
+	/** Absolute path of the written bundle (JSON); null on failure. */
+	bundlePath: z.string().nullable(),
+	/** Categories of private material excluded from the bundle. */
+	redactions: z.array(z.string()),
+	error: z.string().nullable(),
+});
+export type RuntimeDiagnosticsExportResponse = z.infer<typeof runtimeDiagnosticsExportResponseSchema>;

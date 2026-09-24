@@ -37,6 +37,8 @@ import type {
 	RuntimeConfigResponse,
 	RuntimeConfigSaveRequest,
 	RuntimeDebugResetAllStateResponse,
+	RuntimeDiagnosticsExportRequest,
+	RuntimeDiagnosticsExportResponse,
 	RuntimeDirectoryListRequest,
 	RuntimeDirectoryListResponse,
 	RuntimeFeaturebaseTokenResponse,
@@ -79,9 +81,15 @@ import type {
 	RuntimeTaskDeliveryInfoResponse,
 	RuntimeTaskDeliveryStartRequest,
 	RuntimeTaskDeliveryStartResponse,
+	RuntimeTaskDiagnosticsActionRequest,
+	RuntimeTaskDiagnosticsActionResponse,
+	RuntimeTaskDiagnosticsRequest,
+	RuntimeTaskDiagnosticsResponse,
 	RuntimeTaskDispatchReconcileResponse,
 	RuntimeTaskDispatchRunResponse,
 	RuntimeTaskDispatchStatusResponse,
+	RuntimeTaskPhasesRequest,
+	RuntimeTaskPhasesResponse,
 	RuntimeTaskPreservationInfoResponse,
 	RuntimeTaskPreservationRequest,
 	RuntimeTaskReviewInfoRequest,
@@ -142,6 +150,8 @@ import {
 	runtimeConfigResponseSchema,
 	runtimeConfigSaveRequestSchema,
 	runtimeDebugResetAllStateResponseSchema,
+	runtimeDiagnosticsExportRequestSchema,
+	runtimeDiagnosticsExportResponseSchema,
 	runtimeDirectoryListRequestSchema,
 	runtimeDirectoryListResponseSchema,
 	runtimeFeaturebaseTokenResponseSchema,
@@ -184,9 +194,15 @@ import {
 	runtimeTaskDeliveryInfoResponseSchema,
 	runtimeTaskDeliveryStartRequestSchema,
 	runtimeTaskDeliveryStartResponseSchema,
+	runtimeTaskDiagnosticsActionRequestSchema,
+	runtimeTaskDiagnosticsActionResponseSchema,
+	runtimeTaskDiagnosticsRequestSchema,
+	runtimeTaskDiagnosticsResponseSchema,
 	runtimeTaskDispatchReconcileResponseSchema,
 	runtimeTaskDispatchRunResponseSchema,
 	runtimeTaskDispatchStatusResponseSchema,
+	runtimeTaskPhasesRequestSchema,
+	runtimeTaskPhasesResponseSchema,
 	runtimeTaskPreservationInfoResponseSchema,
 	runtimeTaskPreservationRequestSchema,
 	runtimeTaskReviewInfoRequestSchema,
@@ -262,6 +278,26 @@ export interface RuntimeTrpcContext {
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskDeliveryInfoRequest,
 		) => Promise<RuntimeTaskDeliveryInfoResponse>;
+		/** B-10.2: aggregated task diagnostics (phase, delivery, review, dispatch, preservation, context). */
+		getTaskDiagnostics: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskDiagnosticsRequest,
+		) => Promise<RuntimeTaskDiagnosticsResponse>;
+		/** B-10.3: run an operator action (retry/resume/cancel/recover) with in-flight dedup. */
+		runTaskDiagnosticsAction: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskDiagnosticsActionRequest,
+		) => Promise<RuntimeTaskDiagnosticsActionResponse>;
+		/** B-10.1: batched phase summaries for board chips. */
+		getTaskPhases: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskPhasesRequest,
+		) => Promise<RuntimeTaskPhasesResponse>;
+		/** B-10.7: write the redacted diagnostic bundle to disk. */
+		exportTaskDiagnostics: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeDiagnosticsExportRequest,
+		) => Promise<RuntimeDiagnosticsExportResponse>;
 		/** B-9: backend-owned sequential task dispatch — run one queue pass for this workspace. */
 		dispatchReadyTasks: (scope: RuntimeTrpcWorkspaceScope) => Promise<RuntimeTaskDispatchRunResponse>;
 		/** B-9: read-only queue status (ready/blocked tasks, active worker, dispatch records). */
@@ -544,6 +580,31 @@ export const runtimeAppRouter = t.router({
 			.output(runtimeTaskDeliveryInfoResponseSchema)
 			.query(async ({ ctx, input }) => {
 				return await ctx.runtimeApi.getTaskDeliveryInfo(ctx.workspaceScope, input);
+			}),
+		// B-10: operational controls & diagnostics.
+		getTaskDiagnostics: workspaceProcedure
+			.input(runtimeTaskDiagnosticsRequestSchema)
+			.output(runtimeTaskDiagnosticsResponseSchema)
+			.query(async ({ ctx, input }) => {
+				return await ctx.runtimeApi.getTaskDiagnostics(ctx.workspaceScope, input);
+			}),
+		runTaskDiagnosticsAction: workspaceProcedure
+			.input(runtimeTaskDiagnosticsActionRequestSchema)
+			.output(runtimeTaskDiagnosticsActionResponseSchema)
+			.mutation(async ({ ctx, input }) => {
+				return await ctx.runtimeApi.runTaskDiagnosticsAction(ctx.workspaceScope, input);
+			}),
+		getTaskPhases: workspaceProcedure
+			.input(runtimeTaskPhasesRequestSchema)
+			.output(runtimeTaskPhasesResponseSchema)
+			.query(async ({ ctx, input }) => {
+				return await ctx.runtimeApi.getTaskPhases(ctx.workspaceScope, input);
+			}),
+		exportTaskDiagnostics: workspaceProcedure
+			.input(runtimeDiagnosticsExportRequestSchema)
+			.output(runtimeDiagnosticsExportResponseSchema)
+			.mutation(async ({ ctx, input }) => {
+				return await ctx.runtimeApi.exportTaskDiagnostics(ctx.workspaceScope, input);
 			}),
 		// B-9: backend-owned sequential task dispatch ("reliable queue").
 		dispatchReadyTasks: workspaceProcedure.output(runtimeTaskDispatchRunResponseSchema).mutation(async ({ ctx }) => {

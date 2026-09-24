@@ -51,6 +51,18 @@ vi.mock("../../../src/workspace/turn-checkpoints.js", () => ({
 	deleteTaskTurnCheckpointRef: turnCheckpointMocks.deleteTaskTurnCheckpointRef,
 }));
 
+const workspaceStateMocks = vi.hoisted(() => ({
+	getTaskWorktreesHomePath: vi.fn(),
+}));
+
+vi.mock("../../../src/state/workspace-state.js", async (importOriginal) => {
+	const original = await importOriginal<typeof import("../../../src/state/workspace-state")>();
+	return {
+		...original,
+		getTaskWorktreesHomePath: workspaceStateMocks.getTaskWorktreesHomePath,
+	};
+});
+
 beforeEach(() => {
 	turnCheckpointMocks.captureTaskTurnCheckpoint.mockReset();
 	turnCheckpointMocks.deleteTaskTurnCheckpointRef.mockReset();
@@ -140,6 +152,9 @@ async function waitForTurns(minTurns: number, timeoutMs: number): Promise<void> 
 
 beforeAll(async () => {
 	probeDir = mkdtempSync(join(tmpdir(), "kanban-b25-int-"));
+	// Task state (compaction event records) lives under the probe dir, so the
+	// session is self-contained and never writes into the real ~/.cline.
+	workspaceStateMocks.getTaskWorktreesHomePath.mockReturnValue(join(probeDir, "worktrees-home"));
 	savedEnv = {
 		CLINE_DIR: process.env.CLINE_DIR,
 		CLINE_LOG_ENABLED: process.env.CLINE_LOG_ENABLED,

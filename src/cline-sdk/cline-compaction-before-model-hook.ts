@@ -28,6 +28,8 @@
 //
 // All token values are chars/4 ESTIMATES (B-2.3 fallback estimator); logs
 // label them as such.
+
+import type { ClineCompactionObservedInfo } from "./cline-compaction-callback";
 import { computeClineCompactionSafetyMarginTokens, estimateClineToolSchemaTokens } from "./cline-compaction-config";
 import { estimateTextTokens } from "./cline-context-budget";
 import { toPositiveTokenCount } from "./cline-context-policy";
@@ -312,6 +314,12 @@ export interface CreateClineCompactionBeforeModelHookInput {
 	 */
 	safetyMarginTokens?: number;
 	logger?: ClineSdkBasicLogger;
+	/**
+	 * B-10.4: optional observer notified when the hook rewrote the request's
+	 * messages. Must never throw — the hook wraps the notification
+	 * defensively so a failing observer cannot break the model request path.
+	 */
+	onCompacted?: (info: ClineCompactionObservedInfo) => void;
 }
 
 /**
@@ -360,6 +368,21 @@ export function createClineCompactionBeforeModelHook(
 			messagesBefore: messages.length,
 			messagesAfter: result.messages.length,
 		});
+		// B-10.4: observe after the rewrite is settled; a failing observer
+		// must never break the model request path.
+		const onCompacted = input.onCompacted;
+		if (onCompacted) {
+			try {
+				onCompacted({
+					messagesBefore: messages.length,
+					messagesAfter: result.messages.length,
+					tokensBefore: result.tokensBefore,
+					tokensAfter: result.tokensAfter,
+				});
+			} catch {
+				// Intentionally swallowed (see CreateClineCompactionBeforeModelHookInput).
+			}
+		}
 		return { messages: result.messages };
 	};
 }

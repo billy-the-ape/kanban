@@ -8,6 +8,7 @@ import { ClineAgentChatPanel, type ClineAgentChatPanelHandle } from "@/component
 import { ColumnContextPanel } from "@/components/detail-panels/column-context-panel";
 import { type DiffLineComment, DiffViewerPanel } from "@/components/detail-panels/diff-viewer-panel";
 import { FileTreePanel } from "@/components/detail-panels/file-tree-panel";
+import { TaskDiagnosticsPanel } from "@/components/detail-panels/task-diagnostics-panel";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/components/ui/cn";
 import type { ClineChatActionResult } from "@/hooks/use-cline-chat-runtime-actions";
@@ -853,6 +854,8 @@ export function CardDetailView({
 				className="flex min-h-0 min-w-0 flex-col overflow-hidden"
 				style={{ width: isDiffExpanded ? "100%" : detailContentPanelPercent }}
 			>
+				{/* B-10: collapsible diagnostics strip (phase, git, preserved work, context, actions). */}
+				<TaskDiagnosticsPanel workspaceId={currentProjectId} taskId={selection.card.id} />
 				{gitHistoryPanel ? (
 					<div className="flex min-h-0 flex-1 overflow-hidden">{gitHistoryPanel}</div>
 				) : (

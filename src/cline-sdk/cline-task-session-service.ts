@@ -3,6 +3,7 @@
 // history, and subscribe to summaries and chat events without knowing SDK
 // host, repository, or event-adapter details.
 import type {
+	RuntimeClineContextCompactionEvent,
 	RuntimeClineReasoningEffort,
 	RuntimeTaskImage,
 	RuntimeTaskSessionMode,
@@ -12,8 +13,12 @@ import type {
 import { isHomeAgentSessionId } from "../core/home-agent-session";
 import { resolveHomeAgentAppendSystemPrompt } from "../prompts/append-system-prompt";
 import { captureTaskTurnCheckpoint, deleteTaskTurnCheckpointRef } from "../workspace/turn-checkpoints";
-import { compactClineConversationMessages } from "./cline-compaction-callback";
+import {
+	type CompactClineConversationMessagesResult,
+	compactClineConversationMessages,
+} from "./cline-compaction-callback";
 import { type ClineCompactionConfig, calibrateClineCompactionConfig } from "./cline-compaction-config";
+import { readTaskCompactionEvent, recordTaskCompactionEvent } from "./cline-context-events";
 import type { ContextLimitSource } from "./cline-context-policy";
 import {
 	evaluateClineContextRecoveryBudget,
@@ -29,6 +34,7 @@ import {
 import { type ClineRuntimeSetup, createClineRuntimeSetup } from "./cline-runtime-setup";
 import {
 	type ClineLaunchConfigResolver,
+	type ClinePersistedTaskSessionSnapshot,
 	type ClineSessionRestartStartRequest,
 	type ClineSessionRuntime,
 	type CreateInMemoryClineSessionRuntimeOptions,
@@ -126,6 +132,15 @@ export interface ClineTaskSessionService {
 	listMessages(taskId: string): ClineTaskMessage[];
 	listSlashCommands(workspacePath: string): Promise<ClineSdkSlashCommand[]>;
 	loadTaskSessionMessages(taskId: string): Promise<ClineTaskMessage[]>;
+	/**
+	 * B-10.4: context snapshot for diagnostics: the live (or, after a
+	 * Kanban restart, persisted) transcript and the task's last recorded
+	 * compaction event. Null when the task has no session at all.
+	 */
+	getTaskContextSnapshot(taskId: string): Promise<{
+		messages: ClineTaskMessage[];
+		lastCompaction: RuntimeClineContextCompactionEvent | null;
+	} | null>;
 	applyTurnCheckpoint(taskId: string, checkpoint: RuntimeTaskTurnCheckpoint): RuntimeTaskSessionSummary | null;
 	dispose(): Promise<void>;
 }
@@ -248,8 +263,37 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					requestToolApproval: runtimeSetup.requestToolApproval,
 				};
 			},
+			// B-10.4: budget compactions (SDK compact callback in hub mode,
+			// beforeModel hook in local mode) become durable diagnostics
+			// events; overflow recovery records its own event (below).
+			onCompactionObserved: (taskId, info) => {
+				this.recordCompactionEvent(taskId, "proactive", info);
+			},
 		});
 		this.messageRepository = createMessageRepository();
+	}
+
+	/**
+	 * B-10.4: durably record a compaction event (fire-and-forget). The event
+	 * is diagnostic-only: a failed write must never affect the session, and
+	 * missing events simply read back as `lastCompaction: null`.
+	 */
+	private recordCompactionEvent(
+		taskId: string,
+		trigger: RuntimeClineContextCompactionEvent["trigger"],
+		info: { messagesBefore: number; messagesAfter: number; tokensBefore: number; tokensAfter: number },
+	): void {
+		const event: RuntimeClineContextCompactionEvent = {
+			at: new Date().toISOString(),
+			trigger,
+			tokensBefore: Math.max(0, Math.round(info.tokensBefore)),
+			tokensAfter: Math.max(0, Math.round(info.tokensAfter)),
+			messagesBefore: Math.max(0, Math.round(info.messagesBefore)),
+			messagesAfter: Math.max(0, Math.round(info.messagesAfter)),
+		};
+		void recordTaskCompactionEvent(taskId, event).catch(() => {
+			// Intentionally swallowed (see above).
+		});
 	}
 
 	onSummary(listener: (summary: RuntimeTaskSessionSummary) => void): () => void {
@@ -423,7 +467,19 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 				const persistedSnapshot = await this.sessionRuntime
 					.readPersistedTaskSession(input.taskId)
 					.catch(() => null);
-				const messages = this.compactTranscriptForRecovery(startRequest, persistedSnapshot?.messages ?? []);
+				const persistedMessages = persistedSnapshot?.messages ?? [];
+				const compacted = this.compactTranscriptForRecovery(startRequest, persistedMessages);
+				// B-10.4: overflow recovery compaction is the "overflow"
+				// trigger class (budget compactions report "proactive").
+				if (compacted.changed) {
+					this.recordCompactionEvent(input.taskId, "overflow", {
+						messagesBefore: persistedMessages.length,
+						messagesAfter: compacted.messages.length,
+						tokensBefore: compacted.tokensBefore,
+						tokensAfter: compacted.tokensAfter,
+					});
+				}
+				const messages = compacted.messages;
 				await this.sessionRuntime.stopTaskSession(input.taskId).catch(() => null);
 				const restartedSession = await this.sessionRuntime.restartTaskSession({
 					taskId: input.taskId,
@@ -467,7 +523,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 	private compactTranscriptForRecovery(
 		startRequest: ClineSessionRestartStartRequest,
 		persistedMessages: ClineSdkPersistedMessage[],
-	): ClineSdkPersistedMessage[] {
+	): CompactClineConversationMessagesResult {
 		const compaction = startRequest.compaction;
 		if (
 			!compaction ||
@@ -502,7 +558,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			throw new Error(requirements.reason ?? "Original task requirements exceed the compaction target.");
 		}
 		const compacted = compactClineConversationMessages(persistedMessages, targetTokens);
-		return compacted.messages;
+		return compacted;
 	}
 
 	async startTaskSession(request: StartClineTaskSessionRequest): Promise<RuntimeTaskSessionSummary> {
@@ -979,6 +1035,26 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		return await this.messageRepository.hydrateTaskMessages(taskId, async () => {
 			return await this.sessionRuntime.readPersistedTaskSession(taskId);
 		});
+	}
+
+	/**
+	 * B-10.4: context snapshot for diagnostics. Live in-memory messages win;
+	 * after a Kanban restart the durable transcript is read instead. Returns
+	 * null only when the task has no session at all (no live entry and no
+	 * persisted session) — an existing but empty transcript still reports.
+	 */
+	async getTaskContextSnapshot(taskId: string) {
+		const hasLiveEntry = Boolean(this.messageRepository.getTaskEntry(taskId));
+		let persisted: ClinePersistedTaskSessionSnapshot | null = null;
+		if (!hasLiveEntry) {
+			persisted = await this.sessionRuntime.readPersistedTaskSession(taskId).catch(() => null);
+			if (!persisted) {
+				return null;
+			}
+		}
+		const messages = await this.messageRepository.hydrateTaskMessages(taskId, async () => persisted).catch(() => []);
+		const lastCompaction = await readTaskCompactionEvent(taskId);
+		return { messages, lastCompaction };
 	}
 
 	applyTurnCheckpoint(taskId: string, checkpoint: RuntimeTaskTurnCheckpoint): RuntimeTaskSessionSummary | null {

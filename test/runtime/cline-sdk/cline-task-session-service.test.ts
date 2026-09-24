@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ToolApprovalRequest, ToolApprovalResult } from "@clinebot/core";
 import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import type { ClineRuntimeSetup } from "../../../src/cline-sdk/cline-runtime-setup";
@@ -27,6 +30,33 @@ vi.mock("../../../src/workspace/turn-checkpoints.js", () => ({
 	captureTaskTurnCheckpoint: turnCheckpointMocks.captureTaskTurnCheckpoint,
 	deleteTaskTurnCheckpointRef: turnCheckpointMocks.deleteTaskTurnCheckpointRef,
 }));
+
+const workspaceStateMocks = vi.hoisted(() => ({
+	getTaskWorktreesHomePath: vi.fn(),
+}));
+
+vi.mock("../../../src/state/workspace-state.js", async (importOriginal) => {
+	const original = await importOriginal<typeof import("../../../src/state/workspace-state")>();
+	return {
+		...original,
+		getTaskWorktreesHomePath: workspaceStateMocks.getTaskWorktreesHomePath,
+	};
+});
+
+// Compaction event records (B-10.4) are durable per-task artifacts; point them
+// at a throwaway dir so overflow-recovery tests never write into the real
+// ~/.cline.
+let worktreesHomePath = "";
+beforeEach(() => {
+	worktreesHomePath = mkdtempSync(join(tmpdir(), "kanban-session-test-home-"));
+	workspaceStateMocks.getTaskWorktreesHomePath.mockReturnValue(worktreesHomePath);
+});
+afterEach(() => {
+	if (worktreesHomePath) {
+		rmSync(worktreesHomePath, { recursive: true, force: true });
+		worktreesHomePath = "";
+	}
+});
 
 function createDeferred<T>() {
 	let resolve: (value: T) => void = () => {};
