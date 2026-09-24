@@ -73,6 +73,11 @@ export interface CreateTaskSessionServiceHarnessOptions extends CreateFakeClineS
 	 * restarts re-resolve the policy instead of replaying the snapshot.
 	 */
 	resolveClineLaunchConfig?: ClineLaunchConfigResolver;
+	/**
+	 * B-3.5: bounded context-overflow recovery attempt cap forwarded to the
+	 * task session service (the service default is 3 when omitted).
+	 */
+	contextRecoveryMaxAttempts?: number;
 }
 
 export interface TaskSessionServiceHarness {
@@ -88,6 +93,7 @@ export function createTaskSessionServiceHarness(
 	const host = createFakeClineSessionHost(store);
 	const setup = createFakeRuntimeSetup();
 	const service = createInMemoryClineTaskSessionService({
+		contextRecoveryMaxAttempts: options.contextRecoveryMaxAttempts,
 		resolveClineLaunchConfig: options.resolveClineLaunchConfig,
 		createSessionRuntime: (runtimeOptions) =>
 			createInMemoryClineSessionRuntime({

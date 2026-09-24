@@ -130,6 +130,9 @@ export function buildRuntimeConfigResponse(
 		commitPromptTemplateDefault: runtimeConfig.commitPromptTemplateDefault,
 		openPrPromptTemplateDefault: runtimeConfig.openPrPromptTemplateDefault,
 		contextBudget: runtimeConfig.contextBudget ?? null,
+		reviewPolicy: runtimeConfig.reviewPolicy ?? null,
+		verification: runtimeConfig.verification ?? null,
+		gitDeliveryPolicy: runtimeConfig.gitDeliveryPolicy ?? null,
 		effectiveContextWindow: extra.effectiveContextWindow ?? null,
 	};
 }

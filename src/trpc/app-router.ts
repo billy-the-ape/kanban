@@ -6,6 +6,7 @@ import { initTRPC, TRPCError } from "@trpc/server";
 import { z } from "zod";
 
 import type {
+	RuntimeBlockedTaskCleanupsResponse,
 	RuntimeClineAccountBalanceResponse,
 	RuntimeClineAccountOrganizationsResponse,
 	RuntimeClineAccountProfileResponse,
@@ -75,6 +76,16 @@ import type {
 	RuntimeTaskChatReloadResponse,
 	RuntimeTaskChatSendRequest,
 	RuntimeTaskChatSendResponse,
+	RuntimeTaskDeliveryInfoRequest,
+	RuntimeTaskDeliveryInfoResponse,
+	RuntimeTaskDeliveryStartRequest,
+	RuntimeTaskDeliveryStartResponse,
+	RuntimeTaskPreservationInfoResponse,
+	RuntimeTaskPreservationRequest,
+	RuntimeTaskReviewInfoRequest,
+	RuntimeTaskReviewInfoResponse,
+	RuntimeTaskReviewStartRequest,
+	RuntimeTaskReviewStartResponse,
 	RuntimeTaskSessionInputRequest,
 	RuntimeTaskSessionInputResponse,
 	RuntimeTaskSessionStartRequest,
@@ -83,6 +94,8 @@ import type {
 	RuntimeTaskSessionStopResponse,
 	RuntimeTaskWorkspaceInfoRequest,
 	RuntimeTaskWorkspaceInfoResponse,
+	RuntimeTaskWorkspaceMaintenanceReport,
+	RuntimeTaskWorktreeRecoverResponse,
 	RuntimeUpdateStatusResponse,
 	RuntimeWorkspaceChangesRequest,
 	RuntimeWorkspaceChangesResponse,
@@ -97,6 +110,7 @@ import type {
 	RuntimeWorktreeEnsureResponse,
 } from "../core/api-contract";
 import {
+	runtimeBlockedTaskCleanupsResponseSchema,
 	runtimeClineAccountBalanceResponseSchema,
 	runtimeClineAccountOrganizationsResponseSchema,
 	runtimeClineAccountProfileResponseSchema,
@@ -166,6 +180,16 @@ import {
 	runtimeTaskChatReloadResponseSchema,
 	runtimeTaskChatSendRequestSchema,
 	runtimeTaskChatSendResponseSchema,
+	runtimeTaskDeliveryInfoRequestSchema,
+	runtimeTaskDeliveryInfoResponseSchema,
+	runtimeTaskDeliveryStartRequestSchema,
+	runtimeTaskDeliveryStartResponseSchema,
+	runtimeTaskPreservationInfoResponseSchema,
+	runtimeTaskPreservationRequestSchema,
+	runtimeTaskReviewInfoRequestSchema,
+	runtimeTaskReviewInfoResponseSchema,
+	runtimeTaskReviewStartRequestSchema,
+	runtimeTaskReviewStartResponseSchema,
 	runtimeTaskSessionInputRequestSchema,
 	runtimeTaskSessionInputResponseSchema,
 	runtimeTaskSessionStartRequestSchema,
@@ -174,6 +198,8 @@ import {
 	runtimeTaskSessionStopResponseSchema,
 	runtimeTaskWorkspaceInfoRequestSchema,
 	runtimeTaskWorkspaceInfoResponseSchema,
+	runtimeTaskWorkspaceMaintenanceReportSchema,
+	runtimeTaskWorktreeRecoverResponseSchema,
 	runtimeUpdateStatusResponseSchema,
 	runtimeWorkspaceChangesRequestSchema,
 	runtimeWorkspaceChangesResponseSchema,
@@ -218,6 +244,22 @@ export interface RuntimeTrpcContext {
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskSessionStartRequest,
 		) => Promise<RuntimeTaskSessionStartResponse>;
+		startTaskReview: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskReviewStartRequest,
+		) => Promise<RuntimeTaskReviewStartResponse>;
+		getTaskReviewInfo: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskReviewInfoRequest,
+		) => Promise<RuntimeTaskReviewInfoResponse>;
+		startTaskDelivery: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskDeliveryStartRequest,
+		) => Promise<RuntimeTaskDeliveryStartResponse>;
+		getTaskDeliveryInfo: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskDeliveryInfoRequest,
+		) => Promise<RuntimeTaskDeliveryInfoResponse>;
 		stopTaskSession: (
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskSessionStopRequest,
@@ -326,6 +368,16 @@ export interface RuntimeTrpcContext {
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeWorktreeDeleteRequest,
 		) => Promise<RuntimeWorktreeDeleteResponse>;
+		getTaskPreservationInfo: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskPreservationRequest,
+		) => Promise<RuntimeTaskPreservationInfoResponse>;
+		recoverTaskWorktree: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskPreservationRequest,
+		) => Promise<RuntimeTaskWorktreeRecoverResponse>;
+		runTaskWorkspaceMaintenance: (scope: RuntimeTrpcWorkspaceScope) => Promise<RuntimeTaskWorkspaceMaintenanceReport>;
+		listBlockedTaskCleanups: (scope: RuntimeTrpcWorkspaceScope) => Promise<RuntimeBlockedTaskCleanupsResponse>;
 		loadTaskContext: (
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskWorkspaceInfoRequest,
@@ -460,6 +512,32 @@ export const runtimeAppRouter = t.router({
 			.output(runtimeTaskSessionStartResponseSchema)
 			.mutation(async ({ ctx, input }) => {
 				return await ctx.runtimeApi.startTaskSession(ctx.workspaceScope, input);
+			}),
+		startTaskReview: workspaceProcedure
+			.input(runtimeTaskReviewStartRequestSchema)
+			.output(runtimeTaskReviewStartResponseSchema)
+			.mutation(async ({ ctx, input }) => {
+				return await ctx.runtimeApi.startTaskReview(ctx.workspaceScope, input);
+			}),
+		getTaskReviewInfo: workspaceProcedure
+			.input(runtimeTaskReviewInfoRequestSchema)
+			.output(runtimeTaskReviewInfoResponseSchema)
+			.query(async ({ ctx, input }) => {
+				return await ctx.runtimeApi.getTaskReviewInfo(ctx.workspaceScope, input);
+			}),
+		// B-8: deterministic git delivery (commit → integrate → push → verify →
+		// receipt), application-controlled and independent of model availability.
+		startTaskDelivery: workspaceProcedure
+			.input(runtimeTaskDeliveryStartRequestSchema)
+			.output(runtimeTaskDeliveryStartResponseSchema)
+			.mutation(async ({ ctx, input }) => {
+				return await ctx.runtimeApi.startTaskDelivery(ctx.workspaceScope, input);
+			}),
+		getTaskDeliveryInfo: workspaceProcedure
+			.input(runtimeTaskDeliveryInfoRequestSchema)
+			.output(runtimeTaskDeliveryInfoResponseSchema)
+			.query(async ({ ctx, input }) => {
+				return await ctx.runtimeApi.getTaskDeliveryInfo(ctx.workspaceScope, input);
 			}),
 		stopTaskSession: workspaceProcedure
 			.input(runtimeTaskSessionStopRequestSchema)
@@ -641,6 +719,30 @@ export const runtimeAppRouter = t.router({
 			.output(runtimeWorktreeDeleteResponseSchema)
 			.mutation(async ({ ctx, input }) => {
 				return await ctx.workspaceApi.deleteWorktree(ctx.workspaceScope, input);
+			}),
+		getTaskPreservationInfo: workspaceProcedure
+			.input(runtimeTaskPreservationRequestSchema)
+			.output(runtimeTaskPreservationInfoResponseSchema)
+			.query(async ({ ctx, input }) => {
+				return await ctx.workspaceApi.getTaskPreservationInfo(ctx.workspaceScope, input);
+			}),
+		recoverTaskWorktree: workspaceProcedure
+			.input(runtimeTaskPreservationRequestSchema)
+			.output(runtimeTaskWorktreeRecoverResponseSchema)
+			.mutation(async ({ ctx, input }) => {
+				return await ctx.workspaceApi.recoverTaskWorktree(ctx.workspaceScope, input);
+			}),
+		// B-5.7/B-5.9: retry blocked trash cleanups, dispose delivered Done
+		// worktrees, and apply preservation retention.
+		runTaskWorkspaceMaintenance: workspaceProcedure
+			.output(runtimeTaskWorkspaceMaintenanceReportSchema)
+			.mutation(async ({ ctx }) => {
+				return await ctx.workspaceApi.runTaskWorkspaceMaintenance(ctx.workspaceScope);
+			}),
+		listBlockedTaskCleanups: workspaceProcedure
+			.output(runtimeBlockedTaskCleanupsResponseSchema)
+			.query(async ({ ctx }) => {
+				return await ctx.workspaceApi.listBlockedTaskCleanups(ctx.workspaceScope);
 			}),
 		getTaskContext: workspaceProcedure
 			.input(runtimeTaskWorkspaceInfoRequestSchema)

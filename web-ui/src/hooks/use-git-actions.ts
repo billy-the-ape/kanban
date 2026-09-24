@@ -247,6 +247,61 @@ export function useGitActions({
 					return false;
 				}
 
+				// B-8: when deterministic delivery is enabled, the application
+				// itself runs commit → integrate → push → verify → receipt. No
+				// model prompt is involved, so delivery works even when the
+				// model is unavailable. Both "commit" and "pr" actions route
+				// through it (PR follows the policy's requirePullRequest).
+				if (runtimeProjectConfig?.gitDeliveryPolicy?.enabled) {
+					if (!currentProjectId) {
+						showAppToast({
+							intent: "danger",
+							icon: "warning-sign",
+							message: "No active project; cannot run deterministic delivery.",
+							timeout: 6000,
+						});
+						return false;
+					}
+					const trpcClient = getRuntimeTrpcClient(currentProjectId);
+					const payload = await trpcClient.runtime.startTaskDelivery.mutate({ taskId });
+					if (!payload.ok || !payload.receipt) {
+						showAppToast({
+							intent: "danger",
+							icon: "warning-sign",
+							message: payload.error ?? "Git delivery failed.",
+							timeout: 10000,
+						});
+						return false;
+					}
+					const receipt = payload.receipt;
+					if (receipt.status === "delivered" || receipt.status === "no_op") {
+						showAppToast({
+							intent: "success",
+							icon: "tick",
+							message:
+								receipt.status === "no_op"
+									? "No changes to deliver; delivery recorded as a no-op."
+									: `Delivered to ${receipt.destinationBranch}${
+											receipt.remoteBranchSha ? ` on ${receipt.remote}` : ""
+										}.`,
+							timeout: 5000,
+						});
+						refreshGitHistory();
+						await refreshWorkspaceState();
+						return true;
+					}
+					// paused / failed: surface the resumable stage and evidence.
+					showAppToast({
+						intent: "warning",
+						icon: "warning-sign",
+						message: `Delivery ${receipt.status} at stage "${receipt.stage}": ${
+							payload.error ?? "see the delivery receipt."
+						}`,
+						timeout: 10000,
+					});
+					return false;
+				}
+
 				const snapshot = getTaskWorkspaceSnapshot(taskId);
 				const snapshotWorkspaceInfo = snapshot
 					? {
@@ -329,7 +384,10 @@ export function useGitActions({
 		},
 		[
 			board,
+			currentProjectId,
 			fetchTaskWorkspaceInfo,
+			refreshGitHistory,
+			refreshWorkspaceState,
 			runtimeProjectConfig,
 			sendTaskChatMessage,
 			sendTaskSessionInput,

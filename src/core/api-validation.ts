@@ -23,6 +23,11 @@ import {
 	type RuntimeTaskChatMessagesRequest,
 	type RuntimeTaskChatReloadRequest,
 	type RuntimeTaskChatSendRequest,
+	type RuntimeTaskDeliveryInfoRequest,
+	type RuntimeTaskDeliveryStartRequest,
+	type RuntimeTaskPreservationRequest,
+	type RuntimeTaskReviewInfoRequest,
+	type RuntimeTaskReviewStartRequest,
 	type RuntimeTaskSessionInputRequest,
 	type RuntimeTaskSessionStartRequest,
 	type RuntimeTaskSessionStopRequest,
@@ -55,6 +60,11 @@ import {
 	runtimeTaskChatMessagesRequestSchema,
 	runtimeTaskChatReloadRequestSchema,
 	runtimeTaskChatSendRequestSchema,
+	runtimeTaskDeliveryInfoRequestSchema,
+	runtimeTaskDeliveryStartRequestSchema,
+	runtimeTaskPreservationRequestSchema,
+	runtimeTaskReviewInfoRequestSchema,
+	runtimeTaskReviewStartRequestSchema,
 	runtimeTaskSessionInputRequestSchema,
 	runtimeTaskSessionStartRequestSchema,
 	runtimeTaskSessionStopRequestSchema,
@@ -174,6 +184,17 @@ export function parseWorktreeDeleteRequest(value: unknown): RuntimeWorktreeDelet
 	};
 }
 
+export function parseTaskPreservationRequest(value: unknown): RuntimeTaskPreservationRequest {
+	const parsed = parseWithSchema(runtimeTaskPreservationRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Invalid task preservation payload.");
+	}
+	return {
+		taskId,
+	};
+}
+
 export function parseWorkspaceStateSaveRequest(value: unknown): RuntimeWorkspaceStateSaveRequest {
 	return parseWithSchema(runtimeWorkspaceStateSaveRequestSchema, value);
 }
@@ -254,6 +275,65 @@ export function parseTaskSessionInputRequest(value: unknown): RuntimeTaskSession
 	}
 	return {
 		...parsed,
+		taskId,
+	};
+}
+
+/** B-6: validates the review-session start payload. */
+export function parseTaskReviewStartRequest(value: unknown): RuntimeTaskReviewStartRequest {
+	const parsed = parseWithSchema(runtimeTaskReviewStartRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Task review taskId cannot be empty.");
+	}
+	const description = parsed.description.trim();
+	if (!description) {
+		throw new Error("Task review requires a non-empty task description.");
+	}
+	return {
+		...parsed,
+		taskId,
+		description,
+		planDocumentPaths: parsed.planDocumentPaths?.map((path) => path.trim()).filter((path) => path.length > 0),
+	};
+}
+
+/** B-6: validates the review-info (status + tree binding) payload. */
+export function parseTaskReviewInfoRequest(value: unknown): RuntimeTaskReviewInfoRequest {
+	const parsed = parseWithSchema(runtimeTaskReviewInfoRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Task review taskId cannot be empty.");
+	}
+	return {
+		taskId,
+	};
+}
+
+// --- B-8: deterministic git delivery ----------------------------------------
+
+export function parseTaskDeliveryStartRequest(value: unknown): RuntimeTaskDeliveryStartRequest {
+	const parsed = parseWithSchema(runtimeTaskDeliveryStartRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Task delivery taskId cannot be empty.");
+	}
+	// B-8.2: the model-supplied message is optional; blank-only values fall back
+	// to the deterministic task-title message.
+	const commitMessage = parsed.commitMessage?.trim() || undefined;
+	return {
+		taskId,
+		commitMessage,
+	};
+}
+
+export function parseTaskDeliveryInfoRequest(value: unknown): RuntimeTaskDeliveryInfoRequest {
+	const parsed = parseWithSchema(runtimeTaskDeliveryInfoRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Task delivery taskId cannot be empty.");
+	}
+	return {
 		taskId,
 	};
 }

@@ -61,6 +61,9 @@ function createRuntimeConfigResponse(
 		openPrPromptTemplateDefault: "",
 		contextBudget: null,
 		effectiveContextWindow: null,
+		reviewPolicy: null,
+		verification: null,
+		gitDeliveryPolicy: null,
 	};
 	return {
 		...nextConfig,

@@ -8,7 +8,13 @@ import { useLinkedBacklogTaskActions } from "@/hooks/use-linked-backlog-task-act
 import { useProgrammaticCardMoves } from "@/hooks/use-programmatic-card-moves";
 import { useReviewAutoActions } from "@/hooks/use-review-auto-actions";
 import type { UseTaskSessionsResult } from "@/hooks/use-task-sessions";
-import type { RuntimeTaskSessionSummary, RuntimeTaskWorkspaceInfoResponse } from "@/runtime/types";
+import { fetchTaskDependentsUnlock, requestTaskWorkspaceMaintenance } from "@/runtime/task-delivery";
+import type {
+	RuntimeTaskDependentsUnlock,
+	RuntimeTaskSessionSummary,
+	RuntimeTaskWorkspaceInfoResponse,
+	RuntimeWorktreeDeleteResponse,
+} from "@/runtime/types";
 import {
 	applyDragResult,
 	clearColumnTasks,
@@ -22,7 +28,6 @@ import { clearTaskWorkspaceInfo, setTaskWorkspaceInfo } from "@/stores/workspace
 import type { SendTerminalInputOptions } from "@/terminal/terminal-input";
 import type { BoardCard, BoardColumnId, BoardData } from "@/types";
 import { resolveTaskAutoReviewMode } from "@/types";
-import { getNextDetailTaskIdAfterTrashMove } from "@/utils/detail-view-task-order";
 import {
 	getBrowserNotificationPermission,
 	hasPromptedForBrowserNotificationPermission,
@@ -65,7 +70,7 @@ interface UseBoardInteractionsInput {
 	setIsClearTrashDialogOpen: Dispatch<SetStateAction<boolean>>;
 	setIsGitHistoryOpen: Dispatch<SetStateAction<boolean>>;
 	stopTaskSession: (taskId: string) => Promise<void>;
-	cleanupTaskWorkspace: (taskId: string) => Promise<unknown>;
+	cleanupTaskWorkspace: (taskId: string) => Promise<RuntimeWorktreeDeleteResponse | null>;
 	ensureTaskWorkspace: UseTaskSessionsResult["ensureTaskWorkspace"];
 	startTaskSession: UseTaskSessionsResult["startTaskSession"];
 	fetchTaskWorkspaceInfo: (task: BoardCard) => Promise<RuntimeTaskWorkspaceInfoResponse | null>;
@@ -77,6 +82,8 @@ interface UseBoardInteractionsInput {
 	readyForReviewNotificationsEnabled: boolean;
 	taskGitActionLoadingByTaskId: Record<string, TaskGitActionLoadingStateLike>;
 	runAutoReviewGitAction: (taskId: string, action: TaskGitAction) => Promise<boolean>;
+	/** B-8: deterministic delivery is enabled, so a delivery receipt (not a clean tree) completes a task. */
+	deterministicDeliveryEnabled?: boolean;
 }
 
 export interface UseBoardInteractionsResult {
@@ -91,6 +98,8 @@ export interface UseBoardInteractionsResult {
 	handleCardSelect: (taskId: string) => void;
 	handleMoveToTrash: () => void;
 	handleMoveReviewCardToTrash: (taskId: string) => void;
+	handleCompleteTask: () => void;
+	handleCompleteReviewCard: (taskId: string) => void;
 	handleRestoreTaskFromTrash: (taskId: string) => void;
 	handleCancelAutomaticTaskAction: (taskId: string) => void;
 	handleOpenClearTrash: () => void;
@@ -98,6 +107,7 @@ export interface UseBoardInteractionsResult {
 	handleAddReviewComments: (taskId: string, text: string) => Promise<void>;
 	handleSendReviewComments: (taskId: string, text: string) => Promise<void>;
 	moveToTrashLoadingById: Record<string, boolean>;
+	completeTaskLoadingById: Record<string, boolean>;
 	trashTaskCount: number;
 }
 
@@ -121,23 +131,29 @@ export function useBoardInteractions({
 	readyForReviewNotificationsEnabled,
 	taskGitActionLoadingByTaskId,
 	runAutoReviewGitAction,
+	deterministicDeliveryEnabled = false,
 }: UseBoardInteractionsInput): UseBoardInteractionsResult {
 	const previousSessionsRef = useRef<Record<string, RuntimeTaskSessionSummary>>({});
 	const notificationPermissionPromptInFlightRef = useRef(false);
 	const moveToTrashLoadingByIdRef = useRef<Record<string, true>>({});
+	const completeTaskLoadingByIdRef = useRef<Record<string, true>>({});
 	const pendingProgrammaticStartMoveCompletionByTaskIdRef = useRef<
 		Record<string, PendingProgrammaticStartMoveCompletion>
 	>({});
 	const [moveToTrashLoadingById, setMoveToTrashLoadingById] = useState<Record<string, boolean>>({});
+	const [completeTaskLoadingById, setCompleteTaskLoadingById] = useState<Record<string, boolean>>({});
 	const {
 		handleProgrammaticCardMoveReady,
 		setRequestMoveTaskToTrashHandler,
+		setRequestCompleteTaskHandler,
 		tryProgrammaticCardMove,
 		consumeProgrammaticCardMove,
 		resolvePendingProgrammaticTrashMove,
+		resolvePendingProgrammaticCompleteMove,
 		waitForProgrammaticCardMoveAvailability,
 		resetProgrammaticCardMoves,
 		requestMoveTaskToTrashWithAnimation,
+		requestCompleteTaskWithAnimation,
 		programmaticCardMoveCycle,
 	} = useProgrammaticCardMoves();
 
@@ -217,6 +233,32 @@ export function useBoardInteractions({
 
 		delete moveToTrashLoadingByIdRef.current[taskId];
 		setMoveToTrashLoadingById((current) => {
+			if (!current[taskId]) {
+				return current;
+			}
+			const next = { ...current };
+			delete next[taskId];
+			return next;
+		});
+	}, []);
+
+	const setTaskCompleteLoading = useCallback((taskId: string, isLoading: boolean) => {
+		if (isLoading) {
+			completeTaskLoadingByIdRef.current[taskId] = true;
+			setCompleteTaskLoadingById((current) => {
+				if (current[taskId]) {
+					return current;
+				}
+				return {
+					...current,
+					[taskId]: true,
+				};
+			});
+			return;
+		}
+
+		delete completeTaskLoadingByIdRef.current[taskId];
+		setCompleteTaskLoadingById((current) => {
 			if (!current[taskId]) {
 				return current;
 			}
@@ -441,7 +483,6 @@ export function useBoardInteractions({
 		setBoard((currentBoard) => {
 			let nextBoard = currentBoard;
 			const previousSessions = previousSessionsRef.current;
-			const blockedInterruptedTaskIds = new Set<string>();
 			for (const summary of Object.values(sessions)) {
 				const previous = previousSessions[summary.taskId];
 				if (previous && previous.updatedAt > summary.updatedAt) {
@@ -470,72 +511,68 @@ export function useBoardInteractions({
 					if (moved.moved) {
 						nextBoard = moved.board;
 					}
-					continue;
 				}
-				if (
-					summary.state === "interrupted" &&
-					previous?.state !== "interrupted" &&
-					columnId &&
-					columnId !== "trash"
-				) {
-					const nextTaskId = getNextDetailTaskIdAfterTrashMove(nextBoard, summary.taskId);
-					const programmaticMoveAttempt = tryProgrammaticCardMove(summary.taskId, columnId, "trash", {
-						skipTrashWorkflow: true,
-					});
-					if (programmaticMoveAttempt === "started" || programmaticMoveAttempt === "blocked") {
-						if (programmaticMoveAttempt === "blocked") {
-							blockedInterruptedTaskIds.add(summary.taskId);
-						}
-						setSelectedTaskId((currentSelectedTaskId) =>
-							currentSelectedTaskId === summary.taskId ? nextTaskId : currentSelectedTaskId,
-						);
-						continue;
-					}
-					const moved = moveTaskToColumn(nextBoard, summary.taskId, "trash", { insertAtTop: true });
-					if (moved.moved) {
-						setSelectedTaskId((currentSelectedTaskId) =>
-							currentSelectedTaskId === summary.taskId ? nextTaskId : currentSelectedTaskId,
-						);
-						nextBoard = moved.board;
-					}
-				}
+				// B-5: an interrupted session leaves its card where it is (matching
+				// the runtime's shutdown handling); its work is preserved, not
+				// discarded, so it never moves to Trash automatically.
 			}
-			const nextPreviousSessions = { ...sessions };
-			for (const taskId of blockedInterruptedTaskIds) {
-				const previousSession = previousSessions[taskId];
-				if (previousSession) {
-					nextPreviousSessions[taskId] = previousSession;
-					continue;
-				}
-				delete nextPreviousSessions[taskId];
-			}
-			previousSessionsRef.current = nextPreviousSessions;
+			previousSessionsRef.current = { ...sessions };
 			return nextBoard;
 		});
-	}, [programmaticCardMoveCycle, sessions, setBoard, setSelectedTaskId, tryProgrammaticCardMove]);
+	}, [programmaticCardMoveCycle, sessions, setBoard, tryProgrammaticCardMove]);
 
-	const { confirmMoveTaskToTrash, handleCreateDependency, handleDeleteDependency, requestMoveTaskToTrash } =
-		useLinkedBacklogTaskActions({
-			board,
-			setBoard,
-			setSelectedTaskId,
-			stopTaskSession,
-			cleanupTaskWorkspace,
-			maybeRequestNotificationPermissionForTaskStart,
-			kickoffTaskInProgress,
-			startBacklogTaskWithAnimation,
-			waitForBacklogStartAnimationAvailability: waitForProgrammaticCardMoveAvailability,
-		});
+	const checkDependentsUnlock = useCallback(
+		async (taskId: string): Promise<RuntimeTaskDependentsUnlock> =>
+			currentProjectId
+				? await fetchTaskDependentsUnlock(currentProjectId, taskId)
+				: { allowed: false, reason: "No active project." },
+		[currentProjectId],
+	);
+
+	const handleTaskCompleted = useCallback(
+		(_taskId: string) => {
+			// B-5.7: a delivered task's worktree is disposed by runtime maintenance.
+			if (deterministicDeliveryEnabled && currentProjectId) {
+				void requestTaskWorkspaceMaintenance(currentProjectId);
+			}
+		},
+		[currentProjectId, deterministicDeliveryEnabled],
+	);
+
+	const {
+		confirmMoveTaskToTrash,
+		handleCreateDependency,
+		handleDeleteDependency,
+		requestMoveTaskToTrash,
+		requestCompleteTask,
+	} = useLinkedBacklogTaskActions({
+		board,
+		setBoard,
+		setSelectedTaskId,
+		stopTaskSession,
+		cleanupTaskWorkspace,
+		maybeRequestNotificationPermissionForTaskStart,
+		kickoffTaskInProgress,
+		startBacklogTaskWithAnimation,
+		waitForBacklogStartAnimationAvailability: waitForProgrammaticCardMoveAvailability,
+		checkDependentsUnlock,
+		onTaskCompleted: handleTaskCompleted,
+	});
 
 	useEffect(() => {
 		setRequestMoveTaskToTrashHandler(requestMoveTaskToTrash);
 	}, [requestMoveTaskToTrash, setRequestMoveTaskToTrashHandler]);
 
+	useEffect(() => {
+		setRequestCompleteTaskHandler(requestCompleteTask);
+	}, [requestCompleteTask, setRequestCompleteTaskHandler]);
+
 	useReviewAutoActions({
 		board,
 		taskGitActionLoadingByTaskId,
 		runAutoReviewGitAction,
-		requestMoveTaskToTrash: requestMoveTaskToTrashWithAnimation,
+		requestCompleteTask: requestCompleteTaskWithAnimation,
+		completeOnGitActionSuccess: deterministicDeliveryEnabled,
 		resetKey: currentProjectId,
 	});
 
@@ -614,16 +651,24 @@ export function useBoardInteractions({
 
 			if (moveEvent.toColumnId === "trash") {
 				setBoard(applied.board);
-				if (programmaticMoveBehavior?.skipTrashWorkflow) {
-					resolvePendingProgrammaticTrashMove(moveEvent.taskId);
-					return;
-				}
 				const requestPromise = requestMoveTaskToTrash(moveEvent.taskId, moveEvent.fromColumnId, {
 					optimisticMoveApplied: true,
 					skipWorkingChangeWarning: programmaticMoveBehavior?.skipWorkingChangeWarning,
 				});
 				void requestPromise.finally(() => {
 					resolvePendingProgrammaticTrashMove(moveEvent.taskId);
+				});
+				return;
+			}
+
+			if (moveEvent.toColumnId === "done") {
+				setBoard(applied.board);
+				const completeRequestPromise = requestCompleteTask(moveEvent.taskId, moveEvent.fromColumnId, {
+					optimisticMoveApplied: true,
+					skipWorkingChangeWarning: programmaticMoveBehavior?.skipWorkingChangeWarning,
+				});
+				void completeRequestPromise.finally(() => {
+					resolvePendingProgrammaticCompleteMove(moveEvent.taskId);
 				});
 				return;
 			}
@@ -667,8 +712,10 @@ export function useBoardInteractions({
 			consumeProgrammaticCardMove,
 			kickoffTaskInProgress,
 			maybeRequestNotificationPermissionForTaskStart,
+			requestCompleteTask,
 			requestMoveTaskToTrash,
 			resumeTaskFromTrash,
+			resolvePendingProgrammaticCompleteMove,
 			resolvePendingProgrammaticStartMove,
 			resolvePendingProgrammaticTrashMove,
 			setBoard,
@@ -744,7 +791,7 @@ export function useBoardInteractions({
 	const handleCardSelect = useCallback(
 		(taskId: string) => {
 			const selection = findCardSelection(board, taskId);
-			if (!selection || selection.column.id === "trash") {
+			if (!selection || selection.column.id === "trash" || selection.column.id === "done") {
 				return;
 			}
 			setSelectedTaskId(taskId);
@@ -772,11 +819,39 @@ export function useBoardInteractions({
 				return;
 			}
 			setTaskMoveToTrashLoading(taskId, true);
-			void requestMoveTaskToTrashWithAnimation(taskId, "review").finally(() => {
+			// Review cards and completed (done) cards can both be discarded.
+			const fromColumnId = getTaskColumnId(board, taskId) ?? "review";
+			void requestMoveTaskToTrashWithAnimation(taskId, fromColumnId).finally(() => {
 				setTaskMoveToTrashLoading(taskId, false);
 			});
 		},
-		[requestMoveTaskToTrashWithAnimation, setTaskMoveToTrashLoading],
+		[board, requestMoveTaskToTrashWithAnimation, setTaskMoveToTrashLoading],
+	);
+
+	const handleCompleteTask = useCallback(() => {
+		if (!selectedCard || selectedCard.column.id !== "review") {
+			return;
+		}
+		if (completeTaskLoadingByIdRef.current[selectedCard.card.id]) {
+			return;
+		}
+		setTaskCompleteLoading(selectedCard.card.id, true);
+		void requestCompleteTaskWithAnimation(selectedCard.card.id, selectedCard.column.id).finally(() => {
+			setTaskCompleteLoading(selectedCard.card.id, false);
+		});
+	}, [requestCompleteTaskWithAnimation, selectedCard, setTaskCompleteLoading]);
+
+	const handleCompleteReviewCard = useCallback(
+		(taskId: string) => {
+			if (completeTaskLoadingByIdRef.current[taskId]) {
+				return;
+			}
+			setTaskCompleteLoading(taskId, true);
+			void requestCompleteTaskWithAnimation(taskId, "review").finally(() => {
+				setTaskCompleteLoading(taskId, false);
+			});
+		},
+		[requestCompleteTaskWithAnimation, setTaskCompleteLoading],
 	);
 
 	const handleRestoreTaskFromTrash = useCallback(
@@ -881,6 +956,8 @@ export function useBoardInteractions({
 		previousSessionsRef.current = {};
 		moveToTrashLoadingByIdRef.current = {};
 		setMoveToTrashLoadingById({});
+		completeTaskLoadingByIdRef.current = {};
+		setCompleteTaskLoadingById({});
 		for (const taskId of Object.keys(pendingProgrammaticStartMoveCompletionByTaskIdRef.current)) {
 			resolvePendingProgrammaticStartMove(taskId, false);
 		}
@@ -904,6 +981,8 @@ export function useBoardInteractions({
 		handleCardSelect,
 		handleMoveToTrash,
 		handleMoveReviewCardToTrash,
+		handleCompleteTask,
+		handleCompleteReviewCard,
 		handleRestoreTaskFromTrash,
 		handleCancelAutomaticTaskAction,
 		handleOpenClearTrash,
@@ -911,6 +990,7 @@ export function useBoardInteractions({
 		handleAddReviewComments,
 		handleSendReviewComments,
 		moveToTrashLoadingById,
+		completeTaskLoadingById,
 		trashTaskCount,
 	};
 }

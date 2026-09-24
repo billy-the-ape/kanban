@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useBoardInteractions } from "@/hooks/use-board-interactions";
 import type { UseTaskSessionsResult } from "@/hooks/use-task-sessions";
-import type { RuntimeTaskSessionSummary } from "@/runtime/types";
+import type { RuntimeTaskSessionSummary, RuntimeWorktreeDeleteResponse } from "@/runtime/types";
 import type { BoardCard, BoardData } from "@/types";
 
 const notifyErrorMock = vi.hoisted(() => vi.fn());
@@ -53,7 +53,8 @@ function createBoard(): BoardData {
 			},
 			{ id: "in_progress", title: "In Progress", cards: [] },
 			{ id: "review", title: "Review", cards: [] },
-			{ id: "trash", title: "Done", cards: [] },
+			{ id: "done", title: "Done", cards: [] },
+			{ id: "trash", title: "Trash", cards: [] },
 		],
 		dependencies: [],
 	};
@@ -102,7 +103,7 @@ function HookHarness({
 	ensureTaskWorkspace: UseTaskSessionsResult["ensureTaskWorkspace"];
 	startTaskSession: UseTaskSessionsResult["startTaskSession"];
 	stopTaskSession?: (taskId: string) => Promise<void>;
-	cleanupTaskWorkspace?: (taskId: string) => Promise<unknown>;
+	cleanupTaskWorkspace?: (taskId: string) => Promise<RuntimeWorktreeDeleteResponse | null>;
 	selectedCard?: { card: BoardCard; column: { id: "backlog" | "in_progress" | "review" | "trash" } } | null;
 	setSelectedTaskIdOverride?: Dispatch<SetStateAction<string | null>>;
 	onSnapshot?: (snapshot: HookSnapshot) => void;
@@ -201,12 +202,15 @@ describe("useBoardInteractions", () => {
 		useProgrammaticCardMovesMock.mockReturnValue({
 			handleProgrammaticCardMoveReady: () => {},
 			setRequestMoveTaskToTrashHandler: () => {},
+			setRequestCompleteTaskHandler: () => {},
 			tryProgrammaticCardMove: () => "unavailable",
 			consumeProgrammaticCardMove: () => ({}),
 			resolvePendingProgrammaticTrashMove: () => {},
+			resolvePendingProgrammaticCompleteMove: () => {},
 			waitForProgrammaticCardMoveAvailability: async () => {},
 			resetProgrammaticCardMoves: () => {},
 			requestMoveTaskToTrashWithAnimation: async () => {},
+			requestCompleteTaskWithAnimation: async () => {},
 			programmaticCardMoveCycle: 0,
 		});
 
@@ -218,6 +222,7 @@ describe("useBoardInteractions", () => {
 					handleDeleteDependency: () => {},
 					confirmMoveTaskToTrash: async () => {},
 					requestMoveTaskToTrash: async () => {},
+					requestCompleteTask: async () => {},
 				};
 			},
 		);
@@ -233,6 +238,7 @@ describe("useBoardInteractions", () => {
 				path: "/tmp/task-1",
 				baseRef: "main",
 				baseCommit: "abc123",
+				restoredFromPreservation: false,
 			},
 		}));
 		const startTaskSession = vi.fn(async () => ({ ok: true as const }));
@@ -288,12 +294,15 @@ describe("useBoardInteractions", () => {
 		useProgrammaticCardMovesMock.mockReturnValue({
 			handleProgrammaticCardMoveReady: () => {},
 			setRequestMoveTaskToTrashHandler: () => {},
+			setRequestCompleteTaskHandler: () => {},
 			tryProgrammaticCardMove,
 			consumeProgrammaticCardMove: () => ({}),
 			resolvePendingProgrammaticTrashMove: () => {},
+			resolvePendingProgrammaticCompleteMove: () => {},
 			waitForProgrammaticCardMoveAvailability: async () => {},
 			resetProgrammaticCardMoves: () => {},
 			requestMoveTaskToTrashWithAnimation: async () => {},
+			requestCompleteTaskWithAnimation: async () => {},
 			programmaticCardMoveCycle: 0,
 		});
 
@@ -302,6 +311,7 @@ describe("useBoardInteractions", () => {
 			handleDeleteDependency: () => {},
 			confirmMoveTaskToTrash: async () => {},
 			requestMoveTaskToTrash: async () => {},
+			requestCompleteTask: async () => {},
 		});
 
 		const board = createBoard();
@@ -313,6 +323,7 @@ describe("useBoardInteractions", () => {
 				path: "/tmp/task-1",
 				baseRef: "main",
 				baseCommit: "abc123",
+				restoredFromPreservation: false,
 			},
 		}));
 		const startTaskSession = vi.fn(async () => ({ ok: true as const }));
@@ -378,12 +389,15 @@ describe("useBoardInteractions", () => {
 		useProgrammaticCardMovesMock.mockReturnValue({
 			handleProgrammaticCardMoveReady: () => {},
 			setRequestMoveTaskToTrashHandler: () => {},
+			setRequestCompleteTaskHandler: () => {},
 			tryProgrammaticCardMove,
 			consumeProgrammaticCardMove: () => ({}),
 			resolvePendingProgrammaticTrashMove: () => {},
+			resolvePendingProgrammaticCompleteMove: () => {},
 			waitForProgrammaticCardMoveAvailability: async () => {},
 			resetProgrammaticCardMoves: () => {},
 			requestMoveTaskToTrashWithAnimation: async () => {},
+			requestCompleteTaskWithAnimation: async () => {},
 			programmaticCardMoveCycle: 0,
 		});
 
@@ -392,6 +406,7 @@ describe("useBoardInteractions", () => {
 			handleDeleteDependency: () => {},
 			confirmMoveTaskToTrash: async () => {},
 			requestMoveTaskToTrash: async () => {},
+			requestCompleteTask: async () => {},
 		});
 
 		const board = createBoard();
@@ -403,6 +418,7 @@ describe("useBoardInteractions", () => {
 				path: "/tmp/task-1",
 				baseRef: "main",
 				baseCommit: "abc123",
+				restoredFromPreservation: false,
 			},
 		}));
 		const startTaskSession = vi.fn(async () => ({ ok: true as const }));
@@ -443,12 +459,15 @@ describe("useBoardInteractions", () => {
 		useProgrammaticCardMovesMock.mockReturnValue({
 			handleProgrammaticCardMoveReady: () => {},
 			setRequestMoveTaskToTrashHandler: () => {},
+			setRequestCompleteTaskHandler: () => {},
 			tryProgrammaticCardMove: () => "unavailable",
 			consumeProgrammaticCardMove: () => ({}),
 			resolvePendingProgrammaticTrashMove: () => {},
+			resolvePendingProgrammaticCompleteMove: () => {},
 			waitForProgrammaticCardMoveAvailability: async () => {},
 			resetProgrammaticCardMoves: () => {},
 			requestMoveTaskToTrashWithAnimation: async () => {},
+			requestCompleteTaskWithAnimation: async () => {},
 			programmaticCardMoveCycle: 0,
 		});
 
@@ -457,6 +476,7 @@ describe("useBoardInteractions", () => {
 			handleDeleteDependency: () => {},
 			confirmMoveTaskToTrash: async () => {},
 			requestMoveTaskToTrash: async () => {},
+			requestCompleteTask: async () => {},
 		});
 
 		const trashTask = createTask("task-trash", "Trash task", 2);
@@ -479,6 +499,7 @@ describe("useBoardInteractions", () => {
 				path: "/tmp/task-trash",
 				baseRef: "main",
 				baseCommit: "abc123",
+				restoredFromPreservation: false,
 				warning: "Saved task changes could not be reapplied automatically.",
 			},
 		}));
@@ -534,12 +555,15 @@ describe("useBoardInteractions", () => {
 		useProgrammaticCardMovesMock.mockReturnValue({
 			handleProgrammaticCardMoveReady: () => {},
 			setRequestMoveTaskToTrashHandler: () => {},
+			setRequestCompleteTaskHandler: () => {},
 			tryProgrammaticCardMove: () => "unavailable",
 			consumeProgrammaticCardMove: () => ({}),
 			resolvePendingProgrammaticTrashMove: () => {},
+			resolvePendingProgrammaticCompleteMove: () => {},
 			waitForProgrammaticCardMoveAvailability: async () => {},
 			resetProgrammaticCardMoves: () => {},
 			requestMoveTaskToTrashWithAnimation: async () => {},
+			requestCompleteTaskWithAnimation: async () => {},
 			programmaticCardMoveCycle: 0,
 		});
 
@@ -548,6 +572,7 @@ describe("useBoardInteractions", () => {
 			handleDeleteDependency: () => {},
 			confirmMoveTaskToTrash: async () => {},
 			requestMoveTaskToTrash: async () => {},
+			requestCompleteTask: async () => {},
 		});
 
 		const trashTask: BoardCard = {
@@ -589,6 +614,7 @@ describe("useBoardInteractions", () => {
 				path: "/tmp/task-trash-model",
 				baseRef: "main",
 				baseCommit: "abc123",
+				restoredFromPreservation: false,
 			},
 		}));
 		const startTaskSession = vi.fn(async () => ({ ok: true as const }));
@@ -636,12 +662,15 @@ describe("useBoardInteractions", () => {
 		useProgrammaticCardMovesMock.mockReturnValue({
 			handleProgrammaticCardMoveReady: () => {},
 			setRequestMoveTaskToTrashHandler: () => {},
+			setRequestCompleteTaskHandler: () => {},
 			tryProgrammaticCardMove: () => "unavailable",
 			consumeProgrammaticCardMove: () => ({}),
 			resolvePendingProgrammaticTrashMove: () => {},
+			resolvePendingProgrammaticCompleteMove: () => {},
 			waitForProgrammaticCardMoveAvailability: async () => {},
 			resetProgrammaticCardMoves: () => {},
 			requestMoveTaskToTrashWithAnimation: async () => {},
+			requestCompleteTaskWithAnimation: async () => {},
 			programmaticCardMoveCycle: 0,
 		});
 
@@ -650,6 +679,7 @@ describe("useBoardInteractions", () => {
 			handleDeleteDependency: () => {},
 			confirmMoveTaskToTrash: async () => {},
 			requestMoveTaskToTrash: async () => {},
+			requestCompleteTask: async () => {},
 		});
 
 		const trashTask = createTask("task-trash", "Trash task", 2);
@@ -696,12 +726,15 @@ describe("useBoardInteractions", () => {
 		useProgrammaticCardMovesMock.mockReturnValue({
 			handleProgrammaticCardMoveReady: () => {},
 			setRequestMoveTaskToTrashHandler: () => {},
+			setRequestCompleteTaskHandler: () => {},
 			tryProgrammaticCardMove: () => "unavailable",
 			consumeProgrammaticCardMove: () => ({}),
 			resolvePendingProgrammaticTrashMove: () => {},
+			resolvePendingProgrammaticCompleteMove: () => {},
 			waitForProgrammaticCardMoveAvailability: async () => {},
 			resetProgrammaticCardMoves: () => {},
 			requestMoveTaskToTrashWithAnimation: async () => {},
+			requestCompleteTaskWithAnimation: async () => {},
 			programmaticCardMoveCycle: 0,
 		});
 
@@ -710,6 +743,7 @@ describe("useBoardInteractions", () => {
 			handleDeleteDependency: () => {},
 			confirmMoveTaskToTrash: async () => {},
 			requestMoveTaskToTrash: async () => {},
+			requestCompleteTask: async () => {},
 		});
 
 		const trashTaskCount = 25;

@@ -7,6 +7,7 @@ import {
 	loadGlobalRuntimeConfig,
 	loadRuntimeConfig,
 	pickBestInstalledAgentIdFromDetected,
+	readGlobalRuntimeVerificationConfig,
 	saveRuntimeConfig,
 	updateRuntimeConfig,
 } from "../../../src/config/runtime-config";
@@ -674,6 +675,286 @@ describe("B-2.9 — context budget settings", () => {
 			});
 		} finally {
 			cleanupProject();
+			cleanupHome();
+		}
+	});
+});
+
+describe("B-7.1 — verification gate settings", () => {
+	it("saves a verification config and reloads it with normalized defaults", async () => {
+		const { path: tempHome, cleanup: cleanupHome } = createTempDir("kanban-home-runtime-config-verification-");
+		const { path: tempProject, cleanup: cleanupProject } = createTempDir(
+			"kanban-project-runtime-config-verification-",
+		);
+
+		try {
+			await withTemporaryEnv({ home: tempHome }, async () => {
+				await loadRuntimeConfig(tempProject);
+				const state = await updateRuntimeConfig(tempProject, {
+					verification: {
+						enabled: "required",
+						checks: [
+							{
+								id: "lint",
+								command: "npm",
+								args: ["run", "lint"],
+								timeoutMs: 60_000,
+								env: { CI: "1" },
+								successExitCodes: [0, 1],
+							},
+							{ id: "fmt", command: "prettier", args: ["--check", "."], required: false },
+						],
+					},
+				});
+				expect(state.verification).toEqual({
+					enabled: "required",
+					checks: [
+						{
+							id: "lint",
+							command: "npm",
+							args: ["run", "lint"],
+							timeoutMs: 60_000,
+							env: { CI: "1" },
+							successExitCodes: [0, 1],
+							required: true,
+						},
+						{
+							id: "fmt",
+							command: "prettier",
+							args: ["--check", "."],
+							successExitCodes: [0],
+							required: false,
+						},
+					],
+				});
+
+				const filePayload = JSON.parse(readFileSync(join(tempHome, ".cline", "kanban", "config.json"), "utf8")) as {
+					verification?: { enabled?: string; checks?: unknown[] };
+				};
+				expect(filePayload.verification?.enabled).toBe("required");
+				expect(filePayload.verification?.checks).toHaveLength(2);
+
+				const reloaded = await loadRuntimeConfig(tempProject);
+				expect(reloaded.verification).toEqual(state.verification);
+			});
+		} finally {
+			cleanupProject();
+			cleanupHome();
+		}
+	});
+
+	it("merges a partial verification update with the stored config", async () => {
+		const { path: tempHome, cleanup: cleanupHome } = createTempDir("kanban-home-runtime-config-verification-merge-");
+		const { path: tempProject, cleanup: cleanupProject } = createTempDir(
+			"kanban-project-runtime-config-verification-merge-",
+		);
+
+		try {
+			await withTemporaryEnv({ home: tempHome }, async () => {
+				await loadRuntimeConfig(tempProject);
+				await updateRuntimeConfig(tempProject, {
+					verification: {
+						enabled: "required",
+						checks: [{ id: "lint", command: "npm", args: ["run", "lint"] }],
+					},
+				});
+				const updated = await updateRuntimeConfig(tempProject, {
+					verification: { enabled: "off" },
+				});
+				expect(updated.verification).toEqual({
+					enabled: "off",
+					checks: [
+						{
+							id: "lint",
+							command: "npm",
+							args: ["run", "lint"],
+							successExitCodes: [0],
+							required: true,
+						},
+					],
+				});
+			});
+		} finally {
+			cleanupProject();
+			cleanupHome();
+		}
+	});
+
+	it("clears the verification config with an explicit null", async () => {
+		const { path: tempHome, cleanup: cleanupHome } = createTempDir("kanban-home-runtime-config-verification-clear-");
+		const { path: tempProject, cleanup: cleanupProject } = createTempDir(
+			"kanban-project-runtime-config-verification-clear-",
+		);
+
+		try {
+			await withTemporaryEnv({ home: tempHome }, async () => {
+				await loadRuntimeConfig(tempProject);
+				await updateRuntimeConfig(tempProject, {
+					verification: {
+						enabled: "required",
+						checks: [{ id: "lint", command: "npm", args: ["run", "lint"] }],
+					},
+				});
+				const cleared = await updateRuntimeConfig(tempProject, { verification: null });
+				expect(cleared.verification).toBeUndefined();
+				const filePayload = JSON.parse(readFileSync(join(tempHome, ".cline", "kanban", "config.json"), "utf8")) as {
+					verification?: unknown;
+				};
+				expect(filePayload.verification).toBeUndefined();
+			});
+		} finally {
+			cleanupProject();
+			cleanupHome();
+		}
+	});
+
+	it("leaves a stored verification config untouched when the update omits it", async () => {
+		const { path: tempHome, cleanup: cleanupHome } = createTempDir(
+			"kanban-home-runtime-config-verification-preserve-",
+		);
+		const { path: tempProject, cleanup: cleanupProject } = createTempDir(
+			"kanban-project-runtime-config-verification-preserve-",
+		);
+
+		try {
+			await withTemporaryEnv({ home: tempHome }, async () => {
+				await loadRuntimeConfig(tempProject);
+				await updateRuntimeConfig(tempProject, {
+					verification: {
+						enabled: "required",
+						checks: [{ id: "lint", command: "npm", args: ["run", "lint"] }],
+					},
+				});
+				const updated = await updateRuntimeConfig(tempProject, {
+					readyForReviewNotificationsEnabled: false,
+				});
+				expect(updated.verification).toEqual({
+					enabled: "required",
+					checks: [
+						{
+							id: "lint",
+							command: "npm",
+							args: ["run", "lint"],
+							successExitCodes: [0],
+							required: true,
+						},
+					],
+				});
+			});
+		} finally {
+			cleanupProject();
+			cleanupHome();
+		}
+	});
+
+	it("rejects unsafe check cwds and duplicate check ids on save", async () => {
+		const { path: tempHome, cleanup: cleanupHome } = createTempDir(
+			"kanban-home-runtime-config-verification-invalid-",
+		);
+		const { path: tempProject, cleanup: cleanupProject } = createTempDir(
+			"kanban-project-runtime-config-verification-invalid-",
+		);
+
+		try {
+			await withTemporaryEnv({ home: tempHome }, async () => {
+				await loadRuntimeConfig(tempProject);
+				await expect(
+					updateRuntimeConfig(tempProject, {
+						verification: {
+							enabled: "required",
+							checks: [
+								{ id: "a", command: "x" },
+								{ id: "a", command: "y" },
+							],
+						},
+					}),
+				).rejects.toThrow('verification config has duplicate check id "a".');
+				await expect(
+					updateRuntimeConfig(tempProject, {
+						verification: {
+							enabled: "required",
+							checks: [{ id: "a", command: "x", cwd: "../outside" }],
+						},
+					}),
+				).rejects.toThrow('verification check "a" cwd must be a relative path inside the worktree.');
+				await expect(
+					updateRuntimeConfig(tempProject, {
+						verification: {
+							enabled: "required",
+							checks: [{ id: "a", command: "x", successExitCodes: [] }],
+						},
+					}),
+				).rejects.toThrow('verification check "a" successExitCodes must be a non-empty array of 0-255 integers.');
+			});
+		} finally {
+			cleanupProject();
+			cleanupHome();
+		}
+	});
+
+	it("drops corrupted check entries when loading instead of failing", async () => {
+		const { path: tempHome, cleanup: cleanupHome } = createTempDir(
+			"kanban-home-runtime-config-verification-corrupt-",
+		);
+		const { path: tempProject, cleanup: cleanupProject } = createTempDir(
+			"kanban-project-runtime-config-verification-corrupt-",
+		);
+
+		try {
+			await withTemporaryEnv({ home: tempHome }, async () => {
+				mkdirSync(join(tempHome, ".cline", "kanban"), { recursive: true });
+				writeFileSync(
+					join(tempHome, ".cline", "kanban", "config.json"),
+					JSON.stringify({
+						verification: {
+							enabled: "required",
+							checks: [
+								{ id: "  ", command: "x" },
+								{ id: "good", command: "make", successExitCodes: [0, 999] },
+								{ id: "traverse", command: "y", cwd: "../x" },
+							],
+						},
+					}),
+					"utf8",
+				);
+				const state = await loadRuntimeConfig(tempProject);
+				// The empty-id check is dropped, the traversal cwd is stripped,
+				// and the out-of-range exit code is filtered out.
+				expect(state.verification).toEqual({
+					enabled: "required",
+					checks: [
+						{ id: "good", command: "make", args: [], successExitCodes: [0], required: true },
+						{ id: "traverse", command: "y", args: [], successExitCodes: [0], required: true },
+					],
+				});
+			});
+		} finally {
+			cleanupProject();
+			cleanupHome();
+		}
+	});
+
+	it("readGlobalRuntimeVerificationConfig reads only the gate without side effects", async () => {
+		const { path: tempHome, cleanup: cleanupHome } = createTempDir("kanban-home-runtime-config-verification-read-");
+
+		try {
+			await withTemporaryEnv({ home: tempHome }, async () => {
+				expect(await readGlobalRuntimeVerificationConfig()).toBeUndefined();
+
+				mkdirSync(join(tempHome, ".cline", "kanban"), { recursive: true });
+				writeFileSync(
+					join(tempHome, ".cline", "kanban", "config.json"),
+					JSON.stringify({
+						verification: { enabled: "required", checks: [{ id: "build", command: "make" }] },
+					}),
+					"utf8",
+				);
+				expect(await readGlobalRuntimeVerificationConfig()).toEqual({
+					enabled: "required",
+					checks: [{ id: "build", command: "make", args: [], successExitCodes: [0], required: true }],
+				});
+			});
+		} finally {
 			cleanupHome();
 		}
 	});

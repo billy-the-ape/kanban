@@ -373,7 +373,7 @@ describe.sequential("task-worktree integration", () => {
 		});
 	});
 
-	it("resumes a trashed task even when the saved patch is invalid", async () => {
+	it("resumes a trashed task from the preserved snapshot when the saved patch is invalid", async () => {
 		await withTemporaryHome(async () => {
 			const { path: sandboxRoot, cleanup } = createTempDir("kanban-task-worktree-invalid-patch-");
 			try {
@@ -436,8 +436,11 @@ describe.sequential("task-worktree integration", () => {
 					throw new Error("Task worktree was not restored");
 				}
 
-				expect(restored.warning).toContain("Saved task changes could not be reapplied automatically.");
+				// B-5.3: the full worktree archive is authoritative, so a corrupt
+				// patch falls back to it instead of losing the task content.
+				expect(restored.warning).toBeUndefined();
 				expect(runGit(restored.path, ["rev-parse", "HEAD"])).toBe(createdCommit);
+				expect(readFileSync(join(restored.path, "README.md"), "utf8")).toBe("hello\n");
 			} finally {
 				cleanup();
 			}

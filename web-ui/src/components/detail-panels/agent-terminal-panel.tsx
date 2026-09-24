@@ -32,10 +32,13 @@ export interface AgentTerminalPanelProps {
 	isOpenPrLoading?: boolean;
 	taskColumnId?: string;
 	onMoveToTrash?: () => void;
+	onComplete?: () => void;
 	isMoveToTrashLoading?: boolean;
+	isCompleteLoading?: boolean;
 	onCancelAutomaticAction?: () => void;
 	cancelAutomaticActionLabel?: string | null;
 	showMoveToTrash?: boolean;
+	showComplete?: boolean;
 	showSessionToolbar?: boolean;
 	onClose?: () => void;
 	autoFocus?: boolean;
@@ -152,10 +155,13 @@ function AgentTerminalPanelLayout({
 	isOpenPrLoading = false,
 	taskColumnId = "in_progress",
 	onMoveToTrash,
+	onComplete,
 	isMoveToTrashLoading = false,
+	isCompleteLoading = false,
 	onCancelAutomaticAction,
 	cancelAutomaticActionLabel,
 	showMoveToTrash,
+	showComplete,
 	showSessionToolbar = true,
 	onClose,
 	autoFocus: _autoFocus = false,
@@ -314,7 +320,7 @@ function AgentTerminalPanelLayout({
 					{lastError}
 				</div>
 			) : null}
-			{showMoveToTrash && onMoveToTrash ? (
+			{(showComplete && onComplete) || (showMoveToTrash && onMoveToTrash) ? (
 				<div style={{ display: "flex", flexDirection: "column", gap: 8, padding: "8px 12px" }}>
 					<AgentTerminalReviewActions
 						taskId={taskId}
@@ -329,8 +335,13 @@ function AgentTerminalPanelLayout({
 							{cancelAutomaticActionLabel}
 						</Button>
 					) : null}
+					{showComplete && onComplete ? (
+						<Button variant="primary" fill disabled={isCompleteLoading} onClick={onComplete}>
+							{isCompleteLoading ? <Spinner size={14} /> : "Complete Task"}
+						</Button>
+					) : null}
 					<Button variant="danger" fill disabled={isMoveToTrashLoading} onClick={onMoveToTrash}>
-						{isMoveToTrashLoading ? <Spinner size={14} /> : "Move Card To Done"}
+						{isMoveToTrashLoading ? <Spinner size={14} /> : "Move To Trash"}
 					</Button>
 				</div>
 			) : null}

@@ -134,18 +134,8 @@ function createFakeClineSessionRuntime(): FakeClineSessionRuntimeController {
 		return {
 			async startTaskSession(request: StartClineSessionRuntimeRequest): Promise<StartClineSessionRuntimeResult> {
 				const requestedSessionId = createSessionId(request.taskId);
-				lastStartRequestByTaskId.set(request.taskId, {
-					taskId: request.taskId,
-					cwd: request.cwd,
-					providerId: request.providerId,
-					modelId: request.modelId,
-					mode: request.mode ?? "act",
-					apiKey: request.apiKey,
-					baseUrl: request.baseUrl,
-					systemPrompt: request.systemPrompt,
-					userInstructionService: request.userInstructionService,
-					requestToolApproval: request.requestToolApproval,
-				});
+				const { prompt: _prompt, images: _images, initialMessages: _initialMessages, ...restartRequest } = request;
+				lastStartRequestByTaskId.set(request.taskId, { ...restartRequest, mode: request.mode ?? "act" });
 				bindTaskSession(request.taskId, requestedSessionId);
 
 				let startResult: StartClineSessionRuntimeResult;
@@ -223,6 +213,9 @@ function createFakeClineSessionRuntime(): FakeClineSessionRuntimeController {
 			},
 			canRestartTaskSession(taskId: string): boolean {
 				return lastStartRequestByTaskId.has(taskId);
+			},
+			async resolveRestartStartRequest(taskId: string) {
+				return lastStartRequestByTaskId.get(taskId) ?? null;
 			},
 			async readPersistedTaskSession(taskId: string): Promise<ClinePersistedTaskSessionSnapshot | null> {
 				return await readPersistedTaskSessionMock(taskId);
@@ -1576,6 +1569,10 @@ describe("InMemoryClineTaskSessionService", () => {
 				"Anthropic request was rejected (HTTP 400). Maximum prompt length exceeded: 1102640 tokens exceeds the 1000000 token limit.",
 			),
 		);
+		// B-3.2: oversized middle messages (the persisted transcript must
+		// exceed the calibrated compaction target for the deterministic
+		// compactor to delete anything).
+		const bigMessage = (label: string) => `${label} ${"x".repeat(4_900)}`;
 		runtime.readPersistedTaskSessionMock.mockResolvedValue({
 			record: {
 				sessionId: "task-1-failed",
@@ -1595,10 +1592,10 @@ describe("InMemoryClineTaskSessionService", () => {
 			},
 			messages: [
 				{ role: "user", content: "Initial prompt" },
-				{ role: "assistant", content: "Step 1 response" },
-				{ role: "user", content: "Step 2 request" },
-				{ role: "assistant", content: "Step 2 response" },
-				{ role: "assistant", content: "Tool output summary" },
+				{ role: "assistant", content: bigMessage("Step 1 response") },
+				{ role: "user", content: bigMessage("Step 2 request") },
+				{ role: "assistant", content: bigMessage("Step 2 response") },
+				{ role: "assistant", content: bigMessage("Tool output summary") },
 				{ role: "user", content: "Latest user request" },
 				{ role: "assistant", content: "Latest response" },
 			],
@@ -1608,6 +1605,10 @@ describe("InMemoryClineTaskSessionService", () => {
 			taskId: "task-1",
 			cwd: "/tmp/worktree",
 			prompt: "Initial prompt",
+			systemPrompt: "test system prompt",
+			// B-3: recovery compacts against the calibrated compaction target
+			// derived from the explicit compaction config on the start request.
+			compaction: { contextWindowTokens: 8_192, reserveTokens: 1_024 },
 		});
 		await vi.waitFor(() => {
 			expect(runtime.startTaskSessionMock).toHaveBeenCalledTimes(1);
@@ -1625,15 +1626,20 @@ describe("InMemoryClineTaskSessionService", () => {
 		expect(restartCall?.prompt).toBe("resolved:Try again");
 		const compactedMessages = restartCall?.initialMessages;
 		expect(Array.isArray(compactedMessages)).toBe(true);
+		// B-3.2: the deterministic compactor deletes the old oversized
+		// assistant messages (the original user requirements and the most
+		// recent exchange survive).
 		expect((compactedMessages ?? []).length).toBeLessThan(7);
 		expect(compactedMessages?.[0]?.role).toBe("user");
 		const compactedFirstContent =
 			typeof compactedMessages?.[0]?.content === "string"
 				? compactedMessages[0].content
 				: JSON.stringify(compactedMessages?.[0]?.content ?? "");
-		expect(compactedFirstContent).toContain("Previous conversation history was removed due to context window limits");
+		// B-3.2: the B-2.5 compaction notice rides on the surviving first
+		// message (never double-prepended).
+		expect(compactedFirstContent).toContain("Earlier conversation turns were removed to fit the context window");
 		expect(compactedFirstContent).not.toContain("[[");
-		expect(compactedFirstContent).toContain("[Previous conversation history");
+		expect(compactedFirstContent).toContain("[Earlier conversation turns");
 		expect(compactedFirstContent).toContain("Initial prompt");
 		expect(service.listMessages("task-1").some((message) => message.content.includes("Cline SDK send failed"))).toBe(
 			false,

@@ -2,7 +2,7 @@ import { Draggable } from "@hello-pangea/dnd";
 import { getRuntimeAgentCatalogEntry } from "@runtime-agent-catalog";
 import { formatClineToolCallLabel } from "@runtime-cline-tool-call-display";
 import { buildTaskWorktreeDisplayPath } from "@runtime-task-worktree-path";
-import { AlertCircle, AlertTriangle, Bot, GitBranch, Pencil, Play, RotateCcw, Trash2 } from "lucide-react";
+import { AlertCircle, AlertTriangle, Bot, Check, GitBranch, Pencil, Play, RotateCcw, Trash2 } from "lucide-react";
 import type { KeyboardEvent, MouseEvent } from "react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
@@ -219,6 +219,7 @@ export function BoardCard({
 	onClick,
 	onStart,
 	onMoveToTrash,
+	onComplete,
 	onRestoreFromTrash,
 	onSaveTitle,
 	onCommit,
@@ -227,6 +228,8 @@ export function BoardCard({
 	isCommitLoading = false,
 	isOpenPrLoading = false,
 	isMoveToTrashLoading = false,
+	isCompleteLoading = false,
+	cleanupBlockedReason = null,
 	onDependencyPointerDown,
 	onDependencyPointerEnter,
 	isDependencySource = false,
@@ -243,6 +246,7 @@ export function BoardCard({
 	onClick?: () => void;
 	onStart?: (taskId: string) => void;
 	onMoveToTrash?: (taskId: string) => void;
+	onComplete?: (taskId: string) => void;
 	onRestoreFromTrash?: (taskId: string) => void;
 	onSaveTitle?: (taskId: string, title: string) => void;
 	onCommit?: (taskId: string) => void;
@@ -251,6 +255,9 @@ export function BoardCard({
 	isCommitLoading?: boolean;
 	isOpenPrLoading?: boolean;
 	isMoveToTrashLoading?: boolean;
+	isCompleteLoading?: boolean;
+	/** B-5.9: why this Trash card's worktree cleanup is still blocked. */
+	cleanupBlockedReason?: string | null;
 	onDependencyPointerDown?: (taskId: string, event: MouseEvent<HTMLElement>) => void;
 	onDependencyPointerEnter?: (taskId: string) => void;
 	isDependencySource?: boolean;
@@ -271,7 +278,8 @@ export function BoardCard({
 	const [isDescriptionExpanded, setIsDescriptionExpanded] = useState(false);
 	const reviewWorkspaceSnapshot = useTaskWorkspaceSnapshotValue(card.id);
 	const isTrashCard = columnId === "trash";
-	const isCardInteractive = !isTrashCard;
+	const isDoneCard = columnId === "done";
+	const isCardInteractive = !isTrashCard && !isDoneCard;
 	const descriptionWidth = descriptionRect.width > 0 ? descriptionRect.width : descriptionWidthFallback;
 	const rawSessionActivity = useMemo(() => getCardSessionActivity(sessionSummary), [sessionSummary]);
 	const lastSessionActivityRef = useRef<CardSessionActivity | null>(null);
@@ -429,7 +437,9 @@ export function BoardCard({
 	const showReviewGitActions = columnId === "review" && (reviewWorkspaceSnapshot?.changedFiles ?? 0) > 0;
 	const isAnyGitActionLoading = isCommitLoading || isOpenPrLoading;
 	const cancelAutomaticActionLabel =
-		!isTrashCard && card.autoReviewEnabled ? getTaskAutoReviewCancelButtonLabel(card.autoReviewMode) : null;
+		!isTrashCard && !isDoneCard && card.autoReviewEnabled
+			? getTaskAutoReviewCancelButtonLabel(card.autoReviewMode)
+			: null;
 	const agentOverrideLabel = useMemo(
 		() => (card.agentId ? (getRuntimeAgentCatalogEntry(card.agentId)?.label ?? card.agentId) : null),
 		[card.agentId],
@@ -615,12 +625,40 @@ export function BoardCard({
 										}}
 									/>
 								) : columnId === "review" ? (
+									<div className="flex items-center">
+										<Button
+											icon={isCompleteLoading ? <Spinner size={13} /> : <Check size={13} />}
+											variant="ghost"
+											size="sm"
+											className="text-status-green hover:text-status-green"
+											disabled={isCompleteLoading}
+											aria-label="Complete task"
+											onMouseDown={stopEvent}
+											onClick={(event) => {
+												stopEvent(event);
+												onComplete?.(card.id);
+											}}
+										/>
+										<Button
+											icon={isMoveToTrashLoading ? <Spinner size={13} /> : <Trash2 size={13} />}
+											variant="ghost"
+											size="sm"
+											disabled={isMoveToTrashLoading}
+											aria-label="Discard task"
+											onMouseDown={stopEvent}
+											onClick={(event) => {
+												stopEvent(event);
+												onMoveToTrash?.(card.id);
+											}}
+										/>
+									</div>
+								) : columnId === "done" ? (
 									<Button
 										icon={isMoveToTrashLoading ? <Spinner size={13} /> : <Trash2 size={13} />}
 										variant="ghost"
 										size="sm"
 										disabled={isMoveToTrashLoading}
-										aria-label="Move task to done"
+										aria-label="Discard completed task"
 										onMouseDown={stopEvent}
 										onClick={(event) => {
 											stopEvent(event);
@@ -628,28 +666,41 @@ export function BoardCard({
 										}}
 									/>
 								) : columnId === "trash" ? (
-									<Tooltip
-										side="bottom"
-										content={
-											<>
-												Restore session
-												<br />
-												in new worktree
-											</>
-										}
-									>
-										<Button
-											icon={<RotateCcw size={12} />}
-											variant="ghost"
-											size="sm"
-											aria-label="Restore task from done"
-											onMouseDown={stopEvent}
-											onClick={(event) => {
-												stopEvent(event);
-												onRestoreFromTrash?.(card.id);
-											}}
-										/>
-									</Tooltip>
+									<div className="flex items-center">
+										{cleanupBlockedReason ? (
+											<Tooltip side="bottom" content={`Worktree cleanup blocked: ${cleanupBlockedReason}`}>
+												<span
+													className="inline-flex px-1 text-status-orange"
+													role="img"
+													aria-label="Worktree cleanup blocked"
+												>
+													<AlertTriangle size={13} />
+												</span>
+											</Tooltip>
+										) : null}
+										<Tooltip
+											side="bottom"
+											content={
+												<>
+													Restore session
+													<br />
+													in new worktree
+												</>
+											}
+										>
+											<Button
+												icon={<RotateCcw size={12} />}
+												variant="ghost"
+												size="sm"
+												aria-label="Restore task from trash"
+												onMouseDown={stopEvent}
+												onClick={(event) => {
+													stopEvent(event);
+													onRestoreFromTrash?.(card.id);
+												}}
+											/>
+										</Tooltip>
+									</div>
 								) : null}
 							</div>
 							{displayDescription ? (

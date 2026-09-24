@@ -24,10 +24,13 @@ export function BoardColumn({
 	onOpenPrTask,
 	onCancelAutomaticTaskAction,
 	onMoveToTrashTask,
+	onCompleteTask,
 	onRestoreFromTrashTask,
 	commitTaskLoadingById,
 	openPrTaskLoadingById,
 	moveToTrashLoadingById,
+	completeTaskLoadingById,
+	cleanupBlockedReasonByTaskId,
 	onCardClick,
 	activeDragTaskId,
 	activeDragSourceColumnId,
@@ -54,10 +57,13 @@ export function BoardColumn({
 	onOpenPrTask?: (taskId: string) => void;
 	onCancelAutomaticTaskAction?: (taskId: string) => void;
 	onMoveToTrashTask?: (taskId: string) => void;
+	onCompleteTask?: (taskId: string) => void;
 	onRestoreFromTrashTask?: (taskId: string) => void;
 	commitTaskLoadingById?: Record<string, boolean>;
 	openPrTaskLoadingById?: Record<string, boolean>;
 	moveToTrashLoadingById?: Record<string, boolean>;
+	completeTaskLoadingById?: Record<string, boolean>;
+	cleanupBlockedReasonByTaskId?: Record<string, string>;
 	onCardClick?: (card: BoardCardModel) => void;
 	activeDragTaskId?: string | null;
 	activeDragSourceColumnId?: BoardColumnId | null;
@@ -127,8 +133,8 @@ export function BoardColumn({
 							className="text-status-red hover:text-status-red"
 							onClick={onClearTrash}
 							disabled={column.cards.length === 0}
-							aria-label="Clear done"
-							title={column.cards.length > 0 ? "Clear done items permanently" : "Done is empty"}
+							aria-label="Clear trash"
+							title={column.cards.length > 0 ? "Clear trash items permanently" : "Trash is empty"}
 						/>
 					) : null}
 				</div>
@@ -174,6 +180,7 @@ export function BoardColumn({
 											sessionSummary={taskSessions[card.id]}
 											onStart={onStartTask}
 											onMoveToTrash={onMoveToTrashTask}
+											onComplete={onCompleteTask}
 											onRestoreFromTrash={onRestoreFromTrashTask}
 											onCommit={onCommitTask}
 											onOpenPr={onOpenPrTask}
@@ -181,6 +188,8 @@ export function BoardColumn({
 											isCommitLoading={commitTaskLoadingById?.[card.id] ?? false}
 											isOpenPrLoading={openPrTaskLoadingById?.[card.id] ?? false}
 											isMoveToTrashLoading={moveToTrashLoadingById?.[card.id] ?? false}
+											isCompleteLoading={completeTaskLoadingById?.[card.id] ?? false}
+											cleanupBlockedReason={cleanupBlockedReasonByTaskId?.[card.id] ?? null}
 											onDependencyPointerDown={onDependencyPointerDown}
 											onDependencyPointerEnter={onDependencyPointerEnter}
 											isDependencySource={dependencySourceTaskId === card.id}

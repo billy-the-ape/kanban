@@ -9,7 +9,13 @@ import type {
 	RuntimeAgentId,
 	RuntimeContextBudget,
 	RuntimeContextBudgetSave,
+	RuntimeGitDeliveryPolicy,
+	RuntimeGitDeliveryPolicySave,
 	RuntimeProjectShortcut,
+	RuntimeReviewPolicy,
+	RuntimeReviewPolicySave,
+	RuntimeVerificationConfig,
+	RuntimeVerificationConfigSave,
 } from "../core/api-contract";
 import { type LockRequest, lockedFileSystem } from "../fs/locked-file-system";
 import { detectInstalledCommands } from "../terminal/agent-registry";
@@ -23,6 +29,10 @@ interface RuntimeGlobalConfigFileShape {
 	commitPromptTemplate?: string;
 	openPrPromptTemplate?: string;
 	contextBudget?: RuntimeContextBudget;
+	reviewPolicy?: RuntimeReviewPolicySave;
+	verification?: RuntimeVerificationConfigSave;
+	/** B-8: stored in save-shape (partial); normalized to the full policy on read. */
+	gitDeliveryPolicy?: RuntimeGitDeliveryPolicySave;
 }
 
 interface RuntimeProjectConfigFileShape {
@@ -43,6 +53,12 @@ export interface RuntimeConfigState {
 	openPrPromptTemplateDefault: string;
 	/** B-2.9: global context budget settings; absent means all defaults. */
 	contextBudget?: RuntimeContextBudget;
+	/** B-6: global review lifecycle policy; absent means all defaults (off, 2 repair rounds). */
+	reviewPolicy?: RuntimeReviewPolicy;
+	/** B-7: global verification gate; absent means the gate is inactive (off, no checks). */
+	verification?: RuntimeVerificationConfig;
+	/** B-8: global git delivery policy; absent means model-driven git behavior (delivery off). */
+	gitDeliveryPolicy?: RuntimeGitDeliveryPolicy;
 }
 
 export interface RuntimeConfigUpdateInput {
@@ -55,6 +71,12 @@ export interface RuntimeConfigUpdateInput {
 	openPrPromptTemplate?: string;
 	/** B-2.9: `null` clears all context budget settings; `undefined` leaves them untouched. */
 	contextBudget?: RuntimeContextBudgetSave | null;
+	/** B-6: `null` clears all review policy settings; `undefined` leaves them untouched. */
+	reviewPolicy?: RuntimeReviewPolicySave | null;
+	/** B-7: `null` clears all verification gate settings; `undefined` leaves them untouched. */
+	verification?: RuntimeVerificationConfigSave | null;
+	/** B-8: `null` clears all git delivery settings; `undefined` leaves them untouched. */
+	gitDeliveryPolicy?: RuntimeGitDeliveryPolicySave | null;
 }
 
 const RUNTIME_HOME_PARENT_DIR = ".cline";
@@ -67,6 +89,8 @@ const DEFAULT_AGENT_ID: RuntimeAgentId = "cline";
 const AUTO_SELECT_AGENT_PRIORITY: readonly RuntimeAgentId[] = ["claude", "codex", "droid", "kiro"];
 const DEFAULT_AGENT_AUTONOMOUS_MODE_ENABLED = true;
 const DEFAULT_READY_FOR_REVIEW_NOTIFICATIONS_ENABLED = true;
+const DEFAULT_REVIEW_POLICY_ENABLED: "required" | "off" = "off";
+const DEFAULT_REVIEW_POLICY_MAX_REPAIR_ROUNDS = 2;
 const DEFAULT_COMMIT_PROMPT_TEMPLATE = `You are in a worktree on a detached HEAD. When you are finished with the task, commit the working changes onto {{base_ref}}.
 
 - Do not run destructive commands: git reset --hard, git clean -fdx, git worktree remove, rm/mv on repository paths.
@@ -333,6 +357,426 @@ function mergeContextBudgetUpdates(
 	return { ...(stored ?? {}), ...updates };
 }
 
+/** B-6: drop invalid/empty fields so corrupted config files degrade to defaults. */
+function normalizeReviewPolicyValue(
+	value: unknown,
+	field: keyof RuntimeReviewPolicy,
+): RuntimeReviewPolicy[keyof RuntimeReviewPolicy] | undefined {
+	if (field === "enabled") {
+		return value === "required" || value === "off" ? value : undefined;
+	}
+	if (field === "instructions") {
+		return typeof value === "string" ? value : undefined;
+	}
+	if (field === "modelOverride") {
+		if (value === null) {
+			return null;
+		}
+		if (value && typeof value === "object") {
+			const candidate = value as { providerId?: unknown; modelId?: unknown };
+			if (typeof candidate.providerId === "string" && candidate.providerId.trim()) {
+				if (typeof candidate.modelId === "string" && candidate.modelId.trim()) {
+					return { providerId: candidate.providerId, modelId: candidate.modelId };
+				}
+			}
+			return undefined;
+		}
+		return undefined;
+	}
+	if (typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 10) {
+		return value;
+	}
+	return undefined;
+}
+
+/** B-6: normalize a stored/partial review policy; undefined means all defaults. */
+function normalizeReviewPolicy(value: unknown): RuntimeReviewPolicy | undefined {
+	if (!value || typeof value !== "object") {
+		return undefined;
+	}
+	const raw = value as Record<string, unknown>;
+	const policy: RuntimeReviewPolicy = {
+		enabled:
+			(normalizeReviewPolicyValue(raw.enabled, "enabled") as "required" | "off") ?? DEFAULT_REVIEW_POLICY_ENABLED,
+		instructions: (normalizeReviewPolicyValue(raw.instructions, "instructions") as string | undefined) ?? "",
+		modelOverride:
+			(normalizeReviewPolicyValue(raw.modelOverride, "modelOverride") as RuntimeReviewPolicy["modelOverride"]) ??
+			null,
+		maxRepairRounds:
+			(normalizeReviewPolicyValue(raw.maxRepairRounds, "maxRepairRounds") as number) ??
+			DEFAULT_REVIEW_POLICY_MAX_REPAIR_ROUNDS,
+	};
+	return policy;
+}
+
+/**
+ * B-6: strict validation for save-time input (the API boundary already
+ * validates via zod; this is defense in depth for direct callers).
+ */
+function validateReviewPolicy(policy: RuntimeReviewPolicySave | null | undefined): void {
+	if (policy === null || policy === undefined) {
+		return;
+	}
+	if (policy.enabled !== undefined && policy.enabled !== "required" && policy.enabled !== "off") {
+		throw new Error("reviewPolicy.enabled must be either 'required' or 'off'.");
+	}
+	if (
+		policy.maxRepairRounds !== undefined &&
+		(!Number.isInteger(policy.maxRepairRounds) || policy.maxRepairRounds < 1 || policy.maxRepairRounds > 10)
+	) {
+		throw new Error("reviewPolicy.maxRepairRounds must be an integer between 1 and 10.");
+	}
+}
+
+/** B-6: merges a save-shape review policy update (null clears everything, undefined leaves it untouched). */
+function mergeReviewPolicyUpdates(
+	stored: RuntimeReviewPolicy | undefined,
+	updates: RuntimeReviewPolicySave | null | undefined,
+): RuntimeReviewPolicySave | null | undefined {
+	if (updates === undefined) {
+		return undefined;
+	}
+	if (updates === null) {
+		return null;
+	}
+	return { ...(stored ?? {}), ...updates };
+}
+
+function areRuntimeReviewPoliciesEqual(
+	left: RuntimeReviewPolicySave | null | undefined,
+	right: RuntimeReviewPolicySave | null | undefined,
+): boolean {
+	if (!left && !right) {
+		return true;
+	}
+	if (!left || !right) {
+		return false;
+	}
+	return (
+		left.enabled === right.enabled &&
+		left.instructions === right.instructions &&
+		left.maxRepairRounds === right.maxRepairRounds &&
+		(left.modelOverride?.providerId ?? null) === (right.modelOverride?.providerId ?? null) &&
+		(left.modelOverride?.modelId ?? null) === (right.modelOverride?.modelId ?? null)
+	);
+}
+
+const DEFAULT_VERIFICATION_ENABLED: "required" | "off" = "off";
+
+/** B-7.1: a check working directory must stay inside the task worktree root. */
+function isSafeVerificationCwd(value: string): boolean {
+	const trimmed = value.trim();
+	if (!trimmed || trimmed.startsWith("/") || trimmed.startsWith("\\")) {
+		return false;
+	}
+	// Reject absolute Windows paths (C:\) and any segment that traverses upward.
+	if (/^[a-zA-Z]:/.test(trimmed) || trimmed.split(/[\\/]+/).includes("..")) {
+		return false;
+	}
+	return true;
+}
+
+/** B-7.1: normalize one stored check; malformed entries are dropped (load-time defense in depth). */
+function normalizeVerificationCheck(value: unknown): RuntimeVerificationConfig["checks"][number] | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return undefined;
+	}
+	const record = value as Record<string, unknown>;
+	const id = typeof record.id === "string" ? record.id.trim() : "";
+	const command = typeof record.command === "string" ? record.command.trim() : "";
+	if (!id || !command) {
+		return undefined;
+	}
+	const args = Array.isArray(record.args) ? record.args.filter((arg): arg is string => typeof arg === "string") : [];
+	const cwd = typeof record.cwd === "string" && isSafeVerificationCwd(record.cwd) ? record.cwd.trim() : undefined;
+	const timeoutMs =
+		typeof record.timeoutMs === "number" && Number.isInteger(record.timeoutMs) && record.timeoutMs > 0
+			? record.timeoutMs
+			: undefined;
+	const env =
+		record.env && typeof record.env === "object" && !Array.isArray(record.env)
+			? Object.fromEntries(
+					Object.entries(record.env as Record<string, unknown>).filter(
+						(entry): entry is [string, string] => typeof entry[1] === "string",
+					),
+				)
+			: undefined;
+	const successExitCodes = Array.isArray(record.successExitCodes)
+		? record.successExitCodes.filter(
+				(code): code is number => typeof code === "number" && Number.isInteger(code) && code >= 0 && code <= 255,
+			)
+		: [];
+	return {
+		id,
+		command,
+		args,
+		...(cwd ? { cwd } : {}),
+		...(timeoutMs ? { timeoutMs } : {}),
+		...(env && Object.keys(env).length > 0 ? { env } : {}),
+		successExitCodes: successExitCodes.length > 0 ? successExitCodes : [0],
+		required: typeof record.required === "boolean" ? record.required : true,
+	};
+}
+
+/** B-7.1: normalize a stored verification config; undefined means the gate is inactive. */
+function normalizeVerificationConfig(value: unknown): RuntimeVerificationConfig | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return undefined;
+	}
+	const record = value as Record<string, unknown>;
+	const enabled: "required" | "off" =
+		record.enabled === "required" || record.enabled === "off" ? record.enabled : DEFAULT_VERIFICATION_ENABLED;
+	const checks: RuntimeVerificationConfig["checks"] = [];
+	const seenIds = new Set<string>();
+	if (Array.isArray(record.checks)) {
+		for (const item of record.checks) {
+			const check = normalizeVerificationCheck(item);
+			if (!check || seenIds.has(check.id.toLowerCase())) {
+				continue;
+			}
+			seenIds.add(check.id.toLowerCase());
+			checks.push(check);
+		}
+	}
+	return { enabled, checks };
+}
+
+/**
+ * B-7.1: strict save-time validation of the operator-managed verification config
+ * (the API boundary already validates via zod; this is defense in depth for direct callers).
+ */
+function validateVerificationConfig(config: RuntimeVerificationConfigSave | null | undefined): void {
+	if (config === null || config === undefined) {
+		return;
+	}
+	if (config.enabled !== undefined && config.enabled !== "required" && config.enabled !== "off") {
+		throw new Error("verification.enabled must be either 'required' or 'off'.");
+	}
+	if (config.checks !== undefined && !Array.isArray(config.checks)) {
+		throw new Error("verification.checks must be an array.");
+	}
+	const seenIds = new Set<string>();
+	(config.checks ?? []).forEach((check, index) => {
+		const label = check?.id?.trim() || `index ${index}`;
+		if (!check || typeof check !== "object" || Array.isArray(check)) {
+			throw new Error(`verification.checks[${index}] must be an object.`);
+		}
+		if (!check.id?.trim() || !check.command?.trim()) {
+			throw new Error(`verification check "${label}" requires non-empty id and command.`);
+		}
+		if (seenIds.has(check.id.trim().toLowerCase())) {
+			throw new Error(`verification config has duplicate check id "${check.id.trim()}".`);
+		}
+		seenIds.add(check.id.trim().toLowerCase());
+		if (
+			check.args !== undefined &&
+			(!Array.isArray(check.args) || check.args.some((arg) => typeof arg !== "string"))
+		) {
+			throw new Error(`verification check "${label}" args must be strings.`);
+		}
+		if (check.cwd !== undefined && !isSafeVerificationCwd(check.cwd)) {
+			throw new Error(`verification check "${label}" cwd must be a relative path inside the worktree.`);
+		}
+		if (check.timeoutMs !== undefined && (!Number.isInteger(check.timeoutMs) || check.timeoutMs <= 0)) {
+			throw new Error(`verification check "${label}" timeoutMs must be a positive integer.`);
+		}
+		if (check.env !== undefined && Object.values(check.env).some((value) => typeof value !== "string")) {
+			throw new Error(`verification check "${label}" env values must be strings.`);
+		}
+		if (
+			check.successExitCodes !== undefined &&
+			(!Array.isArray(check.successExitCodes) ||
+				check.successExitCodes.length === 0 ||
+				check.successExitCodes.some((code) => !Number.isInteger(code) || code < 0 || code > 255))
+		) {
+			throw new Error(`verification check "${label}" successExitCodes must be a non-empty array of 0-255 integers.`);
+		}
+	});
+}
+
+/** B-7.1: merges a save-shape verification update (null clears everything, undefined leaves it untouched). */
+function mergeVerificationUpdates(
+	stored: RuntimeVerificationConfig | undefined,
+	updates: RuntimeVerificationConfigSave | null | undefined,
+): RuntimeVerificationConfigSave | null | undefined {
+	if (updates === undefined) {
+		return undefined;
+	}
+	if (updates === null) {
+		return null;
+	}
+	return { ...(stored ?? {}), ...updates };
+}
+
+function areRuntimeVerificationConfigsEqual(
+	left: RuntimeVerificationConfigSave | null | undefined,
+	right: RuntimeVerificationConfigSave | null | undefined,
+): boolean {
+	// Compare normalized forms: key order in saved objects is not guaranteed,
+	// and normalization drops the same invalid data both sides would carry.
+	const normalizedLeft = normalizeVerificationConfig(left);
+	const normalizedRight = normalizeVerificationConfig(right);
+	if (!normalizedLeft && !normalizedRight) {
+		return true;
+	}
+	if (!normalizedLeft || !normalizedRight) {
+		return false;
+	}
+	return (
+		normalizedLeft.enabled === normalizedRight.enabled &&
+		JSON.stringify(normalizedLeft.checks) === JSON.stringify(normalizedRight.checks)
+	);
+}
+
+// --- B-8: deterministic git delivery ----------------------------------------
+
+const DEFAULT_GIT_DELIVERY_ENABLED = false;
+const DEFAULT_GIT_DELIVERY_REMOTE = "origin";
+const DEFAULT_GIT_DELIVERY_PUSH_REQUIRED = true;
+const DEFAULT_GIT_DELIVERY_PROTECTED_BRANCHES: string[] = ["main", "master"];
+const DEFAULT_GIT_DELIVERY_INTEGRATION_STRATEGY: RuntimeGitDeliveryPolicy["integrationStrategy"] = "fast_forward";
+const DEFAULT_GIT_DELIVERY_REQUIRE_PULL_REQUEST = false;
+
+/** Conservative git-check-refname(1) check for config-supplied remote/branch names. */
+function isValidGitDeliveryRefName(value: string): boolean {
+	if (value.length === 0 || value.length > 255 || value === "@" || value.startsWith("@{")) {
+		return false;
+	}
+	if (value.startsWith("/") || value.endsWith("/") || value.includes("//")) {
+		return false;
+	}
+	if (/[~^:?*[\]\\]/.test(value)) {
+		return false;
+	}
+	for (const character of value) {
+		const code = character.codePointAt(0);
+		if (code === undefined || code < 0x20 || code === 0x7f) {
+			return false;
+		}
+	}
+	for (const component of value.split("/")) {
+		if (
+			!component ||
+			component === "." ||
+			component.startsWith(".") ||
+			component.endsWith(".") ||
+			component.includes("..") ||
+			!/^[\w.-]+$/.test(component) ||
+			!/[\w]/.test(component)
+		) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * B-8.3: normalize a stored/partial git delivery policy. Returns undefined when
+ * the value is absent; invalid fields degrade to defaults so a corrupted config
+ * file never breaks config load (same contract as the other policy normalizers).
+ */
+export function normalizeGitDeliveryPolicy(value: unknown): RuntimeGitDeliveryPolicy | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return undefined;
+	}
+	const raw = value as Record<string, unknown>;
+	const remote =
+		typeof raw.remote === "string" && isValidGitDeliveryRefName(raw.remote)
+			? raw.remote
+			: DEFAULT_GIT_DELIVERY_REMOTE;
+	const destinationBranchRaw = raw.destinationBranch;
+	const destinationBranch =
+		destinationBranchRaw === null
+			? null
+			: typeof destinationBranchRaw === "string" && isValidGitDeliveryRefName(destinationBranchRaw)
+				? destinationBranchRaw
+				: null;
+	const protectedBranches = Array.isArray(raw.protectedBranches)
+		? raw.protectedBranches.filter(
+				(branch): branch is string => typeof branch === "string" && isValidGitDeliveryRefName(branch),
+			)
+		: DEFAULT_GIT_DELIVERY_PROTECTED_BRANCHES;
+	const pullRequestBaseBranch =
+		typeof raw.pullRequestBaseBranch === "string" && isValidGitDeliveryRefName(raw.pullRequestBaseBranch)
+			? raw.pullRequestBaseBranch
+			: null;
+	return {
+		enabled: typeof raw.enabled === "boolean" ? raw.enabled : DEFAULT_GIT_DELIVERY_ENABLED,
+		remote,
+		destinationBranch,
+		pushRequired: typeof raw.pushRequired === "boolean" ? raw.pushRequired : DEFAULT_GIT_DELIVERY_PUSH_REQUIRED,
+		protectedBranches,
+		integrationStrategy: raw.integrationStrategy === "merge" ? "merge" : DEFAULT_GIT_DELIVERY_INTEGRATION_STRATEGY,
+		requirePullRequest:
+			typeof raw.requirePullRequest === "boolean"
+				? raw.requirePullRequest
+				: DEFAULT_GIT_DELIVERY_REQUIRE_PULL_REQUEST,
+		pullRequestBaseBranch,
+	};
+}
+
+/**
+ * B-8: strict validation for save-time input (defense in depth; the API
+ * boundary already runs the zod save schema). Throws on ref names the delivery
+ * pipeline could not safely use.
+ */
+function validateGitDeliveryPolicy(policy: RuntimeGitDeliveryPolicySave | null | undefined): void {
+	if (policy === null || policy === undefined) {
+		return;
+	}
+	if (typeof policy.remote === "string" && policy.remote.length > 0 && !isValidGitDeliveryRefName(policy.remote)) {
+		throw new Error("gitDeliveryPolicy.remote is not a valid git ref name.");
+	}
+	if (
+		typeof policy.destinationBranch === "string" &&
+		policy.destinationBranch.length > 0 &&
+		!isValidGitDeliveryRefName(policy.destinationBranch)
+	) {
+		throw new Error("gitDeliveryPolicy.destinationBranch is not a valid git ref name.");
+	}
+	if (policy.protectedBranches?.some((branch) => !isValidGitDeliveryRefName(branch))) {
+		throw new Error("gitDeliveryPolicy.protectedBranches contains an invalid git ref name.");
+	}
+	if (
+		typeof policy.pullRequestBaseBranch === "string" &&
+		policy.pullRequestBaseBranch.length > 0 &&
+		!isValidGitDeliveryRefName(policy.pullRequestBaseBranch)
+	) {
+		throw new Error("gitDeliveryPolicy.pullRequestBaseBranch is not a valid git ref name.");
+	}
+}
+
+/** B-8: merge a save-shape update (null clears, undefined leaves as-is). */
+function mergeGitDeliveryPolicyUpdates(
+	stored: RuntimeGitDeliveryPolicy | undefined,
+	updates: RuntimeGitDeliveryPolicySave | null | undefined,
+): RuntimeGitDeliveryPolicySave | null | undefined {
+	if (updates === undefined) {
+		return undefined;
+	}
+	if (updates === null) {
+		return null;
+	}
+	return { ...(stored ?? {}), ...updates };
+}
+
+function areRuntimeGitDeliveryPoliciesEqual(
+	left: RuntimeGitDeliveryPolicySave | null | undefined,
+	right: RuntimeGitDeliveryPolicySave | null | undefined,
+): boolean {
+	// Compare normalized forms: key order in saved objects is not guaranteed,
+	// and normalization drops the same invalid data both sides would carry.
+	const normalizedLeft = normalizeGitDeliveryPolicy(left);
+	const normalizedRight = normalizeGitDeliveryPolicy(right);
+	if (!normalizedLeft && !normalizedRight) {
+		return true;
+	}
+	if (!normalizedLeft || !normalizedRight) {
+		return false;
+	}
+	return JSON.stringify(normalizedLeft) === JSON.stringify(normalizedRight);
+}
+
 function hasOwnKey<T extends object>(value: T | null, key: keyof T): boolean {
 	if (!value) {
 		return false;
@@ -432,6 +876,9 @@ function toRuntimeConfigState({
 		commitPromptTemplateDefault: DEFAULT_COMMIT_PROMPT_TEMPLATE,
 		openPrPromptTemplateDefault: DEFAULT_OPEN_PR_PROMPT_TEMPLATE,
 		contextBudget: normalizeContextBudget(globalConfig?.contextBudget),
+		reviewPolicy: normalizeReviewPolicy(globalConfig?.reviewPolicy),
+		verification: normalizeVerificationConfig(globalConfig?.verification),
+		gitDeliveryPolicy: normalizeGitDeliveryPolicy(globalConfig?.gitDeliveryPolicy),
 	};
 }
 
@@ -455,6 +902,12 @@ async function writeRuntimeGlobalConfigFile(
 		openPrPromptTemplate?: string;
 		/** B-2.9: `null` clears the stored context budget; `undefined` preserves the existing one. Null fields clear individual settings (normalized before write). */
 		contextBudget?: RuntimeContextBudgetSave | null;
+		/** B-6: `null` clears the stored review policy; `undefined` preserves the existing one. */
+		reviewPolicy?: RuntimeReviewPolicySave | null;
+		/** B-7: `null` clears the stored verification gate; `undefined` preserves the existing one. */
+		verification?: RuntimeVerificationConfigSave | null;
+		/** B-8: `null` clears the stored git delivery policy; `undefined` preserves the existing one. */
+		gitDeliveryPolicy?: RuntimeGitDeliveryPolicySave | null;
 	},
 ): Promise<void> {
 	const existing = await readRuntimeConfigFile<RuntimeGlobalConfigFileShape>(configPath);
@@ -526,6 +979,36 @@ async function writeRuntimeGlobalConfigFile(
 		}
 	} else if (existing?.contextBudget) {
 		payload.contextBudget = normalizeContextBudget(existing.contextBudget);
+	}
+	if (config.reviewPolicy !== undefined) {
+		if (config.reviewPolicy !== null) {
+			const normalizedReviewPolicy = normalizeReviewPolicy(config.reviewPolicy);
+			if (normalizedReviewPolicy) {
+				payload.reviewPolicy = normalizedReviewPolicy;
+			}
+		}
+	} else if (existing?.reviewPolicy) {
+		payload.reviewPolicy = normalizeReviewPolicy(existing.reviewPolicy);
+	}
+	if (config.verification !== undefined) {
+		if (config.verification !== null) {
+			const normalizedVerification = normalizeVerificationConfig(config.verification);
+			if (normalizedVerification) {
+				payload.verification = normalizedVerification;
+			}
+		}
+	} else if (existing?.verification) {
+		payload.verification = normalizeVerificationConfig(existing.verification);
+	}
+	if (config.gitDeliveryPolicy !== undefined) {
+		if (config.gitDeliveryPolicy !== null) {
+			const normalizedGitDeliveryPolicy = normalizeGitDeliveryPolicy(config.gitDeliveryPolicy);
+			if (normalizedGitDeliveryPolicy) {
+				payload.gitDeliveryPolicy = normalizedGitDeliveryPolicy;
+			}
+		}
+	} else if (existing?.gitDeliveryPolicy) {
+		payload.gitDeliveryPolicy = normalizeGitDeliveryPolicy(existing.gitDeliveryPolicy);
 	}
 
 	await lockedFileSystem.writeJsonFileAtomic(configPath, payload, {
@@ -610,6 +1093,9 @@ function createRuntimeConfigStateFromValues(input: {
 	commitPromptTemplate: string;
 	openPrPromptTemplate: string;
 	contextBudget?: RuntimeContextBudgetSave | null;
+	reviewPolicy?: RuntimeReviewPolicySave | null;
+	verification?: RuntimeVerificationConfigSave | null;
+	gitDeliveryPolicy?: RuntimeGitDeliveryPolicySave | null;
 }): RuntimeConfigState {
 	return {
 		globalConfigPath: input.globalConfigPath,
@@ -630,6 +1116,9 @@ function createRuntimeConfigStateFromValues(input: {
 		commitPromptTemplateDefault: DEFAULT_COMMIT_PROMPT_TEMPLATE,
 		openPrPromptTemplateDefault: DEFAULT_OPEN_PR_PROMPT_TEMPLATE,
 		contextBudget: normalizeContextBudget(input.contextBudget),
+		reviewPolicy: normalizeReviewPolicy(input.reviewPolicy),
+		verification: normalizeVerificationConfig(input.verification),
+		gitDeliveryPolicy: normalizeGitDeliveryPolicy(input.gitDeliveryPolicy),
 	};
 }
 
@@ -641,6 +1130,26 @@ function createRuntimeConfigStateFromValues(input: {
 export async function readGlobalRuntimeContextBudget(): Promise<RuntimeContextBudget | undefined> {
 	const globalConfig = await readRuntimeConfigFile<RuntimeGlobalConfigFileShape>(getRuntimeGlobalConfigPath());
 	return normalizeContextBudget(globalConfig?.contextBudget);
+}
+
+/**
+ * B-6: reads only the review policy from the global runtime config without the
+ * agent auto-selection side effects of loadGlobalRuntimeConfig, so it is safe
+ * to call on hot paths (per-task review session startup).
+ */
+export async function readGlobalRuntimeReviewPolicy(): Promise<RuntimeReviewPolicy | undefined> {
+	const globalConfig = await readRuntimeConfigFile<RuntimeGlobalConfigFileShape>(getRuntimeGlobalConfigPath());
+	return normalizeReviewPolicy(globalConfig?.reviewPolicy);
+}
+
+/**
+ * B-7.1: reads only the verification gate from the global runtime config without the
+ * agent auto-selection side effects of loadGlobalRuntimeConfig, so it is safe
+ * to call on hot paths (per-task review session startup).
+ */
+export async function readGlobalRuntimeVerificationConfig(): Promise<RuntimeVerificationConfig | undefined> {
+	const globalConfig = await readRuntimeConfigFile<RuntimeGlobalConfigFileShape>(getRuntimeGlobalConfigPath());
+	return normalizeVerificationConfig(globalConfig?.verification);
 }
 
 export function toGlobalRuntimeConfigState(current: RuntimeConfigState): RuntimeConfigState {
@@ -655,6 +1164,9 @@ export function toGlobalRuntimeConfigState(current: RuntimeConfigState): Runtime
 		commitPromptTemplate: current.commitPromptTemplate,
 		openPrPromptTemplate: current.openPrPromptTemplate,
 		contextBudget: current.contextBudget,
+		reviewPolicy: current.reviewPolicy,
+		verification: current.verification,
+		gitDeliveryPolicy: current.gitDeliveryPolicy,
 	});
 }
 
@@ -691,9 +1203,15 @@ export async function saveRuntimeConfig(
 		commitPromptTemplate: string;
 		openPrPromptTemplate: string;
 		contextBudget?: RuntimeContextBudgetSave | null;
+		reviewPolicy?: RuntimeReviewPolicySave | null;
+		verification?: RuntimeVerificationConfigSave | null;
+		gitDeliveryPolicy?: RuntimeGitDeliveryPolicySave | null;
 	},
 ): Promise<RuntimeConfigState> {
 	validateContextBudget(config.contextBudget);
+	validateReviewPolicy(config.reviewPolicy);
+	validateVerificationConfig(config.verification);
+	validateGitDeliveryPolicy(config.gitDeliveryPolicy);
 	const { globalConfigPath, projectConfigPath } = resolveRuntimeConfigPaths(cwd);
 	return await lockedFileSystem.withLocks(getRuntimeConfigLockRequests(cwd), async () => {
 		await writeRuntimeGlobalConfigFile(globalConfigPath, {
@@ -704,6 +1222,9 @@ export async function saveRuntimeConfig(
 			commitPromptTemplate: config.commitPromptTemplate,
 			openPrPromptTemplate: config.openPrPromptTemplate,
 			contextBudget: config.contextBudget,
+			reviewPolicy: config.reviewPolicy,
+			verification: config.verification,
+			gitDeliveryPolicy: config.gitDeliveryPolicy,
 		});
 		await writeRuntimeProjectConfigFile(projectConfigPath, { shortcuts: config.shortcuts });
 		return createRuntimeConfigStateFromValues({
@@ -717,12 +1238,18 @@ export async function saveRuntimeConfig(
 			commitPromptTemplate: config.commitPromptTemplate,
 			openPrPromptTemplate: config.openPrPromptTemplate,
 			contextBudget: config.contextBudget,
+			reviewPolicy: config.reviewPolicy,
+			verification: config.verification,
+			gitDeliveryPolicy: config.gitDeliveryPolicy,
 		});
 	});
 }
 
 export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpdateInput): Promise<RuntimeConfigState> {
 	validateContextBudget(updates.contextBudget);
+	validateReviewPolicy(updates.reviewPolicy);
+	validateVerificationConfig(updates.verification);
+	validateGitDeliveryPolicy(updates.gitDeliveryPolicy);
 	const { globalConfigPath, projectConfigPath } = resolveRuntimeConfigPaths(cwd);
 	return await lockedFileSystem.withLocks(getRuntimeConfigLockRequests(cwd), async () => {
 		const current = await loadRuntimeConfigLocked(cwd);
@@ -730,6 +1257,12 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			throw new Error("Cannot save project shortcuts without a selected project.");
 		}
 		const mergedContextBudget = mergeContextBudgetUpdates(current.contextBudget, updates.contextBudget);
+		const mergedReviewPolicy = mergeReviewPolicyUpdates(current.reviewPolicy, updates.reviewPolicy);
+		const mergedVerification = mergeVerificationUpdates(current.verification, updates.verification);
+		const mergedGitDeliveryPolicy = mergeGitDeliveryPolicyUpdates(
+			current.gitDeliveryPolicy,
+			updates.gitDeliveryPolicy,
+		);
 		const nextConfig = {
 			selectedAgentId: updates.selectedAgentId ?? current.selectedAgentId,
 			selectedShortcutLabel:
@@ -741,6 +1274,9 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			commitPromptTemplate: updates.commitPromptTemplate ?? current.commitPromptTemplate,
 			openPrPromptTemplate: updates.openPrPromptTemplate ?? current.openPrPromptTemplate,
 			contextBudget: mergedContextBudget === undefined ? current.contextBudget : mergedContextBudget,
+			reviewPolicy: mergedReviewPolicy === undefined ? current.reviewPolicy : mergedReviewPolicy,
+			verification: mergedVerification === undefined ? current.verification : mergedVerification,
+			gitDeliveryPolicy: mergedGitDeliveryPolicy === undefined ? current.gitDeliveryPolicy : mergedGitDeliveryPolicy,
 		};
 
 		const hasChanges =
@@ -751,7 +1287,10 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			nextConfig.commitPromptTemplate !== current.commitPromptTemplate ||
 			nextConfig.openPrPromptTemplate !== current.openPrPromptTemplate ||
 			!areRuntimeProjectShortcutsEqual(nextConfig.shortcuts, current.shortcuts) ||
-			!areRuntimeContextBudgetsEqual(nextConfig.contextBudget, current.contextBudget);
+			!areRuntimeContextBudgetsEqual(nextConfig.contextBudget, current.contextBudget) ||
+			!areRuntimeReviewPoliciesEqual(nextConfig.reviewPolicy, current.reviewPolicy) ||
+			!areRuntimeVerificationConfigsEqual(nextConfig.verification, current.verification) ||
+			!areRuntimeGitDeliveryPoliciesEqual(nextConfig.gitDeliveryPolicy, current.gitDeliveryPolicy);
 
 		if (!hasChanges) {
 			return current;
@@ -765,6 +1304,9 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			commitPromptTemplate: nextConfig.commitPromptTemplate,
 			openPrPromptTemplate: nextConfig.openPrPromptTemplate,
 			contextBudget: updates.contextBudget === undefined ? undefined : mergedContextBudget,
+			reviewPolicy: updates.reviewPolicy === undefined ? undefined : mergedReviewPolicy,
+			verification: updates.verification === undefined ? undefined : mergedVerification,
+			gitDeliveryPolicy: updates.gitDeliveryPolicy === undefined ? undefined : mergedGitDeliveryPolicy,
 		});
 		await writeRuntimeProjectConfigFile(projectConfigPath, {
 			shortcuts: nextConfig.shortcuts,
@@ -780,6 +1322,9 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			commitPromptTemplate: nextConfig.commitPromptTemplate,
 			openPrPromptTemplate: nextConfig.openPrPromptTemplate,
 			contextBudget: nextConfig.contextBudget,
+			reviewPolicy: nextConfig.reviewPolicy,
+			verification: nextConfig.verification,
+			gitDeliveryPolicy: nextConfig.gitDeliveryPolicy,
 		});
 	});
 }
@@ -789,6 +1334,9 @@ export async function updateGlobalRuntimeConfig(
 	updates: RuntimeConfigUpdateInput,
 ): Promise<RuntimeConfigState> {
 	validateContextBudget(updates.contextBudget);
+	validateReviewPolicy(updates.reviewPolicy);
+	validateVerificationConfig(updates.verification);
+	validateGitDeliveryPolicy(updates.gitDeliveryPolicy);
 	const globalConfigPath = getRuntimeGlobalConfigPath();
 	return await lockedFileSystem.withLocks(
 		[
@@ -799,6 +1347,12 @@ export async function updateGlobalRuntimeConfig(
 		],
 		async () => {
 			const mergedContextBudget = mergeContextBudgetUpdates(current.contextBudget, updates.contextBudget);
+			const mergedReviewPolicy = mergeReviewPolicyUpdates(current.reviewPolicy, updates.reviewPolicy);
+			const mergedVerification = mergeVerificationUpdates(current.verification, updates.verification);
+			const mergedGitDeliveryPolicy = mergeGitDeliveryPolicyUpdates(
+				current.gitDeliveryPolicy,
+				updates.gitDeliveryPolicy,
+			);
 			const nextConfig = {
 				selectedAgentId: updates.selectedAgentId ?? current.selectedAgentId,
 				selectedShortcutLabel:
@@ -812,6 +1366,10 @@ export async function updateGlobalRuntimeConfig(
 				commitPromptTemplate: updates.commitPromptTemplate ?? current.commitPromptTemplate,
 				openPrPromptTemplate: updates.openPrPromptTemplate ?? current.openPrPromptTemplate,
 				contextBudget: mergedContextBudget === undefined ? current.contextBudget : mergedContextBudget,
+				reviewPolicy: mergedReviewPolicy === undefined ? current.reviewPolicy : mergedReviewPolicy,
+				verification: mergedVerification === undefined ? current.verification : mergedVerification,
+				gitDeliveryPolicy:
+					mergedGitDeliveryPolicy === undefined ? current.gitDeliveryPolicy : mergedGitDeliveryPolicy,
 			};
 
 			const hasChanges =
@@ -821,7 +1379,10 @@ export async function updateGlobalRuntimeConfig(
 				nextConfig.readyForReviewNotificationsEnabled !== current.readyForReviewNotificationsEnabled ||
 				nextConfig.commitPromptTemplate !== current.commitPromptTemplate ||
 				nextConfig.openPrPromptTemplate !== current.openPrPromptTemplate ||
-				!areRuntimeContextBudgetsEqual(nextConfig.contextBudget, current.contextBudget);
+				!areRuntimeContextBudgetsEqual(nextConfig.contextBudget, current.contextBudget) ||
+				!areRuntimeReviewPoliciesEqual(nextConfig.reviewPolicy, current.reviewPolicy) ||
+				!areRuntimeVerificationConfigsEqual(nextConfig.verification, current.verification) ||
+				!areRuntimeGitDeliveryPoliciesEqual(nextConfig.gitDeliveryPolicy, current.gitDeliveryPolicy);
 
 			if (!hasChanges) {
 				return current;
@@ -835,6 +1396,9 @@ export async function updateGlobalRuntimeConfig(
 				commitPromptTemplate: nextConfig.commitPromptTemplate,
 				openPrPromptTemplate: nextConfig.openPrPromptTemplate,
 				contextBudget: updates.contextBudget === undefined ? undefined : mergedContextBudget,
+				reviewPolicy: updates.reviewPolicy === undefined ? undefined : mergedReviewPolicy,
+				verification: updates.verification === undefined ? undefined : mergedVerification,
+				gitDeliveryPolicy: updates.gitDeliveryPolicy === undefined ? undefined : mergedGitDeliveryPolicy,
 			});
 
 			return createRuntimeConfigStateFromValues({
@@ -848,6 +1412,9 @@ export async function updateGlobalRuntimeConfig(
 				commitPromptTemplate: nextConfig.commitPromptTemplate,
 				openPrPromptTemplate: nextConfig.openPrPromptTemplate,
 				contextBudget: nextConfig.contextBudget,
+				reviewPolicy: nextConfig.reviewPolicy,
+				verification: nextConfig.verification,
+				gitDeliveryPolicy: nextConfig.gitDeliveryPolicy,
 			});
 		},
 	);

@@ -12,12 +12,16 @@ import type {
 import { isHomeAgentSessionId } from "../core/home-agent-session";
 import { resolveHomeAgentAppendSystemPrompt } from "../prompts/append-system-prompt";
 import { captureTaskTurnCheckpoint, deleteTaskTurnCheckpointRef } from "../workspace/turn-checkpoints";
-import type { ClineCompactionConfig } from "./cline-compaction-config";
-import {
-	compactPersistedMessagesForContextOverflow,
-	isContextOverflowError,
-} from "./cline-context-overflow-compaction";
+import { compactClineConversationMessages } from "./cline-compaction-callback";
+import { type ClineCompactionConfig, calibrateClineCompactionConfig } from "./cline-compaction-config";
 import type { ContextLimitSource } from "./cline-context-policy";
+import {
+	describeClineUnresolvedToolCalls,
+	evaluateClineContextRecoveryBudget,
+	evaluateClineRecoveryRequirements,
+	findClineUnresolvedToolCalls,
+	isContextOverflowError,
+} from "./cline-context-recovery";
 import { applyClineSessionEvent } from "./cline-event-adapter";
 import {
 	type ClineMessageRepository,
@@ -27,9 +31,11 @@ import {
 import { type ClineRuntimeSetup, createClineRuntimeSetup } from "./cline-runtime-setup";
 import {
 	type ClineLaunchConfigResolver,
+	type ClineSessionRestartStartRequest,
 	type ClineSessionRuntime,
 	type CreateInMemoryClineSessionRuntimeOptions,
 	createInMemoryClineSessionRuntime,
+	type StartClineSessionRuntimeRequest,
 } from "./cline-session-runtime";
 import {
 	type ClineTaskMessage,
@@ -53,11 +59,15 @@ import { SDK_DEFAULT_MODEL_ID, SDK_DEFAULT_PROVIDER_ID } from "./sdk-provider-bo
 import {
 	type ClineSdkPersistedMessage,
 	type ClineSdkSlashCommand,
+	type ClineSdkToolApprovalRequest,
+	type ClineSdkToolApprovalResult,
 	listClineSdkWorkflowSlashCommands,
 	resolveClineSdkSystemPrompt,
 } from "./sdk-runtime-boundary.js";
 
 export type { ClineTaskMessage } from "./cline-session-state";
+
+type ClineSdkToolApprovalHandler = (request: ClineSdkToolApprovalRequest) => Promise<ClineSdkToolApprovalResult>;
 
 export interface StartClineTaskSessionRequest {
 	taskId: string;
@@ -88,6 +98,13 @@ export interface StartClineTaskSessionRequest {
 	 * forwarded to the session runtime for calibration + beforeModel hook.
 	 */
 	compactionSafetyMarginTokens?: number;
+	/**
+	 * B-6.6: per-session tool-approval layer (e.g. the bounded review tool
+	 * policy). It receives the workspace runtime setup's approval handler and
+	 * must delegate to it for anything it does not deny, so existing project
+	 * approvals stay effective. When omitted, the workspace handler applies.
+	 */
+	wrapToolApproval?: (workspaceApproval: ClineSdkToolApprovalHandler) => ClineSdkToolApprovalHandler;
 }
 
 export interface ClineTaskSessionService {
@@ -126,6 +143,12 @@ export interface CreateInMemoryClineTaskSessionServiceOptions {
 	 * current provider settings instead of replaying the start-time snapshot.
 	 */
 	resolveClineLaunchConfig?: ClineLaunchConfigResolver;
+	/**
+	 * B-3.5: maximum number of compaction + restart attempts the reactive
+	 * context-overflow recovery path may make before surfacing the error to
+	 * the user. Defaults to DEFAULT_CONTEXT_RECOVERY_MAX_ATTEMPTS.
+	 */
+	contextRecoveryMaxAttempts?: number;
 }
 
 function toErrorMessage(error: unknown): string {
@@ -179,15 +202,31 @@ function buildClineStartPrompt(prompt: string, startInPlanMode?: boolean): strin
 		trimmedPrompt ? `\n\nTask:\n${trimmedPrompt}` : " Ask the user what they want planned if the task is unclear.",
 	].join(" ");
 }
+/**
+ * B-3.5: default bound on reactive context-overflow recovery attempts.
+ * Each attempt re-compacts the persisted transcript, so a transcript that
+ * still overflows after this many compactions is surfaced to the user
+ * instead of retried forever.
+ */
+const DEFAULT_CONTEXT_RECOVERY_MAX_ATTEMPTS = 3;
+
 export class InMemoryClineTaskSessionService implements ClineTaskSessionService {
 	private readonly pendingTurnCancelTaskIds = new Set<string>();
 	private readonly providerIdByTaskId = new Map<string, string>();
+	private readonly contextRecoveryMaxAttempts: number;
 	private readonly sessionRuntime: ClineSessionRuntime;
 	private readonly messageRepository: ClineMessageRepository;
 	private readonly watcherRegistry: ClineWatcherRegistry;
 	private readonly runtimeSetupLeaseByWorkspacePath = new Map<string, Promise<ClineRuntimeSetupLease>>();
 
 	constructor(options: CreateInMemoryClineTaskSessionServiceOptions = {}) {
+		if (
+			options.contextRecoveryMaxAttempts !== undefined &&
+			(!Number.isInteger(options.contextRecoveryMaxAttempts) || options.contextRecoveryMaxAttempts < 1)
+		) {
+			throw new Error("contextRecoveryMaxAttempts must be a positive integer.");
+		}
+		this.contextRecoveryMaxAttempts = options.contextRecoveryMaxAttempts ?? DEFAULT_CONTEXT_RECOVERY_MAX_ATTEMPTS;
 		const createSessionRuntime = options.createSessionRuntime ?? createInMemoryClineSessionRuntime;
 		const createMessageRepository = options.createMessageRepository ?? createInMemoryClineMessageRepository;
 		this.watcherRegistry =
@@ -200,6 +239,17 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 				this.handleTaskEvent(taskId, event);
 			},
 			resolveClineLaunchConfig: options.resolveClineLaunchConfig,
+			// B-4.8: when a start request is reconstructed from the durable
+			// session record after a process restart, the workspace services
+			// (rules, tool approval) must come from the live per-workspace
+			// runtime setup — the same lease path startTaskSession uses.
+			resolveWorkspaceRuntime: async ({ cwd }) => {
+				const runtimeSetup = await this.ensureRuntimeSetup(cwd);
+				return {
+					userInstructionService: runtimeSetup.userInstructionService,
+					requestToolApproval: runtimeSetup.requestToolApproval,
+				};
+			},
 		});
 		this.messageRepository = createMessageRepository();
 	}
@@ -307,6 +357,24 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		};
 	}
 
+	/**
+	 * B-3: safe bounded reactive context-overflow recovery for the send path.
+	 *
+	 * - B-3.1: `isContextOverflowError` classifies structured and nested
+	 *   provider errors, not just `Error` messages.
+	 * - B-3.2: the persisted transcript is compacted with the same
+	 *   deterministic, token-budget-aware compactor the SDK compaction path
+	 *   uses (the retired message-halving fallback is gone).
+	 * - B-3.4: pauses with an actionable reason when the original task
+	 *   requirements cannot fit the compaction target.
+	 * - B-3.5: bounded by `contextRecoveryMaxAttempts`; each attempt
+	 *   re-compacts the freshly read persisted transcript (which includes
+	 *   the failed resend), so the restarted request only gets smaller.
+	 * - B-3.6: a canceled turn is never revived by recovery, and the
+	 *   restart reuses the full saved session config (B-2.8).
+	 * - B-3.7: pauses with an actionable reason when the restart prompt +
+	 *   system prompt + images alone exceed the effective input budget.
+	 */
 	private async retryAfterContextOverflow(input: {
 		taskId: string;
 		prompt: string;
@@ -317,25 +385,131 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		if (!isContextOverflowError(input.error)) {
 			return null;
 		}
-
-		const persistedSnapshot = await this.sessionRuntime.readPersistedTaskSession(input.taskId).catch(() => null);
-		const compactedMessages = compactPersistedMessagesForContextOverflow(persistedSnapshot?.messages ?? []);
-		if (!compactedMessages) {
+		if (!this.messageRepository.getTaskEntry(input.taskId)) {
+			return null;
+		}
+		// B-3.6: a turn the user just canceled must not be revived by
+		// recovery (cancelTaskTurn records the intent before the abort
+		// surfaces).
+		if (this.pendingTurnCancelTaskIds.has(input.taskId)) {
 			return null;
 		}
 
-		await this.sessionRuntime.stopTaskSession(input.taskId).catch(() => null);
-		const restartedSession = await this.sessionRuntime.restartTaskSession({
-			taskId: input.taskId,
+		// The request the restart will use — including after a Kanban process
+		// restart, when it is reconstructed from the durable session record
+		// (B-4.8) with the live context/compaction policy (B-2.8).
+		const startRequest = await this.sessionRuntime.resolveRestartStartRequest(input.taskId).catch(() => null);
+		if (!startRequest) {
+			return null;
+		}
+
+		// B-3.7: the restart prompt is pinned material — if system prompt +
+		// prompt + images alone exceed the effective input budget, no amount
+		// of history compaction can make this turn fit.
+		const budget = evaluateClineContextRecoveryBudget({
+			contextWindowTokens: startRequest.compaction?.contextWindowTokens,
+			reserveTokens: startRequest.compaction?.reserveTokens,
+			safetyMarginTokens: startRequest.compactionSafetyMarginTokens,
+			systemPrompt: startRequest.systemPrompt,
 			prompt: input.prompt,
-			mode: input.mode,
 			images: input.images,
-			initialMessages: compactedMessages,
 		});
-		return {
-			result: restartedSession.result,
-			warnings: restartedSession.warnings,
-		};
+		if (budget.checked && !budget.fits) {
+			throw new Error(
+				budget.reason ?? "Context overflow recovery cannot fit this turn within the effective context budget.",
+			);
+		}
+
+		for (let attempt = 1; attempt <= this.contextRecoveryMaxAttempts; attempt += 1) {
+			try {
+				const persistedSnapshot = await this.sessionRuntime
+					.readPersistedTaskSession(input.taskId)
+					.catch(() => null);
+				// B-3.5: never resend over a tool call whose completion is unknown.
+				const unresolvedToolCalls = findClineUnresolvedToolCalls(persistedSnapshot?.messages ?? []);
+				if (unresolvedToolCalls.length > 0) {
+					throw new Error(describeClineUnresolvedToolCalls(unresolvedToolCalls));
+				}
+				const messages = this.compactTranscriptForRecovery(startRequest, persistedSnapshot?.messages ?? []);
+				await this.sessionRuntime.stopTaskSession(input.taskId).catch(() => null);
+				const restartedSession = await this.sessionRuntime.restartTaskSession({
+					taskId: input.taskId,
+					prompt: input.prompt,
+					mode: input.mode,
+					images: input.images,
+					initialMessages: messages,
+				});
+				return {
+					result: restartedSession.result,
+					warnings: restartedSession.warnings,
+				};
+			} catch (recoveryError) {
+				if (!isContextOverflowError(recoveryError)) {
+					// Budget/requirements pauses (and any non-overflow
+					// failure) surface immediately; only a repeat overflow
+					// re-enters the bounded retry loop.
+					throw recoveryError;
+				}
+				if (attempt >= this.contextRecoveryMaxAttempts) {
+					throw new Error(
+						`Context overflow recovery failed after ${this.contextRecoveryMaxAttempts} attempt${
+							this.contextRecoveryMaxAttempts === 1 ? "" : "s"
+						}: the conversation still exceeds the context window after compaction. Reduce the conversation or task size, or use a model with a larger context window.`,
+					);
+				}
+				// The compacted transcript still overflowed — the next
+				// attempt re-reads the persisted transcript (now including
+				// this failed resend) and compacts it again.
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * B-3.2/B-3.4: compacts the persisted transcript to the calibrated
+	 * compaction target using the same deterministic compactor the B-2.5
+	 * beforeModel hook / SDK compact callback use, after verifying the
+	 * original task requirements can survive compaction.
+	 */
+	private compactTranscriptForRecovery(
+		startRequest: ClineSessionRestartStartRequest,
+		persistedMessages: ClineSdkPersistedMessage[],
+	): ClineSdkPersistedMessage[] {
+		const compaction = startRequest.compaction;
+		if (
+			!compaction ||
+			typeof compaction.contextWindowTokens !== "number" ||
+			!Number.isFinite(compaction.contextWindowTokens) ||
+			compaction.contextWindowTokens <= 0
+		) {
+			// No known context window: there is no target to compact to, and
+			// resending the same transcript can only overflow again.
+			throw new Error(
+				"Context overflow recovery cannot compact this conversation: the model's context window is unknown. Set a context budget for the model in the runtime settings, then retry.",
+			);
+		}
+		const calibration = calibrateClineCompactionConfig({
+			config: compaction,
+			systemPrompt: startRequest.systemPrompt,
+			providerId: startRequest.providerId,
+			extraTools: [],
+			safetyMarginTokens: startRequest.compactionSafetyMarginTokens,
+		});
+		const targetTokens = calibration.breakdown?.triggerTokens;
+		if (typeof targetTokens !== "number" || targetTokens <= 0) {
+			throw new Error(
+				"Context overflow recovery cannot compact this conversation: no usable compaction target could be derived from the context budget.",
+			);
+		}
+		const requirements = evaluateClineRecoveryRequirements({
+			messages: persistedMessages,
+			targetTokens,
+		});
+		if (requirements.checked && !requirements.fits) {
+			throw new Error(requirements.reason ?? "Original task requirements exceed the compaction target.");
+		}
+		const compacted = compactClineConversationMessages(persistedMessages, targetTokens);
+		return compacted.messages;
 	}
 
 	async startTaskSession(request: StartClineTaskSessionRequest): Promise<RuntimeTaskSessionSummary> {
@@ -436,7 +610,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					systemPrompt = `${systemPrompt}\n\n${appendedSystemPrompt}`;
 				}
 
-				const startResult = await this.sessionRuntime.startTaskSession({
+				const runtimeStartRequest: StartClineSessionRuntimeRequest = {
 					taskId: request.taskId,
 					cwd: request.cwd,
 					prompt: runtimePrompt,
@@ -451,12 +625,15 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					reasoningEffort: request.reasoningEffort,
 					systemPrompt,
 					userInstructionService: runtimeSetup.userInstructionService,
-					requestToolApproval: runtimeSetup.requestToolApproval,
+					requestToolApproval: request.wrapToolApproval
+						? request.wrapToolApproval(runtimeSetup.requestToolApproval)
+						: runtimeSetup.requestToolApproval,
 					contextWindowTokens: request.contextWindowTokens,
 					contextWindowSource: request.contextWindowSource,
 					compaction: request.compaction,
 					compactionSafetyMarginTokens: request.compactionSafetyMarginTokens,
-				});
+				};
+				const startResult = await this.sessionRuntime.startTaskSession(runtimeStartRequest);
 				const warningMessage = formatStartWarnings(startResult.warnings);
 				if (warningMessage) {
 					this.emitSummary(

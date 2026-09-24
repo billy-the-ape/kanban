@@ -4,7 +4,11 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import type { RuntimeBoardData, RuntimeTaskSessionSummary } from "../../src/core/api-contract";
+import type {
+	RuntimeBoardData,
+	RuntimeTaskSessionSummary,
+	RuntimeWorkspaceStateResponse,
+} from "../../src/core/api-contract";
 import { shutdownRuntimeServer } from "../../src/server/shutdown-coordinator";
 import { loadWorkspaceState, saveWorkspaceState } from "../../src/state/workspace-state";
 import type { TerminalSessionManager } from "../../src/terminal/session-manager";
@@ -71,7 +75,8 @@ function createBoard(taskIds: { inProgress?: string[]; review?: string[] }): Run
 				title: "Review",
 				cards: (taskIds.review ?? []).map((taskId) => createCard(taskId)),
 			},
-			{ id: "trash", title: "Done", cards: [] },
+			{ id: "done", title: "Done", cards: [] },
+			{ id: "trash", title: "Trash", cards: [] },
 		],
 		dependencies: [],
 	};
@@ -95,7 +100,7 @@ function createSession(taskId: string, state: "running" | "awaiting_review" | "i
 }
 
 describe.sequential("shutdown coordinator integration", () => {
-	it("moves all in-progress and review cards to trash for every indexed project on shutdown", async () => {
+	it("interrupts in-progress and review sessions for every indexed project on shutdown, keeping cards in place", async () => {
 		await withTemporaryHome(async () => {
 			const { path: sandboxRoot, cleanup } = createTempDir("kanban-shutdown-scope-");
 			try {
@@ -163,20 +168,23 @@ describe.sequential("shutdown coordinator integration", () => {
 
 				expect(didCloseRuntimeServer).toBe(true);
 
+				// B-5: interrupted cards stay in their columns (work preserved, not discarded).
+				const cardIds = (state: RuntimeWorkspaceStateResponse, columnId: string) =>
+					(state.board.columns.find((column) => column.id === columnId)?.cards ?? [])
+						.map((card) => card.id)
+						.sort();
 				const managedAfter = await loadWorkspaceState(managedProjectPath);
-				const managedTrash = managedAfter.board.columns.find((column) => column.id === "trash")?.cards ?? [];
-				expect(managedTrash.map((card) => card.id).sort()).toEqual(
-					["managed-idle", "managed-missing-session", "managed-running"].sort(),
-				);
+				expect(cardIds(managedAfter, "trash")).toEqual([]);
+				expect(cardIds(managedAfter, "in_progress")).toEqual(["managed-missing-session", "managed-running"]);
+				expect(cardIds(managedAfter, "review")).toEqual(["managed-idle"]);
 				expect(managedAfter.sessions["managed-running"]?.state).toBe("interrupted");
 				expect(managedAfter.sessions["managed-idle"]?.state).toBe("interrupted");
 				expect(managedAfter.sessions["managed-missing-session"]).toBeUndefined();
 
 				const indexedAfter = await loadWorkspaceState(indexedProjectPath);
-				const indexedTrash = indexedAfter.board.columns.find((column) => column.id === "trash")?.cards ?? [];
-				expect(indexedTrash.map((card) => card.id).sort()).toEqual(
-					["indexed-awaiting-review", "indexed-missing-session"].sort(),
-				);
+				expect(cardIds(indexedAfter, "trash")).toEqual([]);
+				expect(cardIds(indexedAfter, "in_progress")).toEqual(["indexed-missing-session"]);
+				expect(cardIds(indexedAfter, "review")).toEqual(["indexed-awaiting-review"]);
 				expect(indexedAfter.sessions["indexed-awaiting-review"]?.state).toBe("interrupted");
 				expect(indexedAfter.sessions["indexed-missing-session"]).toBeUndefined();
 			} finally {

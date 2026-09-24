@@ -243,7 +243,9 @@ describe("InMemoryClineSessionRuntime", () => {
 				sessionId: expect.any(String),
 			}),
 		);
-		expect(update).toHaveBeenCalledTimes(1);
+		// Two metadata writes: the Kanban title, then the B-4.8 launch config.
+		// Both are best-effort and must not fail the start.
+		expect(update).toHaveBeenCalledTimes(2);
 	});
 
 	it("routes host events through the pending requested session id before start resolves", async () => {

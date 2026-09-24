@@ -50,18 +50,21 @@ const workspaceSnapshots: Record<string, ReviewTaskWorkspaceSnapshot> = {
 function HookHarness({
 	board,
 	runAutoReviewGitAction,
-	requestMoveTaskToTrash,
+	requestCompleteTask,
+	completeOnGitActionSuccess,
 }: {
 	board: BoardData;
 	runAutoReviewGitAction: (taskId: string, action: TaskGitAction) => Promise<boolean>;
-	requestMoveTaskToTrash: (taskId: string, fromColumnId: BoardColumnId) => Promise<void>;
+	requestCompleteTask: (taskId: string, fromColumnId: BoardColumnId) => Promise<void>;
+	completeOnGitActionSuccess?: boolean;
 }): null {
 	setTaskWorkspaceSnapshot(workspaceSnapshots["task-1"] ?? null);
 	useReviewAutoActions({
 		board,
 		taskGitActionLoadingByTaskId: {},
 		runAutoReviewGitAction,
-		requestMoveTaskToTrash,
+		requestCompleteTask,
+		completeOnGitActionSuccess,
 	});
 	return null;
 }
@@ -98,14 +101,14 @@ describe("useReviewAutoActions", () => {
 
 	it("cancels a scheduled auto review action when autoReviewEnabled is turned off", async () => {
 		const runAutoReviewGitAction = vi.fn(async () => true);
-		const requestMoveTaskToTrash = vi.fn(async () => {});
+		const requestCompleteTask = vi.fn(async () => {});
 
 		await act(async () => {
 			root.render(
 				<HookHarness
 					board={createBoard(true)}
 					runAutoReviewGitAction={runAutoReviewGitAction}
-					requestMoveTaskToTrash={requestMoveTaskToTrash}
+					requestCompleteTask={requestCompleteTask}
 				/>,
 			);
 		});
@@ -115,7 +118,7 @@ describe("useReviewAutoActions", () => {
 				<HookHarness
 					board={createBoard(false)}
 					runAutoReviewGitAction={runAutoReviewGitAction}
-					requestMoveTaskToTrash={requestMoveTaskToTrash}
+					requestCompleteTask={requestCompleteTask}
 				/>,
 			);
 		});
@@ -125,6 +128,51 @@ describe("useReviewAutoActions", () => {
 		});
 
 		expect(runAutoReviewGitAction).not.toHaveBeenCalled();
-		expect(requestMoveTaskToTrash).not.toHaveBeenCalled();
+		expect(requestCompleteTask).not.toHaveBeenCalled();
+	});
+
+	it("completes on a successful deterministic delivery even while the worktree still shows changes", async () => {
+		const runAutoReviewGitAction = vi.fn(async () => true);
+		const requestCompleteTask = vi.fn(async () => {});
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					board={createBoard(true)}
+					runAutoReviewGitAction={runAutoReviewGitAction}
+					requestCompleteTask={requestCompleteTask}
+					completeOnGitActionSuccess
+				/>,
+			);
+		});
+		await act(async () => {
+			vi.advanceTimersByTime(1000);
+		});
+
+		expect(runAutoReviewGitAction).toHaveBeenCalledWith("task-1", "commit");
+		// B-5.1: the delivery receipt, not a clean tree (changedFiles is still 3), is the evidence.
+		expect(requestCompleteTask).toHaveBeenCalledWith("task-1", "review", { skipWorkingChangeWarning: true });
+	});
+
+	it("does not complete when deterministic delivery did not succeed", async () => {
+		const runAutoReviewGitAction = vi.fn(async () => false);
+		const requestCompleteTask = vi.fn(async () => {});
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					board={createBoard(true)}
+					runAutoReviewGitAction={runAutoReviewGitAction}
+					requestCompleteTask={requestCompleteTask}
+					completeOnGitActionSuccess
+				/>,
+			);
+		});
+		await act(async () => {
+			vi.advanceTimersByTime(1000);
+		});
+
+		expect(runAutoReviewGitAction).toHaveBeenCalled();
+		expect(requestCompleteTask).not.toHaveBeenCalled();
 	});
 });

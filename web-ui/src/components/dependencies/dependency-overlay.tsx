@@ -57,7 +57,7 @@ interface AnchorPoint {
 
 const SOURCE_CONNECTOR_PADDING = 2;
 const TARGET_CONNECTOR_PADDING = 8;
-const COLUMN_ORDER: BoardColumnId[] = ["backlog", "in_progress", "review", "trash"];
+const COLUMN_ORDER: BoardColumnId[] = ["backlog", "in_progress", "review", "done", "trash"];
 const SIDE_NORMALS: Record<AnchorSide, { x: number; y: number }> = {
 	left: { x: -1, y: 0 },
 	right: { x: 1, y: 0 },
@@ -145,7 +145,7 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 function normalizeColumnId(value: string | undefined): BoardColumnId | null {
-	if (value === "backlog" || value === "in_progress" || value === "review" || value === "trash") {
+	if (value === "backlog" || value === "in_progress" || value === "review" || value === "done" || value === "trash") {
 		return value;
 	}
 	return null;

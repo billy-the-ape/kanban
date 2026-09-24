@@ -115,6 +115,9 @@ function createRuntimeConfig(selectedAgentId: RuntimeConfigResponse["selectedAge
 		openPrPromptTemplateDefault: "pr",
 		contextBudget: null,
 		effectiveContextWindow: null,
+		reviewPolicy: null,
+		verification: null,
+		gitDeliveryPolicy: null,
 	};
 }
 

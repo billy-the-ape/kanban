@@ -4,7 +4,8 @@ const columnOrder: Array<{ id: BoardColumnId; title: string }> = [
 	{ id: "backlog", title: "Backlog" },
 	{ id: "in_progress", title: "In Progress" },
 	{ id: "review", title: "Review" },
-	{ id: "trash", title: "Done" },
+	{ id: "done", title: "Done" },
+	{ id: "trash", title: "Trash" },
 ];
 
 function createEmptyColumn(id: BoardColumnId, title: string): BoardColumn {

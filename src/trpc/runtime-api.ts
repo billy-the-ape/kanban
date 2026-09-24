@@ -11,6 +11,7 @@ import { buildClineCompactionConfig } from "../cline-sdk/cline-compaction-config
 import { createClineMcpRuntimeService } from "../cline-sdk/cline-mcp-runtime-service";
 import { createClineMcpSettingsService } from "../cline-sdk/cline-mcp-settings-service";
 import { createClineProviderService } from "../cline-sdk/cline-provider-service";
+import type { ClineReviewSessionService } from "../cline-sdk/cline-review-session-service";
 import { isClineClearSlashCommand } from "../cline-sdk/cline-slash-commands";
 import type { ClineTaskSessionService } from "../cline-sdk/cline-task-session-service";
 import type { RuntimeConfigState } from "../config/runtime-config";
@@ -19,6 +20,8 @@ import type {
 	RuntimeCommandRunResponse,
 	RuntimeEffectiveContextWindow,
 	RuntimeRunUpdateResponse,
+	RuntimeTaskDeliveryInfoResponse,
+	RuntimeTaskDeliveryStartResponse,
 	RuntimeUpdateStatusResponse,
 } from "../core/api-contract";
 import {
@@ -39,6 +42,10 @@ import {
 	parseTaskChatMessagesRequest,
 	parseTaskChatReloadRequest,
 	parseTaskChatSendRequest,
+	parseTaskDeliveryInfoRequest,
+	parseTaskDeliveryStartRequest,
+	parseTaskReviewInfoRequest,
+	parseTaskReviewStartRequest,
 	parseTaskSessionInputRequest,
 	parseTaskSessionStartRequest,
 	parseTaskSessionStopRequest,
@@ -48,6 +55,8 @@ import { resolveTaskTitle } from "../core/task-title.js";
 import { openInBrowser } from "../server/browser";
 import { buildRuntimeConfigResponse, resolveAgentCommand } from "../terminal/agent-registry";
 import type { TerminalSessionManager } from "../terminal/session-manager";
+import { evaluateDependentsUnlock, getGitDeliveryService } from "../workspace/git-delivery";
+import { findTaskBaseRef } from "../workspace/task-review-handoff";
 import { resolveTaskCwd } from "../workspace/task-worktree";
 import { captureTaskTurnCheckpoint } from "../workspace/turn-checkpoints";
 import type { RuntimeTrpcContext, RuntimeTrpcWorkspaceScope } from "./app-router";
@@ -59,6 +68,8 @@ export interface CreateRuntimeApiDependencies {
 	setActiveRuntimeConfig: (config: RuntimeConfigState) => void;
 	getScopedTerminalManager: (scope: RuntimeTrpcWorkspaceScope) => Promise<TerminalSessionManager>;
 	getScopedClineTaskSessionService: (scope: RuntimeTrpcWorkspaceScope) => Promise<ClineTaskSessionService>;
+	/** B-6: the per-workspace bounded review session service (its own Cline session instance). */
+	getScopedReviewSessionService?: (scope: RuntimeTrpcWorkspaceScope) => Promise<ClineReviewSessionService>;
 	resolveInteractiveShellCommand: () => { binary: string; args: string[] };
 	runCommand: (command: string, cwd: string) => Promise<RuntimeCommandRunResponse>;
 	broadcastClineMcpAuthStatusesUpdated?: (
@@ -110,6 +121,17 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 	// B-2.9: the effective context window (budget override → provider-settings
 	// override → provider metadata → fallback) is diagnostic input for the
 	// settings UI; a lookup failure must never fail the whole config read.
+	// B-6: the review session service is wired per-workspace by the server; a
+	// missing binding (e.g. a partial test harness) is a clear, recoverable error.
+	const requireReviewSessionService = (): ((
+		scope: RuntimeTrpcWorkspaceScope,
+	) => Promise<ClineReviewSessionService>) => {
+		if (!deps.getScopedReviewSessionService) {
+			throw new Error("The review session service is not configured for this workspace.");
+		}
+		return deps.getScopedReviewSessionService;
+	};
+
 	const buildConfigResponse = async (runtimeConfig: RuntimeConfigState) => {
 		const clineProviderSettings = clineProviderService.getProviderSettingsSummary();
 		let effectiveContextWindow: RuntimeEffectiveContextWindow | null = null;
@@ -337,6 +359,143 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					ok: false,
 					summary: null,
 					error: message,
+				};
+			}
+		},
+		// B-6.2: start a bounded, fresh-context review session for a task. The
+		// effective review policy comes from the scoped runtime config; the service
+		// resolves the worktree, builds the handoff, runs the session (with the
+		// review tool policy), and persists the durable, tree-bound verdict.
+		startTaskReview: async (workspaceScope, input) => {
+			try {
+				const body = parseTaskReviewStartRequest(input);
+				const scopedRuntimeConfig = await deps.loadScopedRuntimeConfig(workspaceScope);
+				const reviewService = await requireReviewSessionService()(workspaceScope);
+				return await reviewService.startTaskReview({
+					...body,
+					reviewPolicy: scopedRuntimeConfig.reviewPolicy,
+					verification: scopedRuntimeConfig.verification,
+				});
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return {
+					ok: false,
+					status: "failed",
+					handoff: null,
+					result: null,
+					candidateTreeHash: null,
+					sessionId: null,
+					error: message,
+					warnings: [],
+					verification: null,
+				};
+			}
+		},
+		// B-6.7: read the durable review verdict + the live candidate tree hash.
+		getTaskReviewInfo: async (workspaceScope, input) => {
+			try {
+				const body = parseTaskReviewInfoRequest(input);
+				const reviewService = await requireReviewSessionService()(workspaceScope);
+				return await reviewService.getReviewInfo(body.taskId);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return {
+					ok: false,
+					status: null,
+					handoff: null,
+					result: null,
+					candidateTreeHash: null,
+					resultMatchesTree: null,
+					error: message,
+					warnings: [],
+					verification: null,
+				};
+			}
+		},
+		// B-8: deterministic git delivery — the application controls commit,
+		// integration, push, remote verification, and the durable receipt,
+		// independent of model availability.
+		startTaskDelivery: async (workspaceScope, input): Promise<RuntimeTaskDeliveryStartResponse> => {
+			try {
+				const body = parseTaskDeliveryStartRequest(input);
+				const scopedRuntimeConfig = await deps.loadScopedRuntimeConfig(workspaceScope);
+				const policy = scopedRuntimeConfig.gitDeliveryPolicy;
+				if (!policy?.enabled) {
+					return {
+						ok: false,
+						receipt: null,
+						error: "Git delivery is not enabled; enable gitDeliveryPolicy in the runtime settings first.",
+					};
+				}
+				const baseRef = await findTaskBaseRef(workspaceScope.workspaceId, body.taskId);
+				if (!baseRef) {
+					return {
+						ok: false,
+						receipt: null,
+						error: "Task has no base ref; its worktree cannot be resolved for delivery.",
+					};
+				}
+				let worktreePath: string;
+				try {
+					worktreePath = await resolveTaskCwd({
+						cwd: workspaceScope.workspacePath,
+						taskId: body.taskId,
+						baseRef,
+						ensure: false,
+					});
+				} catch {
+					return {
+						ok: false,
+						receipt: null,
+						error: `Task worktree for "${body.taskId}" was not found; start the task session before delivery.`,
+					};
+				}
+				return await getGitDeliveryService().startDelivery({
+					taskId: body.taskId,
+					workspaceId: workspaceScope.workspaceId,
+					repoPath: workspaceScope.workspacePath,
+					worktreePath,
+					baseRef,
+					policy,
+					// B-6.7/B-7.6: a required review/verification must be ready and
+					// bound to the exact candidate tree before delivery commits it.
+					gates: {
+						reviewRequired: scopedRuntimeConfig.reviewPolicy?.enabled === "required",
+						verificationRequired: scopedRuntimeConfig.verification?.enabled === "required",
+					},
+					commitMessage: body.commitMessage,
+				});
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return { ok: false, receipt: null, error: message };
+			}
+		},
+		// B-8.8: read the durable delivery receipt for a task. The receipt is
+		// keyed by task id only, so a receipt from another workspace is not
+		// surfaced here.
+		getTaskDeliveryInfo: async (workspaceScope, input): Promise<RuntimeTaskDeliveryInfoResponse> => {
+			try {
+				const body = parseTaskDeliveryInfoRequest(input);
+				const scopedRuntimeConfig = await deps.loadScopedRuntimeConfig(workspaceScope);
+				const info = await getGitDeliveryService().getDeliveryInfo(
+					body.taskId,
+					scopedRuntimeConfig.gitDeliveryPolicy,
+				);
+				if (info.receipt && info.receipt.workspaceId !== workspaceScope.workspaceId) {
+					return {
+						...info,
+						receipt: null,
+						dependentsUnlock: evaluateDependentsUnlock(scopedRuntimeConfig.gitDeliveryPolicy, null),
+					};
+				}
+				return info;
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return {
+					ok: false,
+					receipt: null,
+					error: message,
+					dependentsUnlock: { allowed: false, reason: `The delivery receipt could not be read: ${message}` },
 				};
 			}
 		},

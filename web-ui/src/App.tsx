@@ -35,6 +35,7 @@ import { createIdleTaskSession } from "@/hooks/app-utils";
 import { KanbanAccessBlockedFallback } from "@/hooks/kanban-access-blocked-fallback";
 import { RuntimeDisconnectedFallback } from "@/hooks/runtime-disconnected-fallback";
 import { useAppHotkeys } from "@/hooks/use-app-hotkeys";
+import { useBlockedTaskCleanups } from "@/hooks/use-blocked-task-cleanups";
 import { useBoardInteractions } from "@/hooks/use-board-interactions";
 import { useDebugTools } from "@/hooks/use-debug-tools";
 import { useDetailTaskNavigation } from "@/hooks/use-detail-task-navigation";
@@ -569,6 +570,8 @@ export default function App(): ReactElement {
 		handleCardSelect,
 		handleMoveToTrash,
 		handleMoveReviewCardToTrash,
+		handleCompleteTask,
+		handleCompleteReviewCard,
 		handleRestoreTaskFromTrash,
 		handleCancelAutomaticTaskAction,
 		handleOpenClearTrash,
@@ -576,6 +579,7 @@ export default function App(): ReactElement {
 		handleAddReviewComments,
 		handleSendReviewComments,
 		moveToTrashLoadingById,
+		completeTaskLoadingById,
 		trashTaskCount,
 	} = useBoardInteractions({
 		board,
@@ -597,7 +601,9 @@ export default function App(): ReactElement {
 		readyForReviewNotificationsEnabled,
 		taskGitActionLoadingByTaskId,
 		runAutoReviewGitAction,
+		deterministicDeliveryEnabled: runtimeProjectConfig?.gitDeliveryPolicy?.enabled === true,
 	});
+	const cleanupBlockedReasonByTaskId = useBlockedTaskCleanups(currentProjectId, board);
 
 	const {
 		handleCreateAndStartTask,
@@ -950,7 +956,10 @@ export default function App(): ReactElement {
 												commitTaskLoadingById={commitTaskLoadingById}
 												openPrTaskLoadingById={openPrTaskLoadingById}
 												moveToTrashLoadingById={moveToTrashLoadingById}
+												completeTaskLoadingById={completeTaskLoadingById}
+												cleanupBlockedReasonByTaskId={cleanupBlockedReasonByTaskId}
 												onMoveToTrashTask={handleMoveReviewCardToTrash}
+												onCompleteTask={handleCompleteReviewCard}
 												onRestoreFromTrashTask={handleRestoreTaskFromTrash}
 												dependencies={board.dependencies}
 												onCreateDependency={handleCreateDependency}
@@ -1037,8 +1046,10 @@ export default function App(): ReactElement {
 									openPrTaskLoadingById={openPrTaskLoadingById}
 									agentCommitTaskLoadingById={agentCommitTaskLoadingById}
 									agentOpenPrTaskLoadingById={agentOpenPrTaskLoadingById}
+									completeTaskLoadingById={completeTaskLoadingById}
 									moveToTrashLoadingById={moveToTrashLoadingById}
 									onMoveReviewCardToTrash={handleMoveReviewCardToTrash}
+									onCompleteReviewCard={handleCompleteReviewCard}
 									onRestoreTaskFromTrash={handleRestoreTaskFromTrash}
 									onCancelAutomaticTaskAction={handleCancelAutomaticTaskAction}
 									onAddReviewComments={(taskId: string, text: string) => {
@@ -1053,7 +1064,9 @@ export default function App(): ReactElement {
 									latestClineChatMessage={latestSelectedTaskChatMessage}
 									streamedClineChatMessages={selectedTaskChatMessages}
 									onMoveToTrash={handleMoveToTrash}
+									onComplete={handleCompleteTask}
 									isMoveToTrashLoading={moveToTrashLoadingById[selectedCard.card.id] ?? false}
+									isCompleteLoading={completeTaskLoadingById[selectedCard.card.id] ?? false}
 									gitHistoryPanel={
 										isGitHistoryOpen ? (
 											<GitHistoryView workspaceId={currentProjectId} gitHistory={gitHistory} />

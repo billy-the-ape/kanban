@@ -33,6 +33,11 @@ export function isAllowedCrossColumnCardMove(
 	if (fromColumnId === "backlog" && toColumnId === "in_progress") {
 		return true;
 	}
+	if (fromColumnId === "review" && toColumnId === "done") {
+		return true;
+	}
+	// Any card may be discarded, including completed ones (their retained
+	// worktrees are cleaned up through the preservation-gated trash path).
 	if (toColumnId === "trash" && fromColumnId !== "trash") {
 		return true;
 	}
@@ -86,6 +91,12 @@ export function isCardDropDisabled(
 		if (activeDragSourceColumnId === "backlog" || activeDragSourceColumnId === "in_progress") {
 			return false;
 		}
+		return !isAllowedCrossColumnCardMove(activeDragSourceColumnId, columnId, {
+			taskId: options?.activeDragTaskId,
+			programmaticCardMoveInFlight: options?.programmaticCardMoveInFlight,
+		});
+	}
+	if (columnId === "done") {
 		return !isAllowedCrossColumnCardMove(activeDragSourceColumnId, columnId, {
 			taskId: options?.activeDragTaskId,
 			programmaticCardMoveInFlight: options?.programmaticCardMoveInFlight,

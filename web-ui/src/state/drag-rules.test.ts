@@ -57,4 +57,10 @@ describe("drag rules", () => {
 	it("allows manual trash to review drops", () => {
 		expect(isCardDropDisabled("review", "trash")).toBe(false);
 	});
+
+	it("allows discarding completed (done) cards into trash", () => {
+		expect(isCardDropDisabled("trash", "done")).toBe(false);
+		expect(isCardDropDisabled("done", "review")).toBe(false);
+		expect(isCardDropDisabled("done", "in_progress")).toBe(true);
+	});
 });

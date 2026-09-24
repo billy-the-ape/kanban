@@ -27,10 +27,12 @@ function ColumnSection({
 	onCommitTask,
 	onOpenPrTask,
 	onMoveToTrashTask,
+	onCompleteTask,
 	onRestoreFromTrashTask,
 	commitTaskLoadingById,
 	openPrTaskLoadingById,
 	moveToTrashLoadingById,
+	completeTaskLoadingById,
 	activeDragSourceColumnId,
 	workspacePath,
 	defaultClineModelId,
@@ -51,10 +53,12 @@ function ColumnSection({
 	onCommitTask?: (taskId: string) => void;
 	onOpenPrTask?: (taskId: string) => void;
 	onMoveToTrashTask?: (taskId: string) => void;
+	onCompleteTask?: (taskId: string) => void;
 	onRestoreFromTrashTask?: (taskId: string) => void;
 	commitTaskLoadingById?: Record<string, boolean>;
 	openPrTaskLoadingById?: Record<string, boolean>;
 	moveToTrashLoadingById?: Record<string, boolean>;
+	completeTaskLoadingById?: Record<string, boolean>;
 	activeDragSourceColumnId?: BoardColumnId | null;
 	workspacePath?: string | null;
 	defaultClineModelId?: string | null;
@@ -135,8 +139,8 @@ function ColumnSection({
 						className="text-status-red hover:text-status-red"
 						onClick={onClearTrash}
 						disabled={column.cards.length === 0}
-						aria-label="Clear done"
-						title={column.cards.length > 0 ? "Clear done items permanently" : "Done is empty"}
+						aria-label="Clear trash"
+						title={column.cards.length > 0 ? "Clear trash items permanently" : "Trash is empty"}
 						style={{ marginRight: 4 }}
 					/>
 				) : null}
@@ -192,12 +196,14 @@ function ColumnSection({
 												selected={card.id === selectedCardId}
 												onStart={onStartTask}
 												onMoveToTrash={onMoveToTrashTask}
+												onComplete={onCompleteTask}
 												onRestoreFromTrash={onRestoreFromTrashTask}
 												onCommit={onCommitTask}
 												onOpenPr={onOpenPrTask}
 												isCommitLoading={commitTaskLoadingById?.[card.id] ?? false}
 												isOpenPrLoading={openPrTaskLoadingById?.[card.id] ?? false}
 												isMoveToTrashLoading={moveToTrashLoadingById?.[card.id] ?? false}
+												isCompleteLoading={completeTaskLoadingById?.[card.id] ?? false}
 												workspacePath={workspacePath}
 												defaultClineModelId={defaultClineModelId}
 												onSaveTitle={onSaveTitle}
@@ -245,10 +251,12 @@ export function ColumnContextPanel({
 	onCommitTask,
 	onOpenPrTask,
 	onMoveToTrashTask,
+	onCompleteTask,
 	onRestoreFromTrashTask,
 	commitTaskLoadingById,
 	openPrTaskLoadingById,
 	moveToTrashLoadingById,
+	completeTaskLoadingById,
 	panelWidth,
 }: {
 	selection: CardSelection;
@@ -267,10 +275,12 @@ export function ColumnContextPanel({
 	onCommitTask?: (taskId: string) => void;
 	onOpenPrTask?: (taskId: string) => void;
 	onMoveToTrashTask?: (taskId: string) => void;
+	onCompleteTask?: (taskId: string) => void;
 	onRestoreFromTrashTask?: (taskId: string) => void;
 	commitTaskLoadingById?: Record<string, boolean>;
 	openPrTaskLoadingById?: Record<string, boolean>;
 	moveToTrashLoadingById?: Record<string, boolean>;
+	completeTaskLoadingById?: Record<string, boolean>;
 	panelWidth?: string;
 	defaultClineModelId?: string | null;
 }): React.ReactElement {
@@ -352,14 +362,16 @@ export function ColumnContextPanel({
 							editingTaskId={column.id === "backlog" ? editingTaskId : null}
 							inlineTaskEditor={column.id === "backlog" ? inlineTaskEditor : undefined}
 							onEditTask={column.id === "backlog" ? onEditTask : undefined}
-							onSaveTitle={column.id !== "trash" ? onSaveTaskTitle : undefined}
+							onSaveTitle={column.id !== "trash" && column.id !== "done" ? onSaveTaskTitle : undefined}
 							onCommitTask={column.id === "review" ? onCommitTask : undefined}
 							onOpenPrTask={column.id === "review" ? onOpenPrTask : undefined}
 							onMoveToTrashTask={column.id === "review" ? onMoveToTrashTask : undefined}
+							onCompleteTask={column.id === "review" ? onCompleteTask : undefined}
 							onRestoreFromTrashTask={column.id === "trash" ? onRestoreFromTrashTask : undefined}
 							commitTaskLoadingById={column.id === "review" ? commitTaskLoadingById : undefined}
 							openPrTaskLoadingById={column.id === "review" ? openPrTaskLoadingById : undefined}
 							moveToTrashLoadingById={column.id === "review" ? moveToTrashLoadingById : undefined}
+							completeTaskLoadingById={column.id === "review" ? completeTaskLoadingById : undefined}
 							activeDragSourceColumnId={activeDragSourceColumnId}
 							workspacePath={workspacePath}
 							defaultClineModelId={defaultClineModelId}

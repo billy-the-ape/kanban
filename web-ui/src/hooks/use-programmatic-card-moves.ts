@@ -15,9 +15,14 @@ type RequestMoveTaskToTrash = (
 	options?: RequestMoveTaskToTrashOptions,
 ) => Promise<void>;
 
+type RequestCompleteTask = (
+	taskId: string,
+	fromColumnId: BoardColumnId,
+	options?: RequestMoveTaskToTrashOptions,
+) => Promise<void>;
+
 export interface ProgrammaticCardMoveBehavior {
 	skipKickoff?: boolean;
-	skipTrashWorkflow?: boolean;
 	skipWorkingChangeWarning?: boolean;
 	insertAtTop?: boolean;
 }
@@ -42,6 +47,7 @@ export type ProgrammaticCardMoveAttemptResult = "started" | "blocked" | "unavail
 export function useProgrammaticCardMoves(): {
 	handleProgrammaticCardMoveReady: (requestMove: RequestProgrammaticCardMove | null) => void;
 	setRequestMoveTaskToTrashHandler: (handler: RequestMoveTaskToTrash) => void;
+	setRequestCompleteTaskHandler: (handler: RequestCompleteTask) => void;
 	tryProgrammaticCardMove: (
 		taskId: string,
 		fromColumnId: BoardColumnId,
@@ -50,9 +56,11 @@ export function useProgrammaticCardMoves(): {
 	) => ProgrammaticCardMoveAttemptResult;
 	consumeProgrammaticCardMove: (taskId: string) => ConsumedProgrammaticCardMove;
 	resolvePendingProgrammaticTrashMove: (taskId: string) => void;
+	resolvePendingProgrammaticCompleteMove: (taskId: string) => void;
 	waitForProgrammaticCardMoveAvailability: () => Promise<void>;
 	resetProgrammaticCardMoves: () => void;
 	requestMoveTaskToTrashWithAnimation: RequestMoveTaskToTrash;
+	requestCompleteTaskWithAnimation: RequestCompleteTask;
 	programmaticCardMoveCycle: number;
 } {
 	const requestProgrammaticCardMoveRef = useRef<RequestProgrammaticCardMove | null>(null);
@@ -62,6 +70,10 @@ export function useProgrammaticCardMoves(): {
 		Record<string, PendingProgrammaticTrashMoveCompletion>
 	>({});
 	const requestMoveTaskToTrashRef = useRef<RequestMoveTaskToTrash | null>(null);
+	const requestCompleteTaskRef = useRef<RequestCompleteTask | null>(null);
+	const pendingProgrammaticCompleteMoveCompletionByTaskIdRef = useRef<
+		Record<string, PendingProgrammaticTrashMoveCompletion>
+	>({});
 	const pendingProgrammaticCardMoveAvailabilityRef = useRef<PendingProgrammaticCardMoveAvailability[]>([]);
 	const [programmaticCardMoveCycle, setProgrammaticCardMoveCycle] = useState(0);
 
@@ -71,6 +83,10 @@ export function useProgrammaticCardMoves(): {
 
 	const setRequestMoveTaskToTrashHandler = useCallback((handler: RequestMoveTaskToTrash) => {
 		requestMoveTaskToTrashRef.current = handler;
+	}, []);
+
+	const setRequestCompleteTaskHandler = useCallback((handler: RequestCompleteTask) => {
+		requestCompleteTaskRef.current = handler;
 	}, []);
 
 	const clearProgrammaticCardMoveInFlight = useCallback((taskId?: string) => {
@@ -153,6 +169,16 @@ export function useProgrammaticCardMoves(): {
 		pending.resolve();
 	}, []);
 
+	const resolvePendingProgrammaticCompleteMove = useCallback((taskId: string) => {
+		const pending = pendingProgrammaticCompleteMoveCompletionByTaskIdRef.current[taskId];
+		if (!pending) {
+			return;
+		}
+		window.clearTimeout(pending.timeoutId);
+		delete pendingProgrammaticCompleteMoveCompletionByTaskIdRef.current[taskId];
+		pending.resolve();
+	}, []);
+
 	const waitForProgrammaticCardMoveAvailability = useCallback(async (): Promise<void> => {
 		if (!programmaticCardMoveInFlightRef.current) {
 			return;
@@ -176,12 +202,15 @@ export function useProgrammaticCardMoves(): {
 		for (const taskId of Object.keys(pendingProgrammaticTrashMoveCompletionByTaskIdRef.current)) {
 			resolvePendingProgrammaticTrashMove(taskId);
 		}
+		for (const taskId of Object.keys(pendingProgrammaticCompleteMoveCompletionByTaskIdRef.current)) {
+			resolvePendingProgrammaticCompleteMove(taskId);
+		}
 		const pendingAvailability = pendingProgrammaticCardMoveAvailabilityRef.current.splice(0);
 		for (const pending of pendingAvailability) {
 			window.clearTimeout(pending.timeoutId);
 			pending.resolve();
 		}
-	}, [clearProgrammaticCardMoveInFlight, resolvePendingProgrammaticTrashMove]);
+	}, [clearProgrammaticCardMoveInFlight, resolvePendingProgrammaticCompleteMove, resolvePendingProgrammaticTrashMove]);
 
 	useEffect(() => {
 		return () => {
@@ -237,15 +266,66 @@ export function useProgrammaticCardMoves(): {
 		[resolvePendingProgrammaticTrashMove, tryProgrammaticCardMove, waitForProgrammaticCardMoveAvailability],
 	);
 
+	const requestCompleteTaskWithAnimation = useCallback<RequestCompleteTask>(
+		async (taskId, fromColumnId, options) => {
+			const requestCompleteTask = requestCompleteTaskRef.current;
+			if (!requestCompleteTask) {
+				return;
+			}
+			if (fromColumnId !== "review") {
+				await requestCompleteTask(taskId, fromColumnId, options);
+				return;
+			}
+
+			resolvePendingProgrammaticCompleteMove(taskId);
+
+			let resolveCompletion: (() => void) | null = null;
+			const completionPromise = new Promise<void>((resolve) => {
+				resolveCompletion = resolve;
+			});
+			const timeoutId = window.setTimeout(() => {
+				resolvePendingProgrammaticCompleteMove(taskId);
+			}, 5000);
+			pendingProgrammaticCompleteMoveCompletionByTaskIdRef.current[taskId] = {
+				resolve: () => {
+					resolveCompletion?.();
+					resolveCompletion = null;
+				},
+				timeoutId,
+			};
+
+			const programmaticMoveAttempt = tryProgrammaticCardMove(taskId, fromColumnId, "done", {
+				skipWorkingChangeWarning: options?.skipWorkingChangeWarning,
+			});
+			if (programmaticMoveAttempt === "blocked") {
+				resolvePendingProgrammaticCompleteMove(taskId);
+				await waitForProgrammaticCardMoveAvailability();
+				await requestCompleteTaskWithAnimation(taskId, fromColumnId, options);
+				return;
+			}
+			if (programmaticMoveAttempt === "unavailable") {
+				resolvePendingProgrammaticCompleteMove(taskId);
+				await requestCompleteTask(taskId, fromColumnId, options);
+				return;
+			}
+
+			await completionPromise;
+		},
+		[resolvePendingProgrammaticCompleteMove, tryProgrammaticCardMove, waitForProgrammaticCardMoveAvailability],
+	);
+
 	return {
 		handleProgrammaticCardMoveReady,
 		setRequestMoveTaskToTrashHandler,
+		setRequestCompleteTaskHandler,
 		tryProgrammaticCardMove,
 		consumeProgrammaticCardMove,
 		resolvePendingProgrammaticTrashMove,
+		resolvePendingProgrammaticCompleteMove,
 		waitForProgrammaticCardMoveAvailability,
 		resetProgrammaticCardMoves,
 		requestMoveTaskToTrashWithAnimation,
+		requestCompleteTaskWithAnimation,
 		programmaticCardMoveCycle,
 	};
 }

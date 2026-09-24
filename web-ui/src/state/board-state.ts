@@ -60,7 +60,7 @@ function withUpdatedColumns(board: BoardData, columns: BoardColumn[]): BoardData
 }
 
 function normalizeColumnId(id: string): BoardColumnId | null {
-	if (id === "backlog" || id === "in_progress" || id === "review" || id === "trash") {
+	if (id === "backlog" || id === "in_progress" || id === "review" || id === "done" || id === "trash") {
 		return id;
 	}
 	return null;
@@ -375,8 +375,8 @@ export function removeTaskDependency(board: BoardData, dependencyId: string): { 
 	return runtimeTaskState.removeTaskDependency(board, dependencyId);
 }
 
-export function getReadyLinkedTaskIdsForTaskInTrash(board: BoardData, taskId: string): string[] {
-	return runtimeTaskState.getReadyLinkedTaskIdsForTaskInTrash(board, taskId);
+export function getReadyLinkedTaskIdsForTaskInDone(board: BoardData, taskId: string): string[] {
+	return runtimeTaskState.getReadyLinkedTaskIdsForTaskInDone(board, taskId);
 }
 
 export function trashTaskAndGetReadyLinkedTaskIds(
@@ -384,6 +384,13 @@ export function trashTaskAndGetReadyLinkedTaskIds(
 	taskId: string,
 ): { board: BoardData; moved: boolean; readyTaskIds: string[] } {
 	return runtimeTaskState.trashTaskAndGetReadyLinkedTaskIds(board, taskId);
+}
+
+export function completeTaskAndGetReadyLinkedTaskIds(
+	board: BoardData,
+	taskId: string,
+): { board: BoardData; moved: boolean; readyTaskIds: string[] } {
+	return runtimeTaskState.completeTaskAndGetReadyLinkedTaskIds(board, taskId);
 }
 
 export function applyDragResult(
