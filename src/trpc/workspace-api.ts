@@ -50,6 +50,8 @@ export interface CreateWorkspaceApiDependencies {
 	broadcastRuntimeWorkspaceStateUpdated: (workspaceId: string, workspacePath: string) => Promise<void> | void;
 	broadcastRuntimeProjectsUpdated: (preferredCurrentProjectId: string | null) => Promise<void> | void;
 	buildWorkspaceStateSnapshot: (workspaceId: string, workspacePath: string) => Promise<RuntimeWorkspaceStateResponse>;
+	/** B-9.2: fire-and-forget queue pass after a board save (a card may have just reached Done). */
+	runTaskDispatchPass?: (scope: { workspaceId: string; workspacePath: string }) => void;
 }
 
 function normalizeOptionalTaskWorkspaceScopeInput(
@@ -424,6 +426,12 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 				const response = await saveWorkspaceState(workspaceScope.workspacePath, input);
 				void deps.broadcastRuntimeWorkspaceStateUpdated(workspaceScope.workspaceId, workspaceScope.workspacePath);
 				void deps.broadcastRuntimeProjectsUpdated(workspaceScope.workspaceId);
+				// B-9.2: a board save is the trigger that moves a card to Done;
+				// the pass itself is locked and a no-op unless dispatch is enabled.
+				deps.runTaskDispatchPass?.({
+					workspaceId: workspaceScope.workspaceId,
+					workspacePath: workspaceScope.workspacePath,
+				});
 				return response;
 			} catch (error) {
 				if (error instanceof WorkspaceStateConflictError) {

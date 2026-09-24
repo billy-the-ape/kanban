@@ -8,6 +8,7 @@ import type {
 	RuntimeBoardDependency,
 	RuntimeClineReasoningEffort,
 	RuntimeTaskClineSettings,
+	RuntimeTaskDispatchRunResponse,
 	RuntimeWorkspaceStateResponse,
 } from "../core/api-contract";
 import { runtimeAgentIdSchema, runtimeClineReasoningEffortSchema } from "../core/api-contract";
@@ -793,7 +794,15 @@ interface CompleteTaskExecutionResult {
 	autoStartedTasks: JsonRecord[];
 	/** B-5.9: why ready linked tasks were not started (no delivery evidence yet). */
 	dependentsBlockedReason: string | null;
+	/** B-9: the backend queue pass run after completion (null when the queue is disabled). */
+	taskDispatch: CliTaskDispatchResult | null;
 	alreadyInDone: boolean;
+}
+
+interface CliTaskDispatchResult {
+	dispatchedTaskId: string | null;
+	skippedReason: RuntimeTaskDispatchRunResponse["skippedReason"];
+	error: string | null;
 }
 
 interface CompleteTaskMutationValue {
@@ -860,6 +869,7 @@ async function completeTaskById(input: {
 			readyTaskIds: [],
 			autoStartedTasks: [],
 			dependentsBlockedReason: null,
+			taskDispatch: null,
 			alreadyInDone: true,
 		};
 	}
@@ -870,14 +880,22 @@ async function completeTaskById(input: {
 		await stopTaskRuntimeSession(input.runtimeClient, input.taskId);
 	}
 
+	// B-9: with the backend task queue enabled, the queue launches ready
+	// dependents (fresh context, dispatch record, worker limit); the CLI must
+	// not start them itself. A completion may also free a worker slot, so the
+	// pass runs even when this task had no dependents.
+	const taskDispatch = await runBackendTaskDispatch(input.runtimeClient);
+
 	// B-5.9/B-8.8: dependents start only once delivery evidence exists (when
 	// deterministic delivery is enabled; legacy mode keeps unlock-on-complete).
 	const dependentsBlockedReason =
-		mutation.value.readyTaskIds.length > 0
+		taskDispatch === null && mutation.value.readyTaskIds.length > 0
 			? await readDependentsBlockedReason(input.runtimeClient, input.taskId)
 			: null;
 	const autoStartedTasks: JsonRecord[] = [];
-	for (const readyTaskId of dependentsBlockedReason === null ? mutation.value.readyTaskIds : []) {
+	const legacyStartTaskIds =
+		taskDispatch === null && dependentsBlockedReason === null ? mutation.value.readyTaskIds : [];
+	for (const readyTaskId of legacyStartTaskIds) {
 		const started = await startTask({
 			cwd: input.cwd,
 			taskId: readyTaskId,
@@ -893,8 +911,32 @@ async function completeTaskById(input: {
 		readyTaskIds: mutation.value.readyTaskIds,
 		autoStartedTasks,
 		dependentsBlockedReason,
+		taskDispatch,
 		alreadyInDone: false,
 	};
+}
+
+/**
+ * B-9: run one backend queue pass. Returns null when the queue is disabled, so
+ * the caller keeps the legacy auto-start. A failed call is reported rather
+ * than falling back to a direct start, which would bypass the queue.
+ */
+async function runBackendTaskDispatch(
+	runtimeClient: ReturnType<typeof createRuntimeTrpcClient>,
+): Promise<CliTaskDispatchResult | null> {
+	try {
+		const response = await runtimeClient.runtime.dispatchReadyTasks.mutate();
+		if (response.skippedReason === "disabled") {
+			return null;
+		}
+		return { dispatchedTaskId: response.dispatchedTaskId, skippedReason: response.skippedReason, error: null };
+	} catch (error) {
+		return {
+			dispatchedTaskId: null,
+			skippedReason: null,
+			error: `Could not run the task queue: ${toErrorMessage(error)}`,
+		};
+	}
 }
 
 /**
@@ -954,6 +996,7 @@ async function completeTask(input: {
 			readyTaskIds: completed.readyTaskIds,
 			autoStartedTasks: completed.autoStartedTasks,
 			dependentsBlockedReason: completed.dependentsBlockedReason,
+			taskDispatch: completed.taskDispatch,
 		};
 	}
 
@@ -1002,6 +1045,9 @@ async function completeTask(input: {
 		dependentsBlocked: completedTasks
 			.filter((result) => result.dependentsBlockedReason !== null)
 			.map((result) => ({ taskId: result.taskId, reason: result.dependentsBlockedReason })),
+		taskDispatch: completedTasks.flatMap((result) =>
+			result.taskDispatch ? [{ taskId: result.taskId, ...result.taskDispatch }] : [],
+		),
 		count: completedTasks.length,
 	};
 }

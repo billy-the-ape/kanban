@@ -33,6 +33,7 @@ export function useLinkedBacklogTaskActions({
 	startBacklogTaskWithAnimation,
 	waitForBacklogStartAnimationAvailability,
 	checkDependentsUnlock,
+	isBackendTaskDispatchEnabled = false,
 	onTaskCompleted,
 }: {
 	board: BoardData;
@@ -51,6 +52,8 @@ export function useLinkedBacklogTaskActions({
 	waitForBacklogStartAnimationAvailability?: () => Promise<void>;
 	/** B-5.9: whether a completed task's dependents may start (delivery evidence); absent means always. */
 	checkDependentsUnlock?: (taskId: string) => Promise<RuntimeTaskDependentsUnlock>;
+	/** B-9.5: backend task dispatch is enabled — unblocked tasks are queued for the backend queue, not auto-started locally. */
+	isBackendTaskDispatchEnabled?: boolean;
 	/** Called after a task has been completed and its session stopped. */
 	onTaskCompleted?: (taskId: string) => void;
 }): {
@@ -248,7 +251,19 @@ export function useLinkedBacklogTaskActions({
 					? await checkDependentsUnlock(task.id)
 					: { allowed: true, reason: null };
 			if (unlock.allowed) {
-				await startReadyLinkedTasks(readyTasks);
+				if (isBackendTaskDispatchEnabled) {
+					// B-9.5: with backend dispatch enabled the browser must not
+					// auto-start newly unblocked tasks — the queue pass fired by
+					// the board save launches them deterministically with fresh context.
+					showAppToast({
+						intent: "success",
+						icon: "rocket",
+						message: "Linked task queued for automatic dispatch.",
+						timeout: 4000,
+					});
+				} else {
+					await startReadyLinkedTasks(readyTasks);
+				}
 			} else {
 				showAppToast({
 					intent: "warning",
@@ -263,7 +278,15 @@ export function useLinkedBacklogTaskActions({
 			await Promise.all([stopTaskSession(task.id), stopTaskSession(getDetailTerminalTaskId(task.id))]);
 			onTaskCompleted?.(task.id);
 		},
-		[checkDependentsUnlock, onTaskCompleted, setBoard, setSelectedTaskId, startReadyLinkedTasks, stopTaskSession],
+		[
+			checkDependentsUnlock,
+			isBackendTaskDispatchEnabled,
+			onTaskCompleted,
+			setBoard,
+			setSelectedTaskId,
+			startReadyLinkedTasks,
+			stopTaskSession,
+		],
 	);
 
 	const requestMoveTaskToTrash = useCallback(

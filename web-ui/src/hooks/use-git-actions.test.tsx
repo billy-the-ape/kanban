@@ -118,6 +118,7 @@ function createRuntimeConfig(selectedAgentId: RuntimeConfigResponse["selectedAge
 		reviewPolicy: null,
 		verification: null,
 		gitDeliveryPolicy: null,
+		taskDispatchPolicy: null,
 	};
 }
 

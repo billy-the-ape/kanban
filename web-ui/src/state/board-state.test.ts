@@ -157,7 +157,9 @@ describe("board dependency state", () => {
 
 		const moveATrash = trashTaskAndGetReadyLinkedTaskIds(dependencyB.board, taskA);
 		expect(moveATrash.moved).toBe(true);
-		expect(moveATrash.board.dependencies).toHaveLength(1);
+		// B-9: the edge to the trashed prerequisite is retained so the backend
+		// dispatch queue keeps Task C blocked instead of treating it as free.
+		expect(moveATrash.board.dependencies).toHaveLength(2);
 		expect(moveATrash.readyTaskIds).toEqual([]);
 
 		const moveBTrash = trashTaskAndGetReadyLinkedTaskIds(dependencyB.board, taskB);
@@ -182,7 +184,9 @@ describe("board dependency state", () => {
 
 		const completeA = completeTaskAndGetReadyLinkedTaskIds(dependencyB.board, taskA);
 		expect(completeA.moved).toBe(true);
-		expect(completeA.board.dependencies).toHaveLength(1);
+		// B-9: edges to done tasks survive normalization so the backend
+		// dispatch service can resolve prerequisites after completion.
+		expect(completeA.board.dependencies).toHaveLength(2);
 		expect(completeA.readyTaskIds).toEqual([taskC]);
 
 		const completeB = completeTaskAndGetReadyLinkedTaskIds(completeA.board, taskB);
@@ -202,7 +206,8 @@ describe("board dependency state", () => {
 
 		const trashed = trashTaskAndGetReadyLinkedTaskIds(linked.board, taskA);
 		expect(trashed.readyTaskIds).toEqual([]);
-		expect(trashed.board.dependencies).toEqual([]);
+		// B-9: the backlog dependent keeps its edge to the trashed prerequisite.
+		expect(trashed.board.dependencies).toEqual([expect.objectContaining({ fromTaskId: taskB, toTaskId: taskA })]);
 	});
 
 	it("removes dependency links once both linked cards are in trash", () => {
@@ -217,10 +222,25 @@ describe("board dependency state", () => {
 		expect(linked.board.dependencies).toHaveLength(1);
 
 		const movedATrash = moveTaskToColumn(linked.board, taskA, "trash");
-		expect(movedATrash.board.dependencies).toHaveLength(0);
+		// B-9: retained while the dependent (Task B) is still in the backlog.
+		expect(movedATrash.board.dependencies).toHaveLength(1);
 
 		const movedBTrash = moveTaskToColumn(movedATrash.board, taskB, "trash");
 		expect(movedBTrash.board.dependencies).toHaveLength(0);
+	});
+
+	it("drops the link when the backlog dependent itself is trashed", () => {
+		const fixture = createBacklogBoard(["Task A", "Task B"]);
+		const taskA = requireTaskId(fixture.taskIdByPrompt["Task A"], "Task A");
+		const taskB = requireTaskId(fixture.taskIdByPrompt["Task B"], "Task B");
+
+		// Task A depends on Task B; both are in the backlog.
+		const linked = addTaskDependency(fixture.board, taskA, taskB);
+		expect(linked.added).toBe(true);
+
+		// Trashing the dependent must not flip the edge onto Task B.
+		const trashed = moveTaskToColumn(linked.board, taskA, "trash");
+		expect(trashed.board.dependencies).toEqual([]);
 	});
 
 	it("removes links once neither endpoint remains in backlog", () => {

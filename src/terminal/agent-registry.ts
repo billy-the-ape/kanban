@@ -133,6 +133,7 @@ export function buildRuntimeConfigResponse(
 		reviewPolicy: runtimeConfig.reviewPolicy ?? null,
 		verification: runtimeConfig.verification ?? null,
 		gitDeliveryPolicy: runtimeConfig.gitDeliveryPolicy ?? null,
+		taskDispatchPolicy: runtimeConfig.taskDispatchPolicy ?? null,
 		effectiveContextWindow: extra.effectiveContextWindow ?? null,
 	};
 }

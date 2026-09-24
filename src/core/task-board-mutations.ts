@@ -175,6 +175,7 @@ function resolveDependencyEndpoints(
 	board: RuntimeBoardData,
 	firstTaskId: string,
 	secondTaskId: string,
+	options?: { retainSettledPrerequisites?: boolean },
 ):
 	| {
 			backlogTaskId: string;
@@ -186,12 +187,15 @@ function resolveDependencyEndpoints(
 	if (!firstColumnId || !secondColumnId) {
 		return { reason: "missing_task" };
 	}
-	if (
-		firstColumnId === "trash" ||
-		firstColumnId === "done" ||
-		secondColumnId === "trash" ||
-		secondColumnId === "done"
-	) {
+	const isSettled = (columnId: RuntimeBoardColumnId) => columnId === "done" || columnId === "trash";
+	if (isSettled(firstColumnId) || isSettled(secondColumnId)) {
+		// B-9: an existing edge from a backlog dependent to a prerequisite that
+		// reached done or trash is retained as stored. The dispatch queue reads
+		// it to require a delivery receipt (done) or to keep the dependent
+		// blocked (trash) — dropping it would make the dependent look free.
+		if (options?.retainSettledPrerequisites && firstColumnId === "backlog" && isSettled(secondColumnId)) {
+			return { backlogTaskId: firstTaskId, linkedTaskId: secondTaskId };
+		}
 		return { reason: "trash_task" };
 	}
 	const firstIsBacklog = firstColumnId === "backlog";
@@ -250,7 +254,12 @@ export function updateTaskDependencies(board: RuntimeBoardData): RuntimeBoardDat
 		if (!taskIds.has(firstTaskId) || !taskIds.has(secondTaskId)) {
 			continue;
 		}
-		const resolved = resolveDependencyEndpoints(board, firstTaskId, secondTaskId);
+		const resolved = resolveDependencyEndpoints(board, firstTaskId, secondTaskId, {
+			// B-9: edges to done/trash prerequisites survive normalization so the
+			// backend dispatch service can still see them. New links to done or
+			// trash tasks remain rejected via the default (no-option) path.
+			retainSettledPrerequisites: true,
+		});
 		if ("reason" in resolved) {
 			continue;
 		}

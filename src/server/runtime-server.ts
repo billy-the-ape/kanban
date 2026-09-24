@@ -255,35 +255,54 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		deps.workspaceRegistry.clearActiveWorkspace();
 	};
 
+	// B-9: shared by per-request contexts and the post-startup reconciliation pass.
+	const buildRuntimeApi = () =>
+		createRuntimeApi({
+			getActiveWorkspaceId: deps.workspaceRegistry.getActiveWorkspaceId,
+			getActiveRuntimeConfig: deps.workspaceRegistry.getActiveRuntimeConfig,
+			loadScopedRuntimeConfig: deps.workspaceRegistry.loadScopedRuntimeConfig,
+			setActiveRuntimeConfig: deps.workspaceRegistry.setActiveRuntimeConfig,
+			getScopedTerminalManager,
+			getScopedClineTaskSessionService,
+			getScopedReviewSessionService,
+			resolveInteractiveShellCommand: deps.resolveInteractiveShellCommand,
+			runCommand: deps.runCommand,
+			broadcastClineMcpAuthStatusesUpdated: deps.runtimeStateHub.broadcastClineMcpAuthStatusesUpdated,
+			broadcastTaskChatCleared: deps.runtimeStateHub.broadcastTaskChatCleared,
+			bumpClineSessionContextVersion: deps.runtimeStateHub.bumpClineSessionContextVersion,
+			prepareForStateReset,
+			getUpdateStatus: deps.getUpdateStatus,
+			runUpdateNow: deps.runUpdateNow,
+			broadcastRuntimeWorkspaceStateUpdated: deps.runtimeStateHub.broadcastRuntimeWorkspaceStateUpdated,
+			warnTaskDispatchError: (error) => {
+				deps.warn(`[task-dispatch] Queue pass failed: ${error instanceof Error ? error.message : String(error)}`);
+			},
+		});
+
 	const createTrpcContext = async (req: IncomingMessage): Promise<RuntimeTrpcContext> => {
 		const requestUrl = new URL(req.url ?? "/", "http://localhost");
 		const scope = await resolveWorkspaceScopeFromRequest(req, requestUrl);
+		const runtimeApi = buildRuntimeApi();
 		return {
 			requestedWorkspaceId: scope.requestedWorkspaceId,
 			workspaceScope: scope.workspaceScope,
-			runtimeApi: createRuntimeApi({
-				getActiveWorkspaceId: deps.workspaceRegistry.getActiveWorkspaceId,
-				getActiveRuntimeConfig: deps.workspaceRegistry.getActiveRuntimeConfig,
-				loadScopedRuntimeConfig: deps.workspaceRegistry.loadScopedRuntimeConfig,
-				setActiveRuntimeConfig: deps.workspaceRegistry.setActiveRuntimeConfig,
-				getScopedTerminalManager,
-				getScopedClineTaskSessionService,
-				getScopedReviewSessionService,
-				resolveInteractiveShellCommand: deps.resolveInteractiveShellCommand,
-				runCommand: deps.runCommand,
-				broadcastClineMcpAuthStatusesUpdated: deps.runtimeStateHub.broadcastClineMcpAuthStatusesUpdated,
-				broadcastTaskChatCleared: deps.runtimeStateHub.broadcastTaskChatCleared,
-				bumpClineSessionContextVersion: deps.runtimeStateHub.bumpClineSessionContextVersion,
-				prepareForStateReset,
-				getUpdateStatus: deps.getUpdateStatus,
-				runUpdateNow: deps.runUpdateNow,
-			}),
+			runtimeApi,
 			workspaceApi: createWorkspaceApi({
 				ensureTerminalManagerForWorkspace: deps.ensureTerminalManagerForWorkspace,
 				getScopedClineTaskSessionService,
 				broadcastRuntimeWorkspaceStateUpdated: deps.runtimeStateHub.broadcastRuntimeWorkspaceStateUpdated,
 				broadcastRuntimeProjectsUpdated: deps.runtimeStateHub.broadcastRuntimeProjectsUpdated,
 				buildWorkspaceStateSnapshot: deps.workspaceRegistry.buildWorkspaceStateSnapshot,
+				// B-9.2: a board save may complete prerequisites — fire a queue pass.
+				runTaskDispatchPass: (dispatchScope) => {
+					void runtimeApi.dispatchReadyTasks(dispatchScope).catch((error) => {
+						deps.warn(
+							`[task-dispatch] Queue pass after board save failed for ${dispatchScope.workspaceId}: ${
+								error instanceof Error ? error.message : String(error)
+							}`,
+						);
+					});
+				},
 			}),
 			projectsApi: createProjectsApi({
 				getActiveWorkspacePath: deps.workspaceRegistry.getActiveWorkspacePath,
@@ -557,6 +576,28 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 	if (!address || typeof address === "string") {
 		throw new Error("Failed to start local server.");
 	}
+
+	// B-9.6: restart reconciliation — a runtime restart killed in-flight model
+	// sessions, so dispatched tasks with no live session and no delivery receipt
+	// are relaunched from their recorded base. Fire-and-forget: startup must not
+	// block on git worktree verification, and the pass is a no-op when the
+	// workspace's taskDispatchPolicy is disabled.
+	for (const workspace of deps.workspaceRegistry.listManagedWorkspaces()) {
+		if (!workspace.workspacePath) {
+			continue;
+		}
+		const reconcileScope = { workspaceId: workspace.workspaceId, workspacePath: workspace.workspacePath };
+		void buildRuntimeApi()
+			.reconcileTaskDispatch(reconcileScope)
+			.catch((error) => {
+				deps.warn(
+					`[task-dispatch] Restart reconciliation failed for ${reconcileScope.workspaceId}: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				);
+			});
+	}
+
 	// B-5.7/B-5.9: background maintenance; close() waits for it so no git
 	// subprocess outlives the server.
 	const startupMaintenance = runStartupTaskWorkspaceMaintenance(deps.warn);

@@ -84,6 +84,8 @@ interface UseBoardInteractionsInput {
 	runAutoReviewGitAction: (taskId: string, action: TaskGitAction) => Promise<boolean>;
 	/** B-8: deterministic delivery is enabled, so a delivery receipt (not a clean tree) completes a task. */
 	deterministicDeliveryEnabled?: boolean;
+	/** B-9.5: backend task dispatch is enabled, so completed tasks queue their dependents for the backend queue. */
+	backendTaskDispatchEnabled?: boolean;
 }
 
 export interface UseBoardInteractionsResult {
@@ -132,6 +134,7 @@ export function useBoardInteractions({
 	taskGitActionLoadingByTaskId,
 	runAutoReviewGitAction,
 	deterministicDeliveryEnabled = false,
+	backendTaskDispatchEnabled = false,
 }: UseBoardInteractionsInput): UseBoardInteractionsResult {
 	const previousSessionsRef = useRef<Record<string, RuntimeTaskSessionSummary>>({});
 	const notificationPermissionPromptInFlightRef = useRef(false);
@@ -556,6 +559,7 @@ export function useBoardInteractions({
 		startBacklogTaskWithAnimation,
 		waitForBacklogStartAnimationAvailability: waitForProgrammaticCardMoveAvailability,
 		checkDependentsUnlock,
+		isBackendTaskDispatchEnabled: backendTaskDispatchEnabled,
 		onTaskCompleted: handleTaskCompleted,
 	});
 

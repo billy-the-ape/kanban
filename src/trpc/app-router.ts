@@ -80,6 +80,9 @@ import type {
 	RuntimeTaskDeliveryInfoResponse,
 	RuntimeTaskDeliveryStartRequest,
 	RuntimeTaskDeliveryStartResponse,
+	RuntimeTaskDispatchReconcileResponse,
+	RuntimeTaskDispatchRunResponse,
+	RuntimeTaskDispatchStatusResponse,
 	RuntimeTaskPreservationInfoResponse,
 	RuntimeTaskPreservationRequest,
 	RuntimeTaskReviewInfoRequest,
@@ -184,6 +187,9 @@ import {
 	runtimeTaskDeliveryInfoResponseSchema,
 	runtimeTaskDeliveryStartRequestSchema,
 	runtimeTaskDeliveryStartResponseSchema,
+	runtimeTaskDispatchReconcileResponseSchema,
+	runtimeTaskDispatchRunResponseSchema,
+	runtimeTaskDispatchStatusResponseSchema,
 	runtimeTaskPreservationInfoResponseSchema,
 	runtimeTaskPreservationRequestSchema,
 	runtimeTaskReviewInfoRequestSchema,
@@ -260,6 +266,12 @@ export interface RuntimeTrpcContext {
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskDeliveryInfoRequest,
 		) => Promise<RuntimeTaskDeliveryInfoResponse>;
+		/** B-9: backend-owned sequential task dispatch — run one queue pass for this workspace. */
+		dispatchReadyTasks: (scope: RuntimeTrpcWorkspaceScope) => Promise<RuntimeTaskDispatchRunResponse>;
+		/** B-9: read-only queue status (ready/blocked tasks, active worker, dispatch records). */
+		getDispatchStatus: (scope: RuntimeTrpcWorkspaceScope) => Promise<RuntimeTaskDispatchStatusResponse>;
+		/** B-9.6: restart reconciliation — relaunch dispatched tasks that lost their session. */
+		reconcileTaskDispatch: (scope: RuntimeTrpcWorkspaceScope) => Promise<RuntimeTaskDispatchReconcileResponse>;
 		stopTaskSession: (
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskSessionStopRequest,
@@ -538,6 +550,18 @@ export const runtimeAppRouter = t.router({
 			.output(runtimeTaskDeliveryInfoResponseSchema)
 			.query(async ({ ctx, input }) => {
 				return await ctx.runtimeApi.getTaskDeliveryInfo(ctx.workspaceScope, input);
+			}),
+		// B-9: backend-owned sequential task dispatch ("reliable queue").
+		dispatchReadyTasks: workspaceProcedure.output(runtimeTaskDispatchRunResponseSchema).mutation(async ({ ctx }) => {
+			return await ctx.runtimeApi.dispatchReadyTasks(ctx.workspaceScope);
+		}),
+		getDispatchStatus: workspaceProcedure.output(runtimeTaskDispatchStatusResponseSchema).query(async ({ ctx }) => {
+			return await ctx.runtimeApi.getDispatchStatus(ctx.workspaceScope);
+		}),
+		reconcileTaskDispatch: workspaceProcedure
+			.output(runtimeTaskDispatchReconcileResponseSchema)
+			.mutation(async ({ ctx }) => {
+				return await ctx.runtimeApi.reconcileTaskDispatch(ctx.workspaceScope);
 			}),
 		stopTaskSession: workspaceProcedure
 			.input(runtimeTaskSessionStopRequestSchema)
