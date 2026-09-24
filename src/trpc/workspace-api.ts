@@ -17,7 +17,8 @@ import {
 	parseWorktreeDeleteRequest,
 	parseWorktreeEnsureRequest,
 } from "../core/api-validation";
-import { saveWorkspaceState, WorkspaceStateConflictError } from "../state/workspace-state";
+import { isTaskWriterActive } from "../server/task-writer-activity";
+import { loadWorkspaceBoardById, saveWorkspaceState, WorkspaceStateConflictError } from "../state/workspace-state";
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import {
 	createEmptyWorkspaceChangesResponse,
@@ -25,9 +26,11 @@ import {
 	getWorkspaceChangesBetweenRefs,
 	getWorkspaceChangesFromRef,
 } from "../workspace/get-workspace-changes";
+import { readTaskDeliveryReceipt } from "../workspace/git-delivery";
 import { getCommitDiff, getGitLog, getGitRefs } from "../workspace/git-history";
 import { discardGitChanges, getGitSyncSummary, runGitCheckoutAction, runGitSyncAction } from "../workspace/git-sync";
 import { searchWorkspaceFiles } from "../workspace/search-workspace-files";
+import { listBlockedTaskCleanups, runTaskWorkspaceMaintenance } from "../workspace/task-workspace-maintenance";
 import {
 	deleteTaskWorktree,
 	ensureTaskWorktreeIfDoesntExist,
@@ -331,6 +334,18 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 		},
 		deleteWorktree: async (workspaceScope, input) => {
 			const body = parseWorktreeDeleteRequest(input);
+			// B-5.5: cleanup never removes a worktree that is still being written.
+			const writerActive = isTaskWriterActive(body.taskId, {
+				clineTaskSessionService: await deps.getScopedClineTaskSessionService(workspaceScope),
+				terminalManager: await deps.ensureTerminalManagerForWorkspace(
+					workspaceScope.workspaceId,
+					workspaceScope.workspacePath,
+				),
+			});
+			if (writerActive) {
+				const blockedReason = "The task's agent session is still running; stop it before cleaning up its worktree.";
+				return { ok: false, removed: false, preserved: false, blockedReason, error: blockedReason };
+			}
 			return await deleteTaskWorktree({
 				repoPath: workspaceScope.workspacePath,
 				taskId: body.taskId,
@@ -350,6 +365,26 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 				taskId: body.taskId,
 			});
 		},
+		runTaskWorkspaceMaintenance: async (workspaceScope) => {
+			const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
+			const terminalManager = await deps.ensureTerminalManagerForWorkspace(
+				workspaceScope.workspaceId,
+				workspaceScope.workspacePath,
+			);
+			return await runTaskWorkspaceMaintenance({
+				repoPath: workspaceScope.workspacePath,
+				board: await loadWorkspaceBoardById(workspaceScope.workspaceId),
+				readDeliveryReceipt: readTaskDeliveryReceipt,
+				isTaskWriterActive: async (taskId) =>
+					isTaskWriterActive(taskId, { clineTaskSessionService, terminalManager }),
+			});
+		},
+		listBlockedTaskCleanups: async (workspaceScope) => ({
+			blocked: await listBlockedTaskCleanups({
+				repoPath: workspaceScope.workspacePath,
+				board: await loadWorkspaceBoardById(workspaceScope.workspaceId),
+			}),
+		}),
 		loadTaskContext: async (workspaceScope, input) => {
 			const normalizedInput = normalizeRequiredTaskWorkspaceScopeInput(input);
 			return await getTaskWorkspaceInfo({

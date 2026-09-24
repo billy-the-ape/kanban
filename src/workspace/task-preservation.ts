@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { access, mkdir, readFile, rm } from "node:fs/promises";
+import { access, lstat, mkdir, readdir, readFile, rm } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 
@@ -170,6 +170,7 @@ export async function preserveTaskWorktree(options: {
 		archivePath,
 		refName: refCommit ? refName : null,
 		preservedAt: preserved ? now : (existing?.preservedAt ?? null),
+		cleanupBlockedReason: existing?.cleanupBlockedReason ?? null,
 		updatedAt: now,
 	};
 	try {
@@ -218,6 +219,7 @@ export async function syncTaskPreservationActivity(options: {
 			archivePath: existing?.archivePath ?? null,
 			refName: headCommit ? refName : (existing?.refName ?? null),
 			preservedAt: existing?.preservedAt ?? null,
+			cleanupBlockedReason: existing?.cleanupBlockedReason ?? null,
 			updatedAt: Date.now(),
 		};
 		await writeTaskPreservationRecord(record);
@@ -330,4 +332,46 @@ export async function removeTaskPreservationAssets(repoPath: string, taskId: str
 	await rm(getTaskPreservationDir(normalizedTaskId), { recursive: true, force: true }).catch(() => undefined);
 	await deleteTaskPatchFiles(normalizedTaskId).catch(() => undefined);
 	await runGit(repoPath, ["update-ref", "-d", getTaskPreservationRefName(taskId)]).catch(() => undefined);
+}
+
+/**
+ * B-5.9: durably records why the latest worktree cleanup was blocked (or
+ * clears it after a successful cleanup) so the failure stays visible and
+ * workspace maintenance retries it. No-op when the task has no record.
+ */
+export async function recordTaskCleanupBlockedReason(taskId: string, reason: string | null): Promise<void> {
+	const existing = await readTaskPreservationRecord(taskId);
+	if (!existing || existing.cleanupBlockedReason === reason) {
+		return;
+	}
+	await writeTaskPreservationRecord({ ...existing, cleanupBlockedReason: reason, updatedAt: Date.now() }).catch(
+		() => undefined,
+	);
+}
+
+/** Every preservation record on this machine (all workspaces). */
+export async function listTaskPreservationRecords(): Promise<RuntimeTaskPreservationRecord[]> {
+	const rootPath = join(getRuntimeHomePath(), KANBAN_TASK_PRESERVATION_DIR_NAME);
+	const entries = await readdir(rootPath).catch(() => [] as string[]);
+	const records = await Promise.all(entries.map((entry) => readTaskPreservationRecord(entry)));
+	return records.filter((record): record is RuntimeTaskPreservationRecord => record !== null);
+}
+
+async function measurePathBytes(path: string): Promise<number> {
+	const stats = await lstat(path).catch(() => null);
+	if (!stats) {
+		return 0;
+	}
+	if (!stats.isDirectory()) {
+		return stats.size;
+	}
+	const entries = await readdir(path).catch(() => [] as string[]);
+	const sizes = await Promise.all(entries.map((entry) => measurePathBytes(join(path, entry))));
+	return sizes.reduce((total, size) => total + size, 0);
+}
+
+/** B-5.7: on-disk size of a task's preservation assets (manifest, archive, patches). */
+export async function measureTaskPreservationBytes(taskId: string): Promise<number> {
+	const patch = await findTaskPatch(taskId);
+	return (await measurePathBytes(getTaskPreservationDir(taskId))) + (patch ? await measurePathBytes(patch.path) : 0);
 }

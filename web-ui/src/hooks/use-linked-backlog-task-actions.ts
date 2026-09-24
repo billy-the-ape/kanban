@@ -33,6 +33,7 @@ export function useLinkedBacklogTaskActions({
 	startBacklogTaskWithAnimation,
 	waitForBacklogStartAnimationAvailability,
 	checkDependentsUnlock,
+	onTaskCompleted,
 }: {
 	board: BoardData;
 	setBoard: Dispatch<SetStateAction<BoardData>>;
@@ -50,6 +51,8 @@ export function useLinkedBacklogTaskActions({
 	waitForBacklogStartAnimationAvailability?: () => Promise<void>;
 	/** B-5.9: whether a completed task's dependents may start (delivery evidence); absent means always. */
 	checkDependentsUnlock?: (taskId: string) => Promise<RuntimeTaskDependentsUnlock>;
+	/** Called after a task has been completed and its session stopped. */
+	onTaskCompleted?: (taskId: string) => void;
 }): {
 	handleCreateDependency: (fromTaskId: string, toTaskId: string) => void;
 	handleDeleteDependency: (dependencyId: string) => void;
@@ -168,11 +171,15 @@ export function useLinkedBacklogTaskActions({
 	const cleanupTaskWorktree = useCallback(
 		async (taskId: string): Promise<void> => {
 			const cleanupResult = await cleanupTaskWorkspace(taskId);
-			if (cleanupResult?.ok && !cleanupResult.removed && cleanupResult.blockedReason) {
+			// B-5.9: any cleanup that did not complete stays visible; it is retried
+			// by runtime maintenance and flagged on the Trash card.
+			const blockedReason =
+				cleanupResult?.blockedReason ?? (cleanupResult?.ok === false ? cleanupResult.error : null);
+			if (cleanupResult && !cleanupResult.removed && blockedReason) {
 				showAppToast({
 					intent: "warning",
 					icon: "warning-sign",
-					message: `Task worktree preserved: ${cleanupResult.blockedReason}`,
+					message: `Task worktree kept: ${blockedReason}`,
 					timeout: 7000,
 				});
 			}
@@ -254,8 +261,9 @@ export function useLinkedBacklogTaskActions({
 			// Completing a task never deletes its worktree. Stop the session
 			// best-effort so no live session lingers behind a terminal card.
 			await Promise.all([stopTaskSession(task.id), stopTaskSession(getDetailTerminalTaskId(task.id))]);
+			onTaskCompleted?.(task.id);
 		},
-		[checkDependentsUnlock, setBoard, setSelectedTaskId, startReadyLinkedTasks, stopTaskSession],
+		[checkDependentsUnlock, onTaskCompleted, setBoard, setSelectedTaskId, startReadyLinkedTasks, stopTaskSession],
 	);
 
 	const requestMoveTaskToTrash = useCallback(

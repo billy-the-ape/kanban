@@ -897,6 +897,14 @@ async function completeTaskById(input: {
 	};
 }
 
+/**
+ * B-5.7: after completing tasks, let the runtime dispose delivered worktrees
+ * and apply retention. Best-effort — the runtime also runs it at startup.
+ */
+async function requestWorkspaceMaintenance(runtimeClient: ReturnType<typeof createRuntimeTrpcClient>): Promise<void> {
+	await runtimeClient.workspace.runTaskWorkspaceMaintenance.mutate().catch(() => undefined);
+}
+
 async function readDependentsBlockedReason(
 	runtimeClient: ReturnType<typeof createRuntimeTrpcClient>,
 	taskId: string,
@@ -938,6 +946,7 @@ async function completeTask(input: {
 				autoStartedTasks: [],
 			};
 		}
+		await requestWorkspaceMaintenance(runtimeClient);
 		return {
 			ok: true,
 			task: completed.task,
@@ -978,6 +987,9 @@ async function completeTask(input: {
 
 	const completedTasks = results.filter((result) => !result.alreadyInDone);
 	const alreadyDoneTasks = results.filter((result) => result.alreadyInDone);
+	if (completedTasks.length > 0) {
+		await requestWorkspaceMaintenance(runtimeClient);
+	}
 
 	return {
 		ok: true,
@@ -1237,6 +1249,16 @@ async function deliverTaskCommand(input: {
 		...(input.commitMessage ? { commitMessage: input.commitMessage } : {}),
 	});
 	return { ...delivered, workspacePath: workspaceRepoPath };
+}
+
+/**
+ * B-5.7/B-5.9: retry blocked trash cleanups, dispose delivered Done worktrees,
+ * and apply preservation retention; prints what was done and what is blocked.
+ */
+async function cleanupTaskWorkspacesCommand(input: { cwd: string; projectPath?: string }): Promise<JsonRecord> {
+	const { workspaceRepoPath, runtimeClient } = await connectTaskWorkspace(input);
+	const report = await runtimeClient.workspace.runTaskWorkspaceMaintenance.mutate();
+	return { ok: true, ...report, workspacePath: workspaceRepoPath };
 }
 
 /** B-8.8: show a task's durable delivery receipt and whether its dependents may start. */
@@ -1637,6 +1659,18 @@ export function registerTaskCommand(program: Command): void {
 						taskId: options.taskId,
 						projectPath: options.projectPath,
 					}),
+			);
+		});
+
+	task
+		.command("cleanup")
+		.description(
+			"Retry blocked worktree cleanups, remove delivered Done worktrees, and prune preserved work past retention.",
+		)
+		.option("--project-path <path>", "Workspace path. Defaults to current directory workspace.")
+		.action(async (options: { projectPath?: string }) => {
+			await runTaskCommand(
+				async () => await cleanupTaskWorkspacesCommand({ cwd: process.cwd(), projectPath: options.projectPath }),
 			);
 		});
 

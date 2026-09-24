@@ -30,6 +30,7 @@ export function BoardColumn({
 	openPrTaskLoadingById,
 	moveToTrashLoadingById,
 	completeTaskLoadingById,
+	cleanupBlockedReasonByTaskId,
 	onCardClick,
 	activeDragTaskId,
 	activeDragSourceColumnId,
@@ -62,6 +63,7 @@ export function BoardColumn({
 	openPrTaskLoadingById?: Record<string, boolean>;
 	moveToTrashLoadingById?: Record<string, boolean>;
 	completeTaskLoadingById?: Record<string, boolean>;
+	cleanupBlockedReasonByTaskId?: Record<string, string>;
 	onCardClick?: (card: BoardCardModel) => void;
 	activeDragTaskId?: string | null;
 	activeDragSourceColumnId?: BoardColumnId | null;
@@ -187,6 +189,7 @@ export function BoardColumn({
 											isOpenPrLoading={openPrTaskLoadingById?.[card.id] ?? false}
 											isMoveToTrashLoading={moveToTrashLoadingById?.[card.id] ?? false}
 											isCompleteLoading={completeTaskLoadingById?.[card.id] ?? false}
+											cleanupBlockedReason={cleanupBlockedReasonByTaskId?.[card.id] ?? null}
 											onDependencyPointerDown={onDependencyPointerDown}
 											onDependencyPointerEnter={onDependencyPointerEnter}
 											isDependencySource={dependencySourceTaskId === card.id}

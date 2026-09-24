@@ -49,6 +49,7 @@ export function KanbanBoard({
 	openPrTaskLoadingById,
 	moveToTrashLoadingById,
 	completeTaskLoadingById,
+	cleanupBlockedReasonByTaskId,
 	dependencies,
 	onCreateDependency,
 	onDeleteDependency,
@@ -78,6 +79,7 @@ export function KanbanBoard({
 	openPrTaskLoadingById?: Record<string, boolean>;
 	moveToTrashLoadingById?: Record<string, boolean>;
 	completeTaskLoadingById?: Record<string, boolean>;
+	cleanupBlockedReasonByTaskId?: Record<string, string>;
 	dependencies: BoardDependency[];
 	onCreateDependency?: (fromTaskId: string, toTaskId: string) => void;
 	onDeleteDependency?: (dependencyId: string) => void;
@@ -405,8 +407,11 @@ export function KanbanBoard({
 						onRestoreFromTrashTask={column.id === "trash" ? onRestoreFromTrashTask : undefined}
 						commitTaskLoadingById={column.id === "review" ? commitTaskLoadingById : undefined}
 						openPrTaskLoadingById={column.id === "review" ? openPrTaskLoadingById : undefined}
-						moveToTrashLoadingById={column.id === "review" ? moveToTrashLoadingById : undefined}
+						moveToTrashLoadingById={
+							column.id === "review" || column.id === "done" ? moveToTrashLoadingById : undefined
+						}
 						completeTaskLoadingById={column.id === "review" ? completeTaskLoadingById : undefined}
+						cleanupBlockedReasonByTaskId={column.id === "trash" ? cleanupBlockedReasonByTaskId : undefined}
 						activeDragTaskId={activeDragTaskId}
 						activeDragSourceColumnId={activeDragSourceColumnId}
 						programmaticCardMoveInFlight={programmaticCardMoveInFlight}

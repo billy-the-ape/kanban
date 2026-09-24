@@ -16,8 +16,10 @@ import { compactClineConversationMessages } from "./cline-compaction-callback";
 import { type ClineCompactionConfig, calibrateClineCompactionConfig } from "./cline-compaction-config";
 import type { ContextLimitSource } from "./cline-context-policy";
 import {
+	describeClineUnresolvedToolCalls,
 	evaluateClineContextRecoveryBudget,
 	evaluateClineRecoveryRequirements,
+	findClineUnresolvedToolCalls,
 	isContextOverflowError,
 } from "./cline-context-recovery";
 import { applyClineSessionEvent } from "./cline-event-adapter";
@@ -423,6 +425,11 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 				const persistedSnapshot = await this.sessionRuntime
 					.readPersistedTaskSession(input.taskId)
 					.catch(() => null);
+				// B-3.5: never resend over a tool call whose completion is unknown.
+				const unresolvedToolCalls = findClineUnresolvedToolCalls(persistedSnapshot?.messages ?? []);
+				if (unresolvedToolCalls.length > 0) {
+					throw new Error(describeClineUnresolvedToolCalls(unresolvedToolCalls));
+				}
 				const messages = this.compactTranscriptForRecovery(startRequest, persistedSnapshot?.messages ?? []);
 				await this.sessionRuntime.stopTaskSession(input.taskId).catch(() => null);
 				const restartedSession = await this.sessionRuntime.restartTaskSession({

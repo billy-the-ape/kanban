@@ -229,6 +229,7 @@ export function BoardCard({
 	isOpenPrLoading = false,
 	isMoveToTrashLoading = false,
 	isCompleteLoading = false,
+	cleanupBlockedReason = null,
 	onDependencyPointerDown,
 	onDependencyPointerEnter,
 	isDependencySource = false,
@@ -255,6 +256,8 @@ export function BoardCard({
 	isOpenPrLoading?: boolean;
 	isMoveToTrashLoading?: boolean;
 	isCompleteLoading?: boolean;
+	/** B-5.9: why this Trash card's worktree cleanup is still blocked. */
+	cleanupBlockedReason?: string | null;
 	onDependencyPointerDown?: (taskId: string, event: MouseEvent<HTMLElement>) => void;
 	onDependencyPointerEnter?: (taskId: string) => void;
 	isDependencySource?: boolean;
@@ -663,28 +666,41 @@ export function BoardCard({
 										}}
 									/>
 								) : columnId === "trash" ? (
-									<Tooltip
-										side="bottom"
-										content={
-											<>
-												Restore session
-												<br />
-												in new worktree
-											</>
-										}
-									>
-										<Button
-											icon={<RotateCcw size={12} />}
-											variant="ghost"
-											size="sm"
-											aria-label="Restore task from trash"
-											onMouseDown={stopEvent}
-											onClick={(event) => {
-												stopEvent(event);
-												onRestoreFromTrash?.(card.id);
-											}}
-										/>
-									</Tooltip>
+									<div className="flex items-center">
+										{cleanupBlockedReason ? (
+											<Tooltip side="bottom" content={`Worktree cleanup blocked: ${cleanupBlockedReason}`}>
+												<span
+													className="inline-flex px-1 text-status-orange"
+													role="img"
+													aria-label="Worktree cleanup blocked"
+												>
+													<AlertTriangle size={13} />
+												</span>
+											</Tooltip>
+										) : null}
+										<Tooltip
+											side="bottom"
+											content={
+												<>
+													Restore session
+													<br />
+													in new worktree
+												</>
+											}
+										>
+											<Button
+												icon={<RotateCcw size={12} />}
+												variant="ghost"
+												size="sm"
+												aria-label="Restore task from trash"
+												onMouseDown={stopEvent}
+												onClick={(event) => {
+													stopEvent(event);
+													onRestoreFromTrash?.(card.id);
+												}}
+											/>
+										</Tooltip>
+									</div>
 								) : null}
 							</div>
 							{displayDescription ? (
