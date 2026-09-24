@@ -1898,3 +1898,99 @@ export const runtimeHookIngestResponseSchema = z.object({
 	error: z.string().optional(),
 });
 export type RuntimeHookIngestResponse = z.infer<typeof runtimeHookIngestResponseSchema>;
+
+// ---------------------------------------------------------------------------
+// B-4: durable completion attempts (reliable mode).
+// ---------------------------------------------------------------------------
+
+/** B-4.1: completion phases, in order. `complete` is terminal. */
+export const runtimeCompletionPhaseSchema = z.enum([
+	"implementation",
+	"review",
+	"verification",
+	"committing",
+	"integrating",
+	"integrated_verification",
+	"pushing",
+	"remote_verification",
+	"complete",
+]);
+export type RuntimeCompletionPhase = z.infer<typeof runtimeCompletionPhaseSchema>;
+
+/**
+ * B-4.1: attempt status, separate from the phase. `blocked`, `failed`, and
+ * `canceled` keep the phase they stopped at so the attempt can resume there.
+ */
+export const runtimeCompletionStatusSchema = z.enum(["running", "blocked", "failed", "canceled", "complete"]);
+export type RuntimeCompletionStatus = z.infer<typeof runtimeCompletionStatusSchema>;
+
+export const runtimeCompletionPhaseEventSchema = z.object({
+	phase: runtimeCompletionPhaseSchema,
+	status: runtimeCompletionStatusSchema,
+	detail: z.string(),
+	at: z.number().int(),
+});
+export type RuntimeCompletionPhaseEvent = z.infer<typeof runtimeCompletionPhaseEventSchema>;
+
+/** B-4.2: the durable completion attempt record (logs and artifacts by reference). */
+export const runtimeCompletionAttemptSchema = z.object({
+	schemaVersion: z.literal(1),
+	attemptId: z.string().min(1),
+	taskId: z.string().min(1),
+	workspaceId: z.string().min(1),
+	/** Repository identity: the main checkout path and its root commit. */
+	repoPath: z.string().min(1),
+	repoRootCommit: z.string().nullable(),
+	worktreePath: z.string().nullable(),
+	startingCommit: z.string().nullable(),
+	candidateTreeHash: z.string().nullable(),
+	/** Delivery destination (`refs/heads/<branch>`), null until known. */
+	targetRef: z.string().nullable(),
+	/**
+	 * B-4.7: the mode the attempt started in and the policy it runs under.
+	 * `reliable` attempts finish under their recorded policy even if reliable
+	 * mode is disabled mid-attempt; they never fall back to the legacy prompt.
+	 */
+	mode: z.literal("reliable"),
+	policyVersion: z.string().min(1),
+	policy: z.object({
+		gitDelivery: runtimeGitDeliveryPolicySchema,
+		reviewRequired: z.boolean(),
+		verificationRequired: z.boolean(),
+	}),
+	phase: runtimeCompletionPhaseSchema,
+	status: runtimeCompletionStatusSchema,
+	sessionIds: z.object({
+		implementation: z.string().nullable(),
+		review: z.string().nullable(),
+	}),
+	evidence: z.object({
+		reviewStatus: z.string().nullable(),
+		reviewOutcomeRef: z.string().nullable(),
+		verificationPassed: z.boolean().nullable(),
+		verificationRef: z.string().nullable(),
+		taskCommit: z.string().nullable(),
+		integratedCommit: z.string().nullable(),
+		remoteCommit: z.string().nullable(),
+		deliveryReceiptRef: z.string().nullable(),
+	}),
+	failureReason: z.string().nullable(),
+	cancelRequested: z.boolean(),
+	/** Bounded transition history (most recent last). */
+	history: z.array(runtimeCompletionPhaseEventSchema),
+	createdAt: z.number().int(),
+	updatedAt: z.number().int(),
+});
+export type RuntimeCompletionAttempt = z.infer<typeof runtimeCompletionAttemptSchema>;
+
+export const runtimeTaskCompletionRequestSchema = z.object({
+	taskId: z.string().min(1),
+});
+export type RuntimeTaskCompletionRequest = z.infer<typeof runtimeTaskCompletionRequestSchema>;
+
+export const runtimeTaskCompletionResponseSchema = z.object({
+	ok: z.boolean(),
+	attempt: runtimeCompletionAttemptSchema.nullable(),
+	error: z.string().nullable(),
+});
+export type RuntimeTaskCompletionResponse = z.infer<typeof runtimeTaskCompletionResponseSchema>;

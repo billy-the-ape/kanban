@@ -3,6 +3,7 @@ import { showAppToast } from "@/components/app-toaster";
 import { type UseGitHistoryDataResult, useGitHistoryData } from "@/components/git-history/use-git-history-data";
 import { buildTaskGitActionPrompt, type TaskGitAction } from "@/git-actions/build-task-git-action-prompt";
 import { isNativeClineAgentSelected } from "@/runtime/native-agent";
+import { fetchTaskCompletion, isUnfinishedReliableGitAttempt, runTaskCompletionToEnd } from "@/runtime/task-completion";
 import { getRuntimeTrpcClient } from "@/runtime/trpc-client";
 import type { RuntimeConfigResponse, RuntimeGitSyncAction, RuntimeTaskWorkspaceInfoResponse } from "@/runtime/types";
 import { findCardSelection } from "@/state/board-state";
@@ -247,56 +248,52 @@ export function useGitActions({
 					return false;
 				}
 
-				// B-8: when deterministic delivery is enabled, the application
-				// itself runs commit → integrate → push → verify → receipt. No
-				// model prompt is involved, so delivery works even when the
-				// model is unavailable. Both "commit" and "pr" actions route
-				// through it (PR follows the policy's requirePullRequest).
-				if (runtimeProjectConfig?.gitDeliveryPolicy?.enabled) {
+				// B-4/B-8: in reliable mode the backend completion coordinator runs
+				// review → verification → commit → integrate → push → verify and
+				// records every phase; no model prompt drives Git, so it works even
+				// when the model is unavailable. Both "commit" and "pr" route here
+				// (PR follows the policy's requirePullRequest). B-4.7: an attempt
+				// that already reached the Git phases also finishes here after
+				// reliable mode is turned off, never through the legacy prompt.
+				const reliableModeEnabled = runtimeProjectConfig?.gitDeliveryPolicy?.enabled === true;
+				const unfinishedReliableAttempt =
+					!reliableModeEnabled && currentProjectId
+						? isUnfinishedReliableGitAttempt(await fetchTaskCompletion(currentProjectId, taskId))
+						: false;
+				if (reliableModeEnabled || unfinishedReliableAttempt) {
 					if (!currentProjectId) {
 						showAppToast({
 							intent: "danger",
 							icon: "warning-sign",
-							message: "No active project; cannot run deterministic delivery.",
+							message: "No active project; cannot run reliable completion.",
 							timeout: 6000,
 						});
 						return false;
 					}
-					const trpcClient = getRuntimeTrpcClient(currentProjectId);
-					const payload = await trpcClient.runtime.startTaskDelivery.mutate({ taskId });
-					if (!payload.ok || !payload.receipt) {
-						showAppToast({
-							intent: "danger",
-							icon: "warning-sign",
-							message: payload.error ?? "Git delivery failed.",
-							timeout: 10000,
-						});
-						return false;
-					}
-					const receipt = payload.receipt;
-					if (receipt.status === "delivered" || receipt.status === "no_op") {
+					const response = await runTaskCompletionToEnd(currentProjectId, taskId);
+					const attempt = response.attempt;
+					if (response.ok && attempt?.status === "complete") {
 						showAppToast({
 							intent: "success",
 							icon: "tick",
-							message:
-								receipt.status === "no_op"
-									? "No changes to deliver; delivery recorded as a no-op."
-									: `Delivered to ${receipt.destinationBranch}${
-											receipt.remoteBranchSha ? ` on ${receipt.remote}` : ""
-										}.`,
+							message: attempt.evidence.remoteCommit
+								? `Delivered to ${attempt.targetRef ?? "the destination"} and verified on the remote.`
+								: "Completion finished; delivery recorded.",
 							timeout: 5000,
 						});
 						refreshGitHistory();
 						await refreshWorkspaceState();
 						return true;
 					}
-					// paused / failed: surface the resumable stage and evidence.
+					// blocked / failed / canceled: surface the resumable phase.
 					showAppToast({
 						intent: "warning",
 						icon: "warning-sign",
-						message: `Delivery ${receipt.status} at stage "${receipt.stage}": ${
-							payload.error ?? "see the delivery receipt."
-						}`,
+						message: attempt
+							? `Completion ${attempt.status} at ${attempt.phase}: ${
+									attempt.failureReason ?? response.error ?? "see the completion attempt."
+								}`
+							: (response.error ?? "Completion failed."),
 						timeout: 10000,
 					});
 					return false;

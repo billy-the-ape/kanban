@@ -88,6 +88,8 @@ export interface ClineReviewStartInput extends RuntimeTaskReviewStartRequest {
 export interface ClineReviewSessionService {
 	startTaskReview(input: ClineReviewStartInput): Promise<RuntimeTaskReviewStartResponse>;
 	getReviewInfo(taskId: string): Promise<RuntimeTaskReviewInfoResponse>;
+	/** B-4.6: stops a running review (and its repair sessions); the run then reports failed. */
+	cancelTaskReview(taskId: string): Promise<void>;
 	dispose(): Promise<void>;
 }
 
@@ -497,6 +499,15 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 			warnings,
 			verification: outcome?.verification ?? null,
 		};
+	}
+
+	async cancelTaskReview(taskId: string): Promise<void> {
+		const sessionId = reviewSessionIdForTask(taskId);
+		for (const summary of this.sessionService.listSummaries()) {
+			if (summary.state === "running" && summary.taskId.startsWith(sessionId)) {
+				await this.sessionService.stopTaskSession(summary.taskId).catch(() => null);
+			}
+		}
 	}
 
 	async dispose(): Promise<void> {

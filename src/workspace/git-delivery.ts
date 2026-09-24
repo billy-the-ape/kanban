@@ -40,6 +40,7 @@ import type {
 	RuntimeTaskDeliveryInfoResponse,
 	RuntimeTaskDeliveryStartResponse,
 	RuntimeTaskDependentsUnlock,
+	RuntimeVerificationReceipt,
 } from "../core/api-contract";
 import { runtimeGitDeliveryReceiptSchema } from "../core/api-contract";
 import { createGitProcessEnv } from "../core/git-process-env";
@@ -48,7 +49,12 @@ import { lockedFileSystem } from "../fs/locked-file-system";
 import { getTaskWorktreesHomePath, loadWorkspaceBoardById } from "../state/workspace-state";
 import { runGit } from "./git-utils";
 import { readTaskPreservationRecord } from "./task-preservation";
-import { computeCandidateTreeHash, readReviewHandoff, readReviewOutcome } from "./task-review-handoff";
+import {
+	computeCandidateTreeHash,
+	readReviewHandoff,
+	readReviewOutcome,
+	readVerificationReceipt,
+} from "./task-review-handoff";
 import { normalizeTaskIdForWorktreePath } from "./task-worktree-path";
 
 const execFileAsync = promisify(execFile);
@@ -143,6 +149,12 @@ export interface StartGitDeliveryInput {
 	gates?: GitDeliveryGates;
 	/** Optional model-supplied commit message (B-8.2). */
 	commitMessage?: string;
+	/**
+	 * B-7.6: checks the integrated result before it is pushed; returns why
+	 * delivery must pause (e.g. the integrated tree differs from the verified
+	 * one) or null to continue.
+	 */
+	verifyIntegrated?: (integration: { taskCommitSha: string; integratedSha: string }) => Promise<string | null>;
 }
 
 // --- receipt persistence (B-8.8) --------------------------------------------
@@ -655,13 +667,14 @@ export class GitDeliveryService {
 		const resumingPublication = reuseCommitSha !== null && reuseCommitSha === previous?.taskCommitSha;
 		const reviewOutcome = await readReviewOutcome(input.taskId).catch(() => null);
 		receipt.reviewOutcome = reviewOutcome ? (reviewOutcome.status === "ready" ? "ready" : "not_ready") : "absent";
-		receipt.verificationPassed = reviewOutcome?.verification?.passed ?? null;
+		const standaloneVerification = await readVerificationReceipt(input.taskId).catch(() => null);
+		receipt.verificationPassed = reviewOutcome?.verification?.passed ?? standaloneVerification?.passed ?? null;
 		receipt.candidateTreeHash = resumingPublication
 			? (previous?.candidateTreeHash ?? null)
 			: await this.computeTreeHash(input.worktreePath).catch(() => null);
 		const gateFailure = resumingPublication
 			? null
-			: this.evaluateGates(gates, reviewOutcome, receipt.candidateTreeHash);
+			: this.evaluateGates(gates, reviewOutcome, standaloneVerification, receipt.candidateTreeHash);
 		evidence(
 			"validated",
 			`worktree OK (HEAD ${shortSha(headSha)}); review: ${receipt.reviewOutcome}; verification passed: ${
@@ -771,6 +784,13 @@ export class GitDeliveryService {
 		}
 		receipt.integratedSha = integrated.integratedSha;
 		await checkpoint("integrated");
+		const integratedCheckFailure = await input.verifyIntegrated?.({
+			taskCommitSha,
+			integratedSha: integrated.integratedSha,
+		});
+		if (integratedCheckFailure) {
+			return await pauseHere("integrated", integratedCheckFailure);
+		}
 
 		// --- B-8.6/B-8.7: push an explicit refspec, then verify the remote --
 		if (!input.policy.pushRequired) {
@@ -844,29 +864,43 @@ export class GitDeliveryService {
 	private evaluateGates(
 		gates: GitDeliveryGates,
 		outcome: RuntimeReviewOutcomeFile | null,
+		standaloneVerification: RuntimeVerificationReceipt | null,
 		candidateTreeHash: string | null,
 	): string | null {
 		if (!gates.reviewRequired && !gates.verificationRequired) {
 			return null;
 		}
-		if (!outcome) {
-			return "Delivery requires a completed review/verification, but none was recorded for this task. Run the review first.";
+		const outcomeBound =
+			outcome !== null &&
+			candidateTreeHash !== null &&
+			(outcome.result?.candidateTreeHash ?? null) === candidateTreeHash;
+		if (gates.reviewRequired) {
+			if (!outcome) {
+				return "Delivery requires a completed review, but none was recorded for this task. Run the review first.";
+			}
+			if (!outcomeBound) {
+				return "The task changed after its review (candidate tree mismatch); re-run the review before delivery.";
+			}
+			if (outcome.status !== "ready") {
+				return `Delivery requires a "ready" review, but the latest review is "${outcome.status}"${
+					outcome.error ? `: ${outcome.error}` : "."
+				}`;
+			}
 		}
-		const boundTreeHash = outcome.result?.candidateTreeHash ?? null;
-		if (candidateTreeHash === null || boundTreeHash === null || boundTreeHash !== candidateTreeHash) {
-			return "The task changed after its review/verification (candidate tree mismatch); re-run the review before delivery.";
-		}
-		if (gates.reviewRequired && outcome.status !== "ready") {
-			return `Delivery requires a "ready" review, but the latest review is "${outcome.status}"${
-				outcome.error ? `: ${outcome.error}` : "."
-			}`;
-		}
-		if (gates.verificationRequired && outcome.verification?.passed !== true) {
-			return `Delivery requires passing verification checks${
-				outcome.verification?.error
-					? `: ${outcome.verification.error}`
-					: ", but no passing verification receipt was recorded."
-			}`;
+		if (gates.verificationRequired) {
+			// Evidence is the review's receipt, or a standalone run (review off),
+			// either way bound to the exact candidate tree.
+			const reviewReceiptPassed = outcomeBound && outcome?.verification?.passed === true;
+			const standalonePassed =
+				standaloneVerification?.passed === true &&
+				candidateTreeHash !== null &&
+				standaloneVerification.treeHashBefore === candidateTreeHash;
+			if (!reviewReceiptPassed && !standalonePassed) {
+				const failure = outcomeBound ? outcome?.verification?.error : standaloneVerification?.error;
+				return `Delivery requires passing verification checks on the current tree${
+					failure ? `: ${failure}` : "; none were recorded for it. Run verification (or the review) first."
+				}`;
+			}
 		}
 		return null;
 	}

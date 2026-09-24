@@ -76,6 +76,8 @@ import type {
 	RuntimeTaskChatReloadResponse,
 	RuntimeTaskChatSendRequest,
 	RuntimeTaskChatSendResponse,
+	RuntimeTaskCompletionRequest,
+	RuntimeTaskCompletionResponse,
 	RuntimeTaskDeliveryInfoRequest,
 	RuntimeTaskDeliveryInfoResponse,
 	RuntimeTaskDeliveryStartRequest,
@@ -180,6 +182,8 @@ import {
 	runtimeTaskChatReloadResponseSchema,
 	runtimeTaskChatSendRequestSchema,
 	runtimeTaskChatSendResponseSchema,
+	runtimeTaskCompletionRequestSchema,
+	runtimeTaskCompletionResponseSchema,
 	runtimeTaskDeliveryInfoRequestSchema,
 	runtimeTaskDeliveryInfoResponseSchema,
 	runtimeTaskDeliveryStartRequestSchema,
@@ -260,6 +264,18 @@ export interface RuntimeTrpcContext {
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskDeliveryInfoRequest,
 		) => Promise<RuntimeTaskDeliveryInfoResponse>;
+		startTaskCompletion: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskCompletionRequest,
+		) => Promise<RuntimeTaskCompletionResponse>;
+		getTaskCompletion: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskCompletionRequest,
+		) => Promise<RuntimeTaskCompletionResponse>;
+		cancelTaskCompletion: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskCompletionRequest,
+		) => Promise<RuntimeTaskCompletionResponse>;
 		stopTaskSession: (
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskSessionStopRequest,
@@ -538,6 +554,26 @@ export const runtimeAppRouter = t.router({
 			.output(runtimeTaskDeliveryInfoResponseSchema)
 			.query(async ({ ctx, input }) => {
 				return await ctx.runtimeApi.getTaskDeliveryInfo(ctx.workspaceScope, input);
+			}),
+		// B-4: durable, idempotent completion attempts (review → verification →
+		// commit → integrate → push → remote verification), owned by the backend.
+		startTaskCompletion: workspaceProcedure
+			.input(runtimeTaskCompletionRequestSchema)
+			.output(runtimeTaskCompletionResponseSchema)
+			.mutation(async ({ ctx, input }) => {
+				return await ctx.runtimeApi.startTaskCompletion(ctx.workspaceScope, input);
+			}),
+		getTaskCompletion: workspaceProcedure
+			.input(runtimeTaskCompletionRequestSchema)
+			.output(runtimeTaskCompletionResponseSchema)
+			.query(async ({ ctx, input }) => {
+				return await ctx.runtimeApi.getTaskCompletion(ctx.workspaceScope, input);
+			}),
+		cancelTaskCompletion: workspaceProcedure
+			.input(runtimeTaskCompletionRequestSchema)
+			.output(runtimeTaskCompletionResponseSchema)
+			.mutation(async ({ ctx, input }) => {
+				return await ctx.runtimeApi.cancelTaskCompletion(ctx.workspaceScope, input);
 			}),
 		stopTaskSession: workspaceProcedure
 			.input(runtimeTaskSessionStopRequestSchema)

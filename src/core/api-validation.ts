@@ -23,6 +23,7 @@ import {
 	type RuntimeTaskChatMessagesRequest,
 	type RuntimeTaskChatReloadRequest,
 	type RuntimeTaskChatSendRequest,
+	type RuntimeTaskCompletionRequest,
 	type RuntimeTaskDeliveryInfoRequest,
 	type RuntimeTaskDeliveryStartRequest,
 	type RuntimeTaskPreservationRequest,
@@ -60,6 +61,7 @@ import {
 	runtimeTaskChatMessagesRequestSchema,
 	runtimeTaskChatReloadRequestSchema,
 	runtimeTaskChatSendRequestSchema,
+	runtimeTaskCompletionRequestSchema,
 	runtimeTaskDeliveryInfoRequestSchema,
 	runtimeTaskDeliveryStartRequestSchema,
 	runtimeTaskPreservationRequestSchema,
@@ -336,6 +338,15 @@ export function parseTaskDeliveryInfoRequest(value: unknown): RuntimeTaskDeliver
 	return {
 		taskId,
 	};
+}
+
+export function parseTaskCompletionRequest(value: unknown): RuntimeTaskCompletionRequest {
+	const parsed = parseWithSchema(runtimeTaskCompletionRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Task completion taskId cannot be empty.");
+	}
+	return { taskId };
 }
 
 export function parseTaskChatMessagesRequest(value: unknown): RuntimeTaskChatMessagesRequest {

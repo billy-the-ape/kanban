@@ -42,6 +42,7 @@ import {
 	validateSession,
 } from "../security/passcode-manager";
 import { loadWorkspaceContextById } from "../state/workspace-state";
+import { createTaskCompletionCoordinator } from "../task-completion/create-task-completion-coordinator";
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { createTerminalWebSocketBridge } from "../terminal/ws-server";
 import { type RuntimeTrpcContext, type RuntimeTrpcWorkspaceScope, runtimeAppRouter } from "../trpc/app-router";
@@ -216,6 +217,14 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		}
 		return bundle.reviewService;
 	};
+	// B-4: one backend completion coordinator for the runtime (it keys attempts
+	// by workspace + task and owns their in-process execution).
+	const completionCoordinator = createTaskCompletionCoordinator({
+		loadScopedRuntimeConfig: deps.workspaceRegistry.loadScopedRuntimeConfig,
+		getScopedReviewSessionService,
+		getScopedClineTaskSessionService,
+		getScopedTerminalManager,
+	});
 	const disposeReviewSessionServiceAsync = async (workspaceId: string): Promise<void> => {
 		const bundle = reviewSessionServiceByWorkspaceId.get(workspaceId);
 		if (!bundle) {
@@ -269,6 +278,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				getScopedTerminalManager,
 				getScopedClineTaskSessionService,
 				getScopedReviewSessionService,
+				completionCoordinator,
 				resolveInteractiveShellCommand: deps.resolveInteractiveShellCommand,
 				runCommand: deps.runCommand,
 				broadcastClineMcpAuthStatusesUpdated: deps.runtimeStateHub.broadcastClineMcpAuthStatusesUpdated,
@@ -559,7 +569,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 	}
 	// B-5.7/B-5.9: background maintenance; close() waits for it so no git
 	// subprocess outlives the server.
-	const startupMaintenance = runStartupTaskWorkspaceMaintenance(deps.warn);
+	const startupMaintenance = runStartupTaskWorkspaceMaintenance(deps.warn, completionCoordinator);
 	const activeWorkspaceId = deps.workspaceRegistry.getActiveWorkspaceId();
 	const url = activeWorkspaceId
 		? buildKanbanRuntimeUrl(`/${encodeURIComponent(activeWorkspaceId)}`)

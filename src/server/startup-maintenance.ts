@@ -1,21 +1,34 @@
 import { listWorkspaceIndexEntries, loadWorkspaceBoardById } from "../state/workspace-state";
+import type { TaskCompletionCoordinator } from "../task-completion/completion-coordinator";
 import { readTaskDeliveryReceipt } from "../workspace/git-delivery";
 import { runTaskWorkspaceMaintenance } from "../workspace/task-workspace-maintenance";
 
 /**
- * B-5.7/B-5.9: at runtime startup, run workspace maintenance for every indexed
+ * B-4.5/B-5.7/B-5.9: at runtime startup, settle completion attempts a restart
+ * interrupted, then run workspace maintenance for every indexed
  * project — retry cleanups a crash or restart left behind, dispose delivered
  * Done worktrees, and apply preservation retention. No agent session is
  * running yet, so there is no active writer to wait for. Failures are
  * reported, never fatal.
  */
-export async function runStartupTaskWorkspaceMaintenance(warn: (message: string) => void): Promise<void> {
+export async function runStartupTaskWorkspaceMaintenance(
+	warn: (message: string) => void,
+	completionCoordinator?: TaskCompletionCoordinator,
+): Promise<void> {
 	const entries = await listWorkspaceIndexEntries().catch(() => []);
 	for (const entry of entries) {
 		try {
+			const board = await loadWorkspaceBoardById(entry.workspaceId);
+			// B-4.5: no completion attempt can still be running after a restart.
+			const taskIds = board.columns.flatMap((column) => column.cards.map((card) => card.id));
+			for (const attempt of (await completionCoordinator?.reconcileAfterRestart(taskIds)) ?? []) {
+				warn(
+					`Task "${attempt.taskId}" completion attempt reconciled after restart: ${attempt.status} at ${attempt.phase}.`,
+				);
+			}
 			const report = await runTaskWorkspaceMaintenance({
 				repoPath: entry.repoPath,
-				board: await loadWorkspaceBoardById(entry.workspaceId),
+				board,
 				readDeliveryReceipt: readTaskDeliveryReceipt,
 			});
 			for (const blocked of report.blockedCleanups) {
