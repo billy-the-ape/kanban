@@ -1342,6 +1342,8 @@ export const runtimeTaskDispatchStatusResponseSchema = z.object({
 	workerLimit: z.number().int().min(1).max(4),
 	/** Task id currently holding a worker slot (null when free). */
 	activeWorkerTaskId: z.string().nullable(),
+	/** B-11.2: every task id currently holding a worker slot (review/repair sessions count). */
+	activeWorkerTaskIds: z.array(z.string()),
 	readyTasks: z.array(runtimeTaskDispatchTaskViewSchema),
 	blockedTasks: z.array(runtimeTaskDispatchTaskViewSchema),
 	records: z.array(runtimeTaskDispatchRecordSchema),
@@ -1406,6 +1408,11 @@ export const runtimeGitDeliveryReceiptSchema = z.object({
 	verificationPassed: z.boolean().nullable(),
 	/** B-7.6: content hash of the candidate tree that was committed (null when not computed). */
 	candidateTreeHash: z.string().nullable().default(null),
+	/**
+	 * B-11.5: combined verification of the integrated tree (null when not run —
+	 * the fast path integrates without merging in parallel work).
+	 */
+	combinedVerificationPassed: z.boolean().nullable().default(null),
 	pr: z
 		.object({
 			status: runtimeGitDeliveryPrStatusSchema,

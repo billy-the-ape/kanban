@@ -82,6 +82,7 @@ import {
 } from "../task-dispatch/task-dispatch-service";
 import { buildRuntimeConfigResponse, resolveAgentCommand } from "../terminal/agent-registry";
 import type { TerminalSessionManager } from "../terminal/session-manager";
+import { createVerificationRunner } from "../verification/verification-service";
 import { evaluateDependentsUnlock, getGitDeliveryService, readTaskDeliveryReceipt } from "../workspace/git-delivery";
 import { findTaskBaseRef } from "../workspace/task-review-handoff";
 import { getTaskPreservationInfo, recoverTaskWorktree, resolveTaskCwd } from "../workspace/task-worktree";
@@ -200,6 +201,12 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			listClineSummaries: async () => {
 				const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
 				return clineTaskSessionService.listSummaries();
+			},
+			// B-11.2: review/repair sessions hold model worker slots too; a missing
+			// binding (partial test harness) simply means no review sessions.
+			listReviewSessionSummaries: async () => {
+				const reviewSessionService = await deps.getScopedReviewSessionService?.(workspaceScope);
+				return reviewSessionService?.listSessionSummaries() ?? [];
 			},
 			readReceipt: (taskId) => readTaskDeliveryReceipt(taskId),
 			startSession: async ({ taskId, baseRef, prompt, taskTitle }) => {
@@ -818,6 +825,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				const body = parseTaskDeliveryStartRequest(input);
 				const scopedRuntimeConfig = await deps.loadScopedRuntimeConfig(workspaceScope);
 				const policy = scopedRuntimeConfig.gitDeliveryPolicy;
+				const verificationConfig = scopedRuntimeConfig.verification;
 				if (!policy?.enabled) {
 					return {
 						ok: false,
@@ -863,6 +871,19 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 							verificationRequired: scopedRuntimeConfig.verification?.enabled === "required",
 						},
 						commitMessage: body.commitMessage,
+						// B-11.5: rerun the required checks against the combined tree
+						// once parallel work has been integrated (diverged path only).
+						runCombinedVerification:
+							verificationConfig?.enabled === "required" && verificationConfig.checks.length > 0
+								? async ({ taskId, worktreePath, candidateTreeHash }) => {
+										const receipt = await createVerificationRunner().run(verificationConfig, {
+											taskId,
+											worktreePath,
+											candidateTreeHash,
+										});
+										return { passed: receipt.passed, error: receipt.error };
+									}
+								: undefined,
 					})
 					.then(async (response) => {
 						// B-9.2: a durable delivery receipt is the only thing that unlocks

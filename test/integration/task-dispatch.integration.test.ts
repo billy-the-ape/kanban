@@ -92,6 +92,7 @@ async function writeSimulatedReceipt(
 		reviewOutcome: null,
 		verificationPassed: null,
 		candidateTreeHash: null,
+		combinedVerificationPassed: null,
 		pr: null,
 		evidence: [],
 		attempt: 1,
@@ -313,5 +314,204 @@ describe("B-9 task dispatch integration (linear chain, restart, failed delivery)
 		const record = await readTaskDispatchRecord("t3");
 		expect(record?.status).toBe("dispatched");
 		expect(record?.baseSha).toBe(t2Sha);
+	});
+});
+
+function seedParallelBoard(): RuntimeBoardData {
+	const now = Date.now();
+	const card = (id: string): RuntimeBoardCard => ({
+		id,
+		title: id,
+		prompt: `Do the work for ${id}`,
+		startInPlanMode: false,
+		baseRef: "main",
+		createdAt: now,
+		updatedAt: now,
+	});
+	return {
+		columns: [
+			{ id: "backlog", title: "Backlog", cards: [card("t2"), card("t3")] },
+			{ id: "in_progress", title: "In Progress", cards: [] },
+			{ id: "review", title: "Review", cards: [] },
+			{ id: "done", title: "Done", cards: [card("t1")] },
+			{ id: "trash", title: "Trash", cards: [] },
+		],
+		// t2 and t3 are independent: both depend only on the delivered t1.
+		dependencies: [
+			{ id: "dep-t2-t1", fromTaskId: "t2", toTaskId: "t1", createdAt: now },
+			{ id: "dep-t3-t1", fromTaskId: "t3", toTaskId: "t1", createdAt: now },
+		],
+	};
+}
+
+// B-11 integration: two independent tasks forked from one delivered base run
+// in parallel under a shared budget of 2, both branches land on main (simulated
+// with the same cherry-pick integration the B-8/B-11 pipeline performs against
+// a diverged destination), and the dependent task dispatches at a base
+// containing both integrated results.
+describe("B-11 task dispatch integration (parallel branches, shared budget)", () => {
+	let previousHomeB11: string | undefined;
+	let previousUserProfileB11: string | undefined;
+	let home: { path: string; cleanup: () => void };
+	let repo: { path: string; cleanup: () => void };
+	let repoPath: string;
+	let workspaceId: string;
+	let baseSha: string;
+	const parallelRun: SessionProbe = { started: [] };
+
+	beforeAll(async () => {
+		previousHomeB11 = process.env.HOME;
+		previousUserProfileB11 = process.env.USERPROFILE;
+		home = createTempDir("kanban-b11-home-");
+		repo = createTempDir("kanban-b11-repo-");
+		process.env.HOME = home.path;
+		process.env.USERPROFILE = home.path;
+		repoPath = repo.path;
+		runGit(repoPath, ["init"]);
+		runGit(repoPath, ["branch", "-m", "main"]);
+		await writeFile(join(repoPath, "README.md"), "# repo\n");
+		runGit(repoPath, ["add", "."]);
+		runGit(repoPath, ["commit", "-m", "initial"]);
+		await writeFile(join(repoPath, "a.txt"), "a\n");
+		runGit(repoPath, ["add", "."]);
+		runGit(repoPath, ["commit", "-m", "t1 work"]);
+		baseSha = runGit(repoPath, ["rev-parse", "HEAD"]);
+
+		const context = await loadWorkspaceContext(repoPath);
+		workspaceId = context.workspaceId;
+		await updateRuntimeConfig(repoPath, {
+			taskDispatchPolicy: { enabled: true, workerLimit: 2 },
+		});
+		await mutateWorkspaceState<void>(repoPath, () => ({
+			board: seedParallelBoard(),
+			value: undefined,
+		}));
+	});
+
+	afterAll(() => {
+		if (previousHomeB11 === undefined) {
+			delete process.env.HOME;
+		} else {
+			process.env.HOME = previousHomeB11;
+		}
+		if (previousUserProfileB11 === undefined) {
+			delete process.env.USERPROFILE;
+		} else {
+			process.env.USERPROFILE = previousUserProfileB11;
+		}
+		home.cleanup();
+		repo.cleanup();
+	});
+
+	it("dispatches both independent tasks in one pass under the shared budget", async () => {
+		await writeSimulatedReceipt(workspaceId, "t1", "delivered", baseSha);
+		const response = await dispatchReadyTasks(buildDeps(workspaceId, repoPath, parallelRun));
+		expect(response.dispatchedTaskId).toBe("t2");
+		expect(response.skippedReason).toBeNull();
+		expect(parallelRun.started.map((session) => session.taskId)).toEqual(["t2", "t3"]);
+
+		const board = await loadWorkspaceBoardById(workspaceId);
+		expect(columnIdOf(board, "t2")).toBe("in_progress");
+		expect(columnIdOf(board, "t3")).toBe("in_progress");
+
+		// Real git: both worktrees are created at the verified fork point.
+		for (const taskId of ["t2", "t3"]) {
+			const worktree = await resolveTaskCwd({
+				cwd: repoPath,
+				taskId,
+				baseRef: "main",
+				ensure: false,
+			});
+			expect(runGit(worktree, ["rev-parse", "HEAD"])).toBe(baseSha);
+		}
+	});
+
+	it("integrates both branches and dispatches the dependent task at a base containing both", async () => {
+		// Simulate the agents' work in each task worktree...
+		const t2Worktree = await resolveTaskCwd({
+			cwd: repoPath,
+			taskId: "t2",
+			baseRef: "main",
+			ensure: false,
+		});
+		await writeFile(join(t2Worktree, "b.txt"), "b\n");
+		runGit(t2Worktree, ["add", "."]);
+		runGit(t2Worktree, ["commit", "-m", "t2 work"]);
+		const t2TaskSha = runGit(t2Worktree, ["rev-parse", "HEAD"]);
+		// ...and the B-8/B-11 pipeline's cherry-pick integration into the
+		// destination branch (main has diverged: both tasks forked from baseSha).
+		runGit(repoPath, ["cherry-pick", t2TaskSha]);
+		const t2IntegratedSha = runGit(repoPath, ["rev-parse", "HEAD"]);
+		await writeSimulatedReceipt(workspaceId, "t2", "delivered", t2IntegratedSha);
+
+		const t3Worktree = await resolveTaskCwd({
+			cwd: repoPath,
+			taskId: "t3",
+			baseRef: "main",
+			ensure: false,
+		});
+		await writeFile(join(t3Worktree, "c.txt"), "c\n");
+		runGit(t3Worktree, ["add", "."]);
+		runGit(t3Worktree, ["commit", "-m", "t3 work"]);
+		const t3TaskSha = runGit(t3Worktree, ["rev-parse", "HEAD"]);
+		runGit(repoPath, ["cherry-pick", t3TaskSha]);
+		const t3IntegratedSha = runGit(repoPath, ["rev-parse", "HEAD"]);
+		await writeSimulatedReceipt(workspaceId, "t3", "delivered", t3IntegratedSha);
+
+		await moveToColumn(repoPath, "t2", "done");
+		await moveToColumn(repoPath, "t3", "done");
+
+		// t4 depends on both parallel branches.
+		await mutateWorkspaceState<void>(repoPath, (state) => {
+			const now = Date.now();
+			const card: RuntimeBoardCard = {
+				id: "t4",
+				title: "t4",
+				prompt: "Build on t2 and t3",
+				startInPlanMode: false,
+				baseRef: "main",
+				createdAt: now,
+				updatedAt: now,
+			};
+			const board = state.board;
+			const backlog = board.columns.find((column) => column.id === "backlog");
+			if (backlog) {
+				backlog.cards.push(card);
+			}
+			board.dependencies.push(
+				{ id: "dep-t4-t2", fromTaskId: "t4", toTaskId: "t2", createdAt: now },
+				{ id: "dep-t4-t3", fromTaskId: "t4", toTaskId: "t3", createdAt: now },
+			);
+			return { board, value: undefined };
+		});
+
+		const response = await dispatchReadyTasks(buildDeps(workspaceId, repoPath, parallelRun));
+		expect(response.dispatchedTaskId).toBe("t4");
+		expect(parallelRun.started.map((session) => session.taskId)).toEqual(["t2", "t3", "t4"]);
+
+		const board = await loadWorkspaceBoardById(workspaceId);
+		expect(columnIdOf(board, "t4")).toBe("in_progress");
+
+		// The dependent task's worktree sits on a base that contains both
+		// integrated parallel results (base-SHA ancestry verified against both).
+		const t4Worktree = await resolveTaskCwd({
+			cwd: repoPath,
+			taskId: "t4",
+			baseRef: "main",
+			ensure: false,
+		});
+		const t4Head = runGit(t4Worktree, ["rev-parse", "HEAD"]);
+		expect(gitIsAncestor(t4Worktree, t2IntegratedSha, t4Head)).toBe(true);
+		expect(gitIsAncestor(t4Worktree, t3IntegratedSha, t4Head)).toBe(true);
+		const record = await readTaskDispatchRecord("t4");
+		expect(record?.status).toBe("dispatched");
+		expect(record?.baseSha).toBe(t3IntegratedSha);
+
+		// Both parallel results are on main, and both are referenced in the
+		// dependent task's fresh-context prompt.
+		expect(runGit(repoPath, ["show", "HEAD:b.txt"])).toBe("b");
+		expect(runGit(repoPath, ["show", "HEAD:c.txt"])).toBe("c");
+		expect(parallelRun.started[2]?.prompt).toContain(t2IntegratedSha);
+		expect(parallelRun.started[2]?.prompt).toContain(t3IntegratedSha);
 	});
 });

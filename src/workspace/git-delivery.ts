@@ -60,6 +60,8 @@ const DELIVERY_ARTIFACTS_DIR_NAME = "delivery";
 const DELIVERY_RECEIPT_FILENAME = "receipt.json";
 const DELIVERY_COMMIT_REF_PREFIX = "refs/kanban/delivery/";
 const DELIVERY_REMOTE_TRACKING_REF_PREFIX = "refs/kanban/delivery-remotes/";
+/** B-11.4: home for the disposable clean integration worktrees. */
+const INTEGRATION_WORKTREES_DIR_NAME = "kanban-integration";
 
 export interface GitDeliveryCommandResult {
 	ok: boolean;
@@ -143,6 +145,31 @@ export interface StartGitDeliveryInput {
 	gates?: GitDeliveryGates;
 	/** Optional model-supplied commit message (B-8.2). */
 	commitMessage?: string;
+	/**
+	 * B-11.5: rerun the required checks against the combined tree once parallel
+	 * work has been integrated, before the destination ref advances. Only the
+	 * diverged integration path invokes this; fast-path integrations reuse the
+	 * review-phase verification receipt (the combined tree equals the candidate).
+	 */
+	runCombinedVerification?: (
+		input: GitDeliveryCombinedVerificationInput,
+	) => Promise<GitDeliveryCombinedVerificationResult>;
+}
+
+/** B-11.5: the combined tree a diverged integration produced, for re-verification. */
+export interface GitDeliveryCombinedVerificationInput {
+	/** The task whose delivery is integrating (log artifact placement). */
+	taskId: string;
+	/** The clean integration worktree holding the combined tree. */
+	worktreePath: string;
+	/** Content hash of the combined tree (null when uncomputable). */
+	candidateTreeHash: string | null;
+}
+
+/** B-11.5: a failing combined verification blocks the destination ref advance. */
+export interface GitDeliveryCombinedVerificationResult {
+	passed: boolean;
+	error: string | null;
 }
 
 // --- receipt persistence (B-8.8) --------------------------------------------
@@ -507,6 +534,7 @@ export class GitDeliveryService {
 			reviewOutcome: null,
 			verificationPassed: null,
 			candidateTreeHash: null,
+			combinedVerificationPassed: null,
 			pr: { status: "not_required", number: null, url: null, error: null },
 			evidence: [],
 			attempt: (previous?.attempt ?? 0) + 1,
@@ -765,11 +793,15 @@ export class GitDeliveryService {
 			evidence,
 		});
 		if (!integrated.ok) {
+			if (integrated.combinedVerificationPassed !== undefined) {
+				receipt.combinedVerificationPassed = integrated.combinedVerificationPassed;
+			}
 			return integrated.paused
 				? await pauseHere("committed", integrated.detail)
 				: await fail("committed", integrated.detail);
 		}
 		receipt.integratedSha = integrated.integratedSha;
+		receipt.combinedVerificationPassed = integrated.combinedVerificationPassed;
 		await checkpoint("integrated");
 
 		// --- B-8.6/B-8.7: push an explicit refspec, then verify the remote --
@@ -874,7 +906,10 @@ export class GitDeliveryService {
 	/**
 	 * B-8.4/B-8.5: integrate the task commit onto the destination. Returns the
 	 * destination sha after integration, or why it must pause/fail. Never
-	 * force-updates, resets, stashes, or resolves conflicts.
+	 * force-updates, resets, stashes, or resolves conflicts. When the destination
+	 * advanced past the task's recorded base (B-11.4: parallel integration
+	 * happened first), the merge happens in a dedicated clean worktree instead
+	 * of the user's checkout, with combined verification before the ref advance.
 	 */
 	private async integrate(options: {
 		input: StartGitDeliveryInput;
@@ -886,7 +921,19 @@ export class GitDeliveryService {
 		previous: RuntimeGitDeliveryReceipt | null;
 		worktreeEntries: WorktreeListEntry[];
 		evidence: EvidenceRecorder;
-	}): Promise<{ ok: true; integratedSha: string } | { ok: false; paused: boolean; detail: string }> {
+	}): Promise<
+		| {
+				ok: true;
+				integratedSha: string;
+				combinedVerificationPassed: boolean | null;
+		  }
+		| {
+				ok: false;
+				paused: boolean;
+				detail: string;
+				combinedVerificationPassed?: boolean;
+		  }
+	> {
 		const { input, destinationBranch, destRef, destSha, taskCommitSha, requiredBaseSha, previous, evidence } =
 			options;
 		const repoPath = input.repoPath;
@@ -897,7 +944,11 @@ export class GitDeliveryService {
 				"integrated",
 				`destination ${shortSha(destSha)} already contains task commit ${shortSha(taskCommitSha)}; integration skipped`,
 			);
-			return { ok: true, integratedSha: destSha };
+			return {
+				ok: true,
+				integratedSha: destSha,
+				combinedVerificationPassed: null,
+			};
 		}
 		const isMerge = input.policy.integrationStrategy === "merge";
 		const destIsAncestor = await this.isAncestorOf(repoPath, destSha, taskCommitSha);
@@ -910,6 +961,25 @@ export class GitDeliveryService {
 			previous.taskCommitSha !== null &&
 			(await this.isAncestorOf(repoPath, previous.taskCommitSha, taskCommitSha));
 		const baseMatches = requiredBaseSha === null || destSha === requiredBaseSha || destIsAncestor;
+		// B-11.4: the destination advanced from the task's recorded base (parallel
+		// work integrated first) and is not otherwise related to the task commit →
+		// integrate in a clean worktree rather than pausing.
+		const destAdvancedFromRecordedBase =
+			!destIsAncestor &&
+			requiredBaseSha !== null &&
+			destSha !== requiredBaseSha &&
+			(await this.isAncestorOf(repoPath, requiredBaseSha, destSha));
+		if (destAdvancedFromRecordedBase) {
+			return await this.integrateDivergedDestination({
+				input,
+				destinationBranch,
+				destRef,
+				destSha,
+				taskCommitSha,
+				worktreeEntries: options.worktreeEntries,
+				evidence,
+			});
+		}
 		if (!(destIsAncestor || mergeFollowUp) || !baseMatches) {
 			return {
 				ok: false,
@@ -958,7 +1028,11 @@ export class GitDeliveryService {
 				"integrated",
 				`integrated ${shortSha(taskCommitSha)} onto ${destinationBranch} at ${shortSha(headAfter)}`,
 			);
-			return { ok: true, integratedSha: headAfter };
+			return {
+				ok: true,
+				integratedSha: headAfter,
+				combinedVerificationPassed: null,
+			};
 		}
 
 		let newDestSha = taskCommitSha;
@@ -1006,7 +1080,205 @@ export class GitDeliveryService {
 			"integrated",
 			`integrated ${shortSha(taskCommitSha)} onto ${destinationBranch} at ${shortSha(newDestSha)}`,
 		);
-		return { ok: true, integratedSha: newDestSha };
+		return {
+			ok: true,
+			integratedSha: newDestSha,
+			combinedVerificationPassed: null,
+		};
+	}
+
+	/**
+	 * B-11.4: the destination advanced from the task's recorded base — parallel
+	 * integration happened first, so the destination's current tip must be
+	 * combined with the task commit. That combination runs in a dedicated,
+	 * disposable, clean integration worktree (never the user's checkout):
+	 *
+	 * - `merge` strategy: `git merge --no-ff <taskCommit>`;
+	 * - `fast_forward` strategy: `git cherry-pick <taskCommit>`;
+	 * - a conflict aborts the step and pauses delivery with the conflict as a
+	 *   bounded operator action (no files are auto-resolved, nothing is pushed);
+	 * - B-11.5: an optional combined verification runs against the integrated
+	 *   tree BEFORE the destination ref advances; a failure pauses delivery;
+	 * - success advances the ref atomically: `update-ref` with expected-old, or
+	 *   a `--ff-only` merge when the destination is checked out in a clean
+	 *   worktree (keeping that checkout consistent);
+	 * - the integration worktree is always removed, even on failure.
+	 */
+	private async integrateDivergedDestination(options: {
+		input: StartGitDeliveryInput;
+		destinationBranch: string;
+		destRef: string;
+		destSha: string;
+		taskCommitSha: string;
+		worktreeEntries: WorktreeListEntry[];
+		evidence: EvidenceRecorder;
+	}): Promise<
+		| {
+				ok: true;
+				integratedSha: string;
+				combinedVerificationPassed: boolean | null;
+		  }
+		| {
+				ok: false;
+				paused: boolean;
+				detail: string;
+				combinedVerificationPassed?: boolean;
+		  }
+	> {
+		const { input, destinationBranch, destRef, destSha, taskCommitSha, worktreeEntries, evidence } = options;
+		const repoPath = input.repoPath;
+		const isMerge = input.policy.integrationStrategy === "merge";
+		const strategyLabel = isMerge ? "merge" : "cherry-pick";
+
+		// B-11.4: never advance the branch underneath a dirty checkout.
+		const destWorktree = worktreeEntries.find((entry) => entry.branch === destRef);
+		if (destWorktree) {
+			const cleanResult = await this.git.run(destWorktree.path, ["status", "--porcelain"]);
+			if (!cleanResult.ok || cleanResult.stdout.trim() !== "") {
+				return {
+					ok: false,
+					paused: true,
+					detail: `Destination "${destinationBranch}" is checked out at ${destWorktree.path} with uncommitted changes; commit or stash them in that worktree, then retry delivery. The branch was not advanced.`,
+				};
+			}
+		}
+
+		const worktreePath = this.integrationWorktreePath(repoPath, destinationBranch);
+		// A crashed run may leave a stale worktree; it is pipeline-owned (never
+		// user data), so remove it before recreating.
+		await this.removeIntegrationWorktree(repoPath, worktreePath);
+		const addResult = await this.git.run(repoPath, ["worktree", "add", "--detach", worktreePath, destSha]);
+		if (!addResult.ok) {
+			return {
+				ok: false,
+				paused: false,
+				detail: `Could not create the clean integration worktree at ${worktreePath}: ${
+					addResult.stderr || "git worktree add failed."
+				}`,
+			};
+		}
+		try {
+			const opArgs = isMerge ? ["merge", "--no-ff", "--no-edit", taskCommitSha] : ["cherry-pick", taskCommitSha];
+			const opResult = await this.git.run(worktreePath, opArgs);
+			if (!opResult.ok) {
+				await this.abortIntegrationStep(worktreePath, isMerge);
+				evidence(
+					"integrated",
+					`integration conflict combining ${shortSha(taskCommitSha)} with the advanced ${destinationBranch} ${shortSha(
+						destSha,
+					)}; the integration worktree was aborted and removed`,
+				);
+				return {
+					ok: false,
+					paused: true,
+					detail: `Integrating ${shortSha(taskCommitSha)} into "${destinationBranch}" (now at ${shortSha(
+						destSha,
+					)}) hit a conflict (${strategyLabel}). Resolve the conflict as an explicit operator action — e.g. in a normal checkout — then retry delivery. No files were auto-resolved and the branch was not advanced.`,
+				};
+			}
+			const resultShaResult = await this.git.run(worktreePath, ["rev-parse", "HEAD"]);
+			if (!resultShaResult.ok || !resultShaResult.stdout) {
+				return {
+					ok: false,
+					paused: false,
+					detail: "Integration finished but the new destination sha could not be read.",
+				};
+			}
+			const resultSha = resultShaResult.stdout;
+
+			// B-11.5: rerun the required checks against the combined tree before
+			// the destination ref advances.
+			let combinedVerificationPassed: boolean | null = null;
+			const runCombinedVerification = input.runCombinedVerification;
+			if (runCombinedVerification) {
+				const treeHashResult = await this.git.run(worktreePath, ["rev-parse", "HEAD^{tree}"]);
+				const candidateTreeHash = treeHashResult.ok ? treeHashResult.stdout : null;
+				let verification: GitDeliveryCombinedVerificationResult;
+				try {
+					verification = await runCombinedVerification({
+						taskId: input.taskId,
+						worktreePath,
+						candidateTreeHash,
+					});
+				} catch (error) {
+					verification = {
+						passed: false,
+						error: error instanceof Error ? error.message : String(error),
+					};
+				}
+				combinedVerificationPassed = verification.passed;
+				if (!verification.passed) {
+					evidence(
+						"integrated",
+						`combined verification of the integrated tree failed; destination not advanced: ${(
+							verification.error ?? "one or more required checks failed"
+						).slice(0, DELIVERY_ERROR_DETAIL_MAX_CHARS)}`,
+					);
+					return {
+						ok: false,
+						paused: true,
+						combinedVerificationPassed: false,
+						detail: `Combined verification of the integrated tree failed${
+							verification.error ? `: ${verification.error}` : ""
+						}. "${destinationBranch}" was not advanced; fix the failing checks (the combined change set needs review) and retry delivery.`,
+					};
+				}
+				evidence("integrated", "combined verification of the integrated tree passed");
+			}
+
+			// Apply the integrated result. A checked-out (clean) destination is
+			// fast-forwarded in place so the user's checkout stays consistent;
+			// otherwise the ref advances atomically with expected-old (a
+			// concurrent move fails instead of clobbering).
+			if (destWorktree) {
+				const ffResult = await this.git.run(destWorktree.path, ["merge", "--ff-only", resultSha]);
+				if (!ffResult.ok) {
+					return {
+						ok: false,
+						paused: true,
+						detail: `Destination "${destinationBranch}" changed while integrating (fast-forward in ${destWorktree.path} failed); retry delivery.`,
+					};
+				}
+			} else {
+				const updateResult = await this.git.run(repoPath, ["update-ref", destRef, resultSha, destSha]);
+				if (!updateResult.ok) {
+					return {
+						ok: false,
+						paused: true,
+						detail: `Destination "${destinationBranch}" moved while integrating; retry delivery.`,
+					};
+				}
+			}
+			evidence(
+				"integrated",
+				`integrated ${shortSha(taskCommitSha)} onto ${destinationBranch} at ${shortSha(
+					resultSha,
+				)} via a clean integration worktree (${strategyLabel}; destination had advanced to ${shortSha(destSha)})`,
+			);
+			return { ok: true, integratedSha: resultSha, combinedVerificationPassed };
+		} finally {
+			await this.removeIntegrationWorktree(repoPath, worktreePath);
+		}
+	}
+
+	/** B-11.4: deterministic home for the disposable integration worktree. */
+	private integrationWorktreePath(repoPath: string, destinationBranch: string): string {
+		const repoSlug = resolve(repoPath).replace(/[^a-zA-Z0-9._-]/g, "-");
+		const branchSlug = destinationBranch.replace(/[^a-zA-Z0-9._-]/g, "-");
+		return join(getTaskWorktreesHomePath(), INTEGRATION_WORKTREES_DIR_NAME, repoSlug, branchSlug);
+	}
+
+	/** B-11.4: remove the disposable integration worktree (best effort). */
+	private async removeIntegrationWorktree(repoPath: string, worktreePath: string): Promise<void> {
+		await this.git.run(repoPath, ["worktree", "remove", "--force", worktreePath]).catch(() => undefined);
+		await this.git.run(repoPath, ["worktree", "prune"]).catch(() => undefined);
+	}
+
+	/** B-11.4: unwind an in-flight merge/cherry-pick in the integration worktree (best effort). */
+	private async abortIntegrationStep(worktreePath: string, isMerge: boolean): Promise<void> {
+		await this.git
+			.run(worktreePath, isMerge ? ["merge", "--abort"] : ["cherry-pick", "--abort"])
+			.catch(() => undefined);
 	}
 
 	/**

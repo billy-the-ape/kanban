@@ -10,6 +10,7 @@
 // recover in-flight work (B-9.6), and failed launches retry with a bounded
 // attempt cap (B-9.7).
 import { join } from "node:path";
+import { baseTaskIdForReviewSessionId } from "../cline-sdk/cline-review-session-service";
 import type { RuntimeConfigState } from "../config/runtime-config";
 import type {
 	RuntimeBoardCard,
@@ -72,6 +73,8 @@ export interface TaskDispatchDeps {
 	persistBoard: (mutate: (board: RuntimeBoardData) => RuntimeBoardData) => Promise<void>;
 	listTerminalSummaries: () => Promise<RuntimeTaskSessionSummary[]>;
 	listClineSummaries: () => Promise<RuntimeTaskSessionSummary[]>;
+	/** B-11.2: live review/repair sessions; they hold model worker slots too. */
+	listReviewSessionSummaries?: () => Promise<RuntimeTaskSessionSummary[]>;
 	/** Read a task's durable delivery receipt (null when absent). */
 	readReceipt: (taskId: string) => Promise<RuntimeGitDeliveryReceipt | null>;
 	/** Start a fresh task session (agent/model resolution happens inside). */
@@ -302,16 +305,41 @@ async function buildReadinessInput(
 	};
 }
 
+/**
+ * B-9.1: the tasks currently holding model worker slots. A slot is held while
+ * its model session is actively running or paused for review input. Home-agent
+ * (assistant) sessions are the user's own chat and never block the queue.
+ * B-11.2: review/repair sessions hold the base task's slot too, so summaries
+ * are scoped to base task ids first and the result is de-duplicated.
+ */
 export function getActiveWorkerTaskIds(
 	summaries: Array<Pick<RuntimeTaskSessionSummary, "taskId" | "state">>,
 ): string[] {
-	// A worker slot is held while its model session is actively running or
-	// paused for review input. Home-agent (assistant) sessions are the user's
-	// own chat and never block the queue.
-	return summaries
-		.filter((summary) => !isHomeAgentSessionId(summary.taskId))
-		.filter((summary) => summary.state === "running" || summary.state === "awaiting_review")
-		.map((summary) => summary.taskId);
+	const active = new Set<string>();
+	for (const summary of summaries) {
+		if (isHomeAgentSessionId(summary.taskId)) continue;
+		if (summary.state === "running" || summary.state === "awaiting_review") {
+			active.add(summary.taskId);
+		}
+	}
+	return [...active];
+}
+
+/** B-11.2: scope review session summaries to the base task holding the worker slot. */
+function scopeReviewSessionSummaries(summaries: RuntimeTaskSessionSummary[]): RuntimeTaskSessionSummary[] {
+	return summaries.map((summary) => {
+		const baseTaskId = baseTaskIdForReviewSessionId(summary.taskId);
+		return baseTaskId === null ? summary : { ...summary, taskId: baseTaskId };
+	});
+}
+
+/** B-9/B-11.2: every model session summary scoped to its worker slot (review sessions count). */
+async function listWorkerSlotSummaries(deps: TaskDispatchDeps): Promise<RuntimeTaskSessionSummary[]> {
+	return [
+		...(await deps.listTerminalSummaries()),
+		...(await deps.listClineSummaries()),
+		...scopeReviewSessionSummaries(await (deps.listReviewSessionSummaries?.() ?? [])),
+	];
 }
 
 // --- base SHA resolution (B-9.4) --------------------------------------------
@@ -646,7 +674,7 @@ export async function dispatchReadyTasks(deps: TaskDispatchDeps): Promise<Runtim
 			.filter((entry) => !entry.ready)
 			.map((entry) => toTaskView(board, entry, blockedReasonOf(entry)));
 
-		const summaries = [...(await deps.listTerminalSummaries()), ...(await deps.listClineSummaries())];
+		const summaries = await listWorkerSlotSummaries(deps);
 		const activeWorkers = getActiveWorkerTaskIds(summaries);
 		const slotsToFill = policy.workerLimit - activeWorkers.length;
 		const titleByTaskId = collectCardTitles(board);
@@ -720,7 +748,7 @@ export async function reconcileTaskDispatch(deps: TaskDispatchDeps): Promise<Run
 	return await lockedFileSystem.withLock(getTaskDispatchLockRequest(deps.workspaceId), async () => {
 		const board = await deps.loadBoard();
 		const inProgressColumn = board.columns.find((column) => column.id === "in_progress");
-		const summaries = [...(await deps.listTerminalSummaries()), ...(await deps.listClineSummaries())];
+		const summaries = await listWorkerSlotSummaries(deps);
 		const liveTaskIds = new Set(summaries.map((summary) => summary.taskId));
 		const titleByTaskId = collectCardTitles(board);
 		const prepare =
@@ -826,7 +854,7 @@ export async function getTaskDispatchStatus(deps: TaskDispatchDeps): Promise<Run
 	const board = await deps.loadBoard();
 	const readinessInput = await buildReadinessInput(deps, board);
 	const readiness = resolveReadyTasks(readinessInput);
-	const summaries = [...(await deps.listTerminalSummaries()), ...(await deps.listClineSummaries())];
+	const summaries = await listWorkerSlotSummaries(deps);
 	const activeWorkers = getActiveWorkerTaskIds(summaries);
 	const taskIds = new Set<string>();
 	for (const column of board.columns) {
@@ -841,6 +869,7 @@ export async function getTaskDispatchStatus(deps: TaskDispatchDeps): Promise<Run
 		enabled: policy.enabled,
 		workerLimit: policy.workerLimit,
 		activeWorkerTaskId: activeWorkers[0] ?? null,
+		activeWorkerTaskIds: activeWorkers,
 		readyTasks: readiness.filter((entry) => entry.ready).map((entry) => toTaskView(board, entry, null)),
 		blockedTasks: readiness
 			.filter((entry) => !entry.ready)
