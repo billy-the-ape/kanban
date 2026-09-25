@@ -224,6 +224,8 @@ function buildClineStartPrompt(prompt: string, startInPlanMode?: boolean): strin
  * instead of retried forever.
  */
 const DEFAULT_CONTEXT_RECOVERY_MAX_ATTEMPTS = 3;
+/** B-10.4: minimum spacing between durable writes of repeated proactive compaction events. */
+const COMPACTION_EVENT_PERSIST_INTERVAL_MS = 60_000;
 
 export class InMemoryClineTaskSessionService implements ClineTaskSessionService {
 	private readonly pendingTurnCancelTaskIds = new Set<string>();
@@ -233,6 +235,15 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 	private readonly messageRepository: ClineMessageRepository;
 	private readonly watcherRegistry: ClineWatcherRegistry;
 	private readonly runtimeSetupLeaseByWorkspacePath = new Map<string, Promise<ClineRuntimeSetupLease>>();
+	/**
+	 * B-10.4: latest compaction per task (updated on every observation) and
+	 * when it was last persisted. The local-mode beforeModel hook compacts per
+	 * request without shortening the transcript, so it fires on every model
+	 * request once a session is over budget; memory stays exact while disk
+	 * writes are throttled.
+	 */
+	private readonly latestCompactionByTaskId = new Map<string, RuntimeClineContextCompactionEvent>();
+	private readonly compactionPersistedAtByTaskId = new Map<string, number>();
 
 	constructor(options: CreateInMemoryClineTaskSessionServiceOptions = {}) {
 		if (
@@ -276,9 +287,12 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 	}
 
 	/**
-	 * B-10.4: durably record a compaction event (fire-and-forget). The event
-	 * is diagnostic-only: a failed write must never affect the session, and
-	 * missing events simply read back as `lastCompaction: null`.
+	 * B-10.4: record a compaction event. The in-memory latest event is always
+	 * updated; the durable copy (fire-and-forget) is written for every overflow
+	 * recovery and at most once per COMPACTION_EVENT_PERSIST_INTERVAL_MS for
+	 * repeated proactive compactions. The event is diagnostic-only: a failed
+	 * write must never affect the session, and missing events simply read back
+	 * as `lastCompaction: null`.
 	 */
 	private recordCompactionEvent(
 		taskId: string,
@@ -293,6 +307,17 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			messagesBefore: Math.max(0, Math.round(info.messagesBefore)),
 			messagesAfter: Math.max(0, Math.round(info.messagesAfter)),
 		};
+		this.latestCompactionByTaskId.set(taskId, event);
+		const now = Date.now();
+		const persistedAt = this.compactionPersistedAtByTaskId.get(taskId);
+		if (
+			trigger === "proactive" &&
+			persistedAt !== undefined &&
+			now - persistedAt < COMPACTION_EVENT_PERSIST_INTERVAL_MS
+		) {
+			return;
+		}
+		this.compactionPersistedAtByTaskId.set(taskId, now);
 		void recordTaskCompactionEvent(taskId, event).catch(() => {
 			// Intentionally swallowed (see above).
 		});
@@ -1060,7 +1085,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			}
 		}
 		const messages = await this.messageRepository.hydrateTaskMessages(taskId, async () => persisted).catch(() => []);
-		const lastCompaction = await readTaskCompactionEvent(taskId);
+		const lastCompaction = this.latestCompactionByTaskId.get(taskId) ?? (await readTaskCompactionEvent(taskId));
 		return { messages, lastCompaction };
 	}
 
@@ -1076,6 +1101,8 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 	async dispose(): Promise<void> {
 		await this.sessionRuntime.dispose();
 		this.pendingTurnCancelTaskIds.clear();
+		this.latestCompactionByTaskId.clear();
+		this.compactionPersistedAtByTaskId.clear();
 		for (const leasePromise of this.runtimeSetupLeaseByWorkspacePath.values()) {
 			try {
 				const lease = await leasePromise;

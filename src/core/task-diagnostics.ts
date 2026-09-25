@@ -75,6 +75,11 @@ function lastDeliveryEvidenceDetail(evidence: Array<{ stage: string; detail: str
 	return null;
 }
 
+/** A failed or paused receipt: delivery can resume from its last successful stage. */
+export function isDeliveryResumable(status: RuntimeGitDeliveryStatus | null): boolean {
+	return status === "failed" || status === "paused";
+}
+
 function availability(enabled: boolean, reasonWhenDisabled: string | null): RuntimeTaskActionAvailability {
 	return { enabled, reason: enabled ? null : reasonWhenDisabled };
 }
@@ -125,22 +130,21 @@ function resolveActions(input: TaskPhaseInput): RuntimeTaskDiagnosticsActions {
 	const { deliveryStatus, sessionActive, preservationStatus, worktreeExists } = input;
 	const receiptTerminal = deliveryStatus === "delivered" || deliveryStatus === "no_op";
 	const receiptInProgress = deliveryStatus === "in_progress";
-	const receiptBroken = deliveryStatus === "failed" || deliveryStatus === "paused";
+	const receiptBroken = isDeliveryResumable(deliveryStatus);
 	const reviewBroken = input.reviewStatus === "failed" || input.reviewStatus === "parse_failed";
 
 	// retry_phase: re-run the current phase after a failure. For a broken
 	// delivery receipt that means re-running the delivery pipeline from the
 	// last successful stage (the receipt drives the resume); for a failed
-	// review it means starting a fresh review pass.
+	// review it means starting a fresh review pass. A running or finished
+	// delivery outranks a stale review failure: there is nothing to retry.
 	let retryAvailability: RuntimeTaskActionAvailability;
-	if (receiptBroken) {
-		retryAvailability = availability(true, null);
-	} else if (reviewBroken) {
-		retryAvailability = availability(true, null);
-	} else if (receiptInProgress) {
+	if (receiptInProgress) {
 		retryAvailability = availability(false, "Delivery is already in progress.");
 	} else if (receiptTerminal) {
 		retryAvailability = availability(false, "Task is already delivered.");
+	} else if (receiptBroken || reviewBroken) {
+		retryAvailability = availability(true, null);
 	} else {
 		retryAvailability = availability(false, "No failed phase to retry.");
 	}

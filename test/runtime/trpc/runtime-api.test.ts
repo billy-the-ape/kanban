@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -12,6 +13,7 @@ const agentRegistryMocks = vi.hoisted(() => ({
 
 const taskWorktreeMocks = vi.hoisted(() => ({
 	resolveTaskCwd: vi.fn(),
+	taskWorktreeExists: vi.fn(async () => false),
 }));
 
 const turnCheckpointMocks = vi.hoisted(() => ({
@@ -65,6 +67,7 @@ vi.mock("../../../src/terminal/agent-registry.js", () => ({
 
 vi.mock("../../../src/workspace/task-worktree.js", () => ({
 	resolveTaskCwd: taskWorktreeMocks.resolveTaskCwd,
+	taskWorktreeExists: taskWorktreeMocks.taskWorktreeExists,
 }));
 
 vi.mock("../../../src/workspace/turn-checkpoints.js", () => ({
@@ -2948,5 +2951,64 @@ describe("createRuntimeApi update handlers", () => {
 			message: "Updated Kanban to 0.2.0.",
 		});
 		expect(runUpdateNow).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("createRuntimeApi getTaskPhases (B-10.1)", () => {
+	let previousHome: string | undefined;
+	let previousUserProfile: string | undefined;
+	let tempHome: string;
+
+	beforeEach(() => {
+		previousHome = process.env.HOME;
+		previousUserProfile = process.env.USERPROFILE;
+		tempHome = mkdtempSync(join(tmpdir(), "kanban-task-phases-home-"));
+		process.env.HOME = tempHome;
+		process.env.USERPROFILE = tempHome;
+	});
+
+	afterEach(() => {
+		if (previousHome === undefined) {
+			delete process.env.HOME;
+		} else {
+			process.env.HOME = previousHome;
+		}
+		if (previousUserProfile === undefined) {
+			delete process.env.USERPROFILE;
+		} else {
+			process.env.USERPROFILE = previousUserProfile;
+		}
+		rmSync(tempHome, { recursive: true, force: true });
+	});
+
+	it("treats a terminal-agent session as active only while its process is alive", async () => {
+		const summaries: Record<string, RuntimeTaskSessionSummary> = {
+			"task-live": createSummary({ taskId: "task-live", state: "running" }),
+			"task-hydrated": createSummary({ taskId: "task-hydrated", state: "running" }),
+		};
+		const terminalManager = {
+			getSummary: vi.fn((taskId: string) => summaries[taskId] ?? null),
+			hasActiveProcess: vi.fn((taskId: string) => taskId === "task-live"),
+		};
+		const clineTaskSessionService = createClineTaskSessionServiceMock();
+		const api = createTestRuntimeApi({
+			getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+			loadScopedRuntimeConfig: vi.fn(async () => createRuntimeConfigState()),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: vi.fn(async () => terminalManager as never),
+			getScopedClineTaskSessionService: vi.fn(async () => clineTaskSessionService as never),
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+		});
+
+		const response = await api.getTaskPhases(
+			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+			{ taskIds: ["task-live", "task-hydrated", "task-none"] },
+		);
+
+		expect(response.ok).toBe(true);
+		expect(response.phases["task-live"]?.phase).toBe("implementing");
+		expect(response.phases["task-hydrated"]?.phase).toBe("idle");
+		expect(response.phases["task-none"]?.phase).toBe("idle");
 	});
 });

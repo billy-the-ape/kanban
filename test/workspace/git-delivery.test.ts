@@ -2,12 +2,14 @@
 // temporary git repositories (detached task worktree + bare remote). The model
 // is not involved at all: commit messages fall back to the deterministic
 // task-title form, which is exactly the property B-8 requires.
+import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
 import type { RuntimeGitDeliveryPolicy, RuntimeReviewHandoffArtifact } from "../../src/core/api-contract";
+import { getTaskWorktreesHomePath } from "../../src/state/workspace-state";
 import {
 	evaluateDependentsUnlock,
 	type GhCommandResult,
@@ -1107,6 +1109,55 @@ describe("GitDeliveryService", () => {
 				// The result is durably recorded on the persisted receipt.
 				const persisted = await readTaskDeliveryReceipt("task-b11-verify");
 				expect(persisted?.combinedVerificationPassed).toBe(true);
+			} finally {
+				fixture.cleanup();
+			}
+		});
+
+		it("mirrors the repository's ignored paths into the integration worktree and cleans it up", async () => {
+			const fixture = await createDeliveryFixture();
+			try {
+				await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
+				await persistFixtureHandoff(fixture, "task-b11-env");
+				await writeFile(join(fixture.worktreePath, "fileA.txt"), "task work\n", "utf8");
+				await advanceDestinationParallel(fixture, "fileB.txt", "parallel work\n");
+				// Dependencies live in an ignored directory of the main checkout.
+				await writeFile(join(fixture.repoPath, ".gitignore"), "deps/\n", "utf8");
+				await mkdir(join(fixture.repoPath, "deps"), { recursive: true });
+				await writeFile(join(fixture.repoPath, "deps", "lib.js"), "module.exports = 1;\n", "utf8");
+				// A worktree orphaned by a crashed process (pid that cannot exist).
+				const integrationRoot = join(
+					getTaskWorktreesHomePath(),
+					"kanban-integration",
+					resolve(fixture.repoPath).replace(/[^a-zA-Z0-9._-]/g, "-"),
+					"feature-b8",
+				);
+				const orphanPath = join(integrationRoot, "2147483646-1");
+				await mkdir(orphanPath, { recursive: true });
+
+				let seenWorktreePath: string | null = null;
+				const response = await new GitDeliveryService().startDelivery({
+					taskId: "task-b11-env",
+					workspaceId: "workspace-1",
+					repoPath: fixture.repoPath,
+					worktreePath: fixture.worktreePath,
+					baseRef: "main",
+					policy: deliveryPolicy(),
+					runCombinedVerification: async (input) => {
+						seenWorktreePath = input.worktreePath;
+						expect(existsSync(orphanPath)).toBe(false);
+						expect(await readFile(join(input.worktreePath, "deps", "lib.js"), "utf8")).toBe(
+							"module.exports = 1;\n",
+						);
+						return { passed: true, error: null };
+					},
+				});
+
+				expect(response.receipt?.status).toBe("delivered");
+				expect(seenWorktreePath).not.toBeNull();
+				expect(existsSync(seenWorktreePath ?? "")).toBe(false);
+				// Removing the worktree never followed the mirrored symlink.
+				expect(existsSync(join(fixture.repoPath, "deps", "lib.js"))).toBe(true);
 			} finally {
 				fixture.cleanup();
 			}
