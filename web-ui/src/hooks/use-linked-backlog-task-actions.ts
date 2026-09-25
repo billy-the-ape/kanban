@@ -34,6 +34,7 @@ export function useLinkedBacklogTaskActions({
 	waitForBacklogStartAnimationAvailability,
 	checkDependentsUnlock,
 	isBackendTaskDispatchEnabled = false,
+	onTaskCompleted,
 }: {
 	board: BoardData;
 	setBoard: Dispatch<SetStateAction<BoardData>>;
@@ -53,6 +54,8 @@ export function useLinkedBacklogTaskActions({
 	checkDependentsUnlock?: (taskId: string) => Promise<RuntimeTaskDependentsUnlock>;
 	/** B-9.5: backend task dispatch is enabled — unblocked tasks are queued for the backend queue, not auto-started locally. */
 	isBackendTaskDispatchEnabled?: boolean;
+	/** Called after a task has been completed and its session stopped. */
+	onTaskCompleted?: (taskId: string) => void;
 }): {
 	handleCreateDependency: (fromTaskId: string, toTaskId: string) => void;
 	handleDeleteDependency: (dependencyId: string) => void;
@@ -171,11 +174,15 @@ export function useLinkedBacklogTaskActions({
 	const cleanupTaskWorktree = useCallback(
 		async (taskId: string): Promise<void> => {
 			const cleanupResult = await cleanupTaskWorkspace(taskId);
-			if (cleanupResult?.ok && !cleanupResult.removed && cleanupResult.blockedReason) {
+			// B-5.9: any cleanup that did not complete stays visible; it is retried
+			// by runtime maintenance and flagged on the Trash card.
+			const blockedReason =
+				cleanupResult?.blockedReason ?? (cleanupResult?.ok === false ? cleanupResult.error : null);
+			if (cleanupResult && !cleanupResult.removed && blockedReason) {
 				showAppToast({
 					intent: "warning",
 					icon: "warning-sign",
-					message: `Task worktree preserved: ${cleanupResult.blockedReason}`,
+					message: `Task worktree kept: ${blockedReason}`,
 					timeout: 7000,
 				});
 			}
@@ -269,10 +276,12 @@ export function useLinkedBacklogTaskActions({
 			// Completing a task never deletes its worktree. Stop the session
 			// best-effort so no live session lingers behind a terminal card.
 			await Promise.all([stopTaskSession(task.id), stopTaskSession(getDetailTerminalTaskId(task.id))]);
+			onTaskCompleted?.(task.id);
 		},
 		[
 			checkDependentsUnlock,
 			isBackendTaskDispatchEnabled,
+			onTaskCompleted,
 			setBoard,
 			setSelectedTaskId,
 			startReadyLinkedTasks,

@@ -959,3 +959,38 @@ describe("B-7.1 — verification gate settings", () => {
 		}
 	});
 });
+
+describe("B-9 — task dispatch policy settings", () => {
+	it("rejects enabling the task queue without deterministic delivery", async () => {
+		const { path: tempHome, cleanup: cleanupHome } = createTempDir("kanban-home-runtime-config-dispatch-");
+		const { path: tempProject, cleanup: cleanupProject } = createTempDir("kanban-project-runtime-config-dispatch-");
+
+		try {
+			await withTemporaryEnv({ home: tempHome }, async () => {
+				await loadRuntimeConfig(tempProject);
+				await expect(updateRuntimeConfig(tempProject, { taskDispatchPolicy: { enabled: true } })).rejects.toThrow(
+					"taskDispatchPolicy.enabled requires gitDeliveryPolicy.enabled",
+				);
+
+				// Enabling both in one update is accepted.
+				const enabled = await updateRuntimeConfig(tempProject, {
+					gitDeliveryPolicy: { enabled: true },
+					taskDispatchPolicy: { enabled: true },
+				});
+				expect(enabled.taskDispatchPolicy?.enabled).toBe(true);
+
+				// Turning delivery off while the queue is on is rejected too.
+				await expect(updateRuntimeConfig(tempProject, { gitDeliveryPolicy: { enabled: false } })).rejects.toThrow(
+					"taskDispatchPolicy.enabled requires gitDeliveryPolicy.enabled",
+				);
+
+				// Unrelated updates are not blocked by the rule.
+				const unrelated = await updateRuntimeConfig(tempProject, { agentAutonomousModeEnabled: false });
+				expect(unrelated.agentAutonomousModeEnabled).toBe(false);
+			});
+		} finally {
+			cleanupProject();
+			cleanupHome();
+		}
+	});
+});

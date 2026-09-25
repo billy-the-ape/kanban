@@ -827,6 +827,31 @@ function validateTaskDispatchPolicy(policy: RuntimeTaskDispatchPolicySave | null
 	}
 }
 
+/**
+ * B-9: the task queue unlocks dependents only on delivery receipts, and only
+ * deterministic delivery writes them. Enabling the queue without delivery
+ * would leave every dependent task blocked forever. Checked only when an
+ * update touches either policy, so an unrelated save never fails on it.
+ */
+function validateTaskDispatchRequiresDelivery(
+	updates: Pick<RuntimeConfigUpdateInput, "taskDispatchPolicy" | "gitDeliveryPolicy">,
+	next: {
+		taskDispatchPolicy: RuntimeTaskDispatchPolicySave | null | undefined;
+		gitDeliveryPolicy: RuntimeGitDeliveryPolicySave | null | undefined;
+	},
+): void {
+	if (updates.taskDispatchPolicy === undefined && updates.gitDeliveryPolicy === undefined) {
+		return;
+	}
+	const dispatchEnabled = normalizeTaskDispatchPolicy(next.taskDispatchPolicy)?.enabled === true;
+	const deliveryEnabled = normalizeGitDeliveryPolicy(next.gitDeliveryPolicy)?.enabled === true;
+	if (dispatchEnabled && !deliveryEnabled) {
+		throw new Error(
+			"taskDispatchPolicy.enabled requires gitDeliveryPolicy.enabled: the task queue only unlocks dependents on delivery receipts.",
+		);
+	}
+}
+
 /** B-9: merge a save-shape update (null clears, undefined leaves as-is). */
 function mergeTaskDispatchPolicyUpdates(
 	stored: RuntimeTaskDispatchPolicy | undefined,
@@ -1379,6 +1404,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			taskDispatchPolicy:
 				mergedTaskDispatchPolicy === undefined ? current.taskDispatchPolicy : mergedTaskDispatchPolicy,
 		};
+		validateTaskDispatchRequiresDelivery(updates, nextConfig);
 
 		const hasChanges =
 			nextConfig.selectedAgentId !== current.selectedAgentId ||
@@ -1482,6 +1508,7 @@ export async function updateGlobalRuntimeConfig(
 				taskDispatchPolicy:
 					mergedTaskDispatchPolicy === undefined ? current.taskDispatchPolicy : mergedTaskDispatchPolicy,
 			};
+			validateTaskDispatchRequiresDelivery(updates, nextConfig);
 
 			const hasChanges =
 				nextConfig.selectedAgentId !== current.selectedAgentId ||

@@ -21,8 +21,10 @@ import { type ClineCompactionConfig, calibrateClineCompactionConfig } from "./cl
 import { readTaskCompactionEvent, recordTaskCompactionEvent } from "./cline-context-events";
 import type { ContextLimitSource } from "./cline-context-policy";
 import {
+	describeClineUnresolvedToolCalls,
 	evaluateClineContextRecoveryBudget,
 	evaluateClineRecoveryRequirements,
+	findClineUnresolvedToolCalls,
 	isContextOverflowError,
 } from "./cline-context-recovery";
 import { applyClineSessionEvent } from "./cline-event-adapter";
@@ -468,6 +470,11 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					.readPersistedTaskSession(input.taskId)
 					.catch(() => null);
 				const persistedMessages = persistedSnapshot?.messages ?? [];
+				// B-3.5: never resend over a tool call whose completion is unknown.
+				const unresolvedToolCalls = findClineUnresolvedToolCalls(persistedMessages);
+				if (unresolvedToolCalls.length > 0) {
+					throw new Error(describeClineUnresolvedToolCalls(unresolvedToolCalls));
+				}
 				const compacted = this.compactTranscriptForRecovery(startRequest, persistedMessages);
 				// B-10.4: overflow recovery compaction is the "overflow"
 				// trigger class (budget compactions report "proactive").

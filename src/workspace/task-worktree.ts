@@ -17,6 +17,7 @@ import {
 	applyPreservedWorktreeContent,
 	preserveTaskWorktree,
 	readTaskPreservationRecord,
+	recordTaskCleanupBlockedReason,
 	resolveTaskPreservationRestoreTarget,
 	syncTaskPreservationActivity,
 } from "./task-preservation";
@@ -136,6 +137,11 @@ function getWorktreesBaseRootPath(): string {
 function getTaskWorktreePath(repoPath: string, taskId: string): string {
 	const workspaceLabel = getWorkspaceFolderLabelForWorktreePath(repoPath);
 	return join(getWorktreesRootPath(taskId), workspaceLabel);
+}
+
+/** True when the task's worktree directory exists (B-5.7/B-5.9 maintenance). */
+export async function taskWorktreeExists(repoPath: string, taskId: string): Promise<boolean> {
+	return await pathExists(getTaskWorktreePath(repoPath, normalizeTaskIdForWorktreePath(taskId)));
 }
 
 function shouldSkipSymlink(relativePath: string): boolean {
@@ -552,6 +558,7 @@ export async function deleteTaskWorktree(options: {
 		});
 		if (!preservation.preserved) {
 			const blockedReason = preservation.blockedReasons.join("; ") || "Task work could not be preserved.";
+			await recordTaskCleanupBlockedReason(taskId, blockedReason);
 			return {
 				ok: false,
 				removed: false,
@@ -563,6 +570,7 @@ export async function deleteTaskWorktree(options: {
 
 		const removed = await removeTaskWorktreeInternal(options.repoPath, worktreePath);
 		await pruneEmptyParents(rootPath, dirname(worktreePath));
+		await recordTaskCleanupBlockedReason(taskId, null);
 
 		return {
 			ok: true,
@@ -572,6 +580,7 @@ export async function deleteTaskWorktree(options: {
 		};
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
+		await recordTaskCleanupBlockedReason(options.taskId, message).catch(() => undefined);
 		return {
 			ok: false,
 			removed: false,

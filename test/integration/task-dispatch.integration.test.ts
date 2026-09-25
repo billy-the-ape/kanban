@@ -1,8 +1,9 @@
 // B-9 integration: a three-task linear chain (t1 -> t2 -> t3) running against
 // real git repositories, real board state, real dispatch records, and real
-// delivery receipts. The "restart" is simulated by rebuilding the dispatch
-// deps with a fresh session list; a push failure is simulated with a failed
-// delivery receipt (the B-8 pipeline itself is covered by its own tests).
+// delivery receipts. The "restart" is simulated the way the server sees it: a
+// fresh TerminalSessionManager hydrated from the persisted session summaries
+// (which have no process behind them). A push failure is simulated with a
+// failed delivery receipt (the B-8 pipeline itself is covered by its own tests).
 import { spawnSync } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -14,6 +15,7 @@ import type {
 	RuntimeBoardColumnId,
 	RuntimeBoardData,
 	RuntimeGitDeliveryReceipt,
+	RuntimeTaskSessionSummary,
 } from "../../src/core/api-contract";
 import { moveTaskToColumn } from "../../src/core/task-board-mutations";
 import { lockedFileSystem } from "../../src/fs/locked-file-system";
@@ -25,10 +27,12 @@ import {
 } from "../../src/state/workspace-state";
 import { readTaskDispatchRecord } from "../../src/task-dispatch/dispatch-records";
 import {
+	collectTaskDispatchSessions,
 	dispatchReadyTasks,
 	reconcileTaskDispatch,
 	type TaskDispatchDeps,
 } from "../../src/task-dispatch/task-dispatch-service";
+import { TerminalSessionManager } from "../../src/terminal/session-manager";
 import { getTaskDeliveryDir, readTaskDeliveryReceipt } from "../../src/workspace/git-delivery";
 import { resolveTaskCwd } from "../../src/workspace/task-worktree";
 import { createGitTestEnv } from "../utilities/git-env";
@@ -148,6 +152,14 @@ function columnIdOf(board: RuntimeBoardData, taskId: string): RuntimeBoardColumn
 
 interface SessionProbe {
 	started: Array<{ taskId: string; prompt: string }>;
+	/** The runtime's terminal session manager (hydrated from disk after a restart). */
+	terminal: TerminalSessionManager;
+}
+
+function createSessionProbe(persistedSessions: Record<string, RuntimeTaskSessionSummary> = {}): SessionProbe {
+	const terminal = new TerminalSessionManager();
+	terminal.hydrateFromRecord(persistedSessions);
+	return { started: [], terminal };
 }
 
 function buildDeps(workspaceId: string, repoPath: string, sessions: SessionProbe): TaskDispatchDeps {
@@ -162,8 +174,7 @@ function buildDeps(workspaceId: string, repoPath: string, sessions: SessionProbe
 				value: undefined,
 			}));
 		},
-		listTerminalSummaries: () => Promise.resolve([]),
-		listClineSummaries: () => Promise.resolve([]),
+		listSessions: async () => collectTaskDispatchSessions({ terminal: sessions.terminal, clineSummaries: [] }),
 		readReceipt: (taskId) => readTaskDeliveryReceipt(taskId),
 		// The only seam we stub: no real agent process in an integration test.
 		// Everything around the session launch (records, board, git, receipts)
@@ -201,8 +212,8 @@ describe("B-9 task dispatch integration (linear chain, restart, failed delivery)
 	let workspaceId: string;
 	let t1Sha: string;
 	let t2Sha: string;
-	const firstRun: SessionProbe = { started: [] };
-	const afterRestart: SessionProbe = { started: [] };
+	const firstRun = createSessionProbe();
+	let afterRestart: SessionProbe;
 
 	beforeAll(async () => {
 		previousHome = process.env.HOME;
@@ -224,7 +235,10 @@ describe("B-9 task dispatch integration (linear chain, restart, failed delivery)
 
 		const context = await loadWorkspaceContext(repoPath);
 		workspaceId = context.workspaceId;
-		await updateRuntimeConfig(repoPath, { taskDispatchPolicy: { enabled: true, workerLimit: 1 } });
+		await updateRuntimeConfig(repoPath, {
+			gitDeliveryPolicy: { enabled: true },
+			taskDispatchPolicy: { enabled: true, workerLimit: 1 },
+		});
 		await mutateWorkspaceState<void>(repoPath, () => ({
 			board: seedBoard(),
 			value: undefined,
@@ -270,6 +284,24 @@ describe("B-9 task dispatch integration (linear chain, restart, failed delivery)
 	});
 
 	it("restart reconciliation relaunches the in-flight task with the recorded prompt", async () => {
+		// The shutdown coordinator persisted t2's summary as interrupted; the
+		// restarted runtime hydrates it with no process behind it.
+		afterRestart = createSessionProbe({
+			t2: {
+				taskId: "t2",
+				state: "interrupted",
+				agentId: "claude",
+				workspacePath: repoPath,
+				pid: null,
+				startedAt: null,
+				updatedAt: Date.now(),
+				lastOutputAt: null,
+				reviewReason: "interrupted",
+				exitCode: null,
+				lastHookAt: null,
+				latestHookActivity: null,
+			},
+		});
 		const response = await reconcileTaskDispatch(buildDeps(workspaceId, repoPath, afterRestart));
 		expect(response.relaunchedTaskIds).toEqual(["t2"]);
 		expect(response.skippedTaskIds).toEqual([]);
@@ -357,7 +389,7 @@ describe("B-11 task dispatch integration (parallel branches, shared budget)", ()
 	let repoPath: string;
 	let workspaceId: string;
 	let baseSha: string;
-	const parallelRun: SessionProbe = { started: [] };
+	const parallelRun: SessionProbe = createSessionProbe();
 
 	beforeAll(async () => {
 		previousHomeB11 = process.env.HOME;
@@ -380,6 +412,7 @@ describe("B-11 task dispatch integration (parallel branches, shared budget)", ()
 		const context = await loadWorkspaceContext(repoPath);
 		workspaceId = context.workspaceId;
 		await updateRuntimeConfig(repoPath, {
+			gitDeliveryPolicy: { enabled: true },
 			taskDispatchPolicy: { enabled: true, workerLimit: 2 },
 		});
 		await mutateWorkspaceState<void>(repoPath, () => ({

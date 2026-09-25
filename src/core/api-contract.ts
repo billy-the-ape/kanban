@@ -598,6 +598,9 @@ export const runtimeTaskPreservationRecordSchema = z.object({
 	// refs/kanban/tasks/<taskId> captured in the repository object store.
 	refName: z.string().nullable().default(null),
 	preservedAt: z.number().nullable().default(null),
+	// B-5.9: why the last worktree cleanup attempt was blocked (null once it
+	// succeeds). Blocked cleanups are retried by workspace maintenance.
+	cleanupBlockedReason: z.string().nullable().default(null),
 	updatedAt: z.number(),
 });
 export type RuntimeTaskPreservationRecord = z.infer<typeof runtimeTaskPreservationRecordSchema>;
@@ -622,6 +625,28 @@ export const runtimeTaskPreservationInfoResponseSchema = z.object({
 	error: z.string().optional(),
 });
 export type RuntimeTaskPreservationInfoResponse = z.infer<typeof runtimeTaskPreservationInfoResponseSchema>;
+
+/** B-5.9: one blocked worktree cleanup and why. */
+export const runtimeBlockedTaskCleanupSchema = z.object({
+	taskId: z.string(),
+	reason: z.string(),
+});
+export type RuntimeBlockedTaskCleanup = z.infer<typeof runtimeBlockedTaskCleanupSchema>;
+
+export const runtimeBlockedTaskCleanupsResponseSchema = z.object({
+	blocked: z.array(runtimeBlockedTaskCleanupSchema),
+});
+export type RuntimeBlockedTaskCleanupsResponse = z.infer<typeof runtimeBlockedTaskCleanupsResponseSchema>;
+
+/** B-5.7/B-5.9: result of one workspace maintenance pass. */
+export const runtimeTaskWorkspaceMaintenanceReportSchema = z.object({
+	removedWorktrees: z.array(z.string()),
+	blockedCleanups: z.array(runtimeBlockedTaskCleanupSchema),
+	prunedPreservation: z.array(z.string()),
+	flaggedPreservation: z.array(runtimeBlockedTaskCleanupSchema),
+	preservationBytes: z.number().int().min(0),
+});
+export type RuntimeTaskWorkspaceMaintenanceReport = z.infer<typeof runtimeTaskWorkspaceMaintenanceReportSchema>;
 
 export const runtimeTaskWorktreeRecoverResponseSchema = z.object({
 	ok: z.boolean(),
@@ -1314,8 +1339,12 @@ export const runtimeTaskDispatchRecordSchema = z.object({
 	baseRef: z.string(),
 	/** Verified baseline commit the dispatched worktree sits on (null for blocked records without a resolved base). */
 	baseSha: z.string().nullable(),
-	/** 1-based dispatch attempt count; bounds automatic retries. */
-	attempt: z.number().int().min(1),
+	/**
+	 * Launch attempts in the current dispatch cycle; bounds automatic retries.
+	 * 0 for a task that was blocked before any launch; a new cycle (the task
+	 * returns to the backlog after a successful dispatch) starts again at 1.
+	 */
+	attempt: z.number().int().min(0),
 	status: runtimeTaskDispatchStatusSchema,
 	error: z.string().nullable(),
 	prerequisites: z.array(runtimeTaskDispatchPrerequisiteSchema),

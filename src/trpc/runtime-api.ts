@@ -75,8 +75,10 @@ import { openInBrowser } from "../server/browser";
 import { getRuntimeHomePath, loadWorkspaceBoardById, mutateWorkspaceState } from "../state/workspace-state";
 import { readTaskDispatchRecord } from "../task-dispatch/dispatch-records";
 import {
+	collectTaskDispatchSessions,
 	getTaskDispatchStatus,
 	reconcileTaskDispatch,
+	releaseTaskFromDispatchQueue,
 	dispatchReadyTasks as runTaskDispatchPass,
 	type TaskDispatchDeps,
 } from "../task-dispatch/task-dispatch-service";
@@ -177,11 +179,169 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		return buildRuntimeConfigResponse(runtimeConfig, clineProviderSettings, { effectiveContextWindow });
 	};
 
-	// B-9: the dispatch layer starts fresh task sessions through the exact same
-	// code path the UI uses, so its deps self-reference the api instance below.
-	// `runtimeApiInstance` is assigned right before the return; handlers cannot
-	// run before that point (the server only serves requests afterwards).
-	let runtimeApiInstance: RuntimeTrpcContext["runtimeApi"] | null = null;
+	// Shared by the tRPC handler (manual starts) and the B-9 dispatch queue, so
+	// queued tasks launch through exactly the code path the UI uses.
+	const startTaskSession: RuntimeTrpcContext["runtimeApi"]["startTaskSession"] = async (workspaceScope, input) => {
+		try {
+			const body = parseTaskSessionStartRequest(input);
+			if (body.resumeFromTrash) {
+				deps.broadcastTaskChatCleared?.(workspaceScope.workspaceId, body.taskId);
+			}
+			const requestedClineTaskMode = body.mode ?? "act";
+			const scopedRuntimeConfig = await deps.loadScopedRuntimeConfig(workspaceScope);
+			const taskCwd = isHomeAgentSessionId(body.taskId)
+				? workspaceScope.workspacePath
+				: await resolveExistingTaskCwdOrEnsure({
+						cwd: workspaceScope.workspacePath,
+						taskId: body.taskId,
+						baseRef: body.baseRef,
+					});
+			const shouldCaptureTurnCheckpoint = !body.resumeFromTrash && !isHomeAgentSessionId(body.taskId);
+
+			// Per-task config source-of-truth precedence:
+			//
+			// agentId resolution (which agent runtime to use):
+			//   1. previousTerminalAgentId — persisted in the terminal session summary from
+			//      the last run; ensures trash-restore resumes with the same agent runtime.
+			//   2. body.agentId — the card's current per-task agent override.
+			//   3. scopedRuntimeConfig.selectedAgentId — the workspace-level default.
+			//
+			// clineSettings (which LLM model and reasoning profile the Cline agent uses):
+			//   Always taken from the card's current override object. There is no
+			//   session-level persistence for these;
+			//   if the user changes the model on the card, the next session launch
+			//   (including trash-restore) uses the updated values.
+			const terminalManager = await deps.getScopedTerminalManager(workspaceScope);
+			const previousTerminalAgentId = body.resumeFromTrash
+				? (terminalManager.getSummary(body.taskId)?.agentId ?? null)
+				: null;
+			const effectiveAgentId = previousTerminalAgentId ?? body.agentId ?? scopedRuntimeConfig.selectedAgentId;
+			let useClinePath = effectiveAgentId === "cline";
+			const shouldProbePersistedClineSession =
+				body.resumeFromTrash && !useClinePath && previousTerminalAgentId === null;
+			if (shouldProbePersistedClineSession) {
+				// If the terminal summary already has a concrete non-Cline agentId,
+				// skip Cline persisted-session probing. That probe can cold-start the
+				// Cline session host and adds multi-second latency to Codex restores.
+				const clineSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
+				const persistedSession = await clineSessionService
+					.rebindPersistedTaskSession(body.taskId)
+					.catch(() => null);
+				if (persistedSession) {
+					useClinePath = true;
+				}
+			}
+
+			if (useClinePath) {
+				const hasTaskLevelClineSettingsOverride = body.clineSettings !== undefined;
+				const clineLaunchConfig = await clineProviderService.resolveLaunchConfig({
+					providerIdOverride: body.clineSettings?.providerId ?? undefined,
+					modelIdOverride: body.clineSettings?.modelId ?? undefined,
+					...(hasTaskLevelClineSettingsOverride
+						? {
+								reasoningEffortOverride: body.clineSettings?.reasoningEffort ?? null,
+							}
+						: {}),
+				});
+				const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
+				const resolvedClineTitle = resolveTaskTitle(body.taskTitle?.trim(), body.prompt);
+				const summary = await clineTaskSessionService.startTaskSession({
+					taskId: body.taskId,
+					cwd: taskCwd,
+					prompt: body.prompt,
+					taskTitle: resolvedClineTitle.length > 0 ? resolvedClineTitle : undefined,
+					images: body.images,
+					resumeFromTrash: body.resumeFromTrash,
+					providerId: clineLaunchConfig.providerId,
+					modelId: clineLaunchConfig.modelId,
+					mode: requestedClineTaskMode,
+					startInPlanMode: body.startInPlanMode,
+					apiKey: clineLaunchConfig.apiKey,
+					baseUrl: clineLaunchConfig.baseUrl,
+					reasoningEffort: clineLaunchConfig.reasoningEffort,
+					contextWindowTokens: clineLaunchConfig.contextWindowTokens,
+					contextWindowSource: clineLaunchConfig.contextWindowSource,
+					compaction: buildClineCompactionConfig({ launchConfig: clineLaunchConfig }),
+					compactionSafetyMarginTokens: clineLaunchConfig.compactionSettings?.safetyMarginTokens,
+				});
+
+				let nextSummary = summary;
+				if (shouldCaptureTurnCheckpoint) {
+					try {
+						const nextTurn = (summary.latestTurnCheckpoint?.turn ?? 0) + 1;
+						const checkpoint = await captureTaskTurnCheckpoint({
+							cwd: taskCwd,
+							taskId: body.taskId,
+							turn: nextTurn,
+						});
+						nextSummary = clineTaskSessionService.applyTurnCheckpoint(body.taskId, checkpoint) ?? summary;
+					} catch {
+						// Best effort checkpointing only.
+					}
+				}
+
+				return {
+					ok: true,
+					summary: nextSummary,
+				};
+			}
+
+			const resolvedConfig =
+				effectiveAgentId !== scopedRuntimeConfig.selectedAgentId
+					? { ...scopedRuntimeConfig, selectedAgentId: effectiveAgentId }
+					: scopedRuntimeConfig;
+			const resolved = resolveAgentCommand(resolvedConfig);
+			if (!resolved) {
+				return {
+					ok: false,
+					summary: null,
+					error: "No runnable agent command is configured. Open Settings, install a supported CLI, and select it.",
+				};
+			}
+			const summary = await terminalManager.startTaskSession({
+				taskId: body.taskId,
+				agentId: resolved.agentId,
+				binary: resolved.binary,
+				args: resolved.args,
+				autonomousModeEnabled: scopedRuntimeConfig.agentAutonomousModeEnabled,
+				cwd: taskCwd,
+				prompt: body.prompt,
+				images: body.images,
+				startInPlanMode: body.startInPlanMode,
+				resumeFromTrash: body.resumeFromTrash,
+				cols: body.cols,
+				rows: body.rows,
+				workspaceId: workspaceScope.workspaceId,
+			});
+
+			let nextSummary = summary;
+			if (shouldCaptureTurnCheckpoint) {
+				try {
+					const nextTurn = (summary.latestTurnCheckpoint?.turn ?? 0) + 1;
+					const checkpoint = await captureTaskTurnCheckpoint({
+						cwd: taskCwd,
+						taskId: body.taskId,
+						turn: nextTurn,
+					});
+					nextSummary = terminalManager.applyTurnCheckpoint(body.taskId, checkpoint) ?? summary;
+				} catch {
+					// Best effort checkpointing only.
+				}
+			}
+			return {
+				ok: true,
+				summary: nextSummary,
+			};
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			return {
+				ok: false,
+				summary: null,
+				error: message,
+			};
+		}
+	};
+
 	const buildTaskDispatchDeps = (workspaceScope: RuntimeTrpcWorkspaceScope): TaskDispatchDeps => {
 		return {
 			workspaceId: workspaceScope.workspaceId,
@@ -194,13 +354,13 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					value: undefined,
 				}));
 			},
-			listTerminalSummaries: async () => {
+			listSessions: async () => {
 				const terminalManager = await deps.getScopedTerminalManager(workspaceScope);
-				return terminalManager.listSummaries();
-			},
-			listClineSummaries: async () => {
 				const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
-				return clineTaskSessionService.listSummaries();
+				return collectTaskDispatchSessions({
+					terminal: terminalManager,
+					clineSummaries: clineTaskSessionService.listSummaries(),
+				});
 			},
 			// B-11.2: review/repair sessions hold model worker slots too; a missing
 			// binding (partial test harness) simply means no review sessions.
@@ -210,10 +370,6 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			},
 			readReceipt: (taskId) => readTaskDeliveryReceipt(taskId),
 			startSession: async ({ taskId, baseRef, prompt, taskTitle }) => {
-				const api = runtimeApiInstance;
-				if (!api) {
-					return { ok: false, error: "Runtime api is not initialized yet." };
-				}
 				const request: RuntimeTaskSessionStartRequest = {
 					taskId,
 					baseRef,
@@ -221,7 +377,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					taskTitle,
 					mode: "act",
 				};
-				const response = await api.startTaskSession(workspaceScope, request);
+				const response = await startTaskSession(workspaceScope, request);
 				return response.ok && response.summary
 					? { ok: true, summary: response.summary }
 					: { ok: false, error: response.error ?? "Task session start failed." };
@@ -608,164 +764,12 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			return response;
 		},
 		startTaskSession: async (workspaceScope, input) => {
-			try {
-				const body = parseTaskSessionStartRequest(input);
-				if (body.resumeFromTrash) {
-					deps.broadcastTaskChatCleared?.(workspaceScope.workspaceId, body.taskId);
-				}
-				const requestedClineTaskMode = body.mode ?? "act";
-				const scopedRuntimeConfig = await deps.loadScopedRuntimeConfig(workspaceScope);
-				const taskCwd = isHomeAgentSessionId(body.taskId)
-					? workspaceScope.workspacePath
-					: await resolveExistingTaskCwdOrEnsure({
-							cwd: workspaceScope.workspacePath,
-							taskId: body.taskId,
-							baseRef: body.baseRef,
-						});
-				const shouldCaptureTurnCheckpoint = !body.resumeFromTrash && !isHomeAgentSessionId(body.taskId);
-
-				// Per-task config source-of-truth precedence:
-				//
-				// agentId resolution (which agent runtime to use):
-				//   1. previousTerminalAgentId — persisted in the terminal session summary from
-				//      the last run; ensures trash-restore resumes with the same agent runtime.
-				//   2. body.agentId — the card's current per-task agent override.
-				//   3. scopedRuntimeConfig.selectedAgentId — the workspace-level default.
-				//
-				// clineSettings (which LLM model and reasoning profile the Cline agent uses):
-				//   Always taken from the card's current override object. There is no
-				//   session-level persistence for these;
-				//   if the user changes the model on the card, the next session launch
-				//   (including trash-restore) uses the updated values.
-				const terminalManager = await deps.getScopedTerminalManager(workspaceScope);
-				const previousTerminalAgentId = body.resumeFromTrash
-					? (terminalManager.getSummary(body.taskId)?.agentId ?? null)
-					: null;
-				const effectiveAgentId = previousTerminalAgentId ?? body.agentId ?? scopedRuntimeConfig.selectedAgentId;
-				let useClinePath = effectiveAgentId === "cline";
-				const shouldProbePersistedClineSession =
-					body.resumeFromTrash && !useClinePath && previousTerminalAgentId === null;
-				if (shouldProbePersistedClineSession) {
-					// If the terminal summary already has a concrete non-Cline agentId,
-					// skip Cline persisted-session probing. That probe can cold-start the
-					// Cline session host and adds multi-second latency to Codex restores.
-					const clineSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
-					const persistedSession = await clineSessionService
-						.rebindPersistedTaskSession(body.taskId)
-						.catch(() => null);
-					if (persistedSession) {
-						useClinePath = true;
-					}
-				}
-
-				if (useClinePath) {
-					const hasTaskLevelClineSettingsOverride = body.clineSettings !== undefined;
-					const clineLaunchConfig = await clineProviderService.resolveLaunchConfig({
-						providerIdOverride: body.clineSettings?.providerId ?? undefined,
-						modelIdOverride: body.clineSettings?.modelId ?? undefined,
-						...(hasTaskLevelClineSettingsOverride
-							? {
-									reasoningEffortOverride: body.clineSettings?.reasoningEffort ?? null,
-								}
-							: {}),
-					});
-					const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
-					const resolvedClineTitle = resolveTaskTitle(body.taskTitle?.trim(), body.prompt);
-					const summary = await clineTaskSessionService.startTaskSession({
-						taskId: body.taskId,
-						cwd: taskCwd,
-						prompt: body.prompt,
-						taskTitle: resolvedClineTitle.length > 0 ? resolvedClineTitle : undefined,
-						images: body.images,
-						resumeFromTrash: body.resumeFromTrash,
-						providerId: clineLaunchConfig.providerId,
-						modelId: clineLaunchConfig.modelId,
-						mode: requestedClineTaskMode,
-						startInPlanMode: body.startInPlanMode,
-						apiKey: clineLaunchConfig.apiKey,
-						baseUrl: clineLaunchConfig.baseUrl,
-						reasoningEffort: clineLaunchConfig.reasoningEffort,
-						contextWindowTokens: clineLaunchConfig.contextWindowTokens,
-						contextWindowSource: clineLaunchConfig.contextWindowSource,
-						compaction: buildClineCompactionConfig({ launchConfig: clineLaunchConfig }),
-						compactionSafetyMarginTokens: clineLaunchConfig.compactionSettings?.safetyMarginTokens,
-					});
-
-					let nextSummary = summary;
-					if (shouldCaptureTurnCheckpoint) {
-						try {
-							const nextTurn = (summary.latestTurnCheckpoint?.turn ?? 0) + 1;
-							const checkpoint = await captureTaskTurnCheckpoint({
-								cwd: taskCwd,
-								taskId: body.taskId,
-								turn: nextTurn,
-							});
-							nextSummary = clineTaskSessionService.applyTurnCheckpoint(body.taskId, checkpoint) ?? summary;
-						} catch {
-							// Best effort checkpointing only.
-						}
-					}
-
-					return {
-						ok: true,
-						summary: nextSummary,
-					};
-				}
-
-				const resolvedConfig =
-					effectiveAgentId !== scopedRuntimeConfig.selectedAgentId
-						? { ...scopedRuntimeConfig, selectedAgentId: effectiveAgentId }
-						: scopedRuntimeConfig;
-				const resolved = resolveAgentCommand(resolvedConfig);
-				if (!resolved) {
-					return {
-						ok: false,
-						summary: null,
-						error: "No runnable agent command is configured. Open Settings, install a supported CLI, and select it.",
-					};
-				}
-				const summary = await terminalManager.startTaskSession({
-					taskId: body.taskId,
-					agentId: resolved.agentId,
-					binary: resolved.binary,
-					args: resolved.args,
-					autonomousModeEnabled: scopedRuntimeConfig.agentAutonomousModeEnabled,
-					cwd: taskCwd,
-					prompt: body.prompt,
-					images: body.images,
-					startInPlanMode: body.startInPlanMode,
-					resumeFromTrash: body.resumeFromTrash,
-					cols: body.cols,
-					rows: body.rows,
-					workspaceId: workspaceScope.workspaceId,
-				});
-
-				let nextSummary = summary;
-				if (shouldCaptureTurnCheckpoint) {
-					try {
-						const nextTurn = (summary.latestTurnCheckpoint?.turn ?? 0) + 1;
-						const checkpoint = await captureTaskTurnCheckpoint({
-							cwd: taskCwd,
-							taskId: body.taskId,
-							turn: nextTurn,
-						});
-						nextSummary = terminalManager.applyTurnCheckpoint(body.taskId, checkpoint) ?? summary;
-					} catch {
-						// Best effort checkpointing only.
-					}
-				}
-				return {
-					ok: true,
-					summary: nextSummary,
-				};
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				return {
-					ok: false,
-					summary: null,
-					error: message,
-				};
+			// B-9: a manual start takes the task over from the queue, clearing any
+			// failed/blocked/exhausted dispatch state it had accumulated.
+			if (!isHomeAgentSessionId(input.taskId)) {
+				await releaseTaskFromDispatchQueue(input.taskId).catch(() => null);
 			}
+			return await startTaskSession(workspaceScope, input);
 		},
 		// B-6.2: start a bounded, fresh-context review session for a task. The
 		// effective review policy comes from the scoped runtime config; the service
@@ -1522,6 +1526,5 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			return await deps.runUpdateNow();
 		},
 	};
-	runtimeApiInstance = runtimeApi;
 	return runtimeApi;
 }

@@ -3,7 +3,7 @@
 // written atomically. A dispatch record is written *before* the session is
 // started and *before* the board mutation, so restart reconciliation can
 // always recover what the queue was doing.
-import { readFile } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { RuntimeTaskDispatchRecord } from "../core/api-contract";
@@ -39,4 +39,9 @@ export async function readTaskDispatchRecord(taskId: string): Promise<RuntimeTas
 
 export async function writeTaskDispatchRecord(record: RuntimeTaskDispatchRecord): Promise<void> {
 	await lockedFileSystem.writeJsonFileAtomic(getTaskDispatchRecordPath(record.taskId), record);
+}
+
+/** Forget a task's dispatch history (a manual start takes the task over from the queue). */
+export async function clearTaskDispatchRecord(taskId: string): Promise<void> {
+	await rm(getTaskDispatchRecordPath(taskId), { force: true });
 }

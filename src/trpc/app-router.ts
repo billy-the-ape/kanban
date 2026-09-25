@@ -6,6 +6,7 @@ import { initTRPC, TRPCError } from "@trpc/server";
 import { z } from "zod";
 
 import type {
+	RuntimeBlockedTaskCleanupsResponse,
 	RuntimeClineAccountBalanceResponse,
 	RuntimeClineAccountOrganizationsResponse,
 	RuntimeClineAccountProfileResponse,
@@ -104,6 +105,7 @@ import type {
 	RuntimeTaskSessionStopResponse,
 	RuntimeTaskWorkspaceInfoRequest,
 	RuntimeTaskWorkspaceInfoResponse,
+	RuntimeTaskWorkspaceMaintenanceReport,
 	RuntimeTaskWorktreeRecoverResponse,
 	RuntimeUpdateStatusResponse,
 	RuntimeWorkspaceChangesRequest,
@@ -119,6 +121,7 @@ import type {
 	RuntimeWorktreeEnsureResponse,
 } from "../core/api-contract";
 import {
+	runtimeBlockedTaskCleanupsResponseSchema,
 	runtimeClineAccountBalanceResponseSchema,
 	runtimeClineAccountOrganizationsResponseSchema,
 	runtimeClineAccountProfileResponseSchema,
@@ -217,6 +220,7 @@ import {
 	runtimeTaskSessionStopResponseSchema,
 	runtimeTaskWorkspaceInfoRequestSchema,
 	runtimeTaskWorkspaceInfoResponseSchema,
+	runtimeTaskWorkspaceMaintenanceReportSchema,
 	runtimeTaskWorktreeRecoverResponseSchema,
 	runtimeUpdateStatusResponseSchema,
 	runtimeWorkspaceChangesRequestSchema,
@@ -420,6 +424,8 @@ export interface RuntimeTrpcContext {
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskPreservationRequest,
 		) => Promise<RuntimeTaskWorktreeRecoverResponse>;
+		runTaskWorkspaceMaintenance: (scope: RuntimeTrpcWorkspaceScope) => Promise<RuntimeTaskWorkspaceMaintenanceReport>;
+		listBlockedTaskCleanups: (scope: RuntimeTrpcWorkspaceScope) => Promise<RuntimeBlockedTaskCleanupsResponse>;
 		loadTaskContext: (
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskWorkspaceInfoRequest,
@@ -810,6 +816,18 @@ export const runtimeAppRouter = t.router({
 			.output(runtimeTaskWorktreeRecoverResponseSchema)
 			.mutation(async ({ ctx, input }) => {
 				return await ctx.workspaceApi.recoverTaskWorktree(ctx.workspaceScope, input);
+			}),
+		// B-5.7/B-5.9: retry blocked trash cleanups, dispose delivered Done
+		// worktrees, and apply preservation retention.
+		runTaskWorkspaceMaintenance: workspaceProcedure
+			.output(runtimeTaskWorkspaceMaintenanceReportSchema)
+			.mutation(async ({ ctx }) => {
+				return await ctx.workspaceApi.runTaskWorkspaceMaintenance(ctx.workspaceScope);
+			}),
+		listBlockedTaskCleanups: workspaceProcedure
+			.output(runtimeBlockedTaskCleanupsResponseSchema)
+			.query(async ({ ctx }) => {
+				return await ctx.workspaceApi.listBlockedTaskCleanups(ctx.workspaceScope);
 			}),
 		getTaskContext: workspaceProcedure
 			.input(runtimeTaskWorkspaceInfoRequestSchema)
