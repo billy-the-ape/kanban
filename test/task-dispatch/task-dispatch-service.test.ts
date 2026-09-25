@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-
+import { baseTaskIdForReviewSessionId } from "../../src/cline-sdk/cline-review-session-service";
 import type { RuntimeConfigState } from "../../src/config/runtime-config";
 import type {
 	RuntimeAgentId,
@@ -21,6 +21,7 @@ import type {
 import { readTaskDispatchRecord, writeTaskDispatchRecord } from "../../src/task-dispatch/dispatch-records";
 import {
 	buildFreshDispatchPrompt,
+	collectTaskDispatchSessions,
 	dispatchReadyTasks,
 	getActiveWorkerTaskIds,
 	getTaskDispatchStatus,
@@ -136,6 +137,7 @@ function createReceipt(
 		reviewOutcome: null,
 		verificationPassed: null,
 		candidateTreeHash: null,
+		combinedVerificationPassed: null,
 		pr: null,
 		evidence: [],
 		attempt: 1,
@@ -488,6 +490,114 @@ describe("getActiveWorkerTaskIds", () => {
 			board,
 		);
 		expect(ids).toEqual([]);
+	});
+});
+
+describe("B-11 shared worker budget", () => {
+	// A review/repair session runs for a card sitting in review; it holds that
+	// card's worker slot. "b" depends on the delivered "d" and is ready.
+	const createBudgetBoard = (extra: Partial<Record<RuntimeBoardColumnId, RuntimeBoardCard[]>> = {}) =>
+		createBoard({
+			cardsByColumn: {
+				backlog: [createCard("b"), ...(extra.backlog ?? [])],
+				in_progress: extra.in_progress ?? [],
+				review: [createCard("a"), ...(extra.review ?? [])],
+				done: [createCard("d")],
+			},
+			dependencies: [
+				createDependency("dep-b-d", "b", "d"),
+				...(extra.backlog ?? []).map((card) => createDependency(`dep-${card.id}-d`, card.id, "d")),
+			],
+		});
+	const deliveredReceipts = () => new Map([["d", createReceipt("d", "delivered")]]);
+	/** Review sessions as the runtime reports them (scoped to their base task). */
+	const reviewSessions = (...sessionIds: string[]) =>
+		collectTaskDispatchSessions({
+			terminal: { listSummaries: () => [], hasActiveProcess: () => false },
+			clineSummaries: [],
+			reviewSummaries: sessionIds.map((sessionId) => createSummary(sessionId, "running")),
+		});
+
+	it("scopes review and repair sessions to their base task", () => {
+		const sessions = reviewSessions("a::review", "a::verification-repair-1");
+		expect(sessions.map((session) => session.summary.taskId)).toEqual(["a", "a"]);
+		expect(sessions.every((session) => session.live)).toBe(true);
+	});
+
+	it("counts a running review session against the shared worker budget", async () => {
+		const { deps, startedTasks } = createTestDeps({
+			board: createBudgetBoard(),
+			receipts: deliveredReceipts(),
+			sessions: reviewSessions("a::review"),
+		});
+		const response = await dispatchReadyTasks(deps);
+		expect(response.dispatchedTaskId).toBeNull();
+		expect(response.skippedReason).toBe("worker_busy");
+		expect(startedTasks).toHaveLength(0);
+	});
+
+	it("counts review sessions for distinct tasks as distinct slots", async () => {
+		const board = createBudgetBoard({ in_progress: [createCard("w")], backlog: [createCard("c")] });
+		const sessions = [liveSession("w"), ...reviewSessions("a::review")];
+		const { deps, startedTasks } = createTestDeps({
+			board,
+			receipts: deliveredReceipts(),
+			workerLimit: 2,
+			sessions,
+		});
+		const response = await dispatchReadyTasks(deps);
+		// Two distinct holders (w + a) fill a limit of 2 → the ready tasks wait.
+		expect(response.dispatchedTaskId).toBeNull();
+		expect(response.skippedReason).toBe("worker_busy");
+		expect(startedTasks).toHaveLength(0);
+
+		// With a limit of 3, one slot is free and the first ready task dispatches.
+		const open = createTestDeps({ board, receipts: deliveredReceipts(), workerLimit: 3, sessions });
+		const second = await dispatchReadyTasks(open.deps);
+		expect(second.dispatchedTaskId).toBe("b");
+		expect(open.startedTasks.map((task) => task.taskId)).toEqual(["b"]);
+	});
+
+	it("counts a task and its own review/repair sessions as a single slot", async () => {
+		const board = createBudgetBoard();
+		const sessions = [
+			liveSession("a", "awaiting_review"),
+			...reviewSessions("a::review", "a::verification-repair-1"),
+		];
+		// One holder (a) → the single slot is full even though three sessions exist.
+		const full = createTestDeps({ board, receipts: deliveredReceipts(), sessions });
+		const busy = await dispatchReadyTasks(full.deps);
+		expect(busy.skippedReason).toBe("worker_busy");
+		expect(full.startedTasks).toHaveLength(0);
+
+		// A second free slot dispatches the ready task.
+		const open = createTestDeps({ board, receipts: deliveredReceipts(), workerLimit: 2, sessions });
+		const dispatched = await dispatchReadyTasks(open.deps);
+		expect(dispatched.dispatchedTaskId).toBe("b");
+	});
+
+	it("reports every active worker task (including review sessions) in the dispatch status", async () => {
+		const { deps } = createTestDeps({
+			board: createBudgetBoard({ in_progress: [createCard("w")] }),
+			receipts: deliveredReceipts(),
+			sessions: [liveSession("w"), ...reviewSessions("a::review")],
+		});
+		const status = await getTaskDispatchStatus(deps);
+		expect(status.activeWorkerTaskId).toBe("w");
+		expect(status.activeWorkerTaskIds).toEqual(["w", "a"]);
+	});
+});
+
+describe("baseTaskIdForReviewSessionId", () => {
+	it("maps review session ids to their base task id", () => {
+		expect(baseTaskIdForReviewSessionId("task-1::review")).toBe("task-1");
+		expect(baseTaskIdForReviewSessionId("task-1::verification-repair-1")).toBe("task-1");
+		expect(baseTaskIdForReviewSessionId("task-1::verification-repair-12")).toBe("task-1");
+	});
+
+	it("returns null for non-review session ids", () => {
+		expect(baseTaskIdForReviewSessionId("task-1")).toBeNull();
+		expect(baseTaskIdForReviewSessionId("__home_agent__:ws:cline")).toBeNull();
 	});
 });
 

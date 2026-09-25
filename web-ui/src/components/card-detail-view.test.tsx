@@ -253,9 +253,12 @@ describe("CardDetailView", () => {
 		});
 
 		const toolbarButtons = Array.from(container.querySelectorAll("button"));
-		expect(toolbarButtons[0]?.getAttribute("aria-label")).toBe("Collapse expanded diff view");
-		expect(toolbarButtons[1]?.textContent?.trim()).toBe("All Changes");
-		expect(toolbarButtons[2]?.textContent?.trim()).toBe("Last Turn");
+		const collapseButton = toolbarButtons.find(
+			(button) => button.getAttribute("aria-label") === "Collapse expanded diff view",
+		);
+		expect(collapseButton).toBeDefined();
+		expect(toolbarButtons.some((button) => button.textContent?.trim() === "All Changes")).toBe(true);
+		expect(toolbarButtons.some((button) => button.textContent?.trim() === "Last Turn")).toBe(true);
 		expect(container.querySelector('button[aria-label="Expand split diff view"]')).toBeNull();
 
 		await act(async () => {

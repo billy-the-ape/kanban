@@ -76,6 +76,14 @@ function createRuntimeConfigResponse(
 		verification: null,
 		gitDeliveryPolicy: null,
 		taskDispatchPolicy: null,
+		reliableCompletion: {
+			enabled: false,
+			reviewRequired: false,
+			checksRequired: false,
+			pushRequired: false,
+			dispatchEnabled: false,
+			workerLimit: 1,
+		},
 	};
 }
 

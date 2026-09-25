@@ -9,11 +9,12 @@ import {
 	type SnapDragActions,
 } from "@hello-pangea/dnd";
 import type { ReactNode } from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { BoardColumn } from "@/components/board-column";
 import { DependencyOverlay } from "@/components/dependencies/dependency-overlay";
 import { useDependencyLinking } from "@/components/dependencies/use-dependency-linking";
+import { useTaskPhases } from "@/hooks/use-task-phases";
 import type { RuntimeTaskSessionSummary } from "@/runtime/types";
 import { canCreateTaskDependency } from "@/state/board-state";
 import { findCardColumnId, type ProgrammaticCardMoveInFlight } from "@/state/drag-rules";
@@ -57,6 +58,7 @@ export function KanbanBoard({
 	onRequestProgrammaticCardMoveReady,
 	workspacePath,
 	defaultClineModelId,
+	workspaceId,
 }: {
 	data: BoardData;
 	taskSessions: Record<string, RuntimeTaskSessionSummary>;
@@ -87,6 +89,8 @@ export function KanbanBoard({
 	onRequestProgrammaticCardMoveReady?: (requestMove: RequestProgrammaticCardMove | null) => void;
 	workspacePath?: string | null;
 	defaultClineModelId?: string | null;
+	/** B-10.1: workspace scope for the batched phase query (null disables chips). */
+	workspaceId?: string | null;
 }): React.ReactElement {
 	const dragOccurredRef = useRef(false);
 	const boardRef = useRef<HTMLElement>(null);
@@ -106,6 +110,25 @@ export function KanbanBoard({
 	useEffect(() => {
 		latestDataRef.current = data;
 	}, [data]);
+
+	// B-10.1: batched phase summaries for the board chips. The fingerprint
+	// (task ids + updatedAt per column + each card's session state) changes on
+	// any board mutation or session transition, so the chip data re-queries in
+	// lockstep; useTaskPhases polls for delivery progress in between.
+	const boardTaskIds = useMemo(() => data.columns.flatMap((column) => column.cards.map((card) => card.id)), [data]);
+	const boardPhaseFingerprint = useMemo(
+		() =>
+			data.columns
+				.map(
+					(column) =>
+						`${column.id}:${column.cards
+							.map((card) => `${card.id}:${card.updatedAt}:${taskSessions[card.id]?.state ?? ""}`)
+							.join("|")}`,
+				)
+				.join(";"),
+		[data, taskSessions],
+	);
+	const { phases: taskPhases } = useTaskPhases(workspaceId ?? null, boardTaskIds, boardPhaseFingerprint);
 
 	const programmaticSensor: Sensor = useCallback((api: SensorAPI) => {
 		sensorApiRef.current = api;
@@ -422,6 +445,7 @@ export function KanbanBoard({
 						isDependencyLinking={dependencyLinking.draft !== null}
 						workspacePath={workspacePath}
 						defaultClineModelId={defaultClineModelId}
+						taskPhases={taskPhases}
 						onCardClick={(card) => {
 							if (!dragOccurredRef.current) {
 								onCardSelect(card.id);

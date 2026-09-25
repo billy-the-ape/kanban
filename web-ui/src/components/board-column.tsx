@@ -5,7 +5,7 @@ import type { MouseEvent as ReactMouseEvent, ReactNode } from "react";
 import { BoardCard } from "@/components/board-card";
 import { Button } from "@/components/ui/button";
 import { ColumnIndicator } from "@/components/ui/column-indicator";
-import type { RuntimeTaskSessionSummary } from "@/runtime/types";
+import type { RuntimeTaskPhaseSummary, RuntimeTaskSessionSummary } from "@/runtime/types";
 import { isCardDropDisabled, type ProgrammaticCardMoveInFlight } from "@/state/drag-rules";
 import type { BoardCard as BoardCardModel, BoardColumnId, BoardColumn as BoardColumnModel } from "@/types";
 
@@ -42,6 +42,7 @@ export function BoardColumn({
 	isDependencyLinking,
 	workspacePath,
 	defaultClineModelId,
+	taskPhases,
 }: {
 	column: BoardColumnModel;
 	taskSessions: Record<string, RuntimeTaskSessionSummary>;
@@ -75,6 +76,8 @@ export function BoardColumn({
 	isDependencyLinking?: boolean;
 	workspacePath?: string | null;
 	defaultClineModelId?: string | null;
+	/** B-10.1: reliable-completion phase summaries for the board chips. */
+	taskPhases?: Record<string, RuntimeTaskPhaseSummary>;
 }): React.ReactElement {
 	const canCreate = column.id === "backlog" && onCreateTask;
 	const canStartAllTasks = column.id === "backlog" && onStartAllTasks;
@@ -178,6 +181,7 @@ export function BoardColumn({
 											index={draggableIndex}
 											columnId={column.id}
 											sessionSummary={taskSessions[card.id]}
+											phaseSummary={taskPhases?.[card.id]}
 											onStart={onStartTask}
 											onMoveToTrash={onMoveToTrashTask}
 											onComplete={onCompleteTask}

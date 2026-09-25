@@ -643,7 +643,7 @@ export default function App(): ReactElement {
 			return;
 		}
 		const selection = findCardSelection(board, pendingTaskStartAfterEditId);
-		if (!selection || selection.column.id !== "backlog") {
+		if (selection?.column.id !== "backlog") {
 			return;
 		}
 		handleStartTaskFromBoard(pendingTaskStartAfterEditId);
@@ -942,6 +942,7 @@ export default function App(): ReactElement {
 												data={board}
 												taskSessions={sessions}
 												workspacePath={workspacePath}
+												workspaceId={currentProjectId}
 												onCardSelect={handleCardSelect}
 												onCreateTask={handleOpenCreateTask}
 												onStartTask={handleStartTaskFromBoard}

@@ -10,6 +10,7 @@
 // recover in-flight work (B-9.6), and failed launches retry with a bounded
 // attempt cap (B-9.7).
 import { join } from "node:path";
+import { baseTaskIdForReviewSessionId } from "../cline-sdk/cline-review-session-service";
 import type { RuntimeConfigState } from "../config/runtime-config";
 import type {
 	RuntimeBoardCard,
@@ -73,10 +74,12 @@ export interface TaskDispatchSessionSnapshot {
 }
 
 /**
- * Build session snapshots from the runtime's two session sources. Terminal
+ * Build session snapshots from the runtime's session sources. Terminal
  * summaries include ones hydrated from disk at startup, which have no process
  * behind them. Cline summaries only exist in memory, so a running Cline
- * summary is a turn running in this runtime.
+ * summary is a turn running in this runtime. B-11.2: review/repair sessions
+ * are in-memory Cline sessions too and hold the base task's worker slot, so
+ * they are scoped to the base task id.
  */
 export function collectTaskDispatchSessions(input: {
 	terminal: {
@@ -84,6 +87,7 @@ export function collectTaskDispatchSessions(input: {
 		hasActiveProcess: (taskId: string) => boolean;
 	};
 	clineSummaries: RuntimeTaskSessionSummary[];
+	reviewSummaries?: RuntimeTaskSessionSummary[];
 }): TaskDispatchSessionSnapshot[] {
 	return [
 		...input.terminal.listSummaries().map((summary) => ({
@@ -91,7 +95,17 @@ export function collectTaskDispatchSessions(input: {
 			live: input.terminal.hasActiveProcess(summary.taskId),
 		})),
 		...input.clineSummaries.map((summary) => ({ summary, live: summary.state === "running" })),
+		...(input.reviewSummaries ?? []).map((summary) => ({
+			summary: scopeReviewSessionSummary(summary),
+			live: summary.state === "running",
+		})),
 	];
+}
+
+/** B-11.2: scope a review session summary to the base task holding the worker slot. */
+function scopeReviewSessionSummary(summary: RuntimeTaskSessionSummary): RuntimeTaskSessionSummary {
+	const baseTaskId = baseTaskIdForReviewSessionId(summary.taskId);
+	return baseTaskId === null ? summary : { ...summary, taskId: baseTaskId };
 }
 
 export interface TaskDispatchDeps {
@@ -930,6 +944,7 @@ export async function getTaskDispatchStatus(deps: TaskDispatchDeps): Promise<Run
 		enabled: policy.enabled,
 		workerLimit: policy.workerLimit,
 		activeWorkerTaskId: activeWorkers[0] ?? null,
+		activeWorkerTaskIds: activeWorkers,
 		readyTasks: readiness.filter((entry) => entry.ready).map((entry) => toTaskView(board, entry, null)),
 		blockedTasks: readiness
 			.filter((entry) => !entry.ready)

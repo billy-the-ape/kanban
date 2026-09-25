@@ -3,7 +3,7 @@
 // stopping native Cline sessions without exposing SDK details upstream.
 import type { RuntimeClineReasoningEffort, RuntimeTaskImage, RuntimeTaskSessionMode } from "../core/api-contract";
 import { createClineCompactionBeforeModelHook } from "./cline-compaction-before-model-hook";
-import { createClineCompactionCompactCallback } from "./cline-compaction-callback";
+import { type ClineCompactionObservedInfo, createClineCompactionCompactCallback } from "./cline-compaction-callback";
 import type { ClineCompactionConfig } from "./cline-compaction-config";
 import {
 	buildClineCompactionConfig,
@@ -227,6 +227,13 @@ export interface CreateInMemoryClineSessionRuntimeOptions {
 	 * workspace user-instruction service and custom tool approval.
 	 */
 	resolveWorkspaceRuntime?: ClineWorkspaceRuntimeResolver;
+	/**
+	 * B-10.4: observer notified when a compaction actually changed a
+	 * session's transcript (the hub `compact` callback or the local
+	 * beforeModel hook). Never called for no-op compactions; a throwing
+	 * observer cannot break the compaction pipeline.
+	 */
+	onCompactionObserved?: (taskId: string, info: ClineCompactionObservedInfo) => void;
 }
 
 // Best-effort: write the Kanban task title to the SDK session metadata so external session
@@ -259,6 +266,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 	private readonly mcpToolBundleByTaskId = new Map<string, ClineMcpToolBundle>();
 	private readonly resolveClineLaunchConfig: ClineLaunchConfigResolver | null;
 	private readonly resolveWorkspaceRuntime: ClineWorkspaceRuntimeResolver | null;
+	private readonly onCompactionObserved: ((taskId: string, info: ClineCompactionObservedInfo) => void) | null;
 	private sessionHostPromise: Promise<ClineSessionHostBoundary> | null = null;
 
 	constructor(options: CreateInMemoryClineSessionRuntimeOptions = {}) {
@@ -266,6 +274,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		this.createSessionHost = options.createSessionHost ?? createClineSdkSessionHost;
 		this.resolveClineLaunchConfig = options.resolveClineLaunchConfig ?? null;
 		this.resolveWorkspaceRuntime = options.resolveWorkspaceRuntime ?? null;
+		this.onCompactionObserved = options.onCompactionObserved ?? null;
 		const createMcpRuntimeService = options.createMcpRuntimeService ?? createClineMcpRuntimeService;
 		this.clineMcpRuntimeService = createMcpRuntimeService();
 	}
@@ -391,6 +400,8 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 					outputReserveTokens: request.compaction.reserveTokens ?? CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT,
 					safetyMarginTokens: request.compactionSafetyMarginTokens,
 					logger: sessionLogger,
+					// B-10.4: observe proactive (local-mode) compactions.
+					onCompacted: (info) => this.onCompactionObserved?.(request.taskId, info),
 				}),
 				afterTool: createClineToolResultBoundingHook({
 					taskId: request.taskId,
@@ -442,7 +453,16 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 					// undefined would mean NO compaction), and is registered as a
 					// session capability so it also applies in hub mode.
 					...(effectiveCompaction
-						? { compaction: { compact: createClineCompactionCompactCallback(sessionLogger) } }
+						? {
+								compaction: {
+									// B-10.4: observe SDK-triggered (hub-mode)
+									// compactions through the same observer as
+									// the local-mode beforeModel hook.
+									compact: createClineCompactionCompactCallback(sessionLogger, {
+										onCompacted: (info) => this.onCompactionObserved?.(request.taskId, info),
+									}),
+								},
+							}
 						: {}),
 					...(hasMcpExtraTools ? { extraTools: mcpToolBundle?.tools ?? [] } : {}),
 				},

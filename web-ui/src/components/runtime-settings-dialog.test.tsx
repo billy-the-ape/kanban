@@ -208,6 +208,14 @@ const savedClineOauthConfig = {
 		oauthAccountId: "acc-1",
 		oauthExpiresAt: 1_800_000_000_000,
 	},
+	reliableCompletion: {
+		enabled: false,
+		reviewRequired: false,
+		checksRequired: false,
+		pushRequired: false,
+		dispatchEnabled: false,
+		workerLimit: 1,
+	},
 } as unknown as RuntimeConfigResponse;
 
 describe("RuntimeSettingsDialog", () => {

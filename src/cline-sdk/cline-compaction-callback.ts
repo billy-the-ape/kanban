@@ -67,6 +67,26 @@ export interface CompactClineConversationMessagesResult {
 	tokensAfter: number;
 }
 
+/** B-10.4: observable facts about a compaction that actually changed messages. */
+export interface ClineCompactionObservedInfo {
+	messagesBefore: number;
+	messagesAfter: number;
+	/** Estimated chars/4 message tokens before compaction. */
+	tokensBefore: number;
+	/** Estimated chars/4 message tokens after compaction. */
+	tokensAfter: number;
+}
+
+/**
+ * B-10.4: options for the compact callback factory. The observer is notified
+ * after the callback ran when the compaction actually changed the transcript.
+ * It must never throw — the callback wraps the notification defensively so a
+ * failing observer cannot break the compaction pipeline.
+ */
+export interface ClineCompactionHookOptions {
+	onCompacted?: (info: ClineCompactionObservedInfo) => void;
+}
+
 export function compactClineConversationMessages(
 	inputMessages: readonly ClineSdkPersistedMessage[],
 	targetTokens: number,
@@ -219,11 +239,28 @@ export function compactClineConversationMessages(
  * fallback), so it always returns a `{ messages }` array (possibly unchanged
  * when the estimates already fit the target).
  */
-export function createClineCompactionCompactCallback(logger?: ClineSdkBasicLogger) {
+export function createClineCompactionCompactCallback(
+	logger?: ClineSdkBasicLogger,
+	options: ClineCompactionHookOptions = {},
+) {
 	return function compactClineSessionMessages(context: ClineSdkCompactionContext): ClineSdkCompactionResult {
 		const target = Math.max(1, Math.min(context.triggerTokens, context.contextWindowTokens));
-		const { messages } = compactClineConversationMessages(context.messages, target, { logger });
-		return { messages };
+		const result = compactClineConversationMessages(context.messages, target, { logger });
+		if (result.changed && options.onCompacted) {
+			// B-10.4: notify after the result is settled; a failing observer
+			// must never break the compaction pipeline.
+			try {
+				options.onCompacted({
+					messagesBefore: context.messages.length,
+					messagesAfter: result.messages.length,
+					tokensBefore: result.tokensBefore,
+					tokensAfter: result.tokensAfter,
+				});
+			} catch {
+				// Intentionally swallowed (see ClineCompactionHookOptions).
+			}
+		}
+		return { messages: result.messages };
 	};
 }
 

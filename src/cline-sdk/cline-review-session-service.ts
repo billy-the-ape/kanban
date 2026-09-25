@@ -63,6 +63,22 @@ export function reviewSessionIdForTask(taskId: string): string {
 	return `${taskId}${REVIEW_SESSION_SUFFIX}`;
 }
 
+/**
+ * B-11.2: the base task id for a review session id (review or
+ * verification-repair sessions); null for plain task sessions. Review work
+ * holds the base task's model worker slot, so budgets scope sessions by it.
+ */
+export function baseTaskIdForReviewSessionId(sessionId: string): string | null {
+	if (sessionId.endsWith(REVIEW_SESSION_SUFFIX)) {
+		return sessionId.slice(0, -REVIEW_SESSION_SUFFIX.length);
+	}
+	const repairIndex = sessionId.indexOf(VERIFICATION_REPAIR_SESSION_SUFFIX);
+	if (repairIndex > 0) {
+		return sessionId.slice(0, repairIndex);
+	}
+	return null;
+}
+
 /** B-6: the evidence a review run needs, abstracted for unit testing. */
 export interface ClineReviewEvidencePort {
 	loadTaskBaseRef(taskId: string): Promise<string | null>;
@@ -87,6 +103,11 @@ export interface ClineReviewStartInput extends RuntimeTaskReviewStartRequest {
 
 export interface ClineReviewSessionService {
 	startTaskReview(input: ClineReviewStartInput): Promise<RuntimeTaskReviewStartResponse>;
+	/**
+	 * B-11.2: live review/repair sessions. Their ids are `<taskId>::review` /
+	 * `<taskId>::verification-repair-N`; the base task ids hold worker slots.
+	 */
+	listSessionSummaries(): RuntimeTaskSessionSummary[];
 	getReviewInfo(taskId: string): Promise<RuntimeTaskReviewInfoResponse>;
 	dispose(): Promise<void>;
 }
@@ -202,6 +223,11 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 		this.verificationRunner = options.verificationRunner;
 		this.isTaskWriterActive = options.isTaskWriterActive;
 		this.turnTimeoutMs = options.turnTimeoutMs;
+	}
+
+	/** B-11.2: live review/repair sessions (they hold the base tasks' worker slots). */
+	listSessionSummaries(): RuntimeTaskSessionSummary[] {
+		return this.sessionService.listSummaries();
 	}
 
 	async startTaskReview(input: ClineReviewStartInput): Promise<RuntimeTaskReviewStartResponse> {

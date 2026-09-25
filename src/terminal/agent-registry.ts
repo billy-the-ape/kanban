@@ -6,6 +6,7 @@ import type {
 	RuntimeClineProviderSettings,
 	RuntimeConfigResponse,
 	RuntimeEffectiveContextWindow,
+	RuntimeReliableCompletionStatus,
 } from "../core/api-contract";
 import { isBinaryAvailableOnPath } from "./command-discovery";
 
@@ -99,6 +100,30 @@ export function resolveAgentCommand(runtimeConfig: RuntimeConfigState): Resolved
 	return null;
 }
 
+/**
+ * B-10.6: derive the reliable-completion pipeline status from the underlying
+ * policies so file edits and the settings toggle can never disagree.
+ * `enabled` is true only when every gate is on: required review, required
+ * checks (an "off" gate or an empty check list both count as not required),
+ * required push, and enabled dispatch.
+ */
+export function deriveReliableCompletionStatus(runtimeConfig: RuntimeConfigState): RuntimeReliableCompletionStatus {
+	const reviewRequired = runtimeConfig.reviewPolicy?.enabled === "required";
+	const checksRequired =
+		runtimeConfig.verification?.enabled === "required" && (runtimeConfig.verification?.checks.length ?? 0) > 0;
+	const pushRequired =
+		runtimeConfig.gitDeliveryPolicy?.enabled === true && runtimeConfig.gitDeliveryPolicy?.pushRequired === true;
+	const dispatchEnabled = runtimeConfig.taskDispatchPolicy?.enabled === true;
+	return {
+		enabled: reviewRequired && checksRequired && pushRequired && dispatchEnabled,
+		reviewRequired,
+		checksRequired,
+		pushRequired,
+		dispatchEnabled,
+		workerLimit: runtimeConfig.taskDispatchPolicy?.workerLimit ?? 1,
+	};
+}
+
 export function buildRuntimeConfigResponse(
 	runtimeConfig: RuntimeConfigState,
 	clineProviderSettings: RuntimeClineProviderSettings,
@@ -134,6 +159,7 @@ export function buildRuntimeConfigResponse(
 		verification: runtimeConfig.verification ?? null,
 		gitDeliveryPolicy: runtimeConfig.gitDeliveryPolicy ?? null,
 		taskDispatchPolicy: runtimeConfig.taskDispatchPolicy ?? null,
+		reliableCompletion: deriveReliableCompletionStatus(runtimeConfig),
 		effectiveContextWindow: extra.effectiveContextWindow ?? null,
 	};
 }

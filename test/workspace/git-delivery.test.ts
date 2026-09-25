@@ -2,15 +2,18 @@
 // temporary git repositories (detached task worktree + bare remote). The model
 // is not involved at all: commit messages fall back to the deterministic
 // task-title form, which is exactly the property B-8 requires.
-import { mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
 import type { RuntimeGitDeliveryPolicy, RuntimeReviewHandoffArtifact } from "../../src/core/api-contract";
+import { getTaskWorktreesHomePath } from "../../src/state/workspace-state";
 import {
 	evaluateDependentsUnlock,
 	type GhCommandResult,
+	type GitDeliveryCombinedVerificationInput,
 	type GitDeliveryCommandResult,
 	type GitDeliveryRunner,
 	GitDeliveryService,
@@ -125,6 +128,35 @@ function deliveryPolicy(overrides: Partial<RuntimeGitDeliveryPolicy> = {}): Runt
 		pullRequestBaseBranch: null,
 		...overrides,
 	};
+}
+
+/**
+ * B-11: simulate a parallel delivery — advance the destination branch past the
+ * task's recorded base with a real commit (through a disposable worktree), so
+ * the destination has diverged from the task's base by the time this task
+ * integrates. Returns the new destination sha.
+ */
+async function advanceDestinationParallel(
+	fixture: DeliveryFixture,
+	filePath: string,
+	content: string,
+): Promise<string> {
+	const parallel = createTempDir("kanban-git-delivery-parallel-");
+	try {
+		const add = await runGit(fixture.repoPath, ["worktree", "add", "--detach", parallel.path, "feature/b8"]);
+		expect(add.ok).toBe(true);
+		await writeFile(join(parallel.path, filePath), content, "utf8");
+		await runGit(parallel.path, ["add", filePath]);
+		const commit = await runGit(parallel.path, ["commit", "-m", "parallel work"]);
+		expect(commit.ok).toBe(true);
+		const sha = (await runGit(parallel.path, ["rev-parse", "HEAD"])).stdout;
+		const move = await runGit(fixture.repoPath, ["branch", "-f", "feature/b8", sha]);
+		expect(move.ok).toBe(true);
+		return sha;
+	} finally {
+		await runGit(fixture.repoPath, ["worktree", "remove", "--force", parallel.path]).catch(() => undefined);
+		parallel.cleanup();
+	}
 }
 
 describe("GitDeliveryService", () => {
@@ -292,13 +324,14 @@ describe("GitDeliveryService", () => {
 		}
 	});
 
-	it("pauses with evidence when the destination advanced past the recorded base", async () => {
+	it("integrates when the destination advanced past the recorded base (B-11: diverged, no pause)", async () => {
 		const fixture = await createDeliveryFixture();
 		const destWorktree = createTempDir("kanban-git-delivery-dest-");
 		try {
 			await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
 			await persistFixtureHandoff(fixture, "task-diverge");
-			// advance the destination branch past the recorded base
+			// The destination branch is checked out (clean) and advanced past the
+			// recorded base — a parallel delivery landed first.
 			await runGit(fixture.repoPath, ["worktree", "add", destWorktree.path, "feature/b8"]);
 			await writeFile(join(destWorktree.path, "advance.txt"), "advance\n", "utf8");
 			await runGit(destWorktree.path, ["add", "advance.txt"]);
@@ -315,14 +348,19 @@ describe("GitDeliveryService", () => {
 				policy: deliveryPolicy(),
 			});
 
-			expect(response.ok).toBe(false);
-			expect(response.receipt?.status).toBe("paused");
-			expect(response.receipt?.stage).toBe("committed");
-			expect(response.error).toContain("recorded base");
-			// the task work is preserved (committed + durable ref), the destination is untouched
-			expect(response.receipt?.taskCommitSha).toMatch(/^[0-9a-f]{40}$/);
+			// B-11: a diverged destination is integrated instead of pausing; the
+			// parallel advance stays in history below the cherry-picked task work.
+			expect(response.ok).toBe(true);
+			expect(response.receipt?.status).toBe("delivered");
+			expect(response.receipt?.combinedVerificationPassed).toBeNull();
 			const destSha = (await runGit(fixture.repoPath, ["rev-parse", "refs/heads/feature/b8"])).stdout;
-			expect(destSha).toBe(advancedSha);
+			expect(destSha).not.toBe(advancedSha);
+			expect((await runGit(fixture.repoPath, ["rev-parse", `${destSha}^`])).stdout).toBe(advancedSha);
+			expect((await runGit(fixture.repoPath, ["show", `${destSha}:task.txt`])).stdout).toBe("task work");
+			expect((await runGit(fixture.repoPath, ["show", `${destSha}:advance.txt`])).stdout).toBe("advance");
+			// The checked-out destination is fast-forwarded in place, so the
+			// user's worktree stays consistent with the branch tip.
+			expect((await runGit(destWorktree.path, ["rev-parse", "HEAD"])).stdout).toBe(destSha);
 		} finally {
 			destWorktree.cleanup();
 			fixture.cleanup();
@@ -876,5 +914,290 @@ describe("GitDeliveryService", () => {
 		const locked = evaluateDependentsUnlock(deliveryPolicy(), null);
 		expect(locked.allowed).toBe(false);
 		expect(locked.reason).toMatch(/not been delivered/);
+	});
+
+	describe("B-11 parallel execution", () => {
+		it("integrates a diverged destination via cherry-pick in a clean integration worktree (fast_forward)", async () => {
+			const fixture = await createDeliveryFixture();
+			try {
+				await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
+				await persistFixtureHandoff(fixture, "task-b11-cp");
+				await writeFile(join(fixture.worktreePath, "fileA.txt"), "task work\n", "utf8");
+				const parallelSha = await advanceDestinationParallel(fixture, "fileB.txt", "parallel work\n");
+
+				const response = await new GitDeliveryService().startDelivery({
+					taskId: "task-b11-cp",
+					workspaceId: "workspace-1",
+					repoPath: fixture.repoPath,
+					worktreePath: fixture.worktreePath,
+					baseRef: "main",
+					policy: deliveryPolicy(),
+				});
+
+				expect(response.ok).toBe(true);
+				const receipt = response.receipt;
+				expect(receipt?.status).toBe("delivered");
+				// No verification seam was provided, so nothing ran.
+				expect(receipt?.combinedVerificationPassed).toBeNull();
+				// The destination advanced to a new combined commit cherry-picked
+				// on top of the parallel work (the task commit itself is not the tip).
+				const destSha = (await runGit(fixture.repoPath, ["rev-parse", "refs/heads/feature/b8"])).stdout;
+				expect(destSha).not.toBe(parallelSha);
+				expect(destSha).not.toBe(receipt?.taskCommitSha);
+				expect((await runGit(fixture.repoPath, ["rev-parse", `${destSha}^`])).stdout).toBe(parallelSha);
+				// Both work sets are present in the combined tree.
+				expect((await runGit(fixture.repoPath, ["show", `${destSha}:fileA.txt`])).stdout).toBe("task work");
+				expect((await runGit(fixture.repoPath, ["show", `${destSha}:fileB.txt`])).stdout).toBe("parallel work");
+				// The push followed the combined tip.
+				const remoteSha = (await runGit(fixture.remotePath, ["rev-parse", "refs/heads/feature/b8"])).stdout;
+				expect(remoteSha).toBe(destSha);
+				// The disposable integration worktree is always cleaned up.
+				const worktreeList = await runGit(fixture.repoPath, ["worktree", "list", "--porcelain"]);
+				expect(worktreeList.stdout).not.toContain("kanban-integration");
+			} finally {
+				fixture.cleanup();
+			}
+		});
+
+		it("integrates a diverged destination as a no-ff merge commit (merge strategy)", async () => {
+			const fixture = await createDeliveryFixture();
+			try {
+				await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
+				await persistFixtureHandoff(fixture, "task-b11-merge");
+				await writeFile(join(fixture.worktreePath, "fileA.txt"), "task work\n", "utf8");
+				const parallelSha = await advanceDestinationParallel(fixture, "fileB.txt", "parallel work\n");
+
+				const response = await new GitDeliveryService().startDelivery({
+					taskId: "task-b11-merge",
+					workspaceId: "workspace-1",
+					repoPath: fixture.repoPath,
+					worktreePath: fixture.worktreePath,
+					baseRef: "main",
+					policy: deliveryPolicy({ integrationStrategy: "merge" }),
+				});
+
+				expect(response.ok).toBe(true);
+				expect(response.receipt?.status).toBe("delivered");
+				const destSha = (await runGit(fixture.repoPath, ["rev-parse", "refs/heads/feature/b8"])).stdout;
+				// A real merge commit: both the parallel work and the task commit are parents.
+				const parents = (await runGit(fixture.repoPath, ["rev-list", "--parents", "-1", destSha])).stdout
+					.trim()
+					.split(/\s+/);
+				expect(parents[1]).toBe(parallelSha);
+				expect(parents[2]).toBe(response.receipt?.taskCommitSha);
+				expect((await runGit(fixture.repoPath, ["show", `${destSha}:fileA.txt`])).stdout).toBe("task work");
+				expect((await runGit(fixture.repoPath, ["show", `${destSha}:fileB.txt`])).stdout).toBe("parallel work");
+			} finally {
+				fixture.cleanup();
+			}
+		});
+
+		it("pauses delivery with the conflict as an operator action when the parallel integration conflicts", async () => {
+			const fixture = await createDeliveryFixture();
+			try {
+				await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
+				await persistFixtureHandoff(fixture, "task-b11-conflict");
+				// Both the task and the parallel work modify the same line.
+				await writeFile(join(fixture.worktreePath, "base.txt"), "task change\n", "utf8");
+				const parallelSha = await advanceDestinationParallel(fixture, "base.txt", "parallel change\n");
+
+				const response = await new GitDeliveryService().startDelivery({
+					taskId: "task-b11-conflict",
+					workspaceId: "workspace-1",
+					repoPath: fixture.repoPath,
+					worktreePath: fixture.worktreePath,
+					baseRef: "main",
+					policy: deliveryPolicy(),
+				});
+
+				expect(response.ok).toBe(false);
+				expect(response.receipt?.status).toBe("paused");
+				expect(response.receipt?.stage).toBe("committed");
+				expect(response.receipt?.combinedVerificationPassed).toBeNull();
+				expect(response.error).toContain("conflict");
+				expect(response.error).toContain("not advanced");
+				// The destination branch was not advanced and nothing was pushed.
+				const destSha = (await runGit(fixture.repoPath, ["rev-parse", "refs/heads/feature/b8"])).stdout;
+				expect(destSha).toBe(parallelSha);
+				// The task commit is preserved on the worktree (retry after manual resolution).
+				expect((await runGit(fixture.worktreePath, ["rev-parse", "HEAD"])).stdout).toBe(
+					response.receipt?.taskCommitSha,
+				);
+				// The integration worktree is cleaned up even on conflict.
+				const worktreeList = await runGit(fixture.repoPath, ["worktree", "list", "--porcelain"]);
+				expect(worktreeList.stdout).not.toContain("kanban-integration");
+			} finally {
+				fixture.cleanup();
+			}
+		});
+
+		it("pauses delivery when the diverged destination is checked out with uncommitted changes", async () => {
+			const fixture = await createDeliveryFixture();
+			const destCheckout = createTempDir("kanban-git-delivery-destwt-");
+			try {
+				await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
+				await persistFixtureHandoff(fixture, "task-b11-dirty");
+				await writeFile(join(fixture.worktreePath, "fileA.txt"), "task work\n", "utf8");
+				const parallelSha = await advanceDestinationParallel(fixture, "fileB.txt", "parallel work\n");
+				// A user checkout of the destination with uncommitted changes.
+				const add = await runGit(fixture.repoPath, ["worktree", "add", destCheckout.path, "feature/b8"]);
+				expect(add.ok).toBe(true);
+				await writeFile(join(destCheckout.path, "dirty.txt"), "uncommitted\n", "utf8");
+
+				const response = await new GitDeliveryService().startDelivery({
+					taskId: "task-b11-dirty",
+					workspaceId: "workspace-1",
+					repoPath: fixture.repoPath,
+					worktreePath: fixture.worktreePath,
+					baseRef: "main",
+					policy: deliveryPolicy(),
+				});
+
+				expect(response.ok).toBe(false);
+				expect(response.receipt?.status).toBe("paused");
+				expect(response.error).toContain("uncommitted changes");
+				// The branch was not advanced underneath the dirty checkout.
+				const destSha = (await runGit(fixture.repoPath, ["rev-parse", "refs/heads/feature/b8"])).stdout;
+				expect(destSha).toBe(parallelSha);
+				// No integration worktree was created for a pre-flight refusal.
+				const worktreeList = await runGit(fixture.repoPath, ["worktree", "list", "--porcelain"]);
+				expect(worktreeList.stdout).not.toContain("kanban-integration");
+			} finally {
+				await runGit(fixture.repoPath, ["worktree", "remove", "--force", destCheckout.path]).catch(() => undefined);
+				destCheckout.cleanup();
+				fixture.cleanup();
+			}
+		});
+
+		it("runs combined verification against the integrated tree before advancing the destination", async () => {
+			const fixture = await createDeliveryFixture();
+			try {
+				await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
+				await persistFixtureHandoff(fixture, "task-b11-verify");
+				await writeFile(join(fixture.worktreePath, "fileA.txt"), "task work\n", "utf8");
+				const parallelSha = await advanceDestinationParallel(fixture, "fileB.txt", "parallel work\n");
+
+				const calls: GitDeliveryCombinedVerificationInput[] = [];
+				const response = await new GitDeliveryService().startDelivery({
+					taskId: "task-b11-verify",
+					workspaceId: "workspace-1",
+					repoPath: fixture.repoPath,
+					worktreePath: fixture.worktreePath,
+					baseRef: "main",
+					policy: deliveryPolicy(),
+					runCombinedVerification: async (input) => {
+						calls.push(input);
+						// The combined tree is fully present in the clean worktree.
+						expect(await readFile(join(input.worktreePath, "fileA.txt"), "utf8")).toBe("task work\n");
+						expect(await readFile(join(input.worktreePath, "fileB.txt"), "utf8")).toBe("parallel work\n");
+						return { passed: true, error: null };
+					},
+				});
+
+				expect(response.ok).toBe(true);
+				expect(response.receipt?.status).toBe("delivered");
+				expect(response.receipt?.combinedVerificationPassed).toBe(true);
+				expect(calls).toHaveLength(1);
+				expect(calls[0]?.taskId).toBe("task-b11-verify");
+				expect(calls[0]?.worktreePath).toContain("kanban-integration");
+				// The candidate tree hash is the combined tree's hash.
+				const destSha = (await runGit(fixture.repoPath, ["rev-parse", "refs/heads/feature/b8"])).stdout;
+				expect(destSha).not.toBe(parallelSha);
+				expect(calls[0]?.candidateTreeHash).toBe(
+					(await runGit(fixture.repoPath, ["rev-parse", `${destSha}^{tree}`])).stdout,
+				);
+				// The result is durably recorded on the persisted receipt.
+				const persisted = await readTaskDeliveryReceipt("task-b11-verify");
+				expect(persisted?.combinedVerificationPassed).toBe(true);
+			} finally {
+				fixture.cleanup();
+			}
+		});
+
+		it("mirrors the repository's ignored paths into the integration worktree and cleans it up", async () => {
+			const fixture = await createDeliveryFixture();
+			try {
+				await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
+				await persistFixtureHandoff(fixture, "task-b11-env");
+				await writeFile(join(fixture.worktreePath, "fileA.txt"), "task work\n", "utf8");
+				await advanceDestinationParallel(fixture, "fileB.txt", "parallel work\n");
+				// Dependencies live in an ignored directory of the main checkout.
+				await writeFile(join(fixture.repoPath, ".gitignore"), "deps/\n", "utf8");
+				await mkdir(join(fixture.repoPath, "deps"), { recursive: true });
+				await writeFile(join(fixture.repoPath, "deps", "lib.js"), "module.exports = 1;\n", "utf8");
+				// A worktree orphaned by a crashed process (pid that cannot exist).
+				const integrationRoot = join(
+					getTaskWorktreesHomePath(),
+					"kanban-integration",
+					resolve(fixture.repoPath).replace(/[^a-zA-Z0-9._-]/g, "-"),
+					"feature-b8",
+				);
+				const orphanPath = join(integrationRoot, "2147483646-1");
+				await mkdir(orphanPath, { recursive: true });
+
+				let seenWorktreePath: string | null = null;
+				const response = await new GitDeliveryService().startDelivery({
+					taskId: "task-b11-env",
+					workspaceId: "workspace-1",
+					repoPath: fixture.repoPath,
+					worktreePath: fixture.worktreePath,
+					baseRef: "main",
+					policy: deliveryPolicy(),
+					runCombinedVerification: async (input) => {
+						seenWorktreePath = input.worktreePath;
+						expect(existsSync(orphanPath)).toBe(false);
+						expect(await readFile(join(input.worktreePath, "deps", "lib.js"), "utf8")).toBe(
+							"module.exports = 1;\n",
+						);
+						return { passed: true, error: null };
+					},
+				});
+
+				expect(response.receipt?.status).toBe("delivered");
+				expect(seenWorktreePath).not.toBeNull();
+				expect(existsSync(seenWorktreePath ?? "")).toBe(false);
+				// Removing the worktree never followed the mirrored symlink.
+				expect(existsSync(join(fixture.repoPath, "deps", "lib.js"))).toBe(true);
+			} finally {
+				fixture.cleanup();
+			}
+		});
+
+		it("pauses delivery and records a failed combined verification when the combined checks fail", async () => {
+			const fixture = await createDeliveryFixture();
+			try {
+				await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
+				await persistFixtureHandoff(fixture, "task-b11-verify-fail");
+				await writeFile(join(fixture.worktreePath, "fileA.txt"), "task work\n", "utf8");
+				const parallelSha = await advanceDestinationParallel(fixture, "fileB.txt", "parallel work\n");
+
+				const response = await new GitDeliveryService().startDelivery({
+					taskId: "task-b11-verify-fail",
+					workspaceId: "workspace-1",
+					repoPath: fixture.repoPath,
+					worktreePath: fixture.worktreePath,
+					baseRef: "main",
+					policy: deliveryPolicy(),
+					runCombinedVerification: async () => ({
+						passed: false,
+						error: "typecheck failed",
+					}),
+				});
+
+				expect(response.ok).toBe(false);
+				expect(response.receipt?.status).toBe("paused");
+				expect(response.receipt?.stage).toBe("committed");
+				expect(response.receipt?.combinedVerificationPassed).toBe(false);
+				expect(response.error).toContain("Combined verification");
+				expect(response.error).toContain("typecheck failed");
+				// The destination ref did not advance past the parallel work.
+				const destSha = (await runGit(fixture.repoPath, ["rev-parse", "refs/heads/feature/b8"])).stdout;
+				expect(destSha).toBe(parallelSha);
+				const persisted = await readTaskDeliveryReceipt("task-b11-verify-fail");
+				expect(persisted?.combinedVerificationPassed).toBe(false);
+			} finally {
+				fixture.cleanup();
+			}
+		});
 	});
 });

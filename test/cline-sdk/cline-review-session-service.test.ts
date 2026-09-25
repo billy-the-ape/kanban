@@ -746,3 +746,24 @@ describe("ClineReviewSessionService.startTaskReview — ownership, freshness, an
 		expect(repairPrompt).toContain("src/a.ts");
 	});
 });
+
+describe("ClineReviewSessionService.listSessionSummaries", () => {
+	it("delegates to the underlying task session service (B-11.2)", async () => {
+		const harness = createTaskSessionServiceHarness({
+			resolveClineLaunchConfig: makeResolver(),
+		});
+		services.push(harness);
+		const reviewService = createReviewService(harness, createFakeEvidencePort());
+
+		expect(reviewService.listSessionSummaries()).toEqual([]);
+
+		await harness.service.startTaskSession({
+			taskId: reviewSessionIdForTask("task-9"),
+			cwd: "/tmp/repo",
+			prompt: "review the change",
+		});
+		const summaries = reviewService.listSessionSummaries();
+		expect(summaries).toHaveLength(1);
+		expect(summaries[0]?.taskId).toBe(reviewSessionIdForTask("task-9"));
+	});
+});

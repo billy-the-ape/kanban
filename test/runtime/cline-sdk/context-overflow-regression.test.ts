@@ -33,6 +33,9 @@
 // the next attempt re-reads it — the same property the real recovery relies
 // on for shrink-only restarts.
 
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { compactClineConversationMessages } from "../../../src/cline-sdk/cline-compaction-callback";
 import {
@@ -57,6 +60,20 @@ vi.mock("../../../src/workspace/turn-checkpoints.js", () => ({
 	deleteTaskTurnCheckpointRef: turnCheckpointMocks.deleteTaskTurnCheckpointRef,
 }));
 
+const workspaceStateMocks = vi.hoisted(() => ({
+	getTaskWorktreesHomePath: vi.fn(),
+}));
+
+vi.mock("../../../src/state/workspace-state.js", async (importOriginal) => {
+	const original = await importOriginal<typeof import("../../../src/state/workspace-state")>();
+	return {
+		...original,
+		getTaskWorktreesHomePath: workspaceStateMocks.getTaskWorktreesHomePath,
+	};
+});
+
+let worktreesHomePath = "";
+
 beforeEach(() => {
 	turnCheckpointMocks.captureTaskTurnCheckpoint.mockReset();
 	turnCheckpointMocks.deleteTaskTurnCheckpointRef.mockReset();
@@ -69,6 +86,10 @@ beforeEach(() => {
 		}),
 	);
 	turnCheckpointMocks.deleteTaskTurnCheckpointRef.mockResolvedValue(undefined);
+	// Compaction event records (B-10.4) are durable per-task artifacts; point
+	// them at a throwaway dir so the suite never writes into the real ~/.cline.
+	worktreesHomePath = mkdtempSync(join(tmpdir(), "kanban-b3-overflow-home-"));
+	workspaceStateMocks.getTaskWorktreesHomePath.mockReturnValue(worktreesHomePath);
 });
 
 const LLAMA_CPP_OVERFLOW_ERROR =
@@ -82,6 +103,10 @@ const services: TaskSessionServiceHarness[] = [];
 
 afterEach(async () => {
 	await Promise.allSettled(services.splice(0).map((harness) => harness.service.dispose()));
+	if (worktreesHomePath) {
+		rmSync(worktreesHomePath, { recursive: true, force: true });
+		worktreesHomePath = "";
+	}
 });
 describe("B-3.1 isContextOverflowError classification", () => {
 	it("classifies the OpenAI maximum-context-length error shape", () => {

@@ -1,5 +1,9 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ToolApprovalRequest, ToolApprovalResult } from "@clinebot/core";
 import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "vitest";
+import { readTaskCompactionEvent } from "../../../src/cline-sdk/cline-context-events";
 import type { ClineRuntimeSetup } from "../../../src/cline-sdk/cline-runtime-setup";
 import type {
 	ClinePersistedTaskSessionSnapshot,
@@ -27,6 +31,33 @@ vi.mock("../../../src/workspace/turn-checkpoints.js", () => ({
 	captureTaskTurnCheckpoint: turnCheckpointMocks.captureTaskTurnCheckpoint,
 	deleteTaskTurnCheckpointRef: turnCheckpointMocks.deleteTaskTurnCheckpointRef,
 }));
+
+const workspaceStateMocks = vi.hoisted(() => ({
+	getTaskWorktreesHomePath: vi.fn(),
+}));
+
+vi.mock("../../../src/state/workspace-state.js", async (importOriginal) => {
+	const original = await importOriginal<typeof import("../../../src/state/workspace-state")>();
+	return {
+		...original,
+		getTaskWorktreesHomePath: workspaceStateMocks.getTaskWorktreesHomePath,
+	};
+});
+
+// Compaction event records (B-10.4) are durable per-task artifacts; point them
+// at a throwaway dir so overflow-recovery tests never write into the real
+// ~/.cline.
+let worktreesHomePath = "";
+beforeEach(() => {
+	worktreesHomePath = mkdtempSync(join(tmpdir(), "kanban-session-test-home-"));
+	workspaceStateMocks.getTaskWorktreesHomePath.mockReturnValue(worktreesHomePath);
+});
+afterEach(() => {
+	if (worktreesHomePath) {
+		rmSync(worktreesHomePath, { recursive: true, force: true });
+		worktreesHomePath = "";
+	}
+});
 
 function createDeferred<T>() {
 	let resolve: (value: T) => void = () => {};
@@ -405,6 +436,35 @@ describe("InMemoryClineTaskSessionService", () => {
 		expect(summary.state).toBe("running");
 		expect(summary.workspacePath).toBe("/tmp/worktree");
 		expect(service.listMessages("task-1").map((message) => message.content)).toEqual(["Investigate startup"]);
+	});
+
+	it("keeps the latest compaction in memory but throttles repeated durable writes (B-10.4)", async () => {
+		const runtime = createFakeClineSessionRuntime();
+		const runtimeSetup = createFakeRuntimeSetup();
+		let runtimeOptions: CreateInMemoryClineSessionRuntimeOptions | null = null;
+		const service = createInMemoryClineTaskSessionService({
+			createSessionRuntime: (options) => {
+				runtimeOptions = options;
+				return runtime.createRuntime(options);
+			},
+			createRuntimeSetup: vi.fn(async (_workspacePath: string) => runtimeSetup.setup),
+		});
+		services.push(service);
+		await service.startTaskSession({ taskId: "task-1", cwd: "/tmp/worktree", prompt: "Investigate startup" });
+		const observe = (runtimeOptions as CreateInMemoryClineSessionRuntimeOptions | null)?.onCompactionObserved;
+		expect(observe).toBeDefined();
+
+		// The beforeModel hook reports every over-budget request.
+		observe?.("task-1", { messagesBefore: 40, messagesAfter: 10, tokensBefore: 9000, tokensAfter: 2000 });
+		observe?.("task-1", { messagesBefore: 42, messagesAfter: 11, tokensBefore: 9500, tokensAfter: 2100 });
+		await vi.waitFor(async () => {
+			expect((await readTaskCompactionEvent("task-1"))?.messagesBefore).toBe(40);
+		});
+
+		// Diagnostics read the latest event; disk kept the first one.
+		const snapshot = await service.getTaskContextSnapshot("task-1");
+		expect(snapshot?.lastCompaction?.messagesBefore).toBe(42);
+		expect((await readTaskCompactionEvent("task-1"))?.messagesBefore).toBe(40);
 	});
 
 	it("disposes cached runtime setups when the service shuts down", async () => {
