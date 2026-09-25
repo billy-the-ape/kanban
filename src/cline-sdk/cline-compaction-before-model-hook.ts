@@ -14,8 +14,8 @@
 // and conversation messages). This hook evaluates that assembled request
 // against the calibrated budget and, when it would exceed
 // `limit - outputReserve - safetyMargin`, rewrites the request's messages
-// with the same deterministic compactor the `compact` callback uses
-// (compactClineConversationMessages). The rewrite is request-scoped: the
+// with the same turn-based compactor the `compact` callback uses
+// (compactConversationTurns in cline-compaction-turns.ts). The rewrite is request-scoped: the
 // provider sees a fitting request every turn, while the persisted session
 // transcript stays complete for review.
 //
@@ -31,6 +31,11 @@
 
 import type { ClineCompactionObservedInfo } from "./cline-compaction-callback";
 import { computeClineCompactionSafetyMarginTokens, estimateClineToolSchemaTokens } from "./cline-compaction-config";
+import {
+	COMPACTION_NOTICE_PREFIX,
+	type CompactionMessageAdapter,
+	compactConversationTurns,
+} from "./cline-compaction-turns";
 import { estimateTextTokens } from "./cline-context-budget";
 import { toPositiveTokenCount } from "./cline-context-policy";
 import type {
@@ -44,14 +49,8 @@ import type {
 
 /** Floor for the message-token target (matches the calibrated config floor). */
 const MIN_MESSAGE_TARGET_TOKENS = 256;
-/** Mirrors the minimum truncated-message size used by the compact callback. */
-const MIN_TRUNCATED_MESSAGE_TOKENS = 16;
 /** Minimum retained text length when truncating a part. */
 const MIN_TRUNCATED_TEXT_CHARS = 16;
-
-const COMPACTION_NOTICE_TEXT =
-	"[Earlier conversation turns were removed to fit the context window. " +
-	"Infer prior actions from the current environment state.]";
 
 function serializeAgentPart(part: ClineSdkAgentMessagePart): string {
 	switch (part.type) {
@@ -169,133 +168,63 @@ function truncateAgentMessageContent(message: ClineSdkAgentMessage, maxTokens: n
 
 /**
  * Deterministically compacts agent-runtime messages so their estimated
- * tokens (chars/4) fit `targetTokens`. Same strategy as
- * compactClineConversationMessages (the MessageWithMetadata domain used by
- * the SDK compact callback): delete old assistant messages, then old user
- * messages, then the last assistant/user; repair orphaned tool-result parts;
- * truncate from the back; and prepend a compaction notice to the surviving
- * first message when anything changed. The first user message is never
- * deleted (only truncated as a last resort). Pure: no provider, SDK, or
- * filesystem involvement.
+ * tokens (chars/4) fit `targetTokens`, with the same turn-based strategy the
+ * persisted-message compactor uses (see compactConversationTurns). Pure: no
+ * provider, SDK, or filesystem involvement.
  */
 export function compactClineAgentMessages(
 	inputMessages: readonly ClineSdkAgentMessage[],
 	targetTokens: number,
 	options: { logger?: ClineSdkBasicLogger } = {},
 ): CompactClineAgentMessagesResult {
-	const logger = options.logger;
-	const original = inputMessages;
-	const target = Math.max(1, targetTokens);
-	let messages: ClineSdkAgentMessage[] = [...original];
-	const tokensBefore = messages.reduce((sum, message) => sum + estimateAgentMessage(message), 0);
-	if (messages.length === 0) {
-		return { messages, changed: false, tokensBefore: 0, tokensAfter: 0 };
-	}
-	// Budget for the notice up front, like the MessageWithMetadata compactor.
-	const budget = Math.max(1, target - estimateTextTokens(COMPACTION_NOTICE_TEXT));
-	let remaining = tokensBefore;
-	if (remaining <= budget) {
-		return { messages, changed: false, tokensBefore, tokensAfter: remaining };
-	}
-
-	const firstUser = messages.find((message) => message.role === "user");
-	const lastUser = [...messages].reverse().find((message) => message.role === "user");
-	const lastAssistant = [...messages].reverse().find((message) => message.role === "assistant");
-
-	const passes: Array<(message: ClineSdkAgentMessage) => boolean> = [
-		(message) => message.role === "assistant" && message !== lastAssistant,
-		(message) =>
-			(message.role === "user" || message.role === "tool") && message !== firstUser && message !== lastUser,
-		(message) => message.role === "assistant" && message === lastAssistant,
-		(message) => message.role === "user" && message === lastUser && message !== firstUser,
-	];
-	let changed = false;
-	for (const isDeletable of passes) {
-		for (let index = 0; index < messages.length && remaining > budget; index += 1) {
-			const candidate = messages[index];
-			if (!isDeletable(candidate)) {
-				continue;
-			}
-			remaining -= estimateAgentMessage(candidate);
-			messages.splice(index, 1);
-			changed = true;
-			index -= 1;
-		}
-	}
-
-	// Tool pairing repair: drop tool-result parts whose tool-call part is no
-	// longer present (providers reject requests with orphan tool results).
-	const toolCallIds = new Set<string>();
-	for (const message of messages) {
-		for (const part of message.content) {
-			if (part.type === "tool-call") {
-				toolCallIds.add(part.toolCallId);
-			}
-		}
-	}
-	const pruned = messages.flatMap((message) => {
-		const kept = message.content.filter((part) => part.type !== "tool-result" || toolCallIds.has(part.toolCallId));
-		return kept.length > 0 ? [{ ...message, content: kept }] : [];
-	});
-	if (pruned.length !== messages.length || pruned.some((message, index) => message !== messages[index])) {
-		messages = pruned;
-		remaining = messages.reduce((sum, message) => sum + estimateAgentMessage(message), 0);
-		changed = true;
-	}
-
-	// Truncation pass: from the back, shrink messages in place; the first
-	// user message is only touched as a last resort.
-	if (remaining > budget) {
-		for (let index = messages.length - 1; index >= 0 && remaining > budget; index -= 1) {
-			const message = messages[index];
-			if (message === firstUser) {
-				continue;
-			}
-			const current = estimateAgentMessage(message);
-			const reducedTokens = Math.max(MIN_TRUNCATED_MESSAGE_TOKENS, current - (remaining - budget));
-			if (reducedTokens >= current) {
-				continue;
-			}
-			const truncated = truncateAgentMessageContent(message, reducedTokens);
-			if (truncated) {
-				remaining -= current - estimateAgentMessage(truncated);
-				messages[index] = truncated;
-				changed = true;
-			}
-		}
-		if (remaining > budget && firstUser) {
-			const firstUserIndex = messages.indexOf(firstUser);
-			if (firstUserIndex >= 0) {
-				const current = estimateAgentMessage(firstUser);
-				const reducedTokens = Math.max(1, current - (remaining - budget));
-				const truncated = reducedTokens < current ? truncateAgentMessageContent(firstUser, reducedTokens) : null;
-				if (truncated) {
-					remaining -= current - estimateAgentMessage(truncated);
-					messages[firstUserIndex] = truncated;
-					changed = true;
-				}
-			}
-		}
-	}
-
-	if (changed) {
-		messages[0] = {
-			...messages[0],
-			content: [{ type: "text", text: COMPACTION_NOTICE_TEXT }, ...messages[0].content],
-		};
-	}
-	const tokensAfter = messages.reduce((sum, message) => sum + estimateAgentMessage(message), 0);
-	if (changed) {
-		logger?.debug("Kanban agent-message compaction completed (estimates)", {
-			messagesBefore: original.length,
-			messagesAfter: messages.length,
-			messageTokensBefore: tokensBefore,
-			messageTokensAfter: tokensAfter,
-			target,
-		});
-	}
+	const { messages, changed, tokensBefore, tokensAfter } = compactConversationTurns(
+		inputMessages,
+		targetTokens,
+		AGENT_MESSAGE_ADAPTER,
+		{ logger: options.logger, logLabel: "Kanban agent-message compaction completed (estimates)" },
+	);
 	return { messages, changed, tokensBefore, tokensAfter };
 }
+
+const AGENT_MESSAGE_ADAPTER: CompactionMessageAdapter<ClineSdkAgentMessage> = {
+	estimate: estimateAgentMessage,
+	isAssistant: (message) => message.role === "assistant",
+	isUser: (message) => message.role === "user",
+	toolCalls: (message) =>
+		message.role !== "assistant"
+			? []
+			: message.content.flatMap((part) =>
+					part.type === "tool-call"
+						? [{ toolCallId: part.toolCallId, toolName: part.toolName, input: part.input }]
+						: [],
+				),
+	toolResults: (message) =>
+		message.content.flatMap((part) =>
+			part.type === "tool-result" ? [{ toolCallId: part.toolCallId, isError: part.isError === true }] : [],
+		),
+	userText: (message) =>
+		message.content
+			.flatMap((part) =>
+				part.type === "text" && !part.text.startsWith(COMPACTION_NOTICE_PREFIX) ? [part.text] : [],
+			)
+			.join("\n"),
+	pruneOrphanToolResults: (message, toolCallIds) => {
+		const kept = message.content.filter((part) => part.type !== "tool-result" || toolCallIds.has(part.toolCallId));
+		if (kept.length === message.content.length) {
+			return message;
+		}
+		return kept.length > 0 ? { ...message, content: kept } : null;
+	},
+	truncate: truncateAgentMessageContent,
+	stripNotice: (message) => {
+		const [first, ...rest] = message.content;
+		if (first?.type === "text" && first.text.startsWith(COMPACTION_NOTICE_PREFIX)) {
+			return { message: { ...message, content: rest }, notice: first.text };
+		}
+		return { message, notice: null };
+	},
+	prependNotice: (message, notice) => ({ ...message, content: [{ type: "text", text: notice }, ...message.content] }),
+};
 
 export interface CreateClineCompactionBeforeModelHookInput {
 	/** Effective context limit in tokens (the uncalibrated compaction window). */

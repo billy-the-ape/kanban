@@ -9,16 +9,10 @@
 // Why a Kanban-side callback at all? The built-in "basic" strategy is
 // deterministic too, but it is minified SDK-internal code. Registering
 // Kanban's own model-free callback (localRuntime.compaction.compact) keeps
-// the guard deterministic, unit-testable, and pinned to this codebase. It
-// mirrors the proven SDK basic strategy (delete old assistant messages, then
-// old user messages, then the last assistant/user, then truncate from the
-// back) and adds two safety improvements:
-//
-// - tool pairing repair: deletion can orphan tool_result blocks whose
-//   tool_use assistant message was removed; orphan tool results are dropped
-//   (providers reject requests that contain them).
-// - a compaction notice is prepended to the surviving first message so the
-//   model knows earlier turns were removed.
+// the guard deterministic, unit-testable, and pinned to this codebase. The
+// strategy itself is the turn-based compactor in cline-compaction-turns.ts
+// (drop whole turns oldest-first, summarize them in the notice, truncate as a
+// last resort); this file adapts it to persisted SDK messages.
 //
 // SDK contract (verified against @clinebot/core 0.0.38):
 // - the callback completely replaces the built-in strategy; returning
@@ -29,6 +23,12 @@
 //
 // All token math here uses the documented chars/4 fallback estimator from
 // B-2.3 (cline-context-budget.ts) — the same approach the SDK trigger uses.
+import {
+	COMPACTION_NOTICE_PREFIX,
+	type CompactionMessageAdapter,
+	compactConversationTurns,
+	splitLeadingCompactionNotice,
+} from "./cline-compaction-turns";
 import { createFallbackMessageTokenEstimator } from "./cline-context-budget";
 import type {
 	ClineSdkBasicLogger,
@@ -37,27 +37,9 @@ import type {
 	ClineSdkPersistedMessage,
 } from "./sdk-runtime-boundary";
 
-/** Mirrors the SDK's minimum truncated-message size (16 tokens). */
-const MIN_TRUNCATED_MESSAGE_TOKENS = 16;
 /** Minimum retained text length when truncating a string or text block. */
 const MIN_TRUNCATED_TEXT_CHARS = 16;
 
-const COMPACTION_NOTICE =
-	"[Earlier conversation turns were removed to fit the context window. " +
-	"Infer prior actions from the current environment state.]";
-
-/**
- * Deterministically compacts a conversation so its estimated message tokens
- * (chars/4) fit `targetTokens`. Mirrors the SDK's proven basic-strategy
- * order — delete old assistant messages, then old user messages, then the
- * last assistant, then the last user, then truncate from the back — and adds
- * tool-pairing repair plus a compaction notice on the surviving first
- * message. The first user message is never deleted (only truncated as a last
- * resort). Pure: no provider, SDK, or filesystem involvement.
- *
- * Shared by the SDK `compact` callback (hub mode / future SDK builds) and
- * the local-mode beforeModel hook (see cline-compaction-before-model-hook).
- */
 export interface CompactClineConversationMessagesResult {
 	messages: ClineSdkPersistedMessage[];
 	changed: boolean;
@@ -87,148 +69,90 @@ export interface ClineCompactionHookOptions {
 	onCompacted?: (info: ClineCompactionObservedInfo) => void;
 }
 
+/**
+ * Deterministically compacts a persisted conversation so its estimated
+ * message tokens (chars/4) fit `targetTokens` (see compactConversationTurns
+ * for the strategy). Used by the SDK `compact` callback (hub mode / future
+ * SDK builds) and context-overflow recovery.
+ */
 export function compactClineConversationMessages(
 	inputMessages: readonly ClineSdkPersistedMessage[],
 	targetTokens: number,
 	options: { logger?: ClineSdkBasicLogger } = {},
 ): CompactClineConversationMessagesResult {
-	const logger = options.logger;
-	const estimate = createFallbackMessageTokenEstimator();
-	const totalTokens = (candidate: readonly ClineSdkPersistedMessage[]) =>
-		candidate.reduce((sum, message) => sum + estimate(message), 0);
-
-	const original = inputMessages;
-	const target = Math.max(1, targetTokens);
-	let messages = [...original];
-	if (messages.length === 0) {
-		return { messages, changed: false, tokensBefore: 0, tokensAfter: 0 };
-	}
-
-	// The trigger fired per the SDK's estimator; the notice costs tokens,
-	// so budget for it up front. The string-content prepend also inserts a
-	// "\n\n" separator, so reserve its cost too — otherwise the final
-	// estimate can overshoot the target by one token.
-	const noticeTokens = estimate({ role: "user", content: `${COMPACTION_NOTICE}\n\n` });
-	const budget = Math.max(1, target - noticeTokens);
-	let remaining = totalTokens(messages);
-	if (remaining <= budget) {
-		// Estimator drift: the caller's trigger fired, but under the same
-		// chars/4 estimate the messages already fit — no rewrite.
-		logger?.debug("Kanban proactive compaction: messages already under target (estimates)", {
-			target,
-			messageTokens: remaining,
-		});
-		return { messages, changed: false, tokensBefore: remaining, tokensAfter: remaining };
-	}
-
-	const firstUser = messages.find((message) => message.role === "user");
-	const lastUser = [...messages].reverse().find((message) => message.role === "user");
-	const lastAssistant = [...messages].reverse().find((message) => message.role === "assistant");
-
-	// Deletion passes in the SDK basic strategy's order: oldest first,
-	// protecting the first user message, the last user message, and (until
-	// pass 3) the last assistant message.
-	const passes: Array<(message: ClineSdkPersistedMessage) => boolean> = [
-		(message) => message.role === "assistant" && message !== lastAssistant,
-		(message) => message.role === "user" && message !== firstUser && message !== lastUser,
-		(message) => message.role === "assistant" && message === lastAssistant,
-		(message) => message.role === "user" && message === lastUser && message !== firstUser,
-	];
-	let changed = false;
-	for (const isDeletable of passes) {
-		for (let index = 0; index < messages.length && remaining > budget; index += 1) {
-			const candidate = messages[index];
-			if (!isDeletable(candidate)) {
-				continue;
-			}
-			remaining -= estimate(candidate);
-			messages.splice(index, 1);
-			changed = true;
-			index -= 1;
-		}
-	}
-	// Tool pairing repair: drop orphan tool_result blocks (and messages
-	// left empty by the pruning) whose tool_use was deleted above.
-	const toolUseIds = new Set<string>();
-	for (const message of messages) {
-		if (message.role !== "assistant" || typeof message.content === "string") {
-			continue;
-		}
-		for (const block of message.content) {
-			if (block.type === "tool_use") {
-				toolUseIds.add(block.id);
-			}
-		}
-	}
-	const pruned = messages.flatMap((message) => {
-		if (message.role !== "user" || typeof message.content === "string") {
-			return [message];
-		}
-		const kept = message.content.filter((block) => block.type !== "tool_result" || toolUseIds.has(block.tool_use_id));
-		return kept.length > 0 ? [{ ...message, content: kept }] : [];
-	});
-	if (pruned.length !== messages.length || pruned.some((message, index) => message !== messages[index])) {
-		messages = pruned;
-		remaining = totalTokens(pruned);
-		changed = true;
-	}
-
-	// Truncation pass (SDK Mh equivalent): from the back of the
-	// conversation, shrink messages in place; the first user message is
-	// only touched as a last resort.
-	if (remaining > budget) {
-		for (let index = messages.length - 1; index >= 0 && remaining > budget; index -= 1) {
-			const message = messages[index];
-			if (message === firstUser) {
-				continue;
-			}
-			const current = estimate(message);
-			const reducedTokens = Math.max(MIN_TRUNCATED_MESSAGE_TOKENS, current - (remaining - budget));
-			if (reducedTokens >= current) {
-				continue;
-			}
-			const truncated = truncateMessageContent(message, reducedTokens);
-			if (truncated) {
-				remaining -= current - estimate(truncated);
-				messages[index] = truncated;
-				changed = true;
-			}
-		}
-		if (remaining > budget && firstUser) {
-			const firstUserIndex = messages.indexOf(firstUser);
-			if (firstUserIndex >= 0) {
-				const current = estimate(firstUser);
-				const reducedTokens = Math.max(1, current - (remaining - budget));
-				const truncated = reducedTokens < current ? truncateMessageContent(firstUser, reducedTokens) : null;
-				if (truncated) {
-					remaining -= current - estimate(truncated);
-					messages[firstUserIndex] = truncated;
-					changed = true;
-				}
-			}
-		}
-	}
-
-	// Prepend the notice to the surviving first message so the model knows
-	// earlier turns were removed (mirrors the B-2.2 overflow fallback's
-	// notice approach; that one previews the first user message because it
-	// discards it, which this path never does).
-	if (changed) {
-		messages[0] = prependCompactionNotice(messages[0]);
-	}
-
-	const tokensBefore = totalTokens(original);
-	const tokensAfter = totalTokens(messages);
-	if (changed) {
-		logger?.debug("Kanban proactive compaction completed (estimates)", {
-			messagesBefore: original.length,
-			messagesAfter: messages.length,
-			messageTokensBefore: tokensBefore,
-			messageTokensAfter: tokensAfter,
-			target,
-		});
-	}
+	const { messages, changed, tokensBefore, tokensAfter } = compactConversationTurns(
+		inputMessages,
+		targetTokens,
+		createPersistedMessageAdapter(),
+		{ logger: options.logger, logLabel: "Kanban proactive compaction completed (estimates)" },
+	);
 	return { messages, changed, tokensBefore, tokensAfter };
+}
+
+function createPersistedMessageAdapter(): CompactionMessageAdapter<ClineSdkPersistedMessage> {
+	const estimate = createFallbackMessageTokenEstimator();
+	const blocksOf = (message: ClineSdkPersistedMessage) => (typeof message.content === "string" ? [] : message.content);
+	return {
+		estimate,
+		isAssistant: (message) => message.role === "assistant",
+		isUser: (message) => message.role === "user",
+		toolCalls: (message) =>
+			message.role !== "assistant"
+				? []
+				: blocksOf(message).flatMap((block) =>
+						block.type === "tool_use" ? [{ toolCallId: block.id, toolName: block.name, input: block.input }] : [],
+					),
+		toolResults: (message) =>
+			message.role !== "user"
+				? []
+				: blocksOf(message).flatMap((block) =>
+						block.type === "tool_result"
+							? [{ toolCallId: block.tool_use_id, isError: block.is_error === true }]
+							: [],
+					),
+		userText: (message) => {
+			if (typeof message.content === "string") {
+				return splitLeadingCompactionNotice(message.content)?.rest ?? message.content;
+			}
+			return message.content
+				.flatMap((block) =>
+					block.type === "text" && !block.text.startsWith(COMPACTION_NOTICE_PREFIX) ? [block.text] : [],
+				)
+				.join("\n");
+		},
+		pruneOrphanToolResults: (message, toolCallIds) => {
+			if (typeof message.content === "string") {
+				return message;
+			}
+			const kept = message.content.filter(
+				(block) => block.type !== "tool_result" || toolCallIds.has(block.tool_use_id),
+			);
+			if (kept.length === message.content.length) {
+				return message;
+			}
+			return kept.length > 0 ? { ...message, content: kept } : null;
+		},
+		truncate: truncateMessageContent,
+		stripNotice: (message) => {
+			if (typeof message.content === "string") {
+				const split = splitLeadingCompactionNotice(message.content);
+				return split
+					? { message: { ...message, content: split.rest }, notice: split.notice }
+					: { message, notice: null };
+			}
+			const [first, ...rest] = message.content;
+			if (first?.type === "text" && first.text.startsWith(COMPACTION_NOTICE_PREFIX)) {
+				return { message: { ...message, content: rest }, notice: first.text };
+			}
+			return { message, notice: null };
+		},
+		prependNotice: (message, notice) => {
+			if (typeof message.content === "string") {
+				return { ...message, content: `${notice}\n\n${message.content}` };
+			}
+			return { ...message, content: [{ type: "text", text: notice }, ...message.content] };
+		},
+	};
 }
 
 /**
@@ -262,13 +186,6 @@ export function createClineCompactionCompactCallback(
 		}
 		return { messages: result.messages };
 	};
-}
-
-function prependCompactionNotice(message: ClineSdkPersistedMessage): ClineSdkPersistedMessage {
-	if (typeof message.content === "string") {
-		return { ...message, content: `${COMPACTION_NOTICE}\n\n${message.content}` };
-	}
-	return { ...message, content: [{ type: "text", text: COMPACTION_NOTICE }, ...message.content] };
 }
 
 interface CharBudget {

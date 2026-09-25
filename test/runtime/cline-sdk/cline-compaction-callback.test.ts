@@ -43,27 +43,56 @@ describe("B-2.5 — compactClineConversationMessages", () => {
 		expect(result.messages).toEqual(messages);
 	});
 
-	it("deletes old messages oldest-first, keeps the first and last user message, and adds a notice", () => {
-		const messages: ClineSdkPersistedMessage[] = [];
-		for (let i = 0; i < 4; i += 1) {
-			messages.push(textMessage("user", 100));
-			messages.push(textMessage("assistant", 100));
-		}
-		const result = compactClineConversationMessages(messages, 300);
+	it("drops whole old turns oldest-first, keeps the first prompt, latest instruction, and latest turn, and adds a notice", () => {
+		const messages: ClineSdkPersistedMessage[] = [
+			textMessage("user", 100),
+			textMessage("assistant", 100),
+			textMessage("user", 100),
+			textMessage("assistant", 100),
+			textMessage("user", 100),
+			{ role: "assistant", content: [{ type: "tool_use", id: "c1", name: "read_files", input: {} }] },
+			{ role: "user", content: [{ type: "tool_result", tool_use_id: "c1", content: "x".repeat(400) }] },
+		];
+		const result = compactClineConversationMessages(messages, 400);
 		expect(result.changed).toBe(true);
-		expect(result.messages.length).toBeLessThan(messages.length);
-		// First user message survives (with the notice prepended).
+		expect(result.tokensAfter).toBeLessThanOrEqual(400);
+		// First user message survives with the notice prepended.
 		const first = result.messages[0];
 		expect(first?.role).toBe("user");
 		expect(typeof first?.content).toBe("string");
 		expect(first?.content).toContain("removed to fit the context window");
-		// Last user message survives.
-		const lastUser = [...result.messages].reverse().find((m) => m.role === "user");
-		expect(lastUser?.content).toBe(messages[6]?.content);
-		// Result fits the target (estimates).
-		const estimate = (m: ClineSdkPersistedMessage) => estimateTextTokens(String(m.content));
-		const total = result.messages.reduce((sum, m) => sum + estimate(m), 0);
-		expect(total).toBeLessThanOrEqual(300);
+		expect(String(first?.content).endsWith(String(messages[0]?.content))).toBe(true);
+		// The most recent user instruction and the latest turn survive verbatim.
+		expect(result.messages.slice(1)).toEqual(messages.slice(4));
+	});
+
+	it("merges an earlier persisted notice instead of nesting a second one", () => {
+		const turn = (id: string, path: string): ClineSdkPersistedMessage[] => [
+			{ role: "assistant", content: [{ type: "tool_use", id, name: "editor", input: { command: "create", path } }] },
+			{ role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "x".repeat(4_000) }] },
+		];
+		const messages: ClineSdkPersistedMessage[] = [textMessage("user", 50)];
+		for (let i = 0; i < 12; i += 1) {
+			messages.push(...turn(`c${i}`, `/repo/f${i}.ts`));
+		}
+		const once = compactClineConversationMessages(messages, 10_000);
+		for (let i = 12; i < 20; i += 1) {
+			once.messages.push(...turn(`c${i}`, `/repo/f${i}.ts`));
+		}
+		const twice = compactClineConversationMessages(once.messages, 10_000);
+		const content = String(twice.messages[0]?.content);
+		expect(content.split("[Earlier conversation turns").length).toBe(2);
+		// Actions from both compactions appear once each, oldest first.
+		expect(content).toContain("editor(create /repo/f0.ts)");
+		// The oldest turn kept by the first compaction is dropped by the second
+		// and appended after the carried-over lines.
+		const firstKeptOnce = once.messages
+			.flatMap((m) => (typeof m.content === "string" ? [] : m.content))
+			.find((b) => b.type === "tool_use");
+		const firstKeptPath = `/repo/f${firstKeptOnce?.type === "tool_use" ? firstKeptOnce.id.slice(1) : ""}.ts`;
+		expect(content.indexOf("/repo/f0.ts")).toBeGreaterThan(-1);
+		expect(content.indexOf(firstKeptPath)).toBeGreaterThan(content.indexOf("/repo/f0.ts"));
+		expect(content.split("/repo/f0.ts").length).toBe(2);
 	});
 
 	it("drops orphan tool_result blocks whose tool_use was deleted", () => {
