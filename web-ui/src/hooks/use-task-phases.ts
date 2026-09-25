@@ -1,12 +1,26 @@
 // B-10.1: batched reliable-completion phase summaries for board chips.
 // Re-queries when the workspace, the task set, or the board fingerprint
-// (task ids + updatedAt per column) changes, so chips track board mutations
-// without per-card requests.
+// (task ids + updatedAt per column + session states) changes, so chips track
+// board and session changes without per-card requests. Delivery receipts
+// advance without touching the board, so the hook also polls: quickly while
+// a delivery is in flight, slowly otherwise.
 import { useCallback, useMemo } from "react";
 
 import { fetchTaskPhases } from "@/runtime/task-diagnostics";
-import type { RuntimeTaskPhaseSummary } from "@/runtime/types";
+import type { RuntimeTaskPhase, RuntimeTaskPhaseSummary } from "@/runtime/types";
 import { useTrpcQuery } from "@/runtime/use-trpc-query";
+import { useInterval } from "@/utils/react-use";
+
+const DELIVERY_IN_FLIGHT_REFRESH_MS = 3_000;
+const IDLE_REFRESH_MS = 15_000;
+
+const DELIVERY_IN_FLIGHT_PHASES: ReadonlySet<RuntimeTaskPhase> = new Set([
+	"checking",
+	"committing",
+	"integrating",
+	"pushing",
+	"verifying_remote",
+]);
 
 export function useTaskPhases(
 	workspaceId: string | null,
@@ -29,9 +43,18 @@ export function useTaskPhases(
 		// Keep the last good chip data when a transient fetch fails.
 		retainDataOnError: true,
 	});
+	const phases = result.data ?? {};
+	const deliveryInFlight = Object.values(phases).some((summary) => DELIVERY_IN_FLIGHT_PHASES.has(summary.phase));
+	const { refetch } = result;
+	useInterval(
+		() => {
+			void refetch();
+		},
+		enabled ? (deliveryInFlight ? DELIVERY_IN_FLIGHT_REFRESH_MS : IDLE_REFRESH_MS) : null,
+	);
 	return {
-		phases: result.data ?? {},
+		phases,
 		isLoading: result.isLoading,
-		refetch: result.refetch,
+		refetch,
 	};
 }

@@ -112,15 +112,21 @@ export function KanbanBoard({
 	}, [data]);
 
 	// B-10.1: batched phase summaries for the board chips. The fingerprint
-	// (task ids + updatedAt per column) changes on any board mutation, so the
-	// chip data re-queries in lockstep with board updates.
+	// (task ids + updatedAt per column + each card's session state) changes on
+	// any board mutation or session transition, so the chip data re-queries in
+	// lockstep; useTaskPhases polls for delivery progress in between.
 	const boardTaskIds = useMemo(() => data.columns.flatMap((column) => column.cards.map((card) => card.id)), [data]);
 	const boardPhaseFingerprint = useMemo(
 		() =>
 			data.columns
-				.map((column) => `${column.id}:${column.cards.map((card) => `${card.id}:${card.updatedAt}`).join("|")}`)
+				.map(
+					(column) =>
+						`${column.id}:${column.cards
+							.map((card) => `${card.id}:${card.updatedAt}:${taskSessions[card.id]?.state ?? ""}`)
+							.join("|")}`,
+				)
 				.join(";"),
-		[data],
+		[data, taskSessions],
 	);
 	const { phases: taskPhases } = useTaskPhases(workspaceId ?? null, boardTaskIds, boardPhaseFingerprint);
 

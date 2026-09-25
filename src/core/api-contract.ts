@@ -2101,6 +2101,11 @@ export const runtimeClineContextUsageResponseSchema = z.object({
 	ok: z.boolean(),
 	/** "estimated" when numbers are available (chars/4), "unavailable" otherwise. */
 	source: z.enum(["estimated", "unavailable"]),
+	/**
+	 * Messages / estimated tokens the model currently sees: the latest
+	 * request-scoped compaction's result when it covered the whole stored
+	 * transcript, otherwise the stored transcript itself.
+	 */
 	messageCount: z.number().int().min(0).nullable(),
 	estimatedMessageTokens: z.number().int().min(0).nullable(),
 	/** Resolved effective context limit (override -> provider window -> fallback). */

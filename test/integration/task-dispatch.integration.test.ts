@@ -389,7 +389,7 @@ describe("B-11 task dispatch integration (parallel branches, shared budget)", ()
 	let repoPath: string;
 	let workspaceId: string;
 	let baseSha: string;
-	const parallelRun: SessionProbe = createSessionProbe();
+	const parallelRun = createSessionProbe();
 
 	beforeAll(async () => {
 		previousHomeB11 = process.env.HOME;

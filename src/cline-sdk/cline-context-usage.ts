@@ -20,15 +20,22 @@ export function estimateTaskContextMessageTokens(messages: readonly TaskContextM
 }
 
 export const OMITTED_HISTORY_NOTICE =
-	"Compaction removed earlier turns from what the model can see. The conversation " +
-	"continues from a summary, so the visible history is a partial record — summaries " +
-	"are lossy and do not preserve every detail.";
+	"Compaction removed or truncated earlier turns in what the model sees. The full " +
+	"transcript is still shown here, but the model only has the most recent turns plus " +
+	"the first request, so details from the removed turns are lost to it.";
 
 /**
  * B-10.4: assemble the context-usage diagnostics payload from a message
  * snapshot and the resolved capacity. Pure — no I/O, no provider access.
  * `messages` is null when no transcript is available at all (vs. [] for an
  * empty one); both report `source: "unavailable"`.
+ *
+ * Usage reports what the model sees. The local-mode beforeModel hook
+ * compacts each request without shortening the stored transcript, so when
+ * the latest compaction covered the whole current transcript
+ * (`messagesBefore` equals its length) its `after` figures are what the model
+ * saw; otherwise (no compaction, or the transcript itself was replaced by
+ * overflow recovery / SDK compaction) the transcript is measured directly.
  */
 export function buildTaskContextUsage(input: {
 	messages: readonly TaskContextMessageLike[] | null;
@@ -38,7 +45,14 @@ export function buildTaskContextUsage(input: {
 }): RuntimeClineContextUsageResponse {
 	const { messages, effectiveCapacityTokens, triggerTokens, lastCompaction } = input;
 	const hasMessages = messages !== null && messages.length > 0;
-	const estimatedMessageTokens = hasMessages ? estimateTaskContextMessageTokens(messages) : null;
+	const requestScopedCompaction =
+		hasMessages && lastCompaction !== null && lastCompaction.messagesBefore === messages.length;
+	const estimatedMessageTokens = !hasMessages
+		? null
+		: requestScopedCompaction
+			? lastCompaction.tokensAfter
+			: estimateTaskContextMessageTokens(messages);
+	const messageCount = !hasMessages ? null : requestScopedCompaction ? lastCompaction.messagesAfter : messages.length;
 	const historyOmitted = lastCompaction !== null;
 	const utilizationRatio =
 		estimatedMessageTokens !== null && effectiveCapacityTokens !== null && effectiveCapacityTokens > 0
@@ -47,7 +61,7 @@ export function buildTaskContextUsage(input: {
 	return {
 		ok: true,
 		source: estimatedMessageTokens !== null ? "estimated" : "unavailable",
-		messageCount: hasMessages ? messages.length : null,
+		messageCount,
 		estimatedMessageTokens,
 		effectiveCapacityTokens,
 		triggerTokens,

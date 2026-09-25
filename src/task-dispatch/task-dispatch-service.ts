@@ -74,10 +74,12 @@ export interface TaskDispatchSessionSnapshot {
 }
 
 /**
- * Build session snapshots from the runtime's two session sources. Terminal
+ * Build session snapshots from the runtime's session sources. Terminal
  * summaries include ones hydrated from disk at startup, which have no process
  * behind them. Cline summaries only exist in memory, so a running Cline
- * summary is a turn running in this runtime.
+ * summary is a turn running in this runtime. B-11.2: review/repair sessions
+ * are in-memory Cline sessions too and hold the base task's worker slot, so
+ * they are scoped to the base task id.
  */
 export function collectTaskDispatchSessions(input: {
 	terminal: {
@@ -85,6 +87,7 @@ export function collectTaskDispatchSessions(input: {
 		hasActiveProcess: (taskId: string) => boolean;
 	};
 	clineSummaries: RuntimeTaskSessionSummary[];
+	reviewSummaries?: RuntimeTaskSessionSummary[];
 }): TaskDispatchSessionSnapshot[] {
 	return [
 		...input.terminal.listSummaries().map((summary) => ({
@@ -92,7 +95,17 @@ export function collectTaskDispatchSessions(input: {
 			live: input.terminal.hasActiveProcess(summary.taskId),
 		})),
 		...input.clineSummaries.map((summary) => ({ summary, live: summary.state === "running" })),
+		...(input.reviewSummaries ?? []).map((summary) => ({
+			summary: scopeReviewSessionSummary(summary),
+			live: summary.state === "running",
+		})),
 	];
+}
+
+/** B-11.2: scope a review session summary to the base task holding the worker slot. */
+function scopeReviewSessionSummary(summary: RuntimeTaskSessionSummary): RuntimeTaskSessionSummary {
+	const baseTaskId = baseTaskIdForReviewSessionId(summary.taskId);
+	return baseTaskId === null ? summary : { ...summary, taskId: baseTaskId };
 }
 
 export interface TaskDispatchDeps {
@@ -105,8 +118,6 @@ export interface TaskDispatchDeps {
 	persistBoard: (mutate: (board: RuntimeBoardData) => RuntimeBoardData) => Promise<void>;
 	/** Every task session known to this runtime (terminal and Cline), with liveness. */
 	listSessions: () => Promise<TaskDispatchSessionSnapshot[]>;
-	/** B-11.2: live review/repair sessions; they hold model worker slots too. */
-	listReviewSessionSummaries?: () => Promise<RuntimeTaskSessionSummary[]>;
 	/** Read a task's durable delivery receipt (null when absent). */
 	readReceipt: (taskId: string) => Promise<RuntimeGitDeliveryReceipt | null>;
 	/** Start a fresh task session (agent/model resolution happens inside). */
@@ -368,29 +379,6 @@ function hasRecoverableSession(sessions: TaskDispatchSessionSnapshot[], taskId: 
 	return sessions.some(
 		(session) => session.summary.taskId === taskId && (session.live || session.summary.state === "awaiting_review"),
 	);
-}
-
-/**
- * B-11.2: review/repair sessions hold their base task's worker slot, so their
- * summaries are scoped to the base task id (a task plus its own review/repair
- * sessions counts once). They run in-process, so a running one is live.
- */
-function scopeReviewSessionSummaries(summaries: RuntimeTaskSessionSummary[]): TaskDispatchSessionSnapshot[] {
-	return summaries.map((summary) => {
-		const baseTaskId = baseTaskIdForReviewSessionId(summary.taskId);
-		return {
-			summary: baseTaskId === null ? summary : { ...summary, taskId: baseTaskId },
-			live: summary.state === "running",
-		};
-	});
-}
-
-/** B-9/B-11.2: every session holding a worker slot (review/repair sessions count). */
-async function listWorkerSlotSessions(deps: TaskDispatchDeps): Promise<TaskDispatchSessionSnapshot[]> {
-	return [
-		...(await deps.listSessions()),
-		...scopeReviewSessionSummaries((await deps.listReviewSessionSummaries?.()) ?? []),
-	];
 }
 
 // --- base SHA resolution (B-9.4) --------------------------------------------
@@ -754,7 +742,7 @@ export async function dispatchReadyTasks(deps: TaskDispatchDeps): Promise<Runtim
 			.filter((entry) => !entry.ready)
 			.map((entry) => toTaskView(board, entry, blockedReasonOf(entry)));
 
-		const activeWorkers = getActiveWorkerTaskIds(await listWorkerSlotSessions(deps), board);
+		const activeWorkers = getActiveWorkerTaskIds(await deps.listSessions(), board);
 		const slotsToFill = policy.workerLimit - activeWorkers.length;
 		const titleByTaskId = collectCardTitles(board);
 		let boardChanged = false;
@@ -837,7 +825,7 @@ export async function reconcileTaskDispatch(deps: TaskDispatchDeps): Promise<Run
 	return await lockedFileSystem.withLock(getTaskDispatchLockRequest(deps.workspaceId), async () => {
 		const board = await deps.loadBoard();
 		const inProgressColumn = board.columns.find((column) => column.id === "in_progress");
-		const sessions = await listWorkerSlotSessions(deps);
+		const sessions = await deps.listSessions();
 		const titleByTaskId = collectCardTitles(board);
 		const prepare =
 			deps.prepareWorktree ??
@@ -942,7 +930,7 @@ export async function getTaskDispatchStatus(deps: TaskDispatchDeps): Promise<Run
 	const policy = config.taskDispatchPolicy ?? TASK_DISPATCH_DEFAULT_POLICY;
 	const board = await deps.loadBoard();
 	const readiness = resolveReadyTasks(await buildReadinessInput(deps, board, config));
-	const activeWorkers = getActiveWorkerTaskIds(await listWorkerSlotSessions(deps), board);
+	const activeWorkers = getActiveWorkerTaskIds(await deps.listSessions(), board);
 	const taskIds = new Set<string>();
 	for (const column of board.columns) {
 		for (const card of column.cards) {

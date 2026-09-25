@@ -28,7 +28,7 @@
 // (B-8.1).
 import { execFile } from "node:child_process";
 import { realpathSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 
@@ -49,6 +49,7 @@ import { getTaskWorktreesHomePath, loadWorkspaceBoardById } from "../state/works
 import { runGit } from "./git-utils";
 import { readTaskPreservationRecord } from "./task-preservation";
 import { computeCandidateTreeHash, readReviewHandoff, readReviewOutcome } from "./task-review-handoff";
+import { prepareWorktreeEnvironment } from "./task-worktree";
 import { normalizeTaskIdForWorktreePath } from "./task-worktree-path";
 
 const execFileAsync = promisify(execFile);
@@ -409,20 +410,38 @@ export interface GitDeliveryServiceOptions {
 	gh?: (args: string[], cwd: string) => Promise<GhCommandResult>;
 	/** Injectable candidate-tree hash (defaults to the review/verification tree identity). */
 	computeTreeHash?: (worktreePath: string) => Promise<string | null>;
+	/**
+	 * B-11.5: make the clean integration worktree runnable (submodules, mirrored
+	 * ignored paths such as dependencies) before combined verification runs the
+	 * configured checks there. Defaults to the task worktree preparation.
+	 */
+	prepareIntegrationWorktree?: (repoPath: string, worktreePath: string) => Promise<void>;
 }
 
 type EvidenceRecorder = (stage: string, detail: string) => void;
+
+/** Whether a process with this pid exists (EPERM means it exists but is not ours). */
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
 
 export class GitDeliveryService {
 	private readonly git: GitDeliveryRunner;
 	private readonly gh: (args: string[], cwd: string) => Promise<GhCommandResult>;
 	private readonly computeTreeHash: (worktreePath: string) => Promise<string | null>;
+	private readonly prepareIntegrationWorktree: (repoPath: string, worktreePath: string) => Promise<void>;
 	private readonly inFlightByDestination: Map<string, Promise<unknown>> = new Map();
 
 	constructor(options: GitDeliveryServiceOptions = {}) {
 		this.git = options.git ?? defaultGitDeliveryRunner;
 		this.gh = options.gh ?? runGhCommand;
 		this.computeTreeHash = options.computeTreeHash ?? computeCandidateTreeHash;
+		this.prepareIntegrationWorktree = options.prepareIntegrationWorktree ?? prepareWorktreeEnvironment;
 	}
 
 	/** B-8.6: serialize integration/publication for a destination branch. */
@@ -1143,10 +1162,12 @@ export class GitDeliveryService {
 			}
 		}
 
-		const worktreePath = this.integrationWorktreePath(repoPath, destinationBranch);
-		// A crashed run may leave a stale worktree; it is pipeline-owned (never
-		// user data), so remove it before recreating.
-		await this.removeIntegrationWorktree(repoPath, worktreePath);
+		// Each run gets its own worktree so a concurrent delivery from another
+		// Kanban process can never remove it mid-run. Worktrees left behind by
+		// crashed processes are pipeline-owned (never user data) and reaped here.
+		const integrationRoot = this.integrationWorktreesRoot(repoPath, destinationBranch);
+		await this.reapOrphanedIntegrationWorktrees(repoPath, integrationRoot);
+		const worktreePath = join(integrationRoot, `${process.pid}-${Date.now()}`);
 		const addResult = await this.git.run(repoPath, ["worktree", "add", "--detach", worktreePath, destSha]);
 		if (!addResult.ok) {
 			return {
@@ -1195,6 +1216,9 @@ export class GitDeliveryService {
 				const candidateTreeHash = treeHashResult.ok ? treeHashResult.stdout : null;
 				let verification: GitDeliveryCombinedVerificationResult;
 				try {
+					// The checks need the same environment a task worktree has
+					// (dependencies, build caches), not a bare checkout.
+					await this.prepareIntegrationWorktree(repoPath, worktreePath);
 					verification = await runCombinedVerification({
 						taskId: input.taskId,
 						worktreePath,
@@ -1261,17 +1285,31 @@ export class GitDeliveryService {
 		}
 	}
 
-	/** B-11.4: deterministic home for the disposable integration worktree. */
-	private integrationWorktreePath(repoPath: string, destinationBranch: string): string {
+	/** B-11.4: home for a destination's disposable integration worktrees (one per run, `<pid>-<ms>`). */
+	private integrationWorktreesRoot(repoPath: string, destinationBranch: string): string {
 		const repoSlug = resolve(repoPath).replace(/[^a-zA-Z0-9._-]/g, "-");
 		const branchSlug = destinationBranch.replace(/[^a-zA-Z0-9._-]/g, "-");
 		return join(getTaskWorktreesHomePath(), INTEGRATION_WORKTREES_DIR_NAME, repoSlug, branchSlug);
+	}
+
+	/** B-11.4: remove integration worktrees whose owning process is no longer alive. */
+	private async reapOrphanedIntegrationWorktrees(repoPath: string, integrationRoot: string): Promise<void> {
+		const entries = await readdir(integrationRoot).catch(() => [] as string[]);
+		for (const entry of entries) {
+			const ownerPid = Number.parseInt(entry.split("-")[0] ?? "", 10);
+			if (Number.isInteger(ownerPid) && ownerPid > 0 && isProcessAlive(ownerPid)) {
+				continue;
+			}
+			await this.removeIntegrationWorktree(repoPath, join(integrationRoot, entry));
+		}
 	}
 
 	/** B-11.4: remove the disposable integration worktree (best effort). */
 	private async removeIntegrationWorktree(repoPath: string, worktreePath: string): Promise<void> {
 		await this.git.run(repoPath, ["worktree", "remove", "--force", worktreePath]).catch(() => undefined);
 		await this.git.run(repoPath, ["worktree", "prune"]).catch(() => undefined);
+		// Mirrored ignored paths are symlinks; rm never follows them.
+		await rm(worktreePath, { recursive: true, force: true }).catch(() => undefined);
 	}
 
 	/** B-11.4: unwind an in-flight merge/cherry-pick in the integration worktree (best effort). */

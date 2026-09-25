@@ -303,10 +303,20 @@ async function initializeSubmodulesIfNeeded(worktreePath: string): Promise<void>
 	await getGitStdout(["submodule", "update", "--init", "--recursive"], worktreePath);
 }
 
+/**
+ * Make a fresh worktree of the repository runnable: initialize submodules and
+ * mirror the repository's ignored paths (dependencies, build caches) into it.
+ * B-11.5: the clean integration worktree needs this too before combined
+ * verification runs the configured checks there.
+ */
+export async function prepareWorktreeEnvironment(repoPath: string, worktreePath: string): Promise<void> {
+	await initializeSubmodulesIfNeeded(worktreePath);
+	await syncIgnoredPathsIntoWorktree(repoPath, worktreePath);
+}
+
 async function prepareNewTaskWorktree(repoPath: string, worktreePath: string): Promise<void> {
 	try {
-		await initializeSubmodulesIfNeeded(worktreePath);
-		await syncIgnoredPathsIntoWorktree(repoPath, worktreePath);
+		await prepareWorktreeEnvironment(repoPath, worktreePath);
 	} catch (error) {
 		await removeTaskWorktreeInternal(repoPath, worktreePath).catch(() => {});
 		throw error;

@@ -23,6 +23,7 @@ import { updateGlobalRuntimeConfig, updateRuntimeConfig } from "../config/runtim
 import type {
 	RuntimeCommandRunResponse,
 	RuntimeEffectiveContextWindow,
+	RuntimeGitDeliveryReceipt,
 	RuntimeRunUpdateResponse,
 	RuntimeTaskDeliveryInfoResponse,
 	RuntimeTaskDeliveryStartResponse,
@@ -32,6 +33,7 @@ import type {
 	RuntimeTaskPhaseSummary,
 	RuntimeTaskPhasesResponse,
 	RuntimeTaskPreservationInfoResponse,
+	RuntimeTaskPreservationRecord,
 	RuntimeTaskReviewInfoResponse,
 	RuntimeTaskSessionStartRequest,
 	RuntimeTaskSessionSummary,
@@ -68,7 +70,8 @@ import {
 	parseTaskSessionStopRequest,
 } from "../core/api-validation";
 import { isHomeAgentSessionId } from "../core/home-agent-session";
-import { computeTaskPhase, type TaskPhaseInput } from "../core/task-diagnostics";
+import { computeTaskPhase, isDeliveryResumable, type TaskPhaseInput } from "../core/task-diagnostics";
+import { buildTaskDiagnosticsExportBundle } from "../core/task-diagnostics-export";
 import { resolveTaskTitle } from "../core/task-title.js";
 import { lockedFileSystem } from "../fs/locked-file-system";
 import { openInBrowser } from "../server/browser";
@@ -86,8 +89,14 @@ import { buildRuntimeConfigResponse, resolveAgentCommand } from "../terminal/age
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { createVerificationRunner } from "../verification/verification-service";
 import { evaluateDependentsUnlock, getGitDeliveryService, readTaskDeliveryReceipt } from "../workspace/git-delivery";
-import { findTaskBaseRef } from "../workspace/task-review-handoff";
-import { getTaskPreservationInfo, recoverTaskWorktree, resolveTaskCwd } from "../workspace/task-worktree";
+import { readTaskPreservationRecord } from "../workspace/task-preservation";
+import { findTaskBaseRef, readReviewOutcome } from "../workspace/task-review-handoff";
+import {
+	getTaskPreservationInfo,
+	recoverTaskWorktree,
+	resolveTaskCwd,
+	taskWorktreeExists,
+} from "../workspace/task-worktree";
 import { captureTaskTurnCheckpoint } from "../workspace/turn-checkpoints";
 import type { RuntimeTrpcContext, RuntimeTrpcWorkspaceScope } from "./app-router";
 
@@ -357,16 +366,14 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			listSessions: async () => {
 				const terminalManager = await deps.getScopedTerminalManager(workspaceScope);
 				const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
+				// B-11.2: review/repair sessions hold model worker slots too; a missing
+				// binding (partial test harness) simply means no review sessions.
+				const reviewSessionService = await deps.getScopedReviewSessionService?.(workspaceScope);
 				return collectTaskDispatchSessions({
 					terminal: terminalManager,
 					clineSummaries: clineTaskSessionService.listSummaries(),
+					reviewSummaries: reviewSessionService?.listSessionSummaries() ?? [],
 				});
-			},
-			// B-11.2: review/repair sessions hold model worker slots too; a missing
-			// binding (partial test harness) simply means no review sessions.
-			listReviewSessionSummaries: async () => {
-				const reviewSessionService = await deps.getScopedReviewSessionService?.(workspaceScope);
-				return reviewSessionService?.listSessionSummaries() ?? [];
 			},
 			readReceipt: (taskId) => readTaskDeliveryReceipt(taskId),
 			startSession: async ({ taskId, baseRef, prompt, taskTitle }) => {
@@ -395,11 +402,53 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		});
 	};
 
-	// B-10: shared raw-data snapshot for task diagnostics. The core gather is
-	// cheap (durable records + in-memory summaries) so the batched phases
-	// endpoint can afford it per task; the context snapshot (full transcript)
-	// is only fetched for the single-task diagnostics and export paths.
+	// B-10: shared raw-data snapshot for task diagnostics. The single-task
+	// core gather includes git and tree-hash work (preservation info, review
+	// tree binding); the batched phases endpoint uses the durable records only
+	// (gatherTaskPhaseInputs). The context snapshot (full transcript) is only
+	// fetched for the single-task diagnostics and export paths.
 	type TaskContextSnapshot = Awaited<ReturnType<ClineTaskSessionService["getTaskContextSnapshot"]>>;
+
+	/** The task's session as the runtime sees it right now (Cline or terminal agent). */
+	interface TaskSessionState {
+		summary: RuntimeTaskSessionSummary | null;
+		/** A session is live in this runtime (running or awaiting review input) and can be cancelled. */
+		active: boolean;
+		source: "cline" | "terminal" | null;
+	}
+
+	/**
+	 * Resolve task sessions from both session sources. Terminal summaries can
+	 * be hydrated from disk after a restart with no process behind them, so a
+	 * terminal session only counts as active while its process is alive (the
+	 * same liveness rule the dispatch queue uses).
+	 */
+	const createTaskSessionLookup = async (
+		workspaceScope: RuntimeTrpcWorkspaceScope,
+	): Promise<(taskId: string) => TaskSessionState> => {
+		const [clineTaskSessionService, terminalManager] = await Promise.all([
+			deps.getScopedClineTaskSessionService(workspaceScope).catch(() => null),
+			deps.getScopedTerminalManager(workspaceScope).catch(() => null),
+		]);
+		return (taskId) => {
+			const clineSummary = (clineTaskSessionService?.getSummary(taskId) ?? null) as RuntimeTaskSessionSummary | null;
+			if (clineSummary) {
+				return { summary: clineSummary, active: isLiveSessionState(clineSummary.state), source: "cline" };
+			}
+			const terminalSummary = terminalManager?.getSummary(taskId) ?? null;
+			if (terminalSummary) {
+				return {
+					summary: terminalSummary,
+					active: isLiveSessionState(terminalSummary.state) && terminalManager?.hasActiveProcess(taskId) === true,
+					source: "terminal",
+				};
+			}
+			return { summary: null, active: false, source: null };
+		};
+	};
+
+	const isLiveSessionState = (state: RuntimeTaskSessionSummary["state"]): boolean =>
+		state === "running" || state === "awaiting_review";
 
 	interface TaskDiagnosticsCore {
 		task: { id: string; title: string; columnId: string; updatedAt: number } | null;
@@ -410,7 +459,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		review: RuntimeTaskReviewInfoResponse;
 		dispatchRecord: RuntimeTaskDispatchRecord | null;
 		preservation: RuntimeTaskPreservationInfoResponse | null;
-		sessionSummary: RuntimeTaskSessionSummary | null;
+		session: TaskSessionState;
 	}
 
 	const gatherTaskDiagnosticsCore = async (
@@ -422,14 +471,13 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		const card = columnWithTask?.cards.find((c) => c.id === taskId) ?? null;
 		// Reuse the exact procedure behavior (including the cross-workspace
 		// receipt filter) rather than duplicating it here.
-		const [delivery, review, dispatchRecord, preservation, clineTaskSessionService] = await Promise.all([
+		const [delivery, review, dispatchRecord, preservation, lookupSession] = await Promise.all([
 			runtimeApi.getTaskDeliveryInfo(workspaceScope, { taskId }),
 			runtimeApi.getTaskReviewInfo(workspaceScope, { taskId }),
 			readTaskDispatchRecord(taskId).catch(() => null),
 			getTaskPreservationInfo({ repoPath: workspaceScope.workspacePath, taskId }).catch(() => null),
-			deps.getScopedClineTaskSessionService(workspaceScope).catch(() => null),
+			createTaskSessionLookup(workspaceScope),
 		]);
-		const sessionSummary = (clineTaskSessionService?.getSummary(taskId) ?? null) as RuntimeTaskSessionSummary | null;
 
 		return {
 			task:
@@ -447,7 +495,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			review,
 			dispatchRecord,
 			preservation,
-			sessionSummary,
+			session: lookupSession(taskId),
 		};
 	};
 
@@ -456,35 +504,91 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		taskId: string,
 	): Promise<TaskDiagnosticsCore & { contextSnapshot: TaskContextSnapshot }> => {
 		const core = await gatherTaskDiagnosticsCore(workspaceScope, taskId);
-		const contextSnapshot = core.sessionSummary
-			? await deps
-					.getScopedClineTaskSessionService(workspaceScope)
-					.then((service) => service.getTaskContextSnapshot(taskId))
-					.catch(() => null)
-			: null;
+		// Only native Cline sessions have a transcript Kanban can measure.
+		const contextSnapshot =
+			core.session.source === "cline"
+				? await deps
+						.getScopedClineTaskSessionService(workspaceScope)
+						.then((service) => service.getTaskContextSnapshot(taskId))
+						.catch(() => null)
+				: null;
 		return { ...core, contextSnapshot };
 	};
 
-	const isSessionActive = (summary: RuntimeTaskSessionSummary | null): boolean =>
-		summary !== null && (summary.state === "running" || summary.state === "awaiting_review");
+	/** Map lifecycle records onto the pure phase computation's input. */
+	const toTaskPhaseInput = (records: {
+		sessionActive: boolean;
+		receipt: RuntimeGitDeliveryReceipt | null;
+		reviewStatus: RuntimeTaskReviewInfoResponse["status"];
+		reviewError: string | null;
+		dispatchRecord: RuntimeTaskDispatchRecord | null;
+		preservationRecord: RuntimeTaskPreservationRecord | null;
+		worktreeExists: boolean;
+	}): TaskPhaseInput => ({
+		sessionActive: records.sessionActive,
+		deliveryStatus: records.receipt?.status ?? null,
+		deliveryStage: records.receipt?.stage ?? null,
+		deliveryEvidence: records.receipt?.evidence ?? [],
+		reviewStatus: records.reviewStatus,
+		reviewError: records.reviewError,
+		dispatchStatus: records.dispatchRecord?.status ?? null,
+		dispatchError: records.dispatchRecord?.error ?? null,
+		preservationStatus: records.preservationRecord?.status ?? "none",
+		preservationBlockedReasons: records.preservationRecord?.blockedReasons ?? [],
+		worktreeExists: records.worktreeExists,
+	});
 
-	/** Map the raw snapshot onto the pure phase computation's input. */
-	const buildTaskPhaseInput = (core: TaskDiagnosticsCore): TaskPhaseInput => {
-		const receipt = core.delivery.receipt;
-		const preservationRecord = core.preservation?.preservation ?? null;
-		return {
-			sessionActive: isSessionActive(core.sessionSummary),
-			deliveryStatus: receipt?.status ?? null,
-			deliveryStage: receipt?.stage ?? null,
-			deliveryEvidence: receipt?.evidence ?? [],
+	/** Map the single-task snapshot onto the pure phase computation's input. */
+	const buildTaskPhaseInput = (core: TaskDiagnosticsCore): TaskPhaseInput =>
+		toTaskPhaseInput({
+			sessionActive: core.session.active,
+			receipt: core.delivery.receipt,
 			reviewStatus: core.review.status,
 			reviewError: core.review.error,
-			dispatchStatus: core.dispatchRecord?.status ?? null,
-			dispatchError: core.dispatchRecord?.error ?? null,
-			preservationStatus: preservationRecord?.status ?? "none",
-			preservationBlockedReasons: preservationRecord?.blockedReasons ?? [],
+			dispatchRecord: core.dispatchRecord,
+			preservationRecord: core.preservation?.preservation ?? null,
 			worktreeExists: core.preservation?.worktreeExists ?? false,
-		};
+		});
+
+	/**
+	 * B-10.1: phase inputs for many tasks from the durable records alone — no
+	 * board load, no git commands, no candidate-tree hashing — so the board
+	 * chips can refresh often. Sessions are resolved once for the batch.
+	 */
+	const gatherTaskPhaseInputs = async (
+		workspaceScope: RuntimeTrpcWorkspaceScope,
+		taskIds: string[],
+	): Promise<Map<string, TaskPhaseInput | null>> => {
+		const lookupSession = await createTaskSessionLookup(workspaceScope);
+		const entries = await Promise.all(
+			taskIds.map(async (taskId): Promise<[string, TaskPhaseInput | null]> => {
+				try {
+					const [receipt, outcome, dispatchRecord, preservationRecord, worktreeExists] = await Promise.all([
+						readTaskDeliveryReceipt(taskId).catch(() => null),
+						readReviewOutcome(taskId).catch(() => null),
+						readTaskDispatchRecord(taskId).catch(() => null),
+						readTaskPreservationRecord(taskId).catch(() => null),
+						taskWorktreeExists(workspaceScope.workspacePath, taskId),
+					]);
+					return [
+						taskId,
+						toTaskPhaseInput({
+							sessionActive: lookupSession(taskId).active,
+							// Same cross-workspace filter as getTaskDeliveryInfo.
+							receipt: receipt && receipt.workspaceId === workspaceScope.workspaceId ? receipt : null,
+							reviewStatus: outcome?.status ?? null,
+							reviewError: outcome?.error ?? null,
+							dispatchRecord,
+							preservationRecord,
+							worktreeExists,
+						}),
+					];
+				} catch {
+					return [taskId, null];
+				}
+			}),
+		);
+		return new Map(entries);
 	};
 
 	const buildEmptyContextUsage = (error: string | null) => ({
@@ -617,8 +721,8 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			review: snapshot.review,
 			dispatchRecord: snapshot.dispatchRecord,
 			session: {
-				summary: snapshot.sessionSummary,
-				active: isSessionActive(snapshot.sessionSummary),
+				summary: snapshot.session.summary,
+				active: snapshot.session.active,
 			},
 			context: await buildDiagnosticsContextUsage(workspaceScope, snapshot),
 			actions: phase.actions,
@@ -631,59 +735,6 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 	// action once. The map holds the promise (never a flag) so concurrent
 	// callers join the same run and all see its outcome.
 	const taskDiagnosticsActionInFlight = new Map<string, Promise<RuntimeTaskDiagnosticsActionResponse>>();
-
-	/**
-	 * B-10.7: build the redacted export bundle. The full session transcript is
-	 * never written (only the aggregate context-usage figures), and the
-	 * dispatch record's fresh-context prompt is replaced by null. The
-	 * `redactions` list names every category of private material excluded so
-	 * the operator knows what is (and is not) in the file.
-	 */
-	const buildDiagnosticsExportBundle = (
-		diagnostics: RuntimeTaskDiagnosticsResponse,
-		contextSnapshot: TaskContextSnapshot,
-	): { bundle: Record<string, unknown>; redactions: string[] } => {
-		const redactions: string[] = [];
-		let dispatchRecord = diagnostics.dispatchRecord;
-		if (dispatchRecord?.prompt) {
-			redactions.push("dispatch_prompt");
-			dispatchRecord = { ...dispatchRecord, prompt: null };
-		}
-		const transcriptAvailable = contextSnapshot !== null && contextSnapshot.messages.length > 0;
-		if (transcriptAvailable) {
-			redactions.push("session_transcript");
-		}
-		return {
-			redactions,
-			bundle: {
-				schemaVersion: 1,
-				exportedAt: new Date().toISOString(),
-				task: diagnostics.task,
-				phase: diagnostics.phase,
-				lastSuccessfulPhase: diagnostics.lastSuccessfulPhase,
-				needsAttention: diagnostics.needsAttention,
-				blockedReason: diagnostics.blockedReason,
-				branch: diagnostics.branch,
-				commit: diagnostics.commit,
-				baseRef: diagnostics.baseRef,
-				baseSha: diagnostics.baseSha,
-				workspace: diagnostics.workspace,
-				preservedWork: diagnostics.preservedWork,
-				delivery: diagnostics.delivery,
-				review: diagnostics.review,
-				dispatchRecord,
-				session: {
-					// The live summary (no transcript content) is kept; the full
-					// message list is the redacted material.
-					summary: diagnostics.session.summary,
-					active: diagnostics.session.active,
-					transcriptRedacted: transcriptAvailable,
-				},
-				context: diagnostics.context,
-				actions: diagnostics.actions,
-			},
-		};
-	};
 
 	const runtimeApi: RuntimeTrpcContext["runtimeApi"] = {
 		loadConfig: async (workspaceScope) => {
@@ -948,21 +999,20 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			try {
 				const body = parseTaskPhasesRequest(input);
 				const phases: Record<string, RuntimeTaskPhaseSummary> = {};
-				await Promise.all(
-					body.taskIds.map(async (taskId) => {
-						try {
-							const core = await gatherTaskDiagnosticsCore(workspaceScope, taskId);
-							const phase = computeTaskPhase(buildTaskPhaseInput(core));
-							phases[taskId] = {
-								phase: phase.phase,
-								needsAttention: phase.needsAttention,
-								blockedReason: phase.blockedReason,
-							};
-						} catch {
-							phases[taskId] = { phase: "idle", needsAttention: false, blockedReason: null };
-						}
-					}),
-				);
+				const inputs = await gatherTaskPhaseInputs(workspaceScope, body.taskIds);
+				for (const taskId of body.taskIds) {
+					const input = inputs.get(taskId);
+					if (!input) {
+						phases[taskId] = { phase: "idle", needsAttention: false, blockedReason: null };
+						continue;
+					}
+					const phase = computeTaskPhase(input);
+					phases[taskId] = {
+						phase: phase.phase,
+						needsAttention: phase.needsAttention,
+						blockedReason: phase.blockedReason,
+					};
+				}
 				return { ok: true, phases, error: null };
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
@@ -1007,10 +1057,10 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					switch (body.action) {
 						case "retry_phase":
 						case "resume_repair": {
-							// A durable receipt drives the resume from the last
-							// successful stage; a broken review without a receipt
-							// retries the review pass instead.
-							if (core.delivery.receipt) {
+							// A failed/paused receipt drives the resume from the last
+							// successful stage; otherwise the retry is for a broken
+							// review, which retries the review pass.
+							if (isDeliveryResumable(core.delivery.receipt?.status ?? null)) {
 								const response = await runtimeApi.startTaskDelivery(workspaceScope, {
 									taskId: body.taskId,
 								});
@@ -1090,7 +1140,12 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				const body = parseDiagnosticsExportRequest(input);
 				const snapshot = await gatherTaskDiagnosticsSnapshot(workspaceScope, body.taskId);
 				const diagnostics = await buildTaskDiagnosticsResponse(workspaceScope, snapshot);
-				const { bundle, redactions } = buildDiagnosticsExportBundle(diagnostics, snapshot.contextSnapshot);
+				const { bundle, redactions } = buildTaskDiagnosticsExportBundle({
+					diagnostics,
+					transcriptMessageCount: snapshot.contextSnapshot?.messages.length ?? 0,
+					homeDirectory: homedir(),
+					exportedAt: new Date().toISOString(),
+				});
 				const safeTaskId = body.taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
 				const bundlePath = join(getRuntimeHomePath(), "diagnostics", `task-${safeTaskId}-${Date.now()}.json`);
 				await lockedFileSystem.writeTextFileAtomic(bundlePath, JSON.stringify(bundle, null, 2));
