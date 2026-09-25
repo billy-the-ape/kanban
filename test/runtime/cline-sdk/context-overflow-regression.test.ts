@@ -265,20 +265,20 @@ describe("B-3.2 compactClineConversationMessages", () => {
 		});
 	});
 
-	it("drops orphaned tool_result blocks and keeps the surviving text of the same message", () => {
+	it("drops a tool_use turn together with its tool_result and records it in the notice", () => {
 		const messages: ClineSdkPersistedMessage[] = [
 			{ role: "user", content: "Build the board" },
 			{
 				role: "assistant",
 				content: [
 					{ type: "text", text: "Checking" },
-					{ type: "tool_use", id: "t1", name: "read_file", input: {} },
+					{ type: "tool_use", id: "t1", name: "read_file", input: { path: "/repo/board.ts" } },
 				],
 			},
 			{
 				role: "user",
 				content: [
-					{ type: "tool_result", tool_use_id: "t1", content: "file body" },
+					{ type: "tool_result", tool_use_id: "t1", content: "file body ".repeat(400) },
 					{ type: "text", text: "old note" },
 				],
 			},
@@ -286,21 +286,41 @@ describe("B-3.2 compactClineConversationMessages", () => {
 			{ role: "user", content: "Follow up" },
 		];
 
-		const result = compactClineConversationMessages(messages, 48);
+		const result = compactClineConversationMessages(messages, 1_000);
 
 		expect(result.changed).toBe(true);
-		// The old assistant (owner of tool_use t1) is deleted first; the
-		// pairing repair must drop the now-orphaned tool_result block —
-		// providers reject requests that contain orphaned tool results —
-		// while keeping the other blocks of that user message.
+		// The whole turn (tool_use and its tool_result message) is removed as
+		// a unit, so no orphaned tool_result can reach the provider.
 		expect(orphanToolResultIds(result.messages)).toEqual([]);
-		const noteMessage = result.messages.find((message) => JSON.stringify(message.content).includes("old note"));
-		expect(noteMessage).toBeDefined();
-		const noteBlocks = (noteMessage as { content: Array<{ type: string; text?: string }> }).content;
-		expect(noteBlocks).toHaveLength(1);
-		expect(noteBlocks[0]?.type).toBe("text");
-		expect(noteBlocks[0]?.text).toBe("old note");
-		// No tool_use block for t1 survives.
+		const serialized = JSON.stringify(result.messages);
+		expect(serialized).not.toContain('"id":"t1"');
+		expect(serialized).not.toContain('"tool_use_id":"t1"');
+		// The notice tells the model what the dropped turn did.
+		const first = String(result.messages[0]?.content);
+		expect(first.startsWith(COMPACTION_NOTICE_PREFIX)).toBe(true);
+		expect(first).toContain("read_file(/repo/board.ts)");
+		expect(result.messages.at(-1)?.content).toBe("Follow up");
+	});
+
+	it("drops a tool_result left orphaned by an interleaved user message", () => {
+		const messages: ClineSdkPersistedMessage[] = [
+			{ role: "user", content: "Requirements" },
+			{ role: "assistant", content: [{ type: "tool_use", id: "t1", name: "read_file", input: {} }] },
+			{ role: "user", content: "steer ".repeat(200) },
+			{
+				role: "user",
+				content: [
+					{ type: "tool_result", tool_use_id: "t1", content: "body" },
+					{ type: "text", text: "late note" },
+				],
+			},
+			{ role: "assistant", content: "ok" },
+		];
+
+		const result = compactClineConversationMessages(messages, 80);
+
+		expect(result.changed).toBe(true);
+		expect(orphanToolResultIds(result.messages)).toEqual([]);
 		expect(JSON.stringify(result.messages)).not.toContain('"id":"t1"');
 	});
 

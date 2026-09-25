@@ -62,23 +62,31 @@ describe("B-2.5 — compactClineAgentMessages", () => {
 		expect(result.messages).toEqual(messages);
 	});
 
-	it("deletes old messages, keeps first and last user message, and prepends a notice", () => {
-		const messages: ClineSdkAgentMessage[] = [];
-		for (let i = 0; i < 4; i += 1) {
-			messages.push(agentMessage("user", [sizedTextPart(100)]));
-			messages.push(agentMessage("assistant", [sizedTextPart(100)]));
-		}
-		const result = compactClineAgentMessages(messages, 300);
+	it("drops whole old turns, keeps the first prompt, latest instruction, and latest turn, and prepends a notice", () => {
+		const firstUser = agentMessage("user", [sizedTextPart(100)]);
+		const instruction = agentMessage("user", [sizedTextPart(100)]);
+		const messages: ClineSdkAgentMessage[] = [
+			firstUser,
+			agentMessage("assistant", [sizedTextPart(100)]),
+			agentMessage("user", [sizedTextPart(100)]),
+			agentMessage("assistant", [sizedTextPart(100)]),
+			instruction,
+			agentMessage("assistant", [{ type: "tool-call", toolCallId: "c1", toolName: "read_files", input: {} }]),
+			agentMessage("tool", [
+				{ type: "tool-result", toolCallId: "c1", toolName: "read_files", output: "x".repeat(400) },
+			]),
+		];
+		const result = compactClineAgentMessages(messages, 400);
 		expect(result.changed).toBe(true);
-		expect(result.messages.length).toBeLessThan(messages.length);
+		expect(result.tokensAfter).toBeLessThanOrEqual(400);
 		const firstPart = result.messages[0]?.content[0];
 		expect(firstPart?.type).toBe("text");
 		if (firstPart?.type === "text") {
 			expect(firstPart.text).toContain("removed to fit the context window");
 		}
-		// The last user message content is preserved verbatim.
-		const lastUser = [...result.messages].reverse().find((m) => m.role === "user");
-		expect(lastUser?.content).toEqual(messages[6]?.content);
+		expect(result.messages[0]?.content.slice(1)).toEqual(firstUser.content);
+		// The most recent user instruction and the latest turn survive verbatim.
+		expect(result.messages.slice(1)).toEqual(messages.slice(4));
 	});
 
 	it("drops orphan tool-result parts whose tool-call was deleted", () => {
@@ -128,6 +136,86 @@ describe("B-2.5 — compactClineAgentMessages", () => {
 			estimateTextTokens(m.content.map((p) => (p.type === "text" ? p.text : "")).join("\n"));
 		const total = result.messages.reduce((sum, m) => sum + estimate(m), 0);
 		expect(total).toBeLessThanOrEqual(100);
+	});
+});
+
+describe("compactClineAgentMessages — turn-based regression (whole-history wipe)", () => {
+	/** A realistic agent loop: task prompt, then N turns of a small tool call plus a large tool result. */
+	function agentLoop(turns: number, options: { failedEvery?: number } = {}): ClineSdkAgentMessage[] {
+		const messages: ClineSdkAgentMessage[] = [agentMessage("user", [sizedTextPart(400)])];
+		for (let i = 0; i < turns; i += 1) {
+			const toolName = i % 3 === 0 ? "editor" : "read_files";
+			const input =
+				toolName === "editor"
+					? { path: `/repo/src/f${i}.ts`, command: "str_replace" }
+					: { files: [{ path: `/repo/src/f${i}.ts` }] };
+			messages.push(
+				agentMessage("assistant", [
+					{ type: "reasoning", text: `step ${i} `.repeat(20) },
+					{ type: "tool-call", toolCallId: `c${i}`, toolName, input },
+				]),
+			);
+			messages.push(
+				agentMessage("tool", [
+					{
+						type: "tool-result",
+						toolCallId: `c${i}`,
+						toolName,
+						output: "file content line\n".repeat(400),
+						isError: options.failedEvery !== undefined && i % options.failedEvery === 0,
+					},
+				]),
+			);
+		}
+		return messages;
+	}
+	const toolCallIds = (messages: ClineSdkAgentMessage[]) =>
+		messages.flatMap((m) => m.content.flatMap((p) => (p.type === "tool-call" ? [p.toolCallId] : [])));
+
+	it("a small overflow drops only a few old turns instead of the whole history", () => {
+		const messages = agentLoop(60);
+		const total = compactClineAgentMessages(messages, Number.MAX_SAFE_INTEGER).tokensBefore;
+		const result = compactClineAgentMessages(messages, Math.floor(total * 0.95));
+		expect(result.changed).toBe(true);
+		expect(result.tokensAfter).toBeLessThanOrEqual(Math.floor(total * 0.95));
+		// The previous strategy kept 1 of 60 tool calls (~2% of the tokens).
+		expect(result.tokensAfter).toBeGreaterThan(total * 0.6);
+		const kept = toolCallIds(result.messages);
+		expect(kept.length).toBeGreaterThan(40);
+		// Kept turns are the newest, contiguous, and still paired.
+		expect(kept.at(-1)).toBe("c59");
+		const resultIds = result.messages.flatMap((m) =>
+			m.content.flatMap((p) => (p.type === "tool-result" ? [p.toolCallId] : [])),
+		);
+		expect(resultIds).toEqual(kept);
+	});
+
+	it("records what the dropped turns did in the notice, marking failures", () => {
+		const messages = agentLoop(30, { failedEvery: 6 });
+		const total = compactClineAgentMessages(messages, Number.MAX_SAFE_INTEGER).tokensBefore;
+		const result = compactClineAgentMessages(messages, Math.floor(total * 0.5));
+		const notice = result.messages[0]?.content[0];
+		expect(notice?.type).toBe("text");
+		const text = notice?.type === "text" ? notice.text : "";
+		expect(text).toContain("your own work");
+		expect(text).toContain("- editor(str_replace /repo/src/f0.ts) (failed)");
+		expect(text).toContain("- editor(str_replace /repo/src/f3.ts)\n");
+		expect(text).toContain("read_files(/repo/src/f1.ts)");
+		// The digest only lists turns that were actually dropped.
+		const firstKept = toolCallIds(result.messages)[0] ?? "";
+		expect(text).not.toContain(`/repo/src/f${firstKept.slice(1)}.ts`);
+	});
+
+	it("keeps the same cut across consecutive requests until the tail outgrows the budget", () => {
+		const messages = agentLoop(40);
+		const total = compactClineAgentMessages(messages, Number.MAX_SAFE_INTEGER).tokensBefore;
+		const target = Math.floor(total * 0.8);
+		const first = compactClineAgentMessages(messages, target);
+		const next = compactClineAgentMessages(agentLoop(41), target);
+		// One more turn still fits at the same boundary: the prefix (notice and
+		// first kept turn) is unchanged, so provider prompt caches stay warm.
+		expect(next.messages[0]?.content).toEqual(first.messages[0]?.content);
+		expect(toolCallIds(next.messages)[0]).toBe(toolCallIds(first.messages)[0]);
 	});
 });
 
