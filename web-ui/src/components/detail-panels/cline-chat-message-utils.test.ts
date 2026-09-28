@@ -331,6 +331,9 @@ describe("getCompletedAssistantMessageId", () => {
 	it("does not style interim text, failed runs, or an unmatched final message", () => {
 		expect(getCompletedAssistantMessageId(messages, { ...summary, reviewReason: "error" })).toBeNull();
 		expect(getCompletedAssistantMessageId(messages, { ...summary, latestHookActivity: null })).toBeNull();
-		expect(getCompletedAssistantMessageId([...messages, { ...messages[0], id: "newer" }], summary)).toBeNull();
+		expect(getCompletedAssistantMessageId(
+			[...messages, { id: "newer", role: "assistant", content: "A new turn", createdAt: 3 }],
+			summary,
+		)).toBeNull();
 	});
 });
