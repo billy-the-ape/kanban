@@ -530,7 +530,7 @@ describe("S5 — a large next tool result (real local SDK session)", () => {
 				.listMessages(S5_TASK_ID)
 				.filter((message) => message.role === "tool" && message.meta?.toolName === "run_commands");
 			expect(toolMessages.length).toBe(1);
-			const content = toolMessages[0]!.content;
+			const content = toolMessages[0]?.content;
 			expect(content).toContain("Command 1/1: cat ");
 			expect(content).toContain("Exit status: success");
 			expect(content).toContain(HEAD_MARKER);
@@ -540,7 +540,7 @@ describe("S5 — a large next tool result (real local SDK session)", () => {
 			expect(content.length).toBeLessThanOrEqual(boundChars + 512);
 			// 4. The full output is preserved as a local artifact — including
 			//    the middle lines the excerpt dropped.
-			const reference = content.match(/\[truncated \d+ lines; full output: ([^\]]+)\]/)![1]!.trim();
+			const reference = content.match(/\[truncated \d+ lines; full output: ([^\]]+)\]/)?.[1]?.trim();
 			const artifact = JSON.parse(await readTaskContextArtifact(reference)) as Array<{
 				query: string;
 				result?: string;

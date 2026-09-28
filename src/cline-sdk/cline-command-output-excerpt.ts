@@ -280,7 +280,7 @@ function boundedLineExcerpt(
 	const lineCount = lines.length;
 	const prefixLengths: number[] = [0];
 	for (let i = 0; i < lineCount; i++) {
-		prefixLengths.push(prefixLengths[i]! + lines[i]!.length + 1);
+		prefixLengths.push(prefixLengths[i]! + lines[i]?.length + 1);
 	}
 	const headChars = (count: number): number => (count <= 0 ? 0 : prefixLengths[count]! - 1);
 	const tailChars = (count: number): number =>

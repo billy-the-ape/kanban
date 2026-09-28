@@ -13,19 +13,19 @@ describe("parseCommandOutputEntries", () => {
 			{ query: "echo two", result: "third", success: true },
 		]);
 		expect(entries).toHaveLength(2);
-		expect(entries![0]).toEqual({
+		expect(entries?.[0]).toEqual({
 			query: "echo one",
 			success: true,
 			body: "first body\nsecond",
 			failureReason: null,
 		});
-		expect(entries![1]).toEqual({ query: "echo two", success: true, body: "third", failureReason: null });
+		expect(entries?.[1]).toEqual({ query: "echo two", success: true, body: "third", failureReason: null });
 	});
 
 	it("treats a missing success flag with a non-empty result as success", () => {
 		const entries = parseCommandOutputEntries([{ query: "q", result: "out" }]);
 		expect(entries).toHaveLength(1);
-		expect(entries![0]).toMatchObject({ success: true, body: "out" });
+		expect(entries?.[0]).toMatchObject({ success: true, body: "out" });
 	});
 
 	it("uses the error text as the body for a failed command with an empty result (SDK shape)", () => {
@@ -34,9 +34,9 @@ describe("parseCommandOutputEntries", () => {
 			{ query: "failing", result: "", success: false, error: `Command failed: ${stderr}` },
 		]);
 		expect(entries).toHaveLength(1);
-		expect(entries![0]).toMatchObject({ query: "failing", success: false });
-		expect(entries![0]!.body).toBe(`Command failed: ${stderr}`);
-		expect(entries![0]!.failureReason).toBe("Command failed: stderr line 1");
+		expect(entries?.[0]).toMatchObject({ query: "failing", success: false });
+		expect(entries?.[0]?.body).toBe(`Command failed: ${stderr}`);
+		expect(entries?.[0]?.failureReason).toBe("Command failed: stderr line 1");
 	});
 
 	it("keeps partial stdout ahead of the error text on failure", () => {
@@ -44,8 +44,8 @@ describe("parseCommandOutputEntries", () => {
 			{ query: "failing", result: "partial out", success: false, error: "boom" },
 		]);
 		expect(entries).toHaveLength(1);
-		expect(entries![0]!.body).toBe("partial out\nboom");
-		expect(entries![0]!.failureReason).toBe("boom");
+		expect(entries?.[0]?.body).toBe("partial out\nboom");
+		expect(entries?.[0]?.failureReason).toBe("boom");
 	});
 
 	it("returns null for strings, empty arrays, non-object items, and missing fields", () => {
@@ -86,7 +86,7 @@ describe("buildCommandOutputExcerpt", () => {
 			artifactPath,
 		});
 		expect(result).not.toBeNull();
-		expect(result!.text).toBe("Command 1/1: q\nExit status: success\none\ntwo");
+		expect(result?.text).toBe("Command 1/1: q\nExit status: success\none\ntwo");
 		expect(result).toMatchObject({ headLines: 2, tailLines: 0, omittedLines: 0, truncated: false });
 	});
 
@@ -113,7 +113,7 @@ describe("buildCommandOutputExcerpt", () => {
 
 	it("honors custom head/tail counts and omits the artifact suffix when no path is given", () => {
 		// Long lines so the body exceeds the budget and line truncation kicks in.
-		const body = Array.from({ length: 120 }, (_, i) => `l${i + 1}` + "p".repeat(55)).join("\n");
+		const body = Array.from({ length: 120 }, (_, i) => `l${i + 1}${"p".repeat(55)}`).join("\n");
 		const result = buildCommandOutputExcerpt([entry({ query: "q", body })], {
 			budgetChars: 4_000,
 			headLines: 10,
@@ -144,7 +144,7 @@ describe("buildCommandOutputExcerpt", () => {
 
 	it("falls back to a char cut when no line share fits the budget", () => {
 		const result = buildCommandOutputExcerpt(
-			[entry({ query: "q", body: "a".repeat(5_000) + "\n" + "b".repeat(5_000) })],
+			[entry({ query: "q", body: `${"a".repeat(5_000)}\n${"b".repeat(5_000)}` })],
 			{ budgetChars: 400, artifactPath },
 		)!;
 		expect(result.text.length).toBeLessThanOrEqual(400);
@@ -169,7 +169,7 @@ describe("buildCommandOutputExcerpt", () => {
 		expect(lines[0]).toBe("Command 1/3: one");
 		expect(lines[1]).toBe("Exit status: success");
 		expect(lines[2]).toBe("ok");
-		const thirdIndex = lines.findIndex((line) => line === "Command 3/3: three");
+		const thirdIndex = lines.indexOf("Command 3/3: three");
 		expect(thirdIndex).toBeGreaterThan(-1);
 		expect(lines[thirdIndex + 1]).toBe("Exit status: failed — Command failed: boom");
 		expect(result.truncated).toBe(true);
@@ -179,17 +179,17 @@ describe("buildCommandOutputExcerpt", () => {
 		const result = buildCommandOutputExcerpt(
 			[
 				entry({
-					query: "npm run " + "t".repeat(500),
+					query: `npm run ${"t".repeat(500)}`,
 					body: "x",
 					success: false,
-					failureReason: "Command failed: " + "e".repeat(200),
+					failureReason: `Command failed: ${"e".repeat(200)}`,
 				}),
 			],
 			{ budgetChars: 4_000, artifactPath },
 		)!;
 		const lines = result.text.split("\n");
-		expect(lines[0]).toBe(`Command 1/1: ${"npm run " + "t".repeat(192)}...`);
-		expect(lines[1]).toBe(`Exit status: failed — ${"Command failed: " + "e".repeat(104)}...`);
+		expect(lines[0]).toBe(`Command 1/1: ${`npm run ${"t".repeat(192)}`}...`);
+		expect(lines[1]).toBe(`Exit status: failed — ${`Command failed: ${"e".repeat(104)}`}...`);
 	});
 
 	it("emits a bare Exit status: failed when the entry has no failure reason", () => {

@@ -320,12 +320,12 @@ describe("B-2.6 — tool-result bounding at ingestion (real local SDK session)",
 		for (const request of requests) {
 			expect(request.promptTokens + MAX_TOKENS).toBeLessThanOrEqual(WINDOW);
 		}
-		expect(requests[1]!.promptTokens).toBeLessThan(WINDOW / 2);
+		expect(requests[1]?.promptTokens).toBeLessThan(WINDOW / 2);
 
 		// 2. The request carrying the tool result is bounded and references the artifact.
 		const artifactsDir = join(probeDir, "worktrees-home", TASK_ID, "context-artifacts");
-		expect(requests[1]!.rawBody).toContain("Full content: ");
-		expect(requests[1]!.rawBody).toContain(artifactsDir);
+		expect(requests[1]?.rawBody).toContain("Full content: ");
+		expect(requests[1]?.rawBody).toContain(artifactsDir);
 
 		// 3. The persisted tool message is a head+tail excerpt: markers at both ends
 		//    present, the middle of the file gone, and the total within the bound
@@ -334,7 +334,7 @@ describe("B-2.6 — tool-result bounding at ingestion (real local SDK session)",
 			.listMessages(TASK_ID)
 			.filter((message) => message.role === "tool" && message.meta?.toolName === "read_files");
 		expect(toolMessages.length).toBe(1);
-		const toolContent = toolMessages[0]!.content;
+		const toolContent = toolMessages[0]?.content;
 		expect(toolContent).toContain("Tool: read_files");
 		expect(toolContent).toContain(HEAD_MARKER);
 		expect(toolContent).toContain(TAIL_MARKER);
@@ -344,7 +344,7 @@ describe("B-2.6 — tool-result bounding at ingestion (real local SDK session)",
 
 		// 4. The referenced artifact lives outside any repo checkout and holds the
 		//    full read result.
-		const reference = toolContent.match(/Full content: (.+)$/m)![1]!.trim();
+		const reference = toolContent.match(/Full content: (.+)$/m)?.[1]?.trim();
 		expect(reference.startsWith(artifactsDir)).toBe(true);
 		const artifactContent = await readTaskContextArtifact(reference);
 		expect(artifactContent.length).toBeGreaterThan(900_000);
@@ -361,7 +361,7 @@ describe("B-2.6 — tool-result bounding at ingestion (real local SDK session)",
 			.map((line) => JSON.parse(line) as { message?: string; metadata?: Record<string, unknown> })
 			.filter((entry) => entry.message?.includes("Bounded oversized tool result at ingestion"));
 		expect(hookEntries.length).toBeGreaterThan(0);
-		expect(String(hookEntries[0]!.metadata?.artifactPath)).toBe(reference);
+		expect(String(hookEntries[0]?.metadata?.artifactPath)).toBe(reference);
 
 		const summary = activeService.getSummary(TASK_ID);
 		expect(["running", "awaiting_review", "idle"]).toContain(summary?.state);

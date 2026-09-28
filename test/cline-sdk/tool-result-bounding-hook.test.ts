@@ -65,7 +65,7 @@ describe("computeToolResultBoundChars", () => {
 });
 
 describe("buildBoundedToolResultExcerpt", () => {
-	const full = "A".repeat(10_000) + "MIDDLE" + "B".repeat(10_000);
+	const full = `${"A".repeat(10_000)}MIDDLE${"B".repeat(10_000)}`;
 
 	it("keeps head + tail with an accurate omission marker, within budget, with the reference", () => {
 		const excerpt = buildBoundedToolResultExcerpt(full, 4_000, "/tmp/artifact.txt");
@@ -139,10 +139,10 @@ describe("buildBoundedToolResultExcerpt", () => {
 			const { hook, logger, writeArtifact, context } = createHook({ output: fullOutput });
 			const result = await hook({ ...context, result: { output: fullOutput, isError: true } });
 			expect(result?.result?.output).toBeTypeOf("string");
-			const output = result!.result!.output as string;
+			const output = result?.result?.output as string;
 			expect(output.length).toBeLessThanOrEqual(boundChars);
 			expect(output).toContain("Full content: fake-artifact.txt");
-			expect(result!.result!.isError).toBe(true);
+			expect(result?.result?.isError).toBe(true);
 			expect(writeArtifact).toHaveBeenCalledWith({ taskId: "task-1", toolCallId: "call-1", content: fullOutput });
 			expect(logger.log).toHaveBeenCalledWith(
 				expect.stringContaining("Bounded oversized tool result"),
@@ -154,7 +154,7 @@ describe("buildBoundedToolResultExcerpt", () => {
 			const payload = { entries: [{ query: "big-file.txt", result: "w".repeat(boundChars + 100), success: true }] };
 			const { hook, writeArtifact } = createHook({ output: payload });
 			const result = await hook(createContext({ output: payload }));
-			const output = result!.result!.output as string;
+			const output = result?.result?.output as string;
 			expect(output.length).toBeLessThanOrEqual(boundChars);
 			expect(output).toContain("Full content: fake-artifact.txt");
 			expect(writeArtifact).toHaveBeenCalledWith(
@@ -172,7 +172,7 @@ describe("buildBoundedToolResultExcerpt", () => {
 				writeArtifact: () => Promise.reject(new Error("disk full")),
 			});
 			const result = await hook(createContext({ output: fullOutput }));
-			const output = result!.result!.output as string;
+			const output = result?.result?.output as string;
 			expect(output.length).toBeLessThanOrEqual(boundChars);
 			expect(output).not.toContain("Full content:");
 			expect(logger.log).toHaveBeenCalledWith(
@@ -218,13 +218,13 @@ describe("buildBoundedToolResultExcerpt", () => {
 			const { hook, writeArtifact, logger } = createHook({ toolName: "run_commands", output });
 			const result = await hook(createContext({ toolName: "run_commands", output }));
 			expect(result?.result?.output).toBeTypeOf("string");
-			const excerpt = result!.result!.output as string;
+			const excerpt = result?.result?.output as string;
 			expect(excerpt.length).toBeLessThanOrEqual(boundChars);
 			expect(excerpt).toContain("Command 1/1: seq 1 100000");
 			expect(excerpt).toContain("Exit status: success");
 			expect(excerpt).toMatch(/\.\.\. \[truncated \d+ lines; full output: fake-artifact\.txt\]/);
-			expect(excerpt).toContain("1:" + "x".repeat(58));
-			expect(excerpt).toContain("100000:" + "x".repeat(58));
+			expect(excerpt).toContain(`1:${"x".repeat(58)}`);
+			expect(excerpt).toContain(`100000:${"x".repeat(58)}`);
 			expect(writeArtifact).toHaveBeenCalledWith({
 				taskId: "task-1",
 				toolCallId: "call-1",
@@ -250,7 +250,7 @@ describe("buildBoundedToolResultExcerpt", () => {
 			];
 			const { hook, writeArtifact } = createHook({ toolName: "run_commands", output });
 			const result = await hook(createContext({ toolName: "run_commands", output }));
-			const excerpt = result!.result!.output as string;
+			const excerpt = result?.result?.output as string;
 			const lines = excerpt.split("\n");
 			expect(lines[0]).toBe("Command 1/1: bash -lc 'seq 1 5000 >&2; echo ERR-TAIL-MARK >&2; exit 1'");
 			expect(lines[1]).toBe("Exit status: failed — Command failed: step 1");
@@ -284,7 +284,7 @@ describe("buildBoundedToolResultExcerpt", () => {
 			const output = [{ query: "git diff --cached", result: body, success: true }];
 			const { hook } = createHook({ toolName: "run_commands", output });
 			const result = await hook(createContext({ toolName: "run_commands", output }));
-			const excerpt = result!.result!.output as string;
+			const excerpt = result?.result?.output as string;
 			expect(excerpt.length).toBeLessThanOrEqual(boundChars);
 			const summaryIndex = excerpt.indexOf("Diff summary (2 files):");
 			expect(summaryIndex).toBeGreaterThan(-1);
@@ -299,7 +299,7 @@ describe("buildBoundedToolResultExcerpt", () => {
 			const output = "r".repeat(boundChars + 10);
 			const { hook } = createHook({ toolName: "bash", output });
 			const result = await hook(createContext({ toolName: "bash", output }));
-			const excerpt = result!.result!.output as string;
+			const excerpt = result?.result?.output as string;
 			expect(excerpt.length).toBeLessThanOrEqual(boundChars);
 			expect(excerpt).toContain("Full content: fake-artifact.txt");
 		});

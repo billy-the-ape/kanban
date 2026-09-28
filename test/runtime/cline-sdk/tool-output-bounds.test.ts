@@ -225,7 +225,7 @@ beforeAll(async () => {
 	diffFilePath = join(probeDir, "large-file.txt");
 	writeFileSync(
 		diffFilePath,
-		Array.from({ length: 10 }, (_, i) => `original line ${i + 1}`).join("\n") + "\n",
+		`${Array.from({ length: 10 }, (_, i) => `original line ${i + 1}`).join("\n")}\n`,
 		"utf8",
 	);
 	execFileSync("git", ["-C", probeDir, "config", "user.email", "kanban-b27@example.com"]);
@@ -357,7 +357,7 @@ describe("B-2.7 — command-output bounding at ingestion (real local SDK session
 		for (const request of requests) {
 			expect(request.rawBody).not.toContain(MIDDLE_LINE);
 		}
-		expect(requests[2]!.rawBody).not.toContain(DIFF_MIDDLE_LINE);
+		expect(requests[2]?.rawBody).not.toContain(DIFF_MIDDLE_LINE);
 
 		// 2. The persisted tool messages are bounded line-based excerpts.
 		const artifactsDir = join(probeDir, "worktrees-home", TASK_ID, "context-artifacts");
@@ -368,7 +368,7 @@ describe("B-2.7 — command-output bounding at ingestion (real local SDK session
 
 		// (a) cat result: Command/Exit-status head, head + tail output lines, truncation
 		//     marker with the artifact reference; the middle is dropped.
-		const catContent = toolMessages[0]!.content;
+		const catContent = toolMessages[0]?.content;
 		expect(catContent).toContain("Tool: run_commands");
 		expect(catContent).toContain("Command 1/1: cat ");
 		expect(catContent).toContain("Exit status: success");
@@ -380,7 +380,7 @@ describe("B-2.7 — command-output bounding at ingestion (real local SDK session
 
 		// (b) git diff result: diff stat summary in the head, diff head + tail lines,
 		//     and the middle of the diff dropped.
-		const diffContent = toolMessages[1]!.content;
+		const diffContent = toolMessages[1]?.content;
 		expect(diffContent).toContain("Tool: run_commands");
 		expect(diffContent).toContain("Command 1/1: awk");
 		expect(diffContent).toContain("Exit status: success");
@@ -396,7 +396,7 @@ describe("B-2.7 — command-output bounding at ingestion (real local SDK session
 		//    structured SDK output (JSON per-command entries) — including the middle
 		//    lines the excerpts dropped.
 		const readArtifactFor = (content: string) => {
-			const reference = content.match(/\[truncated \d+ lines; full output: ([^\]]+)\]/)![1]!.trim();
+			const reference = content.match(/\[truncated \d+ lines; full output: ([^\]]+)\]/)?.[1]?.trim();
 			expect(reference.startsWith(artifactsDir)).toBe(true);
 			return reference;
 		};
