@@ -95,7 +95,12 @@ describe("buildCommandOutputExcerpt", () => {
 		const result = buildCommandOutputExcerpt([entry({ query: "seq 1 1000", body })], {
 			budgetChars: 4_000,
 			artifactPath,
-		})!;
+		});
+
+		expect(result).not.toBeFalsy();
+		if (!result) {
+			return;
+		}
 		const expectedLines = result.text.split("\n");
 		// 2 metadata lines + head 100 + marker + tail 100.
 		expect(expectedLines).toHaveLength(203);
@@ -118,7 +123,11 @@ describe("buildCommandOutputExcerpt", () => {
 			budgetChars: 4_000,
 			headLines: 10,
 			tailLines: 15,
-		})!;
+		});
+		expect(result).not.toBeFalsy();
+		if (!result) {
+			return;
+		}
 		const expectedLines = result.text.split("\n");
 		const pad = "p".repeat(55);
 		expect(expectedLines).toHaveLength(28);
@@ -133,7 +142,12 @@ describe("buildCommandOutputExcerpt", () => {
 
 	it("shrinks head and tail together until the budget fits", () => {
 		const body = Array.from({ length: 20_000 }, (_, i) => `long line ${i + 1} with more payload`).join("\n");
-		const result = buildCommandOutputExcerpt([entry({ query: "q", body })], { budgetChars: 800, artifactPath })!;
+		const result = buildCommandOutputExcerpt([entry({ query: "q", body })], { budgetChars: 800, artifactPath });
+
+		expect(result).not.toBeFalsy();
+		if (!result) {
+			return;
+		}
 		expect(result.text.length).toBeLessThanOrEqual(800);
 		expect(result.text).toContain("long line 1 with more payload\n");
 		expect(result.text.endsWith("long line 20000 with more payload")).toBe(true);
@@ -146,7 +160,11 @@ describe("buildCommandOutputExcerpt", () => {
 		const result = buildCommandOutputExcerpt(
 			[entry({ query: "q", body: `${"a".repeat(5_000)}\n${"b".repeat(5_000)}` })],
 			{ budgetChars: 400, artifactPath },
-		)!;
+		);
+		expect(result).not.toBeFalsy();
+		if (!result) {
+			return;
+		}
 		expect(result.text.length).toBeLessThanOrEqual(400);
 		expect(result.text.startsWith(`Command 1/1: q\nExit status: success\n${"a".repeat(150)}`)).toBe(true);
 		expect(result.text.endsWith("b".repeat(150))).toBe(true);
@@ -163,7 +181,11 @@ describe("buildCommandOutputExcerpt", () => {
 			}),
 			entry({ query: "three", body: "boom", success: false, failureReason: "Command failed: boom" }),
 		];
-		const result = buildCommandOutputExcerpt(entries, { budgetChars: 500, artifactPath })!;
+		const result = buildCommandOutputExcerpt(entries, { budgetChars: 500, artifactPath });
+		expect(result).not.toBeFalsy();
+		if (!result) {
+			return;
+		}
 		const lines = result.text.split("\n");
 		expect(result.text.length).toBeLessThanOrEqual(500);
 		expect(lines[0]).toBe("Command 1/3: one");
@@ -186,7 +208,11 @@ describe("buildCommandOutputExcerpt", () => {
 				}),
 			],
 			{ budgetChars: 4_000, artifactPath },
-		)!;
+		);
+		expect(result).not.toBeFalsy();
+		if (!result) {
+			return;
+		}
 		const lines = result.text.split("\n");
 		expect(lines[0]).toBe(`Command 1/1: ${`npm run ${"t".repeat(192)}`}...`);
 		expect(lines[1]).toBe(`Exit status: failed — ${`Command failed: ${"e".repeat(104)}`}...`);
@@ -196,7 +222,11 @@ describe("buildCommandOutputExcerpt", () => {
 		const result = buildCommandOutputExcerpt(
 			[entry({ query: "q", body: "boom\nmore", success: false, failureReason: null })],
 			{ budgetChars: 4_000, artifactPath },
-		)!;
+		);
+		expect(result).not.toBeFalsy();
+		if (!result) {
+			return;
+		}
 		expect(result.text).toBe("Command 1/1: q\nExit status: failed\nboom\nmore");
 	});
 
@@ -211,7 +241,11 @@ describe("buildCommandOutputExcerpt", () => {
 		const result = buildCommandOutputExcerpt([entry({ query: "git diff", body: diffBody })], {
 			budgetChars: 4_000,
 			artifactPath,
-		})!;
+		});
+		expect(result).not.toBeFalsy();
+		if (!result) {
+			return;
+		}
 		const lines = result.text.split("\n");
 		expect(lines[0]).toBe("Command 1/1: git diff");
 		expect(lines[1]).toBe("Exit status: success");

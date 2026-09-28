@@ -153,9 +153,9 @@ export function buildDiffFileSummary(body: string, maxFileLines: number = CLINE_
 	for (const line of body.split("\n")) {
 		const fileMatch = line.match(DIFF_FILE_HEADER_RE);
 		if (fileMatch) {
-			const left = stripDiffPrefix(fileMatch[1]!);
-			const right = stripDiffPrefix(fileMatch[2]!);
-			current = { path: right || left || fileMatch[2]!, added: 0, removed: 0 };
+			const left = stripDiffPrefix(fileMatch[1]);
+			const right = stripDiffPrefix(fileMatch[2]);
+			current = { path: right || left || fileMatch[2], added: 0, removed: 0 };
 			files.push(current);
 			continue;
 		}
@@ -224,7 +224,7 @@ export function buildCommandOutputExcerpt(
 	let totalOmittedLines = 0;
 	let truncated = false;
 	const blocks = metaBlocks.map((metaBlock, index) => {
-		const entry = entries[index]!;
+		const entry = entries[index];
 		const excerpt = boundedLineExcerpt(entry.body, entryBudget, options.artifactPath, headLines, tailLines);
 		totalHeadLines += excerpt.headLines;
 		totalTailLines += excerpt.tailLines;
@@ -280,11 +280,11 @@ function boundedLineExcerpt(
 	const lineCount = lines.length;
 	const prefixLengths: number[] = [0];
 	for (let i = 0; i < lineCount; i++) {
-		prefixLengths.push(prefixLengths[i]! + lines[i]?.length + 1);
+		prefixLengths.push(prefixLengths[i] + lines[i]?.length + 1);
 	}
-	const headChars = (count: number): number => (count <= 0 ? 0 : prefixLengths[count]! - 1);
+	const headChars = (count: number): number => (count <= 0 ? 0 : prefixLengths[count] - 1);
 	const tailChars = (count: number): number =>
-		count <= 0 ? 0 : prefixLengths[lineCount]! - prefixLengths[lineCount - count]! - 1;
+		count <= 0 ? 0 : prefixLengths[lineCount] - prefixLengths[lineCount - count] - 1;
 	const linesMarker = (omitted: number): string =>
 		`... [truncated ${omitted} lines${artifactPath ? `; full output: ${artifactPath}` : ""}]`;
 

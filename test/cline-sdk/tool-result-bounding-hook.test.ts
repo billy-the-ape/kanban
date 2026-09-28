@@ -74,7 +74,7 @@ describe("buildBoundedToolResultExcerpt", () => {
 			/^([AB]*)\n\n\.\.\.\[truncated (\d+) chars\]\.\.\.\n\n([AB]*)\nFull content: \/tmp\/artifact\.txt$/,
 		);
 		expect(match).not.toBeNull();
-		const [, head, omitted, tail] = match!;
+		const [, head, omitted, tail] = match || [];
 		expect(head.length).toBe(tail.length);
 		expect(Number(omitted)).toBe(full.length - head.length - tail.length);
 		expect(head).toBe("A".repeat(head.length));
@@ -102,7 +102,7 @@ describe("buildBoundedToolResultExcerpt", () => {
 		expect(excerpt.length).toBeLessThanOrEqual(4_000);
 		const match = excerpt.match(/^([z]*)\n\n\.\.\.\[truncated (\d+) chars\]\.\.\.\n\n([z]*)$/);
 		expect(match).not.toBeNull();
-		const [, head, omitted, tail] = match!;
+		const [, head, omitted, tail] = match ?? [];
 		expect(Number(omitted)).toBeGreaterThan(0);
 		expect(head.length + tail.length + Number(omitted)).toBe(edge.length);
 	});

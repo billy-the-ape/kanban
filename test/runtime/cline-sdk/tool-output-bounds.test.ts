@@ -397,10 +397,19 @@ describe("B-2.7 — command-output bounding at ingestion (real local SDK session
 		//    lines the excerpts dropped.
 		const readArtifactFor = (content: string) => {
 			const reference = content.match(/\[truncated \d+ lines; full output: ([^\]]+)\]/)?.[1]?.trim();
+			expect(reference).not.toBeFalsy();
+			if (!reference) {
+				return;
+			}
 			expect(reference.startsWith(artifactsDir)).toBe(true);
 			return reference;
 		};
-		const catArtifactContent = await readTaskContextArtifact(readArtifactFor(catContent));
+		const result1 = readArtifactFor(catContent);
+		expect(result1).not.toBeFalsy();
+		if (!result1) {
+			return;
+		}
+		const catArtifactContent = await readTaskContextArtifact(result1);
 		const catArtifact = JSON.parse(catArtifactContent) as Array<{
 			query: string;
 			result?: string;
@@ -414,7 +423,13 @@ describe("B-2.7 — command-output bounding at ingestion (real local SDK session
 		expect(catArtifact[0]?.result).toContain(MIDDLE_LINE);
 		expect(catArtifact[0]?.result).toContain(TAIL_MARKER);
 
-		const diffArtifactContent = await readTaskContextArtifact(readArtifactFor(diffContent));
+		const result2 = readArtifactFor(diffContent);
+		expect(result2).not.toBeFalsy();
+		if (!result2) {
+			return;
+		}
+
+		const diffArtifactContent = await readTaskContextArtifact(result2);
 		const diffArtifact = JSON.parse(diffArtifactContent) as Array<{
 			query: string;
 			result?: string;

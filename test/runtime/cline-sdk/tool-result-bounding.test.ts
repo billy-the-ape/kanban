@@ -345,8 +345,8 @@ describe("B-2.6 — tool-result bounding at ingestion (real local SDK session)",
 		// 4. The referenced artifact lives outside any repo checkout and holds the
 		//    full read result.
 		const reference = toolContent.match(/Full content: (.+)$/m)?.[1]?.trim();
-		expect(reference.startsWith(artifactsDir)).toBe(true);
-		const artifactContent = await readTaskContextArtifact(reference);
+		expect(reference?.startsWith(artifactsDir)).toBe(true);
+		const artifactContent = await readTaskContextArtifact(reference || "");
 		expect(artifactContent.length).toBeGreaterThan(900_000);
 		expect(artifactContent).toContain(HEAD_MARKER);
 		expect(artifactContent).toContain(TAIL_MARKER);

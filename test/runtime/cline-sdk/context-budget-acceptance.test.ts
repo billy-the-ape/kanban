@@ -342,8 +342,11 @@ describe("S3 — output reservations", () => {
 			config: built,
 			systemPrompt: SYSTEM_PROMPT,
 		});
-		expect(breakdown).not.toBeNull();
-		const b = breakdown!;
+		expect(breakdown).not.toBeFalsy();
+		if (!breakdown) {
+			return;
+		}
+		const b = breakdown;
 		// No double count: the output reserve appears exactly once, folded
 		// with the safety margin (never twice the output). All estimates.
 		expect(b.reserveTokens).toBe(MAX_TOKENS + margin);
@@ -352,7 +355,7 @@ describe("S3 — output reservations", () => {
 		expect(calibrated.reserveTokens).toBe(MAX_TOKENS + margin);
 		// The beforeModel hook enforces the same budget:
 		// limit - output reserve - safety margin (messages + system + tools).
-		expect(b.triggerTokens + b.systemPromptTokens + b.toolSchemaTokens).toBe(WINDOW - MAX_TOKENS - margin);
+		expect((b.triggerTokens || 0) + b.systemPromptTokens + b.toolSchemaTokens).toBe(WINDOW - MAX_TOKENS - margin);
 	});
 
 	it("S3 (e2e): every provider request leaves the reserved output room, and the explicit limit source is logged", async () => {
@@ -541,7 +544,8 @@ describe("S5 — a large next tool result (real local SDK session)", () => {
 			// 4. The full output is preserved as a local artifact — including
 			//    the middle lines the excerpt dropped.
 			const reference = content.match(/\[truncated \d+ lines; full output: ([^\]]+)\]/)?.[1]?.trim();
-			const artifact = JSON.parse(await readTaskContextArtifact(reference)) as Array<{
+			expect(reference).toBeDefined();
+			const artifact = JSON.parse(await readTaskContextArtifact(reference || "")) as Array<{
 				query: string;
 				result?: string;
 				success?: boolean;
