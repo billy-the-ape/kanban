@@ -1,7 +1,7 @@
 import { type ClineToolCallDisplay, getClineToolCallDisplay } from "@runtime-cline-tool-call-display";
-import { stripAnsi } from "@/utils/strip-ansi";
 import type { ClineChatMessage } from "@/hooks/use-cline-chat-session";
 import type { RuntimeTaskSessionSummary } from "@/runtime/types";
+import { stripAnsi } from "@/utils/strip-ansi";
 
 export interface ParsedToolMessageContent {
 	toolName: string;
