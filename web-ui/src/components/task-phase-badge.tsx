@@ -8,15 +8,15 @@ import type { RuntimeTaskPhase, RuntimeTaskPhaseSummary } from "@/runtime/types"
 
 const PHASE_LABELS: Record<RuntimeTaskPhase, string> = {
 	idle: "idle",
-	implementing: "implementing",
-	reviewing: "reviewing",
-	checking: "checking",
-	committing: "committing",
-	integrating: "integrating",
-	pushing: "pushing",
-	verifying_remote: "verifying remote",
+	implementing: "impl",
+	reviewing: "rev",
+	checking: "chec",
+	committing: "comm",
+	integrating: "inte",
+	pushing: "push",
+	verifying_remote: "verif",
 	done: "done",
-	needs_attention: "needs attention",
+	needs_attention: "atten",
 };
 
 const PHASE_CLASSES: Record<RuntimeTaskPhase, string> = {

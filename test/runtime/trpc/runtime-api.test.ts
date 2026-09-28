@@ -3007,7 +3007,7 @@ describe("createRuntimeApi getTaskPhases (B-10.1)", () => {
 		);
 
 		expect(response.ok).toBe(true);
-		expect(response.phases["task-live"]?.phase).toBe("implementing");
+		expect(response.phases["task-live"]?.phase).toBe("impl");
 		expect(response.phases["task-hydrated"]?.phase).toBe("idle");
 		expect(response.phases["task-none"]?.phase).toBe("idle");
 	});
