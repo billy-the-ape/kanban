@@ -367,7 +367,9 @@ export function ColumnContextPanel({
 							onOpenPrTask={column.id === "review" ? onOpenPrTask : undefined}
 							onMoveToTrashTask={column.id === "review" ? onMoveToTrashTask : undefined}
 							onCompleteTask={column.id === "review" ? onCompleteTask : undefined}
-							onRestoreFromTrashTask={column.id === "trash" ? onRestoreFromTrashTask : undefined}
+							onRestoreFromTrashTask={
+								column.id === "trash" || column.id === "done" ? onRestoreFromTrashTask : undefined
+							}
 							commitTaskLoadingById={column.id === "review" ? commitTaskLoadingById : undefined}
 							openPrTaskLoadingById={column.id === "review" ? openPrTaskLoadingById : undefined}
 							moveToTrashLoadingById={column.id === "review" ? moveToTrashLoadingById : undefined}

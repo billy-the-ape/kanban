@@ -1204,6 +1204,32 @@ describe("InMemoryClineTaskSessionService", () => {
 		expect(stopped?.reviewReason).toBe("interrupted");
 	});
 
+	it("resumes an interrupted session when a new message is sent", async () => {
+		const { service, runtime } = createTrackedService();
+		await service.startTaskSession({
+			taskId: "task-1",
+			cwd: "/tmp/worktree",
+			prompt: "Initial prompt",
+		});
+		await waitForTaskSessionId(runtime, "task-1");
+		const stopped = await service.stopTaskSession("task-1");
+		expect(stopped?.state).toBe("interrupted");
+
+		const resumed = await service.sendTaskSessionInput("task-1", "Please continue");
+
+		expect(resumed?.state).toBe("running");
+		expect(resumed?.reviewReason).toBeNull();
+		await vi.waitFor(() => {
+			expect(runtime.startTaskSessionMock).toHaveBeenCalledTimes(2);
+		});
+		expect(runtime.startTaskSessionMock).toHaveBeenLastCalledWith(
+			expect.objectContaining({
+				taskId: "task-1",
+				prompt: "resolved:Please continue",
+			}),
+		);
+	});
+
 	it("rebinds persisted sessions before stopping when no in-memory entry exists", async () => {
 		const { service, runtime } = createTrackedService();
 		runtime.readPersistedTaskSessionMock.mockResolvedValue({
