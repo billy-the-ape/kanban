@@ -314,15 +314,14 @@ describe("kanban command display", () => {
 	});
 });
 
-
 describe("getCompletedAssistantMessageId", () => {
 	const messages = [
 		{ id: "earlier", role: "assistant", content: "Working...", createdAt: 1 },
-		{ id: "final", role: "assistant", content: "## Done\\n\\n- Shipped", createdAt: 2 },
+		{ id: "final", role: "assistant", content: "## Done\n\n- Shipped", createdAt: 2 },
 	] as ClineChatMessage[];
 	const summary = {
 		reviewReason: "hook",
-		latestHookActivity: { hookEventName: "agent_end", finalMessage: "## Done\\n\\n- Shipped" },
+		latestHookActivity: { hookEventName: "agent_end", finalMessage: "## Done\n\n- Shipped" },
 	} as RuntimeTaskSessionSummary;
 
 	it("identifies the final response after completion or history reload", () => {
