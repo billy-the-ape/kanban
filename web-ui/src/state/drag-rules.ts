@@ -1,3 +1,4 @@
+import type { RuntimeTaskSessionSummary } from "@/runtime/types";
 import type { BoardColumn, BoardColumnId } from "@/types";
 
 export interface ProgrammaticCardMoveInFlight {
@@ -22,13 +23,22 @@ function isMatchingProgrammaticCardMove(
 	);
 }
 
+export interface CardMoveRuleOptions {
+	taskId?: string | null;
+	programmaticCardMoveInFlight?: ProgrammaticCardMoveInFlight | null;
+	/**
+	 * Whether the moved task's agent session is still working. An in-progress
+	 * card whose session stopped (interrupted by a runtime restart, failed, or
+	 * never started) has nothing left to move it to Review automatically, so it
+	 * may be moved there by hand. Unknown (undefined) is treated as running.
+	 */
+	isTaskSessionRunning?: boolean;
+}
+
 export function isAllowedCrossColumnCardMove(
 	fromColumnId: BoardColumnId,
 	toColumnId: BoardColumnId,
-	options?: {
-		taskId?: string | null;
-		programmaticCardMoveInFlight?: ProgrammaticCardMoveInFlight | null;
-	},
+	options?: CardMoveRuleOptions,
 ): boolean {
 	if (fromColumnId === "backlog" && toColumnId === "in_progress") {
 		return true;
@@ -41,7 +51,12 @@ export function isAllowedCrossColumnCardMove(
 	if (toColumnId === "trash" && fromColumnId !== "trash") {
 		return true;
 	}
-	if (fromColumnId === "trash" && toColumnId === "review") {
+	// Discarded and completed cards can be reopened in Review; the worktree is
+	// recreated from preserved work when it no longer exists.
+	if ((fromColumnId === "trash" || fromColumnId === "done") && toColumnId === "review") {
+		return true;
+	}
+	if (fromColumnId === "in_progress" && toColumnId === "review" && options?.isTaskSessionRunning === false) {
 		return true;
 	}
 	if (
@@ -56,6 +71,10 @@ export function isAllowedCrossColumnCardMove(
 		);
 	}
 	return false;
+}
+
+export function isTaskSessionRunning(summary: RuntimeTaskSessionSummary | null | undefined): boolean {
+	return summary?.state === "running";
 }
 
 export function findCardColumnId(columns: ReadonlyArray<BoardColumn>, taskId: string): BoardColumnId | null {
@@ -73,16 +92,19 @@ export function isCardDropDisabled(
 	options?: {
 		activeDragTaskId?: string | null;
 		programmaticCardMoveInFlight?: ProgrammaticCardMoveInFlight | null;
+		isActiveDragTaskSessionRunning?: boolean;
 	},
 ): boolean {
 	if (!activeDragSourceColumnId) {
 		return false;
 	}
+	const moveRuleOptions: CardMoveRuleOptions = {
+		taskId: options?.activeDragTaskId,
+		programmaticCardMoveInFlight: options?.programmaticCardMoveInFlight,
+		isTaskSessionRunning: options?.isActiveDragTaskSessionRunning,
+	};
 	if (columnId === "review") {
-		return !isAllowedCrossColumnCardMove(activeDragSourceColumnId, columnId, {
-			taskId: options?.activeDragTaskId,
-			programmaticCardMoveInFlight: options?.programmaticCardMoveInFlight,
-		});
+		return !isAllowedCrossColumnCardMove(activeDragSourceColumnId, columnId, moveRuleOptions);
 	}
 	if (columnId === "backlog") {
 		return activeDragSourceColumnId !== "backlog";
@@ -91,16 +113,10 @@ export function isCardDropDisabled(
 		if (activeDragSourceColumnId === "backlog" || activeDragSourceColumnId === "in_progress") {
 			return false;
 		}
-		return !isAllowedCrossColumnCardMove(activeDragSourceColumnId, columnId, {
-			taskId: options?.activeDragTaskId,
-			programmaticCardMoveInFlight: options?.programmaticCardMoveInFlight,
-		});
+		return !isAllowedCrossColumnCardMove(activeDragSourceColumnId, columnId, moveRuleOptions);
 	}
 	if (columnId === "done") {
-		return !isAllowedCrossColumnCardMove(activeDragSourceColumnId, columnId, {
-			taskId: options?.activeDragTaskId,
-			programmaticCardMoveInFlight: options?.programmaticCardMoveInFlight,
-		});
+		return !isAllowedCrossColumnCardMove(activeDragSourceColumnId, columnId, moveRuleOptions);
 	}
 	if (columnId === "trash") {
 		return activeDragSourceColumnId === "trash";

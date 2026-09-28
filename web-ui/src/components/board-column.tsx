@@ -6,7 +6,7 @@ import { BoardCard } from "@/components/board-card";
 import { Button } from "@/components/ui/button";
 import { ColumnIndicator } from "@/components/ui/column-indicator";
 import type { RuntimeTaskPhaseSummary, RuntimeTaskSessionSummary } from "@/runtime/types";
-import { isCardDropDisabled, type ProgrammaticCardMoveInFlight } from "@/state/drag-rules";
+import { isCardDropDisabled, isTaskSessionRunning, type ProgrammaticCardMoveInFlight } from "@/state/drag-rules";
 import type { BoardCard as BoardCardModel, BoardColumnId, BoardColumn as BoardColumnModel } from "@/types";
 
 export function BoardColumn({
@@ -86,6 +86,9 @@ export function BoardColumn({
 	const isDropDisabled = isCardDropDisabled(column.id, activeDragSourceColumnId ?? null, {
 		activeDragTaskId,
 		programmaticCardMoveInFlight,
+		isActiveDragTaskSessionRunning: activeDragTaskId
+			? isTaskSessionRunning(taskSessions[activeDragTaskId])
+			: undefined,
 	});
 	const createTaskButtonText = (
 		<span className="inline-flex items-center gap-1.5">

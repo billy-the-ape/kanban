@@ -830,11 +830,16 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		if (!entry) {
 			return null;
 		}
+		// B-5: an interrupted task keeps its card in place (it is no longer
+		// discarded to Trash and restored from there), so a new message must be
+		// able to resume it; with no live SDK session the dispatch below
+		// restarts from the durable session record, as it does for "failed".
 		if (
 			entry.summary.state !== "running" &&
 			entry.summary.state !== "awaiting_review" &&
 			entry.summary.state !== "idle" &&
-			entry.summary.state !== "failed"
+			entry.summary.state !== "failed" &&
+			entry.summary.state !== "interrupted"
 		) {
 			return null;
 		}

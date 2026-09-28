@@ -396,7 +396,10 @@ export function completeTaskAndGetReadyLinkedTaskIds(
 export function applyDragResult(
 	board: BoardData,
 	result: DropResult,
-	options?: { programmaticCardMoveInFlight?: ProgrammaticCardMoveInFlight | null },
+	options?: {
+		programmaticCardMoveInFlight?: ProgrammaticCardMoveInFlight | null;
+		isTaskSessionRunning?: boolean;
+	},
 ): { board: BoardData; moveEvent?: TaskMoveEvent } {
 	const { source, destination, type } = result;
 
@@ -434,6 +437,7 @@ export function applyDragResult(
 	const isAllowedCrossColumnMove = isAllowedCrossColumnCardMove(sourceColumn.id, destinationColumn.id, {
 		taskId: result.draggableId,
 		programmaticCardMoveInFlight: options?.programmaticCardMoveInFlight,
+		isTaskSessionRunning: options?.isTaskSessionRunning,
 	});
 	if (!isAllowedCrossColumnMove) {
 		return { board };

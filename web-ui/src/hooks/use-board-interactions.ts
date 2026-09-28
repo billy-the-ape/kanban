@@ -24,6 +24,7 @@ import {
 	moveTaskToColumn,
 	updateTask,
 } from "@/state/board-state";
+import { isTaskSessionRunning } from "@/state/drag-rules";
 import { clearTaskWorkspaceInfo, setTaskWorkspaceInfo } from "@/stores/workspace-metadata-store";
 import type { SendTerminalInputOptions } from "@/terminal/terminal-input";
 import type { BoardCard, BoardColumnId, BoardData } from "@/types";
@@ -580,12 +581,17 @@ export function useBoardInteractions({
 		resetKey: currentProjectId,
 	});
 
-	const resumeTaskFromTrash = useCallback(
-		async (task: BoardCard, taskId: string, options?: { optimisticMoveApplied?: boolean }): Promise<void> => {
-			const ensured = await ensureTaskWorkspace(task);
-			if (!ensured.ok) {
-				notifyError(ensured.message ?? "Could not set up task workspace.");
-				if (!options?.optimisticMoveApplied) {
+	// Reopens a discarded (trash) or completed (done) task in Review: recreate
+	// its worktree (from preserved work if it was removed) and resume its agent
+	// session with the prior history. A failure puts the card back where it was.
+	const reopenTaskInReview = useCallback(
+		async (
+			task: BoardCard,
+			taskId: string,
+			options: { fromColumnId: BoardColumnId; optimisticMoveApplied?: boolean },
+		): Promise<void> => {
+			const revertOptimisticMove = () => {
+				if (!options.optimisticMoveApplied) {
 					return;
 				}
 				setBoard((currentBoard) => {
@@ -593,11 +599,16 @@ export function useBoardInteractions({
 					if (currentColumnId !== "review") {
 						return currentBoard;
 					}
-					const reverted = moveTaskToColumn(currentBoard, taskId, "trash", {
+					const reverted = moveTaskToColumn(currentBoard, taskId, options.fromColumnId, {
 						insertAtTop: true,
 					});
 					return reverted.moved ? reverted.board : currentBoard;
 				});
+			};
+			const ensured = await ensureTaskWorkspace(task);
+			if (!ensured.ok) {
+				notifyError(ensured.message ?? "Could not set up task workspace.");
+				revertOptimisticMove();
 				return;
 			}
 			if (ensured.response?.warning) {
@@ -618,19 +629,7 @@ export function useBoardInteractions({
 			}
 
 			notifyError(resumed.message ?? "Could not resume task session.");
-			if (!options?.optimisticMoveApplied) {
-				return;
-			}
-			setBoard((currentBoard) => {
-				const currentColumnId = getTaskColumnId(currentBoard, taskId);
-				if (currentColumnId !== "review") {
-					return currentBoard;
-				}
-				const reverted = moveTaskToColumn(currentBoard, taskId, "trash", {
-					insertAtTop: true,
-				});
-				return reverted.moved ? reverted.board : currentBoard;
-			});
+			revertOptimisticMove();
 		},
 		[ensureTaskWorkspace, setBoard, startTaskSession],
 	);
@@ -644,7 +643,10 @@ export function useBoardInteractions({
 				result.draggableId,
 			);
 
-			const applied = applyDragResult(board, result, { programmaticCardMoveInFlight });
+			const applied = applyDragResult(board, result, {
+				programmaticCardMoveInFlight,
+				isTaskSessionRunning: isTaskSessionRunning(sessions[result.draggableId]),
+			});
 
 			const moveEvent = applied.moveEvent;
 			if (!moveEvent) {
@@ -677,13 +679,19 @@ export function useBoardInteractions({
 				return;
 			}
 
-			if (moveEvent.fromColumnId === "trash" && moveEvent.toColumnId === "review") {
+			if (
+				(moveEvent.fromColumnId === "trash" || moveEvent.fromColumnId === "done") &&
+				moveEvent.toColumnId === "review"
+			) {
 				setBoard(applied.board);
 				const movedSelection = findCardSelection(applied.board, moveEvent.taskId);
 				if (!movedSelection) {
 					return;
 				}
-				void resumeTaskFromTrash(movedSelection.card, moveEvent.taskId, { optimisticMoveApplied: true });
+				void reopenTaskInReview(movedSelection.card, moveEvent.taskId, {
+					fromColumnId: moveEvent.fromColumnId,
+					optimisticMoveApplied: true,
+				});
 				return;
 			}
 
@@ -718,10 +726,11 @@ export function useBoardInteractions({
 			maybeRequestNotificationPermissionForTaskStart,
 			requestCompleteTask,
 			requestMoveTaskToTrash,
-			resumeTaskFromTrash,
+			reopenTaskInReview,
 			resolvePendingProgrammaticCompleteMove,
 			resolvePendingProgrammaticStartMove,
 			resolvePendingProgrammaticTrashMove,
+			sessions,
 			setBoard,
 			setSelectedTaskId,
 		],
@@ -860,13 +869,12 @@ export function useBoardInteractions({
 
 	const handleRestoreTaskFromTrash = useCallback(
 		(taskId: string) => {
-			const programmaticMoveAttempt = tryProgrammaticCardMove(taskId, "trash", "review");
-			if (programmaticMoveAttempt === "started" || programmaticMoveAttempt === "blocked") {
+			const fromColumnId = getTaskColumnId(board, taskId);
+			if (fromColumnId !== "trash" && fromColumnId !== "done") {
 				return;
 			}
-
-			const selection = findCardSelection(board, taskId);
-			if (!selection || selection.column.id !== "trash") {
+			const programmaticMoveAttempt = tryProgrammaticCardMove(taskId, fromColumnId, "review");
+			if (programmaticMoveAttempt === "started" || programmaticMoveAttempt === "blocked") {
 				return;
 			}
 
@@ -879,9 +887,9 @@ export function useBoardInteractions({
 			if (!movedSelection) {
 				return;
 			}
-			void resumeTaskFromTrash(movedSelection.card, taskId, { optimisticMoveApplied: true });
+			void reopenTaskInReview(movedSelection.card, taskId, { fromColumnId, optimisticMoveApplied: true });
 		},
-		[board, resumeTaskFromTrash, setBoard, tryProgrammaticCardMove],
+		[board, reopenTaskInReview, setBoard, tryProgrammaticCardMove],
 	);
 
 	const handleCancelAutomaticTaskAction = useCallback(
