@@ -16,6 +16,7 @@ import React, {
 
 import { ClineChatComposer } from "@/components/detail-panels/cline-chat-composer";
 import { ClineChatMessageItem } from "@/components/detail-panels/cline-chat-message-item";
+import { getCompletedAssistantMessageId } from "@/components/detail-panels/cline-chat-message-utils";
 import {
 	buildClineAgentModelPickerOptions,
 	buildClineSelectedModelButtonText,
@@ -222,6 +223,7 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 			],
 		);
 
+		const completedMessageId = getCompletedAssistantMessageId(messages, summary);
 		const panelError = composerError ?? error;
 		const attachmentWarningMessage =
 			draftImages.length > 0 && selectedModel?.supportsVision === false
@@ -424,7 +426,11 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 					onScroll={handleMessageListScroll}
 				>
 					{messages.map((message) => (
-						<ClineChatMessageItem key={message.id} message={message} />
+						<ClineChatMessageItem
+							key={message.id}
+							message={message}
+							isCompletedResponse={message.id === completedMessageId}
+						/>
 					))}
 					{showAgentProgressIndicator ? <ClineThinkingIndicator /> : null}
 					{isCreditLimitNoticeVisible ? <ClineCreditLimitNotice /> : null}
