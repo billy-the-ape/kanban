@@ -1,7 +1,10 @@
 import { getClineToolCallDisplay } from "@runtime-cline-tool-call-display";
 import { describe, expect, it } from "vitest";
+import type { ClineChatMessage } from "@/hooks/use-cline-chat-session";
+import type { RuntimeTaskSessionSummary } from "@/runtime/types";
 import {
 	formatToolInputForDisplay,
+	getCompletedAssistantMessageId,
 	getToolDisplay,
 	getToolSummary,
 	parseToolMessageContent,
@@ -308,5 +311,27 @@ describe("kanban command display", () => {
 		);
 		expect(display.toolName).toBe("Creating task");
 		expect(display.inputSummary).toBe("Fix the login bug");
+	});
+});
+
+
+describe("getCompletedAssistantMessageId", () => {
+	const messages = [
+		{ id: "earlier", role: "assistant", content: "Working...", createdAt: 1 },
+		{ id: "final", role: "assistant", content: "## Done\\n\\n- Shipped", createdAt: 2 },
+	] as ClineChatMessage[];
+	const summary = {
+		reviewReason: "hook",
+		latestHookActivity: { hookEventName: "agent_end", finalMessage: "## Done\\n\\n- Shipped" },
+	} as RuntimeTaskSessionSummary;
+
+	it("identifies the final response after completion or history reload", () => {
+		expect(getCompletedAssistantMessageId(messages, summary)).toBe("final");
+	});
+
+	it("does not style interim text, failed runs, or an unmatched final message", () => {
+		expect(getCompletedAssistantMessageId(messages, { ...summary, reviewReason: "error" })).toBeNull();
+		expect(getCompletedAssistantMessageId(messages, { ...summary, latestHookActivity: null })).toBeNull();
+		expect(getCompletedAssistantMessageId([...messages, { ...messages[0], id: "newer" }], summary)).toBeNull();
 	});
 });
