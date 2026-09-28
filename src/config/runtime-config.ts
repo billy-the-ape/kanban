@@ -133,10 +133,15 @@ Steps:
 1. Ensure all intended changes are committed in the current task worktree.
 2. If currently on detached HEAD, create a branch at the current commit in this worktree.
 3. Push the branch to origin and set upstream.
-4. Create a pull request with base {{base_ref}} and head as the pushed branch (use gh CLI if available).
-5. If a pull request already exists for the same head and base, return that existing PR URL instead of creating a duplicate.
+4. Draft a readable Markdown PR description with these sections:
+   - Summary: what changed and why.
+   - Changes: the main features or fixes.
+   - Testing: commands run and how a reviewer can test each feature.
+   - Deployment and follow-up: required environment variables, settings, manual actions, or "None".
+5. Preserve actual line breaks, headings, and list markers. If using gh CLI, write the description to a UTF-8 file in the task worktree and pass it with gh pr create --body-file <path>. Do not encode line breaks as literal backslash-n text or squeeze the description into one paragraph.
+6. If a pull request already exists for the same head and base, return that existing PR URL instead of creating a duplicate.
 6. If PR creation is blocked, explain exactly why and provide the exact commands to complete it manually.
-7. Report:
+8. Report:
    - PR title: PR URL
    - Base branch
    - Head branch
