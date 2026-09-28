@@ -63,5 +63,14 @@ export function buildTaskGitActionPrompt(input: BuildTaskGitActionPromptInput): 
 		[TASK_GIT_BASE_REF_PROMPT_VARIABLE.key]: input.workspaceInfo.baseRef,
 	};
 	const template = resolveTemplate(input.action, input.templates);
-	return interpolateTemplate(template, variables);
+	const prompt = interpolateTemplate(template, variables);
+	if (input.action !== "pr") {
+		return prompt;
+	}
+	return `${prompt}
+
+PR description requirements:
+- Write a readable Markdown body with Summary, Changes, Testing, and Deployment and follow-up sections. Include required environment variables, settings, manual actions, and how to test each feature; say "None" when no deployment action is needed.
+- Preserve real newlines, headings, and list markers. If using gh CLI, write the body as UTF-8 to a file in the task worktree and use gh pr create --body-file <path>. Do not pass a long quoted --body argument with literal backslash-n sequences.
+- Check the created PR description on GitHub and correct it if the line breaks or Markdown formatting did not survive.`;
 }
