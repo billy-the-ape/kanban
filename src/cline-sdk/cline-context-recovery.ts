@@ -63,6 +63,7 @@ const STRUCTURED_CONTEXT_OVERFLOW_CODES = new Set<string>([
  */
 const CONTEXT_OVERFLOW_MESSAGE_PATTERNS: readonly RegExp[] = [
 	/prompt is too long/i,
+	/request \d+ tokens? exceeds? available \d+/i,
 	/maximum context (length|window)/i,
 	/maximum prompt length/i,
 	/context length exceeded/i,
