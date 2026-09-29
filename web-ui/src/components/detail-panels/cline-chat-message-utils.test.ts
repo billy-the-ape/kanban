@@ -324,16 +324,29 @@ describe("getCompletedAssistantMessageId", () => {
 		latestHookActivity: { hookEventName: "agent_end", finalMessage: "## Done\n\n- Shipped" },
 	} as RuntimeTaskSessionSummary;
 
-	it("identifies the final response after completion or history reload", () => {
-		expect(getCompletedAssistantMessageId(messages, summary)).toBe("final");
+	it("identifies a final response while the completion event is available", () => {
+		expect(getCompletedAssistantMessageId(messages, summary, "review")).toBe("final");
 	});
 
-	it("does not style interim text, failed runs, or an unmatched final message", () => {
-		expect(getCompletedAssistantMessageId(messages, { ...summary, reviewReason: "error" })).toBeNull();
-		expect(getCompletedAssistantMessageId(messages, { ...summary, latestHookActivity: null })).toBeNull();
-		expect(getCompletedAssistantMessageId(
-			[...messages, { id: "newer", role: "assistant", content: "A new turn", createdAt: 3 }],
-			summary,
-		)).toBeNull();
+	it("survives the SDK ended event changing the review reason to exit", () => {
+		expect(getCompletedAssistantMessageId(messages, { ...summary, reviewReason: "exit" }, "review")).toBe("final");
+	});
+
+	it("identifies the last response on a Done task reloaded without ephemeral event metadata", () => {
+		const rebound = { ...summary, reviewReason: "attention" as const, latestHookActivity: null };
+		expect(getCompletedAssistantMessageId(messages, rebound, "done")).toBe("final");
+		expect(getCompletedAssistantMessageId(messages, rebound, "review")).toBeNull();
+	});
+
+	it("does not style failed, interrupted, or unmatched responses", () => {
+		expect(getCompletedAssistantMessageId(messages, { ...summary, reviewReason: "error" }, "done")).toBeNull();
+		expect(getCompletedAssistantMessageId(messages, { ...summary, reviewReason: "interrupted" }, "done")).toBeNull();
+		expect(
+			getCompletedAssistantMessageId(
+				[...messages, { id: "newer", role: "assistant", content: "A new turn", createdAt: 3 }],
+				summary,
+				"review",
+			),
+		).toBeNull();
 	});
 });

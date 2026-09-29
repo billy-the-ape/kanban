@@ -223,7 +223,7 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 			],
 		);
 
-		const completedMessageId = getCompletedAssistantMessageId(messages, summary);
+		const completedMessageId = getCompletedAssistantMessageId(messages, summary, taskColumnId);
 		const panelError = composerError ?? error;
 		const attachmentWarningMessage =
 			draftImages.length > 0 && selectedModel?.supportsVision === false
