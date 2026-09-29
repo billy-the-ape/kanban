@@ -229,6 +229,8 @@ const COMPACTION_EVENT_PERSIST_INTERVAL_MS = 60_000;
 
 export class InMemoryClineTaskSessionService implements ClineTaskSessionService {
 	private readonly pendingTurnCancelTaskIds = new Set<string>();
+	/** Non-throwing SDK failure events observed during the current send. */
+	private readonly pendingContextOverflowByTaskId = new Map<string, string>();
 	private readonly providerIdByTaskId = new Map<string, string>();
 	private readonly contextRecoveryMaxAttempts: number;
 	private readonly sessionRuntime: ClineSessionRuntime;
@@ -844,6 +846,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			return null;
 		}
 		this.pendingTurnCancelTaskIds.delete(taskId);
+		this.pendingContextOverflowByTaskId.delete(taskId);
 		const normalized = text.trim();
 		const hasImages = Boolean(images && images.length > 0);
 		const effectiveMode: RuntimeTaskSessionMode = mode ?? entry.summary.mode ?? "act";
@@ -884,25 +887,44 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 				.then(async (runtimeSetup) => {
 					const resolvedPrompt = runtimeSetup.resolvePrompt(normalized);
 					try {
-						return await this.dispatchResolvedTaskInput({
-							taskId,
-							prompt: resolvedPrompt,
-							mode: effectiveMode,
-							images,
-							delivery: queueDelivery ? "queue" : undefined,
-						});
-					} catch (error) {
-						const recovered = await this.retryAfterContextOverflow({
-							taskId,
-							prompt: resolvedPrompt,
-							mode: effectiveMode,
-							images,
-							error,
-						});
-						if (recovered) {
-							return recovered;
+						let result: { result: unknown; warnings?: string[] };
+						try {
+							result = await this.dispatchResolvedTaskInput({
+								taskId,
+								prompt: resolvedPrompt,
+								mode: effectiveMode,
+								images,
+								delivery: queueDelivery ? "queue" : undefined,
+							});
+						} catch (error) {
+							const recovered = await this.retryAfterContextOverflow({
+								taskId,
+								prompt: resolvedPrompt,
+								mode: effectiveMode,
+								images,
+								error,
+							});
+							if (recovered) {
+								return recovered;
+							}
+							throw error;
 						}
-						throw error;
+						const eventError = this.pendingContextOverflowByTaskId.get(taskId);
+						if (eventError) {
+							const recovered = await this.retryAfterContextOverflow({
+								taskId,
+								prompt: resolvedPrompt,
+								mode: effectiveMode,
+								images,
+								error: eventError,
+							});
+							if (recovered) {
+								return recovered;
+							}
+						}
+						return result;
+					} finally {
+						this.pendingContextOverflowByTaskId.delete(taskId);
 					}
 				})
 				.then(({ result, warnings }) => {
@@ -1198,6 +1220,13 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 				this.emitMessage(taskIdFromEvent, message);
 			},
 		});
+		if (
+			latestSummary?.reviewReason === "error" &&
+			latestSummary.warningMessage &&
+			isContextOverflowError(latestSummary.warningMessage)
+		) {
+			this.pendingContextOverflowByTaskId.set(taskId, latestSummary.warningMessage);
+		}
 		const shouldAbortForCreditLimit =
 			entry.summary.latestHookActivity?.notificationType === "credit_limit" &&
 			previousSummary?.latestHookActivity?.notificationType !== "credit_limit";
