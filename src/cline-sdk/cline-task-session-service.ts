@@ -919,6 +919,12 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 								error: eventError,
 							});
 							if (recovered) {
+								this.emitSummary(updateSummary(entry, {
+									state: "running",
+									reviewReason: null,
+									warningMessage: null,
+									lastOutputAt: now(),
+								}));
 								return recovered;
 							}
 						}
