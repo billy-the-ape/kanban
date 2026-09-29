@@ -142,6 +142,8 @@ describe("useReviewAutoActions", () => {
 				<HookHarness board={createBoard(true)} runAutoReviewGitAction={runAutoReviewGitAction}
 					requestCompleteTask={requestCompleteTask} />,
 			);
+		});
+		await act(async () => {
 			vi.advanceTimersByTime(1000);
 		});
 		expect(runAutoReviewGitAction).toHaveBeenCalledTimes(1);
@@ -154,6 +156,8 @@ describe("useReviewAutoActions", () => {
 				<HookHarness board={createBoard(true)} runAutoReviewGitAction={runAutoReviewGitAction}
 					requestCompleteTask={requestCompleteTask} />,
 			);
+		});
+		await act(async () => {
 			vi.advanceTimersByTime(1000);
 		});
 		expect(runAutoReviewGitAction).toHaveBeenCalledTimes(1);
