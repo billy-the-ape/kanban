@@ -195,7 +195,7 @@ export function getCompletedAssistantMessageId(
 	for (let index = messages.length - 1; index >= 0; index -= 1) {
 		const message = messages[index];
 		if (message?.role === "assistant") {
-			return (!hasCompletionEvent || message.content.trim() === finalText) && message.content.trim()
+			return message.content.trim() && (taskColumnId === "done" || message.content.trim() === finalText)
 				? message.id
 				: null;
 		}
