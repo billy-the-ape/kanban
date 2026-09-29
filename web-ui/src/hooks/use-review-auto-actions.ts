@@ -8,6 +8,32 @@ import { resolveTaskAutoReviewMode } from "@/types";
 
 const AUTO_REVIEW_ACTION_DELAY_MS = 500;
 
+// The chat accepts an instruction before the agent finishes. Keep its receipt
+// across UI remounts while the Review card's worktree remains dirty.
+function autoReviewPromptKey(projectId: string | null | undefined, taskId: string, action: TaskGitAction): string {
+	return ["kanban:auto-review-prompt", projectId ?? "default", taskId, action].join(":");
+}
+
+function hasSentAutoReviewPrompt(key: string): boolean {
+	try {
+		return window.localStorage.getItem(key) === "sent";
+	} catch {
+		return false;
+	}
+}
+
+function setAutoReviewPromptSent(key: string, sent: boolean): void {
+	try {
+		if (sent) {
+			window.localStorage.setItem(key, "sent");
+		} else {
+			window.localStorage.removeItem(key);
+		}
+	} catch {
+		// Storage may be disabled; the in-memory guard still protects this mount.
+	}
+}
+
 function isTaskAutoReviewEnabled(task: BoardCard): boolean {
 	return task.autoReviewEnabled === true;
 }
@@ -130,6 +156,10 @@ export function useReviewAutoActions({
 			for (const column of boardRef.current.columns) {
 				for (const card of column.cards) {
 					columnByTaskId.set(card.id, column.id);
+					if (column.id !== "review") {
+						setAutoReviewPromptSent(autoReviewPromptKey(resetKey, card.id, "pr"), false);
+						setAutoReviewPromptSent(autoReviewPromptKey(resetKey, card.id, "commit"), false);
+					}
 					if (column.id === "review") {
 						reviewCardsForAutomation.push(card);
 					}
@@ -183,6 +213,10 @@ export function useReviewAutoActions({
 				//   task directly; a clean worktree is never treated as evidence (B-5.1).
 				const changedFiles = getTaskWorkspaceSnapshot(reviewTask.id)?.changedFiles;
 				const awaitingAction = awaitingCleanActionByTaskIdRef.current[reviewTask.id] ?? null;
+			const promptKey = autoReviewPromptKey(resetKey, reviewTask.id, autoReviewMode);
+			if (changedFiles === 0) {
+				setAutoReviewPromptSent(promptKey, false);
+			}
 				if (awaitingAction && completeOnGitActionSuccess) {
 					clearAutoReviewTimer(reviewTask.id);
 					continue;
@@ -221,7 +255,7 @@ export function useReviewAutoActions({
 					continue;
 				}
 
-				if ((changedFiles ?? 0) <= 0 || isGitActionInFlight) {
+				if ((changedFiles ?? 0) <= 0 || isGitActionInFlight || hasSentAutoReviewPrompt(promptKey)) {
 					clearAutoReviewTimer(reviewTask.id);
 					continue;
 				}
@@ -240,6 +274,9 @@ export function useReviewAutoActions({
 					}
 					awaitingCleanActionByTaskIdRef.current[reviewTask.id] = latestMode;
 					void runAutoReviewGitActionRef.current(reviewTask.id, latestMode).then((triggered) => {
+						if (triggered && !completeOnGitActionSuccessRef.current) {
+							setAutoReviewPromptSent(promptKey, true);
+						}
 						if (!triggered && awaitingCleanActionByTaskIdRef.current[reviewTask.id] === latestMode) {
 							delete awaitingCleanActionByTaskIdRef.current[reviewTask.id];
 							return;
@@ -257,7 +294,7 @@ export function useReviewAutoActions({
 				});
 			}
 		},
-		[clearAutoReviewTimer, completeOnGitActionSuccess, scheduleAutoReviewAction, taskGitActionLoadingByTaskId],
+		[clearAutoReviewTimer, completeOnGitActionSuccess, resetKey, scheduleAutoReviewAction, taskGitActionLoadingByTaskId],
 	);
 
 	useEffect(() => {
