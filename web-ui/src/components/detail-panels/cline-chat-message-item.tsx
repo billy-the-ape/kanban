@@ -175,7 +175,13 @@ function ReasoningMessageBlock({ message }: { message: ClineChatMessage }): Reac
 	);
 }
 
-export function ClineChatMessageItem({ message }: { message: ClineChatMessage }): ReactElement {
+export function ClineChatMessageItem({
+	message,
+	isCompletedResponse = false,
+}: {
+	message: ClineChatMessage;
+	isCompletedResponse?: boolean;
+}): ReactElement {
 	if (message.role === "tool") {
 		return <ToolMessageBlock message={message} />;
 	}
@@ -197,7 +203,17 @@ export function ClineChatMessageItem({ message }: { message: ClineChatMessage })
 	if (message.role === "assistant") {
 		const normalizedAssistantContent = message.content.replace(/^\n+/, "");
 		return (
-			<div className="min-w-0 w-full px-1.5 text-sm text-text-primary">
+			<div
+				className={cn(
+					"min-w-0 w-full text-sm text-text-primary",
+					isCompletedResponse
+						? "rounded-md border border-status-green/40 bg-status-green/10 px-3 py-2"
+						: "px-1.5",
+				)}
+			>
+				{isCompletedResponse ? (
+					<div className="mb-2 text-xs font-semibold text-status-green">Task complete</div>
+				) : null}
 				<ClineMarkdownContent content={normalizedAssistantContent} />
 			</div>
 		);

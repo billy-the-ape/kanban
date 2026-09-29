@@ -1,4 +1,6 @@
 import { type ClineToolCallDisplay, getClineToolCallDisplay } from "@runtime-cline-tool-call-display";
+import type { ClineChatMessage } from "@/hooks/use-cline-chat-session";
+import type { RuntimeTaskSessionSummary } from "@/runtime/types";
 import { stripAnsi } from "@/utils/strip-ansi";
 
 export interface ParsedToolMessageContent {
@@ -174,4 +176,22 @@ export function parseToolMessageContent(content: string): ParsedToolMessageConte
 		error: rawError !== null ? stripAnsi(rawError) : null,
 		durationMs,
 	};
+}
+
+/** Identify the successful final response, including after SDK history is reloaded. */
+export function getCompletedAssistantMessageId(
+	messages: ClineChatMessage[],
+	summary: RuntimeTaskSessionSummary | null,
+): string | null {
+	const finalText = summary?.latestHookActivity?.finalMessage?.trim();
+	if (summary?.reviewReason !== "hook" || summary.latestHookActivity?.hookEventName !== "agent_end" || !finalText) {
+		return null;
+	}
+	for (let index = messages.length - 1; index >= 0; index -= 1) {
+		const message = messages[index];
+		if (message?.role === "assistant") {
+			return message.content.trim() === finalText ? message.id : null;
+		}
+	}
+	return null;
 }
