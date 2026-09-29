@@ -105,6 +105,10 @@ function collectContextOverflowCandidates(error: unknown): ContextOverflowErrorC
 	const candidates: ContextOverflowErrorCandidate[] = [];
 	let current: unknown = error;
 	for (let depth = 0; depth < MAX_CONTEXT_OVERFLOW_CAUSE_DEPTH; depth += 1) {
+		if (typeof current === "string") {
+			candidates.push(toContextOverflowCandidate(current));
+			break;
+		}
 		if (current === null || current === undefined || typeof current !== "object") {
 			break;
 		}
