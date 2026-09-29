@@ -122,6 +122,7 @@ describe("B-3.1 isContextOverflowError classification", () => {
 		// context size" matched no pattern); B-3.1 classifies it so the send
 		// path can compact and restart instead of failing the turn.
 		expect(isContextOverflowError(new Error(LLAMA_CPP_OVERFLOW_ERROR))).toBe(true);
+		expect(isContextOverflowError(LLAMA_CPP_OVERFLOW_ERROR)).toBe(true);
 	});
 
 	it("classifies the OpenAI prompt-too-long error shape", () => {
@@ -525,6 +526,42 @@ describe("context overflow recovery through the task session service (B-3)", () 
 		});
 		return { promise, resolve };
 	}
+
+	it("recovers an overflow reported only as a non-throwing SDK event", async () => {
+		let host: TaskSessionServiceHarness["host"] | null = null;
+		const harness = createTaskSessionServiceHarness({
+			onTurn: (context) => {
+				if (context.turnCount === 2) {
+					host?.emitEvent({
+						type: "agent_event",
+						payload: {
+							sessionId: context.sessionId,
+							event: { type: "error", error: new Error(LLAMA_CPP_OVERFLOW_ERROR), recoverable: false },
+						},
+					});
+				}
+				return `reply ${context.turnCount}`;
+			},
+		});
+		services.push(harness);
+		host = harness.host;
+		const taskId = "task-b3-event-overflow";
+		await startFirstTurn(harness, taskId, {
+			initialMessages: oversizedSeedMessages(),
+			compaction: SMALL_COMPACTION,
+		});
+		await harness.service.sendTaskSessionInput(taskId, "Follow up prompt");
+		await vi.waitFor(() => {
+			expect({
+				sends: harness.host.sentPrompts.length,
+				starts: harness.host.startedConfigs.length,
+				warning: harness.service.getSummary(taskId)?.warningMessage,
+			}).toEqual({ sends: 3, starts: 2, warning: null });
+		});
+		expect(harness.service.getSummary(taskId)?.reviewReason).not.toBe("error");
+		const context = await harness.service.getTaskContextSnapshot(taskId);
+		expect(context?.lastCompaction?.trigger).toBe("overflow");
+	});
 
 	it("recovers a follow-up overflow by compacting the persisted transcript (OpenAI shape)", async () => {
 		const harness = createTaskSessionServiceHarness({
