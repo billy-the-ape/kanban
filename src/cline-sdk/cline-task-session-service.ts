@@ -1220,12 +1220,13 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 				this.emitMessage(taskIdFromEvent, message);
 			},
 		});
+		const currentSummary = entry.summary;
 		if (
-			latestSummary?.reviewReason === "error" &&
-			latestSummary.warningMessage &&
-			isContextOverflowError(latestSummary.warningMessage)
+			currentSummary.reviewReason === "error" &&
+			currentSummary.warningMessage &&
+			isContextOverflowError(currentSummary.warningMessage)
 		) {
-			this.pendingContextOverflowByTaskId.set(taskId, latestSummary.warningMessage);
+			this.pendingContextOverflowByTaskId.set(taskId, currentSummary.warningMessage);
 		}
 		const shouldAbortForCreditLimit =
 			entry.summary.latestHookActivity?.notificationType === "credit_limit" &&
