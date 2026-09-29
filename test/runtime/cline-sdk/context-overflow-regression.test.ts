@@ -551,6 +551,9 @@ describe("context overflow recovery through the task session service (B-3)", () 
 		});
 		await harness.service.sendTaskSessionInput(taskId, "Follow up prompt");
 		await vi.waitFor(() => {
+			expect(harness.service.getSummary(taskId)?.warningMessage).toContain("exceeds the available context size");
+		});
+		await vi.waitFor(() => {
 			expect(harness.host.sentPrompts.length).toBe(3);
 		});
 		expect(harness.service.getSummary(taskId)?.reviewReason).not.toBe("error");
