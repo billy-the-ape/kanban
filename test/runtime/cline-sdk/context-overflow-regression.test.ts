@@ -122,6 +122,7 @@ describe("B-3.1 isContextOverflowError classification", () => {
 		// context size" matched no pattern); B-3.1 classifies it so the send
 		// path can compact and restart instead of failing the turn.
 		expect(isContextOverflowError(new Error(LLAMA_CPP_OVERFLOW_ERROR))).toBe(true);
+		expect(isContextOverflowError(LLAMA_CPP_OVERFLOW_ERROR)).toBe(true);
 	});
 
 	it("classifies the OpenAI prompt-too-long error shape", () => {
