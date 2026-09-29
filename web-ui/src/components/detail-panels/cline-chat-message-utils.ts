@@ -178,19 +178,26 @@ export function parseToolMessageContent(content: string): ParsedToolMessageConte
 	};
 }
 
-/** Identify the successful final response, including after SDK history is reloaded. */
+/** Identify the final response after SDK end events or a persisted Done task reload. */
 export function getCompletedAssistantMessageId(
 	messages: ClineChatMessage[],
 	summary: RuntimeTaskSessionSummary | null,
+	taskColumnId: string,
 ): string | null {
+	if (summary?.reviewReason === "error" || summary?.reviewReason === "interrupted") {
+		return null;
+	}
 	const finalText = summary?.latestHookActivity?.finalMessage?.trim();
-	if (summary?.reviewReason !== "hook" || summary.latestHookActivity?.hookEventName !== "agent_end" || !finalText) {
+	const hasCompletionEvent = summary?.latestHookActivity?.hookEventName === "agent_end" && Boolean(finalText);
+	if (!hasCompletionEvent && taskColumnId !== "done") {
 		return null;
 	}
 	for (let index = messages.length - 1; index >= 0; index -= 1) {
 		const message = messages[index];
 		if (message?.role === "assistant") {
-			return message.content.trim() === finalText ? message.id : null;
+			return (!hasCompletionEvent || message.content.trim() === finalText) && message.content.trim()
+				? message.id
+				: null;
 		}
 	}
 	return null;
