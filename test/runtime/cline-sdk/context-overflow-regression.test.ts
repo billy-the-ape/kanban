@@ -109,6 +109,10 @@ afterEach(async () => {
 	}
 });
 describe("B-3.1 isContextOverflowError classification", () => {
+	it("classifies the llama-swap available-token error", () => {
+		expect(isContextOverflowError(new Error("request 263883 tokens exceeds available 262144"))).toBe(true);
+	});
+
 	it("classifies the OpenAI maximum-context-length error shape", () => {
 		expect(isContextOverflowError(new Error(OPENAI_OVERFLOW_ERROR))).toBe(true);
 	});
