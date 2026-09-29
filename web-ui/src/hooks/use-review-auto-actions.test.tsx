@@ -76,6 +76,7 @@ describe("useReviewAutoActions", () => {
 
 	beforeEach(() => {
 		vi.useFakeTimers();
+		window.localStorage.clear();
 		previousActEnvironment = (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
 			.IS_REACT_ACT_ENVIRONMENT;
 		(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -96,6 +97,7 @@ describe("useReviewAutoActions", () => {
 			(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT =
 				previousActEnvironment;
 		}
+		window.localStorage.clear();
 		vi.useRealTimers();
 	});
 
@@ -129,6 +131,32 @@ describe("useReviewAutoActions", () => {
 
 		expect(runAutoReviewGitAction).not.toHaveBeenCalled();
 		expect(requestCompleteTask).not.toHaveBeenCalled();
+	});
+
+	it("does not resend an accepted prompt after the hook remounts with a dirty worktree", async () => {
+		const runAutoReviewGitAction = vi.fn(async () => true);
+		const requestCompleteTask = vi.fn(async () => {});
+
+		await act(async () => {
+			root.render(
+				<HookHarness board={createBoard(true)} runAutoReviewGitAction={runAutoReviewGitAction}
+					requestCompleteTask={requestCompleteTask} />,
+			);
+			vi.advanceTimersByTime(1000);
+		});
+		expect(runAutoReviewGitAction).toHaveBeenCalledTimes(1);
+
+		await act(async () => {
+			root.render(null);
+		});
+		await act(async () => {
+			root.render(
+				<HookHarness board={createBoard(true)} runAutoReviewGitAction={runAutoReviewGitAction}
+					requestCompleteTask={requestCompleteTask} />,
+			);
+			vi.advanceTimersByTime(1000);
+		});
+		expect(runAutoReviewGitAction).toHaveBeenCalledTimes(1);
 	});
 
 	it("completes on a successful deterministic delivery even while the worktree still shows changes", async () => {
