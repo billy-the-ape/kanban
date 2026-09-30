@@ -241,6 +241,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 	private readonly pendingContextOverflowByTaskId = new Map<string, string>();
 	/** Keep one SDK turn (including recovery) in flight per task. */
 	private readonly turnDispatchByTaskId = new Map<string, Promise<void>>();
+	private readonly turnGenerationByTaskId = new Map<string, number>();
 	private readonly providerIdByTaskId = new Map<string, string>();
 	private readonly contextRecoveryMaxAttempts: number;
 	private readonly sessionRuntime: ClineSessionRuntime;
@@ -333,6 +334,10 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		void recordTaskCompactionEvent(taskId, event).catch(() => {
 			// Intentionally swallowed (see above).
 		});
+	}
+
+	private invalidatePendingTaskTurns(taskId: string): void {
+		this.turnGenerationByTaskId.set(taskId, (this.turnGenerationByTaskId.get(taskId) ?? 0) + 1);
 	}
 
 	private enqueueTaskTurn<T>(taskId: string, run: () => Promise<T>): Promise<T> {
@@ -698,6 +703,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			return cloneSummary(existing.summary);
 		}
 
+		this.invalidatePendingTaskTurns(request.taskId);
 		const providerId = request.providerId?.trim().toLowerCase() || SDK_DEFAULT_PROVIDER_ID;
 		this.providerIdByTaskId.set(request.taskId, providerId);
 		const modelId = request.modelId?.trim() || SDK_DEFAULT_MODEL_ID;
@@ -851,6 +857,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 				return reboundSummary;
 			}
 		}
+		this.invalidatePendingTaskTurns(taskId);
 		this.pendingTurnCancelTaskIds.delete(taskId);
 		await this.sessionRuntime.stopTaskSession(taskId).catch(() => null);
 		if (entry.summary.state === "idle") {
@@ -871,6 +878,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		if (!entry) {
 			return null;
 		}
+		this.invalidatePendingTaskTurns(taskId);
 		this.pendingTurnCancelTaskIds.delete(taskId);
 		await this.sessionRuntime.abortTaskSession(taskId).catch(() => null);
 		const summary = updateSummary(entry, {
@@ -891,6 +899,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		if (entry.summary.state !== "running") {
 			return null;
 		}
+		this.invalidatePendingTaskTurns(taskId);
 		this.pendingTurnCancelTaskIds.add(taskId);
 		await this.sessionRuntime.abortTaskSession(taskId).catch(() => null);
 		clearActiveTurnState(entry);
@@ -972,9 +981,13 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 				},
 			});
 			this.emitSummary(waitingSummary);
+			const turnGeneration = this.turnGenerationByTaskId.get(taskId) ?? 0;
 			let assistantCountBeforeSend = 0;
 			void this.enqueueTaskTurn(taskId, () =>
 				this.ensureRuntimeSetup(entry.summary.workspacePath ?? "").then(async (runtimeSetup) => {
+					if ((this.turnGenerationByTaskId.get(taskId) ?? 0) !== turnGeneration) {
+						return { result: null };
+					}
 					this.pendingTurnCancelTaskIds.delete(taskId);
 					this.pendingContextOverflowByTaskId.delete(taskId);
 					this.emitSummary(
@@ -1036,6 +1049,9 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					}
 				})
 				.then(({ result, warnings }) => {
+					if ((this.turnGenerationByTaskId.get(taskId) ?? 0) !== turnGeneration) {
+						return;
+					}
 					const warningMessage = formatStartWarnings(warnings);
 					if (warningMessage) {
 						this.emitSummary(
@@ -1059,7 +1075,9 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					}
 				})
 				.catch((error: unknown) => {
-					this.emitTaskFailure(taskId, entry, "send", error);
+					if ((this.turnGenerationByTaskId.get(taskId) ?? 0) === turnGeneration) {
+						this.emitTaskFailure(taskId, entry, "send", error);
+					}
 				}),
 			);
 		}
@@ -1086,6 +1104,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			}
 		}
 
+		this.invalidatePendingTaskTurns(taskId);
 		this.pendingTurnCancelTaskIds.delete(taskId);
 		await this.sessionRuntime.stopTaskSession(taskId).catch(() => null);
 		clearActiveTurnState(entry);
@@ -1120,6 +1139,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 
 	async clearTaskSession(taskId: string): Promise<RuntimeTaskSessionSummary | null> {
 		const existingEntry = this.messageRepository.getTaskEntry(taskId);
+		this.invalidatePendingTaskTurns(taskId);
 		this.pendingTurnCancelTaskIds.delete(taskId);
 		this.providerIdByTaskId.delete(taskId);
 		await this.sessionRuntime.clearTaskSessions(taskId).catch(() => undefined);
@@ -1237,6 +1257,8 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 	async dispose(): Promise<void> {
 		await this.sessionRuntime.dispose();
 		this.pendingTurnCancelTaskIds.clear();
+		this.turnDispatchByTaskId.clear();
+		this.turnGenerationByTaskId.clear();
 		this.latestCompactionByTaskId.clear();
 		this.compactionPersistedAtByTaskId.clear();
 		for (const leasePromise of this.runtimeSetupLeaseByWorkspacePath.values()) {
