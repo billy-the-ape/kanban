@@ -43,6 +43,8 @@ import {
 	evaluateClineRecoveryRequirements,
 	findClineUnresolvedToolCalls,
 	isContextOverflowError,
+	readReportedContextLimit,
+	withoutFailedResend,
 } from "../../../src/cline-sdk/cline-context-recovery";
 import type { ClineSdkPersistedMessage } from "../../../src/cline-sdk/sdk-runtime-boundary";
 import {
@@ -526,6 +528,41 @@ describe("context overflow recovery through the task session service (B-3)", () 
 		});
 		return { promise, resolve };
 	}
+
+	it("uses the provider ceiling and resends a failed prompt only once", async () => {
+		const providerError =
+			"request (9000 tokens) exceeds the available context size (6000 tokens), try increasing it";
+		expect(readReportedContextLimit(new Error(providerError))).toBe(6000);
+		expect(
+			withoutFailedResend(
+				[{ role: "user", content: "original" }, { role: "user", content: "Open PR" }],
+				"Open PR",
+			),
+		).toEqual([{ role: "user", content: "original" }]);
+		const harness = createTaskSessionServiceHarness({
+			onTurn: (context) => {
+				if (context.turnCount === 2) {
+					throw new Error(providerError);
+				}
+				return `reply ${context.turnCount}`;
+			},
+		});
+		services.push(harness);
+		const taskId = "task-b3-provider-ceiling";
+		await startFirstTurn(harness, taskId, {
+			initialMessages: oversizedSeedMessages(),
+			compaction: SMALL_COMPACTION,
+		});
+		await harness.service.sendTaskSessionInput(taskId, "Open PR");
+		await vi.waitFor(() => {
+			expect(harness.host.sentPrompts.length).toBe(3);
+		});
+		const lastConfig = harness.host.startedConfigs.at(-1);
+		expect(lastConfig?.compaction?.contextWindowTokens).toBeLessThanOrEqual(6000);
+		const lastSessionId = lastConfig?.sessionId ?? "";
+		const lastMessages = harness.store.messagesFor(lastSessionId);
+		expect(lastMessages.filter((message) => message.role === "user" && message.content === "Open PR")).toHaveLength(1);
+	});
 
 	it("recovers an overflow reported only as a non-throwing SDK event", async () => {
 		let host: TaskSessionServiceHarness["host"] | null = null;
