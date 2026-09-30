@@ -214,9 +214,6 @@ export function useReviewAutoActions({
 				const changedFiles = getTaskWorkspaceSnapshot(reviewTask.id)?.changedFiles;
 				const awaitingAction = awaitingCleanActionByTaskIdRef.current[reviewTask.id] ?? null;
 			const promptKey = autoReviewPromptKey(resetKey, reviewTask.id, autoReviewMode);
-			if (changedFiles === 0) {
-				setAutoReviewPromptSent(promptKey, false);
-			}
 				if (awaitingAction && completeOnGitActionSuccess) {
 					clearAutoReviewTimer(reviewTask.id);
 					continue;
@@ -272,10 +269,16 @@ export function useReviewAutoActions({
 					if (latestMode !== autoReviewMode) {
 						return;
 					}
+					if (!completeOnGitActionSuccessRef.current && hasSentAutoReviewPrompt(promptKey)) {
+						return;
+					}
 					awaitingCleanActionByTaskIdRef.current[reviewTask.id] = latestMode;
+					if (!completeOnGitActionSuccessRef.current) {
+						setAutoReviewPromptSent(promptKey, true);
+					}
 					void runAutoReviewGitActionRef.current(reviewTask.id, latestMode).then((triggered) => {
-						if (triggered && !completeOnGitActionSuccessRef.current) {
-							setAutoReviewPromptSent(promptKey, true);
+						if (!triggered && !completeOnGitActionSuccessRef.current) {
+							setAutoReviewPromptSent(promptKey, false);
 						}
 						if (!triggered && awaitingCleanActionByTaskIdRef.current[reviewTask.id] === latestMode) {
 							delete awaitingCleanActionByTaskIdRef.current[reviewTask.id];

@@ -187,6 +187,31 @@ export function isContextOverflowError(error: unknown): boolean {
 	return false;
 }
 
+/** The context ceiling advertised by a provider overflow, if present. */
+export function readReportedContextLimit(error: unknown): number | null {
+	for (const candidate of collectContextOverflowCandidates(error)) {
+		const text = candidate.text;
+		const match = text?.match(/available context size\s*\((\d+)\s*tokens?\)/i);
+		const value = match ? Number(match[1]) : NaN;
+		if (Number.isSafeInteger(value) && value > 0) {
+			return value;
+		}
+	}
+	return null;
+}
+
+/** Remove only the failed user turn that a restart is about to send again. */
+export function withoutFailedResend(
+	messages: readonly ClineSdkPersistedMessage[],
+	prompt: string,
+): ClineSdkPersistedMessage[] {
+	const last = messages.at(-1);
+	if (last?.role === "user" && typeof last.content === "string" && last.content === prompt) {
+		return messages.slice(0, -1);
+	}
+	return [...messages];
+}
+
 // ---------------------------------------------------------------------------
 // B-3.4 / B-3.7 — Recovery budget verdicts
 // ---------------------------------------------------------------------------

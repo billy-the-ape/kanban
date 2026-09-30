@@ -156,6 +156,7 @@ export interface ClineSessionRuntime {
 		initialMessages?: ClineSdkPersistedMessage[];
 		images?: RuntimeTaskImage[];
 		mode?: RuntimeTaskSessionMode;
+		contextWindowCapTokens?: number;
 	}): Promise<StartClineSessionRuntimeResult>;
 	sendTaskSessionInput(
 		taskId: string,
@@ -540,13 +541,24 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		initialMessages?: ClineSdkPersistedMessage[];
 		images?: RuntimeTaskImage[];
 		mode?: RuntimeTaskSessionMode;
+		contextWindowCapTokens?: number;
 	}): Promise<StartClineSessionRuntimeResult> {
 		const restartRequest = await this.resolveRestartStartRequest(input.taskId);
 		if (!restartRequest) {
 			throw new Error(`No previous Cline session config is available for task ${input.taskId}.`);
 		}
+		const cappedLimit =
+			input.contextWindowCapTokens && restartRequest.compaction
+				? Math.min(input.contextWindowCapTokens, restartRequest.compaction.contextWindowTokens ?? input.contextWindowCapTokens)
+				: null;
 		return await this.startTaskSession({
 			...restartRequest,
+			...(cappedLimit !== null && restartRequest.compaction
+				? {
+						contextWindowTokens: cappedLimit,
+						compaction: { ...restartRequest.compaction, contextWindowTokens: cappedLimit },
+					}
+				: {}),
 			prompt: input.prompt,
 			initialMessages: input.initialMessages,
 			images: input.images,

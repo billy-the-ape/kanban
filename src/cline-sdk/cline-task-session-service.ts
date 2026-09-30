@@ -26,6 +26,8 @@ import {
 	evaluateClineRecoveryRequirements,
 	findClineUnresolvedToolCalls,
 	isContextOverflowError,
+	readReportedContextLimit,
+	withoutFailedResend,
 } from "./cline-context-recovery";
 import { applyClineSessionEvent } from "./cline-event-adapter";
 import {
@@ -474,12 +476,38 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			return null;
 		}
 
+		const reportedLimit = readReportedContextLimit(input.error);
+		const configuredLimit = startRequest.compaction?.contextWindowTokens;
+		const contextWindowCapTokens =
+			reportedLimit !== null && typeof configuredLimit === "number"
+				? Math.min(reportedLimit, configuredLimit)
+				: reportedLimit;
+		const baseLimit = contextWindowCapTokens ?? configuredLimit ?? null;
+		const requestForAttempt = (attempt: number) => {
+			// Keep the saved policy for errors without a provider ceiling. When
+			// the provider supplies one, progressively lower it after a rejected retry.
+			const limit =
+				reportedLimit !== null && baseLimit !== null
+					? Math.max(256, Math.floor(baseLimit * (1 - (attempt - 1) * 0.05)))
+					: null;
+			return {
+				limit,
+				request: {
+					...startRequest,
+					...(limit !== null && startRequest.compaction
+						? { compaction: { ...startRequest.compaction, contextWindowTokens: limit } }
+						: {}),
+				},
+			};
+		};
+		const firstAttempt = requestForAttempt(1);
+
 		// B-3.7: the restart prompt is pinned material — if system prompt +
 		// prompt + images alone exceed the effective input budget, no amount
 		// of history compaction can make this turn fit.
 		const budget = evaluateClineContextRecoveryBudget({
-			contextWindowTokens: startRequest.compaction?.contextWindowTokens,
-			reserveTokens: startRequest.compaction?.reserveTokens,
+			contextWindowTokens: firstAttempt.request.compaction?.contextWindowTokens,
+			reserveTokens: firstAttempt.request.compaction?.reserveTokens,
 			safetyMarginTokens: startRequest.compactionSafetyMarginTokens,
 			systemPrompt: startRequest.systemPrompt,
 			prompt: input.prompt,
@@ -492,6 +520,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		}
 
 		for (let attempt = 1; attempt <= this.contextRecoveryMaxAttempts; attempt += 1) {
+			const { limit, request: recoveryRequest } = requestForAttempt(attempt);
 			try {
 				const persistedSnapshot = await this.sessionRuntime
 					.readPersistedTaskSession(input.taskId)
@@ -502,12 +531,13 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 				if (unresolvedToolCalls.length > 0) {
 					throw new Error(describeClineUnresolvedToolCalls(unresolvedToolCalls));
 				}
-				const compacted = this.compactTranscriptForRecovery(startRequest, persistedMessages);
+				const history = withoutFailedResend(persistedMessages, input.prompt);
+				const compacted = this.compactTranscriptForRecovery(recoveryRequest, history);
 				// B-10.4: overflow recovery compaction is the "overflow"
 				// trigger class (budget compactions report "proactive").
 				if (compacted.changed) {
 					this.recordCompactionEvent(input.taskId, "overflow", {
-						messagesBefore: persistedMessages.length,
+						messagesBefore: history.length,
 						messagesAfter: compacted.messages.length,
 						tokensBefore: compacted.tokensBefore,
 						tokensAfter: compacted.tokensAfter,
@@ -521,6 +551,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					mode: input.mode,
 					images: input.images,
 					initialMessages: messages,
+					contextWindowCapTokens: limit ?? undefined,
 				});
 				return {
 					result: restartedSession.result,
@@ -929,6 +960,9 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 								);
 								return recovered;
 							}
+							throw new Error(
+								"Context overflow recovery could not restart this task. Check its context settings and worktree before retrying.",
+							);
 						}
 						return result;
 					} finally {
