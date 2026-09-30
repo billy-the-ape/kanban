@@ -482,19 +482,28 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			reportedLimit !== null && typeof configuredLimit === "number"
 				? Math.min(reportedLimit, configuredLimit)
 				: reportedLimit;
-		const recoveryRequest = {
-			...startRequest,
-			...(contextWindowCapTokens !== null && startRequest.compaction
-				? { compaction: { ...startRequest.compaction, contextWindowTokens: contextWindowCapTokens } }
-				: {}),
+		const baseLimit = contextWindowCapTokens ?? configuredLimit ?? null;
+		const requestForAttempt = (attempt: number) => {
+			const limit =
+				baseLimit !== null ? Math.max(256, Math.floor(baseLimit * (1 - attempt * 0.1))) : null;
+			return {
+				limit,
+				request: {
+					...startRequest,
+					...(limit !== null && startRequest.compaction
+						? { compaction: { ...startRequest.compaction, contextWindowTokens: limit } }
+						: {}),
+				},
+			};
 		};
+		const firstAttempt = requestForAttempt(1);
 
 		// B-3.7: the restart prompt is pinned material — if system prompt +
 		// prompt + images alone exceed the effective input budget, no amount
 		// of history compaction can make this turn fit.
 		const budget = evaluateClineContextRecoveryBudget({
-			contextWindowTokens: recoveryRequest.compaction?.contextWindowTokens,
-			reserveTokens: recoveryRequest.compaction?.reserveTokens,
+			contextWindowTokens: firstAttempt.request.compaction?.contextWindowTokens,
+			reserveTokens: firstAttempt.request.compaction?.reserveTokens,
 			safetyMarginTokens: startRequest.compactionSafetyMarginTokens,
 			systemPrompt: startRequest.systemPrompt,
 			prompt: input.prompt,
@@ -507,6 +516,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		}
 
 		for (let attempt = 1; attempt <= this.contextRecoveryMaxAttempts; attempt += 1) {
+			const { limit, request: recoveryRequest } = requestForAttempt(attempt);
 			try {
 				const persistedSnapshot = await this.sessionRuntime
 					.readPersistedTaskSession(input.taskId)
@@ -537,7 +547,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					mode: input.mode,
 					images: input.images,
 					initialMessages: messages,
-					contextWindowCapTokens: contextWindowCapTokens ?? undefined,
+					contextWindowCapTokens: limit ?? undefined,
 				});
 				return {
 					result: restartedSession.result,
