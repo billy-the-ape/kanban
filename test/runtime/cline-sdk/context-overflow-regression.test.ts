@@ -619,6 +619,30 @@ describe("context overflow recovery through the task session service (B-3)", () 
 		expect(harness.service.getSummary(taskId)?.reviewReason).not.toBe("error");
 	});
 
+	it("restarts safely when a subsequent send targets a missing SDK session", async () => {
+		const harness = createTaskSessionServiceHarness();
+		services.push(harness);
+		const taskId = "task-b3-stale-session";
+		await startFirstTurn(harness, taskId, { compaction: SMALL_COMPACTION });
+		const originalSend = harness.host.send.bind(harness.host);
+		let missingOnce = true;
+		harness.host.send = async (input) => {
+			if (missingOnce && input.prompt === "Open PR") {
+				missingOnce = false;
+				throw new Error(`session not found: ${input.sessionId}`);
+			}
+			return originalSend(input);
+		};
+		await harness.service.sendTaskSessionInput(taskId, "Open PR");
+		await vi.waitFor(() => {
+			expect(harness.host.startedConfigs.length).toBe(2);
+			expect(harness.host.sentPrompts.at(-1)?.prompt).toBe("Open PR");
+		});
+		expect(harness.store.messagesFor(harness.host.startedConfigs.at(-1)?.sessionId ?? "")
+			.filter((message) => message.role === "user" && message.content === "Open PR")).toHaveLength(1);
+		expect(harness.service.getSummary(taskId)?.reviewReason).not.toBe("error");
+	});
+
 	it("stops thinking after bounded overflow replies instead of publishing them as chat", async () => {
 		const harness = createTaskSessionServiceHarness({
 			contextRecoveryMaxAttempts: 1,
