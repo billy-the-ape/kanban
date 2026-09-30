@@ -1090,16 +1090,15 @@ describe("context overflow recovery through the task session service (B-3)", () 
 		expect(canceled?.state).toBe("idle");
 
 		overflowGate.resolve();
-		await vi.waitFor(() => {
-			expect(service.getSummary(taskId)?.reviewReason).toBe("error");
-		});
+		await new Promise((resolve) => setTimeout(resolve, 30));
 
-		// The overflow is still reported (the turn did fail), but recovery
-		// was skipped: no restart, no resend — a canceled turn is never
-		// revived.
+		// A late provider failure from the canceled turn must not revive the
+		// task or overwrite its idle summary; no restart or resend occurs.
 		expect(host.startedConfigs.length).toBe(1);
 		expect(host.sentPrompts.length).toBe(2);
-		expect(service.getSummary(taskId)?.warningMessage).toContain("exceeds the available context size");
+		expect(service.getSummary(taskId)?.state).toBe("idle");
+		expect(service.getSummary(taskId)?.reviewReason).toBeNull();
+		expect(service.getSummary(taskId)?.warningMessage).toBeNull();
 	});
 
 	it("pauses with an actionable reason when the original requirements exceed the compaction target (B-3.4)", async () => {
