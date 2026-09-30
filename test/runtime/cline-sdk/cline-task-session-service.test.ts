@@ -1706,7 +1706,7 @@ describe("InMemoryClineTaskSessionService", () => {
 		await vi.waitFor(() => {
 			expect(runtime.startTaskSessionMock).toHaveBeenCalledTimes(2);
 		});
-		expect(runtime.stopTaskSessionMock).toHaveBeenCalledWith("task-1");
+		expect(runtime.abortTaskSessionMock).toHaveBeenCalledWith("task-1");
 		expect(runtime.sendTaskSessionInputMock).toHaveBeenCalledTimes(1);
 		const restartCall = runtime.startTaskSessionMock.mock.calls[1]?.[0];
 		expect(restartCall?.prompt).toBe("resolved:Try again");

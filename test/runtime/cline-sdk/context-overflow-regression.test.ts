@@ -707,6 +707,115 @@ describe("context overflow recovery through the task session service (B-3)", () 
 		expect(harness.service.getSummary(taskId)?.reviewReason).toBe("hook");
 	});
 
+	it("serializes follow-up turns for one task instead of starting two model loops", async () => {
+		const firstFollowUpGate = deferred();
+		let activeTurns = 0;
+		let maxActiveTurns = 0;
+		const harness = createTaskSessionServiceHarness({
+			onTurn: async (context) => {
+				activeTurns += 1;
+				maxActiveTurns = Math.max(maxActiveTurns, activeTurns);
+				if (context.turnCount === 2) {
+					await firstFollowUpGate.promise;
+				}
+				activeTurns -= 1;
+				return `reply ${context.turnCount}`;
+			},
+		});
+		services.push(harness);
+		const taskId = "task-b3-serialized-turns";
+		await startFirstTurn(harness, taskId, { compaction: SMALL_COMPACTION });
+		await harness.service.sendTaskSessionInput(taskId, "First follow-up");
+		await vi.waitFor(() => {
+			expect(harness.host.sentPrompts.length).toBe(2);
+		});
+		await harness.service.sendTaskSessionInput(taskId, "Second follow-up");
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		expect(harness.host.sentPrompts.length).toBe(2);
+		firstFollowUpGate.resolve();
+		await vi.waitFor(() => {
+			expect(harness.host.sentPrompts.length).toBe(3);
+		});
+		expect(maxActiveTurns).toBe(1);
+		expect(harness.host.sentPrompts.map(({ prompt }) => prompt)).toEqual([
+			"First turn prompt",
+			"First follow-up",
+			"Second follow-up",
+		]);
+	});
+
+	it("drops a queued follow-up when the task is paused", async () => {
+		const activeGate = deferred();
+		const harness = createTaskSessionServiceHarness({
+			onTurn: async (context) => {
+				if (context.turnCount === 2) {
+					await activeGate.promise;
+				}
+				return `reply ${context.turnCount}`;
+			},
+		});
+		services.push(harness);
+		const taskId = "task-b3-pause-queue";
+		await startFirstTurn(harness, taskId, { compaction: SMALL_COMPACTION });
+		await harness.service.sendTaskSessionInput(taskId, "Active prompt");
+		await vi.waitFor(() => {
+			expect(harness.host.sentPrompts.length).toBe(2);
+		});
+		await harness.service.sendTaskSessionInput(taskId, "Queued prompt");
+		await harness.service.stopTaskSession(taskId);
+		activeGate.resolve();
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		expect(harness.host.sentPrompts.map(({ prompt }) => prompt)).toEqual([
+			"First turn prompt",
+			"Active prompt",
+		]);
+		expect(harness.service.getSummary(taskId)?.state).toBe("interrupted");
+	});
+
+	it("pausing aborts an orphaned running SDK session", async () => {
+		const harness = createTaskSessionServiceHarness();
+		services.push(harness);
+		const taskId = "task-b3-pause-orphan";
+		await startFirstTurn(harness, taskId, { compaction: SMALL_COMPACTION });
+		const config = harness.host.startedConfigs[0];
+		if (!config?.sessionId) {
+			throw new Error("Expected a started SDK session.");
+		}
+		const orphanId = `${config.sessionId}-orphan`;
+		await harness.host.start({ config: { ...config, sessionId: orphanId }, initialMessages: [] });
+		const abort = vi.spyOn(harness.host, "abort");
+		await harness.service.stopTaskSession(taskId);
+		expect(abort).toHaveBeenCalledWith(orphanId);
+		expect(harness.store.record(orphanId)?.status).not.toBe("running");
+	});
+
+	it("aborts an orphaned running SDK session before overflow recovery restarts", async () => {
+		const harness = createTaskSessionServiceHarness({
+			onTurn: (context) => {
+				if (context.turnCount === 2) {
+					throw new Error(LLAMA_CPP_OVERFLOW_ERROR);
+				}
+				return `reply ${context.turnCount}`;
+			},
+		});
+		services.push(harness);
+		const taskId = "task-b3-orphan-session";
+		await startFirstTurn(harness, taskId, { compaction: SMALL_COMPACTION });
+		const config = harness.host.startedConfigs[0];
+		if (!config?.sessionId) {
+			throw new Error("Expected a started SDK session.");
+		}
+		const orphanId = `${config.sessionId}-orphan`;
+		await harness.host.start({ config: { ...config, sessionId: orphanId }, initialMessages: [] });
+		const abort = vi.spyOn(harness.host, "abort");
+		await harness.service.sendTaskSessionInput(taskId, "Open PR");
+		await vi.waitFor(() => {
+			expect(harness.host.sentPrompts.length).toBe(3);
+		});
+		expect(abort).toHaveBeenCalledWith(orphanId);
+		expect(harness.store.record(orphanId)?.status).not.toBe("running");
+	});
+
 	it("recovers an overflow reported only as a non-throwing SDK event", async () => {
 		let host: TaskSessionServiceHarness["host"] | null = null;
 		const harness = createTaskSessionServiceHarness({
@@ -981,16 +1090,15 @@ describe("context overflow recovery through the task session service (B-3)", () 
 		expect(canceled?.state).toBe("idle");
 
 		overflowGate.resolve();
-		await vi.waitFor(() => {
-			expect(service.getSummary(taskId)?.reviewReason).toBe("error");
-		});
+		await new Promise((resolve) => setTimeout(resolve, 30));
 
-		// The overflow is still reported (the turn did fail), but recovery
-		// was skipped: no restart, no resend — a canceled turn is never
-		// revived.
+		// A late provider failure from the canceled turn must not revive the
+		// task or overwrite its idle summary; no restart or resend occurs.
 		expect(host.startedConfigs.length).toBe(1);
 		expect(host.sentPrompts.length).toBe(2);
-		expect(service.getSummary(taskId)?.warningMessage).toContain("exceeds the available context size");
+		expect(service.getSummary(taskId)?.state).toBe("idle");
+		expect(service.getSummary(taskId)?.reviewReason).toBeNull();
+		expect(service.getSummary(taskId)?.warningMessage).toBeNull();
 	});
 
 	it("pauses with an actionable reason when the original requirements exceed the compaction target (B-3.4)", async () => {

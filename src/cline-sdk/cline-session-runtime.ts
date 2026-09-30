@@ -547,6 +547,10 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		if (!restartRequest) {
 			throw new Error(`No previous Cline session config is available for task ${input.taskId}.`);
 		}
+		// A prior restart or stale binding may have left another SDK session
+		// running for this task. Abort it before starting a replacement; keep
+		// the persisted record for transcript recovery.
+		await this.abortSupersededTaskSessions(input.taskId);
 		const cappedLimit =
 			input.contextWindowCapTokens && restartRequest.compaction
 				? Math.min(input.contextWindowCapTokens, restartRequest.compaction.contextWindowTokens ?? input.contextWindowCapTokens)
@@ -733,10 +737,33 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		};
 	}
 
+	private async abortSupersededTaskSessions(taskId: string): Promise<void> {
+		const sessionHost = await this.ensureSessionHost();
+		const prefix = buildSessionIdPrefix(taskId);
+		const records = await sessionHost.list();
+		for (const record of records) {
+			if (!record.sessionId.startsWith(prefix) || record.status !== "running") {
+				continue;
+			}
+			try {
+				await sessionHost.abort(record.sessionId);
+			} catch (error) {
+				// A durable record can outlive its live SDK session.
+				if (!/^session not found(?::|$)/i.test(error instanceof Error ? error.message : String(error))) {
+					throw error;
+				}
+			}
+		}
+	}
+
 	async stopTaskSession(taskId: string): Promise<void> {
 		const sessionId = this.sessionIdByTaskId.get(taskId);
 		if (!sessionId) {
-			await this.releaseTaskMcpToolBundle(taskId);
+			try {
+				await this.abortSupersededTaskSessions(taskId);
+			} finally {
+				await this.releaseTaskMcpToolBundle(taskId);
+			}
 			return;
 		}
 		const sessionHost = await this.ensureSessionHost();
@@ -750,14 +777,22 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			}
 			throw error;
 		} finally {
-			await this.releaseTaskMcpToolBundle(taskId);
+			try {
+				await this.abortSupersededTaskSessions(taskId);
+			} finally {
+				await this.releaseTaskMcpToolBundle(taskId);
+			}
 		}
 	}
 
 	async abortTaskSession(taskId: string): Promise<void> {
 		const sessionId = this.sessionIdByTaskId.get(taskId);
 		if (!sessionId) {
-			await this.releaseTaskMcpToolBundle(taskId);
+			try {
+				await this.abortSupersededTaskSessions(taskId);
+			} finally {
+				await this.releaseTaskMcpToolBundle(taskId);
+			}
 			return;
 		}
 		const sessionHost = await this.ensureSessionHost();
@@ -771,7 +806,11 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			}
 			throw error;
 		} finally {
-			await this.releaseTaskMcpToolBundle(taskId);
+			try {
+				await this.abortSupersededTaskSessions(taskId);
+			} finally {
+				await this.releaseTaskMcpToolBundle(taskId);
+			}
 		}
 	}
 
