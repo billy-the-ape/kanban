@@ -541,7 +541,7 @@ describe("context overflow recovery through the task session service (B-3)", () 
 		).toEqual([{ role: "user", content: "original" }]);
 		const harness = createTaskSessionServiceHarness({
 			onTurn: (context) => {
-				if (context.turnCount === 2) {
+				if (context.turnCount === 2 || context.turnCount === 3) {
 					throw new Error(providerError);
 				}
 				return `reply ${context.turnCount}`;
@@ -550,15 +550,20 @@ describe("context overflow recovery through the task session service (B-3)", () 
 		services.push(harness);
 		const taskId = "task-b3-provider-ceiling";
 		await startFirstTurn(harness, taskId, {
-			initialMessages: oversizedSeedMessages(),
+			initialMessages: oversizedSeedMessages().map((message, index) =>
+				index === 0 ? { ...message, content: "s".repeat(1_000) } : message,
+			),
 			compaction: SMALL_COMPACTION,
 		});
 		await harness.service.sendTaskSessionInput(taskId, "Open PR");
 		await vi.waitFor(() => {
-			expect(harness.host.sentPrompts.length).toBe(3);
+			expect(harness.host.sentPrompts.length).toBe(4);
 		});
 		const lastConfig = harness.host.startedConfigs.at(-1);
-		expect(lastConfig?.compaction?.contextWindowTokens).toBeLessThanOrEqual(7500);
+		const firstRecoveryWindow = harness.host.startedConfigs[1]?.compaction?.contextWindowTokens ?? 0;
+		const secondRecoveryWindow = lastConfig?.compaction?.contextWindowTokens ?? 0;
+		expect(firstRecoveryWindow).toBeLessThanOrEqual(6750);
+		expect(secondRecoveryWindow).toBeLessThan(firstRecoveryWindow);
 		const lastSessionId = lastConfig?.sessionId ?? "";
 		const lastMessages = harness.store.messagesFor(lastSessionId);
 		expect(lastMessages.filter((message) => message.role === "user" && message.content === "Open PR")).toHaveLength(1);
