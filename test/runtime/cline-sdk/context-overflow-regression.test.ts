@@ -744,6 +744,51 @@ describe("context overflow recovery through the task session service (B-3)", () 
 		]);
 	});
 
+	it("drops a queued follow-up when the task is paused", async () => {
+		const activeGate = deferred();
+		const harness = createTaskSessionServiceHarness({
+			onTurn: async (context) => {
+				if (context.turnCount === 2) {
+					await activeGate.promise;
+				}
+				return `reply ${context.turnCount}`;
+			},
+		});
+		services.push(harness);
+		const taskId = "task-b3-pause-queue";
+		await startFirstTurn(harness, taskId, { compaction: SMALL_COMPACTION });
+		await harness.service.sendTaskSessionInput(taskId, "Active prompt");
+		await vi.waitFor(() => {
+			expect(harness.host.sentPrompts.length).toBe(2);
+		});
+		await harness.service.sendTaskSessionInput(taskId, "Queued prompt");
+		await harness.service.stopTaskSession(taskId);
+		activeGate.resolve();
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		expect(harness.host.sentPrompts.map(({ prompt }) => prompt)).toEqual([
+			"First turn prompt",
+			"Active prompt",
+		]);
+		expect(harness.service.getSummary(taskId)?.state).toBe("interrupted");
+	});
+
+	it("pausing aborts an orphaned running SDK session", async () => {
+		const harness = createTaskSessionServiceHarness();
+		services.push(harness);
+		const taskId = "task-b3-pause-orphan";
+		await startFirstTurn(harness, taskId, { compaction: SMALL_COMPACTION });
+		const config = harness.host.startedConfigs[0];
+		if (!config?.sessionId) {
+			throw new Error("Expected a started SDK session.");
+		}
+		const orphanId = `${config.sessionId}-orphan`;
+		await harness.host.start({ config: { ...config, sessionId: orphanId }, initialMessages: [] });
+		const abort = vi.spyOn(harness.host, "abort");
+		await harness.service.stopTaskSession(taskId);
+		expect(abort).toHaveBeenCalledWith(orphanId);
+		expect(harness.store.record(orphanId)?.status).not.toBe("running");
+	});
+
 	it("aborts an orphaned running SDK session before overflow recovery restarts", async () => {
 		const harness = createTaskSessionServiceHarness({
 			onTurn: (context) => {
