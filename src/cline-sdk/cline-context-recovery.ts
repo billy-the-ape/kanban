@@ -200,16 +200,30 @@ export function readReportedContextLimit(error: unknown): number | null {
 	return null;
 }
 
-/** Remove only the failed user turn that a restart is about to send again. */
+/** Remove failed copies of the turn a restart is about to send again.
+ *
+ * Some SDK providers persist an overflow as assistant text rather than throwing.
+ * That error and its failed user prompt must not be fed back into the next request.
+ */
 export function withoutFailedResend(
 	messages: readonly ClineSdkPersistedMessage[],
 	prompt: string,
 ): ClineSdkPersistedMessage[] {
-	const last = messages.at(-1);
-	if (last?.role === "user" && typeof last.content === "string" && last.content === prompt) {
-		return messages.slice(0, -1);
+	let end = messages.length;
+	while (end > 0) {
+		const last = messages[end - 1];
+		const failedReply =
+			last?.role === "assistant" &&
+			typeof last.content === "string" &&
+			isContextOverflowError(last.content);
+		const userIndex = end - (failedReply ? 2 : 1);
+		const user = messages[userIndex];
+		if (user?.role !== "user" || typeof user.content !== "string" || user.content !== prompt) {
+			break;
+		}
+		end = userIndex;
 	}
-	return [...messages];
+	return messages.slice(0, end);
 }
 
 // ---------------------------------------------------------------------------
