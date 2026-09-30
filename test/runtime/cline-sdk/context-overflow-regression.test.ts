@@ -531,8 +531,8 @@ describe("context overflow recovery through the task session service (B-3)", () 
 
 	it("uses the provider ceiling and resends a failed prompt only once", async () => {
 		const providerError =
-			"request (9000 tokens) exceeds the available context size (6000 tokens), try increasing it";
-		expect(readReportedContextLimit(new Error(providerError))).toBe(6000);
+			"request (9000 tokens) exceeds the available context size (7500 tokens), try increasing it";
+		expect(readReportedContextLimit(new Error(providerError))).toBe(7500);
 		expect(
 			withoutFailedResend(
 				[{ role: "user", content: "original" }, { role: "user", content: "Open PR" }],
@@ -558,7 +558,7 @@ describe("context overflow recovery through the task session service (B-3)", () 
 			expect(harness.host.sentPrompts.length).toBe(3);
 		});
 		const lastConfig = harness.host.startedConfigs.at(-1);
-		expect(lastConfig?.compaction?.contextWindowTokens).toBeLessThanOrEqual(6000);
+		expect(lastConfig?.compaction?.contextWindowTokens).toBeLessThanOrEqual(7500);
 		const lastSessionId = lastConfig?.sessionId ?? "";
 		const lastMessages = harness.store.messagesFor(lastSessionId);
 		expect(lastMessages.filter((message) => message.role === "user" && message.content === "Open PR")).toHaveLength(1);
