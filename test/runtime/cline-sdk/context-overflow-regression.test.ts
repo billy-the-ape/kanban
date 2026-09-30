@@ -707,6 +707,70 @@ describe("context overflow recovery through the task session service (B-3)", () 
 		expect(harness.service.getSummary(taskId)?.reviewReason).toBe("hook");
 	});
 
+	it("serializes follow-up turns for one task instead of starting two model loops", async () => {
+		const firstFollowUpGate = deferred();
+		let activeTurns = 0;
+		let maxActiveTurns = 0;
+		const harness = createTaskSessionServiceHarness({
+			onTurn: async (context) => {
+				activeTurns += 1;
+				maxActiveTurns = Math.max(maxActiveTurns, activeTurns);
+				if (context.turnCount === 2) {
+					await firstFollowUpGate.promise;
+				}
+				activeTurns -= 1;
+				return `reply ${context.turnCount}`;
+			},
+		});
+		services.push(harness);
+		const taskId = "task-b3-serialized-turns";
+		await startFirstTurn(harness, taskId, { compaction: SMALL_COMPACTION });
+		await harness.service.sendTaskSessionInput(taskId, "First follow-up");
+		await vi.waitFor(() => {
+			expect(harness.host.sentPrompts.length).toBe(2);
+		});
+		await harness.service.sendTaskSessionInput(taskId, "Second follow-up");
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		expect(harness.host.sentPrompts.length).toBe(2);
+		firstFollowUpGate.resolve();
+		await vi.waitFor(() => {
+			expect(harness.host.sentPrompts.length).toBe(3);
+		});
+		expect(maxActiveTurns).toBe(1);
+		expect(harness.host.sentPrompts.map(({ prompt }) => prompt)).toEqual([
+			"First turn prompt",
+			"First follow-up",
+			"Second follow-up",
+		]);
+	});
+
+	it("aborts an orphaned running SDK session before overflow recovery restarts", async () => {
+		const harness = createTaskSessionServiceHarness({
+			onTurn: (context) => {
+				if (context.turnCount === 2) {
+					throw new Error(LLAMA_CPP_OVERFLOW_ERROR);
+				}
+				return `reply ${context.turnCount}`;
+			},
+		});
+		services.push(harness);
+		const taskId = "task-b3-orphan-session";
+		await startFirstTurn(harness, taskId, { compaction: SMALL_COMPACTION });
+		const config = harness.host.startedConfigs[0];
+		if (!config?.sessionId) {
+			throw new Error("Expected a started SDK session.");
+		}
+		const orphanId = `${config.sessionId}-orphan`;
+		await harness.host.start({ config: { ...config, sessionId: orphanId }, initialMessages: [] });
+		const abort = vi.spyOn(harness.host, "abort");
+		await harness.service.sendTaskSessionInput(taskId, "Open PR");
+		await vi.waitFor(() => {
+			expect(harness.host.sentPrompts.length).toBe(3);
+		});
+		expect(abort).toHaveBeenCalledWith(orphanId);
+		expect(harness.store.record(orphanId)?.status).not.toBe("running");
+	});
+
 	it("recovers an overflow reported only as a non-throwing SDK event", async () => {
 		let host: TaskSessionServiceHarness["host"] | null = null;
 		const harness = createTaskSessionServiceHarness({
