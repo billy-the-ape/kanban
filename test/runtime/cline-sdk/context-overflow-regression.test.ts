@@ -431,6 +431,30 @@ describe("B-3.4/B-3.7 recovery budget verdicts (pure)", () => {
 			expect(verdict.reason).toBeNull();
 		});
 
+		it("removes persisted overflow replies together with failed resends", () => {
+			expect(
+				withoutFailedResend(
+					[
+						{ role: "user", content: "original" },
+						{ role: "user", content: "Open PR" },
+						{ role: "assistant", content: LLAMA_CPP_OVERFLOW_ERROR },
+						{ role: "user", content: "Open PR" },
+						{ role: "assistant", content: LLAMA_CPP_OVERFLOW_ERROR },
+					],
+					"Open PR",
+				),
+			).toEqual([{ role: "user", content: "original" }]);
+			expect(
+				withoutFailedResend(
+					[
+						{ role: "user", content: "Open PR" },
+						{ role: "assistant", content: "The PR is ready." },
+					],
+					"Open PR",
+				),
+			).toHaveLength(2);
+		});
+
 		it("fails with an actionable reason when the pinned material exceeds the budget", () => {
 			const verdict = evaluateClineContextRecoveryBudget({
 				contextWindowTokens: 8_192,
@@ -567,6 +591,50 @@ describe("context overflow recovery through the task session service (B-3)", () 
 		const lastSessionId = lastConfig?.sessionId ?? "";
 		const lastMessages = harness.store.messagesFor(lastSessionId);
 		expect(lastMessages.filter((message) => message.role === "user" && message.content === "Open PR")).toHaveLength(1);
+	});
+
+	it("recovers provider overflow returned as assistant text, then bounds another returned overflow", async () => {
+		const harness = createTaskSessionServiceHarness({
+			onTurn: (context) =>
+				context.turnCount === 2 || context.turnCount === 3
+					? LLAMA_CPP_OVERFLOW_ERROR
+					: `reply ${context.turnCount}`,
+		});
+		services.push(harness);
+		const taskId = "task-b3-returned-overflow";
+		await startFirstTurn(harness, taskId, {
+			initialMessages: oversizedSeedMessages(),
+			compaction: SMALL_COMPACTION,
+		});
+		await harness.service.sendTaskSessionInput(taskId, "Open PR");
+		await vi.waitFor(() => {
+			expect(harness.host.sentPrompts.length).toBe(4);
+			expect(harness.service.getSummary(taskId)?.warningMessage).toBeNull();
+		});
+		expect(harness.host.startedConfigs.length).toBe(3);
+		const restarted = harness.store.messagesFor(harness.host.startedConfigs.at(-1)?.sessionId ?? "");
+		expect(restarted.filter((message) => message.role === "user" && message.content === "Open PR")).toHaveLength(1);
+		expect(restarted.some((message) => message.role === "assistant" && message.content === LLAMA_CPP_OVERFLOW_ERROR)).toBe(false);
+		expect(harness.service.listMessages(taskId).some((message) => message.role === "assistant" && message.content === LLAMA_CPP_OVERFLOW_ERROR)).toBe(false);
+		expect(harness.service.getSummary(taskId)?.reviewReason).not.toBe("error");
+	});
+
+	it("stops thinking after bounded overflow replies instead of publishing them as chat", async () => {
+		const harness = createTaskSessionServiceHarness({
+			contextRecoveryMaxAttempts: 1,
+			onTurn: (context) => (context.turnCount === 1 ? "ready" : LLAMA_CPP_OVERFLOW_ERROR),
+		});
+		services.push(harness);
+		const taskId = "task-b3-returned-overflow-bounded";
+		await startFirstTurn(harness, taskId, { compaction: SMALL_COMPACTION });
+		await harness.service.sendTaskSessionInput(taskId, "Open PR");
+		await vi.waitFor(() => {
+			expect(harness.service.getSummary(taskId)?.reviewReason).toBe("error");
+		});
+		expect(harness.host.sentPrompts.length).toBe(3);
+		expect(harness.service.getSummary(taskId)?.state).toBe("awaiting_review");
+		expect(harness.service.getSummary(taskId)?.warningMessage).toContain("failed after 1 attempt");
+		expect(harness.service.listMessages(taskId).some((message) => message.role === "assistant" && message.content === LLAMA_CPP_OVERFLOW_ERROR)).toBe(false);
 	});
 
 	it("recovers an overflow reported only as a non-throwing SDK event", async () => {
