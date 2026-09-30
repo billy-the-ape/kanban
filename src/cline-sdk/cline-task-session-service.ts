@@ -193,6 +193,12 @@ function readAgentResultText(result: unknown): string | null {
 	return normalized.length > 0 ? normalized : null;
 }
 
+/** Some SDK hosts resolve a failed turn with the provider error as plain text. */
+function returnedContextOverflow(result: unknown): string | null {
+	const text = readAgentResultText(result);
+	return text && isContextOverflowError(text) ? text : null;
+}
+
 function formatStartWarnings(warnings: readonly string[] | undefined): string | null {
 	if (!warnings) {
 		return null;
@@ -544,6 +550,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					});
 				}
 				const messages = compacted.messages;
+				this.pendingContextOverflowByTaskId.delete(input.taskId);
 				await this.sessionRuntime.stopTaskSession(input.taskId).catch(() => null);
 				const restartedSession = await this.sessionRuntime.restartTaskSession({
 					taskId: input.taskId,
@@ -553,6 +560,14 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					initialMessages: messages,
 					contextWindowCapTokens: limit ?? undefined,
 				});
+				// A resumed SDK turn can fail by resolving to error text or by
+				// emitting a terminal event without rejecting the send promise.
+				const restartOverflow =
+					returnedContextOverflow(restartedSession.result) ??
+					this.pendingContextOverflowByTaskId.get(input.taskId);
+				if (restartOverflow) {
+					throw new Error(restartOverflow);
+				}
 				return {
 					result: restartedSession.result,
 					warnings: restartedSession.warnings,
@@ -927,6 +942,10 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 								images,
 								delivery: queueDelivery ? "queue" : undefined,
 							});
+							const returnedOverflow = returnedContextOverflow(result.result);
+							if (returnedOverflow) {
+								throw new Error(returnedOverflow);
+							}
 						} catch (error) {
 							const recovered = await this.retryAfterContextOverflow({
 								taskId,
