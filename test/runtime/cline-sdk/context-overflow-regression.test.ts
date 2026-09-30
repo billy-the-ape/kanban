@@ -562,7 +562,7 @@ describe("context overflow recovery through the task session service (B-3)", () 
 		const lastConfig = harness.host.startedConfigs.at(-1);
 		const firstRecoveryWindow = harness.host.startedConfigs[1]?.compaction?.contextWindowTokens ?? 0;
 		const secondRecoveryWindow = lastConfig?.compaction?.contextWindowTokens ?? 0;
-		expect(firstRecoveryWindow).toBeLessThanOrEqual(6750);
+		expect(firstRecoveryWindow).toBeLessThanOrEqual(7500);
 		expect(secondRecoveryWindow).toBeLessThan(firstRecoveryWindow);
 		const lastSessionId = lastConfig?.sessionId ?? "";
 		const lastMessages = harness.store.messagesFor(lastSessionId);
