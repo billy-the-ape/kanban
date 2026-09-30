@@ -163,6 +163,45 @@ describe("useReviewAutoActions", () => {
 		expect(runAutoReviewGitAction).toHaveBeenCalledTimes(1);
 	});
 
+	it("does not re-arm a sent prompt after a transient clean snapshot", async () => {
+		const runAutoReviewGitAction = vi.fn(async () => true);
+		const requestCompleteTask = vi.fn(async () => {});
+		await act(async () => {
+			root.render(
+				<HookHarness
+					board={createBoard(true)}
+					runAutoReviewGitAction={runAutoReviewGitAction}
+					requestCompleteTask={requestCompleteTask}
+				/>,
+			);
+		});
+		await act(async () => {
+			vi.advanceTimersByTime(1000);
+		});
+		expect(runAutoReviewGitAction).toHaveBeenCalledTimes(1);
+
+		await act(async () => {
+			setTaskWorkspaceSnapshot({ ...workspaceSnapshots["task-1"], changedFiles: 0 });
+			setTaskWorkspaceSnapshot(workspaceSnapshots["task-1"]);
+		});
+		await act(async () => {
+			root.render(null);
+		});
+		await act(async () => {
+			root.render(
+				<HookHarness
+					board={createBoard(true)}
+					runAutoReviewGitAction={runAutoReviewGitAction}
+					requestCompleteTask={requestCompleteTask}
+				/>,
+			);
+		});
+		await act(async () => {
+			vi.advanceTimersByTime(1000);
+		});
+		expect(runAutoReviewGitAction).toHaveBeenCalledTimes(1);
+	});
+
 	it("completes on a successful deterministic delivery even while the worktree still shows changes", async () => {
 		const runAutoReviewGitAction = vi.fn(async () => true);
 		const requestCompleteTask = vi.fn(async () => {});
