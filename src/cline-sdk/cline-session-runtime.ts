@@ -759,7 +759,11 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 	async stopTaskSession(taskId: string): Promise<void> {
 		const sessionId = this.sessionIdByTaskId.get(taskId);
 		if (!sessionId) {
-			await this.releaseTaskMcpToolBundle(taskId);
+			try {
+				await this.abortSupersededTaskSessions(taskId);
+			} finally {
+				await this.releaseTaskMcpToolBundle(taskId);
+			}
 			return;
 		}
 		const sessionHost = await this.ensureSessionHost();
@@ -773,14 +777,22 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			}
 			throw error;
 		} finally {
-			await this.releaseTaskMcpToolBundle(taskId);
+			try {
+				await this.abortSupersededTaskSessions(taskId);
+			} finally {
+				await this.releaseTaskMcpToolBundle(taskId);
+			}
 		}
 	}
 
 	async abortTaskSession(taskId: string): Promise<void> {
 		const sessionId = this.sessionIdByTaskId.get(taskId);
 		if (!sessionId) {
-			await this.releaseTaskMcpToolBundle(taskId);
+			try {
+				await this.abortSupersededTaskSessions(taskId);
+			} finally {
+				await this.releaseTaskMcpToolBundle(taskId);
+			}
 			return;
 		}
 		const sessionHost = await this.ensureSessionHost();
@@ -794,7 +806,11 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			}
 			throw error;
 		} finally {
-			await this.releaseTaskMcpToolBundle(taskId);
+			try {
+				await this.abortSupersededTaskSessions(taskId);
+			} finally {
+				await this.releaseTaskMcpToolBundle(taskId);
+			}
 		}
 	}
 
