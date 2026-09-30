@@ -476,7 +476,8 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		if (!isContextOverflowError(input.error)) {
 			return null;
 		}
-		if (!this.messageRepository.getTaskEntry(input.taskId)) {
+		const entry = this.messageRepository.getTaskEntry(input.taskId);
+		if (!entry) {
 			return null;
 		}
 		// B-3.6: a turn the user just canceled must not be revived by
@@ -564,6 +565,17 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 				const messages = compacted.messages;
 				this.pendingContextOverflowByTaskId.delete(input.taskId);
 				await this.sessionRuntime.stopTaskSession(input.taskId).catch(() => null);
+				// The previous overflow belongs to the failed session. Report the
+				// replacement turn as active before awaiting its model call; a
+				// later retry error or terminal event will update the summary.
+				this.emitSummary(
+					updateSummary(entry, {
+						state: "running",
+						reviewReason: null,
+						warningMessage: null,
+						lastOutputAt: now(),
+					}),
+				);
 				const restartedSession = await this.sessionRuntime.restartTaskSession({
 					taskId: input.taskId,
 					prompt: input.prompt,
@@ -981,14 +993,6 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 								error: eventError,
 							});
 							if (recovered) {
-								this.emitSummary(
-									updateSummary(entry, {
-										state: "running",
-										reviewReason: null,
-										warningMessage: null,
-										lastOutputAt: now(),
-									}),
-								);
 								return recovered;
 							}
 							throw new Error(
