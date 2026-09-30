@@ -1260,7 +1260,7 @@ describe("InMemoryClineTaskSessionService", () => {
 		const stopped = await service.stopTaskSession("task-1");
 
 		expect(runtime.readPersistedTaskSessionMock).toHaveBeenCalledWith("task-1");
-		expect(runtime.abortTaskSessionMock).toHaveBeenCalledWith("task-1");
+		expect(runtime.stopTaskSessionMock).toHaveBeenCalledWith("task-1");
 		expect(stopped?.state).toBe("interrupted");
 		expect(stopped?.reviewReason).toBe("interrupted");
 	});
@@ -1706,7 +1706,7 @@ describe("InMemoryClineTaskSessionService", () => {
 		await vi.waitFor(() => {
 			expect(runtime.startTaskSessionMock).toHaveBeenCalledTimes(2);
 		});
-		expect(runtime.stopTaskSessionMock).toHaveBeenCalledWith("task-1");
+		expect(runtime.abortTaskSessionMock).toHaveBeenCalledWith("task-1");
 		expect(runtime.sendTaskSessionInputMock).toHaveBeenCalledTimes(1);
 		const restartCall = runtime.startTaskSessionMock.mock.calls[1]?.[0];
 		expect(restartCall?.prompt).toBe("resolved:Try again");
