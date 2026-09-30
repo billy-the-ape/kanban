@@ -484,8 +484,12 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 				: reportedLimit;
 		const baseLimit = contextWindowCapTokens ?? configuredLimit ?? null;
 		const requestForAttempt = (attempt: number) => {
+			// Keep the saved policy for errors without a provider ceiling. When
+			// the provider supplies one, progressively lower it after a rejected retry.
 			const limit =
-				baseLimit !== null ? Math.max(256, Math.floor(baseLimit * (1 - attempt * 0.1))) : null;
+				reportedLimit !== null && baseLimit !== null
+					? Math.max(256, Math.floor(baseLimit * (1 - (attempt - 1) * 0.05)))
+					: null;
 			return {
 				limit,
 				request: {
