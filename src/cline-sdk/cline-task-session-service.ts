@@ -26,6 +26,8 @@ import {
 	evaluateClineRecoveryRequirements,
 	findClineUnresolvedToolCalls,
 	isContextOverflowError,
+	readReportedContextLimit,
+	withoutFailedResend,
 } from "./cline-context-recovery";
 import { applyClineSessionEvent } from "./cline-event-adapter";
 import {
@@ -474,12 +476,25 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			return null;
 		}
 
+		const reportedLimit = readReportedContextLimit(input.error);
+		const configuredLimit = startRequest.compaction?.contextWindowTokens;
+		const contextWindowCapTokens =
+			reportedLimit !== null && typeof configuredLimit === "number"
+				? Math.min(reportedLimit, configuredLimit)
+				: reportedLimit;
+		const recoveryRequest = {
+			...startRequest,
+			...(contextWindowCapTokens !== null && startRequest.compaction
+				? { compaction: { ...startRequest.compaction, contextWindowTokens: contextWindowCapTokens } }
+				: {}),
+		};
+
 		// B-3.7: the restart prompt is pinned material — if system prompt +
 		// prompt + images alone exceed the effective input budget, no amount
 		// of history compaction can make this turn fit.
 		const budget = evaluateClineContextRecoveryBudget({
-			contextWindowTokens: startRequest.compaction?.contextWindowTokens,
-			reserveTokens: startRequest.compaction?.reserveTokens,
+			contextWindowTokens: recoveryRequest.compaction?.contextWindowTokens,
+			reserveTokens: recoveryRequest.compaction?.reserveTokens,
 			safetyMarginTokens: startRequest.compactionSafetyMarginTokens,
 			systemPrompt: startRequest.systemPrompt,
 			prompt: input.prompt,
@@ -502,12 +517,13 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 				if (unresolvedToolCalls.length > 0) {
 					throw new Error(describeClineUnresolvedToolCalls(unresolvedToolCalls));
 				}
-				const compacted = this.compactTranscriptForRecovery(startRequest, persistedMessages);
+				const history = withoutFailedResend(persistedMessages, input.prompt);
+				const compacted = this.compactTranscriptForRecovery(recoveryRequest, history);
 				// B-10.4: overflow recovery compaction is the "overflow"
 				// trigger class (budget compactions report "proactive").
 				if (compacted.changed) {
 					this.recordCompactionEvent(input.taskId, "overflow", {
-						messagesBefore: persistedMessages.length,
+						messagesBefore: history.length,
 						messagesAfter: compacted.messages.length,
 						tokensBefore: compacted.tokensBefore,
 						tokensAfter: compacted.tokensAfter,
@@ -521,6 +537,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					mode: input.mode,
 					images: input.images,
 					initialMessages: messages,
+					contextWindowCapTokens: contextWindowCapTokens ?? undefined,
 				});
 				return {
 					result: restartedSession.result,
@@ -929,6 +946,9 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 								);
 								return recovered;
 							}
+							throw new Error(
+								"Context overflow recovery could not restart this task. Check its context settings and worktree before retrying.",
+							);
 						}
 						return result;
 					} finally {
