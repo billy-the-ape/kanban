@@ -407,15 +407,25 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		warnings?: string[];
 	}> {
 		if (this.sessionRuntime.getTaskSessionId(input.taskId)) {
-			return {
-				result: await this.sessionRuntime.sendTaskSessionInput(
-					input.taskId,
-					input.prompt,
-					input.mode,
-					input.images,
-					input.delivery,
-				),
-			};
+			try {
+				return {
+					result: await this.sessionRuntime.sendTaskSessionInput(
+						input.taskId,
+						input.prompt,
+						input.mode,
+						input.images,
+						input.delivery,
+					),
+				};
+			} catch (error) {
+				// A failed SDK turn can leave a binding to a session the host no
+				// longer owns. This rejection occurs before prompt delivery, so
+				// restarting from the durable transcript is safe.
+				if (!/^session not found(?::|$)/i.test(toErrorMessage(error))) {
+					throw error;
+				}
+				await this.sessionRuntime.stopTaskSession(input.taskId).catch(() => null);
+			}
 		}
 
 		if (isHomeAgentSessionId(input.taskId) && !this.sessionRuntime.canRestartTaskSession(input.taskId)) {
@@ -428,7 +438,9 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			prompt: input.prompt,
 			mode: input.mode,
 			images: input.images,
-			initialMessages: persistedSnapshot?.messages,
+			initialMessages: persistedSnapshot
+				? withoutFailedResend(persistedSnapshot.messages, input.prompt)
+				: undefined,
 		});
 		return {
 			result: restartedSession.result,
