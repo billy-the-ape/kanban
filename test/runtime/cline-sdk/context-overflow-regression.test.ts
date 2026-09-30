@@ -661,6 +661,52 @@ describe("context overflow recovery through the task session service (B-3)", () 
 		expect(harness.service.listMessages(taskId).some((message) => message.role === "assistant" && message.content === LLAMA_CPP_OVERFLOW_ERROR)).toBe(false);
 	});
 
+	it("clears an overflow warning while the replacement turn is active", async () => {
+		const replacementGate = deferred();
+		let host: TaskSessionServiceHarness["host"] | null = null;
+		const harness = createTaskSessionServiceHarness({
+			onTurn: async (context) => {
+				if (context.turnCount === 2) {
+					host?.emitEvent({
+						type: "agent_event",
+						payload: {
+							sessionId: context.sessionId,
+							event: { type: "error", error: new Error(LLAMA_CPP_OVERFLOW_ERROR), recoverable: false },
+						},
+					});
+					throw new Error(LLAMA_CPP_OVERFLOW_ERROR);
+				}
+				if (context.turnCount === 3) {
+					await replacementGate.promise;
+					host?.emitEvent({
+						type: "agent_event",
+						payload: {
+							sessionId: context.sessionId,
+							event: { type: "done", text: "PR ready", reason: "completed" },
+						},
+					});
+				}
+				return "PR ready";
+			},
+		});
+		services.push(harness);
+		host = harness.host;
+		const taskId = "task-b3-warning-after-recovery";
+		await startFirstTurn(harness, taskId, { compaction: SMALL_COMPACTION });
+		await harness.service.sendTaskSessionInput(taskId, "Open PR");
+		await vi.waitFor(() => {
+			expect(harness.host.sentPrompts.length).toBe(3);
+			expect(harness.service.getSummary(taskId)?.state).toBe("running");
+			expect(harness.service.getSummary(taskId)?.warningMessage).toBeNull();
+		});
+		replacementGate.resolve();
+		await vi.waitFor(() => {
+			expect(harness.service.getSummary(taskId)?.state).toBe("awaiting_review");
+		});
+		expect(harness.service.getSummary(taskId)?.warningMessage).toBeNull();
+		expect(harness.service.getSummary(taskId)?.reviewReason).toBe("hook");
+	});
+
 	it("recovers an overflow reported only as a non-throwing SDK event", async () => {
 		let host: TaskSessionServiceHarness["host"] | null = null;
 		const harness = createTaskSessionServiceHarness({
