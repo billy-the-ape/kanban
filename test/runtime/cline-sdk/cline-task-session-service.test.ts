@@ -1260,7 +1260,7 @@ describe("InMemoryClineTaskSessionService", () => {
 		const stopped = await service.stopTaskSession("task-1");
 
 		expect(runtime.readPersistedTaskSessionMock).toHaveBeenCalledWith("task-1");
-		expect(runtime.stopTaskSessionMock).toHaveBeenCalledWith("task-1");
+		expect(runtime.abortTaskSessionMock).toHaveBeenCalledWith("task-1");
 		expect(stopped?.state).toBe("interrupted");
 		expect(stopped?.reviewReason).toBe("interrupted");
 	});
