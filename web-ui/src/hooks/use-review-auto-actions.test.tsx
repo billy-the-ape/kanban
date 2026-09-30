@@ -164,6 +164,10 @@ describe("useReviewAutoActions", () => {
 	});
 
 	it("does not re-arm a sent prompt after a transient clean snapshot", async () => {
+		const snapshot = workspaceSnapshots["task-1"];
+		if (!snapshot) {
+			throw new Error("Missing task workspace snapshot");
+		}
 		const runAutoReviewGitAction = vi.fn(async () => true);
 		const requestCompleteTask = vi.fn(async () => {});
 		await act(async () => {
@@ -181,8 +185,8 @@ describe("useReviewAutoActions", () => {
 		expect(runAutoReviewGitAction).toHaveBeenCalledTimes(1);
 
 		await act(async () => {
-			setTaskWorkspaceSnapshot({ ...workspaceSnapshots["task-1"], changedFiles: 0 });
-			setTaskWorkspaceSnapshot(workspaceSnapshots["task-1"]);
+			setTaskWorkspaceSnapshot({ ...snapshot, changedFiles: 0 });
+			setTaskWorkspaceSnapshot(snapshot);
 		});
 		await act(async () => {
 			root.render(null);
