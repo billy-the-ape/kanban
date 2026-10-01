@@ -282,9 +282,20 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			// session record after a process restart, the workspace services
 			// (rules, tool approval) must come from the live per-workspace
 			// runtime setup — the same lease path startTaskSession uses.
-			resolveWorkspaceRuntime: async ({ cwd }) => {
+			resolveWorkspaceRuntime: async ({ taskId, cwd, rebuildSystemPromptForProvider }) => {
 				const runtimeSetup = await this.ensureRuntimeSetup(cwd);
+				let systemPrompt: string | undefined;
+				if (rebuildSystemPromptForProvider) {
+					systemPrompt = await resolveClineSdkSystemPrompt({
+						cwd,
+						providerId: rebuildSystemPromptForProvider,
+						rules: runtimeSetup.loadRules(),
+					});
+					const appended = resolveHomeAgentAppendSystemPrompt(taskId);
+					if (appended) systemPrompt = `${systemPrompt}\n\n${appended}`;
+				}
 				return {
+					systemPrompt,
 					userInstructionService: runtimeSetup.userInstructionService,
 					requestToolApproval: runtimeSetup.requestToolApproval,
 				};
@@ -394,7 +405,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			const systemMessage = createMessage(
 				taskId,
 				"system",
-				`Cline SDK ${context} failed: ${errorMessage}. You can send another message to continue the conversation.`,
+				`Cline SDK ${context} failed: ${errorMessage}. Check the error above before retrying.`,
 			);
 			entry.messages.push(systemMessage);
 			this.emitMessage(taskId, systemMessage);
@@ -461,9 +472,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			prompt: input.prompt,
 			mode: input.mode,
 			images: input.images,
-			initialMessages: persistedSnapshot
-				? withoutFailedResend(persistedSnapshot.messages, input.prompt)
-				: undefined,
+			initialMessages: persistedSnapshot ? withoutFailedResend(persistedSnapshot.messages, input.prompt) : undefined,
 		});
 		return {
 			result: restartedSession.result,
@@ -984,101 +993,102 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			const turnGeneration = this.turnGenerationByTaskId.get(taskId) ?? 0;
 			let assistantCountBeforeSend = 0;
 			void this.enqueueTaskTurn(taskId, () =>
-				this.ensureRuntimeSetup(entry.summary.workspacePath ?? "").then(async (runtimeSetup) => {
-					if ((this.turnGenerationByTaskId.get(taskId) ?? 0) !== turnGeneration) {
-						return { result: null };
-					}
-					this.pendingTurnCancelTaskIds.delete(taskId);
-					this.pendingContextOverflowByTaskId.delete(taskId);
-					this.emitSummary(
-						updateSummary(entry, {
-							state: "running",
-							reviewReason: null,
-							warningMessage: null,
-							lastOutputAt: now(),
-						}),
-					);
-					assistantCountBeforeSend = entry.messages.filter((message) => message.role === "assistant").length;
-					const resolvedPrompt = runtimeSetup.resolvePrompt(normalized);
-					try {
-						let result: { result: unknown; warnings?: string[] };
-						try {
-							result = await this.dispatchResolvedTaskInput({
-								taskId,
-								prompt: resolvedPrompt,
-								mode: effectiveMode,
-								images,
-								delivery: queueDelivery ? "queue" : undefined,
-							});
-							const returnedOverflow = returnedContextOverflow(result.result);
-							if (returnedOverflow) {
-								throw new Error(returnedOverflow);
-							}
-						} catch (error) {
-							const recovered = await this.retryAfterContextOverflow({
-								taskId,
-								prompt: resolvedPrompt,
-								mode: effectiveMode,
-								images,
-								error,
-							});
-							if (recovered) {
-								return recovered;
-							}
-							throw error;
+				this.ensureRuntimeSetup(entry.summary.workspacePath ?? "")
+					.then(async (runtimeSetup) => {
+						if ((this.turnGenerationByTaskId.get(taskId) ?? 0) !== turnGeneration) {
+							return { result: null };
 						}
-						const eventError = this.pendingContextOverflowByTaskId.get(taskId);
-						if (eventError) {
-							const recovered = await this.retryAfterContextOverflow({
-								taskId,
-								prompt: resolvedPrompt,
-								mode: effectiveMode,
-								images,
-								error: eventError,
-							});
-							if (recovered) {
-								return recovered;
-							}
-							throw new Error(
-								"Context overflow recovery could not restart this task. Check its context settings and worktree before retrying.",
-							);
-						}
-						return result;
-					} finally {
+						this.pendingTurnCancelTaskIds.delete(taskId);
 						this.pendingContextOverflowByTaskId.delete(taskId);
-					}
-				})
-				.then(({ result, warnings }) => {
-					if ((this.turnGenerationByTaskId.get(taskId) ?? 0) !== turnGeneration) {
-						return;
-					}
-					const warningMessage = formatStartWarnings(warnings);
-					if (warningMessage) {
 						this.emitSummary(
 							updateSummary(entry, {
-								warningMessage,
+								state: "running",
+								reviewReason: null,
+								warningMessage: null,
+								lastOutputAt: now(),
 							}),
 						);
-					}
-					const agentText = readAgentResultText(result);
-					if (agentText) {
-						const assistantCountAfterSend = entry.messages.filter(
-							(message) => message.role === "assistant",
-						).length;
-						if (assistantCountAfterSend > assistantCountBeforeSend) {
+						assistantCountBeforeSend = entry.messages.filter((message) => message.role === "assistant").length;
+						const resolvedPrompt = runtimeSetup.resolvePrompt(normalized);
+						try {
+							let result: { result: unknown; warnings?: string[] };
+							try {
+								result = await this.dispatchResolvedTaskInput({
+									taskId,
+									prompt: resolvedPrompt,
+									mode: effectiveMode,
+									images,
+									delivery: queueDelivery ? "queue" : undefined,
+								});
+								const returnedOverflow = returnedContextOverflow(result.result);
+								if (returnedOverflow) {
+									throw new Error(returnedOverflow);
+								}
+							} catch (error) {
+								const recovered = await this.retryAfterContextOverflow({
+									taskId,
+									prompt: resolvedPrompt,
+									mode: effectiveMode,
+									images,
+									error,
+								});
+								if (recovered) {
+									return recovered;
+								}
+								throw error;
+							}
+							const eventError = this.pendingContextOverflowByTaskId.get(taskId);
+							if (eventError) {
+								const recovered = await this.retryAfterContextOverflow({
+									taskId,
+									prompt: resolvedPrompt,
+									mode: effectiveMode,
+									images,
+									error: eventError,
+								});
+								if (recovered) {
+									return recovered;
+								}
+								throw new Error(
+									"Context overflow recovery could not restart this task. Check its context settings and worktree before retrying.",
+								);
+							}
+							return result;
+						} finally {
+							this.pendingContextOverflowByTaskId.delete(taskId);
+						}
+					})
+					.then(({ result, warnings }) => {
+						if ((this.turnGenerationByTaskId.get(taskId) ?? 0) !== turnGeneration) {
 							return;
 						}
-						const agentMessage =
-							setOrCreateAssistantMessage(entry, taskId, agentText) ??
-							createAssistantMessage(entry, taskId, agentText);
-						this.emitMessage(taskId, agentMessage);
-					}
-				})
-				.catch((error: unknown) => {
-					if ((this.turnGenerationByTaskId.get(taskId) ?? 0) === turnGeneration) {
-						this.emitTaskFailure(taskId, entry, "send", error);
-					}
-				}),
+						const warningMessage = formatStartWarnings(warnings);
+						if (warningMessage) {
+							this.emitSummary(
+								updateSummary(entry, {
+									warningMessage,
+								}),
+							);
+						}
+						const agentText = readAgentResultText(result);
+						if (agentText) {
+							const assistantCountAfterSend = entry.messages.filter(
+								(message) => message.role === "assistant",
+							).length;
+							if (assistantCountAfterSend > assistantCountBeforeSend) {
+								return;
+							}
+							const agentMessage =
+								setOrCreateAssistantMessage(entry, taskId, agentText) ??
+								createAssistantMessage(entry, taskId, agentText);
+							this.emitMessage(taskId, agentMessage);
+						}
+					})
+					.catch((error: unknown) => {
+						if ((this.turnGenerationByTaskId.get(taskId) ?? 0) === turnGeneration) {
+							this.emitTaskFailure(taskId, entry, "send", error);
+						}
+					}),
 			);
 		}
 		const summary = updateSummary(entry, {

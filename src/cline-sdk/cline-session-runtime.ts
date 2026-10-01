@@ -1,6 +1,8 @@
 // Owns the live SDK session host plus taskId to sessionId bindings.
 // This is the runtime-facing layer for starting, looking up, resuming, and
 // stopping native Cline sessions without exposing SDK details upstream.
+import { stat } from "node:fs/promises";
+
 import type { RuntimeClineReasoningEffort, RuntimeTaskImage, RuntimeTaskSessionMode } from "../core/api-contract";
 import { createClineCompactionBeforeModelHook } from "./cline-compaction-before-model-hook";
 import { type ClineCompactionObservedInfo, createClineCompactionCompactCallback } from "./cline-compaction-callback";
@@ -24,6 +26,7 @@ import {
 	buildPersistedTaskLaunchConfig,
 	mergeTaskLaunchConfigIntoMetadata,
 	readPersistedTaskLaunchConfig,
+	TASK_LAUNCH_CONFIG_METADATA_KEY,
 } from "./cline-task-launch-config";
 import { createClineToolResultBoundingHook } from "./cline-tool-result-bounding-hook";
 import { CLINE_MODEL_CATALOG_DEFAULTS, SDK_DEFAULT_MODEL_ID, SDK_DEFAULT_PROVIDER_ID } from "./sdk-provider-boundary";
@@ -204,9 +207,12 @@ export type ClineLaunchConfigResolver = (overrides: {
 export type ClineWorkspaceRuntimeResolver = (input: {
 	taskId: string;
 	cwd: string;
+	/** Only legacy recovery needs to regenerate the missing prompt. */
+	rebuildSystemPromptForProvider?: string;
 }) => Promise<ClineRestoredWorkspaceRuntime | null> | ClineRestoredWorkspaceRuntime | null;
 
 export interface ClineRestoredWorkspaceRuntime {
+	systemPrompt?: string;
 	userInstructionService?: ClineSdkUserInstructionService;
 	requestToolApproval?: (request: ClineSdkToolApprovalRequest) => Promise<ClineSdkToolApprovalResult>;
 }
@@ -616,9 +622,10 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 	 * `resolveRestartedLaunchPolicy` (B-2.8) — secrets are never read back
 	 * from the record. Workspace services (user instructions, tool approval)
 	 * come from `resolveWorkspaceRuntime`, which the task session service
-	 * wires to the per-workspace runtime setup. Returns null when the record
-	 * has no usable launch config (pre-B-4 records) so the caller can
-	 * surface the baseline error.
+	 * wires to the per-workspace runtime setup. Legacy records without launch
+	 * metadata rebuild workspace instructions
+	 * using live services, but only with a usable original worktree, transcript,
+	 * and pinned provider/model. Invalid metadata is never silently replaced.
 	 */
 	private async restoreStartRequestFromPersistence(
 		taskId: string,
@@ -628,15 +635,56 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		if (!record) {
 			return null;
 		}
-		const launchConfig = readPersistedTaskLaunchConfig(record);
-		if (!launchConfig) {
-			return null;
-		}
+
+		let launchConfig = readPersistedTaskLaunchConfig(record);
 		const cwd = typeof record.cwd === "string" ? record.cwd.trim() : "";
 		if (!cwd) {
-			return null;
+			throw new Error("Cline session recovery unavailable: the saved worktree path is missing.");
 		}
-		const workspaceRuntime = (await this.resolveWorkspaceRuntime?.({ taskId, cwd })) ?? null;
+		let workspaceRuntime: ClineRestoredWorkspaceRuntime | null;
+		if (!launchConfig) {
+			// Recover only the old missing-metadata defect, never malformed or
+			// future configuration whose meaning this version does not know.
+			if (record.metadata && TASK_LAUNCH_CONFIG_METADATA_KEY in record.metadata) {
+				throw new Error(
+					"Cline session recovery unavailable: the saved launch configuration is invalid or unsupported.",
+				);
+			}
+			const provider = typeof record.provider === "string" ? record.provider.trim() : "";
+			const model = typeof record.model === "string" ? record.model.trim() : "";
+			if (!provider || !model || !this.resolveClineLaunchConfig || !this.resolveWorkspaceRuntime) {
+				throw new Error(
+					"Cline session recovery unavailable: the saved provider/model or live recovery services are missing.",
+				);
+			}
+			const worktree = await stat(cwd).catch(() => null);
+			if (!worktree?.isDirectory()) {
+				throw new Error(
+					"Cline session recovery unavailable: restore the original worktree directory before retrying.",
+				);
+			}
+			const messages = await sessionHost.readMessages(record.sessionId);
+			if (messages.length === 0) {
+				throw new Error(
+					"Cline session recovery unavailable: the saved conversation transcript is empty or missing.",
+				);
+			}
+			workspaceRuntime = await this.resolveWorkspaceRuntime({
+				taskId,
+				cwd,
+				rebuildSystemPromptForProvider: provider,
+			});
+			if (!workspaceRuntime?.systemPrompt?.trim()) {
+				throw new Error("Cline session recovery unavailable: workspace instructions could not be rebuilt.");
+			}
+			launchConfig = buildPersistedTaskLaunchConfig({
+				systemPrompt: workspaceRuntime.systemPrompt,
+				taskTitle: typeof record.metadata?.title === "string" ? record.metadata.title : undefined,
+			});
+		} else {
+			workspaceRuntime = (await this.resolveWorkspaceRuntime?.({ taskId, cwd })) ?? null;
+		}
+
 		return {
 			taskId,
 			cwd,

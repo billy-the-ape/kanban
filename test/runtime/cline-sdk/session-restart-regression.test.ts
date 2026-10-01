@@ -23,7 +23,10 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { buildSessionIdPrefix } from "../../../src/cline-sdk/cline-session-state";
-import { readPersistedTaskLaunchConfig } from "../../../src/cline-sdk/cline-task-launch-config";
+import {
+	readPersistedTaskLaunchConfig,
+	TASK_LAUNCH_CONFIG_METADATA_KEY,
+} from "../../../src/cline-sdk/cline-task-launch-config";
 import {
 	createTaskSessionServiceHarness,
 	type TaskSessionServiceHarness,
@@ -58,9 +61,11 @@ beforeEach(() => {
 const RESTART_TASK_ID = "task-restart-1";
 
 const services: TaskSessionServiceHarness[] = [];
+const legacyWorktrees: string[] = [];
 
 afterEach(async () => {
 	await Promise.allSettled(services.splice(0).map((harness) => harness.service.dispose()));
+	for (const cwd of legacyWorktrees.splice(0)) rmSync(cwd, { recursive: true, force: true });
 });
 
 /**
@@ -71,11 +76,12 @@ afterEach(async () => {
  */
 async function restartService(
 	firstHarness: TaskSessionServiceHarness,
+	cwd = "/tmp/worktree",
 ): Promise<{ before: TaskSessionServiceHarness; after: TaskSessionServiceHarness }> {
 	const { service, host } = firstHarness;
 	await service.startTaskSession({
 		taskId: RESTART_TASK_ID,
-		cwd: "/tmp/worktree",
+		cwd,
 		prompt: "First turn before restart",
 		systemPrompt: "test system prompt",
 		taskTitle: "B-1.7 restart repro",
@@ -91,6 +97,94 @@ async function restartService(
 	services.push(after);
 	return { before: firstHarness, after };
 }
+describe("legacy sessions without saved launch configuration", () => {
+	async function legacySession() {
+		const cwd = mkdtempSync(join(tmpdir(), "kanban-legacy-worktree-"));
+		legacyWorktrees.push(cwd);
+		const first = createTaskSessionServiceHarness();
+		services.push(first);
+		await restartService(first, cwd);
+		const record = [...first.store.records.values()][0];
+		if (!record) throw new Error("Missing fixture record");
+		delete record.metadata?.[TASK_LAUNCH_CONFIG_METADATA_KEY];
+		const resolver = vi.fn(async (overrides: { providerIdOverride?: string; modelIdOverride?: string }) => ({
+			providerId: overrides.providerIdOverride ?? "unused",
+			modelId: overrides.modelIdOverride ?? "unused",
+			apiKey: "fresh-key-canary",
+			baseUrl: "http://localhost:1234/v1",
+			contextWindowTokens: 200_000,
+			maxTokens: 4_096,
+			contextWindowSource: "fallback" as const,
+		}));
+		const after = createTaskSessionServiceHarness({ store: first.store, resolveClineLaunchConfig: resolver });
+		services.push(after);
+		return { after, record, cwd, resolver };
+	}
+
+	it("delivers a follow-up with saved history and persists recovery config for the next restart", async () => {
+		const { after, record, cwd, resolver } = await legacySession();
+		const oldId = record.sessionId;
+		await after.service.rebindPersistedTaskSession(RESTART_TASK_ID);
+		await after.service.sendTaskSessionInput(RESTART_TASK_ID, "Address review comments");
+		await vi.waitFor(() => expect(after.host.sentPrompts).toHaveLength(1));
+		expect(after.host.sentPrompts[0]?.prompt).toBe("Address review comments");
+		expect(resolver).toHaveBeenCalledWith({ providerIdOverride: record.provider, modelIdOverride: record.model });
+		expect(after.host.startedConfigs[0]).toMatchObject({
+			cwd,
+			providerId: record.provider,
+			modelId: record.model,
+			apiKey: "fresh-key-canary",
+		});
+		expect(after.host.startedConfigs[0]?.systemPrompt).toContain("test rules");
+		const newId = after.host.sentPrompts[0]?.sessionId ?? "";
+		expect(newId).not.toBe(oldId);
+		expect(
+			after.store
+				.messagesFor(newId)
+				.filter((message) => message.role === "user")
+				.map((message) => message.content),
+		).toEqual(["First turn before restart", "Address review comments"]);
+		expect(after.store.record(oldId)).toEqual(record);
+		expect(readPersistedTaskLaunchConfig(after.store.record(newId))?.systemPrompt).toContain("test rules");
+		expect(JSON.stringify(after.store.record(newId))).not.toContain("fresh-key-canary");
+		await after.service.stopTaskSession(RESTART_TASK_ID);
+		await after.service.dispose();
+		const next = createTaskSessionServiceHarness({ store: after.store, resolveClineLaunchConfig: resolver });
+		services.push(next);
+		await next.service.rebindPersistedTaskSession(RESTART_TASK_ID);
+		await next.service.sendTaskSessionInput(RESTART_TASK_ID, "One more follow-up");
+		await vi.waitFor(() => expect(next.host.sentPrompts).toHaveLength(1));
+		expect(next.host.sentPrompts[0]?.prompt).toBe("One more follow-up");
+	});
+
+	it.each(["worktree", "provider", "model", "transcript", "configuration"])(
+		"refuses recovery with missing or invalid %s and gives honest retry guidance",
+		async (missing) => {
+			const { after, record, cwd } = await legacySession();
+			if (missing === "worktree") rmSync(cwd, { recursive: true, force: true });
+			if (missing === "provider") record.provider = "";
+			if (missing === "model") record.model = "";
+			if (missing === "configuration") record.metadata = { [TASK_LAUNCH_CONFIG_METADATA_KEY]: { version: 999 } };
+			if (missing === "transcript") after.store.messages.set(record.sessionId, []);
+			await after.service.rebindPersistedTaskSession(RESTART_TASK_ID);
+			await after.service.sendTaskSessionInput(RESTART_TASK_ID, "Address review comments");
+			await vi.waitFor(() => expect(after.service.getSummary(RESTART_TASK_ID)?.reviewReason).toBe("error"));
+			expect(after.host.startedConfigs).toHaveLength(0);
+			expect(after.host.sentPrompts).toHaveLength(0);
+			expect(after.service.getSummary(RESTART_TASK_ID)?.warningMessage).toContain(
+				"Cline session recovery unavailable:",
+			);
+			const messages = after.service
+				.listMessages(RESTART_TASK_ID)
+				.map((message) => message.content)
+				.join("\n");
+			expect(messages).not.toContain("You can send another message to continue");
+			expect(messages).toContain("Check the error above before retrying");
+			expect(after.store.records.size).toBe(1);
+		},
+	);
+});
+
 describe("service restart with a persisted session (B-1.7)", () => {
 	it("recovers after restart when the SDK persists the record only on first send", async () => {
 		const store = createFakeClineSessionStore({ deferPersistenceUntilSend: true });
