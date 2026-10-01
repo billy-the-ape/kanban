@@ -5,6 +5,7 @@ import { AlertTriangle } from "lucide-react";
 import { cn } from "@/components/ui/cn";
 import { Tooltip } from "@/components/ui/tooltip";
 import type { RuntimeTaskPhase, RuntimeTaskPhaseSummary } from "@/runtime/types";
+import type { BoardColumnId } from "@/types";
 
 const PHASE_LABELS: Record<RuntimeTaskPhase, string> = {
 	idle: "idle",
@@ -17,6 +18,19 @@ const PHASE_LABELS: Record<RuntimeTaskPhase, string> = {
 	verifying_remote: "verif",
 	done: "done",
 	needs_attention: "atten",
+};
+
+const PHASE_DESCRIPTIONS: Record<RuntimeTaskPhase, string> = {
+	idle: "No active phase",
+	implementing: "Agent is implementing",
+	reviewing: "Review is ready",
+	checking: "Checking delivery",
+	committing: "Committing changes",
+	integrating: "Integrating changes",
+	pushing: "Pushing changes",
+	verifying_remote: "Verifying remote delivery",
+	done: "Delivery complete",
+	needs_attention: "Needs attention",
 };
 
 const PHASE_CLASSES: Record<RuntimeTaskPhase, string> = {
@@ -34,12 +48,22 @@ const PHASE_CLASSES: Record<RuntimeTaskPhase, string> = {
 
 export function TaskPhaseBadge({
 	summary,
+	columnId,
 	className,
 }: {
 	summary: RuntimeTaskPhaseSummary | null | undefined;
+	columnId?: BoardColumnId;
 	className?: string;
 }): React.ReactElement | null {
 	if (!summary || summary.phase === "idle") {
+		return null;
+	}
+	// A stale session or durable record can outlive the card's active phase.
+	// Only show transient progress where that work can actually be happening.
+	if (columnId && summary.phase === "implementing" && columnId !== "in_progress") {
+		return null;
+	}
+	if (columnId === "done" && summary.phase !== "done" && summary.phase !== "needs_attention") {
 		return null;
 	}
 	const needsAttention = summary.needsAttention || summary.phase === "needs_attention";
@@ -59,8 +83,11 @@ export function TaskPhaseBadge({
 			<span className="truncate">{PHASE_LABELS[summary.phase]}</span>
 		</span>
 	);
-	if (!needsAttention || !summary.blockedReason) {
-		return badge;
-	}
-	return <Tooltip content={summary.blockedReason}>{badge}</Tooltip>;
+	return (
+		<Tooltip
+			content={needsAttention && summary.blockedReason ? summary.blockedReason : PHASE_DESCRIPTIONS[summary.phase]}
+		>
+			{badge}
+		</Tooltip>
+	);
 }

@@ -44,6 +44,8 @@ const DELIVERY_STAGE_ACTIVE_PHASE: Record<RuntimeGitDeliveryStage, RuntimeTaskPh
 export interface TaskPhaseInput {
 	/** A Cline session is live (running or awaiting review) for the task right now. */
 	sessionActive: boolean;
+	/** The agent is currently executing a turn, rather than waiting for input in Review. */
+	sessionRunning: boolean;
 	deliveryStatus: RuntimeGitDeliveryStatus | null;
 	deliveryStage: RuntimeGitDeliveryStage | null;
 	/** Receipt evidence trail (most recent last); used for failure detail. */
@@ -181,7 +183,7 @@ function resolveActions(input: TaskPhaseInput): RuntimeTaskDiagnosticsActions {
  * availability. Deterministic and pure.
  */
 export function computeTaskPhase(input: TaskPhaseInput): TaskPhaseResult {
-	const { sessionActive, deliveryStatus, deliveryStage, reviewStatus, dispatchStatus, worktreeExists } = input;
+	const { sessionRunning, deliveryStatus, deliveryStage, reviewStatus, dispatchStatus } = input;
 
 	const blockedReason = resolveBlockedReason(input);
 	const needsAttention = blockedReason !== null;
@@ -195,18 +197,13 @@ export function computeTaskPhase(input: TaskPhaseInput): TaskPhaseResult {
 		phase = "needs_attention";
 	} else if (deliveryStatus === "in_progress" && deliveryStage) {
 		phase = DELIVERY_STAGE_ACTIVE_PHASE[deliveryStage];
-	} else if (sessionActive || dispatchStatus === "dispatching" || dispatchStatus === "dispatched") {
-		// A live session (or an active dispatch record) means implementation
-		// work is in flight.
+	} else if (sessionRunning || dispatchStatus === "dispatching") {
+		// Only an executing turn or dispatch attempt is implementing. The
+		// durable "dispatched" record remains after the session stops.
 		phase = "implementing";
-	} else if (reviewStatus === "ready") {
-		// Review verdict is ready but no delivery has run yet: the task sits at
-		// the review → delivery boundary.
+	} else if (reviewStatus !== null) {
+		// A recorded review is meaningful even after implementation stops.
 		phase = "reviewing";
-	} else if (reviewStatus !== null || worktreeExists) {
-		// A review handoff exists (implementation was handed off) or a live
-		// worktree is present: the task's working phase is implementation.
-		phase = "implementing";
 	} else {
 		phase = "idle";
 	}
