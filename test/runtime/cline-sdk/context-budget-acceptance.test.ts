@@ -21,7 +21,7 @@
 //    at ingestion (line excerpt + local artifact reference) so the follow-up
 //    request fits the window and the provider never rejects it (real local
 //    SDK session driven through a scripted SSE tool call).
-// S6 near-limit history — 0.79/0.81 utilization matrix around the ~80%
+// S6 near-limit history — 0.59/0.61 utilization matrix around the ~60%
 //    trigger (deterministic hook level) plus a multi-round e2e session whose
 //    un-compacted history would overflow the window: zero provider overflow
 //    errors.
@@ -455,12 +455,12 @@ describe("S4 — tool-schema overhead", () => {
 			limitTokens: WINDOW,
 			outputReserveTokens: MAX_TOKENS,
 		});
-		// 10 messages × 300 estimated tokens = 3_000 tokens of conversation —
-		// fits the hook's request budget when no schema overhead is present,
+		// 10 messages × 220 estimated tokens = 2_200 tokens of conversation —
+		// fits the hook's tokenizer-adjusted budget without schema overhead,
 		// but not once the large schema's estimate is subtracted.
 		const messages: ClineSdkAgentMessage[] = [];
 		for (let i = 0; i < 10; i += 1) {
-			messages.push(agentMessage(i % 2 === 0 ? "user" : "assistant", [sizedTextPart(300)]));
+			messages.push(agentMessage(i % 2 === 0 ? "user" : "assistant", [sizedTextPart(220)]));
 		}
 		expect(await hook(makeBeforeModelRequest(messages, { systemPrompt: "system", tools: [] }))).toBeUndefined();
 
@@ -471,14 +471,14 @@ describe("S4 — tool-schema overhead", () => {
 		expect(result).toBeDefined();
 		expect(result?.messages?.length ?? 0).toBeLessThan(messages.length);
 		// The rewritten messages fit the shrunken budget:
-		// limit - output reserve - safety margin - system - tool schemas (estimates).
+		// 75% of (limit - output reserve - safety margin - system - tools).
 		const budget =
 			WINDOW -
 			MAX_TOKENS -
 			computeClineCompactionSafetyMarginTokens(WINDOW) -
 			estimateTextTokens("system") -
 			estimateClineToolSchemaTokens(bigTools);
-		expect(sumAgentMessageTokens(result?.messages ?? [])).toBeLessThanOrEqual(budget);
+		expect(sumAgentMessageTokens(result?.messages ?? [])).toBeLessThanOrEqual(Math.floor(budget * 0.75));
 	});
 });
 
@@ -566,12 +566,13 @@ describe("S5 — a large next tool result (real local SDK session)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// S6 — near-limit history (0.79/0.81 matrix, no provider overflow error).
+// S6 — near-limit history (0.59/0.61 matrix, no provider overflow error).
 // ---------------------------------------------------------------------------
 
 describe("S6 — near-limit history", () => {
-	// With the B-2.9 user-set margin, the trigger sits at ~80% utilization:
-	// request budget = 10_000 - 500 (output reserve) - 1_500 (margin) = 8_000.
+	// The nominal budget is 10_000 - 500 (output) - 1_500 (margin) = 8_000.
+	// After system/tool overhead, the 75% tokenizer allowance puts the
+	// message trigger just below 6_000 tokens (~60% window utilization).
 	const S6_LIMIT = 10_000;
 	const S6_OUTPUT_RESERVE = 500;
 	const S6_MARGIN = 1_500;
@@ -597,9 +598,9 @@ describe("S6 — near-limit history", () => {
 		return messages;
 	}
 
-	it("0.79 utilization: the request fits the budget, so no compaction fires", async () => {
+	it("0.59 utilization: the request fits the budget, so no compaction fires", async () => {
 		const hook = makeS6Hook();
-		const assembled = Math.round(S6_LIMIT * 0.79); // 7_900 estimated tokens
+		const assembled = Math.round(S6_LIMIT * 0.59); // 5_900 estimated tokens
 		const messages = sizedHistory(assembled - estimateTextTokens(S6_SYSTEM_PROMPT));
 		expect(sumAgentMessageTokens(messages)).toBe(assembled - estimateTextTokens(S6_SYSTEM_PROMPT));
 
@@ -608,9 +609,9 @@ describe("S6 — near-limit history", () => {
 		).toBeUndefined();
 	});
 
-	it("0.81 utilization: compaction fires and the rewritten request leaves the reserve in the window", async () => {
+	it("0.61 utilization: compaction fires and the rewritten request leaves the reserve in the window", async () => {
 		const hook = makeS6Hook();
-		const assembled = Math.round(S6_LIMIT * 0.81); // 8_100 estimated tokens
+		const assembled = Math.round(S6_LIMIT * 0.61); // 6_100 estimated tokens
 		const messages = sizedHistory(assembled - estimateTextTokens(S6_SYSTEM_PROMPT));
 
 		const result = await hook(makeBeforeModelRequest(messages, { systemPrompt: S6_SYSTEM_PROMPT, tools: [] }));
@@ -625,6 +626,15 @@ describe("S6 — near-limit history", () => {
 		// Rewritten assembled request + reserved output stays under the
 		// limit minus the margin (all chars/4 estimates).
 		const after = sumAgentMessageTokens(result?.messages ?? []);
+		const messageTarget = Math.floor(
+			(S6_LIMIT -
+				S6_OUTPUT_RESERVE -
+				S6_MARGIN -
+				estimateTextTokens(S6_SYSTEM_PROMPT) -
+				estimateClineToolSchemaTokens([])) *
+				0.75,
+		);
+		expect(after).toBeLessThanOrEqual(messageTarget);
 		expect(after + estimateTextTokens(S6_SYSTEM_PROMPT) + S6_OUTPUT_RESERVE).toBeLessThanOrEqual(
 			S6_LIMIT - S6_MARGIN,
 		);
