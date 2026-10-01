@@ -219,6 +219,20 @@ describe("BoardCard", () => {
 		expect(discardButton?.querySelector("svg.animate-spin")).toBeTruthy();
 	});
 
+	it("only shows the implementing pill while the card is in progress", async () => {
+		const phaseSummary = { phase: "implementing" as const, needsAttention: false, blockedReason: null };
+		for (const columnId of ["in_progress", "review", "done"] as const) {
+			await act(async () => {
+				root.render(
+					<TooltipProvider>
+						<BoardCard card={createCard()} index={0} columnId={columnId} phaseSummary={phaseSummary} />
+					</TooltipProvider>,
+				);
+			});
+			expect(container.querySelector('[aria-label="implementing"]') !== null).toBe(columnId === "in_progress");
+		}
+	});
+
 	it("shows inline see more and less controls for long descriptions", async () => {
 		const description =
 			"Alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau final hidden segment";

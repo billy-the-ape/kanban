@@ -2985,10 +2985,11 @@ describe("createRuntimeApi getTaskPhases (B-10.1)", () => {
 		const summaries: Record<string, RuntimeTaskSessionSummary> = {
 			"task-live": createSummary({ taskId: "task-live", state: "running" }),
 			"task-hydrated": createSummary({ taskId: "task-hydrated", state: "running" }),
+			"task-awaiting": createSummary({ taskId: "task-awaiting", state: "awaiting_review" }),
 		};
 		const terminalManager = {
 			getSummary: vi.fn((taskId: string) => summaries[taskId] ?? null),
-			hasActiveProcess: vi.fn((taskId: string) => taskId === "task-live"),
+			hasActiveProcess: vi.fn((taskId: string) => taskId === "task-live" || taskId === "task-awaiting"),
 		};
 		const clineTaskSessionService = createClineTaskSessionServiceMock();
 		const api = createTestRuntimeApi({
@@ -3003,12 +3004,13 @@ describe("createRuntimeApi getTaskPhases (B-10.1)", () => {
 
 		const response = await api.getTaskPhases(
 			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
-			{ taskIds: ["task-live", "task-hydrated", "task-none"] },
+			{ taskIds: ["task-live", "task-hydrated", "task-awaiting", "task-none"] },
 		);
 
 		expect(response.ok).toBe(true);
 		expect(response.phases["task-live"]?.phase).toBe("implementing");
 		expect(response.phases["task-hydrated"]?.phase).toBe("idle");
+		expect(response.phases["task-awaiting"]?.phase).toBe("idle");
 		expect(response.phases["task-none"]?.phase).toBe("idle");
 	});
 });

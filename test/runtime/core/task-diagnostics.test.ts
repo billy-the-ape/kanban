@@ -6,6 +6,7 @@ import { computeTaskPhase, type TaskPhaseInput } from "../../../src/core/task-di
 function createInput(overrides: Partial<TaskPhaseInput> = {}): TaskPhaseInput {
 	return {
 		sessionActive: false,
+		sessionRunning: false,
 		deliveryStatus: null,
 		deliveryStage: null,
 		deliveryEvidence: [],
@@ -49,5 +50,35 @@ describe("computeTaskPhase retry availability", () => {
 	it("offers cancel only while a session is active", () => {
 		expect(computeTaskPhase(createInput({ sessionActive: true })).actions.cancel.enabled).toBe(true);
 		expect(computeTaskPhase(createInput()).actions.cancel.enabled).toBe(false);
+	});
+});
+
+describe("computeTaskPhase current phase", () => {
+	it("shows implementation only while the agent is running or dispatch is starting", () => {
+		expect(computeTaskPhase(createInput({ sessionActive: true, sessionRunning: true })).phase).toBe("implementing");
+		expect(computeTaskPhase(createInput({ dispatchStatus: "dispatching" })).phase).toBe("implementing");
+	});
+
+	it("does not call an awaiting session, retained worktree, or old dispatch record implementation", () => {
+		const phase = computeTaskPhase(
+			createInput({
+				sessionActive: true,
+				sessionRunning: false,
+				worktreeExists: true,
+				dispatchStatus: "dispatched",
+			}),
+		);
+		expect(phase.phase).toBe("idle");
+		expect(phase.actions.cancel.enabled).toBe(true);
+	});
+
+	it("reports a review verdict or active delivery phase after implementation", () => {
+		expect(computeTaskPhase(createInput({ reviewStatus: "ready", worktreeExists: true })).phase).toBe("reviewing");
+		expect(computeTaskPhase(createInput({ deliveryStatus: "in_progress", deliveryStage: "staged" })).phase).toBe(
+			"committing",
+		);
+		expect(computeTaskPhase(createInput({ deliveryStatus: "delivered", dispatchStatus: "dispatched" })).phase).toBe(
+			"done",
+		);
 	});
 });

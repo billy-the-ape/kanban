@@ -616,7 +616,9 @@ export function BoardCard({
 										</p>
 									)}
 								</div>
-								{columnId !== "trash" ? <TaskPhaseBadge summary={phaseSummary} className="shrink-0" /> : null}
+								{columnId !== "trash" ? (
+									<TaskPhaseBadge summary={phaseSummary} columnId={columnId} className="shrink-0" />
+								) : null}
 								{columnId === "backlog" ? (
 									<Button
 										icon={<Play size={14} />}

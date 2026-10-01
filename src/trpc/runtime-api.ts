@@ -518,6 +518,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 	/** Map lifecycle records onto the pure phase computation's input. */
 	const toTaskPhaseInput = (records: {
 		sessionActive: boolean;
+		sessionRunning: boolean;
 		receipt: RuntimeGitDeliveryReceipt | null;
 		reviewStatus: RuntimeTaskReviewInfoResponse["status"];
 		reviewError: string | null;
@@ -526,6 +527,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		worktreeExists: boolean;
 	}): TaskPhaseInput => ({
 		sessionActive: records.sessionActive,
+		sessionRunning: records.sessionRunning,
 		deliveryStatus: records.receipt?.status ?? null,
 		deliveryStage: records.receipt?.stage ?? null,
 		deliveryEvidence: records.receipt?.evidence ?? [],
@@ -542,6 +544,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 	const buildTaskPhaseInput = (core: TaskDiagnosticsCore): TaskPhaseInput =>
 		toTaskPhaseInput({
 			sessionActive: core.session.active,
+			sessionRunning: core.session.active && core.session.summary?.state === "running",
 			receipt: core.delivery.receipt,
 			reviewStatus: core.review.status,
 			reviewError: core.review.error,
@@ -570,10 +573,12 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 						readTaskPreservationRecord(taskId).catch(() => null),
 						taskWorktreeExists(workspaceScope.workspacePath, taskId),
 					]);
+					const session = lookupSession(taskId);
 					return [
 						taskId,
 						toTaskPhaseInput({
-							sessionActive: lookupSession(taskId).active,
+							sessionActive: session.active,
+							sessionRunning: session.active && session.summary?.state === "running",
 							// Same cross-workspace filter as getTaskDeliveryInfo.
 							receipt: receipt && receipt.workspaceId === workspaceScope.workspaceId ? receipt : null,
 							reviewStatus: outcome?.status ?? null,
