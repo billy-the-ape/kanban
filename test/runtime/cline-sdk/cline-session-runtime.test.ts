@@ -162,7 +162,7 @@ describe("InMemoryClineSessionRuntime", () => {
 		);
 	});
 
-	it("persists provided task title to session metadata when supported", async () => {
+	it("seeds task title and recovery config in the SDK start metadata", async () => {
 		const update = vi.fn(async () => ({ updated: true }));
 		const fakeHost = {
 			start: vi.fn(async (input: { config?: { sessionId?: string } }) => ({
@@ -197,12 +197,21 @@ describe("InMemoryClineSessionRuntime", () => {
 		});
 
 		expect(result.sessionId).toBeTruthy();
-		expect(update).toHaveBeenCalledWith(result.sessionId, {
-			title: "Readable task title",
-		});
+		expect(fakeHost.start).toHaveBeenCalledWith(
+			expect.objectContaining({
+				sessionMetadata: expect.objectContaining({
+					title: "Readable task title",
+					"kanban.taskLaunchConfig": expect.objectContaining({
+						mode: "act",
+						systemPrompt: "You are a helpful coding assistant.",
+					}),
+				}),
+			}),
+		);
+		expect(update).not.toHaveBeenCalled();
 	});
 
-	it("ignores session metadata update failures during start", async () => {
+	it("does not depend on post-start metadata updates", async () => {
 		const update = vi.fn(async () => {
 			throw new Error("storage unavailable");
 		});
@@ -243,9 +252,8 @@ describe("InMemoryClineSessionRuntime", () => {
 				sessionId: expect.any(String),
 			}),
 		);
-		// Two metadata writes: the Kanban title, then the B-4.8 launch config.
-		// Both are best-effort and must not fail the start.
-		expect(update).toHaveBeenCalledTimes(2);
+		// The local SDK record does not exist yet; update cannot save it.
+		expect(update).not.toHaveBeenCalled();
 	});
 
 	it("routes host events through the pending requested session id before start resolves", async () => {

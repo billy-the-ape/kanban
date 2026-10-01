@@ -48,6 +48,8 @@ export interface FakeClineSessionStore {
 	onTurn?: FakeClineSessionTurnHandler;
 	/** Default assistant reply when onTurn returns nothing. */
 	assistantText?: (context: FakeClineSessionTurnContext) => string;
+	/** Local SDK sessions become durable only on their first send. */
+	deferPersistenceUntilSend?: boolean;
 	record(sessionId: string): ClineSdkSessionRecord | undefined;
 	messagesFor(sessionId: string): ClineSdkPersistedMessage[];
 	/** Returns the next 1-based turn number; shared across hosts bound to this store. */
@@ -63,6 +65,8 @@ export interface CreateFakeClineSessionStoreOptions {
 	onTurn?: FakeClineSessionTurnHandler;
 	/** Default assistant reply when onTurn returns nothing. */
 	assistantText?: (context: FakeClineSessionTurnContext) => string;
+	/** Local SDK sessions become durable only on their first send. */
+	deferPersistenceUntilSend?: boolean;
 }
 
 export interface FakeClineSessionHost {
@@ -102,6 +106,7 @@ export function createFakeClineSessionStore(options: CreateFakeClineSessionStore
 		messages,
 		onTurn: options.onTurn,
 		assistantText: options.assistantText,
+		deferPersistenceUntilSend: options.deferPersistenceUntilSend,
 		record: (sessionId) => records.get(sessionId),
 		messagesFor: (sessionId) => messages.get(sessionId) ?? [],
 		nextTurnCount: () => {
@@ -143,6 +148,7 @@ function buildRecord(
 }
 
 export function createFakeClineSessionHost(store: FakeClineSessionStore): FakeClineSessionHost {
+	const pendingRecords = new Map<string, ClineSdkSessionRecord>();
 	const listeners = new Set<(event: unknown) => void>();
 	const startedConfigs: FakeClineSessionStartConfig[] = [];
 	const sentPrompts: FakeClineSessionSendInput[] = [];
@@ -155,7 +161,13 @@ export function createFakeClineSessionHost(store: FakeClineSessionStore): FakeCl
 			}
 			startedConfigs.push(config);
 			const sessionId = config.sessionId;
-			store.records.set(sessionId, buildRecord(config, sessionId, store.records.get(sessionId)));
+			const record = buildRecord(config, sessionId, store.records.get(sessionId));
+			record.metadata = input.sessionMetadata ?? record.metadata;
+			if (store.deferPersistenceUntilSend) {
+				pendingRecords.set(sessionId, record);
+			} else {
+				store.records.set(sessionId, record);
+			}
 			store.messages.set(
 				sessionId,
 				(input.initialMessages ?? []).map((message) => ({ ...message })),
@@ -165,6 +177,11 @@ export function createFakeClineSessionHost(store: FakeClineSessionStore): FakeCl
 
 		async send(input: FakeClineSessionSendInput) {
 			sentPrompts.push(input);
+			const pending = pendingRecords.get(input.sessionId);
+			if (pending) {
+				store.records.set(input.sessionId, pending);
+				pendingRecords.delete(input.sessionId);
+			}
 			const record = store.records.get(input.sessionId);
 			if (!record) {
 				throw new Error(`Fake session host has no session ${input.sessionId}.`);
