@@ -139,8 +139,11 @@ describe("useReviewAutoActions", () => {
 
 		await act(async () => {
 			root.render(
-				<HookHarness board={createBoard(true)} runAutoReviewGitAction={runAutoReviewGitAction}
-					requestCompleteTask={requestCompleteTask} />,
+				<HookHarness
+					board={createBoard(true)}
+					runAutoReviewGitAction={runAutoReviewGitAction}
+					requestCompleteTask={requestCompleteTask}
+				/>,
 			);
 		});
 		await act(async () => {
@@ -153,8 +156,73 @@ describe("useReviewAutoActions", () => {
 		});
 		await act(async () => {
 			root.render(
-				<HookHarness board={createBoard(true)} runAutoReviewGitAction={runAutoReviewGitAction}
-					requestCompleteTask={requestCompleteTask} />,
+				<HookHarness
+					board={createBoard(true)}
+					runAutoReviewGitAction={runAutoReviewGitAction}
+					requestCompleteTask={requestCompleteTask}
+				/>,
+			);
+		});
+		await act(async () => {
+			vi.advanceTimersByTime(1000);
+		});
+		expect(runAutoReviewGitAction).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not resend Auto-PR after the accepted instruction moves through In Progress", async () => {
+		const runAutoReviewGitAction = vi.fn(async () => true);
+		const requestCompleteTask = vi.fn(async () => {});
+		const reviewBoard = createBoard(true);
+		const reviewColumn = reviewBoard.columns.find((column) => column.id === "review");
+		const inProgressColumn = reviewBoard.columns.find((column) => column.id === "in_progress");
+		const task = reviewColumn?.cards[0];
+		if (!reviewColumn || !inProgressColumn || !task) {
+			throw new Error("Missing test card or column");
+		}
+		task.autoReviewMode = "pr";
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					board={reviewBoard}
+					runAutoReviewGitAction={runAutoReviewGitAction}
+					requestCompleteTask={requestCompleteTask}
+				/>,
+			);
+		});
+		await act(async () => {
+			vi.advanceTimersByTime(1000);
+		});
+		expect(runAutoReviewGitAction).toHaveBeenCalledTimes(1);
+
+		const runningBoard = createBoard(true);
+		const runningReview = runningBoard.columns.find((column) => column.id === "review");
+		const runningColumn = runningBoard.columns.find((column) => column.id === "in_progress");
+		const runningTask = runningReview?.cards.shift();
+		if (!runningColumn || !runningTask) {
+			throw new Error("Missing test card or column");
+		}
+		runningTask.autoReviewMode = "pr";
+		runningColumn.cards.push(runningTask);
+		await act(async () => {
+			root.render(
+				<HookHarness
+					board={runningBoard}
+					runAutoReviewGitAction={runAutoReviewGitAction}
+					requestCompleteTask={requestCompleteTask}
+				/>,
+			);
+		});
+		await act(async () => {
+			root.render(null);
+		});
+		await act(async () => {
+			root.render(
+				<HookHarness
+					board={reviewBoard}
+					runAutoReviewGitAction={runAutoReviewGitAction}
+					requestCompleteTask={requestCompleteTask}
+				/>,
 			);
 		});
 		await act(async () => {

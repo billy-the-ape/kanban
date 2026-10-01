@@ -9,7 +9,8 @@ import { resolveTaskAutoReviewMode } from "@/types";
 const AUTO_REVIEW_ACTION_DELAY_MS = 500;
 
 // The chat accepts an instruction before the agent finishes. Keep its receipt
-// across UI remounts while the Review card's worktree remains dirty.
+// across UI remounts and while an accepted git instruction moves the card
+// through In Progress. That movement must not re-arm the same instruction.
 function autoReviewPromptKey(projectId: string | null | undefined, taskId: string, action: TaskGitAction): string {
 	return ["kanban:auto-review-prompt", projectId ?? "default", taskId, action].join(":");
 }
@@ -156,7 +157,7 @@ export function useReviewAutoActions({
 			for (const column of boardRef.current.columns) {
 				for (const card of column.cards) {
 					columnByTaskId.set(card.id, column.id);
-					if (column.id !== "review") {
+					if (column.id !== "review" && column.id !== "in_progress") {
 						setAutoReviewPromptSent(autoReviewPromptKey(resetKey, card.id, "pr"), false);
 						setAutoReviewPromptSent(autoReviewPromptKey(resetKey, card.id, "commit"), false);
 					}
@@ -213,7 +214,7 @@ export function useReviewAutoActions({
 				//   task directly; a clean worktree is never treated as evidence (B-5.1).
 				const changedFiles = getTaskWorkspaceSnapshot(reviewTask.id)?.changedFiles;
 				const awaitingAction = awaitingCleanActionByTaskIdRef.current[reviewTask.id] ?? null;
-			const promptKey = autoReviewPromptKey(resetKey, reviewTask.id, autoReviewMode);
+				const promptKey = autoReviewPromptKey(resetKey, reviewTask.id, autoReviewMode);
 				if (awaitingAction && completeOnGitActionSuccess) {
 					clearAutoReviewTimer(reviewTask.id);
 					continue;
@@ -297,7 +298,13 @@ export function useReviewAutoActions({
 				});
 			}
 		},
-		[clearAutoReviewTimer, completeOnGitActionSuccess, resetKey, scheduleAutoReviewAction, taskGitActionLoadingByTaskId],
+		[
+			clearAutoReviewTimer,
+			completeOnGitActionSuccess,
+			resetKey,
+			scheduleAutoReviewAction,
+			taskGitActionLoadingByTaskId,
+		],
 	);
 
 	useEffect(() => {
