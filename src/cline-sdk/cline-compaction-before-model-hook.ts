@@ -27,7 +27,8 @@
 // the SDK trigger never fires — no double compaction.
 //
 // All token values are chars/4 ESTIMATES (B-2.3 fallback estimator); logs
-// label them as such.
+// label them as such. The request target is reduced to account for models
+// whose tokenizer counts substantially more tokens than this fallback.
 
 import type { ClineCompactionObservedInfo } from "./cline-compaction-callback";
 import { computeClineCompactionSafetyMarginTokens, estimateClineToolSchemaTokens } from "./cline-compaction-config";
@@ -49,6 +50,14 @@ import type {
 
 /** Floor for the message-token target (matches the calibrated config floor). */
 const MIN_MESSAGE_TARGET_TOKENS = 256;
+/**
+ * The local qwen3.8-27b provider counted ~260k tokens for a request whose
+ * agent-message chars/4 estimate was ~198k. Keep the compactor's internal
+ * estimator and truncation math consistent, but target only 75% of the
+ * nominal message budget (equivalent to roughly three chars per token).
+ * The output reserve and user-configured safety margin remain independent.
+ */
+const PROVIDER_TOKENIZER_HEADROOM_RATIO = 0.75;
 /** Minimum retained text length when truncating a part. */
 const MIN_TRUNCATED_TEXT_CHARS = 16;
 
@@ -278,9 +287,13 @@ export function createClineCompactionBeforeModelHook(
 		// start-time estimates used by the config calibration.
 		const systemPromptTokens = estimateTextTokens(context.request.systemPrompt ?? "");
 		const toolSchemaTokens = estimateClineToolSchemaTokens(context.request.tools);
-		const messageTargetTokens = Math.max(
+		const nominalMessageTargetTokens = Math.max(
 			MIN_MESSAGE_TARGET_TOKENS,
 			requestBudgetTokens - systemPromptTokens - toolSchemaTokens,
+		);
+		const messageTargetTokens = Math.max(
+			MIN_MESSAGE_TARGET_TOKENS,
+			Math.floor(nominalMessageTargetTokens * PROVIDER_TOKENIZER_HEADROOM_RATIO),
 		);
 
 		const result = compactClineAgentMessages(messages, messageTargetTokens, { logger });
@@ -292,6 +305,8 @@ export function createClineCompactionBeforeModelHook(
 			requestBudgetTokens,
 			systemPromptTokens,
 			toolSchemaTokens,
+			nominalMessageTargetTokens,
+			messageTargetTokens,
 			messageTokensBefore: result.tokensBefore,
 			messageTokensAfter: result.tokensAfter,
 			messagesBefore: messages.length,

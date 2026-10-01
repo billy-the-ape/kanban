@@ -261,6 +261,42 @@ describe("B-2.5 — createClineCompactionBeforeModelHook", () => {
 		expect(messages.length).toBe(16);
 	});
 
+	it("compacts a long tool history that chars/4 would incorrectly consider safe", async () => {
+		// Mirrors the observed request's proportions without storing its task or
+		// repository data: ~790k message characters, including tool outputs and
+		// reasoning. llama.cpp counted ~260k tokens for ~198k chars/4 tokens.
+		const messages: ClineSdkAgentMessage[] = [agentMessage("user", [textPart("task ".repeat(400))])];
+		for (let index = 0; index < 100; index += 1) {
+			const toolCallId = `call-${index}`;
+			messages.push(
+				agentMessage("assistant", [
+					{ type: "reasoning", text: "reasoning ".repeat(200) },
+					{ type: "tool-call", toolCallId, toolName: "editor", input: { path: `src/file-${index}.ts` } },
+				]),
+			);
+			messages.push(
+				agentMessage("tool", [
+					{ type: "tool-result", toolCallId, toolName: "editor", output: "changed line\n".repeat(480) },
+				]),
+			);
+		}
+		const nominalTokens = compactClineAgentMessages(messages, Number.MAX_SAFE_INTEGER).tokensBefore;
+		const limitTokens = 262_144;
+		const outputReserveTokens = 16_384;
+		const nominalBudget = limitTokens - outputReserveTokens - computeClineCompactionSafetyMarginTokens(limitTokens);
+		expect(nominalTokens).toBeLessThan(nominalBudget);
+		const result = await createClineCompactionBeforeModelHook({ limitTokens, outputReserveTokens })(
+			makeRequest(messages, { systemPrompt: "system", tools: [] }),
+		);
+		expect(result?.messages?.length ?? 0).toBeLessThan(messages.length);
+		const compactedTokens = compactClineAgentMessages(result?.messages ?? [], Number.MAX_SAFE_INTEGER).tokensBefore;
+		expect(compactedTokens).toBeLessThanOrEqual(Math.floor(nominalBudget * 0.75));
+		const keptToolCalls = result?.messages?.flatMap((message) =>
+			message.content.flatMap((part) => (part.type === "tool-call" ? [part.toolCallId] : [])),
+		);
+		expect(keptToolCalls?.at(-1)).toBe("call-99");
+	});
+
 	it("returns undefined for empty request messages", async () => {
 		const context = makeRequest([], { systemPrompt: "s", tools: [] });
 		expect(await hook(context)).toBeUndefined();
