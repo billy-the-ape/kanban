@@ -29,6 +29,7 @@ import {
 	type TaskSessionServiceHarness,
 } from "../../utilities/cline-session-service-harness";
 import type { FakeClineSessionStartConfig } from "../../utilities/fake-cline-session-host";
+import { createFakeClineSessionStore } from "../../utilities/fake-cline-session-host";
 
 const turnCheckpointMocks = vi.hoisted(() => ({
 	captureTaskTurnCheckpoint: vi.fn(),
@@ -91,6 +92,25 @@ async function restartService(
 	return { before: firstHarness, after };
 }
 describe("service restart with a persisted session (B-1.7)", () => {
+	it("recovers after restart when the SDK persists the record only on first send", async () => {
+		const store = createFakeClineSessionStore({ deferPersistenceUntilSend: true });
+		const first = createTaskSessionServiceHarness({ store });
+		services.push(first);
+		const { after } = await restartService(first);
+		const record = [...store.records.values()][0];
+		expect(readPersistedTaskLaunchConfig(record)?.systemPrompt).toBe("test system prompt");
+		expect(record?.metadata?.title).toBe("B-1.7 restart repro");
+		await after.service.rebindPersistedTaskSession(RESTART_TASK_ID);
+		await after.service.sendTaskSessionInput(RESTART_TASK_ID, "Address review comments");
+		await vi.waitFor(() => {
+			expect(after.host.sentPrompts.map((entry) => entry.prompt)).toContain("Address review comments");
+		});
+		expect(after.service.getSummary(RESTART_TASK_ID)?.reviewReason).not.toBe("error");
+		expect(after.service.listMessages(RESTART_TASK_ID).map((message) => message.content)).toContain(
+			"First turn before restart",
+		);
+	});
+
 	it("keeps the persisted transcript visible after restart", async () => {
 		const first = createTaskSessionServiceHarness();
 		services.push(first);

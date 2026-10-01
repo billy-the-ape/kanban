@@ -237,22 +237,6 @@ export interface CreateInMemoryClineSessionRuntimeOptions {
 	onCompactionObserved?: (taskId: string, info: ClineCompactionObservedInfo) => void;
 }
 
-// Best-effort: write the Kanban task title to the SDK session metadata so external session
-// lists (e.g. the Cline extension) show a human-readable name. Kanban never reads this back.
-async function persistKanbanTitleToClineSessionMetadata(
-	sessionHost: ClineSessionHostBoundary,
-	sessionId: string,
-	taskTitle: string | undefined,
-): Promise<void> {
-	const title = taskTitle?.trim();
-	if (!title) return;
-	try {
-		await sessionHost.update?.(sessionId, { title });
-	} catch {
-		// Best-effort only — Kanban board title remains canonical regardless.
-	}
-}
-
 // Own the SDK session host plus the taskId <-> sessionId bindings so higher layers can stay task-oriented.
 export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 	private readonly onTaskEvent: ((taskId: string, event: unknown) => void) | null;
@@ -443,6 +427,18 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 					// B-2.6: ingestion-time tool-result bounding (see above).
 					...(agentHooks ? { hooks: agentHooks } : {}),
 				},
+				// Local SDK mode creates its durable record on the first send,
+				// so update() before that turn cannot persist recovery metadata.
+				// Seed the live session as well as the eventual durable record.
+				sessionMetadata: mergeTaskLaunchConfigIntoMetadata(
+					request.taskTitle?.trim() ? { title: request.taskTitle.trim() } : undefined,
+					buildPersistedTaskLaunchConfig({
+						mode: resolvedMode,
+						systemPrompt: request.systemPrompt,
+						taskTitle: request.taskTitle,
+						reasoningEffort: request.reasoningEffort,
+					}),
+				),
 				initialMessages: request.initialMessages,
 				interactive: true,
 				localRuntime: {
@@ -481,15 +477,6 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		if (startResult.sessionId !== requestedSessionId) {
 			this.taskIdBySessionId.delete(requestedSessionId);
 		}
-
-		// B-4.8: persist the credential-free launch configuration into the
-		// SDK session record before the initial turn starts, so a process
-		// crash cannot leave the task unrestorable after a Kanban restart.
-		// The title write runs first and the launch-config write last because
-		// SDK session updates replace `metadata` wholesale — the read-merge-
-		// write in persistTaskLaunchConfig preserves both.
-		await persistKanbanTitleToClineSessionMetadata(sessionHost, startResult.sessionId, request.taskTitle);
-		await this.persistTaskLaunchConfig(sessionHost, startResult.sessionId, request);
 
 		let result: unknown = startResult.result ?? null;
 		if (shouldSendInitialTurn) {
@@ -553,7 +540,10 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		await this.abortSupersededTaskSessions(input.taskId);
 		const cappedLimit =
 			input.contextWindowCapTokens && restartRequest.compaction
-				? Math.min(input.contextWindowCapTokens, restartRequest.compaction.contextWindowTokens ?? input.contextWindowCapTokens)
+				? Math.min(
+						input.contextWindowCapTokens,
+						restartRequest.compaction.contextWindowTokens ?? input.contextWindowCapTokens,
+					)
 				: null;
 		return await this.startTaskSession({
 			...restartRequest,
@@ -613,40 +603,6 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			compaction: buildClineCompactionConfig({ launchConfig }),
 			compactionSafetyMarginTokens: launchConfig.compactionSettings?.safetyMarginTokens,
 		};
-	}
-
-	/**
-	 * B-4.8: best-effort persistence of the credential-free launch config
-	 * into the SDK session record's metadata. Runs in startTaskSession before
-	 * the initial turn is sent (and again on every restart, which reuses
-	 * startTaskSession), so the latest session record always carries the
-	 * configuration that a process restart needs to rebuild the start
-	 * request. The SDK replaces `metadata` wholesale on update, so the
-	 * record's existing metadata is read back and merged first (this
-	 * preserves e.g. the Kanban title). A failed write degrades restart
-	 * recovery to the in-memory-only behavior; the live session is unaffected.
-	 */
-	private async persistTaskLaunchConfig(
-		sessionHost: ClineSessionHostBoundary,
-		sessionId: string,
-		request: StartClineSessionRuntimeRequest,
-	): Promise<void> {
-		if (!sessionHost.update) {
-			return;
-		}
-		try {
-			const launchConfig = buildPersistedTaskLaunchConfig({
-				mode: request.mode,
-				systemPrompt: request.systemPrompt,
-				taskTitle: request.taskTitle,
-				reasoningEffort: request.reasoningEffort,
-			});
-			const record = await sessionHost.get(sessionId);
-			const metadata = mergeTaskLaunchConfigIntoMetadata(record?.metadata, launchConfig);
-			await sessionHost.update(sessionId, { metadata });
-		} catch {
-			// Best-effort persistence; see the method docs.
-		}
 	}
 
 	/**
