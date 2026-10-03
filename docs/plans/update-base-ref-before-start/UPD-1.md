@@ -5,12 +5,12 @@ This document is a self-contained execution brief for the second implementation 
 
 | Field | Value |
 | --- | --- |
-| Document revision | 1 |
-| Prepared | 2026-03-10 |
+| Document revision | 2 |
+| Prepared | 2026-10-03 (revision 2: 2026-10-03) |
 | Status | Proposed; not started |
 | Source baseline | ba3b7151f44f9ed5d1cb4d83590e98388ae2cac7 (re-verify at start; UPD-0's merged head is the true base) |
 | Fork | https://github.com/billy-the-ape/kanban |
-| Prerequisites | UPD-0 merged (persisted policy, runtime refresh, durable baseline, failure shape) |
+| Prerequisites | UPD-0 merged (persisted policy, runtime refresh, durable baseline, failure shape, preparation-state contract) |
 | Follow-on | None; final acceptance rows in PLAN.md close with this PR |
 
 ## Objective
@@ -28,7 +28,8 @@ Allowed:
 - `web-ui/src/components/task-create-dialog.tsx`, `task-inline-create-card.tsx`, multi-create, and any
   other create surfaces exposing the base selector
 - `web-ui/src/hooks/use-task-sessions.ts`, `use-task-start-actions.ts`, `use-board-interactions.ts`
-  (progress state, duplicate-submit guard, start-failure rollback and messaging)
+  (progress state, duplicate-submit guard, start-failure rollback and messaging — on top of UPD-0's
+  minimal start-orchestration change, which this PR does not rework)
 - `web-ui/src/types/board.ts`, `web-ui/src/state/board-state.ts` (any parity gaps left by UPD-0)
 - `docs/` user documentation for the new checkbox; `docs/plans/update-base-ref-before-start/PLAN.md`
   consistency updates only (no re-planning)
@@ -46,9 +47,12 @@ Explicit non-goals:
 - `web-ui/src/hooks/use-task-editor.ts` loads and saves `baseRef`; the editor closes when the task leaves
   backlog. Adding the policy load/save here is the pattern for backlog editing.
 - `web-ui/src/hooks/use-task-sessions.ts` sends `baseRef` through both `workspace.ensureWorktree` and
-  `runtime.startTaskSession`; start-failure handling and optimistic column movement live around
-  `use-board-interactions.ts` / `use-task-start-actions.ts`. The UPD-0 failure shape (ref, category,
-  reason, remedy) plugs into the existing start-failure path.
+  `runtime.startTaskSession`; `use-board-interactions.ts` `kickoffTaskInProgress` currently awaits the
+  ensure before start. UPD-0 changes that sequence (fresh tasks skip the eager ensure; runtime start owns
+  worktree creation after the refresh) and adds the preparation-state contract (server-computed
+  baseline-fixed signal, extended start response); this PR's start-failure handling, optimistic column
+  movement, and progress state build on that contract. The UPD-0 failure shape (ref, category, reason,
+  remedy) plugs into the existing start-failure path.
 - Creation surfaces: `web-ui/src/components/task-create-dialog.tsx` and `task-inline-create-card.tsx`
   expose task options including the base selector; multi-create and child creation follow the same board
   mutation inputs. CLI/API creation defaults were set in UPD-0 and need only regression coverage here.
@@ -62,12 +66,15 @@ Explicit non-goals:
   the base branch before creating this task's worktree.” Use Radix `Checkbox` styled per the repo's
   `src/components/ui/` conventions (tabs, Tailwind, dark tokens). Load the persisted value; changing the
   selected branch must not reset it. For already-started tasks (including those returned to backlog),
-  hide or disable the control with a short explanation that the initial start baseline is fixed.
+  hide or disable the control with a short explanation that the initial start baseline is fixed; drive
+  that decision from the UPD-0 server-computed baseline-fixed signal (durable and reload-safe, and covers
+  automated dispatch starts), never from a local flag.
 - [ ] UPD-1.2 Persist the value through every save/create path: backlog edit save, inline creation,
   multi-create, and child creation. Explicit `false` must reach the server unchanged (regression: an
   unchecked box is `false`, not absent). New tasks default to checked via the shared default.
 - [ ] UPD-1.3 Wire start UX: show “Updating base ref…” (or equivalent in the existing start affordance)
-  while the runtime prepares a fresh start for an enabled task; disable duplicate start submissions for
+  while the runtime prepares a fresh start for an enabled task; drive it from the UPD-0 preparation-state
+  contract (start response stage/event), not a local heuristic; disable duplicate start submissions for
   that task during preparation.
 - [ ] UPD-1.4 Wire failure UX: on a blocked update, keep the task in backlog (restore it through the
   established start-failure handling if the flow moved the card optimistically), and show the selected
@@ -94,6 +101,7 @@ UPD-0 covers the runtime/Git rows of the PLAN.md matrix; this PR must at minimum
 | Automated starts | Dispatched tasks honor their persisted policy identically to UI starts |
 | Resume after remote advance | An existing started task's worktree and work are unchanged; no refresh runs |
 | Started task editing | Checkbox hidden/disabled with explanation; saved value untouched |
+| UI reload/reconnect or automated (dispatch) start | Checkbox state re-derived from the UPD-0 server-computed baseline-fixed signal after reload; no client flag drives refresh eligibility, progress, or control visibility |
 
 Run: targeted web-ui tests (`use-task-editor`, `use-task-sessions`, board interactions, create dialogs),
 the targeted runtime/integration suites touched, backend and web typechecks, and the repository's
