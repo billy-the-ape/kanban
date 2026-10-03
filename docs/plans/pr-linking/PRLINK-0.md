@@ -178,6 +178,7 @@ npx @biomejs/biome check src test
 npm run typecheck
 npm run test:fast          # test/runtime + test/utilities
 npm run test:integration   # workspace-state merge test
+npx vitest run test/workspace   # git-delivery parser swap; not covered by test:fast or test:integration
 npm run web:typecheck && npm run web:test   # contract ripple check (field is optional; expect no changes needed)
 ```
 

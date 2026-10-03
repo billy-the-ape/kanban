@@ -67,8 +67,8 @@ Plus a `refreshTaskPullRequests` request (`{ taskId }`) and response (`{ ok, upd
 export interface TaskPullRequestLookupInput {
 	workspacePath: string;
 	taskId: string;
-	/** Branch to query (the task branch / destination branch). */
-	branch: string;
+	/** Branch to query. When omitted, resolved inside the helper (see below). */
+	branch?: string;
 	/** Injectable gh runner (defaults to execFile — tests pass fakes). */
 	gh?: (args: string[], cwd: string) => Promise<GhCommandResult>;
 }
@@ -76,7 +76,7 @@ export interface TaskPullRequestLookupInput {
 export async function lookupTaskPullRequests(input: TaskPullRequestLookupInput): Promise<{ recorded: number }>
 ```
 
-- Resolve the task worktree with `resolveTaskCwd({ cwd: workspacePath, taskId, baseRef: null, ensure: false })`; when there is no worktree, no-op (return `{ recorded: 0 }`).
+- Resolve the task worktree with `resolveTaskCwd({ cwd: workspacePath, taskId, baseRef: card.baseRef, ensure: false })` (`baseRef` is a required `string`; read it from the card). When there is no worktree, no-op (return `{ recorded: 0 }`).
 - Run **directly** (never an interactive shell): `gh pr list --head <branch> --state all --json number,url,title,state --limit 5` in the worktree with a short timeout (~10s). Reuse the gh runner conventions from `git-delivery.ts` (`missingBinary` detection).
 - Skip silently (log at debug, no error) when: `gh` missing (ENOENT/`missingBinary`), gh exits non-zero (unauthenticated, no remote), or the worktree is gone.
 - Map results: `state` OPEN → `open`, MERGED → `merged`, CLOSED → `closed` (gh's `state` enum has no draft; leave `draft` unset). Record each URL via `parsePullRequestUrl` + `recordTaskPullRequests(..., source: "branch_lookup")` with snapshot `{ title, state, stateCheckedAt: Date.now() }`.
@@ -85,7 +85,7 @@ export async function lookupTaskPullRequests(input: TaskPullRequestLookupInput):
 Wiring:
 
 - **Transition to Review with no PR**:
-  - `src/trpc/hooks-api.ts`: in the `to_review` branch, after the transition succeeds, read the card; if `(card.pullRequests ?? []).length === 0`, fire the lookup with the task branch (from the session summary's worktree state or the card's known branch info — use the destination/task branch available at the call site; if unknown, read it from the task worktree via `git rev-parse --abbrev-ref HEAD` is NOT acceptable on a hot path — instead resolve the branch from the delivery/worktree helpers already used by B-8, and skip the lookup when it cannot be determined cheaply).
+  - `src/trpc/hooks-api.ts`: in the `to_review` branch, after the transition succeeds, read the card; if `(card.pullRequests ?? []).length === 0`, fire the lookup **without awaiting it** and without a `branch`. The helper then resolves the branch itself, inside the fire-and-forget work, with a direct `execFile("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: worktree })` (no shell). It skips the lookup on a detached `HEAD` or any git error. Because nothing awaits it, the transition and ingest response are never delayed.
   - `src/trpc/workspace-api.ts` `saveState`: diff the old and new board; for any card that moved **into** `review` and has no `pullRequests`, fire the lookup.
 - **Refresh action**: the `refreshTaskPullRequests` tRPC mutation (§2) calls the same helper synchronously (it is user-initiated, so a bounded await with the 10s timeout is fine) and returns `recorded`.
 
@@ -115,6 +115,7 @@ Wiring:
 npx @biomejs/biome check src test web-ui/src
 npm run typecheck
 npm run test:fast
+npx vitest run test/workspace   # task-pull-request-lookup.test.ts; not covered by test:fast or test:integration
 npm run web:typecheck && npm run web:test
 ```
 
@@ -129,7 +130,7 @@ Manual (end-to-end, scratch repo with GitHub remote):
 
 ## Acceptance criteria
 
-- Users can add and remove PR links; the server strictly validates URLs; manual entries use `source: "manual"` and survive the 20-entry cap.
+- Users can add and remove PR links; the server strictly validates URLs; manual entries use `source: "manual"` and are evicted by the 20-entry cap only after every non-manual entry (PRLINK-0 rule).
 - Branch lookup is best-effort, bounded (10s), runs outside interactive shells, never blocks transitions, and degrades silently without `gh`.
 - Refresh is opt-in and writes snapshot fields only.
 - All surfaces update via the standard state broadcast (no page reload needed).

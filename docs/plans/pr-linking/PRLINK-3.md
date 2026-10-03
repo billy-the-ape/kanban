@@ -74,6 +74,7 @@ npx @biomejs/biome check src test
 npm run typecheck
 npm run test:fast
 npm run test:integration   # task-dispatch integration touches delivery
+npx vitest run test/workspace   # git-delivery.test.ts; not covered by test:fast or test:integration
 ```
 
 Manual: scratch repo with GitHub remote and delivery policy `requirePullRequest` enabled. Move a task through Review → Done (or trigger delivery) so B-8 opens a PR. Confirm `board.json` shows the PR on the card with source `delivery` and the gh title; re-run delivery (PR now pre-existing) and confirm the entry is not duplicated and the title/state snapshot is present.

@@ -145,6 +145,6 @@ Manual: seed a scratch workspace's `board.json` with 1, 3, and 6 `pullRequests` 
 
 - All PRs visible in the task detail top bar (overflow beyond 3 collapsed into a `+N` popover); latest-only on board cards.
 - Links open in a new tab with `rel="noopener noreferrer"`; propagation stopped on cards.
-- Only design tokens used; no inline styles except none; no new runtime dependencies (Radix popover + Lucide already in use).
+- Only design tokens used; no inline styles; no new runtime dependencies (Radix popover + Lucide already in use).
 - Existing mock card factories still compile (field optional) — `npm run web:typecheck` green without touching unrelated mocks.
 

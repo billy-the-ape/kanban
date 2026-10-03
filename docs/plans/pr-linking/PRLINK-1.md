@@ -154,6 +154,7 @@ broadcastWorkspaceStateUpdated: (workspacePath) =>
 npx @biomejs/biome check src test
 npm run typecheck
 npm run test:fast
+npx vitest run test/workspace   # task-pull-requests.test.ts; not covered by test:fast or test:integration
 ```
 
 Manual: on a scratch repo with a GitHub remote, run a Cline task that ends by running `gh pr create`. Without reloading the page, the PR appears in the workspace state (`board.json` gains `pullRequests`; the state broadcast reaches the UI — with PRLINK-4 not yet landed, verify via `board.json`/network rather than pixels). Restart Kanban and confirm the link persists. A second run of `gh pr create` for the same branch (gh "already exists" stderr) must not duplicate the entry or bump the revision.
