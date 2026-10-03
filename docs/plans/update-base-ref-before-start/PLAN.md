@@ -15,8 +15,11 @@ backlog task. It defaults to checked. Before the first task prompt is sent and b
 created, fetch origin, safely fast-forward the selected local base branch, resolve its updated commit, and create the
 task worktree at that exact SHA. The same policy applies to automated initial starts.
 
-This folder owns the feature's master plan. Future execution documents can be added alongside this file without
-moving it or mixing this feature with the existing B-series plans.
+This folder owns the feature's master plan. The feature is split into one file per task
+(`UPDBASE-0.md` through `UPDBASE-9.md`) in this directory so a coding agent only needs to load
+the task it is executing plus the shared context in this file. UPDBASE-0 through UPDBASE-6
+form the first implementation PR (runtime); UPDBASE-7 through UPDBASE-9 form the second (UI).
+Do not renumber tasks once work starts; record later additions under a new UPDBASE number.
 
 ## Scope
 
@@ -145,6 +148,21 @@ progress, not evidence that an agent is running or that a task has completed.
 
 Expected size: two focused implementation PRs after this plan is reviewed. Keep both under this folder when creating
 execution documents; no generic repository-management redesign is required.
+
+Task-level breakdown (one file per task in this folder):
+
+| Task | Title | Depends on |
+| --- | --- | --- |
+| [UPDBASE-0](./UPDBASE-0.md) | Persist the `updateBaseRefBeforeStart` task policy | — |
+| [UPDBASE-1](./UPDBASE-1.md) | Base-refresh module: ref classification and bounded fetch | — |
+| [UPDBASE-2](./UPDBASE-2.md) | Base-refresh module: safe local-branch update | UPDBASE-1 |
+| [UPDBASE-3](./UPDBASE-3.md) | Durable initial-start preparation/baseline record | — |
+| [UPDBASE-4](./UPDBASE-4.md) | Runtime fresh-start preparation integration | UPDBASE-0, UPDBASE-1, UPDBASE-2, UPDBASE-3 |
+| [UPDBASE-5](./UPDBASE-5.md) | Caller audit, start-failure semantics, and observability | UPDBASE-4 |
+| [UPDBASE-6](./UPDBASE-6.md) | Runtime and Git integration test coverage (first-PR gate) | UPDBASE-0 through UPDBASE-5 |
+| [UPDBASE-7](./UPDBASE-7.md) | Checkbox in backlog editing and creation surfaces | UPDBASE-0 + merged runtime PR |
+| [UPDBASE-8](./UPDBASE-8.md) | Start progress and failure UX | UPDBASE-5, UPDBASE-7 |
+| [UPDBASE-9](./UPDBASE-9.md) | End-to-end verification, documentation, and plan consistency | UPDBASE-7, UPDBASE-8 |
 
 ### 1. Runtime preparation, policy, and Git integration
 
