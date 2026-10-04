@@ -14,6 +14,7 @@ import {
 } from "./cline-compaction-config";
 import type { ContextLimitSource } from "./cline-context-policy";
 import { extractClineSessionId } from "./cline-event-adapter";
+import { createClineInterruptedToolCallRepairHook } from "./cline-interrupted-tool-call-repair";
 import {
 	type ClineMcpRuntimeService,
 	type ClineMcpToolBundle,
@@ -405,21 +406,33 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		// as a local artifact. It complements the SDK's own 50k
 		// request-assembly truncation, which is request-scoped only and
 		// leaves the persisted transcript unbounded.
-		let agentHooks: ClineSdkAgentHooks | undefined;
+		// A tool call interrupted mid-execution leaves the transcript without
+		// its result, and the AI SDK then rejects every later request. The
+		// repair hook always runs first, so compaction sees a well-formed
+		// history (see cline-interrupted-tool-call-repair.ts).
+		const repairInterruptedToolCallsHook = createClineInterruptedToolCallRepairHook({ logger: sessionLogger });
+		let agentHooks: ClineSdkAgentHooks = { beforeModel: repairInterruptedToolCallsHook };
 		if (
 			request.compaction &&
 			typeof request.compaction.contextWindowTokens === "number" &&
 			request.compaction.contextWindowTokens > 0
 		) {
+			const compactionHook = createClineCompactionBeforeModelHook({
+				limitTokens: request.compaction.contextWindowTokens,
+				outputReserveTokens: request.compaction.reserveTokens ?? CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT,
+				safetyMarginTokens: request.compactionSafetyMarginTokens,
+				logger: sessionLogger,
+				// B-10.4: observe proactive (local-mode) compactions.
+				onCompacted: (info) => this.onCompactionObserved?.(request.taskId, info),
+			});
 			agentHooks = {
-				beforeModel: createClineCompactionBeforeModelHook({
-					limitTokens: request.compaction.contextWindowTokens,
-					outputReserveTokens: request.compaction.reserveTokens ?? CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT,
-					safetyMarginTokens: request.compactionSafetyMarginTokens,
-					logger: sessionLogger,
-					// B-10.4: observe proactive (local-mode) compactions.
-					onCompacted: (info) => this.onCompactionObserved?.(request.taskId, info),
-				}),
+				beforeModel: async (context) => {
+					const repaired = await repairInterruptedToolCallsHook(context);
+					const repairedContext = repaired?.messages
+						? { ...context, request: { ...context.request, messages: repaired.messages } }
+						: context;
+					return (await compactionHook(repairedContext)) ?? repaired;
+				},
 				afterTool: createClineToolResultBoundingHook({
 					taskId: request.taskId,
 					limitTokens: request.compaction.contextWindowTokens,
@@ -458,7 +471,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 					compaction: effectiveCompaction,
 					// B-2.5: local-mode proactive compaction guard (see above).
 					// B-2.6: ingestion-time tool-result bounding (see above).
-					...(agentHooks ? { hooks: agentHooks } : {}),
+					hooks: agentHooks,
 				},
 				// Local SDK mode creates its durable record on the first send,
 				// so update() before that turn cannot persist recovery metadata.
