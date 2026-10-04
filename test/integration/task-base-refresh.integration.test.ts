@@ -530,91 +530,95 @@ describe.sequential("task base refresh integration (UPD-0)", () => {
 		});
 	});
 
-	it("queues concurrent refreshes on the per-repo refresh lock while the setup lock stays available", {
-		timeout: 45_000,
-	}, async () => {
-		await withTemporaryHome(async () => {
-			const { path: sandboxRoot, cleanup } = createTempDir("kanban-base-refresh-concurrency-");
-			try {
-				const fixture = createBaseRefreshFixture(sandboxRoot);
-				// An existing worktree: its ensure only takes the setup lock.
-				const existing = await prepareInitialTaskWorktree({
-					cwd: fixture.workspacePath,
-					taskId: "task-existing",
-					baseRef: fixture.baseRef,
-					updateBaseRefBeforeStart: true,
-				});
-				expect(existing.ok).toBe(true);
-
-				// Simulate a slow origin: another process holds the per-repo
-				// base refresh lock (a foreign lockfile) for longer than the
-				// setup lock's default retry budget (~5s).
-				const gitDir = runGit(fixture.workspacePath, ["rev-parse", "--absolute-git-dir"]);
-				const refreshLockDir = join(gitDir, "kanban-task-base-refresh.lock");
-				mkdirSync(refreshLockDir, { recursive: true });
-				writeFileSync(
-					join(refreshLockDir, "cipher"),
-					JSON.stringify({ pid: process.pid, uuid: randomUUID(), stale: 10_000 }),
-				);
-				const releaseHolder = () => rmSync(refreshLockDir, { recursive: true, force: true });
-				const holder = new Promise<void>((resolve) => setTimeout(resolve, 6500)).then(() => {
-					releaseHolder();
-				});
-
-				const ensureTask = (async () => {
-					const startedAt = Date.now();
-					const ensured = await ensureTaskWorktreeIfDoesntExist({
+	it(
+		"queues concurrent refreshes on the per-repo refresh lock while the setup lock stays available",
+		{
+			timeout: 45_000,
+		},
+		async () => {
+			await withTemporaryHome(async () => {
+				const { path: sandboxRoot, cleanup } = createTempDir("kanban-base-refresh-concurrency-");
+				try {
+					const fixture = createBaseRefreshFixture(sandboxRoot);
+					// An existing worktree: its ensure only takes the setup lock.
+					const existing = await prepareInitialTaskWorktree({
 						cwd: fixture.workspacePath,
 						taskId: "task-existing",
 						baseRef: fixture.baseRef,
+						updateBaseRefBeforeStart: true,
 					});
-					return { ensured, elapsedMs: Date.now() - startedAt };
-				})();
-				const [ensureResult, preparedA, preparedB, preparedC] = await Promise.all([
-					ensureTask,
-					prepareInitialTaskWorktree({
-						cwd: fixture.workspacePath,
-						taskId: "task-a",
-						baseRef: fixture.baseRef,
-						updateBaseRefBeforeStart: true,
-					}),
-					prepareInitialTaskWorktree({
-						cwd: fixture.workspacePath,
-						taskId: "task-b",
-						baseRef: fixture.baseRef,
-						updateBaseRefBeforeStart: true,
-					}),
-					prepareInitialTaskWorktree({
-						cwd: fixture.workspacePath,
-						taskId: "task-c",
-						baseRef: fixture.baseRef,
-						updateBaseRefBeforeStart: true,
-					}),
-				]);
+					expect(existing.ok).toBe(true);
 
-				// The setup-lock caller completed promptly — a held refresh
-				// must not starve the ~5s setup-lock retry budget.
-				expect(ensureResult.ensured.ok).toBe(true);
-				expect(ensureResult.elapsedMs).toBeLessThan(4500);
-				// The three concurrent refreshes queued on the refresh lock
-				// (long retries) and all completed after the release.
-				for (const prepared of [preparedA, preparedB, preparedC]) {
-					expect(prepared.ok, JSON.stringify(prepared, null, 2)).toBe(true);
-					if (!prepared.path) {
-						throw new Error("Expected a prepared worktree path");
+					// Simulate a slow origin: another process holds the per-repo
+					// base refresh lock (a foreign lockfile) for longer than the
+					// setup lock's default retry budget (~5s).
+					const gitDir = runGit(fixture.workspacePath, ["rev-parse", "--absolute-git-dir"]);
+					const refreshLockDir = join(gitDir, "kanban-task-base-refresh.lock");
+					mkdirSync(refreshLockDir, { recursive: true });
+					writeFileSync(
+						join(refreshLockDir, "cipher"),
+						JSON.stringify({ pid: process.pid, uuid: randomUUID(), stale: 10_000 }),
+					);
+					const releaseHolder = () => rmSync(refreshLockDir, { recursive: true, force: true });
+					const holder = new Promise<void>((resolve) => setTimeout(resolve, 6500)).then(() => {
+						releaseHolder();
+					});
+
+					const ensureTask = (async () => {
+						const startedAt = Date.now();
+						const ensured = await ensureTaskWorktreeIfDoesntExist({
+							cwd: fixture.workspacePath,
+							taskId: "task-existing",
+							baseRef: fixture.baseRef,
+						});
+						return { ensured, elapsedMs: Date.now() - startedAt };
+					})();
+					const [ensureResult, preparedA, preparedB, preparedC] = await Promise.all([
+						ensureTask,
+						prepareInitialTaskWorktree({
+							cwd: fixture.workspacePath,
+							taskId: "task-a",
+							baseRef: fixture.baseRef,
+							updateBaseRefBeforeStart: true,
+						}),
+						prepareInitialTaskWorktree({
+							cwd: fixture.workspacePath,
+							taskId: "task-b",
+							baseRef: fixture.baseRef,
+							updateBaseRefBeforeStart: true,
+						}),
+						prepareInitialTaskWorktree({
+							cwd: fixture.workspacePath,
+							taskId: "task-c",
+							baseRef: fixture.baseRef,
+							updateBaseRefBeforeStart: true,
+						}),
+					]);
+
+					// The setup-lock caller completed promptly — a held refresh
+					// must not starve the ~5s setup-lock retry budget.
+					expect(ensureResult.ensured.ok).toBe(true);
+					expect(ensureResult.elapsedMs).toBeLessThan(4500);
+					// The three concurrent refreshes queued on the refresh lock
+					// (long retries) and all completed after the release.
+					for (const prepared of [preparedA, preparedB, preparedC]) {
+						expect(prepared.ok, JSON.stringify(prepared, null, 2)).toBe(true);
+						if (!prepared.path) {
+							throw new Error("Expected a prepared worktree path");
+						}
+						expect(runGit(prepared.path, ["rev-parse", "HEAD"])).toBe(fixture.remoteBaseSha);
 					}
-					expect(runGit(prepared.path, ["rev-parse", "HEAD"])).toBe(fixture.remoteBaseSha);
+					// The local base was fast-forwarded once and stays there.
+					expect(runGit(fixture.workspacePath, ["rev-parse", `refs/heads/${fixture.baseRef}`])).toBe(
+						fixture.remoteBaseSha,
+					);
+					await holder;
+				} finally {
+					cleanup();
 				}
-				// The local base was fast-forwarded once and stays there.
-				expect(runGit(fixture.workspacePath, ["rev-parse", `refs/heads/${fixture.baseRef}`])).toBe(
-					fixture.remoteBaseSha,
-				);
-				await holder;
-			} finally {
-				cleanup();
-			}
-		});
-	});
+			});
+		},
+	);
 
 	it("keeps the base refresh and worktree setup locks independent in the same process", async () => {
 		await withTemporaryHome(async () => {
