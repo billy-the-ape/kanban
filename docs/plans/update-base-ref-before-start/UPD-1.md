@@ -5,8 +5,8 @@ This document is a self-contained execution brief for the second implementation 
 
 | Field | Value |
 | --- | --- |
-| Document revision | 2 |
-| Prepared | 2026-10-03 (revision 2: 2026-10-03) |
+| Document revision | 3 |
+| Prepared | 2026-10-03 (revision 2: 2026-10-03, revision 3: 2026-10-04) |
 | Status | Proposed; not started |
 | Source baseline | ba3b7151f44f9ed5d1cb4d83590e98388ae2cac7 (re-verify at start; UPD-0's merged head is the true base) |
 | Fork | https://github.com/billy-the-ape/kanban |
@@ -48,11 +48,13 @@ Explicit non-goals:
   backlog. Adding the policy load/save here is the pattern for backlog editing.
 - `web-ui/src/hooks/use-task-sessions.ts` sends `baseRef` through both `workspace.ensureWorktree` and
   `runtime.startTaskSession`; `use-board-interactions.ts` `kickoffTaskInProgress` currently awaits the
-  ensure before start. UPD-0 changes that sequence (fresh tasks skip the eager ensure; runtime start owns
-  worktree creation after the refresh) and adds the preparation-state contract (server-computed
-  baseline-fixed signal, extended start response); this PR's start-failure handling, optimistic column
-  movement, and progress state build on that contract. The UPD-0 failure shape (ref, category, reason,
-  remedy) plugs into the existing start-failure path.
+  ensure before start. UPD-0 changes that sequence (fresh tasks skip the eager ensure and go straight to
+  runtime start; runtime start owns worktree creation after the refresh) and refuses a generic ensure for
+  a fresh, unstarted task with an actionable failure; it also adds the preparation-state contract
+  (server-computed baseline-fixed signal, live per-task preparation stage with a reconnect/reload
+  snapshot, extended start response); this PR's start-failure handling, optimistic column movement, and
+  progress state build on that contract. The UPD-0 failure shape (ref, category, reason, remedy) plugs
+  into the existing start-failure path.
 - Creation surfaces: `web-ui/src/components/task-create-dialog.tsx` and `task-inline-create-card.tsx`
   expose task options including the base selector; multi-create and child creation follow the same board
   mutation inputs. CLI/API creation defaults were set in UPD-0 and need only regression coverage here.
@@ -73,9 +75,10 @@ Explicit non-goals:
   multi-create, and child creation. Explicit `false` must reach the server unchanged (regression: an
   unchecked box is `false`, not absent). New tasks default to checked via the shared default.
 - [ ] UPD-1.3 Wire start UX: show “Updating base ref…” (or equivalent in the existing start affordance)
-  while the runtime prepares a fresh start for an enabled task; drive it from the UPD-0 preparation-state
-  contract (start response stage/event), not a local heuristic; disable duplicate start submissions for
-  that task during preparation.
+  while the runtime prepares a fresh start for an enabled task; subscribe/poll the live per-task
+  preparation stage UPD-0 delivers (event and/or query, including the reconnect/reload snapshot) and
+  render the delivered status — no local heuristic, no new runtime mechanism; disable duplicate start
+  submissions for that task during preparation.
 - [ ] UPD-1.4 Wire failure UX: on a blocked update, keep the task in backlog (restore it through the
   established start-failure handling if the flow moved the card optimistically), and show the selected
   ref, reason, and remedy from the UPD-0 structured failure. No prompt is sent on failure.
@@ -95,13 +98,13 @@ UPD-0 covers the runtime/Git rows of the PLAN.md matrix; this PR must at minimum
 | --- | --- |
 | Save/edit, inline, multi-create, child creation (UI) | Correct policy persisted and honored by the runtime; explicit false survives every path |
 | New and legacy task defaults in the UI | Checked; legacy tasks without the field read as checked |
-| Start with option enabled | Progress indicator shown during preparation; duplicate starts suppressed; prompt sent only after preparation |
+| Start with option enabled | Progress indicator shown during preparation, driven by the UPD-0 live stage (not a local heuristic); duplicate starts suppressed; prompt sent only after preparation |
 | Blocked update | Card stays in (or returns to) backlog; UI shows selected ref, reason, and remedy; no agent prompt sent |
 | Refresh retry | After the fault (network/dirty/diverged) is removed, starting again succeeds and uses the refreshed SHA |
 | Automated starts | Dispatched tasks honor their persisted policy identically to UI starts |
 | Resume after remote advance | An existing started task's worktree and work are unchanged; no refresh runs |
 | Started task editing | Checkbox hidden/disabled with explanation; saved value untouched |
-| UI reload/reconnect or automated (dispatch) start | Checkbox state re-derived from the UPD-0 server-computed baseline-fixed signal after reload; no client flag drives refresh eligibility, progress, or control visibility |
+| UI reload/reconnect or automated (dispatch) start | Checkbox state re-derived from the UPD-0 server-computed baseline-fixed signal after reload; in-flight preparation stage comes from the UPD-0 event/query snapshot; no client flag drives refresh eligibility, progress, or control visibility |
 
 Run: targeted web-ui tests (`use-task-editor`, `use-task-sessions`, board interactions, create dialogs),
 the targeted runtime/integration suites touched, backend and web typechecks, and the repository's
