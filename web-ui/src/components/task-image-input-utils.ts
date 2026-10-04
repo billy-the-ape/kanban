@@ -1,3 +1,4 @@
+import { createRandomHexId } from "@runtime-task-id";
 import type { TaskImage } from "@/types";
 
 const MAX_IMAGE_SIZE_BYTES = 20 * 1024 * 1024;
@@ -33,7 +34,7 @@ export async function fileToTaskImage(file: File): Promise<TaskImage | null> {
 				return;
 			}
 			resolve({
-				id: crypto.randomUUID().replaceAll("-", "").slice(0, 12),
+				id: createRandomHexId(12),
 				data: base64,
 				mimeType: file.type,
 				name: file.name || undefined,

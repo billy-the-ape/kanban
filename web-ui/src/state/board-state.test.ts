@@ -79,6 +79,18 @@ describe("board dependency state", () => {
 		expect(backlogCards[0]?.id).toBe("4fzzz");
 	});
 
+	it("links tasks when randomUUID is unavailable", () => {
+		const fixture = createBacklogBoard(["Task A", "Task B"]);
+		const taskA = requireTaskId(fixture.taskIdByPrompt["Task A"], "Task A");
+		const taskB = requireTaskId(fixture.taskIdByPrompt["Task B"], "Task B");
+		vi.stubGlobal("crypto", { randomUUID: undefined, getRandomValues: crypto.getRandomValues.bind(crypto) });
+
+		const result = addTaskDependency(fixture.board, taskA, taskB);
+
+		expect(result.added).toBe(true);
+		expect(result.board.dependencies[0]?.id).toMatch(/^[0-9a-f]{8}$/);
+	});
+
 	it("prevents duplicate links in either direction", () => {
 		const fixture = createBacklogBoard(["Task A", "Task B", "Task C"]);
 		const taskA = requireTaskId(fixture.taskIdByPrompt["Task A"], "Task A");
