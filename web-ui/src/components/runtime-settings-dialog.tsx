@@ -367,6 +367,7 @@ export function RuntimeSettingsDialog({
 	const { config, isLoading, isSaving, save, refresh } = useRuntimeConfig(open, workspaceId, initialConfig);
 	const { resetLayoutCustomizations } = useLayoutCustomizations();
 	const [selectedAgentId, setSelectedAgentId] = useState<RuntimeAgentId>("claude");
+	const [clineConcurrencyLimit, setClineConcurrencyLimit] = useState("");
 	const [agentAutonomousModeEnabled, setAgentAutonomousModeEnabled] = useState(true);
 	const [readyForReviewNotificationsEnabled, setReadyForReviewNotificationsEnabled] = useState(true);
 	// B-10.6: reliable completion master switch. `null` means "unchanged" so the
@@ -475,6 +476,12 @@ export function RuntimeSettingsDialog({
 		if (readyForReviewNotificationsEnabled !== initialReadyForReviewNotificationsEnabled) {
 			return true;
 		}
+		if (
+			selectedAgentId === "cline" &&
+			clineConcurrencyLimit.trim() !== (config.clineConcurrencyLimit?.toString() ?? "")
+		) {
+			return true;
+		}
 		if (clineSettings.hasUnsavedChanges) {
 			return true;
 		}
@@ -504,6 +511,7 @@ export function RuntimeSettingsDialog({
 	}, [
 		agentAutonomousModeEnabled,
 		clineMcpSettings.hasUnsavedChanges,
+		clineConcurrencyLimit,
 		clineSettings.hasUnsavedChanges,
 		clineSettings.hasUnsavedContextBudgetChanges,
 		commitPromptTemplate,
@@ -527,6 +535,7 @@ export function RuntimeSettingsDialog({
 			return;
 		}
 		setSelectedAgentId(configuredAgentId ?? fallbackAgentId);
+		setClineConcurrencyLimit(config?.clineConcurrencyLimit?.toString() ?? "");
 		setAgentAutonomousModeEnabled(config?.agentAutonomousModeEnabled ?? true);
 		setReadyForReviewNotificationsEnabled(config?.readyForReviewNotificationsEnabled ?? true);
 		// B-10.6: reset the reliable completion master switch from saved config.
@@ -536,6 +545,7 @@ export function RuntimeSettingsDialog({
 		setOpenPrPromptTemplate(config?.openPrPromptTemplate ?? "");
 		setSaveError(null);
 	}, [
+		config?.clineConcurrencyLimit,
 		config?.agentAutonomousModeEnabled,
 		config?.commitPromptTemplate,
 		config?.openPrPromptTemplate,
@@ -698,6 +708,15 @@ export function RuntimeSettingsDialog({
 			setSaveError("Choose a Cline provider before saving.");
 			return;
 		}
+		const concurrencyOverride = clineConcurrencyLimit.trim() === "" ? null : Number(clineConcurrencyLimit);
+		if (
+			selectedAgentId === "cline" &&
+			concurrencyOverride !== null &&
+			(!Number.isInteger(concurrencyOverride) || concurrencyOverride < 1 || concurrencyOverride > 64)
+		) {
+			setSaveError("Cline concurrency limit must be an integer between 1 and 64, or empty for automatic.");
+			return;
+		}
 		// B-2.9: an invalid context budget draft blocks the whole save.
 		if (selectedAgentId === "cline" && clineSettings.contextBudgetError) {
 			setSaveError(clineSettings.contextBudgetError);
@@ -716,6 +735,10 @@ export function RuntimeSettingsDialog({
 			}
 		}
 		const saved = await save({
+			...(selectedAgentId === "cline" &&
+			clineConcurrencyLimit.trim() !== (config?.clineConcurrencyLimit?.toString() ?? "")
+				? { clineConcurrencyLimit: concurrencyOverride }
+				: {}),
 			selectedAgentId,
 			agentAutonomousModeEnabled,
 			readyForReviewNotificationsEnabled,
@@ -920,6 +943,27 @@ export function RuntimeSettingsDialog({
 									onError={setSaveError}
 									onSaved={handleClineSetupSaved}
 								/>
+								<div className="mt-4">
+									<label
+										htmlFor="cline-concurrency-limit"
+										className="block text-text-primary font-semibold text-[12px] mb-2"
+									>
+										Concurrent Cline turns per model
+									</label>
+									<input
+										id="cline-concurrency-limit"
+										value={clineConcurrencyLimit}
+										onChange={(event) => setClineConcurrencyLimit(event.target.value)}
+										placeholder="Auto (server slots; fallback 1)"
+										inputMode="numeric"
+										disabled={controlsDisabled}
+										className="h-8 w-full rounded-md border border-border bg-surface-2 px-2 text-[13px] text-text-primary placeholder:text-text-tertiary focus:border-border-focus focus:outline-none"
+									/>
+									<p className="text-text-secondary text-[12px] mt-2 mb-0">
+										Leave empty to detect model capacity automatically, or enter 1–64 to override it.
+										Additional turns wait; idle sessions do not use capacity. Changes apply to new turns.
+									</p>
+								</div>
 							</div>
 						</>
 					) : null}

@@ -30,6 +30,7 @@ interface RuntimeGlobalConfigFileShape {
 	readyForReviewNotificationsEnabled?: boolean;
 	commitPromptTemplate?: string;
 	openPrPromptTemplate?: string;
+	clineConcurrencyLimit?: number | null;
 	contextBudget?: RuntimeContextBudget;
 	reviewPolicy?: RuntimeReviewPolicySave;
 	verification?: RuntimeVerificationConfigSave;
@@ -55,6 +56,8 @@ export interface RuntimeConfigState {
 	openPrPromptTemplate: string;
 	commitPromptTemplateDefault: string;
 	openPrPromptTemplateDefault: string;
+	/** Maximum Cline turns per endpoint/model; null or absent discovers server slots (fallback 1). */
+	clineConcurrencyLimit?: number | null;
 	/** B-2.9: global context budget settings; absent means all defaults. */
 	contextBudget?: RuntimeContextBudget;
 	/** B-6: global review lifecycle policy; absent means all defaults (off, 2 repair rounds). */
@@ -75,6 +78,8 @@ export interface RuntimeConfigUpdateInput {
 	shortcuts?: RuntimeProjectShortcut[];
 	commitPromptTemplate?: string;
 	openPrPromptTemplate?: string;
+	/** Null restores automatic capacity discovery; undefined preserves the setting. */
+	clineConcurrencyLimit?: number | null;
 	/** B-2.9: `null` clears all context budget settings; `undefined` leaves them untouched. */
 	contextBudget?: RuntimeContextBudgetSave | null;
 	/** B-6: `null` clears all review policy settings; `undefined` leaves them untouched. */
@@ -238,6 +243,21 @@ function normalizeShortcutLabel(value: unknown): string | null {
 	}
 	const normalized = value.trim();
 	return normalized.length > 0 ? normalized : null;
+}
+
+function normalizeClineConcurrencyLimit(value: unknown): number | null {
+	return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 64 ? value : null;
+}
+
+function validateClineConcurrencyLimit(value: number | null | undefined): void {
+	if (value !== undefined && value !== null && normalizeClineConcurrencyLimit(value) === null) {
+		throw new Error("Cline concurrency limit must be an integer between 1 and 64, or null for automatic.");
+	}
+}
+
+export async function readGlobalRuntimeClineConcurrencyLimit(): Promise<number | null> {
+	const config = await readRuntimeConfigFile<RuntimeGlobalConfigFileShape>(getRuntimeGlobalConfigPath());
+	return normalizeClineConcurrencyLimit(config?.clineConcurrencyLimit);
 }
 
 function normalizeContextBudgetTokenField(value: unknown): number | undefined {
@@ -984,6 +1004,7 @@ function toRuntimeConfigState({
 		),
 		commitPromptTemplateDefault: DEFAULT_COMMIT_PROMPT_TEMPLATE,
 		openPrPromptTemplateDefault: DEFAULT_OPEN_PR_PROMPT_TEMPLATE,
+		clineConcurrencyLimit: normalizeClineConcurrencyLimit(globalConfig?.clineConcurrencyLimit),
 		contextBudget: normalizeContextBudget(globalConfig?.contextBudget),
 		reviewPolicy: normalizeReviewPolicy(globalConfig?.reviewPolicy),
 		verification: normalizeVerificationConfig(globalConfig?.verification),
@@ -1010,6 +1031,7 @@ async function writeRuntimeGlobalConfigFile(
 		readyForReviewNotificationsEnabled?: boolean;
 		commitPromptTemplate?: string;
 		openPrPromptTemplate?: string;
+		clineConcurrencyLimit?: number | null;
 		/** B-2.9: `null` clears the stored context budget; `undefined` preserves the existing one. Null fields clear individual settings (normalized before write). */
 		contextBudget?: RuntimeContextBudgetSave | null;
 		/** B-6: `null` clears the stored review policy; `undefined` preserves the existing one. */
@@ -1081,6 +1103,11 @@ async function writeRuntimeGlobalConfigFile(
 	}
 	if (hasOwnKey(existing, "openPrPromptTemplate") || openPrPromptTemplate !== DEFAULT_OPEN_PR_PROMPT_TEMPLATE) {
 		payload.openPrPromptTemplate = openPrPromptTemplate;
+	}
+	if (config.clineConcurrencyLimit !== undefined) {
+		payload.clineConcurrencyLimit = normalizeClineConcurrencyLimit(config.clineConcurrencyLimit);
+	} else if (existing?.clineConcurrencyLimit !== undefined) {
+		payload.clineConcurrencyLimit = normalizeClineConcurrencyLimit(existing.clineConcurrencyLimit);
 	}
 	if (config.contextBudget !== undefined) {
 		if (config.contextBudget !== null) {
@@ -1214,6 +1241,7 @@ function createRuntimeConfigStateFromValues(input: {
 	shortcuts: RuntimeProjectShortcut[];
 	commitPromptTemplate: string;
 	openPrPromptTemplate: string;
+	clineConcurrencyLimit?: number | null;
 	contextBudget?: RuntimeContextBudgetSave | null;
 	reviewPolicy?: RuntimeReviewPolicySave | null;
 	verification?: RuntimeVerificationConfigSave | null;
@@ -1238,6 +1266,7 @@ function createRuntimeConfigStateFromValues(input: {
 		openPrPromptTemplate: normalizePromptTemplate(input.openPrPromptTemplate, DEFAULT_OPEN_PR_PROMPT_TEMPLATE),
 		commitPromptTemplateDefault: DEFAULT_COMMIT_PROMPT_TEMPLATE,
 		openPrPromptTemplateDefault: DEFAULT_OPEN_PR_PROMPT_TEMPLATE,
+		clineConcurrencyLimit: normalizeClineConcurrencyLimit(input.clineConcurrencyLimit),
 		contextBudget: normalizeContextBudget(input.contextBudget),
 		reviewPolicy: normalizeReviewPolicy(input.reviewPolicy),
 		verification: normalizeVerificationConfig(input.verification),
@@ -1287,6 +1316,7 @@ export function toGlobalRuntimeConfigState(current: RuntimeConfigState): Runtime
 		shortcuts: [],
 		commitPromptTemplate: current.commitPromptTemplate,
 		openPrPromptTemplate: current.openPrPromptTemplate,
+		clineConcurrencyLimit: current.clineConcurrencyLimit,
 		contextBudget: current.contextBudget,
 		reviewPolicy: current.reviewPolicy,
 		verification: current.verification,
@@ -1326,12 +1356,14 @@ export async function saveRuntimeConfig(
 		shortcuts: RuntimeProjectShortcut[];
 		commitPromptTemplate: string;
 		openPrPromptTemplate: string;
+		clineConcurrencyLimit?: number | null;
 		contextBudget?: RuntimeContextBudgetSave | null;
 		reviewPolicy?: RuntimeReviewPolicySave | null;
 		verification?: RuntimeVerificationConfigSave | null;
 		gitDeliveryPolicy?: RuntimeGitDeliveryPolicySave | null;
 	},
 ): Promise<RuntimeConfigState> {
+	validateClineConcurrencyLimit(config.clineConcurrencyLimit);
 	validateContextBudget(config.contextBudget);
 	validateReviewPolicy(config.reviewPolicy);
 	validateVerificationConfig(config.verification);
@@ -1345,6 +1377,7 @@ export async function saveRuntimeConfig(
 			readyForReviewNotificationsEnabled: config.readyForReviewNotificationsEnabled,
 			commitPromptTemplate: config.commitPromptTemplate,
 			openPrPromptTemplate: config.openPrPromptTemplate,
+			clineConcurrencyLimit: config.clineConcurrencyLimit,
 			contextBudget: config.contextBudget,
 			reviewPolicy: config.reviewPolicy,
 			verification: config.verification,
@@ -1361,6 +1394,7 @@ export async function saveRuntimeConfig(
 			shortcuts: config.shortcuts,
 			commitPromptTemplate: config.commitPromptTemplate,
 			openPrPromptTemplate: config.openPrPromptTemplate,
+			clineConcurrencyLimit: config.clineConcurrencyLimit,
 			contextBudget: config.contextBudget,
 			reviewPolicy: config.reviewPolicy,
 			verification: config.verification,
@@ -1370,6 +1404,7 @@ export async function saveRuntimeConfig(
 }
 
 export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpdateInput): Promise<RuntimeConfigState> {
+	validateClineConcurrencyLimit(updates.clineConcurrencyLimit);
 	validateContextBudget(updates.contextBudget);
 	validateReviewPolicy(updates.reviewPolicy);
 	validateVerificationConfig(updates.verification);
@@ -1402,6 +1437,8 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			shortcuts: projectConfigPath ? (updates.shortcuts ?? current.shortcuts) : current.shortcuts,
 			commitPromptTemplate: updates.commitPromptTemplate ?? current.commitPromptTemplate,
 			openPrPromptTemplate: updates.openPrPromptTemplate ?? current.openPrPromptTemplate,
+			clineConcurrencyLimit:
+				updates.clineConcurrencyLimit === undefined ? current.clineConcurrencyLimit : updates.clineConcurrencyLimit,
 			contextBudget: mergedContextBudget === undefined ? current.contextBudget : mergedContextBudget,
 			reviewPolicy: mergedReviewPolicy === undefined ? current.reviewPolicy : mergedReviewPolicy,
 			verification: mergedVerification === undefined ? current.verification : mergedVerification,
@@ -1419,6 +1456,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			nextConfig.commitPromptTemplate !== current.commitPromptTemplate ||
 			nextConfig.openPrPromptTemplate !== current.openPrPromptTemplate ||
 			!areRuntimeProjectShortcutsEqual(nextConfig.shortcuts, current.shortcuts) ||
+			(nextConfig.clineConcurrencyLimit ?? null) !== (current.clineConcurrencyLimit ?? null) ||
 			!areRuntimeContextBudgetsEqual(nextConfig.contextBudget, current.contextBudget) ||
 			!areRuntimeReviewPoliciesEqual(nextConfig.reviewPolicy, current.reviewPolicy) ||
 			!areRuntimeVerificationConfigsEqual(nextConfig.verification, current.verification) ||
@@ -1436,6 +1474,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			readyForReviewNotificationsEnabled: nextConfig.readyForReviewNotificationsEnabled,
 			commitPromptTemplate: nextConfig.commitPromptTemplate,
 			openPrPromptTemplate: nextConfig.openPrPromptTemplate,
+			clineConcurrencyLimit: updates.clineConcurrencyLimit,
 			contextBudget: updates.contextBudget === undefined ? undefined : mergedContextBudget,
 			reviewPolicy: updates.reviewPolicy === undefined ? undefined : mergedReviewPolicy,
 			verification: updates.verification === undefined ? undefined : mergedVerification,
@@ -1455,6 +1494,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			shortcuts: nextConfig.shortcuts,
 			commitPromptTemplate: nextConfig.commitPromptTemplate,
 			openPrPromptTemplate: nextConfig.openPrPromptTemplate,
+			clineConcurrencyLimit: nextConfig.clineConcurrencyLimit,
 			contextBudget: nextConfig.contextBudget,
 			reviewPolicy: nextConfig.reviewPolicy,
 			verification: nextConfig.verification,
@@ -1468,6 +1508,7 @@ export async function updateGlobalRuntimeConfig(
 	current: RuntimeConfigState,
 	updates: RuntimeConfigUpdateInput,
 ): Promise<RuntimeConfigState> {
+	validateClineConcurrencyLimit(updates.clineConcurrencyLimit);
 	validateContextBudget(updates.contextBudget);
 	validateReviewPolicy(updates.reviewPolicy);
 	validateVerificationConfig(updates.verification);
@@ -1505,6 +1546,10 @@ export async function updateGlobalRuntimeConfig(
 				shortcuts: current.shortcuts,
 				commitPromptTemplate: updates.commitPromptTemplate ?? current.commitPromptTemplate,
 				openPrPromptTemplate: updates.openPrPromptTemplate ?? current.openPrPromptTemplate,
+				clineConcurrencyLimit:
+					updates.clineConcurrencyLimit === undefined
+						? current.clineConcurrencyLimit
+						: updates.clineConcurrencyLimit,
 				contextBudget: mergedContextBudget === undefined ? current.contextBudget : mergedContextBudget,
 				reviewPolicy: mergedReviewPolicy === undefined ? current.reviewPolicy : mergedReviewPolicy,
 				verification: mergedVerification === undefined ? current.verification : mergedVerification,
@@ -1522,6 +1567,7 @@ export async function updateGlobalRuntimeConfig(
 				nextConfig.readyForReviewNotificationsEnabled !== current.readyForReviewNotificationsEnabled ||
 				nextConfig.commitPromptTemplate !== current.commitPromptTemplate ||
 				nextConfig.openPrPromptTemplate !== current.openPrPromptTemplate ||
+				(nextConfig.clineConcurrencyLimit ?? null) !== (current.clineConcurrencyLimit ?? null) ||
 				!areRuntimeContextBudgetsEqual(nextConfig.contextBudget, current.contextBudget) ||
 				!areRuntimeReviewPoliciesEqual(nextConfig.reviewPolicy, current.reviewPolicy) ||
 				!areRuntimeVerificationConfigsEqual(nextConfig.verification, current.verification) ||
@@ -1539,6 +1585,7 @@ export async function updateGlobalRuntimeConfig(
 				readyForReviewNotificationsEnabled: nextConfig.readyForReviewNotificationsEnabled,
 				commitPromptTemplate: nextConfig.commitPromptTemplate,
 				openPrPromptTemplate: nextConfig.openPrPromptTemplate,
+				clineConcurrencyLimit: updates.clineConcurrencyLimit,
 				contextBudget: updates.contextBudget === undefined ? undefined : mergedContextBudget,
 				reviewPolicy: updates.reviewPolicy === undefined ? undefined : mergedReviewPolicy,
 				verification: updates.verification === undefined ? undefined : mergedVerification,
@@ -1556,6 +1603,7 @@ export async function updateGlobalRuntimeConfig(
 				shortcuts: nextConfig.shortcuts,
 				commitPromptTemplate: nextConfig.commitPromptTemplate,
 				openPrPromptTemplate: nextConfig.openPrPromptTemplate,
+				clineConcurrencyLimit: nextConfig.clineConcurrencyLimit,
 				contextBudget: nextConfig.contextBudget,
 				reviewPolicy: nextConfig.reviewPolicy,
 				verification: nextConfig.verification,

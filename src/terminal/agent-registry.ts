@@ -154,6 +154,7 @@ export function buildRuntimeConfigResponse(
 		openPrPromptTemplate: runtimeConfig.openPrPromptTemplate,
 		commitPromptTemplateDefault: runtimeConfig.commitPromptTemplateDefault,
 		openPrPromptTemplateDefault: runtimeConfig.openPrPromptTemplateDefault,
+		clineConcurrencyLimit: runtimeConfig.clineConcurrencyLimit ?? null,
 		contextBudget: runtimeConfig.contextBudget ?? null,
 		reviewPolicy: runtimeConfig.reviewPolicy ?? null,
 		verification: runtimeConfig.verification ?? null,

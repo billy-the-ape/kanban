@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { createInMemoryClineSessionRuntime } from "../../../src/cline-sdk/cline-session-runtime";
+import { ClineTurnScheduler } from "../../../src/cline-sdk/cline-turn-scheduler";
 import type { ClineSdkSessionRecord } from "../../../src/cline-sdk/sdk-runtime-boundary";
 
 function createNoopMcpRuntimeService() {
@@ -54,6 +55,35 @@ function createPersistedRecord(input: {
 }
 
 describe("InMemoryClineSessionRuntime", () => {
+	it("does not create an SDK host when disposed during startup preparation", async () => {
+		const mcp = createNoopMcpRuntimeService();
+		const bundle = createDeferred<Awaited<ReturnType<typeof mcp.createToolBundle>>>();
+		mcp.createToolBundle.mockImplementation(() => bundle.promise);
+		const createHost = vi.fn(async () => {
+			throw new Error("SDK host must not start after disposal");
+		});
+		const runtime = createInMemoryClineSessionRuntime({
+			turnScheduler: new ClineTurnScheduler(async () => 1),
+			createSessionHost: createHost,
+			createMcpRuntimeService: () => mcp,
+		});
+		const pending = runtime.startTaskSession({
+			taskId: "canceled-start",
+			cwd: "/tmp/worktree",
+			prompt: "Run",
+			providerId: "anthropic",
+			modelId: "test",
+			systemPrompt: "Test",
+		});
+		const canceled = expect(pending).rejects.toThrow("Cline turn canceled");
+		await vi.waitFor(() => expect(mcp.createToolBundle).toHaveBeenCalled());
+		await runtime.dispose();
+		bundle.resolve({ tools: [], warnings: [], dispose: async () => {} });
+		await canceled;
+		expect(createHost).not.toHaveBeenCalled();
+		expect(runtime.getTaskSessionId("canceled-start")).toBeNull();
+	});
+
 	it("disables SDK MCP settings auto-load when Kanban injects MCP tools", async () => {
 		const fakeHost = {
 			start: vi.fn(async (input: { config?: { sessionId?: string } }) => ({

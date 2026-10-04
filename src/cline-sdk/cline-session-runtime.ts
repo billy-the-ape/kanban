@@ -29,6 +29,7 @@ import {
 	TASK_LAUNCH_CONFIG_METADATA_KEY,
 } from "./cline-task-launch-config";
 import { createClineToolResultBoundingHook } from "./cline-tool-result-bounding-hook";
+import { type ClineTurnScheduler, sharedClineTurnScheduler } from "./cline-turn-scheduler";
 import { CLINE_MODEL_CATALOG_DEFAULTS, SDK_DEFAULT_MODEL_ID, SDK_DEFAULT_PROVIDER_ID } from "./sdk-provider-boundary";
 import {
 	CLINE_SDK_DEFAULT_CONTEXT_WINDOW_TOKENS,
@@ -218,6 +219,7 @@ export interface ClineRestoredWorkspaceRuntime {
 }
 
 export interface CreateInMemoryClineSessionRuntimeOptions {
+	turnScheduler?: ClineTurnScheduler;
 	onTaskEvent?: (taskId: string, event: unknown) => void;
 	createSessionHost?: () => Promise<ClineSessionHostBoundary>;
 	createMcpRuntimeService?: () => ClineMcpRuntimeService;
@@ -259,9 +261,14 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 	private readonly resolveWorkspaceRuntime: ClineWorkspaceRuntimeResolver | null;
 	private readonly onCompactionObserved: ((taskId: string, info: ClineCompactionObservedInfo) => void) | null;
 	private sessionHostPromise: Promise<ClineSessionHostBoundary> | null = null;
+	private readonly turnScheduler: ClineTurnScheduler;
+	private readonly schedulerOwner = Symbol("cline-runtime");
+	private readonly turnGenerationByTaskId = new Map<string, number>();
+	private disposed = false;
 
 	constructor(options: CreateInMemoryClineSessionRuntimeOptions = {}) {
 		this.onTaskEvent = options.onTaskEvent ?? null;
+		this.turnScheduler = options.turnScheduler ?? sharedClineTurnScheduler;
 		this.createSessionHost = options.createSessionHost ?? createClineSdkSessionHost;
 		this.resolveClineLaunchConfig = options.resolveClineLaunchConfig ?? null;
 		this.resolveWorkspaceRuntime = options.resolveWorkspaceRuntime ?? null;
@@ -271,7 +278,21 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 	}
 
 	async startTaskSession(request: StartClineSessionRuntimeRequest): Promise<StartClineSessionRuntimeResult> {
-		this.assertSingleActiveClineSession(request.taskId);
+		if (this.disposed) throw new Error("Cline runtime disposed.");
+		return this.turnScheduler.run(
+			this.schedulerOwner,
+			request.taskId,
+			request,
+			(signal) => this.startAdmittedTaskSession(request, signal),
+			(queued) => this.emitConcurrencyState(request.taskId, queued),
+			request.prompt.trim().length > 0 || Boolean(toSdkUserImages(request.images)?.length),
+		);
+	}
+
+	private async startAdmittedTaskSession(
+		request: StartClineSessionRuntimeRequest,
+		signal: AbortSignal,
+	): Promise<StartClineSessionRuntimeResult> {
 		const requestedSessionId = createSessionId(request.taskId);
 		const resolvedMode: RuntimeTaskSessionMode = request.mode ?? "act";
 		this.lastStartRequestByTaskId.set(request.taskId, {
@@ -309,6 +330,11 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		this.replaceTaskMcpToolBundle(request.taskId, mcpToolBundle);
 		const hasMcpExtraTools = Boolean(mcpToolBundle && mcpToolBundle.tools.length > 0);
 
+		if (signal.aborted) {
+			this.clearTaskSessionBinding(request.taskId, requestedSessionId);
+			await this.releaseTaskMcpToolBundle(request.taskId);
+			signal.throwIfAborted();
+		}
 		const sessionHost = await this.ensureSessionHost();
 		const userImages = toSdkUserImages(request.images);
 		const shouldSendInitialTurn = request.prompt.trim().length > 0 || Boolean(userImages?.length);
@@ -402,6 +428,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			};
 		}
 		try {
+			signal.throwIfAborted();
 			// Hub-backed SDK hosts create the interactive session in start; the first turn runs through send.
 			startResult = await sessionHost.start({
 				config: {
@@ -479,6 +506,12 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			throw error;
 		}
 
+		if (signal.aborted) {
+			await sessionHost.abort(startResult.sessionId).catch(() => undefined);
+			this.clearTaskSessionBinding(request.taskId, requestedSessionId);
+			await this.releaseTaskMcpToolBundle(request.taskId);
+			signal.throwIfAborted();
+		}
 		this.bindTaskSession(request.taskId, startResult.sessionId);
 		if (startResult.sessionId !== requestedSessionId) {
 			this.taskIdBySessionId.delete(requestedSessionId);
@@ -506,26 +539,19 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		};
 	}
 
-	/**
-	 * B-2.8 single-worker guard: at most one live Cline session per workspace
-	 * runtime — the default target workflow runs a single model worker
-	 * (typically a local model), and concurrent sessions would overload it.
-	 * The check is race-free: startTaskSession binds the requested session
-	 * synchronously before its first await, so overlapping starts for distinct
-	 * tasks can never both pass. A blocked start runs before any state write,
-	 * so it leaves no orphaned bindings or start-request snapshots.
-	 * Same-task starts (replace / resume-from-trash) are unaffected. Queuing
-	 * or parallel scheduling is B-11.
-	 */
-	private assertSingleActiveClineSession(requestTaskId: string): void {
-		for (const [taskId] of this.sessionIdByTaskId) {
-			if (taskId !== requestTaskId) {
-				throw new Error(
-					`Another Cline session is already active (task "${taskId}"). ` +
-						`Cline sessions run one at a time by default: stop that session before starting this one.`,
-				);
-			}
+	private cancelPendingTaskTurns(taskId: string): void {
+		this.turnGenerationByTaskId.set(taskId, (this.turnGenerationByTaskId.get(taskId) ?? 0) + 1);
+		this.turnScheduler.cancel(this.schedulerOwner, taskId);
+	}
+
+	private assertCurrentTurnGeneration(taskId: string, generation: number): void {
+		if (this.disposed || generation !== (this.turnGenerationByTaskId.get(taskId) ?? 0)) {
+			throw new Error("Cline turn canceled.");
 		}
+	}
+
+	private emitConcurrencyState(taskId: string, queued: boolean): void {
+		this.onTaskEvent?.(taskId, { type: "kanban_concurrency", queued });
 	}
 
 	async restartTaskSession(input: {
@@ -536,7 +562,9 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		mode?: RuntimeTaskSessionMode;
 		contextWindowCapTokens?: number;
 	}): Promise<StartClineSessionRuntimeResult> {
+		const generation = this.turnGenerationByTaskId.get(input.taskId) ?? 0;
 		const restartRequest = await this.resolveRestartStartRequest(input.taskId);
+		this.assertCurrentTurnGeneration(input.taskId, generation);
 		if (!restartRequest) {
 			throw new Error(`No previous Cline session config is available for task ${input.taskId}.`);
 		}
@@ -544,6 +572,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		// running for this task. Abort it before starting a replacement; keep
 		// the persisted record for transcript recovery.
 		await this.abortSupersededTaskSessions(input.taskId);
+		this.assertCurrentTurnGeneration(input.taskId, generation);
 		const cappedLimit =
 			input.contextWindowCapTokens && restartRequest.compaction
 				? Math.min(
@@ -710,6 +739,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		images?: RuntimeTaskImage[],
 		delivery?: "queue" | "steer",
 	): Promise<unknown> {
+		const generation = this.turnGenerationByTaskId.get(taskId) ?? 0;
 		const sessionId = this.sessionIdByTaskId.get(taskId);
 		if (!sessionId) {
 			throw new Error(`No active Cline session for task ${taskId}.`);
@@ -719,12 +749,40 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			this.updateActiveSessionMode(sessionHost, sessionId, mode);
 			this.updateLastStartRequestMode(taskId, mode);
 		}
-		return await sessionHost.send({
-			sessionId,
-			prompt,
-			userImages: toSdkUserImages(images),
-			...(delivery ? { delivery } : {}),
-		});
+		const target = this.lastStartRequestByTaskId.get(taskId);
+		const record = target ? null : await this.findPersistedTaskSessionRecord(taskId, sessionHost);
+		const persistedTarget = record
+			? {
+					providerId: record.provider || SDK_DEFAULT_PROVIDER_ID,
+					modelId: record.model || SDK_DEFAULT_MODEL_ID,
+				}
+			: null;
+		const resolvedTarget =
+			persistedTarget && this.resolveClineLaunchConfig
+				? await this.resolveClineLaunchConfig({
+						providerIdOverride: persistedTarget.providerId,
+						modelIdOverride: persistedTarget.modelId,
+					})
+				: persistedTarget;
+		// Sending to a live resumed session needs capacity metadata, not a rebuilt system prompt.
+		this.assertCurrentTurnGeneration(taskId, generation);
+		const turnTarget = target ?? resolvedTarget;
+		if (!turnTarget) throw new Error(`No Cline launch config is available for task ${taskId}.`);
+		return this.turnScheduler.run(
+			this.schedulerOwner,
+			taskId,
+			turnTarget,
+			async (signal) => {
+				signal.throwIfAborted();
+				return sessionHost.send({
+					sessionId,
+					prompt,
+					userImages: toSdkUserImages(images),
+					...(delivery ? { delivery } : {}),
+				});
+			},
+			(queued) => this.emitConcurrencyState(taskId, queued),
+		);
 	}
 
 	async resumeTaskSession(taskId: string): Promise<ClinePersistedTaskSessionSnapshot | null> {
@@ -761,6 +819,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 	}
 
 	async stopTaskSession(taskId: string): Promise<void> {
+		this.cancelPendingTaskTurns(taskId);
 		const sessionId = this.sessionIdByTaskId.get(taskId);
 		if (!sessionId) {
 			try {
@@ -790,6 +849,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 	}
 
 	async abortTaskSession(taskId: string): Promise<void> {
+		this.cancelPendingTaskTurns(taskId);
 		const sessionId = this.sessionIdByTaskId.get(taskId);
 		if (!sessionId) {
 			try {
@@ -819,6 +879,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 	}
 
 	async clearTaskSessions(taskId: string): Promise<void> {
+		this.cancelPendingTaskTurns(taskId);
 		const sessionHost = await this.ensureSessionHost();
 		const sessionIdPrefix = buildSessionIdPrefix(taskId);
 		const records = await sessionHost.list();
@@ -865,6 +926,8 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 	}
 
 	async dispose(): Promise<void> {
+		this.disposed = true;
+		this.turnScheduler.cancel(this.schedulerOwner);
 		const hostPromise = this.sessionHostPromise;
 		this.sessionHostPromise = null;
 		if (hostPromise) {

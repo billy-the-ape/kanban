@@ -1,4 +1,4 @@
-// B-2.8 — Same policy across all session phases; serialized local-model usage.
+// Restart policy remains consistent across session phases; model turns share a bounded queue.
 //
 // Drives the real InMemoryClineTaskSessionService through the real
 // InMemoryClineSessionRuntime against the in-memory fake session host and
@@ -12,15 +12,13 @@
 //    resolver — not cache-and-replay the start-time snapshot — and the
 //    restarted SDK session must carry the same compaction policy.
 //
-// 2. Single-worker guard: while a Cline session is active, a start for a
-//    different task fails with an explicit, user-readable error, leaves no
-//    orphaned state, and is recoverable once the active session is stopped.
-//    (Queuing / parallel scheduling is B-11, deliberately out of scope.)
+// 2. Capacity is held by running turns; excess tasks wait and can be canceled.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { buildClineCompactionConfig } from "../../../src/cline-sdk/cline-compaction-config";
 import type { ResolvedClineLaunchConfig } from "../../../src/cline-sdk/cline-provider-service";
 import type { ClineTaskSessionService } from "../../../src/cline-sdk/cline-task-session-service";
+import { ClineTurnScheduler } from "../../../src/cline-sdk/cline-turn-scheduler";
 import {
 	createTaskSessionServiceHarness,
 	type TaskSessionServiceHarness,
@@ -243,159 +241,144 @@ describe("B-2.8 — restart policy re-resolution", () => {
 	});
 });
 
-describe("B-2.8 — single-worker guard", () => {
-	it("blocks a second start while a Cline session is active and recovers after stop", async () => {
-		const harness = createTaskSessionServiceHarness();
+function deferredTurn() {
+	let resolve: () => void = () => {};
+	const promise = new Promise<void>((done) => {
+		resolve = done;
+	});
+	return { promise, resolve };
+}
+
+describe("model turn scheduling", () => {
+	it("runs two turns and queues a third without an error, then releases on turn completion", async () => {
+		const gate = deferredTurn();
+		const scheduler = new ClineTurnScheduler(async () => 2);
+		const harness = createTaskSessionServiceHarness({
+			turnScheduler: scheduler,
+			onTurn: async () => {
+				await gate.promise;
+				return "done";
+			},
+		});
 		services.push(harness);
-		const { service, host } = harness;
-
-		await service.startTaskSession({
-			taskId: "task-worker-a",
-			cwd: "/tmp/worktree",
-			prompt: "Worker A prompt",
-		});
-		await vi.waitFor(() => {
-			expect(host.startedConfigs.length).toBe(1);
-		});
-
-		await service.startTaskSession({
-			taskId: "task-worker-b",
-			cwd: "/tmp/worktree",
-			prompt: "Worker B prompt",
-		});
-		await vi.waitFor(() => {
-			expect(service.getSummary("task-worker-b")?.reviewReason).toBe("error");
-		});
-
-		const blockedSummary = service.getSummary("task-worker-b");
-		expect(blockedSummary?.warningMessage).toContain("Another Cline session is already active");
-		expect(blockedSummary?.warningMessage).toContain("task-worker-a");
-		// No orphaned half-start: only A's session was created, and A is
-		// unaffected.
-		expect(host.startedConfigs.length).toBe(1);
-		expect(service.getSummary("task-worker-a")?.reviewReason).not.toBe("error");
-
-		// Recoverable: stop the active session, clear the blocked task's
-		// failed entry (the same /clear path the UI exposes), and start it.
-		await service.stopTaskSession("task-worker-a");
-		await service.clearTaskSession("task-worker-b");
-		await service.startTaskSession({
-			taskId: "task-worker-b",
-			cwd: "/tmp/worktree",
-			prompt: "Worker B prompt (retry)",
-		});
-		await vi.waitFor(() => {
-			expect(host.startedConfigs.length).toBe(2);
-		});
-		expect(service.getSummary("task-worker-b")?.reviewReason).not.toBe("error");
+		try {
+			for (const taskId of ["a", "b", "c"]) {
+				await harness.service.startTaskSession({ taskId, cwd: "/tmp/worktree", prompt: taskId });
+			}
+			await vi.waitFor(() => expect(harness.host.sentPrompts).toHaveLength(2));
+			await vi.waitFor(() =>
+				expect(harness.service.getSummary("c")?.latestHookActivity?.activityText).toBe(
+					"Waiting for model capacity",
+				),
+			);
+			expect(harness.service.getSummary("c")?.reviewReason).not.toBe("error");
+			gate.resolve();
+			await vi.waitFor(() => expect(harness.host.sentPrompts).toHaveLength(3));
+			// All SDK sessions remain bound in this fake host, but idle sessions do not block a new turn.
+			await harness.service.startTaskSession({ taskId: "d", cwd: "/tmp/worktree", prompt: "next" });
+			await vi.waitFor(() => expect(harness.host.sentPrompts).toHaveLength(4));
+		} finally {
+			gate.resolve();
+		}
 	});
 
-	it("starts exactly one session for two overlapping starts", async () => {
-		const harness = createTaskSessionServiceHarness();
+	it("cancels a queued task on pause so it never starts later", async () => {
+		const gate = deferredTurn();
+		const harness = createTaskSessionServiceHarness({
+			onTurn: async () => {
+				await gate.promise;
+				return "done";
+			},
+		});
 		services.push(harness);
-		const { service, host } = harness;
-
-		await Promise.all([
-			service.startTaskSession({
-				taskId: "task-race-a",
-				cwd: "/tmp/worktree",
-				prompt: "Race A prompt",
-			}),
-			service.startTaskSession({
-				taskId: "task-race-b",
-				cwd: "/tmp/worktree",
-				prompt: "Race B prompt",
-			}),
-		]);
-		await vi.waitFor(() => {
-			expect(host.startedConfigs.length).toBe(1);
-		});
-		await vi.waitFor(() => {
-			const a = service.getSummary("task-race-a");
-			const b = service.getSummary("task-race-b");
-			expect((a?.reviewReason === "error") !== (b?.reviewReason === "error")).toBe(true);
-		});
-
-		const aSummary = service.getSummary("task-race-a");
-		const bSummary = service.getSummary("task-race-b");
-		const blocked = aSummary?.reviewReason === "error" ? aSummary : bSummary;
-		const winnerTaskId = aSummary?.reviewReason === "error" ? "task-race-b" : "task-race-a";
-		const loserTaskId = aSummary?.reviewReason === "error" ? "task-race-a" : "task-race-b";
-		// Exactly one explicit guard failure, naming the blocking task.
-		expect(blocked?.warningMessage).toContain("Another Cline session is already active");
-		expect(blocked?.warningMessage).toContain(winnerTaskId);
-		expect(host.startedConfigs.length).toBe(1);
-
-		// Recoverable: stop the winner, clear the loser's failed entry, start it.
-		await service.stopTaskSession(winnerTaskId);
-		await service.clearTaskSession(loserTaskId);
-		await service.startTaskSession({
-			taskId: loserTaskId,
-			cwd: "/tmp/worktree",
-			prompt: "Loser retry prompt",
-		});
-		await vi.waitFor(() => {
-			expect(host.startedConfigs.length).toBe(2);
-		});
-		expect(service.getSummary(loserTaskId)?.reviewReason).not.toBe("error");
+		try {
+			await harness.service.startTaskSession({ taskId: "active", cwd: "/tmp/worktree", prompt: "active" });
+			await vi.waitFor(() => expect(harness.host.sentPrompts).toHaveLength(1));
+			await harness.service.startTaskSession({ taskId: "queued", cwd: "/tmp/worktree", prompt: "queued" });
+			await vi.waitFor(() =>
+				expect(harness.service.getSummary("queued")?.latestHookActivity?.hookEventName).toBe("concurrency_waiting"),
+			);
+			await harness.service.stopTaskSession("queued");
+			gate.resolve();
+			await harness.service.startTaskSession({ taskId: "next", cwd: "/tmp/worktree", prompt: "next" });
+			await vi.waitFor(() => expect(harness.host.sentPrompts).toHaveLength(2));
+			expect(harness.host.startedConfigs).toHaveLength(2);
+			expect(harness.service.getSummary("queued")?.state).toBe("interrupted");
+		} finally {
+			gate.resolve();
+		}
 	});
 
-	it("blocks a review/repair prompt restart while another session is active, then lands the prompt on a policy-carrying session", async () => {
+	it("cancels a restart while launch policy is being resolved", async () => {
+		const policyGate = deferredTurn();
+		const resolving = vi.fn();
+		const harness = createTaskSessionServiceHarness({
+			resolveClineLaunchConfig: async () => {
+				resolving();
+				await policyGate.promise;
+				return makeLaunchConfig();
+			},
+		});
+		services.push(harness);
+		try {
+			await harness.service.startTaskSession({ taskId: "restart", cwd: "/tmp/worktree", prompt: "initial" });
+			await vi.waitFor(() => expect(harness.host.sentPrompts).toHaveLength(1));
+			await endLastSession(harness.service, harness.host, "restart");
+			await harness.service.sendTaskSessionInput("restart", "resume");
+			await vi.waitFor(() => expect(resolving).toHaveBeenCalled());
+			await harness.service.stopTaskSession("restart");
+			policyGate.resolve();
+			await harness.service.startTaskSession({ taskId: "next", cwd: "/tmp/worktree", prompt: "next" });
+			await vi.waitFor(() => expect(harness.host.sentPrompts).toHaveLength(2));
+			expect(harness.host.startedConfigs).toHaveLength(2);
+			expect(harness.service.getSummary("restart")?.state).toBe("interrupted");
+		} finally {
+			policyGate.resolve();
+		}
+	});
+
+	it("queues a follow-up while another turn is active, then delivers it with the restart policy", async () => {
+		const gate = deferredTurn();
 		const launchConfig = makeLaunchConfig();
-		const resolveClineLaunchConfig = vi.fn(async () => launchConfig);
-		const harness = createTaskSessionServiceHarness({ resolveClineLaunchConfig });
+		const harness = createTaskSessionServiceHarness({
+			resolveClineLaunchConfig: async () => launchConfig,
+			onTurn: async ({ prompt }) => {
+				if (prompt === "Background") await gate.promise;
+				return "done";
+			},
+		});
 		services.push(harness);
-		const { service, host } = harness;
-
-		// Task under review: implementation turn completes, session ends.
-		await service.startTaskSession({
-			taskId: "task-review",
-			cwd: "/tmp/worktree",
-			prompt: "Implement the fix",
-			providerId: launchConfig.providerId,
-			modelId: launchConfig.modelId,
-			apiKey: launchConfig.apiKey,
-			baseUrl: launchConfig.baseUrl,
-			contextWindowTokens: launchConfig.contextWindowTokens,
-			contextWindowSource: launchConfig.contextWindowSource,
-			compaction: buildClineCompactionConfig({ launchConfig }),
-		});
-		await vi.waitFor(() => {
-			expect(host.sentPrompts.length).toBe(1);
-		});
-		await endLastSession(service, host, "task-review");
-
-		// Another task becomes the active worker.
-		await service.startTaskSession({
-			taskId: "task-active",
-			cwd: "/tmp/worktree",
-			prompt: "Background work",
-		});
-		await vi.waitFor(() => {
-			expect(host.startedConfigs.length).toBe(2);
-		});
-
-		// The auto-commit (review/repair) prompt reaches the review task
-		// while the other session is active → explicit guard failure.
-		await service.sendTaskSessionInput("task-review", AUTO_COMMIT_PROMPT);
-		await vi.waitFor(() => {
-			expect(service.getSummary("task-review")?.reviewReason).toBe("error");
-		});
-		const blockedSummary = service.getSummary("task-review");
-		expect(blockedSummary?.warningMessage).toContain("Another Cline session is already active");
-		expect(blockedSummary?.warningMessage).toContain("task-active");
-		expect(host.startedConfigs.length).toBe(2);
-
-		// Once the active session is stopped, the same prompt restarts the
-		// review session — carrying the same compaction policy.
-		await service.stopTaskSession("task-active");
-		await service.sendTaskSessionInput("task-review", AUTO_COMMIT_PROMPT);
-		await vi.waitFor(() => {
-			expect(host.startedConfigs.length).toBe(3);
-		});
-		expect(host.startedConfigs[2]?.compaction).toBeDefined();
-		expect(host.startedConfigs[2]?.compaction).toEqual(host.startedConfigs[0]?.compaction);
-		expect(host.sentPrompts.at(-1)?.prompt).toBe(AUTO_COMMIT_PROMPT);
-		expect(service.getSummary("task-review")?.reviewReason).not.toBe("error");
+		try {
+			await harness.service.startTaskSession({
+				taskId: "review",
+				cwd: "/tmp/worktree",
+				prompt: "Implement",
+				providerId: launchConfig.providerId,
+				modelId: launchConfig.modelId,
+				baseUrl: launchConfig.baseUrl,
+				compaction: buildClineCompactionConfig({ launchConfig }),
+			});
+			await vi.waitFor(() => expect(harness.host.sentPrompts).toHaveLength(1));
+			await endLastSession(harness.service, harness.host, "review");
+			await harness.service.startTaskSession({
+				taskId: "active",
+				cwd: "/tmp/worktree",
+				prompt: "Background",
+				providerId: launchConfig.providerId,
+				modelId: launchConfig.modelId,
+				baseUrl: launchConfig.baseUrl,
+			});
+			await vi.waitFor(() => expect(harness.host.sentPrompts).toHaveLength(2));
+			await harness.service.sendTaskSessionInput("review", AUTO_COMMIT_PROMPT);
+			await vi.waitFor(() =>
+				expect(harness.service.getSummary("review")?.latestHookActivity?.hookEventName).toBe("concurrency_waiting"),
+			);
+			gate.resolve();
+			await vi.waitFor(() => expect(harness.host.sentPrompts).toHaveLength(3));
+			expect(harness.host.sentPrompts.at(-1)?.prompt).toBe(AUTO_COMMIT_PROMPT);
+			expect(harness.host.startedConfigs.at(-1)?.compaction).toBeDefined();
+		} finally {
+			gate.resolve();
+		}
 	});
 });
