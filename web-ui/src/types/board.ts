@@ -47,6 +47,8 @@ export interface BoardCard {
 	agentId?: RuntimeAgentId;
 	clineSettings?: RuntimeTaskClineSettings;
 	baseRef: string;
+	/** UPD-0: missing values normalize to true; an explicit false disables the pre-start base refresh. */
+	updateBaseRefBeforeStart?: boolean;
 	createdAt: number;
 	updatedAt: number;
 }

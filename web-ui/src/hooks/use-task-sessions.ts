@@ -11,6 +11,7 @@ import { estimateTaskSessionGeometry } from "@/runtime/task-session-geometry";
 import { getRuntimeTrpcClient } from "@/runtime/trpc-client";
 import type {
 	RuntimeTaskChatMessage,
+	RuntimeTaskInitialStartStatusResponse,
 	RuntimeTaskSessionMode,
 	RuntimeTaskSessionSummary,
 	RuntimeTaskWorkspaceInfoResponse,
@@ -51,6 +52,13 @@ interface StartTaskSessionOptions {
 export interface UseTaskSessionsResult {
 	upsertSession: (summary: RuntimeTaskSessionSummary) => void;
 	ensureTaskWorkspace: (task: BoardCard) => Promise<EnsureTaskWorkspaceResult>;
+	/**
+	 * UPD-0: pollable initial-start preparation status. Callers use
+	 * `initialStartBaselineFixed` to distinguish fresh, unstarted tasks (server-
+	 * derived; never a local heuristic) from tasks that already have a fixed
+	 * baseline and keep the pre-start ensure.
+	 */
+	getTaskInitialStartStatus: (taskId: string) => Promise<RuntimeTaskInitialStartStatusResponse | null>;
 	startTaskSession: (task: BoardCard, options?: StartTaskSessionOptions) => Promise<StartTaskSessionResult>;
 	stopTaskSession: (taskId: string) => Promise<void>;
 	sendTaskSessionInput: (
@@ -186,6 +194,24 @@ export function useTaskSessions({ currentProjectId, setSessions }: UseTaskSessio
 		[currentProjectId, upsertSession],
 	);
 
+	// UPD-0: durable, server-derived preparation status for the start path.
+	// Null on transport errors so callers fall back to the conservative
+	// (ensure-before-start) behavior instead of skipping preparation work.
+	const getTaskInitialStartStatus = useCallback(
+		async (taskId: string): Promise<RuntimeTaskInitialStartStatusResponse | null> => {
+			if (!currentProjectId) {
+				return null;
+			}
+			try {
+				const trpcClient = getRuntimeTrpcClient(currentProjectId);
+				return await trpcClient.runtime.taskInitialStartStatus.query({ taskId });
+			} catch {
+				return null;
+			}
+		},
+		[currentProjectId],
+	);
+
 	const stopTaskSession = useCallback(
 		async (taskId: string): Promise<void> => {
 			if (!currentProjectId) {
@@ -287,6 +313,7 @@ export function useTaskSessions({ currentProjectId, setSessions }: UseTaskSessio
 		upsertSession,
 		ensureTaskWorkspace,
 		startTaskSession,
+		getTaskInitialStartStatus,
 		stopTaskSession,
 		sendTaskSessionInput,
 		sendTaskChatMessage,

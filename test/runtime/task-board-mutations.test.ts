@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { RuntimeBoardData } from "../../src/core/api-contract";
+import { type RuntimeBoardData, runtimeBoardDataSchema } from "../../src/core/api-contract";
 import {
 	addTaskDependency,
 	addTaskToColumn,
@@ -102,6 +102,81 @@ describe("task images", () => {
 				mimeType: "image/jpeg",
 			},
 		]);
+	});
+});
+
+describe("updateBaseRefBeforeStart policy (UPD-0.1)", () => {
+	it("defaults a new task to checked when the field is absent", () => {
+		const created = addTaskToColumn(createBoard(), "backlog", { prompt: "Task", baseRef: "main" }, () => "aaaaa111");
+		expect(created.task.updateBaseRefBeforeStart).toBe(true);
+	});
+
+	it("persists an explicit false and survives update and move round-trips", () => {
+		const created = addTaskToColumn(
+			createBoard(),
+			"backlog",
+			{ prompt: "Task", baseRef: "main", updateBaseRefBeforeStart: false },
+			() => "aaaaa111",
+		);
+		expect(created.task.updateBaseRefBeforeStart).toBe(false);
+
+		// An update that omits the field keeps the persisted value (no
+		// truthy fallback overwriting false).
+		const updated = updateTask(created.board, created.task.id, { prompt: "Task", baseRef: "main" });
+		expect(updated.task?.updateBaseRefBeforeStart).toBe(false);
+
+		// Explicit toggles both directions are honored.
+		const rechecked = updateTask(updated.board, created.task.id, {
+			prompt: "Task",
+			baseRef: "main",
+			updateBaseRefBeforeStart: true,
+		});
+		expect(rechecked.task?.updateBaseRefBeforeStart).toBe(true);
+
+		const unchecked = updateTask(rechecked.board, created.task.id, {
+			prompt: "Task",
+			baseRef: "main",
+			updateBaseRefBeforeStart: false,
+		});
+		expect(unchecked.task?.updateBaseRefBeforeStart).toBe(false);
+
+		const moved = moveTaskToColumn(unchecked.board, created.task.id, "in_progress", 1234);
+		expect(moved.task?.updateBaseRefBeforeStart).toBe(false);
+	});
+
+	it("keeps the board schema backward compatible and preserves an explicit false on reload", () => {
+		// Explicit false survives the persisted-board schema round-trip.
+		const created = addTaskToColumn(
+			createBoard(),
+			"backlog",
+			{ prompt: "Task", baseRef: "main", updateBaseRefBeforeStart: false },
+			() => "aaaaa111",
+		);
+		const reloaded = runtimeBoardDataSchema.parse(created.board);
+		const reloadedCard = reloaded.columns.find((column) => column.id === "backlog")?.cards.at(0);
+		expect(reloadedCard?.updateBaseRefBeforeStart).toBe(false);
+
+		// A legacy card without the field still parses, and the consumer
+		// normalization (absent means checked) reads it as true.
+		const legacyBoard: RuntimeBoardData = {
+			...created.board,
+			columns: created.board.columns.map((column) =>
+				column.id === "backlog"
+					? {
+							...column,
+							cards: column.cards.map((card) => {
+								const { updateBaseRefBeforeStart: _dropped, ...rest } = card;
+								return rest as typeof card;
+							}),
+						}
+					: column,
+			),
+		};
+		const parsedLegacy = runtimeBoardDataSchema.parse(legacyBoard);
+		const legacyCard = parsedLegacy.columns.find((column) => column.id === "backlog")?.cards.at(0);
+		expect(legacyCard?.updateBaseRefBeforeStart).toBeUndefined();
+		// The same normalization the start path and board state use:
+		expect(legacyCard?.updateBaseRefBeforeStart !== false).toBe(true);
 	});
 });
 

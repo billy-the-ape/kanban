@@ -145,6 +145,12 @@ export const runtimeBoardCardSchema = z
 		clineModelId: z.string().optional(),
 		clineReasoningEffort: runtimeLegacyTaskClineReasoningEffortSchema.optional(),
 		baseRef: z.string(),
+		/**
+		 * UPD-0: whether the start lifecycle refreshes the origin-backed base ref
+		 * before creating a fresh task's worktree. Missing values normalize to
+		 * true; an explicit false is honored as-is.
+		 */
+		updateBaseRefBeforeStart: z.boolean().optional(),
 		createdAt: z.number(),
 		updatedAt: z.number(),
 	})
@@ -561,9 +567,80 @@ export const runtimeWorktreeEnsureResponseSchema = z.union([
 		baseRef: z.string(),
 		baseCommit: z.null(),
 		error: z.string().optional(),
+		/** UPD-0: named failure category (e.g. initial_start_preparation_required). */
+		category: z.string().optional(),
+		/** UPD-0: what the user can do about this failure. */
+		remedy: z.string().optional(),
 	}),
 ]);
 export type RuntimeWorktreeEnsureResponse = z.infer<typeof runtimeWorktreeEnsureResponseSchema>;
+
+// ---------------------------------------------------------------------------
+// UPD-0: base-ref refresh before initial start (preparation + baseline record).
+// ---------------------------------------------------------------------------
+
+export const runtimeTaskBaseRefreshFailureCategorySchema = z.enum([
+	"missing_origin",
+	"missing_remote_branch",
+	"unsupported_ref",
+	"dirty_checkout",
+	"local_ahead_or_diverged",
+	"auth_or_network_timeout",
+	"concurrent_change",
+	"worktree_setup_failed",
+]);
+export type RuntimeTaskBaseRefreshFailureCategory = z.infer<typeof runtimeTaskBaseRefreshFailureCategorySchema>;
+
+export const runtimeTaskBaseRefreshFailureSchema = z.object({
+	category: runtimeTaskBaseRefreshFailureCategorySchema,
+	reason: z.string(),
+	remedy: z.string(),
+	/** The base ref the failing refresh was attempted against. */
+	selectedRef: z.string().nullable().default(null),
+});
+export type RuntimeTaskBaseRefreshFailure = z.infer<typeof runtimeTaskBaseRefreshFailureSchema>;
+
+export const runtimeTaskInitialStartStageSchema = z.enum([
+	"idle",
+	"refreshing",
+	"creating_worktree",
+	"recording_baseline",
+	"ready",
+	"blocked",
+]);
+export type RuntimeTaskInitialStartStage = z.infer<typeof runtimeTaskInitialStartStageSchema>;
+
+/** Terminal preparation outcome surfaced on the task-start response. */
+export const runtimeTaskInitialStartOutcomeSchema = z.object({
+	stage: runtimeTaskInitialStartStageSchema,
+	baselineSha: z.string().nullable().default(null),
+	/** True when the base ref was refreshed from origin for this preparation. */
+	refreshed: z.boolean().default(false),
+	failure: runtimeTaskBaseRefreshFailureSchema.nullable().default(null),
+});
+export type RuntimeTaskInitialStartOutcome = z.infer<typeof runtimeTaskInitialStartOutcomeSchema>;
+
+export const runtimeTaskInitialStartStatusRequestSchema = z.object({
+	taskId: z.string(),
+});
+export type RuntimeTaskInitialStartStatusRequest = z.infer<typeof runtimeTaskInitialStartStatusRequestSchema>;
+
+/**
+ * UPD-0.7: pollable preparation status. A live in-process preparation reports
+ * its current stage; completed preparations report their durable outcome
+ * (ready/blocked from the persisted record).
+ */
+export const runtimeTaskInitialStartStatusResponseSchema = z.object({
+	ok: z.boolean(),
+	taskId: z.string(),
+	stage: runtimeTaskInitialStartStageSchema,
+	baselineSha: z.string().nullable().default(null),
+	/** Same durable signal that gates the refresh (single source of truth). */
+	initialStartBaselineFixed: z.boolean().default(false),
+	failure: runtimeTaskBaseRefreshFailureSchema.nullable().default(null),
+	error: z.string().optional(),
+});
+export type RuntimeTaskInitialStartStatusResponse = z.infer<typeof runtimeTaskInitialStartStatusResponseSchema>;
 
 export const runtimeWorktreeDeleteRequestSchema = z.object({
 	taskId: z.string(),
@@ -667,6 +744,12 @@ export type RuntimeTaskWorkspaceInfoRequest = z.infer<typeof runtimeTaskWorkspac
 export const runtimeTaskWorkspaceInfoResponseSchema = z.object({
 	taskId: z.string(),
 	path: z.string(),
+	/**
+	 * UPD-0: true when the task's initial baseline is fixed (existing worktree,
+	 * persisted baseline record, preservation, saved patch, or delivery receipt)
+	 * and its base ref must not be re-resolved against a newer origin state.
+	 */
+	initialStartBaselineFixed: z.boolean().optional(),
 	exists: z.boolean(),
 	baseRef: z.string(),
 	branch: z.string().nullable(),
@@ -1571,6 +1654,11 @@ export const runtimeTaskSessionStartRequestSchema = z.object({
 	mode: runtimeTaskSessionModeSchema.optional(),
 	resumeFromTrash: z.boolean().optional(),
 	baseRef: z.string(),
+	/**
+	 * UPD-0: optional client-side copy of the card's persisted policy. The
+	 * runtime re-reads the persisted board value and prefers it when present.
+	 */
+	updateBaseRefBeforeStart: z.boolean().optional(),
 	cols: z.number().int().positive().optional(),
 	rows: z.number().int().positive().optional(),
 	agentId: runtimeAgentIdSchema.optional(),
@@ -1582,6 +1670,12 @@ export const runtimeTaskSessionStartResponseSchema = z.object({
 	ok: z.boolean(),
 	summary: runtimeTaskSessionSummarySchema.nullable(),
 	error: z.string().optional(),
+	/**
+	 * UPD-0: initial-start preparation outcome (fixed baseline SHA and final
+	 * stage on success, structured failure on a block). Null for home-agent
+	 * sessions and non-preparation failures.
+	 */
+	initialStart: runtimeTaskInitialStartOutcomeSchema.nullable().default(null),
 });
 export type RuntimeTaskSessionStartResponse = z.infer<typeof runtimeTaskSessionStartResponseSchema>;
 

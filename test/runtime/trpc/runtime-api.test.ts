@@ -12,6 +12,7 @@ const agentRegistryMocks = vi.hoisted(() => ({
 }));
 
 const taskWorktreeMocks = vi.hoisted(() => ({
+	prepareInitialTaskWorktree: vi.fn(),
 	resolveTaskCwd: vi.fn(),
 	taskWorktreeExists: vi.fn(async () => false),
 }));
@@ -66,6 +67,7 @@ vi.mock("../../../src/terminal/agent-registry.js", () => ({
 }));
 
 vi.mock("../../../src/workspace/task-worktree.js", () => ({
+	prepareInitialTaskWorktree: taskWorktreeMocks.prepareInitialTaskWorktree,
 	resolveTaskCwd: taskWorktreeMocks.resolveTaskCwd,
 	taskWorktreeExists: taskWorktreeMocks.taskWorktreeExists,
 }));
@@ -267,6 +269,16 @@ describe("createRuntimeApi startTaskSession", () => {
 		agentRegistryMocks.resolveAgentCommand.mockReset();
 		agentRegistryMocks.buildRuntimeConfigResponse.mockReset();
 		taskWorktreeMocks.resolveTaskCwd.mockReset();
+		// UPD-0: the start path checks worktree existence first; existing-worktree
+		// is the common unit-test setup so legacy cwd-resolution assertions hold.
+		taskWorktreeMocks.taskWorktreeExists.mockReset();
+		taskWorktreeMocks.taskWorktreeExists.mockResolvedValue(true);
+		taskWorktreeMocks.prepareInitialTaskWorktree.mockReset();
+		taskWorktreeMocks.prepareInitialTaskWorktree.mockResolvedValue({
+			ok: true,
+			path: "/tmp/prepared-worktree",
+			initialStart: null,
+		});
 		turnCheckpointMocks.captureTaskTurnCheckpoint.mockReset();
 		oauthMocks.addLocalProvider.mockReset();
 		oauthMocks.ensureCustomProvidersLoaded.mockReset();
@@ -417,7 +429,8 @@ describe("createRuntimeApi startTaskSession", () => {
 		rmSync(`${mcpOauthSettingsPath}.lock`, { force: true });
 	});
 
-	it("reuses an existing worktree path before falling back to ensure", async () => {
+	it("reuses an existing worktree path without initial-start preparation", async () => {
+		taskWorktreeMocks.taskWorktreeExists.mockResolvedValueOnce(true);
 		taskWorktreeMocks.resolveTaskCwd.mockResolvedValue("/tmp/existing-worktree");
 
 		const terminalManager = {
@@ -448,6 +461,7 @@ describe("createRuntimeApi startTaskSession", () => {
 		);
 
 		expect(response.ok).toBe(true);
+		expect(taskWorktreeMocks.prepareInitialTaskWorktree).not.toHaveBeenCalled();
 		expect(taskWorktreeMocks.resolveTaskCwd).toHaveBeenCalledTimes(1);
 		expect(taskWorktreeMocks.resolveTaskCwd).toHaveBeenCalledWith({
 			cwd: "/tmp/repo",
@@ -462,14 +476,20 @@ describe("createRuntimeApi startTaskSession", () => {
 		);
 	});
 
-	it("ensures the worktree when no existing task cwd is available", async () => {
-		taskWorktreeMocks.resolveTaskCwd
-			.mockRejectedValueOnce(new Error("missing"))
-			.mockResolvedValueOnce("/tmp/new-worktree");
+	it("prepares the initial worktree through the start-owned path when none exists", async () => {
+		// UPD-0: a missing worktree never goes through resolveTaskCwd ensure; the
+		// start-owned preparation creates it and reports the baseline outcome.
+		taskWorktreeMocks.taskWorktreeExists.mockResolvedValueOnce(false);
+		taskWorktreeMocks.prepareInitialTaskWorktree.mockResolvedValueOnce({
+			ok: true,
+			path: "/tmp/new-worktree",
+			initialStart: null,
+		});
 
 		const terminalManager = {
 			startTaskSession: vi.fn(async () => createSummary()),
 			applyTurnCheckpoint: vi.fn(),
+			getSummary: vi.fn(() => null),
 		};
 		const clineTaskSessionService = createClineTaskSessionServiceMock();
 		const api = createTestRuntimeApi({
@@ -495,18 +515,127 @@ describe("createRuntimeApi startTaskSession", () => {
 		);
 
 		expect(response.ok).toBe(true);
-		expect(taskWorktreeMocks.resolveTaskCwd).toHaveBeenNthCalledWith(1, {
+		expect(taskWorktreeMocks.resolveTaskCwd).not.toHaveBeenCalled();
+		expect(taskWorktreeMocks.prepareInitialTaskWorktree).toHaveBeenCalledTimes(1);
+		expect(taskWorktreeMocks.prepareInitialTaskWorktree).toHaveBeenCalledWith({
 			cwd: "/tmp/repo",
 			taskId: "task-1",
 			baseRef: "main",
-			ensure: false,
+			updateBaseRefBeforeStart: true,
+			hasPriorSession: false,
 		});
-		expect(taskWorktreeMocks.resolveTaskCwd).toHaveBeenNthCalledWith(2, {
+		expect(terminalManager.startTaskSession).toHaveBeenCalledWith(
+			expect.objectContaining({
+				cwd: "/tmp/new-worktree",
+			}),
+		);
+	});
+
+	it("treats trash resumes as prior sessions so the base is never refreshed (UPD-0)", async () => {
+		// A resumeFromTrash start with no session summaries and no durable
+		// evidence is still a resume: preparation must not refresh the base.
+		taskWorktreeMocks.taskWorktreeExists.mockResolvedValueOnce(false);
+		taskWorktreeMocks.prepareInitialTaskWorktree.mockResolvedValueOnce({
+			ok: true,
+			path: "/tmp/resumed-worktree",
+			initialStart: null,
+		});
+
+		const terminalManager = {
+			startTaskSession: vi.fn(async () => createSummary()),
+			applyTurnCheckpoint: vi.fn(),
+			getSummary: vi.fn(() => null),
+		};
+		const clineTaskSessionService = createClineTaskSessionServiceMock();
+		const api = createTestRuntimeApi({
+			getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+			loadScopedRuntimeConfig: vi.fn(async () => createRuntimeConfigState()),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: vi.fn(async () => terminalManager as never),
+			getScopedClineTaskSessionService: vi.fn(async () => clineTaskSessionService as never),
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+		});
+
+		const response = await api.startTaskSession(
+			{
+				workspaceId: "workspace-1",
+				workspacePath: "/tmp/repo",
+			},
+			{
+				taskId: "task-1",
+				baseRef: "main",
+				prompt: "Investigate startup freeze",
+				resumeFromTrash: true,
+			},
+		);
+
+		expect(response.ok).toBe(true);
+		expect(taskWorktreeMocks.prepareInitialTaskWorktree).toHaveBeenCalledTimes(1);
+		expect(taskWorktreeMocks.prepareInitialTaskWorktree).toHaveBeenCalledWith({
 			cwd: "/tmp/repo",
 			taskId: "task-1",
 			baseRef: "main",
-			ensure: true,
+			updateBaseRefBeforeStart: true,
+			hasPriorSession: true,
 		});
+		expect(terminalManager.startTaskSession).toHaveBeenCalledWith(
+			expect.objectContaining({
+				cwd: "/tmp/resumed-worktree",
+			}),
+		);
+	});
+
+	it("surfaces initial-start preparation failures on the start response", async () => {
+		taskWorktreeMocks.taskWorktreeExists.mockResolvedValueOnce(false);
+		taskWorktreeMocks.prepareInitialTaskWorktree.mockResolvedValueOnce({
+			ok: false,
+			path: null,
+			initialStart: {
+				stage: "blocked",
+				baselineSha: null,
+				refreshed: false,
+				failure: {
+					category: "auth_or_network_timeout",
+					reason: "origin fetch failed",
+					remedy: "Check network access and retry.",
+					selectedRef: "main",
+				},
+			},
+			error: "Base ref fetch failed: origin fetch failed",
+		});
+
+		const terminalManager = {
+			startTaskSession: vi.fn(async () => createSummary()),
+			applyTurnCheckpoint: vi.fn(),
+			getSummary: vi.fn(() => null),
+		};
+		const clineTaskSessionService = createClineTaskSessionServiceMock();
+		const api = createTestRuntimeApi({
+			getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+			loadScopedRuntimeConfig: vi.fn(async () => createRuntimeConfigState()),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: vi.fn(async () => terminalManager as never),
+			getScopedClineTaskSessionService: vi.fn(async () => clineTaskSessionService as never),
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+		});
+
+		const response = await api.startTaskSession(
+			{
+				workspaceId: "workspace-1",
+				workspacePath: "/tmp/repo",
+			},
+			{
+				taskId: "task-1",
+				baseRef: "main",
+				prompt: "Investigate startup freeze",
+			},
+		);
+
+		expect(response.ok).toBe(false);
+		expect(response.initialStart?.stage).toBe("blocked");
+		expect(terminalManager.startTaskSession).not.toHaveBeenCalled();
 	});
 
 	it("routes cline start sessions to cline task session service", async () => {
