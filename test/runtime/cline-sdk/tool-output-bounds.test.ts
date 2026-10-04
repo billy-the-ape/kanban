@@ -31,7 +31,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ClineCore } from "@clinebot/core";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-
 import { buildClineCompactionConfig } from "../../../src/cline-sdk/cline-compaction-config";
 import type { ResolvedClineLaunchConfig } from "../../../src/cline-sdk/cline-provider-service";
 import { createInMemoryClineSessionRuntime } from "../../../src/cline-sdk/cline-session-runtime";
@@ -42,6 +41,7 @@ import {
 import { computeToolResultBoundChars } from "../../../src/cline-sdk/cline-tool-result-bounding-hook";
 import { readTaskContextArtifact } from "../../../src/workspace/task-artifacts";
 import { createFakeMcpRuntimeService, createFakeRuntimeSetup } from "../../utilities/cline-session-service-harness";
+import { createGitTestEnv } from "../../utilities/git-env";
 
 const turnCheckpointMocks = vi.hoisted(() => ({
 	captureTaskTurnCheckpoint: vi.fn(),
@@ -213,7 +213,8 @@ beforeAll(async () => {
 	process.env.CLINE_LOG_LEVEL = "debug";
 	logPath = join(probeDir, "kanban.log");
 	process.env.CLINE_LOG_PATH = logPath;
-	execFileSync("git", ["init", "-q"], { cwd: probeDir });
+	const gitEnv = createGitTestEnv();
+	execFileSync("git", ["init", "-q"], { cwd: probeDir, env: gitEnv });
 	// Task state (worktrees + context artifacts) lives under the probe dir too, so the
 	// whole session is self-contained and cleaned up in afterAll.
 	workspaceStateMocks.getTaskWorktreesHomePath.mockReturnValue(join(probeDir, "worktrees-home"));
@@ -228,10 +229,10 @@ beforeAll(async () => {
 		`${Array.from({ length: 10 }, (_, i) => `original line ${i + 1}`).join("\n")}\n`,
 		"utf8",
 	);
-	execFileSync("git", ["-C", probeDir, "config", "user.email", "kanban-b27@example.com"]);
-	execFileSync("git", ["-C", probeDir, "config", "user.name", "Kanban B27 Test"]);
-	execFileSync("git", ["-C", probeDir, "add", "large-file.txt"]);
-	execFileSync("git", ["-C", probeDir, "commit", "-q", "-m", "initial"]);
+	execFileSync("git", ["-C", probeDir, "config", "user.email", "kanban-b27@example.com"], { env: gitEnv });
+	execFileSync("git", ["-C", probeDir, "config", "user.name", "Kanban B27 Test"], { env: gitEnv });
+	execFileSync("git", ["-C", probeDir, "add", "large-file.txt"], { env: gitEnv });
+	execFileSync("git", ["-C", probeDir, "commit", "-q", "-m", "initial"], { env: gitEnv });
 	diffCommand =
 		`awk 'BEGIN { for (i = 1; i <= 3000; i++ ) print "generated line " i }' > ${diffFilePath} && ` +
 		`git -C ${probeDir} diff -- large-file.txt`;

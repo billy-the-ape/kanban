@@ -8,7 +8,7 @@ import type {
 	RuntimeTaskClineSettings,
 	RuntimeTaskImage,
 } from "./api-contract";
-import { createUniqueTaskId } from "./task-id";
+import { createRandomHexId, createUniqueTaskId } from "./task-id";
 import { resolveTaskTitle } from "./task-title";
 
 export interface RuntimeCreateTaskInput {
@@ -126,7 +126,7 @@ function collectTaskIds(board: RuntimeBoardData): Set<string> {
 }
 
 function createDependencyId(): string {
-	return crypto.randomUUID().replaceAll("-", "").slice(0, 8);
+	return createRandomHexId(8);
 }
 
 function createDependencyPairKey(backlogTaskId: string, linkedTaskId: string): string {

@@ -5,7 +5,8 @@ process.env.NODE_ENV = "production";
 export default defineConfig({
 	test: {
 		globals: true,
-		environment: "node",
+		// Runs before test imports; teardown follows all suite hooks.
+		environment: "./test/environment.ts",
 		// `packages/**` excluded: those workspaces have their own vitest
 		// configs and runtime shapes (e.g. Electron) and are run explicitly by
 		// CI. New workspaces under `packages/` MUST get matching install/test
