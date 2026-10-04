@@ -12,8 +12,6 @@ import {
 	loadWorkspaceContext,
 	loadWorkspaceState,
 	type RuntimeWorkspaceIndexEntry,
-	removeWorkspaceIndexEntry,
-	removeWorkspaceStateFiles,
 } from "../state/workspace-state";
 import { TerminalSessionManager } from "../terminal/session-manager";
 
@@ -38,14 +36,7 @@ export interface DisposeWorkspaceRegistryOptions {
 export interface ResolvedWorkspaceStreamTarget {
 	workspaceId: string | null;
 	workspacePath: string | null;
-	removedRequestedWorkspacePath: string | null;
-	didPruneProjects: boolean;
-}
-
-export interface RemovedWorkspaceNotice {
-	workspaceId: string;
-	repoPath: string;
-	message: string;
+	unavailableRequestedWorkspaceMessage: string | null;
 }
 
 export interface WorkspaceRegistry {
@@ -78,12 +69,7 @@ export interface WorkspaceRegistry {
 		currentProjectId: string | null;
 		projects: RuntimeProjectSummary[];
 	}>;
-	resolveWorkspaceForStream: (
-		requestedWorkspaceId: string | null,
-		options?: {
-			onRemovedWorkspace?: (workspace: RemovedWorkspaceNotice) => void;
-		},
-	) => Promise<ResolvedWorkspaceStreamTarget>;
+	resolveWorkspaceForStream: (requestedWorkspaceId: string | null) => Promise<ResolvedWorkspaceStreamTarget>;
 	listManagedWorkspaces: () => Array<{
 		workspaceId: string;
 		workspacePath: string | null;
@@ -355,41 +341,30 @@ export async function createWorkspaceRegistry(deps: CreateWorkspaceRegistryDepen
 
 	const resolveWorkspaceForStream = async (
 		requestedWorkspaceId: string | null,
-		options?: {
-			onRemovedWorkspace?: (workspace: RemovedWorkspaceNotice) => void;
-		},
 	): Promise<ResolvedWorkspaceStreamTarget> => {
 		const allProjects = await listWorkspaceIndexEntries();
 		const existingProjects: RuntimeWorkspaceIndexEntry[] = [];
-		const removedProjects: RuntimeWorkspaceIndexEntry[] = [];
+		let unavailableRequestedWorkspaceMessage: string | null = null;
 
 		for (const project of allProjects) {
-			let removalMessage: string | null = null;
+			let unavailableMessage: string | null = null;
 			if (!(await deps.pathIsDirectory(project.repoPath))) {
-				removalMessage = `Project no longer exists on disk and was removed: ${project.repoPath}`;
+				unavailableMessage = `Project directory is unavailable: ${project.repoPath}`;
 			} else if (!deps.hasGitRepository(project.repoPath)) {
-				removalMessage = `Project is not a git repository and was removed: ${project.repoPath}`;
+				unavailableMessage = `Project Git validation failed: ${project.repoPath}`;
 			}
 
-			if (!removalMessage) {
+			if (!unavailableMessage) {
 				existingProjects.push(project);
 				continue;
 			}
 
-			removedProjects.push(project);
-			await removeWorkspaceIndexEntry(project.workspaceId);
-			await removeWorkspaceStateFiles(project.workspaceId);
-			disposeWorkspace(project.workspaceId);
-			options?.onRemovedWorkspace?.({
-				workspaceId: project.workspaceId,
-				repoPath: project.repoPath,
-				message: removalMessage,
-			});
+			// Validation can fail transiently (permissions, mounts, or Git config).
+			// Only explicit project removal may delete saved state or dispose sessions.
+			if (project.workspaceId === requestedWorkspaceId) {
+				unavailableRequestedWorkspaceMessage = `${unavailableMessage}. Project and task data retained. Repair the repository and retry.`;
+			}
 		}
-
-		const removedRequestedWorkspacePath = requestedWorkspaceId
-			? (removedProjects.find((project) => project.workspaceId === requestedWorkspaceId)?.repoPath ?? null)
-			: null;
 
 		const activeWorkspaceMissing = !existingProjects.some((project) => project.workspaceId === activeWorkspaceId);
 		if (activeWorkspaceMissing) {
@@ -398,6 +373,14 @@ export async function createWorkspaceRegistry(deps: CreateWorkspaceRegistryDepen
 			} else {
 				clearActiveWorkspace();
 			}
+		}
+
+		if (unavailableRequestedWorkspaceMessage) {
+			return {
+				workspaceId: null,
+				workspacePath: null,
+				unavailableRequestedWorkspaceMessage,
+			};
 		}
 
 		if (requestedWorkspaceId) {
@@ -412,8 +395,7 @@ export async function createWorkspaceRegistry(deps: CreateWorkspaceRegistryDepen
 				return {
 					workspaceId: requestedWorkspace.workspaceId,
 					workspacePath: requestedWorkspace.repoPath,
-					removedRequestedWorkspacePath,
-					didPruneProjects: removedProjects.length > 0,
+					unavailableRequestedWorkspaceMessage,
 				};
 			}
 		}
@@ -424,15 +406,13 @@ export async function createWorkspaceRegistry(deps: CreateWorkspaceRegistryDepen
 			return {
 				workspaceId: null,
 				workspacePath: null,
-				removedRequestedWorkspacePath,
-				didPruneProjects: removedProjects.length > 0,
+				unavailableRequestedWorkspaceMessage,
 			};
 		}
 		return {
 			workspaceId: fallbackWorkspace.workspaceId,
 			workspacePath: fallbackWorkspace.repoPath,
-			removedRequestedWorkspacePath,
-			didPruneProjects: removedProjects.length > 0,
+			unavailableRequestedWorkspaceMessage,
 		};
 	};
 
