@@ -5,14 +5,16 @@
 // base, the generic-ensure refusal, and retry after a fetch fault.
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 import { describe, expect, it } from "vitest";
-import { getTaskInitialStartEvidence } from "../../src/workspace/task-initial-start";
+import { getTaskInitialStartEvidence, readTaskInitialStartRecord } from "../../src/workspace/task-initial-start";
 import {
 	deleteTaskWorktree,
 	ensureTaskWorktreeIfDoesntExist,
+	getTaskWorktreePath,
 	prepareInitialTaskWorktree,
 } from "../../src/workspace/task-worktree";
 import { createGitTestEnv } from "../utilities/git-env";
@@ -453,6 +455,149 @@ describe.sequential("task base refresh integration (UPD-0)", () => {
 					throw new Error("Preparation did not create the worktree on retry");
 				}
 				expect(runGit(prepared.path, ["rev-parse", "HEAD"])).toBe(fixture.remoteBaseSha);
+			} finally {
+				cleanup();
+			}
+		});
+	});
+
+	it("queues concurrent refreshes on the per-repo refresh lock while the setup lock stays available", {
+		timeout: 45_000,
+	}, async () => {
+		await withTemporaryHome(async () => {
+			const { path: sandboxRoot, cleanup } = createTempDir("kanban-base-refresh-concurrency-");
+			try {
+				const fixture = createBaseRefreshFixture(sandboxRoot);
+				// An existing worktree: its ensure only takes the setup lock.
+				const existing = await prepareInitialTaskWorktree({
+					cwd: fixture.workspacePath,
+					taskId: "task-existing",
+					baseRef: fixture.baseRef,
+					updateBaseRefBeforeStart: true,
+				});
+				expect(existing.ok).toBe(true);
+
+				// Simulate a slow origin: another process holds the per-repo
+				// base refresh lock (a foreign lockfile) for longer than the
+				// setup lock's default retry budget (~5s).
+				const gitDir = runGit(fixture.workspacePath, ["rev-parse", "--absolute-git-dir"]);
+				const refreshLockDir = join(gitDir, "kanban-task-base-refresh.lock");
+				mkdirSync(refreshLockDir, { recursive: true });
+				writeFileSync(
+					join(refreshLockDir, "cipher"),
+					JSON.stringify({ pid: process.pid, uuid: randomUUID(), stale: 10_000 }),
+				);
+				const releaseHolder = () => rmSync(refreshLockDir, { recursive: true, force: true });
+				const holder = new Promise<void>((resolve) => setTimeout(resolve, 6500)).then(() => {
+					releaseHolder();
+				});
+
+				const ensureTask = (async () => {
+					const startedAt = Date.now();
+					const ensured = await ensureTaskWorktreeIfDoesntExist({
+						cwd: fixture.workspacePath,
+						taskId: "task-existing",
+						baseRef: fixture.baseRef,
+					});
+					return { ensured, elapsedMs: Date.now() - startedAt };
+				})();
+				const [ensureResult, preparedA, preparedB, preparedC] = await Promise.all([
+					ensureTask,
+					prepareInitialTaskWorktree({
+						cwd: fixture.workspacePath,
+						taskId: "task-a",
+						baseRef: fixture.baseRef,
+						updateBaseRefBeforeStart: true,
+					}),
+					prepareInitialTaskWorktree({
+						cwd: fixture.workspacePath,
+						taskId: "task-b",
+						baseRef: fixture.baseRef,
+						updateBaseRefBeforeStart: true,
+					}),
+					prepareInitialTaskWorktree({
+						cwd: fixture.workspacePath,
+						taskId: "task-c",
+						baseRef: fixture.baseRef,
+						updateBaseRefBeforeStart: true,
+					}),
+				]);
+
+				// The setup-lock caller completed promptly — a held refresh
+				// must not starve the ~5s setup-lock retry budget.
+				expect(ensureResult.ensured.ok).toBe(true);
+				expect(ensureResult.elapsedMs).toBeLessThan(4500);
+				// The three concurrent refreshes queued on the refresh lock
+				// (long retries) and all completed after the release.
+				for (const prepared of [preparedA, preparedB, preparedC]) {
+					expect(prepared.ok, JSON.stringify(prepared, null, 2)).toBe(true);
+					if (!prepared.path) {
+						throw new Error("Expected a prepared worktree path");
+					}
+					expect(runGit(prepared.path, ["rev-parse", "HEAD"])).toBe(fixture.remoteBaseSha);
+				}
+				// The local base was fast-forwarded once and stays there.
+				expect(runGit(fixture.workspacePath, ["rev-parse", `refs/heads/${fixture.baseRef}`])).toBe(
+					fixture.remoteBaseSha,
+				);
+				await holder;
+			} finally {
+				cleanup();
+			}
+		});
+	});
+
+	it("keeps the refresh and records a blocked outcome when worktree creation fails", async () => {
+		await withTemporaryHome(async () => {
+			const { path: sandboxRoot, cleanup } = createTempDir("kanban-base-refresh-createfail-");
+			try {
+				const fixture = createBaseRefreshFixture(sandboxRoot);
+				const taskId = "task-createfail";
+				// Block worktree creation: the task worktrees root exists as a
+				// file, so the worktree directory cannot be created (an obstacle
+				// at the worktree path itself would be cleaned up first).
+				const worktreePath = getTaskWorktreePath(fixture.workspacePath, taskId);
+				const taskRoot = dirname(worktreePath);
+				mkdirSync(dirname(taskRoot), { recursive: true });
+				writeFileSync(taskRoot, "blocker\n", "utf8");
+
+				const failed = await prepareInitialTaskWorktree({
+					cwd: fixture.workspacePath,
+					taskId,
+					baseRef: fixture.baseRef,
+					updateBaseRefBeforeStart: true,
+				});
+				expect(failed.ok).toBe(false);
+				expect(failed.initialStart.stage).toBe("blocked");
+				expect(failed.initialStart.failure?.category).toBe("worktree_setup_failed");
+				// The refresh happened first and its fast-forward stays in place.
+				expect(runGit(fixture.workspacePath, ["rev-parse", `refs/heads/${fixture.baseRef}`])).toBe(
+					fixture.remoteBaseSha,
+				);
+				// The durable record reports THIS attempt (not idle or a stale
+				// record), while keeping the baseline unfixed for a retry.
+				const record = await readTaskInitialStartRecord(taskId);
+				expect(record?.state).toBe("blocked");
+				expect(record?.baselineSha).toBeNull();
+				expect(record?.failure?.category).toBe("worktree_setup_failed");
+
+				// Retry after clearing the obstacle: the re-fetch is a no-op
+				// for the equal tip, and the worktree is created at baseline.
+				rmSync(taskRoot, { force: true });
+				const prepared = await prepareInitialTaskWorktree({
+					cwd: fixture.workspacePath,
+					taskId,
+					baseRef: fixture.baseRef,
+					updateBaseRefBeforeStart: true,
+				});
+				expect(prepared.ok, JSON.stringify(prepared, null, 2)).toBe(true);
+				if (!prepared.path) {
+					throw new Error("Expected a prepared worktree path");
+				}
+				expect(runGit(prepared.path, ["rev-parse", "HEAD"])).toBe(fixture.remoteBaseSha);
+				const finalRecord = await readTaskInitialStartRecord(taskId);
+				expect(finalRecord?.state).toBe("prepared");
+				expect(finalRecord?.baselineSha).toBe(fixture.remoteBaseSha);
 			} finally {
 				cleanup();
 			}

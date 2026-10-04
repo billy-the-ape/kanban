@@ -4,9 +4,9 @@ Part of the **Update task base ref before starting** feature. The master plan li
 
 | Field | Value |
 | --- | --- |
-| Document revision | 4 |
-| Prepared | 2026-10-03 (revision 2: 2026-10-03, revision 3: 2026-10-04, revision 4: 2026-10-04 implementation record) |
-| Status | Implemented — PR opened targeting `feat/update-base` (awaiting review) |
+| Document revision | 5 |
+| Prepared | 2026-10-03 (revision 2: 2026-10-03, revision 3: 2026-10-04, revision 4: 2026-10-04 implementation record, revision 5: 2026-10-04 review responses) |
+| Status | Implemented — PR opened targeting `feat/update-base` (review responses committed) |
 | Source baseline | ba3b7151f44f9ed5d1cb4d83590e98388ae2cac7 |
 | Fork | https://github.com/billy-the-ape/kanban |
 | Prerequisites | PLAN.md reviewed and approved |
@@ -354,6 +354,87 @@ serialize refresh + create. Each task still receives its own resolved SHA at cre
 
 The branch carried docs PRs on top of `ba3b7151` (HEAD `293924a` at implementation time); no
 runtime-code drift affecting this feature was found.
+
+## Review responses (revision 5, PR #35)
+
+The review raised four issues; all are addressed in this revision (superseding the revision-4 notes below
+where they conflict).
+
+### 1. Fetch only the specific target ref (task-base-refresh.ts)
+
+`fetchOriginTargets` no longer runs a generic `git fetch origin` (which would pull every branch/tag —
+doubling the per-start network cost on a large repo). It runs the explicit single-refspec fetch
+(`+refs/heads/<branch>:refs/remotes/origin/<branch>`, which still covers restrictive/custom configured
+fetch refspecs) and classifies the outcome with a `git ls-remote --exit-code` probe: exit code 2 means
+the remote branch is missing → `missing_remote_branch` with its own remedy; any other failure stays
+`auth_or_network_timeout` with the fetch diagnostics. No credential exposure, same bounded timeouts.
+
+### 2. Phase split + dedicated per-repo refresh lock (task-base-refresh.ts, task-worktree.ts)
+
+The refresh is split into two exported phases:
+
+- `fetchTaskBaseRefTarget({ repoPath, baseRef })` — classify + fetch (network). Returns the post-fetch
+  target SHA, the remote-tracking ref, and the local branch name (if any) still to update.
+- `updateLocalBaseBranch({ repoPath, branchName, targetSha })` — the safe local fast-forward (clean
+  checked-out ff-only with tip re-verification, or ancestor-checked compare-and-swap for unoccupied
+  branches). Safe to run under the (short-held) worktree setup lock.
+- `refreshTaskBaseRef` remains as the unsplit composition (behavior unchanged for direct callers).
+
+`prepareInitialTaskWorktree` now runs three lock phases:
+
+- Phase 1 (setup lock): existing-worktree / preservation / prepared-baseline checks — local only, never
+  refreshed (unchanged behavior, extracted into `checkExistingOrHistorical`).
+- Phase 2: when a refresh is needed, the network fetch runs under a new per-repo base refresh lock
+  (`kanban-task-base-refresh.lock` in the git common dir, exported as `getTaskBaseRefreshLock`) with long
+  retries (~2 minutes: 2400 × 50 ms) — NOT under the setup lock, whose callers give up after the
+  default ~5 s retry budget. A slow origin can therefore no longer starve bulk starts, dispatch queues,
+  or concurrent ensures/deletes. The local branch update takes the setup lock only briefly (the CAS /
+  ff-only update re-verifies the tip immediately before mutating).
+- Phase 3 (setup lock): re-check `checkExistingOrHistorical` (a concurrent start may have finished
+  while this one held the refresh lock), then create the worktree at the fixed baseline and persist the
+  record.
+
+### 3. Worktree-creation failure after a successful refresh (task-worktree.ts)
+
+If the baseline refresh succeeded but `git worktree add` fails, the preparation now persists a `blocked`
+record for this attempt (category `worktree_setup_failed`, `baselineSha: null`) before failing —
+overwriting any stale record — so the pollable status reports the actual attempt outcome and the
+baseline stays unfixed (a retry re-fetches, which is a no-op for an equal tip). The outer catch of
+`prepareInitialTaskWorktree` does the same (best-effort) for unexpected throws. The legitimate
+local-branch fast-forward is never rolled back.
+
+### 4. Reopening a trashed/done task without evidence (runtime-api.ts, use-board-interactions.ts)
+
+- **Server:** `resumeFromTrash: true` counts as a prior session in `startTaskSession`, so a trash
+  resume never refreshes the base — a resume must never fast-forward a local branch, even when no
+  durable session summary or evidence record remains.
+- **Browser:** `reopenTaskInReview` first queries `workspace.getTaskInitialStartStatus`; when the
+  task has no fixed baseline (`initialStartBaselineFixed === false`, i.e. no worktree, prepared
+  baseline, preservation, saved patch, or delivery receipt) it skips the generic ensure — which would
+  be refused with a non-actionable "start the task to create its worktree" — and lets the server-side
+  trash resume own worktree creation. A failed status query keeps the conservative ensure-first
+  behavior.
+
+### New tests (revision 5)
+
+- `test/integration/task-base-refresh.integration.test.ts`
+  - "queues concurrent refreshes on the per-repo refresh lock while the setup lock stays available":
+    a foreign (other-process) refresh lockfile held >5 s while a setup-lock caller (generic ensure for
+    an existing worktree) must still complete within its retry budget and three concurrent
+    start-owned preparations queue on the refresh lock and all succeed after release.
+  - "keeps the refresh and records a blocked outcome when worktree creation fails": an uncreatable
+    worktree path (task worktrees root exists as a file) yields a failed preparation that keeps the
+    local-branch fast-forward, persists a `blocked` / `worktree_setup_failed` record with no baseline,
+    and a retry after clearing the obstacle creates the worktree at the refreshed baseline and records
+    `prepared`.
+- `test/runtime/trpc/runtime-api.test.ts`
+  - "treats trash resumes as prior sessions so the base is never refreshed (UPD-0)":
+    `resumeFromTrash` with no summaries → `prepareInitialTaskWorktree` called with
+    `hasPriorSession: true`.
+- `web-ui/src/hooks/use-board-interactions.test.tsx`
+  - "skips the pre-start ensure when reopening a task without a fixed baseline (UPD-0)": status
+    reports no fixed baseline → `ensureTaskWorkspace` is not called; `startTaskSession` still receives
+    `{ resumeFromTrash: true }`.
 
 ## Stop conditions
 

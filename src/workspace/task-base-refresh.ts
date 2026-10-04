@@ -18,6 +18,13 @@
  *   remedy) that the start lifecycle surfaces verbatim.
  *
  * The local branch is never force-updated, reset, or rebased.
+ *
+ * Phase split (UPD-0 review): the network phase ({@link fetchTaskBaseRefTarget})
+ * fetches only the one target ref and is meant to run under the per-repo
+ * base refresh lock (long retries), while the local phase
+ * ({@link updateLocalBaseBranch}) re-verifies the tip before mutating and is
+ * safe under the (short-held) worktree setup lock. {@link refreshTaskBaseRef}
+ * composes the two phases unsplit.
  */
 import type { RuntimeTaskBaseRefreshFailure, RuntimeTaskBaseRefreshFailureCategory } from "../core/api-contract";
 import { createGitProcessEnv } from "../core/git-process-env";
@@ -26,6 +33,14 @@ import { runGit } from "./git-utils";
 /** Bounded fetch: a held/credential-prompting fetch must not hang a start. */
 export const BASE_REFRESH_FETCH_TIMEOUT_MS = 60_000;
 
+export interface TaskBaseRefreshLocalBranchUpdate {
+	branchRef: string;
+	branchName: string;
+	oldSha: string;
+	newSha: string;
+	checkedOutAt: string | null;
+}
+
 export interface TaskBaseRefreshSuccess {
 	ok: true;
 	/** The commit the new worktree must be created from (post-refresh). */
@@ -33,13 +48,7 @@ export interface TaskBaseRefreshSuccess {
 	/** refs/remotes/origin/<name> that was fetched for this refresh. */
 	remoteTargetRef: string;
 	/** Set when a local branch was moved (unoccupied or checked out). */
-	localBranchUpdate: {
-		branchRef: string;
-		branchName: string;
-		oldSha: string;
-		newSha: string;
-		checkedOutAt: string | null;
-	} | null;
+	localBranchUpdate: TaskBaseRefreshLocalBranchUpdate | null;
 }
 
 export interface TaskBaseRefreshBlocked {
@@ -49,9 +58,45 @@ export interface TaskBaseRefreshBlocked {
 
 export type TaskBaseRefreshResult = TaskBaseRefreshSuccess | TaskBaseRefreshBlocked;
 
+/**
+ * Result of the network phase: the post-fetch target SHA plus the local
+ * branch (if any) that still needs the safe local update. The two phases
+ * are split so the caller can hold different locks for each: the fetch
+ * runs under a per-repo refresh lock (long waits), the local update under
+ * the worktree setup lock (short hold, re-verified by CAS / ff-only).
+ */
+export interface TaskBaseFetchTargetSuccess {
+	ok: true;
+	targetSha: string;
+	remoteTargetRef: string;
+	/** Local branch name to update, or null for explicit origin/... refs. */
+	localBranchName: string | null;
+}
+
+export type TaskBaseFetchTargetResult = TaskBaseFetchTargetSuccess | TaskBaseRefreshBlocked;
+
+export interface TaskBaseLocalUpdateSuccess {
+	ok: true;
+	localBranchUpdate: TaskBaseRefreshLocalBranchUpdate | null;
+}
+
+export type TaskBaseLocalUpdateResult = TaskBaseLocalUpdateSuccess | TaskBaseRefreshBlocked;
+
 const LOCAL_AHEAD_OR_DIVERGED_REMEDY =
 	"Push or reconcile the local commits on the base branch, or disable the update option and start from the local state.";
 const RETRY_START_REMEDY = "Retry starting the task.";
+
+function makeFailureForRef(baseRef: string): BlockedFailure {
+	return (category, reason, remedy) => ({
+		ok: false,
+		failure: {
+			category,
+			reason,
+			remedy,
+			selectedRef: baseRef,
+		},
+	});
+}
 
 /** Strip credentials that may be embedded in a remote URL or git diagnostics. */
 function scrubCredentialsFromText(text: string): string {
@@ -139,57 +184,57 @@ function findBranchCheckoutPath(repoPath: string, branchName: string): Promise<s
 	});
 }
 
-function fetchOriginTargets(
+async function fetchOriginTargets(
 	repoPath: string,
-	selectedRef: string,
 	remoteBranch: string,
 	failure: BlockedFailure,
 ): Promise<string | TaskBaseRefreshBlocked> {
-	const genericFetch = runGit(repoPath, ["fetch", "origin"], {
-		timeoutMs: BASE_REFRESH_FETCH_TIMEOUT_MS,
-		env: getFetchEnv(),
-	});
-	return genericFetch.then(async (result) => {
-		if (!result.ok) {
+	// Fetch only the specific target ref (an explicit refspec also covers
+	// restrictive/custom configured fetch refspecs). No generic
+	// "fetch origin": pulling every branch (and tags) would double the
+	// network time per start for a ref that is fetched explicitly anyway.
+	const explicitFetch = await runGit(
+		repoPath,
+		["fetch", "origin", `+refs/heads/${remoteBranch}:refs/remotes/origin/${remoteBranch}`],
+		{
+			timeoutMs: BASE_REFRESH_FETCH_TIMEOUT_MS,
+			env: getFetchEnv(),
+		},
+	);
+	if (!explicitFetch.ok) {
+		// Distinguish a missing remote branch (git ls-remote --exit-code
+		// exits 2 when the ref does not exist) from auth/network failures
+		// (the explicit fetch error carries the diagnostics).
+		const probe = await runGit(repoPath, ["ls-remote", "--exit-code", "origin", `refs/heads/${remoteBranch}`], {
+			timeoutMs: BASE_REFRESH_FETCH_TIMEOUT_MS,
+			env: getFetchEnv(),
+		});
+		if (probe.exitCode === 2) {
 			return failure(
-				"auth_or_network_timeout",
-				`Fetching the origin for base ref "${selectedRef}" failed: ${toDiagnostic(result.stderr || result.output)}`,
-				"Check network access and origin credentials, then start the task again.",
+				"missing_remote_branch",
+				`Remote branch "origin/${remoteBranch}" was not found on origin.`,
+				"Restore the remote branch, select a different base ref, or disable the update option and start from the local state.",
 			);
 		}
-		// Refresh the exact remote-tracking ref even when the configured fetch
-		// refspec is restrictive (it may not cover the selected base branch).
-		const explicitFetch = await runGit(
-			repoPath,
-			["fetch", "origin", `+refs/heads/${remoteBranch}:refs/remotes/origin/${remoteBranch}`],
-			{
-				timeoutMs: BASE_REFRESH_FETCH_TIMEOUT_MS,
-				env: getFetchEnv(),
-			},
+		return failure(
+			"auth_or_network_timeout",
+			`Fetching origin/"${remoteBranch}" failed: ${toDiagnostic(explicitFetch.stderr || explicitFetch.output)}`,
+			"Check network access and origin credentials, then start the task again.",
 		);
-		if (!explicitFetch.ok) {
-			return failure(
-				"missing_remote_branch",
-				`Remote branch "origin/${remoteBranch}" was not found or could not be fetched: ${toDiagnostic(
-					explicitFetch.stderr || explicitFetch.output,
-				)}`,
-				"Restore the remote branch, select a different base ref, or disable the update option and start from the local state.",
-			);
-		}
-		const targetResult = await runGit(repoPath, [
-			"rev-parse",
-			"--verify",
-			`refs/remotes/origin/${remoteBranch}^{commit}`,
-		]);
-		if (!targetResult.ok) {
-			return failure(
-				"missing_remote_branch",
-				`Remote branch "origin/${remoteBranch}" has no resolvable commit.`,
-				"Restore the remote branch, select a different base ref, or disable the update option and start from the local state.",
-			);
-		}
-		return targetResult.stdout;
-	});
+	}
+	const targetResult = await runGit(repoPath, [
+		"rev-parse",
+		"--verify",
+		`refs/remotes/origin/${remoteBranch}^{commit}`,
+	]);
+	if (!targetResult.ok) {
+		return failure(
+			"missing_remote_branch",
+			`Remote branch "origin/${remoteBranch}" has no resolvable commit.`,
+			"Restore the remote branch, select a different base ref, or disable the update option and start from the local state.",
+		);
+	}
+	return targetResult.stdout;
 }
 
 async function updateLocalBranchSafely(
@@ -338,24 +383,18 @@ async function updateLocalBranchSafely(
 }
 
 /**
- * Refresh the selected base ref against origin and return the baseline SHA a
- * fresh task worktree must be created from. Never moves a local branch except
- * by a verified fast-forward or a compare-and-swap update-ref.
+ * Network phase of the base refresh: classify the selected ref, fetch the
+ * specific origin target, and return the post-fetch SHA plus the local
+ * branch (if any) that still needs the safe local update. Runs under the
+ * per-repo refresh lock (never the worktree setup lock), so a slow origin
+ * cannot starve setup-lock waiters.
  */
-export async function refreshTaskBaseRef(options: {
+export async function fetchTaskBaseRefTarget(options: {
 	repoPath: string;
 	baseRef: string;
-}): Promise<TaskBaseRefreshResult> {
+}): Promise<TaskBaseFetchTargetResult> {
 	const baseRef = options.baseRef.trim();
-	const failure: BlockedFailure = (category, reason, remedy) => ({
-		ok: false,
-		failure: {
-			category,
-			reason,
-			remedy,
-			selectedRef: baseRef,
-		},
-	});
+	const failure = makeFailureForRef(baseRef);
 
 	const originUrl = await runGit(options.repoPath, ["remote", "get-url", "origin"]);
 	if (!originUrl.ok) {
@@ -381,15 +420,15 @@ export async function refreshTaskBaseRef(options: {
 	}
 
 	if (explicitRemoteBranch !== null) {
-		const targetSha = await fetchOriginTargets(options.repoPath, baseRef, explicitRemoteBranch, failure);
+		const targetSha = await fetchOriginTargets(options.repoPath, explicitRemoteBranch, failure);
 		if (typeof targetSha !== "string") {
 			return targetSha;
 		}
 		return {
 			ok: true,
-			baselineSha: targetSha,
+			targetSha,
 			remoteTargetRef: `refs/remotes/origin/${explicitRemoteBranch}`,
-			localBranchUpdate: null,
+			localBranchName: null,
 		};
 	}
 
@@ -441,22 +480,79 @@ export async function refreshTaskBaseRef(options: {
 		remoteBranch = branchName;
 	}
 
-	const targetSha = await fetchOriginTargets(options.repoPath, baseRef, remoteBranch, failure);
+	const targetSha = await fetchOriginTargets(options.repoPath, remoteBranch, failure);
 	if (typeof targetSha !== "string") {
 		return targetSha;
 	}
+	return {
+		ok: true,
+		targetSha,
+		remoteTargetRef: `refs/remotes/origin/${remoteBranch}`,
+		localBranchName: branchName,
+	};
+}
 
-	const localResult = await updateLocalBranchSafely(options.repoPath, branchName, targetSha, failure);
+/**
+ * Local phase of the base refresh: safely fast-forward the local base
+ * branch to the fetched target (clean-checked-out ff-only, or
+ * ancestor-checked compare-and-swap for unoccupied branches). Re-verifies
+ * the tip immediately before mutating, so it is safe to run under the
+ * (short-held) worktree setup lock. Returns the baseline SHA unchanged.
+ */
+export async function updateLocalBaseBranch(options: {
+	repoPath: string;
+	branchName: string;
+	targetSha: string;
+}): Promise<TaskBaseLocalUpdateResult> {
+	const failure = makeFailureForRef(options.branchName);
+	const localResult = await updateLocalBranchSafely(options.repoPath, options.branchName, options.targetSha, failure);
 	if (localResult !== null && "ok" in localResult) {
 		// Blocked: surface the structured failure (ok is always false here).
 		return localResult;
 	}
-	const localBranchUpdate = localResult;
-
 	return {
 		ok: true,
-		baselineSha: targetSha,
-		remoteTargetRef: `refs/remotes/origin/${remoteBranch}`,
-		localBranchUpdate,
+		localBranchUpdate: localResult,
+	};
+}
+
+/**
+ * Refresh the selected base ref against origin and return the baseline SHA a
+ * fresh task worktree must be created from (network phase + local phase,
+ * unsplit). Callers that need different lock scopes for the two phases use
+ * {@link fetchTaskBaseRefTarget} and {@link updateLocalBaseBranch} directly.
+ * Never moves a local branch except by a verified fast-forward or a
+ * compare-and-swap update-ref.
+ */
+export async function refreshTaskBaseRef(options: {
+	repoPath: string;
+	baseRef: string;
+}): Promise<TaskBaseRefreshResult> {
+	const fetchResult = await fetchTaskBaseRefTarget(options);
+	if (!fetchResult.ok) {
+		return fetchResult;
+	}
+	const remoteTargetRef = fetchResult.remoteTargetRef;
+	if (fetchResult.localBranchName !== null) {
+		const localResult = await updateLocalBaseBranch({
+			repoPath: options.repoPath,
+			branchName: fetchResult.localBranchName,
+			targetSha: fetchResult.targetSha,
+		});
+		if (!localResult.ok) {
+			return localResult;
+		}
+		return {
+			ok: true,
+			baselineSha: fetchResult.targetSha,
+			remoteTargetRef,
+			localBranchUpdate: localResult.localBranchUpdate,
+		};
+	}
+	return {
+		ok: true,
+		baselineSha: fetchResult.targetSha,
+		remoteTargetRef,
+		localBranchUpdate: null,
 	};
 }

@@ -13,7 +13,7 @@ import type {
 import { type LockRequest, lockedFileSystem } from "../fs/locked-file-system";
 import { getTaskWorktreesHomePath, loadWorkspaceContext } from "../state/workspace-state";
 import { getGitCommandErrorMessage, getGitStdout, readGitHeadInfo, runGit } from "./git-utils";
-import { refreshTaskBaseRef } from "./task-base-refresh";
+import { fetchTaskBaseRefTarget, updateLocalBaseBranch } from "./task-base-refresh";
 import {
 	clearInitialStartLiveStage,
 	getTaskInitialStartEvidence,
@@ -135,6 +135,37 @@ async function withTaskWorktreeSetupLock<T>(repoPath: string, operation: () => P
 	return await lockedFileSystem.withLock(await getTaskWorktreeSetupLock(repoPath), operation);
 }
 
+// UPD-0 review: the base refresh does network work (bounded fetches), so it
+// must not run under the setup lock — other callers give that lock up after
+// ~5s (DEFAULT_LOCK_RETRIES) and would fail with ELOCKED behind a slow
+// origin. The refresh instead takes its own per-repo lock (same common-dir
+// scope, distinct lockfile) with long retries, and the setup lock is held
+// only for the local branch update (CAS / ff-only re-verifies the tip) and
+// the worktree mutation.
+const KANBAN_TASK_BASE_REFRESH_LOCKFILE_NAME = "kanban-task-base-refresh.lock";
+// A refresh is at most one bounded fetch (60s) plus a fast local update.
+// Wait up to ~2 minutes for a concurrent same-repo refresh.
+const TASK_BASE_REFRESH_LOCK_RETRIES: NonNullable<LockRequest["retries"]> = {
+	retries: 2400,
+	factor: 1,
+	minTimeout: 50,
+	maxTimeout: 50,
+	randomize: false,
+};
+
+export async function getTaskBaseRefreshLock(repoPath: string): Promise<LockRequest> {
+	return {
+		path: await getGitCommonDir(repoPath),
+		type: "directory",
+		lockfileName: KANBAN_TASK_BASE_REFRESH_LOCKFILE_NAME,
+		retries: TASK_BASE_REFRESH_LOCK_RETRIES,
+	};
+}
+
+async function withTaskBaseRefreshLock<T>(repoPath: string, operation: () => Promise<T>): Promise<T> {
+	return await lockedFileSystem.withLock(await getTaskBaseRefreshLock(repoPath), operation);
+}
+
 function getWorktreesRootPath(taskId: string): string {
 	const normalizedTaskId = normalizeTaskIdForWorktreePath(taskId);
 	return join(getTaskWorktreesHomePath(), normalizedTaskId);
@@ -144,7 +175,7 @@ function getWorktreesBaseRootPath(): string {
 	return getTaskWorktreesHomePath();
 }
 
-function getTaskWorktreePath(repoPath: string, taskId: string): string {
+export function getTaskWorktreePath(repoPath: string, taskId: string): string {
 	const workspaceLabel = getWorkspaceFolderLabelForWorktreePath(repoPath);
 	return join(getWorktreesRootPath(taskId), workspaceLabel);
 }
@@ -662,8 +693,16 @@ export interface InitialStartPreparationResponse {
  *    against origin when the persisted policy allows it, then creates the
  *    worktree detached at the post-refresh SHA and persists the baseline.
  *
+ * Lock scope: the local recovery checks (1-3) and the worktree mutation
+ * (5-6) run under the per-repo setup lock; the network refresh in (4) runs
+ * under a separate per-repo refresh lock with long retries so a slow origin
+ * cannot starve the setup lock, and the local branch update in (4) takes
+ * the setup lock only briefly (the CAS / ff-only update re-verifies the
+ * tip). A concurrent start is re-checked before the worktree is created.
+ *
  * Failures before a successful worktree preparation are retryable: a blocked
- * record is overwritten by the next attempt and may fetch again.
+ * record is overwritten by the next attempt (including a worktree-creation
+ * failure after a successful refresh) and may fetch again.
  */
 export async function prepareInitialTaskWorktree(options: {
 	cwd: string;
@@ -705,8 +744,12 @@ export async function prepareInitialTaskWorktree(options: {
 		const context = await loadWorkspaceContext(options.cwd);
 		const worktreePath = getTaskWorktreePath(context.repoPath, taskId);
 
-		return await withTaskWorktreeSetupLock(context.repoPath, async () => {
-			// 1. Existing worktree: authoritative, never refreshed.
+		// Phase 1 (setup lock): an existing worktree or historical evidence
+		// (preservation, saved patch, prepared baseline) is authoritative and
+		// never refreshed. These checks are local only — recovery must not
+		// depend on resolving or fetching the selected ref, and a refresh in
+		// flight elsewhere must not block them.
+		const checkExistingOrHistorical = async (): Promise<InitialStartPreparationResponse | null> => {
 			const existingCommit = await tryRunGit(worktreePath, ["rev-parse", "HEAD^{commit}"]);
 			if (existingCommit) {
 				await syncIgnoredPathsIntoWorktree(context.repoPath, worktreePath);
@@ -819,62 +862,112 @@ export async function prepareInitialTaskWorktree(options: {
 						failure: null,
 					},
 				};
-			} // 4. Fresh task (or blocked retry): resolve the base. A prior
-			//    session (durable session records) or a disabled policy means
-			//    no refresh — resolve locally as before.
-			let baselineSha: string;
-			let refreshed = false;
-			if (options.updateBaseRefBeforeStart && !options.hasPriorSession) {
-				setInitialStartLiveStage(taskId, "refreshing");
-				logWorkspaceEvent(`initial-start refreshing base task=${taskId} baseRef=${baseRef}`);
-				const refresh = await refreshTaskBaseRef({
+			}
+			return null;
+		};
+
+		const existingOrHistorical = await withTaskWorktreeSetupLock(context.repoPath, checkExistingOrHistorical);
+		if (existingOrHistorical !== null) {
+			return existingOrHistorical;
+		}
+
+		// Phase 2: fix the baseline for a fresh task (or a blocked retry).
+		// A prior session (durable session records) or a disabled policy
+		// means no refresh — resolve locally as before.
+		let baselineSha: string;
+		let refreshed = false;
+		if (options.updateBaseRefBeforeStart && !options.hasPriorSession) {
+			setInitialStartLiveStage(taskId, "refreshing");
+			logWorkspaceEvent(`initial-start refreshing base task=${taskId} baseRef=${baseRef}`);
+			// The network refresh runs under the per-repo refresh lock (long
+			// retries), NOT under the setup lock: a slow origin must not
+			// starve the ~5s setup-lock waiters (bulk starts, dispatch
+			// queues, concurrent ensures/deletes).
+			const fetchResult = await withTaskBaseRefreshLock(context.repoPath, () =>
+				fetchTaskBaseRefTarget({
 					repoPath: context.repoPath,
 					baseRef,
+				}),
+			);
+			if (!fetchResult.ok) {
+				await writeTaskInitialStartRecord({
+					taskId,
+					baseRef,
+					updateBaseRefBeforeStart: true,
+					state: "blocked",
+					baselineSha: null,
+					failure: fetchResult.failure,
+					updatedAt: Date.now(),
 				});
-				if (!refresh.ok) {
+				return fail(`${fetchResult.failure.reason} ${fetchResult.failure.remedy}`, fetchResult.failure);
+			}
+			const fetchTarget = fetchResult;
+			const localBranchName = fetchTarget.localBranchName;
+			if (localBranchName !== null) {
+				// Local branch update under the (short-held) setup lock. The
+				// CAS / ff-only update re-verifies the tip immediately before
+				// mutating, so a concurrent external change fails safely.
+				const localResult = await withTaskWorktreeSetupLock(context.repoPath, () =>
+					updateLocalBaseBranch({
+						repoPath: context.repoPath,
+						branchName: localBranchName,
+						targetSha: fetchTarget.targetSha,
+					}),
+				);
+				if (!localResult.ok) {
 					await writeTaskInitialStartRecord({
 						taskId,
 						baseRef,
 						updateBaseRefBeforeStart: true,
 						state: "blocked",
 						baselineSha: null,
-						failure: refresh.failure,
+						failure: localResult.failure,
 						updatedAt: Date.now(),
 					});
-					return fail(`${refresh.failure.reason} ${refresh.failure.remedy}`, refresh.failure);
+					return fail(`${localResult.failure.reason} ${localResult.failure.remedy}`, localResult.failure);
 				}
-				baselineSha = refresh.baselineSha;
-				refreshed = true;
-				logWorkspaceEvent(`initial-start refreshed base task=${taskId} baseRef=${baseRef} baseline=${baselineSha}`);
-			} else {
-				const resolved = await runGit(context.repoPath, ["rev-parse", "--verify", `${baseRef}^{commit}`]);
-				if (!resolved.ok) {
-					const resolutionError = getWorktreeBaseRefResolutionErrorMessage(
-						baseRef,
-						resolved.stderr || resolved.output,
-					);
-					await writeTaskInitialStartRecord({
-						taskId,
-						baseRef,
-						updateBaseRefBeforeStart: options.updateBaseRefBeforeStart,
-						state: "blocked",
-						baselineSha: null,
-						failure: {
-							category: "unsupported_ref",
-							reason: resolutionError,
-							remedy: "Select a valid base ref for the task, then start again.",
-							selectedRef: baseRef,
-						},
-						updatedAt: Date.now(),
-					});
-					return fail(resolutionError, {
+			}
+			baselineSha = fetchTarget.targetSha;
+			refreshed = true;
+			logWorkspaceEvent(`initial-start refreshed base task=${taskId} baseRef=${baseRef} baseline=${baselineSha}`);
+		} else {
+			const resolved = await runGit(context.repoPath, ["rev-parse", "--verify", `${baseRef}^{commit}`]);
+			if (!resolved.ok) {
+				const resolutionError = getWorktreeBaseRefResolutionErrorMessage(
+					baseRef,
+					resolved.stderr || resolved.output,
+				);
+				await writeTaskInitialStartRecord({
+					taskId,
+					baseRef,
+					updateBaseRefBeforeStart: options.updateBaseRefBeforeStart,
+					state: "blocked",
+					baselineSha: null,
+					failure: {
 						category: "unsupported_ref",
 						reason: resolutionError,
 						remedy: "Select a valid base ref for the task, then start again.",
 						selectedRef: baseRef,
-					});
-				}
-				baselineSha = resolved.stdout;
+					},
+					updatedAt: Date.now(),
+				});
+				return fail(resolutionError, {
+					category: "unsupported_ref",
+					reason: resolutionError,
+					remedy: "Select a valid base ref for the task, then start again.",
+					selectedRef: baseRef,
+				});
+			}
+			baselineSha = resolved.stdout;
+		}
+
+		// Phase 3 (setup lock): create the worktree at the fixed baseline.
+		// Re-check existing/historical state first — a concurrent start may
+		// have finished preparation while this one held the refresh lock.
+		return await withTaskWorktreeSetupLock(context.repoPath, async () => {
+			const concurrent = await checkExistingOrHistorical();
+			if (concurrent !== null) {
+				return concurrent;
 			}
 
 			// 5. Create the worktree detached at the fixed baseline.
@@ -885,6 +978,25 @@ export async function prepareInitialTaskWorktree(options: {
 				sha: baselineSha,
 			});
 			if (!created.ok) {
+				// The refresh above may have fast-forwarded the local base.
+				// Keep that legitimate update in place (never roll it back),
+				// but persist THIS failure (overwriting any stale record) so
+				// the pollable status reports this attempt's outcome. A retry
+				// re-fetches (a no-op for an equal tip) and recreates.
+				await writeTaskInitialStartRecord({
+					taskId,
+					baseRef,
+					updateBaseRefBeforeStart: options.updateBaseRefBeforeStart,
+					state: "blocked",
+					baselineSha: null,
+					failure: {
+						category: "worktree_setup_failed",
+						reason: created.error,
+						remedy: "Retry starting the task.",
+						selectedRef: baseRef,
+					},
+					updatedAt: Date.now(),
+				});
 				return fail(created.error, {
 					category: "worktree_setup_failed",
 					reason: created.error,
@@ -924,6 +1036,27 @@ export async function prepareInitialTaskWorktree(options: {
 		});
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
+		// Persist the failed attempt (best-effort) so the pollable status
+		// reports this outcome and a blocked record keeps the baseline
+		// unfixed for a retry.
+		await writeTaskInitialStartRecord({
+			taskId,
+			baseRef,
+			updateBaseRefBeforeStart: options.updateBaseRefBeforeStart,
+			state: "blocked",
+			baselineSha: null,
+			failure: {
+				category: "worktree_setup_failed",
+				reason: message,
+				remedy: "Retry starting the task.",
+				selectedRef: baseRef,
+			},
+			updatedAt: Date.now(),
+		}).catch((recordError: unknown) => {
+			logWorkspaceEvent(
+				`initial-start failed to record blocked state task=${taskId}: ${recordError instanceof Error ? recordError.message : String(recordError)}`,
+			);
+		});
 		return fail(message, {
 			category: "worktree_setup_failed",
 			reason: message,

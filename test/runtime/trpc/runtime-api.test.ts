@@ -531,6 +531,61 @@ describe("createRuntimeApi startTaskSession", () => {
 		);
 	});
 
+	it("treats trash resumes as prior sessions so the base is never refreshed (UPD-0)", async () => {
+		// A resumeFromTrash start with no session summaries and no durable
+		// evidence is still a resume: preparation must not refresh the base.
+		taskWorktreeMocks.taskWorktreeExists.mockResolvedValueOnce(false);
+		taskWorktreeMocks.prepareInitialTaskWorktree.mockResolvedValueOnce({
+			ok: true,
+			path: "/tmp/resumed-worktree",
+			initialStart: null,
+		});
+
+		const terminalManager = {
+			startTaskSession: vi.fn(async () => createSummary()),
+			applyTurnCheckpoint: vi.fn(),
+			getSummary: vi.fn(() => null),
+		};
+		const clineTaskSessionService = createClineTaskSessionServiceMock();
+		const api = createTestRuntimeApi({
+			getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+			loadScopedRuntimeConfig: vi.fn(async () => createRuntimeConfigState()),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: vi.fn(async () => terminalManager as never),
+			getScopedClineTaskSessionService: vi.fn(async () => clineTaskSessionService as never),
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+		});
+
+		const response = await api.startTaskSession(
+			{
+				workspaceId: "workspace-1",
+				workspacePath: "/tmp/repo",
+			},
+			{
+				taskId: "task-1",
+				baseRef: "main",
+				prompt: "Investigate startup freeze",
+				resumeFromTrash: true,
+			},
+		);
+
+		expect(response.ok).toBe(true);
+		expect(taskWorktreeMocks.prepareInitialTaskWorktree).toHaveBeenCalledTimes(1);
+		expect(taskWorktreeMocks.prepareInitialTaskWorktree).toHaveBeenCalledWith({
+			cwd: "/tmp/repo",
+			taskId: "task-1",
+			baseRef: "main",
+			updateBaseRefBeforeStart: true,
+			hasPriorSession: true,
+		});
+		expect(terminalManager.startTaskSession).toHaveBeenCalledWith(
+			expect.objectContaining({
+				cwd: "/tmp/resumed-worktree",
+			}),
+		);
+	});
+
 	it("surfaces initial-start preparation failures on the start response", async () => {
 		taskWorktreeMocks.taskWorktreeExists.mockResolvedValueOnce(false);
 		taskWorktreeMocks.prepareInitialTaskWorktree.mockResolvedValueOnce({

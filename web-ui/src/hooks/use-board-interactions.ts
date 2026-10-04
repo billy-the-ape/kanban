@@ -626,19 +626,30 @@ export function useBoardInteractions({
 					return reverted.moved ? reverted.board : currentBoard;
 				});
 			};
-			const ensured = await ensureTaskWorkspace(task);
-			if (!ensured.ok) {
-				notifyError(ensured.message ?? "Could not set up task workspace.");
-				revertOptimisticMove();
-				return;
-			}
-			if (ensured.response?.warning) {
-				showAppToast({
-					intent: "warning",
-					icon: "warning-sign",
-					message: ensured.response.warning,
-					timeout: 7000,
-				});
+			// UPD-0: a reopened task without durable evidence (worktree, prepared
+			// baseline, preservation, saved patch, delivery receipt) is refused
+			// by the generic ensure ("start the task to create its worktree"),
+			// which is not actionable for a card already leaving trash/done.
+			// Skip the ensure and let the server-side start (a trash resume,
+			// which never refreshes the base) own worktree creation. A failed
+			// status query keeps the conservative ensure-first behavior.
+			const initialStartStatus = await getTaskInitialStartStatus(taskId);
+			const isFreshUnreopenedTask = initialStartStatus?.ok && initialStartStatus.initialStartBaselineFixed === false;
+			if (!isFreshUnreopenedTask) {
+				const ensured = await ensureTaskWorkspace(task);
+				if (!ensured.ok) {
+					notifyError(ensured.message ?? "Could not set up task workspace.");
+					revertOptimisticMove();
+					return;
+				}
+				if (ensured.response?.warning) {
+					showAppToast({
+						intent: "warning",
+						icon: "warning-sign",
+						message: ensured.response.warning,
+						timeout: 7000,
+					});
+				}
 			}
 			const resumed = await startTaskSession(task, { resumeFromTrash: true });
 			if (resumed.ok) {
@@ -652,7 +663,7 @@ export function useBoardInteractions({
 			notifyError(resumed.message ?? "Could not resume task session.");
 			revertOptimisticMove();
 		},
-		[ensureTaskWorkspace, setBoard, startTaskSession],
+		[ensureTaskWorkspace, getTaskInitialStartStatus, setBoard, startTaskSession],
 	);
 
 	const handleDragEnd = useCallback(

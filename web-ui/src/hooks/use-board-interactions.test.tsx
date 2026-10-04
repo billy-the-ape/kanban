@@ -805,6 +805,101 @@ describe("useBoardInteractions", () => {
 		});
 	});
 
+	it("skips the pre-start ensure when reopening a task without a fixed baseline (UPD-0)", async () => {
+		// A reopened task without durable evidence is refused by the generic
+		// ensure; the server-side trash resume owns worktree creation.
+		let latestSnapshot: HookSnapshot | null = null;
+
+		useProgrammaticCardMovesMock.mockReturnValue({
+			handleProgrammaticCardMoveReady: () => {},
+			setRequestMoveTaskToTrashHandler: () => {},
+			setRequestCompleteTaskHandler: () => {},
+			tryProgrammaticCardMove: () => "unavailable",
+			consumeProgrammaticCardMove: () => ({}),
+			resolvePendingProgrammaticTrashMove: () => {},
+			resolvePendingProgrammaticCompleteMove: () => {},
+			waitForProgrammaticCardMoveAvailability: async () => {},
+			resetProgrammaticCardMoves: () => {},
+			requestMoveTaskToTrashWithAnimation: async () => {},
+			requestCompleteTaskWithAnimation: async () => {},
+			programmaticCardMoveCycle: 0,
+		});
+
+		useLinkedBacklogTaskActionsMock.mockReturnValue({
+			handleCreateDependency: () => {},
+			handleDeleteDependency: () => {},
+			confirmMoveTaskToTrash: async () => {},
+			requestMoveTaskToTrash: async () => {},
+			requestCompleteTask: async () => {},
+		});
+
+		const trashTask = createTask("task-trash-fresh", "Fresh trash task", 2);
+		const board: BoardData = {
+			columns: [
+				{ id: "backlog", title: "Backlog", cards: [] },
+				{ id: "in_progress", title: "In Progress", cards: [] },
+				{ id: "review", title: "Review", cards: [] },
+				{ id: "trash", title: "Done", cards: [trashTask] },
+			],
+			dependencies: [],
+		};
+		const setBoard = vi.fn<Dispatch<SetStateAction<BoardData>>>((_nextBoard) => {
+			// The optimistic move is not part of this assertion.
+		});
+		const ensureTaskWorkspace = vi.fn(async () => ({
+			ok: true as const,
+			response: {
+				ok: true as const,
+				path: "/tmp/task-trash-fresh",
+				baseRef: "main",
+				baseCommit: "abc123",
+				restoredFromPreservation: false,
+			},
+		}));
+		const getTaskInitialStartStatus = vi.fn(async () => createInitialStartStatus(false));
+		const startTaskSession = vi.fn(async () => ({ ok: true as const }));
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					board={board}
+					setBoard={setBoard}
+					ensureTaskWorkspace={ensureTaskWorkspace}
+					getTaskInitialStartStatus={getTaskInitialStartStatus}
+					startTaskSession={startTaskSession}
+					onSnapshot={(snapshot) => {
+						latestSnapshot = snapshot;
+					}}
+				/>,
+			);
+		});
+
+		if (!latestSnapshot) {
+			throw new Error("Expected a hook snapshot.");
+		}
+
+		await act(async () => {
+			latestSnapshot!.handleRestoreTaskFromTrash("task-trash-fresh");
+			// resumeTaskFromTrash is fire-and-forget (void), so flush enough
+			// microtasks for the status query and startTaskSession to resolve.
+			for (let i = 0; i < 10; i++) {
+				await Promise.resolve();
+			}
+		});
+
+		const expectedTask = expect.objectContaining({
+			id: trashTask.id,
+			prompt: trashTask.prompt,
+			baseRef: trashTask.baseRef,
+			createdAt: trashTask.createdAt,
+		});
+		expect(getTaskInitialStartStatus).toHaveBeenCalledWith("task-trash-fresh");
+		// No durable evidence: the generic ensure would refuse, so the
+		// browser skips it and lets the server-side resume create the worktree.
+		expect(ensureTaskWorkspace).not.toHaveBeenCalled();
+		expect(startTaskSession).toHaveBeenCalledWith(expectedTask, { resumeFromTrash: true });
+	});
+
 	it("reopens a completed task in review and puts it back in done when the session cannot resume", async () => {
 		let latestSnapshot: HookSnapshot | null = null;
 

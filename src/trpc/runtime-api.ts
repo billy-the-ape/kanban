@@ -225,12 +225,16 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				} else {
 					// UPD-0: prior-session detection is a preparation concern — an
 					// existing session makes the baseline fixed even without a
-					// persisted evidence record.
+					// persisted evidence record. A trash resume is a resume, never
+					// a fresh start: it must not refresh the base even when no
+					// durable evidence remains (fast-forwarding a local branch
+					// during a trash restore is surprising).
 					const prepTerminalManager = await deps.getScopedTerminalManager(workspaceScope);
 					const prepClineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
 					const hasPriorSession =
 						prepTerminalManager.getSummary(body.taskId) !== null ||
-						prepClineTaskSessionService.getSummary(body.taskId) !== null;
+						prepClineTaskSessionService.getSummary(body.taskId) !== null ||
+						body.resumeFromTrash === true;
 					// UPD-0: the persisted board card policy is authoritative
 					// (missing values normalize to true; explicit false honored).
 					const board = await loadWorkspaceBoardById(workspaceScope.workspaceId).catch(() => null);
