@@ -4,7 +4,11 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { deleteTaskWorktree, ensureTaskWorktreeIfDoesntExist } from "../../src/workspace/task-worktree";
+import {
+	deleteTaskWorktree,
+	ensureTaskWorktreeIfDoesntExist,
+	prepareInitialTaskWorktree,
+} from "../../src/workspace/task-worktree";
 import { createGitTestEnv } from "../utilities/git-env";
 import { createTempDir } from "../utilities/temp-dir";
 
@@ -72,15 +76,20 @@ describe.sequential("task-worktree integration", () => {
 				runGit(repoPath, ["config", "user.email", "kanban-test@example.com"]);
 
 				const currentBranch = runGit(repoPath, ["symbolic-ref", "--short", "HEAD"]);
-				const ensured = await ensureTaskWorktreeIfDoesntExist({
+				// UPD-0: worktree creation only happens through the start-owned
+				// preparation; base-ref resolution failures surface there.
+				const prepared = await prepareInitialTaskWorktree({
 					cwd: repoPath,
 					taskId: "task-no-initial-commit",
 					baseRef: currentBranch,
+					updateBaseRefBeforeStart: false,
 				});
 
-				expect(ensured.ok).toBe(false);
-				expect(ensured.error).toContain("does not have an initial commit yet");
-				expect(ensured.error).toContain(`base ref "${currentBranch}"`);
+				expect(prepared.ok).toBe(false);
+				expect(prepared.error).toContain("does not have an initial commit yet");
+				expect(prepared.error).toContain(`base ref "${currentBranch}"`);
+				expect(prepared.initialStart.stage).toBe("blocked");
+				expect(prepared.initialStart.failure).not.toBeNull();
 			} finally {
 				cleanup();
 			}
@@ -116,10 +125,11 @@ describe.sequential("task-worktree integration", () => {
 				]);
 				expect(ignoredPaths).toContain(".husky/_/");
 
-				const ensured = await ensureTaskWorktreeIfDoesntExist({
+				const ensured = await prepareInitialTaskWorktree({
 					cwd: repoPath,
 					taskId: "task-1",
 					baseRef: "HEAD",
+					updateBaseRefBeforeStart: false,
 				});
 				expect(ensured.ok).toBe(true);
 				if (!ensured.ok || !ensured.path) {
@@ -168,10 +178,11 @@ describe.sequential("task-worktree integration", () => {
 				runGit(repoPath, ["add", "README.md", ".gitignore"]);
 				runGit(repoPath, ["commit", "-m", "init"]);
 
-				const ensured = await ensureTaskWorktreeIfDoesntExist({
+				const ensured = await prepareInitialTaskWorktree({
 					cwd: repoPath,
 					taskId: "task-2",
 					baseRef: "HEAD",
+					updateBaseRefBeforeStart: false,
 				});
 				expect(ensured.ok).toBe(true);
 				if (!ensured.ok || !ensured.path) {
@@ -222,10 +233,11 @@ describe.sequential("task-worktree integration", () => {
 				runGit(repoPath, ["add", "README.md", "package.json", ".gitignore"]);
 				runGit(repoPath, ["commit", "-m", "init"]);
 
-				const ensured = await ensureTaskWorktreeIfDoesntExist({
+				const ensured = await prepareInitialTaskWorktree({
 					cwd: repoPath,
 					taskId: "task-root-turbopack",
 					baseRef: "HEAD",
+					updateBaseRefBeforeStart: false,
 				});
 				expect(ensured.ok).toBe(true);
 				if (!ensured.ok || !ensured.path) {
@@ -272,10 +284,11 @@ describe.sequential("task-worktree integration", () => {
 				runGit(repoPath, ["add", "README.md", "package.json", "apps/web/package.json", ".gitignore"]);
 				runGit(repoPath, ["commit", "-m", "init"]);
 
-				const ensured = await ensureTaskWorktreeIfDoesntExist({
+				const ensured = await prepareInitialTaskWorktree({
 					cwd: repoPath,
 					taskId: "task-nested-turbopack",
 					baseRef: "HEAD",
+					updateBaseRefBeforeStart: false,
 				});
 				expect(ensured.ok).toBe(true);
 				if (!ensured.ok || !ensured.path) {
@@ -314,10 +327,11 @@ describe.sequential("task-worktree integration", () => {
 				runGit(repoPath, ["commit", "-m", "init"]);
 
 				const taskId = `task-restore-${Date.now()}`;
-				const ensured = await ensureTaskWorktreeIfDoesntExist({
+				const ensured = await prepareInitialTaskWorktree({
 					cwd: repoPath,
 					taskId,
 					baseRef: "HEAD",
+					updateBaseRefBeforeStart: false,
 				});
 				expect(ensured.ok).toBe(true);
 				if (!ensured.ok || !ensured.path) {
@@ -389,10 +403,11 @@ describe.sequential("task-worktree integration", () => {
 				runGit(repoPath, ["commit", "-m", "init"]);
 
 				const taskId = `task-invalid-patch-${Date.now()}`;
-				const ensured = await ensureTaskWorktreeIfDoesntExist({
+				const ensured = await prepareInitialTaskWorktree({
 					cwd: repoPath,
 					taskId,
 					baseRef: "HEAD",
+					updateBaseRefBeforeStart: false,
 				});
 				expect(ensured.ok).toBe(true);
 				if (!ensured.ok || !ensured.path) {

@@ -2,6 +2,7 @@ import { access, lstat, mkdir, readdir, readFile, rm, symlink } from "node:fs/pr
 import { dirname, isAbsolute, join } from "node:path";
 
 import type {
+	RuntimeTaskInitialStartOutcome,
 	RuntimeTaskPreservationInfoResponse,
 	RuntimeTaskPreservationRecord,
 	RuntimeTaskWorkspaceInfoResponse,
@@ -12,6 +13,14 @@ import type {
 import { type LockRequest, lockedFileSystem } from "../fs/locked-file-system";
 import { getTaskWorktreesHomePath, loadWorkspaceContext } from "../state/workspace-state";
 import { getGitCommandErrorMessage, getGitStdout, readGitHeadInfo, runGit } from "./git-utils";
+import { refreshTaskBaseRef } from "./task-base-refresh";
+import {
+	clearInitialStartLiveStage,
+	getTaskInitialStartEvidence,
+	isInitialStartBaselineFixed,
+	setInitialStartLiveStage,
+	writeTaskInitialStartRecord,
+} from "./task-initial-start";
 import { applyTaskPatch, findTaskPatch } from "./task-patch";
 import {
 	applyPreservedWorktreeContent,
@@ -23,6 +32,7 @@ import {
 } from "./task-preservation";
 import { getWorkspaceFolderLabelForWorktreePath, normalizeTaskIdForWorktreePath } from "./task-worktree-path";
 import { listTurbopackNodeModulesSymlinkSkipPaths } from "./task-worktree-turbopack";
+import { logWorkspaceEvent } from "./workspace-logger";
 
 const KANBAN_MANAGED_EXCLUDE_BLOCK_START = "# kanban-managed-symlinked-ignored-paths:start";
 const KANBAN_MANAGED_EXCLUDE_BLOCK_END = "# kanban-managed-symlinked-ignored-paths:end";
@@ -412,6 +422,63 @@ export async function ensureTaskWorktreeIfDoesntExist(options: {
 				};
 			}
 
+			// UPD-0: a generic ensure never creates a worktree for a task that
+			// has never started. That worktree is created by the start
+			// lifecycle, which first refreshes the origin-backed base ref for
+			// fresh tasks with the update option enabled.
+			const initialStartEvidence = await getTaskInitialStartEvidence(taskId);
+			const hasHistoricalWork = initialStartEvidence.hasPreservationRecord || initialStartEvidence.hasSavedPatch;
+			if (!hasHistoricalWork && initialStartEvidence.preparedBaselineSha !== null) {
+				// A fixed baseline is authoritative (only when no preserved
+				// work needs restoring): restore at the recorded SHA, never
+				// re-resolve against a newer origin state.
+				const restored = await restoreDetachedTaskWorktree({
+					repoPath: context.repoPath,
+					worktreePath,
+					sha: initialStartEvidence.preparedBaselineSha,
+				});
+				if (!restored.ok) {
+					return {
+						ok: false,
+						path: null,
+						baseRef: requestedBaseRef,
+						baseCommit: null,
+						error: restored.error,
+						restoredFromPreservation: false,
+					};
+				}
+				await syncTaskPreservationActivity({
+					repoPath: context.repoPath,
+					taskId,
+					worktreePath,
+					headCommit: restored.headCommit,
+					startingCommit: restored.headCommit,
+				});
+				return {
+					ok: true,
+					path: worktreePath,
+					baseRef: requestedBaseRef,
+					baseCommit: restored.headCommit,
+					restoredFromPreservation: false,
+				};
+			}
+			if (
+				!hasHistoricalWork &&
+				!initialStartEvidence.hasDeliveryReceipt &&
+				initialStartEvidence.preparedBaselineSha === null
+			) {
+				return {
+					ok: false,
+					path: null,
+					baseRef: requestedBaseRef,
+					baseCommit: null,
+					category: "initial_start_preparation_required",
+					remedy: "Start the task to create its worktree.",
+					error: `The worktree for task "${options.taskId}" is created when the task starts, which prepares its base ref first. Start the task to create its worktree.`,
+					restoredFromPreservation: false,
+				};
+			}
+
 			const baseRefResult = await runGit(context.repoPath, [
 				"rev-parse",
 				"--verify",
@@ -535,6 +602,461 @@ export async function ensureTaskWorktreeIfDoesntExist(options: {
 			baseCommit: null,
 			error: message,
 		};
+	}
+}
+
+/**
+ * Create (or recreate a stale) detached task worktree at an exact commit and
+ * make it runnable. Shared by the prepared-baseline restore path and the
+ * start-owned preparation.
+ */
+async function restoreDetachedTaskWorktree(options: {
+	repoPath: string;
+	worktreePath: string;
+	sha: string;
+}): Promise<{ ok: true; headCommit: string } | { ok: false; error: string }> {
+	if (await pathExists(options.worktreePath)) {
+		await removeTaskWorktreeInternal(options.repoPath, options.worktreePath);
+	}
+	// Clean up stale worktree registrations that can linger when git
+	// worktree remove fails or the process is interrupted. Without this,
+	// git worktree add refuses with "missing but already registered".
+	await runGit(options.repoPath, ["worktree", "prune"]);
+	await mkdir(dirname(options.worktreePath), { recursive: true });
+	const addResult = await runGit(options.repoPath, ["worktree", "add", "--detach", options.worktreePath, options.sha]);
+	if (!addResult.ok) {
+		return {
+			ok: false,
+			error: addResult.stderr || addResult.output || "Could not create the task worktree at the recorded baseline.",
+		};
+	}
+	await prepareNewTaskWorktree(options.repoPath, options.worktreePath);
+	const headCommit = (await tryRunGit(options.worktreePath, ["rev-parse", "HEAD^{commit}"])) ?? options.sha;
+	return { ok: true, headCommit };
+}
+
+export interface InitialStartPreparationResponse {
+	ok: boolean;
+	path: string | null;
+	baseRef: string;
+	baseCommit: string | null;
+	restoredFromPreservation: boolean;
+	warning?: string;
+	error?: string;
+	/** UPD-0: terminal preparation outcome (fixed baseline + final stage). */
+	initialStart: RuntimeTaskInitialStartOutcome;
+}
+
+/**
+ * UPD-0: runtime-owned preparation for a task's initial start. This is the
+ * ONLY path that creates the worktree for a task that has never started and
+ * the only path that refreshes the base ref:
+ *
+ * 1. an existing worktree is authoritative and reused (never refreshed);
+ * 2. preserved work or a saved patch restores before any base resolution
+ *    (trash restore / saved-patch resume keeps historical state
+ *    authoritative);
+ * 3. a prepared baseline record restores at the recorded SHA (never
+ *    re-resolved against a newer origin state);
+ * 4. a fresh task (no durable evidence) refreshes the selected base ref
+ *    against origin when the persisted policy allows it, then creates the
+ *    worktree detached at the post-refresh SHA and persists the baseline.
+ *
+ * Failures before a successful worktree preparation are retryable: a blocked
+ * record is overwritten by the next attempt and may fetch again.
+ */
+export async function prepareInitialTaskWorktree(options: {
+	cwd: string;
+	taskId: string;
+	baseRef: string;
+	/** Persisted card policy (missing values already normalized to true). */
+	updateBaseRefBeforeStart: boolean;
+	/** True when durable session records show this task already started. */
+	hasPriorSession?: boolean;
+}): Promise<InitialStartPreparationResponse> {
+	const startedAt = Date.now();
+	const taskId = normalizeTaskIdForWorktreePath(options.taskId);
+	const baseRef = options.baseRef.trim();
+	const elapsed = () => `${Date.now() - startedAt}ms`;
+	const fail = (
+		error: string,
+		failure: RuntimeTaskInitialStartOutcome["failure"],
+	): InitialStartPreparationResponse => {
+		clearInitialStartLiveStage(taskId);
+		logWorkspaceEvent(
+			`initial-start preparation blocked task=${taskId} baseRef=${baseRef} after ${elapsed()}: ${error}`,
+		);
+		return {
+			ok: false,
+			path: null,
+			baseRef,
+			baseCommit: null,
+			restoredFromPreservation: false,
+			error,
+			initialStart: {
+				stage: "blocked",
+				baselineSha: null,
+				refreshed: false,
+				failure,
+			},
+		};
+	};
+	try {
+		const context = await loadWorkspaceContext(options.cwd);
+		const worktreePath = getTaskWorktreePath(context.repoPath, taskId);
+
+		return await withTaskWorktreeSetupLock(context.repoPath, async () => {
+			// 1. Existing worktree: authoritative, never refreshed.
+			const existingCommit = await tryRunGit(worktreePath, ["rev-parse", "HEAD^{commit}"]);
+			if (existingCommit) {
+				await syncIgnoredPathsIntoWorktree(context.repoPath, worktreePath);
+				await syncTaskPreservationActivity({
+					repoPath: context.repoPath,
+					taskId,
+					worktreePath,
+					headCommit: existingCommit,
+				});
+				logWorkspaceEvent(
+					`initial-start reused existing worktree task=${taskId} head=${existingCommit} after ${elapsed()}`,
+				);
+				return {
+					ok: true,
+					path: worktreePath,
+					baseRef,
+					baseCommit: existingCommit,
+					restoredFromPreservation: false,
+					initialStart: {
+						stage: "ready",
+						baselineSha: existingCommit,
+						refreshed: false,
+						failure: null,
+					},
+				};
+			}
+
+			const evidence = await getTaskInitialStartEvidence(taskId);
+
+			// 2. Preserved work / saved patch: restore before any base
+			//    resolution or baseline reuse so historical state stays
+			//    authoritative (trash restore, saved-patch resume).
+			if (evidence.hasPreservationRecord || evidence.hasSavedPatch) {
+				const restored = await restorePreservedOrPatchedWorktree({
+					repoPath: context.repoPath,
+					taskId,
+					worktreePath,
+					baseRef,
+				});
+				if (!restored.ok) {
+					return fail(restored.error, {
+						category: "worktree_setup_failed",
+						reason: restored.error,
+						remedy:
+							"Recover the task's preserved work (kanban task recover), or delete the task and start again.",
+						selectedRef: baseRef,
+					});
+				}
+				logWorkspaceEvent(
+					`initial-start restored historical work task=${taskId} sha=${restored.baseCommit} after ${elapsed()}`,
+				);
+				return {
+					ok: true,
+					path: restored.path,
+					baseRef,
+					baseCommit: restored.baseCommit,
+					restoredFromPreservation: restored.restoredFromPreservation,
+					...(restored.warning ? { warning: restored.warning } : {}),
+					initialStart: {
+						stage: "ready",
+						baselineSha: restored.baseCommit,
+						refreshed: false,
+						failure: null,
+					},
+				};
+			}
+
+			// 3. Prepared baseline (no preserved work): restore at the recorded
+			//    SHA, never re-resolved against a newer origin state.
+			if (evidence.preparedBaselineSha !== null) {
+				setInitialStartLiveStage(taskId, "creating_worktree");
+				const restored = await restoreDetachedTaskWorktree({
+					repoPath: context.repoPath,
+					worktreePath,
+					sha: evidence.preparedBaselineSha,
+				});
+				if (!restored.ok) {
+					return fail(
+						`The recorded initial baseline ${evidence.preparedBaselineSha.slice(0, 12)} is no longer available. ${restored.error}`,
+						{
+							category: "worktree_setup_failed",
+							reason: "The recorded initial baseline for the task is no longer available in the repository.",
+							remedy:
+								"Recover the task's preserved work (kanban task recover), or delete the task and start again.",
+							selectedRef: baseRef,
+						},
+					);
+				}
+				await syncTaskPreservationActivity({
+					repoPath: context.repoPath,
+					taskId,
+					worktreePath,
+					headCommit: restored.headCommit,
+					startingCommit: restored.headCommit,
+				});
+				clearInitialStartLiveStage(taskId);
+				logWorkspaceEvent(
+					`initial-start restored prepared baseline task=${taskId} sha=${restored.headCommit} after ${elapsed()}`,
+				);
+				return {
+					ok: true,
+					path: worktreePath,
+					baseRef,
+					baseCommit: restored.headCommit,
+					restoredFromPreservation: false,
+					initialStart: {
+						stage: "ready",
+						baselineSha: restored.headCommit,
+						refreshed: false,
+						failure: null,
+					},
+				};
+			} // 4. Fresh task (or blocked retry): resolve the base. A prior
+			//    session (durable session records) or a disabled policy means
+			//    no refresh — resolve locally as before.
+			let baselineSha: string;
+			let refreshed = false;
+			if (options.updateBaseRefBeforeStart && !options.hasPriorSession) {
+				setInitialStartLiveStage(taskId, "refreshing");
+				logWorkspaceEvent(`initial-start refreshing base task=${taskId} baseRef=${baseRef}`);
+				const refresh = await refreshTaskBaseRef({
+					repoPath: context.repoPath,
+					baseRef,
+				});
+				if (!refresh.ok) {
+					await writeTaskInitialStartRecord({
+						taskId,
+						baseRef,
+						updateBaseRefBeforeStart: true,
+						state: "blocked",
+						baselineSha: null,
+						failure: refresh.failure,
+						updatedAt: Date.now(),
+					});
+					return fail(`${refresh.failure.reason} ${refresh.failure.remedy}`, refresh.failure);
+				}
+				baselineSha = refresh.baselineSha;
+				refreshed = true;
+				logWorkspaceEvent(`initial-start refreshed base task=${taskId} baseRef=${baseRef} baseline=${baselineSha}`);
+			} else {
+				const resolved = await runGit(context.repoPath, ["rev-parse", "--verify", `${baseRef}^{commit}`]);
+				if (!resolved.ok) {
+					const resolutionError = getWorktreeBaseRefResolutionErrorMessage(
+						baseRef,
+						resolved.stderr || resolved.output,
+					);
+					await writeTaskInitialStartRecord({
+						taskId,
+						baseRef,
+						updateBaseRefBeforeStart: options.updateBaseRefBeforeStart,
+						state: "blocked",
+						baselineSha: null,
+						failure: {
+							category: "unsupported_ref",
+							reason: resolutionError,
+							remedy: "Select a valid base ref for the task, then start again.",
+							selectedRef: baseRef,
+						},
+						updatedAt: Date.now(),
+					});
+					return fail(resolutionError, {
+						category: "unsupported_ref",
+						reason: resolutionError,
+						remedy: "Select a valid base ref for the task, then start again.",
+						selectedRef: baseRef,
+					});
+				}
+				baselineSha = resolved.stdout;
+			}
+
+			// 5. Create the worktree detached at the fixed baseline.
+			setInitialStartLiveStage(taskId, "creating_worktree");
+			const created = await restoreDetachedTaskWorktree({
+				repoPath: context.repoPath,
+				worktreePath,
+				sha: baselineSha,
+			});
+			if (!created.ok) {
+				return fail(created.error, {
+					category: "worktree_setup_failed",
+					reason: created.error,
+					remedy: "Retry starting the task.",
+					selectedRef: baseRef,
+				});
+			}
+
+			// 6. Persist the fixed baseline before anything can relaunch it.
+			setInitialStartLiveStage(taskId, "recording_baseline");
+			await writeTaskInitialStartRecord({
+				taskId,
+				baseRef,
+				updateBaseRefBeforeStart: options.updateBaseRefBeforeStart,
+				state: "prepared",
+				baselineSha: created.headCommit,
+				failure: null,
+				updatedAt: Date.now(),
+			});
+			clearInitialStartLiveStage(taskId);
+			logWorkspaceEvent(
+				`initial-start prepared worktree task=${taskId} baseline=${created.headCommit} refreshed=${refreshed} after ${elapsed()}`,
+			);
+			return {
+				ok: true,
+				path: worktreePath,
+				baseRef,
+				baseCommit: created.headCommit,
+				restoredFromPreservation: false,
+				initialStart: {
+					stage: "ready",
+					baselineSha: created.headCommit,
+					refreshed,
+					failure: null,
+				},
+			};
+		});
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return fail(message, {
+			category: "worktree_setup_failed",
+			reason: message,
+			remedy: "Retry starting the task.",
+			selectedRef: baseRef,
+		});
+	}
+}
+
+/**
+ * UPD-0: preservation / saved-patch restoration shared by the start-owned
+ * preparation (the generic ensure keeps its own equivalent behavior).
+ */
+async function restorePreservedOrPatchedWorktree(options: {
+	repoPath: string;
+	taskId: string;
+	worktreePath: string;
+	baseRef: string;
+}): Promise<
+	| {
+			ok: true;
+			path: string;
+			baseCommit: string;
+			restoredFromPreservation: boolean;
+			warning?: string;
+	  }
+	| { ok: false; error: string }
+> {
+	try {
+		// 1. Preserved work (trashed, or the runtime was interrupted) is
+		//    authoritative and restores without resolving the selected base
+		//    ref, which may no longer exist.
+		const restoreTarget = await resolveTaskPreservationRestoreTarget({
+			repoPath: options.repoPath,
+			taskId: options.taskId,
+		});
+		if (restoreTarget?.commit) {
+			const restored = await restoreDetachedTaskWorktree({
+				repoPath: options.repoPath,
+				worktreePath: options.worktreePath,
+				sha: restoreTarget.commit,
+			});
+			if (restored.ok) {
+				const preserveWarning = await applyPreservedWorktreeContent({
+					taskId: options.taskId,
+					worktreePath: options.worktreePath,
+					checkedOutCommit: restoreTarget.commit,
+					patch: restoreTarget.patch,
+					archivePath: restoreTarget.archivePath,
+				});
+				await syncTaskPreservationActivity({
+					repoPath: options.repoPath,
+					taskId: options.taskId,
+					worktreePath: options.worktreePath,
+					headCommit: restoreTarget.commit,
+					startingCommit: restoreTarget.commit,
+				});
+				return {
+					ok: true,
+					path: options.worktreePath,
+					baseCommit: restoreTarget.commit,
+					restoredFromPreservation: true,
+					...(preserveWarning ? { warning: preserveWarning } : {}),
+				};
+			}
+			// The preserved commit may no longer exist (e.g. gc'd objects).
+			// Fall through to the patch/base-ref path below.
+		}
+
+		// 2. Saved patch: restore onto its recorded commit; this also never
+		//    requires the selected base ref.
+		const storedPatch = await findTaskPatch(options.taskId);
+		if (storedPatch) {
+			const created = await restoreDetachedTaskWorktree({
+				repoPath: options.repoPath,
+				worktreePath: options.worktreePath,
+				sha: storedPatch.commit,
+			});
+			if (created.ok) {
+				let patchWarning: string | undefined;
+				try {
+					await applyTaskPatch(storedPatch.path, options.worktreePath);
+					await rm(storedPatch.path, { force: true });
+				} catch (patchError) {
+					patchWarning = `Saved task changes could not be reapplied automatically. ${getGitCommandErrorMessage(patchError)}`;
+				}
+				return {
+					ok: true,
+					path: options.worktreePath,
+					baseCommit: storedPatch.commit,
+					restoredFromPreservation: false,
+					...(patchWarning ? { warning: patchWarning } : {}),
+				};
+			}
+			// The saved patch's original commit is gone; fall back to the base
+			// ref below with a warning.
+		}
+
+		// 3. Last resort: no restorable state survived (or its commits are
+		//    gone), so resolve the selected base ref.
+		const baseRefResult = await runGit(options.repoPath, ["rev-parse", "--verify", `${options.baseRef}^{commit}`]);
+		if (!baseRefResult.ok) {
+			return {
+				ok: false,
+				error: getWorktreeBaseRefResolutionErrorMessage(
+					options.baseRef,
+					baseRefResult.stderr || baseRefResult.output,
+				),
+			};
+		}
+		const requestedBaseCommit = baseRefResult.stdout;
+		const created = await restoreDetachedTaskWorktree({
+			repoPath: options.repoPath,
+			worktreePath: options.worktreePath,
+			sha: requestedBaseCommit,
+		});
+		if (!created.ok) {
+			return { ok: false, error: created.error };
+		}
+		return {
+			ok: true,
+			path: options.worktreePath,
+			baseCommit: requestedBaseCommit,
+			restoredFromPreservation: false,
+			...(restoreTarget?.commit || storedPatch
+				? {
+						warning:
+							"Could not restore the saved task patch onto its original commit. Started from the task base ref instead.",
+					}
+				: {}),
+		};
+	} catch (error) {
+		return { ok: false, error: error instanceof Error ? error.message : String(error) };
 	}
 }
 
@@ -848,6 +1370,11 @@ export async function getTaskWorkspaceInfo(options: {
 	baseRef: string;
 }): Promise<RuntimeTaskWorkspaceInfoResponse> {
 	const workspacePathInfo = await getTaskWorkspacePathInfo(options);
+	// UPD-0: expose the same durable signal that gates the base refresh.
+	const evidence = await getTaskInitialStartEvidence(workspacePathInfo.taskId);
+	const initialStartBaselineFixed = isInitialStartBaselineFixed(evidence, {
+		worktreeExists: workspacePathInfo.exists,
+	});
 	if (!workspacePathInfo.exists) {
 		return {
 			taskId: workspacePathInfo.taskId,
@@ -857,6 +1384,7 @@ export async function getTaskWorkspaceInfo(options: {
 			branch: null,
 			isDetached: false,
 			headCommit: null,
+			initialStartBaselineFixed,
 		};
 	}
 
@@ -869,5 +1397,6 @@ export async function getTaskWorkspaceInfo(options: {
 		branch: headInfo.branch,
 		isDetached: headInfo.isDetached,
 		headCommit: headInfo.headCommit,
+		initialStartBaselineFixed,
 	};
 }

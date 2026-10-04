@@ -89,6 +89,8 @@ import type {
 	RuntimeTaskDispatchReconcileResponse,
 	RuntimeTaskDispatchRunResponse,
 	RuntimeTaskDispatchStatusResponse,
+	RuntimeTaskInitialStartStatusRequest,
+	RuntimeTaskInitialStartStatusResponse,
 	RuntimeTaskPhasesRequest,
 	RuntimeTaskPhasesResponse,
 	RuntimeTaskPreservationInfoResponse,
@@ -204,6 +206,8 @@ import {
 	runtimeTaskDispatchReconcileResponseSchema,
 	runtimeTaskDispatchRunResponseSchema,
 	runtimeTaskDispatchStatusResponseSchema,
+	runtimeTaskInitialStartStatusRequestSchema,
+	runtimeTaskInitialStartStatusResponseSchema,
 	runtimeTaskPhasesRequestSchema,
 	runtimeTaskPhasesResponseSchema,
 	runtimeTaskPreservationInfoResponseSchema,
@@ -266,6 +270,11 @@ export interface RuntimeTrpcContext {
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskSessionStartRequest,
 		) => Promise<RuntimeTaskSessionStartResponse>;
+		/** UPD-0: pollable initial-start preparation status (live stage or durable outcome). */
+		getTaskInitialStartStatus: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskInitialStartStatusRequest,
+		) => Promise<RuntimeTaskInitialStartStatusResponse>;
 		startTaskReview: (
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskReviewStartRequest,
@@ -560,6 +569,13 @@ export const runtimeAppRouter = t.router({
 			.output(runtimeTaskSessionStartResponseSchema)
 			.mutation(async ({ ctx, input }) => {
 				return await ctx.runtimeApi.startTaskSession(ctx.workspaceScope, input);
+			}),
+		// UPD-0: pollable initial-start preparation status.
+		taskInitialStartStatus: workspaceProcedure
+			.input(runtimeTaskInitialStartStatusRequestSchema)
+			.output(runtimeTaskInitialStartStatusResponseSchema)
+			.query(async ({ ctx, input }) => {
+				return await ctx.runtimeApi.getTaskInitialStartStatus(ctx.workspaceScope, input);
 			}),
 		startTaskReview: workspaceProcedure
 			.input(runtimeTaskReviewStartRequestSchema)

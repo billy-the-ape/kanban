@@ -28,6 +28,8 @@ export interface TaskDraft {
 	agentId?: RuntimeAgentId;
 	clineSettings?: RuntimeTaskClineSettings;
 	baseRef: string;
+	/** UPD-0: undefined keeps the existing card policy on update; create normalizes missing to true. */
+	updateBaseRefBeforeStart?: boolean;
 }
 
 export interface TaskMoveEvent {
@@ -159,6 +161,7 @@ function normalizeCard(rawCard: unknown): BoardCard | null {
 		baseRef?: unknown;
 		agentId?: unknown;
 		clineSettings?: unknown;
+		updateBaseRefBeforeStart?: unknown;
 		clineProviderId?: unknown;
 		clineModelId?: unknown;
 		clineReasoningEffort?: unknown;
@@ -199,6 +202,9 @@ function normalizeCard(rawCard: unknown): BoardCard | null {
 		baseRef,
 		...(typeof card.agentId === "string" && card.agentId ? { agentId: card.agentId as RuntimeAgentId } : {}),
 		...(clineSettings !== undefined ? { clineSettings } : {}),
+		...(typeof card.updateBaseRefBeforeStart === "boolean"
+			? { updateBaseRefBeforeStart: card.updateBaseRefBeforeStart }
+			: {}),
 		createdAt: typeof card.createdAt === "number" ? card.createdAt : now,
 		updatedAt: typeof card.updatedAt === "number" ? card.updatedAt : now,
 	};
@@ -347,6 +353,7 @@ export function addTaskToColumnWithResult(
 			agentId: draft.agentId,
 			clineSettings: draft.clineSettings,
 			baseRef: draft.baseRef,
+			updateBaseRefBeforeStart: draft.updateBaseRefBeforeStart,
 		},
 		createBrowserUuid,
 	);
@@ -556,6 +563,10 @@ export function updateTask(board: BoardData, taskId: string, draft: TaskDraft): 
 				agentId: draft.agentId,
 				clineSettings: draft.clineSettings,
 				baseRef,
+				updateBaseRefBeforeStart:
+					draft.updateBaseRefBeforeStart === undefined
+						? card.updateBaseRefBeforeStart
+						: draft.updateBaseRefBeforeStart,
 				updatedAt: Date.now(),
 			};
 		});

@@ -116,6 +116,9 @@ function seedBoard(): RuntimeBoardData {
 		prompt: `Do the work for ${id}`,
 		startInPlanMode: false,
 		baseRef: "main",
+		// UPD-0: fixture repos have no origin remote; the dispatch pipeline
+		// under test must not attempt a base-ref refresh.
+		updateBaseRefBeforeStart: false,
 		createdAt: now,
 		updatedAt: now,
 	});
@@ -357,6 +360,9 @@ function seedParallelBoard(): RuntimeBoardData {
 		prompt: `Do the work for ${id}`,
 		startInPlanMode: false,
 		baseRef: "main",
+		// UPD-0: fixture repos have no origin remote; the dispatch pipeline
+		// under test must not attempt a base-ref refresh.
+		updateBaseRefBeforeStart: false,
 		createdAt: now,
 		updatedAt: now,
 	});
@@ -503,6 +509,8 @@ describe("B-11 task dispatch integration (parallel branches, shared budget)", ()
 				prompt: "Build on t2 and t3",
 				startInPlanMode: false,
 				baseRef: "main",
+				// UPD-0: no origin remote in this fixture; skip the refresh.
+				updateBaseRefBeforeStart: false,
 				createdAt: now,
 				updatedAt: now,
 			};

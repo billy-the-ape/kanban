@@ -26,6 +26,7 @@ import type {
 	RuntimeWorkspaceStateResponse,
 	RuntimeWorktreeEnsureResponse,
 } from "../../src/core/api-contract";
+import { prepareInitialTaskWorktree } from "../../src/workspace/task-worktree";
 import { createGitTestEnv } from "../utilities/git-env";
 import { createTempDir } from "../utilities/temp-dir";
 
@@ -954,20 +955,32 @@ describe.sequential("runtime state stream integration", () => {
 			});
 			expect(saveResponse.status).toBe(200);
 
-			const ensureResponse = await requestJson<RuntimeWorktreeEnsureResponse>({
-				baseUrl: `http://127.0.0.1:${port}`,
-				procedure: "workspace.ensureWorktree",
-				type: "mutation",
-				workspaceId,
-				payload: {
-					taskId,
-					baseRef,
-				},
+			// UPD-0: a fresh task worktree is created by the start-owned
+			// preparation, not by the generic ensure route (which now refuses
+			// fresh, unstarted tasks). Align this process's HOME with the
+			// server's so the worktree path resolves identically on disk.
+			const previousHome = process.env.HOME;
+			const previousUserProfile = process.env.USERPROFILE;
+			process.env.HOME = tempHome;
+			process.env.USERPROFILE = tempHome;
+			const prepared = await prepareInitialTaskWorktree({
+				cwd: projectPath,
+				taskId,
+				baseRef,
+				updateBaseRefBeforeStart: false,
 			});
-			expect(ensureResponse.status).toBe(200);
-			expect(ensureResponse.payload.ok).toBe(true);
-			if (!ensureResponse.payload.ok) {
-				throw new Error(ensureResponse.payload.error ?? "ensureWorktree failed");
+			if (previousHome === undefined) {
+				delete process.env.HOME;
+			} else {
+				process.env.HOME = previousHome;
+			}
+			if (previousUserProfile === undefined) {
+				delete process.env.USERPROFILE;
+			} else {
+				process.env.USERPROFILE = previousUserProfile;
+			}
+			if (!prepared.ok || prepared.path === null) {
+				throw new Error(prepared.error ?? "prepareInitialTaskWorktree failed");
 			}
 
 			stream = await connectRuntimeStream(
@@ -987,7 +1000,7 @@ describe.sequential("runtime state stream integration", () => {
 				false,
 			);
 
-			writeFileSync(join(ensureResponse.payload.path, "task-change.txt"), "updated\n", "utf8");
+			writeFileSync(join(prepared.path, "task-change.txt"), "updated\n", "utf8");
 
 			const metadataMessage = await stream.waitForMessage(
 				(message) =>
@@ -1071,27 +1084,39 @@ describe.sequential("runtime state stream integration", () => {
 			});
 			expect(saveResponse.status).toBe(200);
 
-			const firstEnsure = await requestJson<RuntimeWorktreeEnsureResponse>({
-				baseUrl: `http://127.0.0.1:${port}`,
-				procedure: "workspace.ensureWorktree",
-				type: "mutation",
-				workspaceId,
-				payload: {
-					taskId,
-					baseRef,
-				},
+			// UPD-0: the first worktree is created by the start-owned preparation
+			// (the generic ensure now refuses fresh, unstarted tasks). Align
+			// this process's HOME with the server's so the worktree path resolves
+			// identically on disk.
+			const previousHome = process.env.HOME;
+			const previousUserProfile = process.env.USERPROFILE;
+			process.env.HOME = tempHome;
+			process.env.USERPROFILE = tempHome;
+			const firstPrepared = await prepareInitialTaskWorktree({
+				cwd: projectPath,
+				taskId,
+				baseRef,
+				updateBaseRefBeforeStart: false,
 			});
-			expect(firstEnsure.status).toBe(200);
-			expect(firstEnsure.payload.ok).toBe(true);
-			if (!firstEnsure.payload.ok) {
-				throw new Error(firstEnsure.payload.error ?? "ensureWorktree failed");
+			if (previousHome === undefined) {
+				delete process.env.HOME;
+			} else {
+				process.env.HOME = previousHome;
 			}
-			expect(firstEnsure.payload.baseCommit).toBe(firstBaseCommit);
+			if (previousUserProfile === undefined) {
+				delete process.env.USERPROFILE;
+			} else {
+				process.env.USERPROFILE = previousUserProfile;
+			}
+			if (!firstPrepared.ok || firstPrepared.path === null) {
+				throw new Error(firstPrepared.error ?? "prepareInitialTaskWorktree failed");
+			}
+			expect(firstPrepared.baseCommit).toBe(firstBaseCommit);
 
-			runGit(firstEnsure.payload.path, ["config", "user.name", "Task User"]);
-			runGit(firstEnsure.payload.path, ["config", "user.email", "task@example.com"]);
-			writeFileSync(join(firstEnsure.payload.path, "task-local.txt"), "task commit\n", "utf8");
-			const taskWorktreeCommit = commitAll(firstEnsure.payload.path, "task-local commit");
+			runGit(firstPrepared.path, ["config", "user.name", "Task User"]);
+			runGit(firstPrepared.path, ["config", "user.email", "task@example.com"]);
+			writeFileSync(join(firstPrepared.path, "task-local.txt"), "task commit\n", "utf8");
+			const taskWorktreeCommit = commitAll(firstPrepared.path, "task-local commit");
 
 			writeFileSync(join(projectPath, "advance-base.txt"), "two\n", "utf8");
 			const advancedBaseCommit = commitAll(projectPath, "advance base");
@@ -1112,7 +1137,7 @@ describe.sequential("runtime state stream integration", () => {
 			if (!secondEnsure.payload.ok) {
 				throw new Error(secondEnsure.payload.error ?? "ensureWorktree failed");
 			}
-			expect(secondEnsure.payload.path).toBe(firstEnsure.payload.path);
+			expect(secondEnsure.payload.path).toBe(firstPrepared.path);
 			expect(secondEnsure.payload.baseCommit).toBe(taskWorktreeCommit);
 
 			const taskContext = await requestJson<RuntimeTaskWorkspaceInfoResponse>({

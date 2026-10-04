@@ -194,6 +194,7 @@ export default function App(): ReactElement {
 	const {
 		upsertSession,
 		ensureTaskWorkspace,
+		getTaskInitialStartStatus,
 		startTaskSession,
 		stopTaskSession,
 		sendTaskSessionInput,
@@ -595,6 +596,7 @@ export default function App(): ReactElement {
 		stopTaskSession,
 		cleanupTaskWorkspace,
 		ensureTaskWorkspace,
+		getTaskInitialStartStatus,
 		startTaskSession,
 		fetchTaskWorkspaceInfo,
 		sendTaskSessionInput,

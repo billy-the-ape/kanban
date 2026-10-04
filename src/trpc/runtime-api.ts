@@ -30,6 +30,7 @@ import type {
 	RuntimeTaskDiagnosticsActionResponse,
 	RuntimeTaskDiagnosticsResponse,
 	RuntimeTaskDispatchRecord,
+	RuntimeTaskInitialStartOutcome,
 	RuntimeTaskPhaseSummary,
 	RuntimeTaskPhasesResponse,
 	RuntimeTaskPreservationInfoResponse,
@@ -39,6 +40,7 @@ import type {
 	RuntimeTaskSessionSummary,
 	RuntimeUpdateStatusResponse,
 } from "../core/api-contract";
+import { runtimeTaskInitialStartStatusRequestSchema } from "../core/api-contract";
 import {
 	parseClineAccountSwitchRequest,
 	parseClineAddProviderRequest,
@@ -89,10 +91,12 @@ import { buildRuntimeConfigResponse, resolveAgentCommand } from "../terminal/age
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { createVerificationRunner } from "../verification/verification-service";
 import { evaluateDependentsUnlock, getGitDeliveryService, readTaskDeliveryReceipt } from "../workspace/git-delivery";
+import { getTaskInitialStartStatus as readTaskInitialStartStatus } from "../workspace/task-initial-start";
 import { readTaskPreservationRecord } from "../workspace/task-preservation";
 import { findTaskBaseRef, readReviewOutcome } from "../workspace/task-review-handoff";
 import {
 	getTaskPreservationInfo,
+	prepareInitialTaskWorktree,
 	recoverTaskWorktree,
 	resolveTaskCwd,
 	taskWorktreeExists,
@@ -191,6 +195,9 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 	// Shared by the tRPC handler (manual starts) and the B-9 dispatch queue, so
 	// queued tasks launch through exactly the code path the UI uses.
 	const startTaskSession: RuntimeTrpcContext["runtimeApi"]["startTaskSession"] = async (workspaceScope, input) => {
+		// UPD-0: terminal initial-start preparation outcome surfaced on the
+		// response (null for home-agent sessions and non-preparation failures).
+		let initialStart: RuntimeTaskInitialStartOutcome | null = null;
 		try {
 			const body = parseTaskSessionStartRequest(input);
 			if (body.resumeFromTrash) {
@@ -198,14 +205,62 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			}
 			const requestedClineTaskMode = body.mode ?? "act";
 			const scopedRuntimeConfig = await deps.loadScopedRuntimeConfig(workspaceScope);
-			const taskCwd = isHomeAgentSessionId(body.taskId)
-				? workspaceScope.workspacePath
-				: await resolveExistingTaskCwdOrEnsure({
+			let taskCwd: string;
+			if (isHomeAgentSessionId(body.taskId)) {
+				taskCwd = workspaceScope.workspacePath;
+			} else {
+				// UPD-0: the start owns initial worktree preparation. An
+				// existing worktree is authoritative (never refreshed); a
+				// missing worktree goes through the start-owned preparation,
+				// which refreshes the origin-backed base ref for fresh tasks
+				// with the persisted update option enabled and fixes the
+				// baseline before the agent starts.
+				const worktreeExists = await taskWorktreeExists(workspaceScope.workspacePath, body.taskId);
+				if (worktreeExists) {
+					taskCwd = await resolveExistingTaskCwdOrEnsure({
 						cwd: workspaceScope.workspacePath,
 						taskId: body.taskId,
 						baseRef: body.baseRef,
 					});
+				} else {
+					// UPD-0: prior-session detection is a preparation concern — an
+					// existing session makes the baseline fixed even without a
+					// persisted evidence record.
+					const prepTerminalManager = await deps.getScopedTerminalManager(workspaceScope);
+					const prepClineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
+					const hasPriorSession =
+						prepTerminalManager.getSummary(body.taskId) !== null ||
+						prepClineTaskSessionService.getSummary(body.taskId) !== null;
+					// UPD-0: the persisted board card policy is authoritative
+					// (missing values normalize to true; explicit false honored).
+					const board = await loadWorkspaceBoardById(workspaceScope.workspaceId).catch(() => null);
+					const card = board?.columns.flatMap((column) => column.cards).find((entry) => entry.id === body.taskId);
+					const updateBaseRefBeforeStart =
+						card !== undefined
+							? card.updateBaseRefBeforeStart !== false
+							: body.updateBaseRefBeforeStart !== false;
+					const prepared = await prepareInitialTaskWorktree({
+						cwd: workspaceScope.workspacePath,
+						taskId: body.taskId,
+						baseRef: body.baseRef,
+						updateBaseRefBeforeStart,
+						hasPriorSession,
+					});
+					if (!prepared.ok || prepared.path === null) {
+						initialStart = prepared.initialStart;
+						return {
+							ok: false,
+							summary: null,
+							error: prepared.error ?? "Initial start preparation failed.",
+							initialStart: prepared.initialStart,
+						};
+					}
+					taskCwd = prepared.path;
+					initialStart = prepared.initialStart;
+				}
+			}
 			const shouldCaptureTurnCheckpoint = !body.resumeFromTrash && !isHomeAgentSessionId(body.taskId);
+			const terminalManager = await deps.getScopedTerminalManager(workspaceScope);
 
 			// Per-task config source-of-truth precedence:
 			//
@@ -220,7 +275,6 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			//   session-level persistence for these;
 			//   if the user changes the model on the card, the next session launch
 			//   (including trash-restore) uses the updated values.
-			const terminalManager = await deps.getScopedTerminalManager(workspaceScope);
 			const previousTerminalAgentId = body.resumeFromTrash
 				? (terminalManager.getSummary(body.taskId)?.agentId ?? null)
 				: null;
@@ -292,6 +346,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				return {
 					ok: true,
 					summary: nextSummary,
+					initialStart,
 				};
 			}
 
@@ -305,6 +360,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					ok: false,
 					summary: null,
 					error: "No runnable agent command is configured. Open Settings, install a supported CLI, and select it.",
+					initialStart,
 				};
 			}
 			const summary = await terminalManager.startTaskSession({
@@ -340,6 +396,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			return {
 				ok: true,
 				summary: nextSummary,
+				initialStart,
 			};
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -347,8 +404,24 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				ok: false,
 				summary: null,
 				error: message,
+				initialStart,
 			};
 		}
+	};
+
+	// UPD-0: pollable initial-start preparation status. A live in-process
+	// preparation reports its current stage; completed preparations report
+	// their durable outcome from the persisted baseline record.
+	const getTaskInitialStartStatus: RuntimeTrpcContext["runtimeApi"]["getTaskInitialStartStatus"] = async (
+		workspaceScope,
+		input,
+	) => {
+		const body = runtimeTaskInitialStartStatusRequestSchema.parse(input);
+		const worktreeExists = await taskWorktreeExists(workspaceScope.workspacePath, body.taskId);
+		return await readTaskInitialStartStatus({
+			taskId: body.taskId,
+			worktreeExists,
+		});
 	};
 
 	const buildTaskDispatchDeps = (workspaceScope: RuntimeTrpcWorkspaceScope): TaskDispatchDeps => {
@@ -827,6 +900,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			}
 			return await startTaskSession(workspaceScope, input);
 		},
+		getTaskInitialStartStatus,
 		// B-6.2: start a bounded, fresh-context review session for a task. The
 		// effective review policy comes from the scoped runtime config; the service
 		// resolves the worktree, builds the handoff, runs the session (with the

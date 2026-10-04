@@ -73,6 +73,8 @@ interface UseBoardInteractionsInput {
 	stopTaskSession: (taskId: string) => Promise<void>;
 	cleanupTaskWorkspace: (taskId: string) => Promise<RuntimeWorktreeDeleteResponse | null>;
 	ensureTaskWorkspace: UseTaskSessionsResult["ensureTaskWorkspace"];
+	/** UPD-0: server-derived initial-start preparation status (fresh-task gate). */
+	getTaskInitialStartStatus: UseTaskSessionsResult["getTaskInitialStartStatus"];
 	startTaskSession: UseTaskSessionsResult["startTaskSession"];
 	fetchTaskWorkspaceInfo: (task: BoardCard) => Promise<RuntimeTaskWorkspaceInfoResponse | null>;
 	sendTaskSessionInput: (
@@ -128,6 +130,7 @@ export function useBoardInteractions({
 	stopTaskSession,
 	cleanupTaskWorkspace,
 	ensureTaskWorkspace,
+	getTaskInitialStartStatus,
 	startTaskSession,
 	fetchTaskWorkspaceInfo,
 	sendTaskSessionInput,
@@ -344,44 +347,55 @@ export function useBoardInteractions({
 			options?: { optimisticMove?: boolean },
 		): Promise<boolean> => {
 			const optimisticMove = options?.optimisticMove ?? true;
-			const ensured = await ensureTaskWorkspace(task);
-			if (!ensured.ok) {
-				notifyError(ensured.message ?? "Could not set up task workspace.");
-				if (optimisticMove) {
-					setBoard((currentBoard) => {
-						const currentColumnId = getTaskColumnId(currentBoard, taskId);
-						if (currentColumnId !== "in_progress") {
-							return currentBoard;
-						}
-						const reverted = moveTaskToColumn(currentBoard, taskId, fromColumnId);
-						return reverted.moved ? reverted.board : currentBoard;
+			// UPD-0.6: fresh, unstarted tasks (no existing worktree and no fixed
+			// initial baseline, per the server's durable record) skip the eager
+			// ensure so runtime.startTaskSession owns worktree creation at the
+			// post-refresh SHA. An eager ensure would materialize a stale
+			// worktree ahead of the base refresh and defeat it. Tasks with an
+			// existing worktree or a fixed baseline keep the pre-start ensure;
+			// a failed status query falls back to the conservative behavior.
+			const initialStartStatus = await getTaskInitialStartStatus(taskId);
+			const isFreshUnstartedTask = initialStartStatus?.ok && initialStartStatus.initialStartBaselineFixed === false;
+			if (!isFreshUnstartedTask) {
+				const ensured = await ensureTaskWorkspace(task);
+				if (!ensured.ok) {
+					notifyError(ensured.message ?? "Could not set up task workspace.");
+					if (optimisticMove) {
+						setBoard((currentBoard) => {
+							const currentColumnId = getTaskColumnId(currentBoard, taskId);
+							if (currentColumnId !== "in_progress") {
+								return currentBoard;
+							}
+							const reverted = moveTaskToColumn(currentBoard, taskId, fromColumnId);
+							return reverted.moved ? reverted.board : currentBoard;
+						});
+					}
+					return false;
+				}
+				if (ensured.response?.warning) {
+					showAppToast({
+						intent: "warning",
+						icon: "warning-sign",
+						message: ensured.response.warning,
+						timeout: 7000,
 					});
 				}
-				return false;
-			}
-			if (ensured.response?.warning) {
-				showAppToast({
-					intent: "warning",
-					icon: "warning-sign",
-					message: ensured.response.warning,
-					timeout: 7000,
-				});
-			}
-			if (selectedTaskId === taskId) {
-				if (ensured.response) {
-					setTaskWorkspaceInfo({
-						taskId,
-						path: ensured.response.path,
-						exists: true,
-						baseRef: ensured.response.baseRef,
-						branch: null,
-						isDetached: true,
-						headCommit: ensured.response.baseCommit,
-					});
-				}
-				const infoAfterEnsure = await fetchTaskWorkspaceInfo(task);
-				if (infoAfterEnsure) {
-					setTaskWorkspaceInfo(infoAfterEnsure);
+				if (selectedTaskId === taskId) {
+					if (ensured.response) {
+						setTaskWorkspaceInfo({
+							taskId,
+							path: ensured.response.path,
+							exists: true,
+							baseRef: ensured.response.baseRef,
+							branch: null,
+							isDetached: true,
+							headCommit: ensured.response.baseCommit,
+						});
+					}
+					const infoAfterEnsure = await fetchTaskWorkspaceInfo(task);
+					if (infoAfterEnsure) {
+						setTaskWorkspaceInfo(infoAfterEnsure);
+					}
 				}
 			}
 			const started = await startTaskSession(task);
@@ -411,19 +425,26 @@ export function useBoardInteractions({
 			}
 			return true;
 		},
-		[ensureTaskWorkspace, fetchTaskWorkspaceInfo, selectedTaskId, setBoard, startTaskSession],
+		[
+			ensureTaskWorkspace,
+			fetchTaskWorkspaceInfo,
+			getTaskInitialStartStatus,
+			selectedTaskId,
+			setBoard,
+			startTaskSession,
+		],
 	);
 
 	const startBacklogTaskImmediately = useCallback(
 		async (task: BoardCard): Promise<boolean> => {
 			const selection = findCardSelection(board, task.id);
-			if (!selection || selection.column.id !== "backlog") {
+			if (selection?.column.id !== "backlog") {
 				return false;
 			}
 
 			setBoard((currentBoard) => {
 				const currentSelection = findCardSelection(currentBoard, task.id);
-				if (!currentSelection || currentSelection.column.id !== "backlog") {
+				if (currentSelection?.column.id !== "backlog") {
 					return currentBoard;
 				}
 				const moved = moveTaskToColumn(currentBoard, task.id, "in_progress", { insertAtTop: true });
@@ -739,7 +760,7 @@ export function useBoardInteractions({
 	const handleStartTask = useCallback(
 		(taskId: string) => {
 			const selection = findCardSelection(board, taskId);
-			if (!selection || selection.column.id !== "backlog") {
+			if (selection?.column.id !== "backlog") {
 				return;
 			}
 			maybeRequestNotificationPermissionForTaskStart();
@@ -765,7 +786,7 @@ export function useBoardInteractions({
 					continue;
 				}
 				const selection = findCardSelection(nextBoard, taskId);
-				if (!selection || selection.column.id !== "backlog") {
+				if (selection?.column.id !== "backlog") {
 					continue;
 				}
 				const moved = moveTaskToColumn(nextBoard, taskId, "in_progress", { insertAtTop: true });
@@ -842,7 +863,7 @@ export function useBoardInteractions({
 	);
 
 	const handleCompleteTask = useCallback(() => {
-		if (!selectedCard || selectedCard.column.id !== "review") {
+		if (selectedCard?.column.id !== "review") {
 			return;
 		}
 		if (completeTaskLoadingByIdRef.current[selectedCard.card.id]) {
@@ -896,7 +917,7 @@ export function useBoardInteractions({
 		(taskId: string) => {
 			setBoard((currentBoard) => {
 				const selection = findCardSelection(currentBoard, taskId);
-				if (!selection || selection.card.autoReviewEnabled !== true) {
+				if (selection?.card.autoReviewEnabled !== true) {
 					return currentBoard;
 				}
 				const updated = updateTask(currentBoard, taskId, {

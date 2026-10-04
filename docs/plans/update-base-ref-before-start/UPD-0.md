@@ -4,9 +4,9 @@ Part of the **Update task base ref before starting** feature. The master plan li
 
 | Field | Value |
 | --- | --- |
-| Document revision | 3 |
-| Prepared | 2026-10-03 (revision 2: 2026-10-03, revision 3: 2026-10-04) |
-| Status | Proposed; not started |
+| Document revision | 4 |
+| Prepared | 2026-10-03 (revision 2: 2026-10-03, revision 3: 2026-10-04, revision 4: 2026-10-04 implementation record) |
+| Status | Implemented — PR opened targeting `feat/update-base` (awaiting review) |
 | Source baseline | ba3b7151f44f9ed5d1cb4d83590e98388ae2cac7 |
 | Fork | https://github.com/billy-the-ape/kanban |
 | Prerequisites | PLAN.md reviewed and approved |
@@ -88,12 +88,12 @@ Explicit non-goals:
 
 ## Implementation tasks
 
-- [ ] UPD-0.1 Add `updateBaseRefBeforeStart` to the task model: contract schemas (create, edit, session
+- [x] UPD-0.1 Add `updateBaseRefBeforeStart` to the task model: contract schemas (create, edit, session
       start, board serialization), `task-board-mutations.ts` create/update paths, CLI/API input defaults,
       and automated task creation (`task-dispatch-service.ts`, review follow-ups, child creation). Absent
       field normalizes to `true`; explicit `false` is preserved through save, reload, and serialization.
       Update `web-ui/src/types/board.ts` and `board-state.ts` normalization for type parity.
-- [ ] UPD-0.2 Add a focused base-refresh module under `src/workspace/` (e.g. `task-base-refresh.ts`) with:
+- [x] UPD-0.2 Add a focused base-refresh module under `src/workspace/` (e.g. `task-base-refresh.ts`) with:
   - Unambiguous ref classification for the full policy table in PLAN.md ("Supported ref policy"): local
     branch tracking origin (respecting differing local/remote names), local branch without upstream (use a
     same-name origin ref explicitly, never rewrite upstream config), local branch tracking another remote
@@ -113,12 +113,12 @@ Explicit non-goals:
     local-ahead/divergence, auth/network timeout, concurrent change, worktree setup failure), each
     carrying safe Git diagnostics and a specific remedy. No silent stale-base fallback.
   All Git arguments passed as arrays through `runGit`; never interpolate refs into a shell string.
-- [ ] UPD-0.3 Add the durable initial-start preparation/baseline record (per task, restart-surviving,
+- [x] UPD-0.3 Add the durable initial-start preparation/baseline record (per task, restart-surviving,
   backward-compatible): selected ref, option value, resolved baseline SHA, and preparation state.
   Persist it before launching the agent. A server restart must neither re-refresh nor lose the chosen
   baseline. Design the record so a prepared task whose worktree later disappears is restored at its
   recorded SHA (or blocked), never re-resolved against a newer base.
-- [ ] UPD-0.4 Integrate refresh into runtime-owned fresh-start worktree preparation, shared by native
+- [x] UPD-0.4 Integrate refresh into runtime-owned fresh-start worktree preparation, shared by native
   Cline and terminal agents, under a lock scoped to the canonical Git common directory (shared by linked
   worktrees), following the PLAN.md "Start lifecycle" six steps: re-read persisted policy/lifecycle and
   reject stale requests; recheck existing worktree, preservation/saved-patch history, and historical-task
@@ -126,7 +126,7 @@ Explicit non-goals:
   the selected ref); refresh only for a fresh enabled task; resolve the post-refresh SHA once and pass it
   into detached worktree creation; persist the baseline before sending the first prompt; transition to
   In Progress only after preparation succeeds.
-- [ ] UPD-0.5 Audit and wire every worktree-creation caller: browser start (`runtime.startTaskSession`
+- [x] UPD-0.5 Audit and wire every worktree-creation caller: browser start (`runtime.startTaskSession`
   cwd resolution), the `workspace.ensureWorktree` trpc route, shell opening, workspace inspection
   (`workspace-metadata-monitor`), automated dispatch, review sessions, and resume. Contract for a
   generic ensure on a fresh, unstarted task (no existing worktree, no fixed baseline, including
@@ -138,7 +138,7 @@ Explicit non-goals:
   worktree is never treated as disposable merely because no prompt has been sent yet. Generic ensure
   calls must neither trigger the refresh nor consume its record. Unchecked fresh tasks follow current
   local base resolution at start with zero refresh-related network activity.
-- [ ] UPD-0.6 Minimal browser start orchestration (start-specific preparation contract): in
+- [x] UPD-0.6 Minimal browser start orchestration (start-specific preparation contract): in
   `web-ui/src/hooks/use-board-interactions.ts` `kickoffTaskInProgress`, skip the eager
   `ensureTaskWorkspace` for fresh, unstarted tasks (no existing worktree and no fixed initial baseline)
   so that `runtime.startTaskSession` — whose cwd resolution already falls back to worktree setup — owns
@@ -155,7 +155,7 @@ Explicit non-goals:
   worktree and baseline-fixed tasks keep their current ensure behavior); a hook-level test proves
   kickoff skips the eager ensure for fresh tasks, so the runtime start response is the sole source of
   worktree state for the kickoff path.
-- [ ] UPD-0.7 Preparation-state contract for the UI (consumed by UPD-1):
+- [x] UPD-0.7 Preparation-state contract for the UI (consumed by UPD-1):
   - Server-computed `initialStartBaselineFixed` per task: true when the durable preparation record holds a
     resolved baseline SHA or when historical-task detection (durable session, preservation, saved-patch,
     or delivery records) shows the task already started. This is the same signal that gates the refresh —
@@ -177,15 +177,15 @@ Explicit non-goals:
   - Minimum behavior: automated starts perform the same preparation, persist the same record, and honor
     the same stage semantics (they need not render progress); no new configuration. Add contract tests
     for the new response fields.
-- [ ] UPD-0.8 Failure semantics: a blocked update surfaces through the start-failure result shape
+- [x] UPD-0.8 Failure semantics: a blocked update surfaces through the start-failure result shape
   (extended per UPD-0.7): task stays in backlog, no prompt sent, with the selected ref, category, reason,
   and remedy. If a base
   update succeeded but later preparation failed, leave the legitimate fast-forward in place and report
   the preparation failure; never roll the branch back.
-- [ ] UPD-0.9 Observability: timestamped preparation stage logs (task ID, selected ref, remote target,
+- [x] UPD-0.9 Observability: timestamped preparation stage logs (task ID, selected ref, remote target,
   old/new SHA, duration, outcome) via existing runtime logging, with token/credential-bearing URLs
   redacted. A fetch/pull status is preparation progress only — it must not mark the task running or done.
-- [ ] UPD-0.10 Tests: real local-Git integration coverage (temporary repo, local bare origin, second clone
+- [x] UPD-0.10 Tests: real local-Git integration coverage (temporary repo, local bare origin, second clone
   advancing the remote) covering the acceptance rows below — including the browser revised-start regression
   and generic-ensure refusal (UPD-0.6), the live-stage contract coverage with a deliberately held fetch
   (UPD-0.7), and the recovery-with-unavailable-base row — plus runtime start/failure tests. Unit-style
@@ -237,6 +237,123 @@ kickoff paths keep vs skip the pre-start ensure), the generic-ensure refusal con
 live-stage mechanism chosen — event and/or query — and stage names, and where everything is exposed),
 test commands and results, and any baseline drift discovered against ba3b7151. UPD-1 then adds the UI
 against the runtime behavior and contract verified here.
+
+## Implementation record (revision 4)
+
+### Changed files
+
+- `src/core/api-contract.ts` — `updateBaseRefBeforeStart` on task create/update/board-card schemas
+  (`z.boolean().optional()`, absent reads as checked), the start-request field, the initial-start
+  stage/outcome/status response schemas, and the `initialStartBaselineFixed` board field.
+- `src/core/task-board-mutations.ts` — create normalizes absent to `true`; update preserves the
+  persisted value when the field is omitted and honors explicit toggles.
+- `src/workspace/git-utils.ts` — new fetch/remote-ref helpers (bounded, noninteractive,
+  credential-scrubbed) reused by the refresh module.
+- `src/workspace/task-base-refresh.ts` (new) — UPD-0.2 ref classification, `git fetch origin` +
+  specific-target verification, checked-out (clean-tree, ff-only-in-place) vs unoccupied
+  (ancestor check + CAS `update-ref`) update paths, structured failure categories with remedies.
+- `src/workspace/task-initial-start.ts` (new) — UPD-0.3 durable record, evidence/baseline-fixed
+  derivation, in-memory live stages, pollable status.
+- `src/workspace/workspace-logger.ts` (new) — UPD-0.9 stage-log surface (plain `[kanban]` stdout
+  lines; direct `console.*` is forbidden in `src/` by `grit/no-console.grit`).
+- `src/workspace/task-worktree.ts` — `prepareInitialTaskWorktree` (the only initial-creation path,
+  UPD-0.4 ordering: existing worktree → prepared baseline → preservation → saved patch → fresh
+  resolution/refresh → detached create → baseline record) and the generic-ensure refusal for
+  fresh, unstarted tasks (UPD-0.5).
+- `src/trpc/runtime-api.ts`, `src/trpc/workspace-api.ts`, `src/trpc/app-router.ts` — start-owned
+  preparation wiring, `runtime.getTaskInitialStartStatus` pollable route, ensure refusal pass-through.
+- `src/task-dispatch/task-dispatch-service.ts` — dispatch and restart-recovery create missing
+  worktrees through the start-owned preparation with the persisted card policy (no bypass).
+- `web-ui/src/types/board.ts`, `web-ui/src/state/board-state.ts` — field + absent-means-checked
+  normalization parity.
+- `web-ui/src/hooks/use-task-sessions.ts` — start response/failure (including `initialStart`)
+  pass-through; `web-ui/src/hooks/use-board-interactions.ts` + `web-ui/src/App.tsx` — kickoff skips
+  the eager ensure for fresh, unstarted tasks (determined via the pollable status).
+- Tests: `test/integration/task-base-refresh.integration.test.ts` (new, 9 tests),
+  `test/runtime/task-initial-start.test.ts` (new, 5 tests), plus updated
+  `test/runtime/task-worktree.test.ts`, `test/integration/task-worktree.integration.test.ts`,
+  `test/runtime/trpc/runtime-api.test.ts`, `test/runtime/trpc/workspace-api.test.ts`,
+  `test/runtime/task-board-mutations.test.ts`, and the B-5/B-1 fixture helpers
+  (`task-preservation`, `task-worktree-delivery`, `task-workspace-maintenance`,
+  `task-dispatch` integration). The `runtime-state-stream` integration's two
+  worktree tests also moved their fixture worktree creation from the HTTP
+  `workspace.ensureWorktree` call to in-process `prepareInitialTaskWorktree`
+  (with the test process HOME aligned to the server's temp home).
+
+### Durable record
+
+Location: `~/.cline/kanban/task-initial-start/<normalizedTaskId>/record.json`
+(`getRuntimeHomePath()` + `task-initial-start/`). Fields: `taskId`, `baseRef`,
+`updateBaseRefBeforeStart`, `state` (`prepared` | `blocked`), `baselineSha` (null unless prepared),
+`failure` (structured `RuntimeTaskBaseRefreshFailure` or null), `updatedAt`. Written before the
+agent launches; read on restart to restore the recorded SHA (never re-resolve) and to block retry
+refreshes after a blocked record. Legacy boards/records without the field parse unchanged
+(`optional()` + absent-means-checked at the consumer sites), so the rollout is backward compatible.
+
+### Lock scope
+
+`prepareInitialTaskWorktree` and the generic ensure both run under the existing
+`withTaskWorktreeSetupLock(repoPath)` — keyed at the Git **common directory**
+(`git rev-parse --git-common-dir`), so tasks sharing one repository (linked worktrees included)
+serialize refresh + create. Each task still receives its own resolved SHA at creation time.
+
+
+### Caller audit (start-owned vs generic ensure)
+
+- **Start-owned:** `runtime.startTaskSession` (manual + dispatch — dispatch queues launch through
+  the same shared start path), and `src/task-dispatch/task-dispatch-service.ts`
+  `prepareTaskWorktreeBaseline` (pre-launch baseline verification and restart reconciliation now
+  create missing worktrees via `prepareInitialTaskWorktree` with
+  `card.updateBaseRefBeforeStart !== false`).
+- **Generic ensure (refused for fresh tasks):** `workspace.ensureWorktree` trpc route (pass-through),
+  shell-open / `workspace-metadata-monitor` / review-session resolution paths — all resolve an
+  existing worktree or restore evidence; none create a fresh task worktree anymore.
+- **Refusal contract:** `{ ok: false, path: null,
+  category: "initial_start_preparation_required",
+  remedy: "Start the task to create its worktree.",
+  error: '<taskId> ... is created when the task starts, which prepares its base ref first. Start
+  the task to create its worktree.' }` — no worktree, no refresh, no record consumed. Covered by
+  `test/runtime/trpc/workspace-api.test.ts` and the hook-level kickoff test.
+- **Browser kickoff:** `kickoffTaskInProgress` queries `runtime.getTaskInitialStartStatus` first;
+  fresh + not-baseline-fixed tasks skip `ensureTaskWorkspace` and go straight to
+  `startTaskSession` (which owns preparation). Resume/existing-worktree tasks keep the pre-start
+  ensure. Covered by `use-board-interactions.test.tsx` (fresh → no ensure; resume → ensure kept).
+
+### Preparation-state contract (UPD-0.7)
+
+- `initialStartBaselineFixed` is server-derived from durable evidence (prepared baseline SHA,
+  blocked record, preservation, saved patch, delivery receipt, worktree existence, or prior
+  session) — the same signal that gates the refresh. Exposed on the board card serialization and on
+  the status response, so reloads/reconnects and dispatch starts re-derive it from durable state.
+- Start response extended with `initialStart: { stage, baselineSha, refreshed, failure } | null`.
+- Live stage mechanism: **pollable query** `runtime.getTaskInitialStartStatus(taskId)` (in-memory
+  live stage map while a preparation is in flight; durable record outcome once settled). Stage
+  names: `idle → refreshing → creating_worktree → recording_baseline → ready | blocked`. No new
+  event mechanism; UPD-1 polls this. Contract coverage includes the deliberately held fetch (stage
+  observable before the start settles), prepared/blocked durable outcomes, and live-over-durable
+  precedence on retry — `test/runtime/task-initial-start.test.ts`.
+
+### Test commands and results (2026-10-04, this sandbox)
+
+- `npx tsc --noEmit` (root) and `web-ui` — clean.
+- `npx vitest run test/runtime test/utilities` — 834 passed, 2 failed:
+  `server/middleware.test.ts › passes through upgrades…` and
+  `runtime-api.test.ts › restarts the home chat session…` — **both fail identically on the clean
+  base commit** (verified by stashing the change set); environment-dependent, not regressions.
+- `npx vitest run test/integration` (all 10 suites incl. `task-base-refresh`, `task-worktree`,
+  `task-preservation`, `task-worktree-delivery`, `task-dispatch`) — green after migrating the
+  pre-existing B-5/B-1/B-9 fixture helpers from generic-ensure creation to
+  `prepareInitialTaskWorktree` (the documented UPD-0.5 behavior change) and marking the no-origin
+  B-9/B-11 fixture cards with explicit `updateBaseRefBeforeStart: false`.
+- `npx vitest run test/workspace test/task-dispatch` — green.
+- `web-ui` targeted suites (`use-board-interactions`, `use-task-sessions`, `src/state`) — green.
+- `biome check` — the changed files are clean; the repository-wide run reports only pre-existing
+  drift in untouched files (biome 2.5.15 vs the 2.3.5-era lock at the base commit).
+
+### Baseline drift
+
+The branch carried docs PRs on top of `ba3b7151` (HEAD `293924a` at implementation time); no
+runtime-code drift affecting this feature was found.
 
 ## Stop conditions
 

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
@@ -54,53 +54,7 @@ vi.mock("../../src/workspace/task-worktree-path.js", () => ({
 
 import { ensureTaskWorktreeIfDoesntExist, removeTaskWorktreeSetupLock } from "../../src/workspace/task-worktree";
 
-type ExecFileOptions = {
-	cwd?: string;
-	encoding?: string;
-	maxBuffer?: number;
-	env?: NodeJS.ProcessEnv;
-};
-
-function createGitError(message: string): NodeJS.ErrnoException & { stdout: string; stderr: string; code: number } {
-	const error = new Error(message) as NodeJS.ErrnoException & { stdout: string; stderr: string };
-	Object.assign(error, {
-		code: 1,
-		stdout: "",
-		stderr: message,
-	});
-	return error as NodeJS.ErrnoException & { stdout: string; stderr: string; code: number };
-}
-
-function stripConfigFlags(args: readonly string[]): string[] {
-	const result: string[] = [];
-	for (let i = 0; i < args.length; i++) {
-		if (args[i] === "-c" && i + 1 < args.length) {
-			i += 1;
-			continue;
-		}
-		result.push(args[i] as string);
-	}
-	return result;
-}
-
-function getCommandArgs(args: readonly string[], options?: ExecFileOptions): { cwd: string; command: string[] } {
-	const cleaned = stripConfigFlags(args);
-	if (cleaned[0] === "-C" && typeof cleaned[1] === "string") {
-		return {
-			cwd: cleaned[1],
-			command: cleaned.slice(2),
-		};
-	}
-	if (typeof options?.cwd === "string") {
-		return {
-			cwd: options.cwd,
-			command: cleaned,
-		};
-	}
-	throw new Error(`Unexpected git args: ${args.join(" ")}`);
-}
-
-describe.sequential("task-worktree serialization", () => {
+describe.sequential("task-worktree generic ensure", () => {
 	beforeEach(() => {
 		childProcessMocks.execFile.mockReset();
 		childProcessMocks.execFilePromise.mockReset();
@@ -135,8 +89,8 @@ describe.sequential("task-worktree serialization", () => {
 		vi.clearAllMocks();
 	});
 
-	it("serializes submodule initialization across concurrent worktree creation", async () => {
-		const { path: sandboxRoot, cleanup } = createTempDir("kanban-task-worktree-lock-");
+	it("rejects a generic ensure for a task that has never started", async () => {
+		const { path: sandboxRoot, cleanup } = createTempDir("kanban-task-worktree-ensure-gate-");
 		try {
 			const repoPath = join(sandboxRoot, "repo");
 			const runtimeHomePath = join(sandboxRoot, "runtime-home");
@@ -153,124 +107,34 @@ describe.sequential("task-worktree serialization", () => {
 			taskWorktreePathMocks.getWorkspaceFolderLabelForWorktreePath.mockReturnValue("repo");
 			taskWorktreePathMocks.normalizeTaskIdForWorktreePath.mockImplementation((taskId: string) => taskId);
 
-			const worktreeHeads = new Map<string, string>();
-			let activeSubmoduleUpdates = 0;
-			let maxConcurrentSubmoduleUpdates = 0;
-
-			childProcessMocks.execFilePromise.mockImplementation(
-				async (_file: string, args: readonly string[], options?: ExecFileOptions) => {
-					const { cwd, command } = getCommandArgs(args, options);
-
-					if (command[0] === "rev-parse" && command[1] === "--git-common-dir") {
-						return {
-							stdout: ".git\n",
-							stderr: "",
-						};
-					}
-
-					if (command[0] === "rev-parse" && command[1] === "HEAD") {
-						const head = worktreeHeads.get(cwd);
-						if (!head) {
-							throw createGitError("fatal: not a git repository");
-						}
-						return {
-							stdout: `${head}\n`,
-							stderr: "",
-						};
-					}
-
-					if (command[0] === "rev-parse" && command[1] === "--verify") {
-						return {
-							stdout: "base-commit\n",
-							stderr: "",
-						};
-					}
-
-					if (command[0] === "worktree" && command[1] === "add") {
-						const worktreePath = command[3];
-						const commit = command[4] ?? "base-commit";
-						if (!worktreePath) {
-							throw createGitError("fatal: missing worktree path");
-						}
-						mkdirSync(worktreePath, { recursive: true });
-						writeFileSync(
-							join(worktreePath, ".gitmodules"),
-							'[submodule "evals/cline-bench"]\n\tpath = evals/cline-bench\n\turl = ../cline-bench\n',
-							"utf8",
-						);
-						worktreeHeads.set(worktreePath, commit);
-						return {
-							stdout: "",
-							stderr: "",
-						};
-					}
-
-					if (command[0] === "config" && command[1] === "--file") {
-						return {
-							stdout: "submodule.evals/cline-bench.path evals/cline-bench\n",
-							stderr: "",
-						};
-					}
-
-					if (command[0] === "submodule" && command[1] === "update") {
-						activeSubmoduleUpdates += 1;
-						maxConcurrentSubmoduleUpdates = Math.max(maxConcurrentSubmoduleUpdates, activeSubmoduleUpdates);
-						await new Promise((resolve) => {
-							setTimeout(resolve, 25);
-						});
-						mkdirSync(join(cwd, "evals", "cline-bench"), { recursive: true });
-						writeFileSync(join(cwd, "evals", "cline-bench", ".git"), "gitdir: fake\n", "utf8");
-						activeSubmoduleUpdates -= 1;
-						return {
-							stdout: "",
-							stderr: "",
-						};
-					}
-
-					if (command[0] === "ls-files") {
-						return {
-							stdout: "",
-							stderr: "",
-						};
-					}
-
-					if (command[0] === "rev-parse" && command[1] === "--git-path") {
-						return {
-							stdout: ".git/info/exclude\n",
-							stderr: "",
-						};
-					}
-
-					throw createGitError(`Unhandled git command: ${command.join(" ")}`);
-				},
-			);
-
-			const [first, second] = await Promise.all([
-				ensureTaskWorktreeIfDoesntExist({
-					cwd: repoPath,
-					taskId: "task-a",
-					baseRef: "HEAD",
-				}),
-				ensureTaskWorktreeIfDoesntExist({
-					cwd: repoPath,
-					taskId: "task-b",
-					baseRef: "HEAD",
-				}),
-			]);
-
-			const firstLockRequest = lockedFileSystemMocks.withLock.mock.calls[0]?.[0] as {
-				path: string;
-				type: string;
-				lockfileName: string;
-			};
-			expect(first, JSON.stringify(first, null, 2)).toMatchObject({ ok: true, baseCommit: "base-commit" });
-			expect(second, JSON.stringify(second, null, 2)).toMatchObject({ ok: true, baseCommit: "base-commit" });
-			expect(firstLockRequest).toMatchObject({
-				path: join(repoPath, ".git"),
-				type: "directory",
-				lockfileName: "kanban-task-worktree-setup.lock",
+			childProcessMocks.execFilePromise.mockImplementation(async (_file: string, args: readonly string[]) => {
+				const command = args.join(" ");
+				if (command.includes("--git-common-dir")) {
+					return {
+						stdout: ".git\n",
+						stderr: "",
+					};
+				}
+				throw Object.assign(new Error(`fatal: ${command}`), { code: 1, stdout: "", stderr: `fatal: ${command}` });
 			});
-			expect(maxConcurrentSubmoduleUpdates).toBe(1);
+
+			const ensured = await ensureTaskWorktreeIfDoesntExist({
+				cwd: repoPath,
+				taskId: "task-a",
+				baseRef: "HEAD",
+			});
+
+			// UPD-0: worktree creation is start-owned. A generic ensure must not
+			// create (or attempt to create) a worktree for a task that has never
+			// started; the start lifecycle prepares the base ref first.
+			expect(ensured.ok).toBe(false);
+			if (ensured.ok) {
+				throw new Error("Expected the generic ensure to be rejected");
+			}
+			expect(ensured.category).toBe("initial_start_preparation_required");
+			expect(ensured.error).toContain("created when the task starts");
+			// No worktree is created (start-owned preparation is the only creator).
+			expect(existsSync(join(worktreesHomePath, "repo", "task-a"))).toBe(false);
 		} finally {
 			cleanup();
 		}
