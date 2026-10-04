@@ -140,6 +140,7 @@ vi.mock("@clinebot/core", async (importOriginal) => {
 // B-2.9: resolveLaunchConfig reads the global context budget from the
 // runtime config; keep the test hermetic (no real HOME reads).
 vi.mock("../../../src/config/runtime-config", () => ({
+	readGlobalRuntimeClineConcurrencyLimit: async () => null,
 	readGlobalRuntimeContextBudget: runtimeConfigMocks.readGlobalRuntimeContextBudget,
 }));
 

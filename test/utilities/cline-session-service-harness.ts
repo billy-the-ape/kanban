@@ -15,6 +15,7 @@ import {
 } from "../../src/cline-sdk/cline-session-runtime";
 import type { ClineTaskSessionService } from "../../src/cline-sdk/cline-task-session-service";
 import { createInMemoryClineTaskSessionService } from "../../src/cline-sdk/cline-task-session-service";
+import { ClineTurnScheduler } from "../../src/cline-sdk/cline-turn-scheduler";
 import {
 	type CreateFakeClineSessionStoreOptions,
 	createFakeClineSessionHost,
@@ -78,6 +79,7 @@ export interface CreateTaskSessionServiceHarnessOptions extends CreateFakeClineS
 	 * task session service (the service default is 3 when omitted).
 	 */
 	contextRecoveryMaxAttempts?: number;
+	turnScheduler?: ClineTurnScheduler;
 }
 
 export interface TaskSessionServiceHarness {
@@ -98,6 +100,7 @@ export function createTaskSessionServiceHarness(
 		createSessionRuntime: (runtimeOptions) =>
 			createInMemoryClineSessionRuntime({
 				...runtimeOptions,
+				turnScheduler: options.turnScheduler ?? new ClineTurnScheduler(async () => 1),
 				createSessionHost: async () => host,
 				createMcpRuntimeService: () => createFakeMcpRuntimeService(),
 			}),

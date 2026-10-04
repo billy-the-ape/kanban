@@ -1521,6 +1521,7 @@ export const runtimeConfigResponseSchema = z.object({
 	openPrPromptTemplate: z.string(),
 	commitPromptTemplateDefault: z.string(),
 	openPrPromptTemplateDefault: z.string(),
+	clineConcurrencyLimit: z.number().int().min(1).max(64).nullable().optional(),
 	contextBudget: runtimeContextBudgetSchema.nullable(),
 	/** B-6: global review lifecycle policy; null means all defaults (off, 2 repair rounds). */
 	reviewPolicy: runtimeReviewPolicySchema.nullable(),
@@ -1544,6 +1545,7 @@ export const runtimeConfigSaveRequestSchema = z.object({
 	readyForReviewNotificationsEnabled: z.boolean().optional(),
 	commitPromptTemplate: z.string().optional(),
 	openPrPromptTemplate: z.string().optional(),
+	clineConcurrencyLimit: z.number().int().min(1).max(64).nullable().optional(),
 	contextBudget: runtimeContextBudgetSaveSchema.optional(),
 	/** B-6: `null` clears the stored review policy; `undefined` leaves it untouched. */
 	reviewPolicy: runtimeReviewPolicySaveSchema.optional(),

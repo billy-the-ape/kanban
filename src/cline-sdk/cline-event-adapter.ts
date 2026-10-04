@@ -230,6 +230,25 @@ export function extractClineSessionId(event: unknown): string | null {
 // Translate raw SDK events into Kanban summary and chat mutations so the session service can stay focused on host ownership.
 export function applyClineSessionEvent(input: ApplyClineSessionEventInput): void {
 	const { entry, event, taskId } = input;
+	const concurrencyEvent = asRecord(event);
+	if (concurrencyEvent?.type === "kanban_concurrency") {
+		const queued = concurrencyEvent.queued === true;
+		emitSummary(input, {
+			state: "running",
+			lastHookAt: now(),
+			latestHookActivity: {
+				activityText: queued ? "Waiting for model capacity" : "Agent active",
+				toolName: null,
+				toolInputSummary: null,
+				finalMessage: null,
+				hookEventName: queued ? "concurrency_waiting" : "turn_start",
+				notificationType: null,
+				source: "cline-sdk",
+			},
+		});
+		return;
+	}
+
 	const agentEvent = readAgentEvent(event);
 	const chunkEvent = readChunkEvent(event);
 	const hookEvent = readHookEvent(event);

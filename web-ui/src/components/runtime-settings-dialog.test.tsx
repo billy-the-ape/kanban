@@ -75,6 +75,7 @@ vi.mock("@radix-ui/react-select", () => ({
 }));
 
 const resetLayoutCustomizationsMock = vi.hoisted(() => vi.fn());
+const saveConfigMock = vi.hoisted(() => vi.fn(async () => true));
 const clineSetupSectionOnSavedRef = vi.hoisted(() => ({
 	onSaved: null as null | (() => void),
 }));
@@ -142,7 +143,7 @@ vi.mock("@/runtime/use-runtime-config", () => ({
 		isLoading: false,
 		isSaving: false,
 		refresh: vi.fn(),
-		save: vi.fn(async () => true),
+		save: saveConfigMock,
 	}),
 }));
 
@@ -395,5 +396,59 @@ describe("RuntimeSettingsDialog", () => {
 		});
 
 		expect(handleSaved).toHaveBeenCalledTimes(1);
+	});
+	it.each([
+		{ stored: null, draft: "2", expected: 2 },
+		{ stored: 2, draft: "", expected: null },
+	])("saves concurrency override $draft from $stored", async ({ stored, draft, expected }) => {
+		saveConfigMock.mockClear();
+		await act(async () => {
+			root.render(
+				<RuntimeSettingsDialog
+					open={true}
+					workspaceId="workspace-1"
+					initialConfig={{ ...savedClineOauthConfig, clineConcurrencyLimit: stored }}
+					onOpenChange={() => {}}
+				/>,
+			);
+		});
+		const input = document.querySelector<HTMLInputElement>("#cline-concurrency-limit");
+		expect(input).toBeInstanceOf(HTMLInputElement);
+		await act(async () => {
+			if (!input) throw new Error("Missing concurrency field");
+			Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, draft);
+			input.dispatchEvent(new Event("input", { bubbles: true }));
+		});
+		const save = findButtonByText(document.body, "Save");
+		expect(save?.disabled).toBe(false);
+		await act(async () => {
+			save?.click();
+		});
+		expect(saveConfigMock).toHaveBeenCalledWith(expect.objectContaining({ clineConcurrencyLimit: expected }));
+	});
+
+	it("blocks an invalid concurrency override before saving any configuration", async () => {
+		saveConfigMock.mockClear();
+		await act(async () => {
+			root.render(
+				<RuntimeSettingsDialog
+					open={true}
+					workspaceId="workspace-1"
+					initialConfig={savedClineOauthConfig}
+					onOpenChange={() => {}}
+				/>,
+			);
+		});
+		const input = document.querySelector<HTMLInputElement>("#cline-concurrency-limit");
+		await act(async () => {
+			if (!input) throw new Error("Missing concurrency field");
+			Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, "0");
+			input.dispatchEvent(new Event("input", { bubbles: true }));
+		});
+		await act(async () => {
+			findButtonByText(document.body, "Save")?.click();
+		});
+		expect(saveConfigMock).not.toHaveBeenCalled();
+		expect(document.body.textContent).toContain("Cline concurrency limit must be an integer between 1 and 64");
 	});
 });

@@ -7,8 +7,10 @@ import {
 	loadGlobalRuntimeConfig,
 	loadRuntimeConfig,
 	pickBestInstalledAgentIdFromDetected,
+	readGlobalRuntimeClineConcurrencyLimit,
 	readGlobalRuntimeVerificationConfig,
 	saveRuntimeConfig,
+	updateGlobalRuntimeConfig,
 	updateRuntimeConfig,
 } from "../../../src/config/runtime-config";
 import { createTempDir } from "../../utilities/temp-dir";
@@ -991,6 +993,30 @@ describe("B-9 — task dispatch policy settings", () => {
 		} finally {
 			cleanupProject();
 			cleanupHome();
+		}
+	});
+});
+
+describe("Cline concurrency configuration", () => {
+	it("persists manual capacity, preserves it on unrelated saves and clears to auto", async () => {
+		const home = createTempDir("kanban-concurrency-config-");
+		try {
+			await withTemporaryEnv({ home: home.path }, async () => {
+				const initial = await loadGlobalRuntimeConfig();
+				expect(await readGlobalRuntimeClineConcurrencyLimit()).toBeNull();
+				const manual = await updateGlobalRuntimeConfig(initial, { clineConcurrencyLimit: 2 });
+				expect(manual.clineConcurrencyLimit).toBe(2);
+				expect(await readGlobalRuntimeClineConcurrencyLimit()).toBe(2);
+				const unrelated = await updateGlobalRuntimeConfig(manual, { readyForReviewNotificationsEnabled: false });
+				expect((await loadGlobalRuntimeConfig()).clineConcurrencyLimit).toBe(2);
+				await updateGlobalRuntimeConfig(unrelated, { clineConcurrencyLimit: null });
+				expect(await readGlobalRuntimeClineConcurrencyLimit()).toBeNull();
+				await expect(updateGlobalRuntimeConfig(unrelated, { clineConcurrencyLimit: 0 })).rejects.toThrow(
+					"Cline concurrency limit",
+				);
+			});
+		} finally {
+			home.cleanup();
 		}
 	});
 });
