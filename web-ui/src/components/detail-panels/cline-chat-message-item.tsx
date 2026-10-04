@@ -206,9 +206,7 @@ export function ClineChatMessageItem({
 			<div
 				className={cn(
 					"min-w-0 w-full text-sm text-text-primary",
-					isCompletedResponse
-						? "rounded-md border border-status-green/40 bg-status-green/10 px-3 py-2"
-						: "px-1.5",
+					isCompletedResponse ? "rounded-md border border-status-green/40 bg-status-green/10 px-3 py-2" : "px-1.5",
 				)}
 			>
 				{isCompletedResponse ? (
