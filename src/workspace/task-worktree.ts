@@ -116,7 +116,7 @@ async function getGitCommonDir(repoPath: string): Promise<string> {
 	return isAbsolute(gitCommonDir) ? gitCommonDir : join(repoPath, gitCommonDir);
 }
 
-async function getTaskWorktreeSetupLock(repoPath: string): Promise<LockRequest> {
+export async function getTaskWorktreeSetupLock(repoPath: string): Promise<LockRequest> {
 	return {
 		path: await getGitCommonDir(repoPath),
 		type: "directory",
@@ -138,10 +138,10 @@ async function withTaskWorktreeSetupLock<T>(repoPath: string, operation: () => P
 // UPD-0 review: the base refresh does network work (bounded fetches), so it
 // must not run under the setup lock — other callers give that lock up after
 // ~5s (DEFAULT_LOCK_RETRIES) and would fail with ELOCKED behind a slow
-// origin. The refresh instead takes its own per-repo lock (same common-dir
-// scope, distinct lockfile) with long retries, and the setup lock is held
-// only for the local branch update (CAS / ff-only re-verifies the tip) and
-// the worktree mutation.
+// origin. The refresh instead takes its own per-repo lock (distinct path AND
+// lockfile, see getTaskBaseRefreshLock) with long retries, and the setup lock
+// is held only for the local branch update (CAS / ff-only re-verifies the
+// tip) and the worktree mutation.
 const KANBAN_TASK_BASE_REFRESH_LOCKFILE_NAME = "kanban-task-base-refresh.lock";
 // A refresh is at most one bounded fetch (60s) plus a fast local update.
 // Wait up to ~2 minutes for a concurrent same-repo refresh.
@@ -154,10 +154,19 @@ const TASK_BASE_REFRESH_LOCK_RETRIES: NonNullable<LockRequest["retries"]> = {
 };
 
 export async function getTaskBaseRefreshLock(repoPath: string): Promise<LockRequest> {
+	const commonDir = await getGitCommonDir(repoPath);
+	// proper-lockfile keys its in-process `locks` map by the resolved `path`
+	// (NOT by `lockfilePath`), so two LockRequests that share a `path` and
+	// differ only in lockfile collide: the second acquisition overwrites the
+	// first's in-process entry, and releasing one marks the other "already
+	// released" (ERELEASED + ECOMPROMISED), leaving a window where neither
+	// lockfile is protected. The refresh lock therefore uses a distinct
+	// `path` while keeping the same on-disk lockfile name/location via an
+	// explicit `lockfilePath`.
 	return {
-		path: await getGitCommonDir(repoPath),
-		type: "directory",
-		lockfileName: KANBAN_TASK_BASE_REFRESH_LOCKFILE_NAME,
+		path: join(commonDir, "kanban-task-base-refresh"),
+		type: "file",
+		lockfilePath: join(commonDir, KANBAN_TASK_BASE_REFRESH_LOCKFILE_NAME),
 		retries: TASK_BASE_REFRESH_LOCK_RETRIES,
 	};
 }
@@ -912,6 +921,7 @@ export async function prepareInitialTaskWorktree(options: {
 						repoPath: context.repoPath,
 						branchName: localBranchName,
 						targetSha: fetchTarget.targetSha,
+						selectedRef: baseRef,
 					}),
 				);
 				if (!localResult.ok) {

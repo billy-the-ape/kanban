@@ -4,9 +4,9 @@ Part of the **Update task base ref before starting** feature. The master plan li
 
 | Field | Value |
 | --- | --- |
-| Document revision | 5 |
-| Prepared | 2026-10-03 (revision 2: 2026-10-03, revision 3: 2026-10-04, revision 4: 2026-10-04 implementation record, revision 5: 2026-10-04 review responses) |
-| Status | Implemented — PR opened targeting `feat/update-base` (review responses committed) |
+| Document revision | 6 |
+| Prepared | 2026-10-03 (revision 2: 2026-10-03, revision 3: 2026-10-04, revision 4: 2026-10-04 implementation record, revision 5: 2026-10-04 review responses, revision 6: 2026-10-04 re-review responses) |
+| Status | Implemented — PR opened targeting `feat/update-base` (re-review responses committed) |
 | Source baseline | ba3b7151f44f9ed5d1cb4d83590e98388ae2cac7 |
 | Fork | https://github.com/billy-the-ape/kanban |
 | Prerequisites | PLAN.md reviewed and approved |
@@ -435,6 +435,45 @@ local-branch fast-forward is never rolled back.
   - "skips the pre-start ensure when reopening a task without a fixed baseline (UPD-0)": status
     reports no fixed baseline → `ensureTaskWorkspace` is not called; `startTaskSession` still receives
     `{ resumeFromTrash: true }`.
+
+## Review responses (revision 6, PR #35 re-review of be2f709)
+
+Two findings from the re-review; both addressed (superseding the revision-5 notes where they
+conflict).
+
+### 1. Blocking — the refresh and setup locks collide inside proper-lockfile (task-worktree.ts)
+
+proper-lockfile keys its in-process `locks` map by the resolved lock **`path`** (NOT by
+`lockfilePath`). Both the setup lock and the base refresh lock passed `path: <git common dir>` and
+differed only in `lockfileName`, so they shared one in-process entry: a second acquisition
+overwrote the first, and releasing one marked the other "already released" (ERELEASED / ENOTACQUIRED
++ ECOMPROMISED), leaving a window where neither lockfile was protected.
+
+Fix: `getTaskBaseRefreshLock` now uses a **distinct `path`** (`<common dir>/kanban-task-base-refresh`)
+with `type: "file"` and an explicit `lockfilePath` that keeps the on-disk lockfile name/location
+unchanged (`<common dir>/kanban-task-base-refresh.lock`). The two locks therefore get separate
+in-process keys while still being per-repo on disk. `getTaskWorktreeSetupLock` is exported for the
+regression test.
+
+### 2. Nit — local-phase failures reported the normalized branch, not the selected ref
+
+After the phase split, network-phase failures reported `selectedRef` as the user-selected ref
+(e.g. `refs/heads/main`) while local-phase failures reported the normalized branch (`main`).
+`updateLocalBaseBranch` now accepts an optional `selectedRef` (defaulting to the branch name); both
+the split caller in `prepareInitialTaskWorktree` and the unsplit `refreshTaskBaseRef` pass the
+original (trimmed) `baseRef` through, so the two phases report a consistent `selectedRef`.
+
+### New tests (revision 6)
+
+- `test/integration/task-base-refresh.integration.test.ts`
+  - "keeps the base refresh and worktree setup locks independent in the same process": holds the
+    setup lock, then (while it is held) the refresh lock, in the same process, and releases the
+    refresh lock first then the setup lock. Deterministically fails with ENOTACQUIRED if the two
+    `LockRequest`s ever share a `path` (verified by reverting the fix and re-running).
+  - "reports the selected ref (not the normalized branch) on a local-phase failure": selects the
+    base with a `refs/heads/` prefix and a dirty checkout (local-phase `dirty_checkout` failure) and
+    asserts `selectedRef` is the selected ref, not the normalized branch.
+  - The existing "queues concurrent refreshes…" test is now deterministic (3/3 runs) under the fix.
 
 ## Stop conditions
 

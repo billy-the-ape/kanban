@@ -10,11 +10,14 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { dirname, join } from "node:path";
 
 import { describe, expect, it } from "vitest";
+import { type LockRequest, lockedFileSystem } from "../../src/fs/locked-file-system";
 import { getTaskInitialStartEvidence, readTaskInitialStartRecord } from "../../src/workspace/task-initial-start";
 import {
 	deleteTaskWorktree,
 	ensureTaskWorktreeIfDoesntExist,
+	getTaskBaseRefreshLock,
 	getTaskWorktreePath,
+	getTaskWorktreeSetupLock,
 	prepareInitialTaskWorktree,
 } from "../../src/workspace/task-worktree";
 import { createGitTestEnv } from "../utilities/git-env";
@@ -111,6 +114,40 @@ function createBaseRefreshFixture(sandboxRoot: string, baseRef = "feat/task"): B
 		baseRef,
 		localBaseSha,
 		remoteBaseSha,
+	};
+}
+
+/**
+ * Acquire a lock and hold it until the returned release function is called.
+ * Resolves only after the lock is actually acquired (the operation entered),
+ * so callers can order acquisitions deterministically. The returned function
+ * resolves once the lock is fully released (and rejects if the release fails).
+ */
+async function acquireHeldLock(request: LockRequest): Promise<() => Promise<void>> {
+	const state: { releaseOperation: (() => void) | null; held: Promise<void> | null } = {
+		releaseOperation: null,
+		held: null,
+	};
+	await new Promise<void>((resolveEntered) => {
+		const held = lockedFileSystem.withLock(request, () => {
+			// The operation only runs once the lock is acquired.
+			resolveEntered();
+			return new Promise<void>((resolveOperation) => {
+				state.releaseOperation = resolveOperation;
+			});
+		});
+		state.held = held;
+		// Avoid an unhandled rejection while we deliberately hold the lock.
+		held.catch(() => {});
+	});
+	const releaseOperation = state.releaseOperation;
+	const held = state.held;
+	if (!releaseOperation || !held) {
+		throw new Error("Expected the lock to be acquired.");
+	}
+	return () => {
+		releaseOperation();
+		return held;
 	};
 }
 
@@ -261,6 +298,38 @@ describe.sequential("task base refresh integration (UPD-0)", () => {
 				);
 				const evidence = await getTaskInitialStartEvidence(taskId);
 				expect(evidence.preparedBaselineSha).toBeNull();
+			} finally {
+				cleanup();
+			}
+		});
+	});
+
+	it("reports the selected ref (not the normalized branch) on a local-phase failure", async () => {
+		await withTemporaryHome(async () => {
+			const { path: sandboxRoot, cleanup } = createTempDir("kanban-base-refresh-selectedref-");
+			try {
+				const fixture = createBaseRefreshFixture(sandboxRoot);
+				const taskId = "task-selectedref";
+				// Dirty the checkout so the refresh fails in the LOCAL phase
+				// (the network fetch succeeds first).
+				const stagedFile = join(fixture.workspacePath, "staged.txt");
+				writeFileSync(stagedFile, "staged\n", "utf8");
+				runGit(fixture.workspacePath, ["add", "staged.txt"]);
+
+				// Select the base with a refs/heads/ prefix: the network phase
+				// normalizes it to the branch, but a local-phase failure must
+				// report the ref the user actually selected.
+				const prepared = await prepareInitialTaskWorktree({
+					cwd: fixture.workspacePath,
+					taskId,
+					baseRef: `refs/heads/${fixture.baseRef}`,
+					updateBaseRefBeforeStart: true,
+				});
+
+				expect(prepared.ok).toBe(false);
+				expect(prepared.initialStart.stage).toBe("blocked");
+				expect(prepared.initialStart.failure?.category).toBe("dirty_checkout");
+				expect(prepared.initialStart.failure?.selectedRef).toBe(`refs/heads/${fixture.baseRef}`);
 			} finally {
 				cleanup();
 			}
@@ -541,6 +610,37 @@ describe.sequential("task base refresh integration (UPD-0)", () => {
 					fixture.remoteBaseSha,
 				);
 				await holder;
+			} finally {
+				cleanup();
+			}
+		});
+	});
+
+	it("keeps the base refresh and worktree setup locks independent in the same process", async () => {
+		await withTemporaryHome(async () => {
+			const { path: sandboxRoot, cleanup } = createTempDir("kanban-base-refresh-lockkeys-");
+			try {
+				// A plain git repo is enough: both locks key off the common dir.
+				const repoPath = join(sandboxRoot, "repo");
+				mkdirSync(repoPath, { recursive: true });
+				runGit(repoPath, ["init"]);
+
+				const setupLockRequest = await getTaskWorktreeSetupLock(repoPath);
+				const refreshLockRequest = await getTaskBaseRefreshLock(repoPath);
+
+				// Hold the setup lock, then (while it is held) the refresh lock,
+				// both in this process. proper-lockfile keys its in-process
+				// `locks` map by the resolved `path`, so if both requests shared
+				// a `path` the refresh acquisition would overwrite the setup
+				// entry and releasing the setup lock afterward would fail with
+				// ERELEASED / ENOTACQUIRED.
+				const releaseSetup = await acquireHeldLock(setupLockRequest);
+				const releaseRefresh = await acquireHeldLock(refreshLockRequest);
+
+				// Release the refresh lock first, then the setup lock. Both
+				// releases must succeed, proving the two locks are independent.
+				await releaseRefresh();
+				await releaseSetup();
 			} finally {
 				cleanup();
 			}

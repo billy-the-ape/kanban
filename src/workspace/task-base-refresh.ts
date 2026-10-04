@@ -503,8 +503,14 @@ export async function updateLocalBaseBranch(options: {
 	repoPath: string;
 	branchName: string;
 	targetSha: string;
+	/**
+	 * The ref the user selected (e.g. `refs/heads/main`), reported as
+	 * `selectedRef` on failures so the local phase stays consistent with the
+	 * network phase. Defaults to the normalized branch name.
+	 */
+	selectedRef?: string;
 }): Promise<TaskBaseLocalUpdateResult> {
-	const failure = makeFailureForRef(options.branchName);
+	const failure = makeFailureForRef(options.selectedRef ?? options.branchName);
 	const localResult = await updateLocalBranchSafely(options.repoPath, options.branchName, options.targetSha, failure);
 	if (localResult !== null && "ok" in localResult) {
 		// Blocked: surface the structured failure (ok is always false here).
@@ -538,6 +544,7 @@ export async function refreshTaskBaseRef(options: {
 			repoPath: options.repoPath,
 			branchName: fetchResult.localBranchName,
 			targetSha: fetchResult.targetSha,
+			selectedRef: options.baseRef.trim(),
 		});
 		if (!localResult.ok) {
 			return localResult;
