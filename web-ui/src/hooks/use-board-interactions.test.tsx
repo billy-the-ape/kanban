@@ -219,6 +219,58 @@ describe("useBoardInteractions", () => {
 		}
 	});
 
+	it("moves a running backlog task into In Progress when its session is hydrated", async () => {
+		useProgrammaticCardMovesMock.mockReturnValue({
+			handleProgrammaticCardMoveReady: () => {},
+			setRequestMoveTaskToTrashHandler: () => {},
+			setRequestCompleteTaskHandler: () => {},
+			tryProgrammaticCardMove: () => "unavailable",
+			consumeProgrammaticCardMove: () => ({}),
+			resolvePendingProgrammaticTrashMove: () => {},
+			resolvePendingProgrammaticCompleteMove: () => {},
+			waitForProgrammaticCardMoveAvailability: async () => {},
+			resetProgrammaticCardMoves: () => {},
+			requestMoveTaskToTrashWithAnimation: async () => {},
+			requestCompleteTaskWithAnimation: async () => {},
+			programmaticCardMoveCycle: 0,
+		});
+		useLinkedBacklogTaskActionsMock.mockReturnValue({});
+
+		let board = createBoard();
+		const setBoard = vi.fn<Dispatch<SetStateAction<BoardData>>>((nextBoard) => {
+			board = typeof nextBoard === "function" ? nextBoard(board) : nextBoard;
+		});
+		const task = board.columns.find((column) => column.id === "backlog")?.cards[0];
+		if (!task) throw new Error("Expected a backlog task.");
+		const runningSession: RuntimeTaskSessionSummary = {
+			taskId: task.id,
+			state: "running",
+			agentId: "cline",
+			workspacePath: "/tmp/task",
+			pid: null,
+			startedAt: 1,
+			updatedAt: 2,
+			lastOutputAt: 2,
+			reviewReason: null,
+			exitCode: null,
+		};
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					board={board}
+					setBoard={setBoard}
+					ensureTaskWorkspace={vi.fn()}
+					startTaskSession={vi.fn()}
+					initialSessions={{ [task.id]: runningSession }}
+				/>,
+			);
+		});
+
+		expect(board.columns.find((column) => column.id === "in_progress")?.cards[0]?.id).toBe(task.id);
+		expect(board.columns.find((column) => column.id === "backlog")?.cards).toHaveLength(0);
+	});
+
 	it.each([true, false])(
 		"moves an eligible queued task only after the backend returns success=%s",
 		async (success) => {
