@@ -1,5 +1,10 @@
 # PRLINK-1 — Cline capture (record path + `onToolFinished`)
 
+> **Status: DONE.** Implemented as sketched; final-state notes are under
+> "Final-state notes" at the bottom. Typecheck, `test:fast`, `test/workspace`,
+> and `test/integration` verified (the only failures are two pre-existing,
+> unrelated ones that also fail on the base branch).
+
 Master plan: `PR_LINKING_PLAN.md` (this is milestone **PL-2**).
 Depends on: **PRLINK-0** (contract, parser, detection, board mutations).
 
@@ -166,4 +171,40 @@ Manual: on a scratch repo with a GitHub remote, run a Cline task that ends by ru
 - Cline-created PRs (fresh or "already exists") are recorded exactly once; non-creating commands record nothing.
 - Open UIs receive a state broadcast only when the card actually changed.
 - All Cline unit tests stay fake-based (no live SDK host).
+
+## Final-state notes
+
+Deviations from the sketch above, discovered during implementation:
+
+- **Error logging:** the biome `grit/no-console.grit` rule forbids `console.*`
+  in `src/` (except `src/cli.ts`), so the best-effort catch logs via
+  `process.stderr.write("[task-pull-requests] ...")` — the same pattern as
+  `src/commands/hooks.ts` — instead of `console.error`.
+- **Mutation generic:** `mutateWorkspaceState<boolean>` with `value:
+  result.added` (not `{ added: boolean }`), because
+  `RuntimeWorkspaceAtomicMutationResult<T>` must match the returned value's
+  type; `response.saved && response.value` is the "recorded and changed" check.
+- **Adapter output text:** a small `toToolOutputText(output)` helper
+  (string passthrough, `JSON.stringify` fallback, `null` otherwise) reduces
+  the tool-result payload to text before it reaches `onToolFinished`, so URL
+  scanning works for structured results too.
+- **Service:** the options object is stored on the instance
+  (`private readonly options`); `extractCommandStrings` is imported from
+  `./review-tool-policy` (same module the review tool policy uses).
+- **Workspace tests:** revision assertions account for the initial
+  `saveWorkspaceState` bump (`loadWorkspaceState` auto-creates state at
+  revision 0): recorded → `initial.revision + 2`, repeated no-op → still
+  `+ 2`, pure no-op paths → `+ 1`.
+- **Service "missing workspacePath" test:** built via
+  `rebindPersistedTaskSession` with a persisted record whose `cwd`/
+  `workspaceRoot` are empty strings (both are *required* fields on
+  `SessionHistoryRecord`); rebind trims them to `null`. The fake runtime is
+  then bound with `runtime.bindTaskSession` because the rebind path never
+  binds a live session.
+- **Pre-existing, unrelated failures** (verified to fail on the base branch
+  too, with these changes stashed):
+  - `test/runtime/server/middleware.test.ts` → "passes through upgrades whose
+    Host and Origin are both allowed"
+  - `test/integration/task-worktree.integration.test.ts` → "resumes a trashed
+    task from the preserved snapshot when the saved patch is invalid"
 

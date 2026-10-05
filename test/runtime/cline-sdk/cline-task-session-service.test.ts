@@ -44,6 +44,16 @@ vi.mock("../../../src/state/workspace-state.js", async (importOriginal) => {
 	};
 });
 
+// PRLINK-1: PR recording goes through the single server-side write path; spy
+// on it so this suite never touches the real workspace state on disk.
+const taskPullRequestMocks = vi.hoisted(() => ({
+	recordTaskPullRequests: vi.fn(),
+}));
+
+vi.mock("../../../src/workspace/task-pull-requests.js", () => ({
+	recordTaskPullRequests: taskPullRequestMocks.recordTaskPullRequests,
+}));
+
 // Compaction event records (B-10.4) are durable per-task artifacts; point them
 // at a throwaway dir so overflow-recovery tests never write into the real
 // ~/.cline.
@@ -379,6 +389,8 @@ describe("InMemoryClineTaskSessionService", () => {
 
 	beforeEach(() => {
 		turnCheckpointMocks.captureTaskTurnCheckpoint.mockReset();
+		taskPullRequestMocks.recordTaskPullRequests.mockReset();
+		taskPullRequestMocks.recordTaskPullRequests.mockResolvedValue({ recorded: false, changed: false });
 		turnCheckpointMocks.deleteTaskTurnCheckpointRef.mockReset();
 		turnCheckpointMocks.captureTaskTurnCheckpoint.mockImplementation(
 			async (input: { taskId: string; turn: number }) => ({
@@ -1933,5 +1945,161 @@ describe("InMemoryClineTaskSessionService", () => {
 			.filter((message) => message.role === "assistant")
 			.map((message) => message.content);
 		expect(assistantMessages).toEqual(["Done."]);
+	});
+	describe("Cline PR capture (PRLINK-1)", () => {
+		const PR_URL = "https://github.com/owner/repo/pull/12";
+
+		// Emits a tool-started/tool-finished pair for one tool call; the
+		// tool-finished adapter branch reads the input from the
+		// tool-started entry, mirroring the real SDK event order.
+		function emitFinishedToolCall(
+			runtime: FakeClineSessionRuntimeController,
+			sessionId: string,
+			toolName: string,
+			toolInput: unknown,
+			output: unknown,
+		): void {
+			const toolCall = { type: "tool-call", toolCallId: "tool-1", toolName, input: toolInput };
+			runtime.emitAgentEvent(sessionId, { type: "tool-started", iteration: 1, toolCall });
+			runtime.emitAgentEvent(sessionId, {
+				type: "tool-finished",
+				iteration: 1,
+				toolCall,
+				message: {
+					id: "msg-tool-1",
+					role: "tool",
+					content: [{ type: "tool-result", toolCallId: "tool-1", output }],
+					createdAt: 1,
+				},
+			});
+		}
+
+		async function startSessionWithService(
+			options: { broadcastWorkspaceStateUpdated?: (workspacePath: string) => void } = {},
+		): Promise<{ service: ClineTaskSessionService; runtime: FakeClineSessionRuntimeController; sessionId: string }> {
+			const runtime = createFakeClineSessionRuntime();
+			const runtimeSetup = createFakeRuntimeSetup();
+			const service = createInMemoryClineTaskSessionService({
+				createSessionRuntime: (runtimeOptions) => runtime.createRuntime(runtimeOptions),
+				createRuntimeSetup: vi.fn(async (_workspacePath: string) => runtimeSetup.setup),
+				broadcastWorkspaceStateUpdated: options.broadcastWorkspaceStateUpdated,
+			});
+			services.push(service);
+			await service.startTaskSession({ taskId: "task-1", cwd: "/tmp/worktree", prompt: "Create a PR" });
+			await waitForTaskSessionId(runtime, "task-1");
+			const sessionId = runtime.getTaskSessionId("task-1");
+			expect(sessionId).toBeTruthy();
+			return { service, runtime, sessionId: sessionId ?? "session-1" };
+		}
+
+		it("records a PR created by a Cline run_commands tool call", async () => {
+			const { runtime, sessionId } = await startSessionWithService();
+
+			emitFinishedToolCall(runtime, sessionId, "run_commands", { commands: ["gh pr create --title 'Fix'"] }, PR_URL);
+
+			expect(taskPullRequestMocks.recordTaskPullRequests).toHaveBeenCalledTimes(1);
+			expect(taskPullRequestMocks.recordTaskPullRequests).toHaveBeenCalledWith({
+				workspacePath: "/tmp/worktree",
+				taskId: "task-1",
+				links: [
+					{
+						provider: "github",
+						host: "github.com",
+						repository: "owner/repo",
+						number: 12,
+						url: "https://github.com/owner/repo/pull/12",
+					},
+				],
+				source: "agent_tool",
+			});
+		});
+
+		it("does not record PR URLs from commands that do not create PRs", async () => {
+			const { runtime, sessionId } = await startSessionWithService();
+
+			emitFinishedToolCall(runtime, sessionId, "run_commands", { commands: ["gh pr view 205"] }, PR_URL);
+
+			expect(taskPullRequestMocks.recordTaskPullRequests).not.toHaveBeenCalled();
+		});
+
+		it("broadcasts workspace state only when the card actually changed", async () => {
+			const broadcastedPaths: string[] = [];
+			taskPullRequestMocks.recordTaskPullRequests.mockResolvedValue({ recorded: true, changed: true });
+			const { runtime: recordingRuntime, sessionId: recordingSessionId } = await startSessionWithService({
+				broadcastWorkspaceStateUpdated: (workspacePath) => broadcastedPaths.push(workspacePath),
+			});
+
+			emitFinishedToolCall(
+				recordingRuntime,
+				recordingSessionId,
+				"run_commands",
+				{ commands: ["gh pr create"] },
+				PR_URL,
+			);
+
+			await vi.waitFor(() => {
+				expect(broadcastedPaths).toEqual(["/tmp/worktree"]);
+			});
+
+			const noopBroadcastedPaths: string[] = [];
+			taskPullRequestMocks.recordTaskPullRequests.mockResolvedValue({ recorded: false, changed: false });
+			const { runtime: noopRuntime, sessionId: noopSessionId } = await startSessionWithService({
+				broadcastWorkspaceStateUpdated: (workspacePath) => noopBroadcastedPaths.push(workspacePath),
+			});
+
+			emitFinishedToolCall(noopRuntime, noopSessionId, "run_commands", { commands: ["gh pr create"] }, PR_URL);
+
+			// The mock settles on a microtask; give the .then a macrotask tick
+			// to run before asserting the broadcast did not happen.
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			expect(noopBroadcastedPaths).toEqual([]);
+		});
+
+		it("does not attempt recording when the session summary has no workspace path", async () => {
+			const runtime = createFakeClineSessionRuntime();
+			const runtimeSetup = createFakeRuntimeSetup();
+			const service = createInMemoryClineTaskSessionService({
+				createSessionRuntime: (runtimeOptions) => runtime.createRuntime(runtimeOptions),
+				createRuntimeSetup: vi.fn(async (_workspacePath: string) => runtimeSetup.setup),
+			});
+			services.push(service);
+			runtime.readPersistedTaskSessionMock.mockResolvedValue({
+				record: {
+					sessionId: "task-1-persisted",
+					source: "core" as ClinePersistedTaskSessionSnapshot["record"]["source"],
+					status: "completed",
+					startedAt: "2026-03-17T10:00:00.000Z",
+					updatedAt: "2026-03-17T10:05:00.000Z",
+					interactive: true,
+					provider: "anthropic",
+					model: "claude-sonnet-4-6",
+					cwd: "",
+					workspaceRoot: "",
+					enableTools: true,
+					enableSpawn: false,
+					enableTeams: false,
+					isSubagent: false,
+				},
+				messages: [{ role: "user", content: "Recovered prompt" }],
+			});
+
+			const reboundSummary = await service.rebindPersistedTaskSession("task-1");
+			expect(reboundSummary?.workspacePath).toBeNull();
+			// The rebind path rebuilds the in-memory entry without binding a
+			// live SDK session; bind the persisted session id directly.
+			runtime.bindTaskSession("task-1", "task-1-persisted");
+			const sessionId = runtime.getTaskSessionId("task-1");
+			expect(sessionId).toBeTruthy();
+
+			emitFinishedToolCall(
+				runtime,
+				sessionId ?? "session-1",
+				"run_commands",
+				{ commands: ["gh pr create"] },
+				PR_URL,
+			);
+
+			expect(taskPullRequestMocks.recordTaskPullRequests).not.toHaveBeenCalled();
+		});
 	});
 });

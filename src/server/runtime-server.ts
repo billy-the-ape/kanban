@@ -164,6 +164,10 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				// compaction policy, credentials) from the current provider
 				// settings instead of replaying the start-time snapshot.
 				resolveClineLaunchConfig: (overrides) => clineProviderService.resolveLaunchConfig(overrides),
+				// PRLINK-1: open UIs pick up server-side card writes (Cline PR
+				// recording) without a reload; only fired when the card changed.
+				broadcastWorkspaceStateUpdated: (workspacePath) =>
+					void deps.runtimeStateHub.broadcastRuntimeWorkspaceStateUpdated(scope.workspaceId, workspacePath),
 			});
 			clineTaskSessionServiceByWorkspaceId.set(scope.workspaceId, service);
 			deps.runtimeStateHub.trackClineTaskSessionService(scope.workspaceId, scope.workspacePath, service);
