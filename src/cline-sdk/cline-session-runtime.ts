@@ -285,7 +285,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			request.taskId,
 			request,
 			(signal) => this.startAdmittedTaskSession(request, signal),
-			(queued) => this.emitConcurrencyState(request.taskId, queued),
+			(queued, position) => this.emitConcurrencyState(request.taskId, queued, position),
 			request.prompt.trim().length > 0 || Boolean(toSdkUserImages(request.images)?.length),
 		);
 	}
@@ -573,8 +573,8 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		}
 	}
 
-	private emitConcurrencyState(taskId: string, queued: boolean): void {
-		this.onTaskEvent?.(taskId, { type: "kanban_concurrency", queued });
+	private emitConcurrencyState(taskId: string, queued: boolean, queuePosition?: number): void {
+		this.onTaskEvent?.(taskId, { type: "kanban_concurrency", queued, queuePosition });
 	}
 
 	async restartTaskSession(input: {
@@ -804,7 +804,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 					...(delivery ? { delivery } : {}),
 				});
 			},
-			(queued) => this.emitConcurrencyState(taskId, queued),
+			(queued, position) => this.emitConcurrencyState(taskId, queued, position),
 		);
 	}
 

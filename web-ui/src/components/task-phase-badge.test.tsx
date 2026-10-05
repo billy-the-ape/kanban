@@ -69,4 +69,24 @@ describe("TaskPhaseBadge errors", () => {
 		);
 		expect(container.textContent).toBe("impl");
 	});
+	it("preserves the queue label and lets an error override stale queue metadata", async () => {
+		await render(
+			<TaskPhaseBadge
+				summary={{ phase: "implementing", needsAttention: false, blockedReason: null }}
+				queuePosition={2}
+				sessionSummary={session({ state: "running", reviewReason: null })}
+				columnId="in_progress"
+			/>,
+		);
+		expect(container.textContent).toBe("q #2");
+		await render(
+			<TaskPhaseBadge
+				summary={{ phase: "implementing", needsAttention: false, blockedReason: null }}
+				queuePosition={2}
+				sessionSummary={session()}
+				columnId="in_progress"
+			/>,
+		);
+		expect(container.textContent).toBe("err");
+	});
 });

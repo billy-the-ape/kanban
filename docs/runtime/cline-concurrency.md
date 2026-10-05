@@ -73,3 +73,5 @@ curl -fsS 'http://127.0.0.1:8080/props?model=qwen3.8-27b' \
    start fresh turns to return to discovery.
 5. Test a provider without `/props`: tasks serialize and queue without errors.
    A failing turn must release capacity for the next queued task.
+
+Waiting board cards show `q #1`, `q #2`, and so on in place of the phase badge. Positions are FIFO within each endpoint/model pool and update when a waiting turn is canceled or admitted. The normal phase badge returns when the turn starts.

@@ -48,11 +48,13 @@ const PHASE_CLASSES: Record<RuntimeTaskPhase, string> = {
 
 export function TaskPhaseBadge({
 	summary,
+	queuePosition,
 	columnId,
 	sessionSummary,
 	className,
 }: {
 	summary: RuntimeTaskPhaseSummary | null | undefined;
+	queuePosition?: number | null;
 	columnId?: BoardColumnId;
 	sessionSummary?: RuntimeTaskSessionSummary;
 	className?: string;
@@ -74,7 +76,7 @@ export function TaskPhaseBadge({
 			</Tooltip>
 		);
 	}
-	if (!summary || summary.phase === "idle") {
+	if (!summary || (summary.phase === "idle" && !queuePosition)) {
 		return null;
 	}
 	// A stale session or durable record can outlive the card's active phase.
@@ -86,27 +88,31 @@ export function TaskPhaseBadge({
 		return null;
 	}
 	const needsAttention = summary.needsAttention || summary.phase === "needs_attention";
+	const queued = !needsAttention && (!columnId || columnId === "in_progress") && !!queuePosition;
+	const description = queued
+		? `Waiting for model capacity: queue position ${queuePosition}`
+		: PHASE_DESCRIPTIONS[summary.phase];
 	const badge = (
 		<span
 			role="img"
 			aria-label={
-				needsAttention ? `Needs attention: ${summary.blockedReason ?? "check diagnostics"}` : summary.phase
+				needsAttention
+					? `Needs attention: ${summary.blockedReason ?? "check diagnostics"}`
+					: queued
+						? description
+						: summary.phase
 			}
 			className={cn(
 				"inline-flex max-w-full items-center gap-1 rounded-sm px-1.5 py-0.5 text-[11px] leading-none font-medium",
-				PHASE_CLASSES[summary.phase],
+				queued ? "bg-surface-3 text-status-orange" : PHASE_CLASSES[summary.phase],
 				className,
 			)}
 		>
 			{needsAttention ? <AlertTriangle size={11} className="shrink-0" /> : null}
-			<span className="truncate">{PHASE_LABELS[summary.phase]}</span>
+			<span className="truncate">{queued ? `q #${queuePosition}` : PHASE_LABELS[summary.phase]}</span>
 		</span>
 	);
 	return (
-		<Tooltip
-			content={needsAttention && summary.blockedReason ? summary.blockedReason : PHASE_DESCRIPTIONS[summary.phase]}
-		>
-			{badge}
-		</Tooltip>
+		<Tooltip content={needsAttention && summary.blockedReason ? summary.blockedReason : description}>{badge}</Tooltip>
 	);
 }

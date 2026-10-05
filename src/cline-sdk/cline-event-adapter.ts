@@ -233,10 +233,14 @@ export function applyClineSessionEvent(input: ApplyClineSessionEventInput): void
 	const concurrencyEvent = asRecord(event);
 	if (concurrencyEvent?.type === "kanban_concurrency") {
 		const queued = concurrencyEvent.queued === true;
+		const position = concurrencyEvent.queuePosition;
+		const queuePosition =
+			queued && typeof position === "number" && Number.isSafeInteger(position) && position > 0 ? position : null;
 		emitSummary(input, {
 			state: "running",
 			lastHookAt: now(),
 			latestHookActivity: {
+				queuePosition,
 				activityText: queued ? "Waiting for model capacity" : "Agent active",
 				toolName: null,
 				toolInputSummary: null,
