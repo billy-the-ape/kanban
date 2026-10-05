@@ -4,7 +4,7 @@
 import { AlertTriangle } from "lucide-react";
 import { cn } from "@/components/ui/cn";
 import { Tooltip } from "@/components/ui/tooltip";
-import type { RuntimeTaskPhase, RuntimeTaskPhaseSummary } from "@/runtime/types";
+import type { RuntimeTaskPhase, RuntimeTaskPhaseSummary, RuntimeTaskSessionSummary } from "@/runtime/types";
 import type { BoardColumnId } from "@/types";
 
 const PHASE_LABELS: Record<RuntimeTaskPhase, string> = {
@@ -50,13 +50,32 @@ export function TaskPhaseBadge({
 	summary,
 	queuePosition,
 	columnId,
+	sessionSummary,
 	className,
 }: {
 	summary: RuntimeTaskPhaseSummary | null | undefined;
 	queuePosition?: number | null;
 	columnId?: BoardColumnId;
+	sessionSummary?: RuntimeTaskSessionSummary;
 	className?: string;
 }): React.ReactElement | null {
+	const error = sessionSummary?.reviewReason === "error" || sessionSummary?.state === "failed";
+	if (error) {
+		return (
+			<Tooltip content={sessionSummary?.warningMessage ?? "Agent failed; check task details"}>
+				<span
+					role="img"
+					aria-label="Task error"
+					className={cn(
+						"inline-flex rounded-sm px-1.5 py-0.5 text-[11px] font-medium bg-status-red/15 text-status-red",
+						className,
+					)}
+				>
+					err
+				</span>
+			</Tooltip>
+		);
+	}
 	if (!summary || (summary.phase === "idle" && !queuePosition)) {
 		return null;
 	}

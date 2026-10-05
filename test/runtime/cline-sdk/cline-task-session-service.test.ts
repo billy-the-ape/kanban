@@ -1537,6 +1537,32 @@ describe("InMemoryClineTaskSessionService", () => {
 		sendDeferred.resolve({ text: "done" });
 	});
 
+	it("stops thinking when startup resolves a failed turn without an error event", async () => {
+		const { service, runtime } = createTrackedService();
+		runtime.startTaskSessionMock.mockImplementationOnce(async (request) => ({
+			sessionId: request.sessionId,
+			result: { finishReason: "error", text: "Tool recovery exhausted" },
+		}));
+		await service.startTaskSession({ taskId: "task-1", cwd: "/tmp/worktree", prompt: "Start" });
+		await vi.waitFor(() => expect(service.getSummary("task-1")?.reviewReason).toBe("error"));
+		expect(service.getSummary("task-1")?.state).toBe("awaiting_review");
+		expect(service.getSummary("task-1")?.warningMessage).toBe("Tool recovery exhausted");
+	});
+
+	it("stops thinking when a follow-up resolves a failed turn without an error event", async () => {
+		const { service, runtime } = createTrackedService();
+		await service.startTaskSession({ taskId: "task-1", cwd: "/tmp/worktree", prompt: "Start" });
+		await vi.waitFor(() => expect(runtime.startTaskSessionMock).toHaveBeenCalledTimes(1));
+		runtime.sendTaskSessionInputMock.mockResolvedValueOnce({
+			finishReason: "error",
+			text: "Tool recovery exhausted",
+		});
+		await service.sendTaskSessionInput("task-1", "Try again");
+		await vi.waitFor(() => expect(service.getSummary("task-1")?.reviewReason).toBe("error"));
+		expect(service.getSummary("task-1")?.state).toBe("awaiting_review");
+		expect(service.getSummary("task-1")?.warningMessage).toBe("Tool recovery exhausted");
+	});
+
 	it("keeps the task resumable when native Cline startup throws", async () => {
 		const { service, runtime } = createTrackedService();
 		runtime.startTaskSessionMock.mockRejectedValueOnce(new Error('Missing API key for provider "cline".'));

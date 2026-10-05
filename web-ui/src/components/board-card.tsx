@@ -653,6 +653,7 @@ export function BoardCard({
 								{columnId !== "trash" ? (
 									<TaskPhaseBadge
 										summary={phaseSummary}
+										sessionSummary={sessionSummary}
 										queuePosition={
 											sessionSummary?.state === "running" &&
 											sessionSummary.latestHookActivity?.hookEventName === "concurrency_waiting"
