@@ -3,8 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createTRPCProxyClient, httpBatchLink, TRPCClientError } from "@trpc/client";
 import type { Command } from "commander";
+import { extractCommandStrings } from "../cline-sdk/review-tool-policy";
 import type { RuntimeHookEvent, RuntimeTaskHookActivity } from "../core/api-contract";
 import { buildKanbanCommandParts } from "../core/kanban-command";
+import { detectCreatedPullRequests } from "../core/pull-request-detection";
 import { buildKanbanRuntimeUrl, getRuntimeFetch } from "../core/runtime-endpoint";
 import { buildWindowsCmdArgsArray, resolveWindowsComSpec, shouldUseWindowsCmdLaunch } from "../core/windows-cmd-launch";
 import { parseHookRuntimeContextFromEnv } from "../terminal/hook-runtime-context";
@@ -33,6 +35,8 @@ interface HooksIngestArgs {
 	workspaceId: string;
 	metadata?: Partial<RuntimeTaskHookActivity>;
 	payload?: Record<string, unknown> | null;
+	/** Canonical PR URLs detected from the hook payload (max 10). */
+	pullRequestUrls?: string[];
 }
 
 interface HookCommandMetadataOptionValues {
@@ -163,6 +167,66 @@ function extractToolInput(payload: Record<string, unknown>): Record<string, unkn
 	const output = asRecord(payload.output);
 	const outputArgs = output ? asRecord(output.args) : null;
 	return outputArgs;
+}
+
+/**
+ * PRLINK-2: extracts the tool name from a hook payload. Shared by metadata
+ * normalization and hook-side PR detection so both see the same tool.
+ */
+export function extractHookToolName(payload: Record<string, unknown> | null): string | null {
+	return payload
+		? (readStringField(payload, "tool_name") ??
+				readStringField(payload, "toolName") ??
+				readNestedString(payload, ["preToolUse", "tool"]) ??
+				readNestedString(payload, ["preToolUse", "toolName"]) ??
+				readNestedString(payload, ["postToolUse", "tool"]) ??
+				readNestedString(payload, ["postToolUse", "toolName"]) ??
+				readNestedString(payload, ["input", "tool"]) ??
+				readNestedString(payload, ["input", "toolName"]))
+		: null;
+}
+
+const TOOL_RESPONSE_STRING_FIELDS = ["stdout", "stderr", "output", "error"] as const;
+
+/**
+ * PRLINK-2: reads the tool output from a hook payload's `tool_response`
+ * (string as-is; record joins stdout/stderr/output/error, or falls back to
+ * the serialized record so structured output can still be scanned).
+ */
+function extractHookToolResponse(payload: Record<string, unknown> | null): string | null {
+	if (!payload) {
+		return null;
+	}
+	const response = payload.tool_response ?? payload.toolResponse;
+	if (typeof response === "string") {
+		return response;
+	}
+	const responseRecord = asRecord(response);
+	if (!responseRecord) {
+		return null;
+	}
+	const parts = TOOL_RESPONSE_STRING_FIELDS.map((key) => {
+		const value = responseRecord[key];
+		return typeof value === "string" && value.length > 0 ? value : null;
+	}).filter((value): value is string => value !== null);
+	if (parts.length > 0) {
+		return parts.join("\n");
+	}
+	return JSON.stringify(responseRecord);
+}
+
+// PRLINK-2: canonical PR URLs detected from the hook payload. Only URLs
+// cross the wire — never raw tool output (master plan Risk #2).
+const MAX_HOOK_PULL_REQUEST_URLS = 10;
+
+export function extractHookPullRequestUrls(payload: Record<string, unknown> | null): string[] | undefined {
+	const toolName = extractHookToolName(payload);
+	const toolInput = payload ? extractToolInput(payload) : null;
+	const commands = toolInput ? extractCommandStrings(toolInput) : [];
+	const output = extractHookToolResponse(payload);
+	const links = detectCreatedPullRequests({ toolName, commands, output });
+	const urls = links.map((link) => link.url).slice(0, MAX_HOOK_PULL_REQUEST_URLS);
+	return urls.length > 0 ? urls : undefined;
 }
 
 function describeToolOperation(toolName: string | null, toolInput: Record<string, unknown> | null): string | null {
@@ -311,16 +375,7 @@ function normalizeHookMetadata(
 			readStringField(payload, "hookEventName") ??
 			readStringField(payload, "hookName"))
 		: null;
-	const toolName = payload
-		? (readStringField(payload, "tool_name") ??
-			readStringField(payload, "toolName") ??
-			readNestedString(payload, ["preToolUse", "tool"]) ??
-			readNestedString(payload, ["preToolUse", "toolName"]) ??
-			readNestedString(payload, ["postToolUse", "tool"]) ??
-			readNestedString(payload, ["postToolUse", "toolName"]) ??
-			readNestedString(payload, ["input", "tool"]) ??
-			readNestedString(payload, ["input", "toolName"]))
-		: null;
+	const toolName = extractHookToolName(payload);
 	const notificationType = payload
 		? (readStringField(payload, "notification_type") ??
 			readStringField(payload, "notificationType") ??
@@ -366,12 +421,16 @@ function parseHooksIngestArgs(
 	const payloadFromArg = payloadArg ? parseJsonObject(payloadArg) : null;
 	const payload = payloadFromBase64 ?? payloadFromStdin ?? payloadFromArg;
 	const metadata = normalizeHookMetadata(event, payload, flagMetadata);
+	// PRLINK-2: detect PR creation in the hook CLI process so only resulting
+	// canonical URLs cross the wire, never raw tool output.
+	const pullRequestUrls = extractHookPullRequestUrls(payload);
 	return {
 		event,
 		taskId: context.taskId,
 		workspaceId: context.workspaceId,
 		metadata,
 		payload,
+		pullRequestUrls,
 	};
 }
 
@@ -394,6 +453,7 @@ async function ingestHookEvent(args: HooksIngestArgs): Promise<void> {
 			workspaceId: args.workspaceId,
 			event: args.event,
 			metadata: args.metadata,
+			pullRequestUrls: args.pullRequestUrls,
 		}),
 		3000,
 		"kanban hooks ingest",

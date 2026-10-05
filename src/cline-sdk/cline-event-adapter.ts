@@ -72,7 +72,7 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function readAgentEvent(event: unknown): RawClineSdkAgentEvent | null {
 	const record = asRecord(event);
-	if (!record || record.type !== "agent_event") {
+	if (record?.type !== "agent_event") {
 		return null;
 	}
 	const payload = asRecord(record.payload);
@@ -88,7 +88,7 @@ function readAgentEvent(event: unknown): RawClineSdkAgentEvent | null {
 
 function readChunkEvent(event: unknown): ClineSdkChunkEvent | null {
 	const record = asRecord(event);
-	if (!record || record.type !== "chunk") {
+	if (record?.type !== "chunk") {
 		return null;
 	}
 	const payload = asRecord(record.payload);
@@ -103,7 +103,7 @@ function readChunkEvent(event: unknown): ClineSdkChunkEvent | null {
 
 function readHookEvent(event: unknown): ClineSdkHookEvent | null {
 	const record = asRecord(event);
-	if (!record || record.type !== "hook") {
+	if (record?.type !== "hook") {
 		return null;
 	}
 	const payload = asRecord(record.payload);
@@ -115,7 +115,7 @@ function readHookEvent(event: unknown): ClineSdkHookEvent | null {
 
 function readEndedEvent(event: unknown): ClineSdkEndedEvent | null {
 	const record = asRecord(event);
-	if (!record || record.type !== "ended") {
+	if (record?.type !== "ended") {
 		return null;
 	}
 	const payload = asRecord(record.payload);
@@ -127,7 +127,7 @@ function readEndedEvent(event: unknown): ClineSdkEndedEvent | null {
 
 function readStatusEvent(event: unknown): ClineSdkStatusEvent | null {
 	const record = asRecord(event);
-	if (!record || record.type !== "status") {
+	if (record?.type !== "status") {
 		return null;
 	}
 	const payload = asRecord(record.payload);
@@ -142,7 +142,7 @@ function getRetainedClineToolActivity(entry: ClineTaskSessionEntry): {
 	toolInputSummary: string | null;
 } {
 	const latestHookActivity = entry.summary.latestHookActivity;
-	if (!latestHookActivity || latestHookActivity.source !== "cline-sdk" || !latestHookActivity.toolName) {
+	if (latestHookActivity?.source !== "cline-sdk" || !latestHookActivity.toolName) {
 		return {
 			toolName: null,
 			toolInputSummary: null,

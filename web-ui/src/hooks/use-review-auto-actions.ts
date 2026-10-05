@@ -227,7 +227,7 @@ export function useReviewAutoActions({
 					) {
 						scheduleAutoReviewAction(reviewTask.id, "move_to_done_after_git_action", () => {
 							const latestSelection = findCardSelection(boardRef.current, reviewTask.id);
-							if (!latestSelection || latestSelection.column.id !== "review") {
+							if (latestSelection?.column.id !== "review") {
 								return;
 							}
 							if (!isTaskAutoReviewEnabled(latestSelection.card)) {
@@ -260,7 +260,7 @@ export function useReviewAutoActions({
 
 				scheduleAutoReviewAction(reviewTask.id, autoReviewMode, () => {
 					const latestSelection = findCardSelection(boardRef.current, reviewTask.id);
-					if (!latestSelection || latestSelection.column.id !== "review") {
+					if (latestSelection?.column.id !== "review") {
 						return;
 					}
 					if (!isTaskAutoReviewEnabled(latestSelection.card)) {
@@ -316,7 +316,7 @@ export function useReviewAutoActions({
 	useEffect(() => {
 		return subscribeToAnyTaskMetadata((taskId) => {
 			const selection = findCardSelection(boardRef.current, taskId);
-			if (!selection || selection.column.id !== "review") {
+			if (selection?.column.id !== "review") {
 				return;
 			}
 			evaluateAutoReview({

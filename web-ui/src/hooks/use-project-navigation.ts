@@ -28,7 +28,7 @@ function isDirectoryPickerUnavailableError(message: string | null | undefined): 
 }
 
 export function parseRemovedProjectPathFromStreamError(streamError: string | null): string | null {
-	if (!streamError || !streamError.startsWith(REMOVED_PROJECT_ERROR_PREFIX)) {
+	if (!streamError?.startsWith(REMOVED_PROJECT_ERROR_PREFIX)) {
 		return null;
 	}
 	return streamError.slice(REMOVED_PROJECT_ERROR_PREFIX.length).trim();

@@ -7,6 +7,7 @@ import type {
 import { parseHookIngestRequest } from "../core/api-validation";
 import { loadWorkspaceContextById } from "../state/workspace-state";
 import type { TerminalSessionManager } from "../terminal/session-manager";
+import { recordHookPullRequests } from "../workspace/task-pull-requests";
 import { captureTaskTurnCheckpoint, deleteTaskTurnCheckpointRef } from "../workspace/turn-checkpoints";
 import type { RuntimeTrpcContext } from "./app-router";
 
@@ -64,6 +65,18 @@ export function createHooksApi(deps: CreateHooksApiDependencies): RuntimeTrpcCon
 						ok: false,
 						error: `Task "${taskId}" not found in workspace "${workspaceId}"`,
 					} satisfies RuntimeHookIngestResponse;
+				}
+
+				// PRLINK-2: record hook-detected PRs before the transition early
+				// return so recording is independent of column transitions.
+				if (body.pullRequestUrls && body.pullRequestUrls.length > 0) {
+					await recordHookPullRequests({
+						rawUrls: body.pullRequestUrls,
+						workspaceId,
+						workspacePath,
+						taskId,
+						broadcast: deps.broadcastRuntimeWorkspaceStateUpdated,
+					});
 				}
 
 				if (!canTransitionTaskForHookEvent(summary, event)) {

@@ -305,7 +305,7 @@ export function TaskAgentModelPicker({
 					nextSettings.providerId ||
 					nextSettings.modelId ||
 					currentSettings !== undefined ||
-					Boolean(defaultReasoningEffort)
+					defaultReasoningEffort
 				) {
 					return nextSettings;
 				}
