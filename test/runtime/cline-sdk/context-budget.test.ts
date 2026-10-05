@@ -170,7 +170,17 @@ describe("createFallbackMessageTokenEstimator (documented chars/4 estimate fallb
 			],
 		] as const)(
 			"%s",
-			(_, limitTokens, requestTokens, expectedNextInputTokens, sdkReserveTokens, safetyMarginTokens, expectedInputBudget, expectedHeadroom, expectedFits) => {
+			(
+				_,
+				limitTokens,
+				requestTokens,
+				expectedNextInputTokens,
+				sdkReserveTokens,
+				safetyMarginTokens,
+				expectedInputBudget,
+				expectedHeadroom,
+				expectedFits,
+			) => {
 				const budget = computeContextBudget({
 					limitTokens,
 					requestTokens,
