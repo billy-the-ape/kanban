@@ -43,6 +43,7 @@ import type {
 } from "../core/api-contract";
 import { runtimeGitDeliveryReceiptSchema } from "../core/api-contract";
 import { createGitProcessEnv } from "../core/git-process-env";
+import { parsePullRequestUrl } from "../core/pull-request-links";
 import { resolveTaskTitle } from "../core/task-title";
 import { lockedFileSystem } from "../fs/locked-file-system";
 import { getTaskWorktreesHomePath, loadWorkspaceBoardById } from "../state/workspace-state";
@@ -390,11 +391,6 @@ function parseGhJsonArray(output: string): Array<Record<string, unknown>> {
 	} catch {
 		return [];
 	}
-}
-
-function parsePullRequestNumberFromUrl(url: string | null): number | null {
-	const match = url?.match(/\/pull\/(\d+)/);
-	return match?.[1] ? Number.parseInt(match[1], 10) : null;
 }
 
 function isResumableStatus(status: RuntimeGitDeliveryReceipt["status"]): boolean {
@@ -1442,7 +1438,12 @@ export class GitDeliveryService {
 			};
 		}
 		const url = createResult.stdout.match(/https?:\/\/\S+/)?.[0] ?? null;
-		return { status: "created", number: parsePullRequestNumberFromUrl(url), url, error: null };
+		return {
+			status: "created",
+			number: url !== null ? (parsePullRequestUrl(url)?.number ?? null) : null,
+			url,
+			error: null,
+		};
 	}
 }
 

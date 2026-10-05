@@ -1,13 +1,21 @@
 import { describe, expect, it } from "vitest";
 
-import { type RuntimeBoardData, runtimeBoardDataSchema } from "../../src/core/api-contract";
+import {
+	type RuntimeBoardData,
+	type RuntimeTaskPullRequest,
+	runtimeBoardDataSchema,
+} from "../../src/core/api-contract";
+import { getPullRequestIdentityKey } from "../../src/core/pull-request-links";
 import {
 	addTaskDependency,
+	addTaskPullRequests,
 	addTaskToColumn,
 	deleteTasksFromBoard,
 	moveTaskToColumn,
+	removeTaskPullRequest,
 	trashTaskAndGetReadyLinkedTaskIds,
 	updateTask,
+	updateTaskPullRequestSnapshot,
 } from "../../src/core/task-board-mutations";
 
 function createBoard(): RuntimeBoardData {
@@ -20,6 +28,38 @@ function createBoard(): RuntimeBoardData {
 		],
 		dependencies: [],
 	};
+}
+
+function createPullRequest(overrides: Partial<RuntimeTaskPullRequest> = {}): RuntimeTaskPullRequest {
+	return {
+		provider: "github",
+		host: "github.com",
+		repository: "owner/repo",
+		number: 12,
+		url: "https://github.com/owner/repo/pull/12",
+		source: "agent_tool",
+		createdAt: 1000,
+		...overrides,
+	};
+}
+
+function boardWithTaskPullRequests(
+	board: RuntimeBoardData,
+	taskId: string,
+	pullRequests: RuntimeTaskPullRequest[],
+): RuntimeBoardData {
+	return {
+		...board,
+		columns: board.columns.map((column) => ({
+			...column,
+			cards: column.cards.map((card) => (card.id === taskId ? { ...card, pullRequests } : card)),
+		})),
+	};
+}
+
+function taskWithId(board: RuntimeBoardData, taskId: string): RuntimeBoardData {
+	return addTaskToColumn(board, "backlog", { prompt: `Task ${taskId}`, baseRef: "main", taskId }, () => "00000000")
+		.board;
 }
 
 describe("deleteTasksFromBoard", () => {
@@ -345,5 +385,165 @@ describe("per-task agent/model/provider overrides", () => {
 			modelId: "claude-sonnet-4-20250514",
 			reasoningEffort: "high",
 		});
+	});
+});
+
+describe("task pull request links (PRLINK-0)", () => {
+	it("dedupes by identity (case-insensitive) and backfills missing snapshot fields", () => {
+		const board = taskWithId(createBoard(), "task-1");
+		const first = addTaskPullRequests(board, "task-1", [
+			createPullRequest({ host: "GITHUB.COM", repository: "Owner/Repo", createdAt: 1000, source: "delivery" }),
+		]);
+		expect(first.added).toBe(true);
+
+		const second = addTaskPullRequests(
+			first.board,
+			"task-1",
+			[createPullRequest({ title: "Fix bug", state: "open", stateCheckedAt: 2000 })],
+			3000,
+		);
+		expect(second.added).toBe(true);
+		const cards = second.board.columns.flatMap((column) => column.cards);
+		const task = cards.find((card) => card.id === "task-1");
+		expect(task?.pullRequests).toEqual([
+			{
+				provider: "github",
+				host: "GITHUB.COM",
+				repository: "Owner/Repo",
+				number: 12,
+				url: "https://github.com/owner/repo/pull/12",
+				source: "delivery",
+				createdAt: 1000,
+				title: "Fix bug",
+				state: "open",
+				stateCheckedAt: 2000,
+			},
+		]);
+		expect(task?.updatedAt).toBe(3000);
+	});
+
+	it("is a no-op when the incoming links are already stored verbatim", () => {
+		const board = taskWithId(createBoard(), "task-1");
+		const first = addTaskPullRequests(board, "task-1", [createPullRequest()]);
+		const repeat = addTaskPullRequests(first.board, "task-1", [createPullRequest()]);
+		expect(repeat.added).toBe(false);
+		expect(repeat.board).toBe(first.board);
+	});
+
+	it("preserves first-appearance order across interleaved adds", () => {
+		const board = taskWithId(createBoard(), "task-1");
+		const a = createPullRequest({ number: 1, url: "https://github.com/owner/repo/pull/1" });
+		const b = createPullRequest({ number: 2, url: "https://github.com/owner/repo/pull/2" });
+		const c = createPullRequest({ number: 3, url: "https://github.com/owner/repo/pull/3" });
+		const first = addTaskPullRequests(board, "task-1", [a, b]);
+		const second = addTaskPullRequests(first.board, "task-1", [createPullRequest({ number: 1, url: a.url }), c]);
+		expect(second.task?.pullRequests?.map((pr) => pr.number)).toEqual([1, 2, 3]);
+	});
+
+	it("caps stored links at 20, dropping the oldest non-manual entry first", () => {
+		const seed = Array.from({ length: 19 }, (_, index) =>
+			createPullRequest({
+				number: index + 1,
+				url: `https://github.com/owner/repo/pull/${index + 1}`,
+				createdAt: 1000 + index,
+			}),
+		);
+		const manual = createPullRequest({ number: 20, url: "https://github.com/owner/repo/pull/20", source: "manual" });
+		const board = boardWithTaskPullRequests(taskWithId(createBoard(), "task-1"), "task-1", [...seed, manual]);
+
+		const added = addTaskPullRequests(board, "task-1", [
+			createPullRequest({ number: 21, url: "https://github.com/owner/repo/pull/21" }),
+		]);
+		expect(added.added).toBe(true);
+		const numbers = added.task?.pullRequests?.map((pr) => pr.number) ?? [];
+		expect(numbers).toHaveLength(20);
+		expect(numbers[0]).toBe(2); // oldest non-manual dropped
+		expect(numbers).toContain(20); // manual entry survived
+	});
+
+	it("drops the oldest manual entry when every stored link is manual", () => {
+		const seed = Array.from({ length: 20 }, (_, index) =>
+			createPullRequest({
+				number: index + 1,
+				url: `https://github.com/owner/repo/pull/${index + 1}`,
+				source: "manual",
+				createdAt: 1000 + index,
+			}),
+		);
+		const board = boardWithTaskPullRequests(taskWithId(createBoard(), "task-1"), "task-1", seed);
+
+		const added = addTaskPullRequests(board, "task-1", [
+			createPullRequest({ number: 21, url: "https://github.com/owner/repo/pull/21", source: "manual" }),
+		]);
+		const numbers = added.task?.pullRequests?.map((pr) => pr.number) ?? [];
+		expect(numbers).toHaveLength(20);
+		expect(numbers[0]).toBe(2); // oldest manual dropped
+	});
+
+	it("returns added: false and leaves the board unchanged for an unknown task", () => {
+		const board = taskWithId(createBoard(), "task-1");
+		const result = addTaskPullRequests(board, "nope", [createPullRequest()]);
+		expect(result.added).toBe(false);
+		expect(result.task).toBeNull();
+		expect(result.board).toBe(board);
+	});
+});
+
+describe("removeTaskPullRequest / updateTaskPullRequestSnapshot (PRLINK-0)", () => {
+	it("removes by identity key case-insensitively and is a no-op for unknown identities", () => {
+		const stored = createPullRequest({ host: "GITHUB.COM", repository: "Owner/Repo" });
+		const board = boardWithTaskPullRequests(taskWithId(createBoard(), "task-1"), "task-1", [stored]);
+
+		const removed = removeTaskPullRequest(board, "task-1", getPullRequestIdentityKey(stored), 5000);
+		expect(removed.removed).toBe(true);
+		expect(removed.task?.pullRequests).toEqual([]);
+		expect(removed.task?.updatedAt).toBe(5000);
+
+		const repeat = removeTaskPullRequest(removed.board, "task-1", getPullRequestIdentityKey(stored));
+		expect(repeat.removed).toBe(false);
+		expect(repeat.board).toBe(removed.board);
+	});
+
+	it("is a no-op for unknown tasks and tasks without links", () => {
+		const board = taskWithId(createBoard(), "task-1");
+		const unknownTask = removeTaskPullRequest(board, "nope", "github|github.com|owner/repo|12");
+		expect(unknownTask.removed).toBe(false);
+		expect(unknownTask.task).toBeNull();
+		const noLinks = removeTaskPullRequest(board, "task-1", "github|github.com|owner/repo|12");
+		expect(noLinks.removed).toBe(false);
+		expect(noLinks.task?.id).toBe("task-1");
+	});
+
+	it("updates only the provided snapshot fields and stamps stateCheckedAt", () => {
+		const stored = createPullRequest();
+		const board = boardWithTaskPullRequests(taskWithId(createBoard(), "task-1"), "task-1", [stored]);
+		const identityKey = getPullRequestIdentityKey(stored);
+
+		const updated = updateTaskPullRequestSnapshot(board, "task-1", identityKey, { title: "Fix bug" }, 7000);
+		expect(updated.updated).toBe(true);
+		expect(updated.task?.pullRequests).toEqual([{ ...stored, title: "Fix bug", stateCheckedAt: 7000 }]);
+
+		const restamped = updateTaskPullRequestSnapshot(updated.board, "task-1", identityKey, {
+			state: "merged",
+			stateCheckedAt: 9000,
+		});
+		expect(restamped.updated).toBe(true);
+		expect(restamped.task?.pullRequests).toEqual([
+			{ ...stored, title: "Fix bug", state: "merged", stateCheckedAt: 9000 },
+		]);
+	});
+
+	it("is a no-op for unknown tasks, unknown identities, or empty snapshots", () => {
+		const stored = createPullRequest();
+		const board = boardWithTaskPullRequests(taskWithId(createBoard(), "task-1"), "task-1", [stored]);
+		const identityKey = getPullRequestIdentityKey(stored);
+
+		expect(updateTaskPullRequestSnapshot(board, "nope", identityKey, { title: "x" }).updated).toBe(false);
+		expect(
+			updateTaskPullRequestSnapshot(board, "task-1", "github|github.com|other/repo|1", { title: "x" }).updated,
+		).toBe(false);
+		const empty = updateTaskPullRequestSnapshot(board, "task-1", identityKey, {});
+		expect(empty.updated).toBe(false);
+		expect(empty.board).toBe(board);
 	});
 });

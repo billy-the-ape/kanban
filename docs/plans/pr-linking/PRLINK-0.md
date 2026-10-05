@@ -3,6 +3,20 @@
 Master plan: `PR_LINKING_PLAN.md` (this is milestone **PL-1**).
 Depends on: nothing. This is the first milestone and must land before any runtime writer (PRLINK-1 through PRLINK-3).
 
+## Status: implemented
+
+All of the above landed as specified:
+
+- `src/core/api-contract.ts` — PR schemas + optional `pullRequests` card field (kept optional; no web-ui mock changes needed).
+- `src/core/pull-request-links.ts` (new) — `parsePullRequestUrl`, `extractPullRequestLinks`, `getPullRequestIdentityKey`.
+- `src/core/pull-request-detection.ts` (new) — `detectCreatedPullRequests` gate; `extractCommandStrings` is now exported from `src/cline-sdk/review-tool-policy.ts` and reused.
+- `src/core/task-board-mutations.ts` — `addTaskPullRequests`, `removeTaskPullRequest`, `updateTaskPullRequestSnapshot` (identity-key based, per section 4).
+- `src/state/workspace-state.ts` — server-owned merge in `saveWorkspaceState` (section 5).
+- `src/workspace/git-delivery.ts` — private `parsePullRequestNumberFromUrl` removed; receipt number comes from `parsePullRequestUrl(url)?.number ?? null`.
+- Tests: new `test/runtime/core/pull-request-links.test.ts`, new `test/runtime/core/pull-request-detection.test.ts`; extended `test/runtime/task-board-mutations.test.ts` and `test/integration/workspace-state.integration.test.ts`; `test/workspace/git-delivery.test.ts` stays green.
+
+Verification results: Biome check clean, `npm run typecheck` clean, `npm run test:fast` green, `npm run test:integration` green (except two **pre-existing, unrelated** base-branch failures also present without this change: `test/runtime/server/middleware.test.ts` socket-upgrade test and `test/integration/task-worktree.integration.test.ts` "resumes a trashed task … invalid patch"), `npx vitest run test/workspace` green, web-ui `tsc` + `vitest` green.
+
 ## Purpose
 
 Lay the foundation for task ↔ pull request linking, with **no user-visible behavior**:
@@ -17,7 +31,7 @@ Lay the foundation for task ↔ pull request linking, with **no user-visible beh
 
 - `runtimeBoardCardSchema` is at `src/core/api-contract.ts:133` — it is a `z.object({...}).transform(...)`; the transform destructures legacy fields and spreads `...card`, so a new optional field passes through untouched.
 - `saveWorkspaceState` is at `src/state/workspace-state.ts:686`; `mutateWorkspaceState` at `:739` (already read-modify-write under the workspace lock).
-- `extractCommandStrings` at `src/cline-sdk/review-tool-policy.ts:50` is **module-private**; `COMMAND_TOOL_NAMES = new Set(["run_commands", "bash"])` at `:33`.
+- `extractCommandStrings` at `src/cline-sdk/review-tool-policy.ts:50` is **module-private** (now exported — see Status above); `COMMAND_TOOL_NAMES = new Set(["run_commands", "bash"])` at `:33`.
 - `parsePullRequestNumberFromUrl` (private) at `src/workspace/git-delivery.ts:395`, used once at `:1445`.
 - Board mutation conventions: pure functions in `src/core/task-board-mutations.ts` returning result objects (`{ board, task, <verb>ed: boolean }`), e.g. `moveTaskToColumn` (`:510`), `updateTask` (`:610`).
 

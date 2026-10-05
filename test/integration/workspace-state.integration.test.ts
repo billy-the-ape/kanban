@@ -4,7 +4,8 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import type { RuntimeBoardData, RuntimeTaskSessionSummary } from "../../src/core/api-contract";
+import type { RuntimeBoardData, RuntimeTaskPullRequest, RuntimeTaskSessionSummary } from "../../src/core/api-contract";
+import { addTaskPullRequests } from "../../src/core/task-board-mutations";
 import type { WorkspaceStateConflictError } from "../../src/state/workspace-state";
 import {
 	getWorkspacesRootPath,
@@ -12,6 +13,7 @@ import {
 	loadWorkspaceContext,
 	loadWorkspaceContextById,
 	loadWorkspaceState,
+	mutateWorkspaceState,
 	removeWorkspaceIndexEntry,
 	saveWorkspaceState,
 } from "../../src/state/workspace-state";
@@ -93,6 +95,34 @@ function initGitRepository(path: string): void {
 	if (init.status !== 0) {
 		throw new Error(`Failed to initialize git repository at ${path}`);
 	}
+}
+
+function stripPullRequests(board: RuntimeBoardData): RuntimeBoardData {
+	return {
+		...board,
+		columns: board.columns.map((column) => ({
+			...column,
+			cards: column.cards.map((card) => {
+				const nextCard = { ...card };
+				delete nextCard.pullRequests;
+				return nextCard;
+			}),
+		})),
+	};
+}
+
+function boardWithTaskPullRequests(
+	board: RuntimeBoardData,
+	taskId: string,
+	pullRequests: RuntimeTaskPullRequest[],
+): RuntimeBoardData {
+	return {
+		...board,
+		columns: board.columns.map((column) => ({
+			...column,
+			cards: column.cards.map((card) => (card.id === taskId ? { ...card, pullRequests } : card)),
+		})),
+	};
 }
 
 describe.sequential("workspace-state integration", () => {
@@ -369,6 +399,109 @@ describe.sequential("workspace-state integration", () => {
 
 			await expect(listWorkspaceIndexEntries()).rejects.toThrow("index.json");
 			await expect(listWorkspaceIndexEntries()).rejects.toThrow("repoPath");
+		});
+	});
+	it("keeps server-recorded pull request links across full board saves", async () => {
+		await withTemporaryHome(async () => {
+			const { path: sandboxRoot, cleanup } = createTempDir("kanban-pr-links-");
+			try {
+				const workspacePath = join(sandboxRoot, "project-pr-links");
+				mkdirSync(workspacePath, { recursive: true });
+				initGitRepository(workspacePath);
+
+				const recordedLink: RuntimeTaskPullRequest = {
+					provider: "github",
+					host: "github.com",
+					repository: "owner/repo",
+					number: 12,
+					url: "https://github.com/owner/repo/pull/12",
+					source: "agent_tool",
+					createdAt: Date.now(),
+					title: "Recorded title",
+					state: "open",
+					stateCheckedAt: Date.now(),
+				};
+
+				const initial = await loadWorkspaceState(workspacePath);
+				await saveWorkspaceState(workspacePath, {
+					board: createBoard("PR link task"),
+					sessions: {},
+					expectedRevision: initial.revision,
+				});
+
+				await mutateWorkspaceState(workspacePath, (state) => {
+					const result = addTaskPullRequests(state.board, "task-1", [recordedLink]);
+					if (!result.added) {
+						throw new Error("Expected the seed pull request to be recorded.");
+					}
+					return { board: result.board, value: result };
+				});
+
+				const seeded = await loadWorkspaceState(workspacePath);
+				expect(seeded.board.columns[0]?.cards[0]?.pullRequests).toEqual([recordedLink]);
+
+				// (a) A client board that omits the field must not erase the link.
+				const omitSave = await saveWorkspaceState(workspacePath, {
+					board: stripPullRequests(seeded.board),
+					sessions: {},
+					expectedRevision: seeded.revision,
+				});
+				expect(omitSave.board.columns[0]?.cards[0]?.pullRequests).toEqual([recordedLink]);
+
+				// (b) A stale client list must not overwrite the recorded link.
+				const staleSave = await saveWorkspaceState(workspacePath, {
+					board: boardWithTaskPullRequests(omitSave.board, "task-1", [
+						{ ...recordedLink, number: 99, url: "https://github.com/owner/repo/pull/99" },
+					]),
+					sessions: {},
+					expectedRevision: omitSave.revision,
+				});
+				expect(staleSave.board.columns[0]?.cards[0]?.pullRequests).toEqual([recordedLink]);
+
+				// (c) A brand-new card must never accept client-supplied pullRequests.
+				const now = Date.now();
+				const newCardBoard: RuntimeBoardData = {
+					...staleSave.board,
+					columns: staleSave.board.columns.map((column) =>
+						column.id === "in_progress"
+							? {
+									...column,
+									cards: [
+										{
+											id: "task-2",
+											title: "New task",
+											prompt: "New task",
+											startInPlanMode: false,
+											baseRef: "main",
+											createdAt: now,
+											updatedAt: now,
+											pullRequests: [
+												{ ...recordedLink, number: 7, url: "https://github.com/owner/repo/pull/7" },
+											],
+										},
+										...column.cards,
+									],
+								}
+							: column,
+					),
+				};
+				const newCardSave = await saveWorkspaceState(workspacePath, {
+					board: newCardBoard,
+					sessions: {},
+					expectedRevision: staleSave.revision,
+				});
+				const savedCards = newCardSave.board.columns.flatMap((column) => column.cards);
+				expect(savedCards.find((card) => card.id === "task-1")?.pullRequests).toEqual([recordedLink]);
+				expect(savedCards.find((card) => card.id === "task-2")?.pullRequests).toBeUndefined();
+
+				const loaded = await loadWorkspaceState(workspacePath);
+				expect(
+					loaded.board.columns.flatMap((column) => column.cards).find((card) => card.id === "task-1")
+						?.pullRequests,
+				).toEqual([recordedLink]);
+			} finally {
+				cleanup();
+			}
 		});
 	});
 });
