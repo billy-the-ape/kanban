@@ -383,6 +383,7 @@ export function useBoardInteractions({
 				});
 			};
 			let stagePollTimerId: number | null = null;
+			let isStartSettled = false;
 			try {
 				// UPD-0.6: fresh, unstarted tasks (no existing worktree and no fixed
 				// initial baseline, per the server's durable record) skip the eager
@@ -403,7 +404,9 @@ export function useBoardInteractions({
 					}
 					stagePollTimerId = window.setInterval(() => {
 						void getTaskInitialStartStatus(taskId).then((status) => {
-							if (status?.ok && status.stage !== "idle") {
+							// A poll that resolves after the start settled must not
+							// resurrect the chip (it would never be cleared).
+							if (!isStartSettled && status?.ok && status.stage !== "idle") {
 								setInitialStartStage(status.stage);
 							}
 						});
@@ -481,6 +484,7 @@ export function useBoardInteractions({
 				}
 				return true;
 			} finally {
+				isStartSettled = true;
 				if (stagePollTimerId !== null) {
 					window.clearInterval(stagePollTimerId);
 				}
