@@ -130,6 +130,36 @@ function normalizeRuntimeTaskClineSettings(input: {
 	};
 }
 
+export const runtimeTaskPullRequestProviderSchema = z.enum(["github", "gitlab", "bitbucket"]);
+export type RuntimeTaskPullRequestProvider = z.infer<typeof runtimeTaskPullRequestProviderSchema>;
+
+export const runtimeTaskPullRequestSourceSchema = z.enum(["agent_tool", "delivery", "manual", "branch_lookup"]);
+export type RuntimeTaskPullRequestSource = z.infer<typeof runtimeTaskPullRequestSourceSchema>;
+
+/**
+ * A pull request linked to a task card. Recorded by the runtime (tool-call
+ * detection, deterministic delivery, branch lookup) or added manually; the
+ * card-level `pullRequests` array is server-owned (see workspace-state save).
+ */
+export const runtimeTaskPullRequestSchema = z.object({
+	provider: runtimeTaskPullRequestProviderSchema,
+	/** "github.com", or a GHE / self-hosted GitLab host (lowercase). */
+	host: z.string(),
+	/** "owner/repo" (GitLab may be "group/subgroup/repo"). */
+	repository: z.string(),
+	number: z.number().int().positive(),
+	/** Canonical URL produced by the shared parser, never raw agent text. */
+	url: z.string(),
+	source: runtimeTaskPullRequestSourceSchema,
+	/** First time Kanban recorded this link. */
+	createdAt: z.number(),
+	// Optional snapshot; may be stale. Populated by delivery/branch lookup/refresh only.
+	title: z.string().optional(),
+	state: z.enum(["open", "closed", "merged", "draft"]).optional(),
+	stateCheckedAt: z.number().optional(),
+});
+export type RuntimeTaskPullRequest = z.infer<typeof runtimeTaskPullRequestSchema>;
+
 export const runtimeBoardCardSchema = z
 	.object({
 		id: z.string(),
@@ -151,6 +181,12 @@ export const runtimeBoardCardSchema = z
 		 * true; an explicit false is honored as-is.
 		 */
 		updateBaseRefBeforeStart: z.boolean().optional(),
+		/**
+		 * Pull requests linked to this task. Server-owned: the runtime records
+		 * links through board mutations and `saveWorkspaceState` restores the
+		 * persisted list over any client-supplied value (see workspace-state).
+		 */
+		pullRequests: z.array(runtimeTaskPullRequestSchema).optional(),
 		createdAt: z.number(),
 		updatedAt: z.number(),
 	})
