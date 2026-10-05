@@ -1975,17 +1975,28 @@ describe("InMemoryClineTaskSessionService", () => {
 		}
 
 		async function startSessionWithService(
-			options: { broadcastWorkspaceStateUpdated?: (workspacePath: string) => void } = {},
+			options: {
+				broadcastWorkspaceStateUpdated?: (workspacePath: string) => void;
+				workspacePath?: string | null;
+			} = {},
 		): Promise<{ service: ClineTaskSessionService; runtime: FakeClineSessionRuntimeController; sessionId: string }> {
 			const runtime = createFakeClineSessionRuntime();
 			const runtimeSetup = createFakeRuntimeSetup();
 			const service = createInMemoryClineTaskSessionService({
 				createSessionRuntime: (runtimeOptions) => runtime.createRuntime(runtimeOptions),
 				createRuntimeSetup: vi.fn(async (_workspacePath: string) => runtimeSetup.setup),
+				// The workspace repo root to record against — deliberately
+				// distinct from the session cwd below, which is shaped like
+				// a linked task worktree. An explicit null disables PR capture.
+				workspacePath: options.workspacePath === undefined ? "/tmp/workspace-root" : options.workspacePath,
 				broadcastWorkspaceStateUpdated: options.broadcastWorkspaceStateUpdated,
 			});
 			services.push(service);
-			await service.startTaskSession({ taskId: "task-1", cwd: "/tmp/worktree", prompt: "Create a PR" });
+			await service.startTaskSession({
+				taskId: "task-1",
+				cwd: "/tmp/worktrees/task-1/project",
+				prompt: "Create a PR",
+			});
 			await waitForTaskSessionId(runtime, "task-1");
 			const sessionId = runtime.getTaskSessionId("task-1");
 			expect(sessionId).toBeTruthy();
@@ -1999,7 +2010,9 @@ describe("InMemoryClineTaskSessionService", () => {
 
 			expect(taskPullRequestMocks.recordTaskPullRequests).toHaveBeenCalledTimes(1);
 			expect(taskPullRequestMocks.recordTaskPullRequests).toHaveBeenCalledWith({
-				workspacePath: "/tmp/worktree",
+				// The repo root from the service options, not the session's
+				// worktree-shaped cwd.
+				workspacePath: "/tmp/workspace-root",
 				taskId: "task-1",
 				links: [
 					{
@@ -2038,7 +2051,7 @@ describe("InMemoryClineTaskSessionService", () => {
 			);
 
 			await vi.waitFor(() => {
-				expect(broadcastedPaths).toEqual(["/tmp/worktree"]);
+				expect(broadcastedPaths).toEqual(["/tmp/workspace-root"]);
 			});
 
 			const noopBroadcastedPaths: string[] = [];
@@ -2055,49 +2068,12 @@ describe("InMemoryClineTaskSessionService", () => {
 			expect(noopBroadcastedPaths).toEqual([]);
 		});
 
-		it("does not attempt recording when the session summary has no workspace path", async () => {
-			const runtime = createFakeClineSessionRuntime();
-			const runtimeSetup = createFakeRuntimeSetup();
-			const service = createInMemoryClineTaskSessionService({
-				createSessionRuntime: (runtimeOptions) => runtime.createRuntime(runtimeOptions),
-				createRuntimeSetup: vi.fn(async (_workspacePath: string) => runtimeSetup.setup),
-			});
-			services.push(service);
-			runtime.readPersistedTaskSessionMock.mockResolvedValue({
-				record: {
-					sessionId: "task-1-persisted",
-					source: "core" as ClinePersistedTaskSessionSnapshot["record"]["source"],
-					status: "completed",
-					startedAt: "2026-03-17T10:00:00.000Z",
-					updatedAt: "2026-03-17T10:05:00.000Z",
-					interactive: true,
-					provider: "anthropic",
-					model: "claude-sonnet-4-6",
-					cwd: "",
-					workspaceRoot: "",
-					enableTools: true,
-					enableSpawn: false,
-					enableTeams: false,
-					isSubagent: false,
-				},
-				messages: [{ role: "user", content: "Recovered prompt" }],
-			});
+		it("does not attempt recording when the service has no workspace path", async () => {
+			// Omitting the workspacePath option disables PR capture even though
+			// the session itself has a (worktree) cwd.
+			const { runtime, sessionId } = await startSessionWithService({ workspacePath: null });
 
-			const reboundSummary = await service.rebindPersistedTaskSession("task-1");
-			expect(reboundSummary?.workspacePath).toBeNull();
-			// The rebind path rebuilds the in-memory entry without binding a
-			// live SDK session; bind the persisted session id directly.
-			runtime.bindTaskSession("task-1", "task-1-persisted");
-			const sessionId = runtime.getTaskSessionId("task-1");
-			expect(sessionId).toBeTruthy();
-
-			emitFinishedToolCall(
-				runtime,
-				sessionId ?? "session-1",
-				"run_commands",
-				{ commands: ["gh pr create"] },
-				PR_URL,
-			);
+			emitFinishedToolCall(runtime, sessionId, "run_commands", { commands: ["gh pr create"] }, PR_URL);
 
 			expect(taskPullRequestMocks.recordTaskPullRequests).not.toHaveBeenCalled();
 		});

@@ -1,14 +1,14 @@
 // PRLINK-1: single server-side write path for task card pull-request links.
 // Isolated from the real ~/.cline by redirecting HOME (AGENTS.md).
 import { spawnSync } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { RuntimeBoardData } from "../../src/core/api-contract";
 import { type ParsedPullRequestLink, parsePullRequestUrl } from "../../src/core/pull-request-links";
-import { loadWorkspaceState, saveWorkspaceState } from "../../src/state/workspace-state";
+import { listWorkspaceIndexEntries, loadWorkspaceState, saveWorkspaceState } from "../../src/state/workspace-state";
 import { recordTaskPullRequests } from "../../src/workspace/task-pull-requests";
 import { createGitTestEnv } from "../utilities/git-env";
 import { createTempDir } from "../utilities/temp-dir";
@@ -274,4 +274,67 @@ describe("recordTaskPullRequests", () => {
 			cleanup();
 		}
 	});
+});
+it("records against the repo root without phantom entries for a linked worktree path", async () => {
+	const { path: sandboxRoot, cleanup } = createTempDir("kanban-task-pr-ws-");
+	try {
+		// A repo with an initial commit and a real linked worktree, mirroring
+		// how task session cwds live under ~/.cline/worktrees/<taskId>/.
+		const repoPath = join(sandboxRoot, "project-g");
+		mkdirSync(repoPath, { recursive: true });
+		const gitEnv = createGitTestEnv();
+		const run = (args: string[]) => {
+			const result = spawnSync("git", args, { cwd: repoPath, stdio: "pipe", env: gitEnv });
+			if (result.status !== 0) {
+				throw new Error(`git ${args.join(" ")} failed: ${result.stderr.toString().trim()}`);
+			}
+		};
+		run(["init"]);
+		writeFileSync(join(repoPath, "README.md"), "hello\n");
+		run(["add", "README.md"]);
+		run(["commit", "-m", "initial"]);
+		const worktreePath = join(sandboxRoot, "wt", "task-1");
+		run(["worktree", "add", "--detach", worktreePath, "HEAD"]);
+		// Sanity: the worktree resolves to its own root, not the repo root.
+		const worktreeTop = spawnSync("git", ["rev-parse", "--show-toplevel"], {
+			cwd: worktreePath,
+			stdio: "pipe",
+			env: gitEnv,
+		});
+		expect(worktreeTop.stdout.toString().trim().replace(/\\/g, "/")).toBe(worktreePath);
+
+		const initial = await loadWorkspaceState(repoPath);
+		await saveWorkspaceState(repoPath, {
+			board: createBoard("task-1"),
+			sessions: {},
+			expectedRevision: initial.revision,
+		});
+		const link = parseLink("https://github.com/owner/repo/pull/12");
+
+		// The task session's cwd is the linked worktree: resolving it must
+		// not auto-create a phantom workspace entry.
+		const fromWorktree = await recordTaskPullRequests({
+			workspacePath: worktreePath,
+			taskId: "task-1",
+			links: [link],
+			source: "agent_tool",
+		});
+		expect(fromWorktree).toEqual({ recorded: false, changed: false });
+		expect(await listWorkspaceIndexEntries()).toEqual([{ workspaceId: expect.any(String), repoPath }]);
+
+		// Recording against the repo root reaches the card on the main
+		// workspace and keeps the index untouched.
+		const fromRepo = await recordTaskPullRequests({
+			workspacePath: repoPath,
+			taskId: "task-1",
+			links: [link],
+			source: "agent_tool",
+		});
+		expect(fromRepo).toEqual({ recorded: true, changed: true });
+		expect(await listWorkspaceIndexEntries()).toEqual([{ workspaceId: expect.any(String), repoPath }]);
+		const recorded = await loadWorkspaceState(repoPath);
+		expect(findCardPullRequests(recorded.board, "task-1")).toHaveLength(1);
+	} finally {
+		cleanup();
+	}
 });

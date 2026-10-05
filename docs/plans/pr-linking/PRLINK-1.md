@@ -1,8 +1,13 @@
 # PRLINK-1 — Cline capture (record path + `onToolFinished`)
 
-> **Status: DONE.** Implemented as sketched; final-state notes are under
-> "Final-state notes" at the bottom. Typecheck, `test:fast`, `test/workspace`,
-> and `test/integration` verified (the only failures are two pre-existing,
+> **Status: DONE (review blocker addressed).** The original review found that
+> recording against `summary.workspacePath` (the task worktree cwd) silently
+> no-ops and auto-created phantom workspace entries. Recording now uses a
+> per-service `workspacePath` option (the workspace repo root, wired from
+> `scope.workspacePath` in `runtime-server.ts`), and `recordTaskPullRequests`
+> refuses to auto-create a workspace for an unknown path. Final-state notes
+> are at the bottom. Typecheck, `test:fast`, `test/workspace`, and
+> `test/integration` verified (the only failures are two pre-existing,
 > unrelated ones that also fail on the base branch).
 
 Master plan: `PR_LINKING_PLAN.md` (this is milestone **PL-2**).
@@ -144,14 +149,18 @@ broadcastWorkspaceStateUpdated: (workspacePath) =>
   - Repeated call with the same link → `changed: false`, **revision unchanged**, no extra board write.
   - Unknown taskId / unknown workspace path → `{ recorded: false, changed: false }`, no throw.
   - Multiple links in one call keep first-appearance order.
+  - Linked-worktree regression: a real `git worktree add` checkout passed as
+    `workspacePath` is a quiet no-op that never adds a phantom workspace
+    index entry; recording against the repo root reaches the card on the
+    main workspace.
 - **Extend `test/runtime/cline-sdk/cline-event-adapter.test.ts`**:
   - `tool-finished` for `run_commands` invokes `onToolFinished` with toolName, original input (via `entry.toolInputByToolCallId`), and the `readToolResult` output/error.
   - Other agent events (chunk, tool_call, status) do not invoke it; absence of the callback never throws.
 - **Extend `test/runtime/cline-sdk/cline-task-session-service.test.ts`** (unit-style with fakes — **do not boot the real Cline SDK host**; see AGENTS.md Node-22 CI trap):
-  - `run_commands` with `gh pr create` + output URL → `recordTaskPullRequests` invoked with source `agent_tool` and the parsed link (mock/spy the module).
+  - `run_commands` with `gh pr create` + output URL → `recordTaskPullRequests` invoked with source `agent_tool`, the parsed link, and the **workspace repo root from the service options** while the session `cwd` is a worktree-shaped path distinct from it (mock/spy the module).
   - `run_commands` with `gh pr view 205` + PR URL in output → **not** invoked.
-  - Recording result `changed: true` → `broadcastWorkspaceStateUpdated` called with the session's workspacePath; `changed: false` → not called.
-  - Missing `workspacePath` on the summary → no recording attempt.
+  - Recording result `changed: true` → `broadcastWorkspaceStateUpdated` called with the repo path; `changed: false` → not called.
+  - Service constructed without `workspacePath` → no recording attempt.
 
 ## Verification
 
@@ -195,12 +204,17 @@ Deviations from the sketch above, discovered during implementation:
   `saveWorkspaceState` bump (`loadWorkspaceState` auto-creates state at
   revision 0): recorded → `initial.revision + 2`, repeated no-op → still
   `+ 2`, pure no-op paths → `+ 1`.
-- **Service "missing workspacePath" test:** built via
-  `rebindPersistedTaskSession` with a persisted record whose `cwd`/
-  `workspaceRoot` are empty strings (both are *required* fields on
-  `SessionHistoryRecord`); rebind trims them to `null`. The fake runtime is
-  then bound with `runtime.bindTaskSession` because the rebind path never
-  binds a live session.
+- **Review fix — record against the workspace repo root:** the first
+  version recorded/broadcast against `summary.workspacePath`, which for real
+  tasks is the linked task worktree (`runtime-api.ts` sets `taskCwd` to
+  `prepared.path`). `loadWorkspaceContext` defaults to
+  `autoCreateIfMissing: true`, so that path silently resolved to a different
+  workspace id and auto-created phantom index entries. The service now takes
+  a `workspacePath` option (wired from `scope.workspacePath` in
+  `runtime-server.ts`) and recording is disabled when it is omitted;
+  `recordTaskPullRequests` also pre-checks with
+  `loadWorkspaceContext(path, { autoCreateIfMissing: false })` so a bad path
+  can never add a phantom project.
 - **Pre-existing, unrelated failures** (verified to fail on the base branch
   too, with these changes stashed):
   - `test/runtime/server/middleware.test.ts` → "passes through upgrades whose

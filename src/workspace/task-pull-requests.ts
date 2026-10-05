@@ -10,7 +10,7 @@
 import type { RuntimeTaskPullRequest, RuntimeTaskPullRequestSource } from "../core/api-contract";
 import type { ParsedPullRequestLink } from "../core/pull-request-links";
 import { addTaskPullRequests } from "../core/task-board-mutations";
-import { mutateWorkspaceState } from "../state/workspace-state";
+import { loadWorkspaceContext, mutateWorkspaceState } from "../state/workspace-state";
 
 export interface RecordTaskPullRequestsInput {
 	workspacePath: string;
@@ -53,6 +53,10 @@ export async function recordTaskPullRequests(
 		return NO_OP_RESULT;
 	}
 	try {
+		// A linked worktree (the usual task cwd) is not a workspace root:
+		// refuse to auto-create a phantom workspace entry for a path that is
+		// not already added to Kanban.
+		await loadWorkspaceContext(input.workspacePath, { autoCreateIfMissing: false });
 		const response = await mutateWorkspaceState<boolean>(input.workspacePath, (state) => {
 			const result = addTaskPullRequests(
 				state.board,

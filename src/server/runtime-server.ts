@@ -159,6 +159,9 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		let service = clineTaskSessionServiceByWorkspaceId.get(scope.workspaceId);
 		if (!service) {
 			service = createInMemoryClineTaskSessionService({
+				// PRLINK-1: record Cline-created PRs against the workspace's
+				// repo root (task session cwds are linked worktrees).
+				workspacePath: scope.workspacePath,
 				watcherRegistry: clineWatcherRegistry,
 				// B-2.8: restarts re-resolve the launch config (context limit,
 				// compaction policy, credentials) from the current provider

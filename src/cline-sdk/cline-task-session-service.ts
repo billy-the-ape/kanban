@@ -170,6 +170,13 @@ export interface CreateInMemoryClineTaskSessionServiceOptions {
 	 */
 	contextRecoveryMaxAttempts?: number;
 	/**
+	 * PRLINK-1: the repo root of this service instance's workspace — NOT a
+	 * task session's cwd, which is usually a linked worktree. Cline-created
+	 * PRs are recorded against this path and state updates are broadcast
+	 * for it. When omitted, PR capture is disabled for this service.
+	 */
+	workspacePath?: string | null;
+	/**
 	 * PRLINK-1: broadcast board state to open UIs after server-side card
 	 * writes (e.g. PR recording from Cline tool calls).
 	 */
@@ -1384,7 +1391,11 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 				if (links.length === 0) {
 					return;
 				}
-				const workspacePath = entry.summary.workspacePath;
+				// Record against the workspace repo root that owns this
+				// service instance: a task session's cwd is usually a linked
+				// worktree and is not where the workspace state (and the
+				// card) live.
+				const workspacePath = this.options.workspacePath;
 				if (!workspacePath) {
 					return;
 				}
