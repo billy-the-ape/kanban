@@ -430,6 +430,31 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		this.emitSummary(errorSummary);
 	}
 
+	/** SDK local hosts may resolve a failed run instead of rejecting send(). */
+	private emitReturnedTaskFailure(
+		taskId: string,
+		entry: ClineTaskSessionEntry,
+		context: "start" | "send",
+		result: unknown,
+	): boolean {
+		if (!result || typeof result !== "object") return false;
+		const failed =
+			("finishReason" in result && result.finishReason === "error") ||
+			("status" in result && result.status === "failed");
+		if (!failed) return false;
+		// Keep the precise error already reported by the event path, including credit-limit handling.
+		if (entry.summary.reviewReason === "error") return true;
+		const error = "error" in result ? result.error : undefined;
+		const message =
+			error instanceof Error
+				? error.message
+				: typeof error === "string"
+					? error
+					: (readAgentResultText(result) ?? "Cline SDK turn failed without an error event.");
+		this.emitTaskFailure(taskId, entry, context, new Error(message));
+		return true;
+	}
+
 	private async dispatchResolvedTaskInput(input: {
 		taskId: string;
 		prompt: string;
@@ -824,6 +849,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					compactionSafetyMarginTokens: request.compactionSafetyMarginTokens,
 				};
 				const startResult = await this.sessionRuntime.startTaskSession(runtimeStartRequest);
+				if (this.emitReturnedTaskFailure(request.taskId, entry, "start", startResult.result)) return;
 				const warningMessage = formatStartWarnings(startResult.warnings);
 				if (warningMessage) {
 					this.emitSummary(
@@ -1062,6 +1088,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 						if ((this.turnGenerationByTaskId.get(taskId) ?? 0) !== turnGeneration) {
 							return;
 						}
+						if (this.emitReturnedTaskFailure(taskId, entry, "send", result)) return;
 						const warningMessage = formatStartWarnings(warnings);
 						if (warningMessage) {
 							this.emitSummary(

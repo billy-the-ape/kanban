@@ -2,7 +2,6 @@
 // This is the runtime-facing layer for starting, looking up, resuming, and
 // stopping native Cline sessions without exposing SDK details upstream.
 import { stat } from "node:fs/promises";
-
 import type { RuntimeClineReasoningEffort, RuntimeTaskImage, RuntimeTaskSessionMode } from "../core/api-contract";
 import { createClineCompactionBeforeModelHook } from "./cline-compaction-before-model-hook";
 import { type ClineCompactionObservedInfo, createClineCompactionCompactCallback } from "./cline-compaction-callback";
@@ -29,6 +28,7 @@ import {
 	readPersistedTaskLaunchConfig,
 	TASK_LAUNCH_CONFIG_METADATA_KEY,
 } from "./cline-task-launch-config";
+import { createClineToolFailureRecoveryHooks } from "./cline-tool-failure-recovery";
 import { createClineToolResultBoundingHook } from "./cline-tool-result-bounding-hook";
 import { type ClineTurnScheduler, sharedClineTurnScheduler } from "./cline-turn-scheduler";
 import { CLINE_MODEL_CATALOG_DEFAULTS, SDK_DEFAULT_MODEL_ID, SDK_DEFAULT_PROVIDER_ID } from "./sdk-provider-boundary";
@@ -411,35 +411,45 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		// repair hook always runs first, so compaction sees a well-formed
 		// history (see cline-interrupted-tool-call-repair.ts).
 		const repairInterruptedToolCallsHook = createClineInterruptedToolCallRepairHook({ logger: sessionLogger });
-		let agentHooks: ClineSdkAgentHooks = { beforeModel: repairInterruptedToolCallsHook };
-		if (
+		const recoveryHooks = createClineToolFailureRecoveryHooks();
+		const compactionHook =
 			request.compaction &&
 			typeof request.compaction.contextWindowTokens === "number" &&
 			request.compaction.contextWindowTokens > 0
-		) {
-			const compactionHook = createClineCompactionBeforeModelHook({
-				limitTokens: request.compaction.contextWindowTokens,
-				outputReserveTokens: request.compaction.reserveTokens ?? CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT,
-				safetyMarginTokens: request.compactionSafetyMarginTokens,
-				logger: sessionLogger,
-				// B-10.4: observe proactive (local-mode) compactions.
-				onCompacted: (info) => this.onCompactionObserved?.(request.taskId, info),
-			});
-			agentHooks = {
-				beforeModel: async (context) => {
-					const repaired = await repairInterruptedToolCallsHook(context);
-					const repairedContext = repaired?.messages
-						? { ...context, request: { ...context.request, messages: repaired.messages } }
-						: context;
-					return (await compactionHook(repairedContext)) ?? repaired;
-				},
-				afterTool: createClineToolResultBoundingHook({
-					taskId: request.taskId,
-					limitTokens: request.compaction.contextWindowTokens,
-					logger: sessionLogger,
-				}),
-			};
-		}
+				? createClineCompactionBeforeModelHook({
+						limitTokens: request.compaction.contextWindowTokens,
+						outputReserveTokens: request.compaction.reserveTokens ?? CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT,
+						safetyMarginTokens: request.compactionSafetyMarginTokens,
+						logger: sessionLogger,
+						onCompacted: (info) => this.onCompactionObserved?.(request.taskId, info),
+					})
+				: undefined;
+		const boundingHook =
+			request.compaction &&
+			typeof request.compaction.contextWindowTokens === "number" &&
+			request.compaction.contextWindowTokens > 0
+				? createClineToolResultBoundingHook({
+						taskId: request.taskId,
+						limitTokens: request.compaction.contextWindowTokens,
+						logger: sessionLogger,
+					})
+				: undefined;
+		const agentHooks: ClineSdkAgentHooks = {
+			...recoveryHooks,
+			beforeModel: async (context) => {
+				const repaired = await repairInterruptedToolCallsHook(context);
+				const recovered = await recoveryHooks.beforeModel?.({
+					...context,
+					request: { ...context.request, messages: repaired?.messages ?? context.request.messages },
+				});
+				const messages = recovered?.messages ?? repaired?.messages ?? context.request.messages;
+				return (await compactionHook?.({ ...context, request: { ...context.request, messages } })) ?? { messages };
+			},
+			afterTool: async (context) => {
+				const recovered = await recoveryHooks.afterTool?.(context);
+				return (await boundingHook?.({ ...context, result: recovered?.result ?? context.result })) ?? recovered;
+			},
+		};
 		try {
 			signal.throwIfAborted();
 			// Hub-backed SDK hosts create the interactive session in start; the first turn runs through send.

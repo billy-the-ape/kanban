@@ -637,7 +637,12 @@ export function BoardCard({
 									)}
 								</div>
 								{columnId !== "trash" ? (
-									<TaskPhaseBadge summary={phaseSummary} columnId={columnId} className="shrink-0" />
+									<TaskPhaseBadge
+										summary={phaseSummary}
+										sessionSummary={sessionSummary}
+										columnId={columnId}
+										className="shrink-0"
+									/>
 								) : null}
 								{isPreparingInitialStart && initialStartStage ? (
 									<span

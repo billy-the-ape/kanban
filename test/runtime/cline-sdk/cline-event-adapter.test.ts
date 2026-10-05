@@ -802,3 +802,31 @@ describe("applyClineSessionEvent", () => {
 		expect(result.entry.activeAssistantMessageId).toBeNull();
 	});
 });
+
+describe("tool recovery terminal event ordering", () => {
+	it("keeps the error and clears thinking when SDK ended follows the failure", () => {
+		const entry = createEntry("task-1");
+		entry.summary.state = "running";
+		applyEvent({
+			entry,
+			event: {
+				type: "agent_event",
+				payload: {
+					sessionId: "session-1",
+					event: { type: "error", error: new Error("Tool recovery exhausted"), recoverable: false },
+				},
+			},
+		});
+		applyEvent({
+			entry,
+			event: { type: "agent_event", payload: { sessionId: "session-1", event: { type: "done", reason: "error" } } },
+		});
+		applyEvent({
+			entry,
+			event: { type: "ended", payload: { sessionId: "session-1", reason: "error", ts: Date.now() } },
+		});
+		expect(entry.summary.state).toBe("awaiting_review");
+		expect(entry.summary.reviewReason).toBe("error");
+		expect(entry.summary.warningMessage).toBe("Tool recovery exhausted");
+	});
+});

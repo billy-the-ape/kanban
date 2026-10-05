@@ -770,10 +770,20 @@ export function applyClineSessionEvent(input: ApplyClineSessionEventInput): void
 			emitTurnCanceled(input);
 			return;
 		}
+		const failed =
+			endedEvent.payload.reason === "error" ||
+			endedEvent.payload.reason === "failed" ||
+			entry.summary.reviewReason === "error";
 		clearActiveTurnState(entry);
 		emitSummary(input, {
 			state: interrupted ? "interrupted" : "awaiting_review",
-			reviewReason: interrupted ? "interrupted" : "exit",
+			reviewReason: interrupted ? "interrupted" : failed ? "error" : "exit",
+			...(failed && !interrupted
+				? {
+						warningMessage:
+							entry.summary.warningMessage ?? "Agent ended with an error. Check task details before retrying.",
+					}
+				: {}),
 			lastOutputAt: now(),
 		});
 		return;
