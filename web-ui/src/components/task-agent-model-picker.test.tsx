@@ -1,8 +1,8 @@
-import { act, useEffect } from "react";
+import { act, useEffect, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { UseTaskAgentModelPickerResult } from "@/components/task-agent-model-picker";
+import { TaskAgentModelPicker, type UseTaskAgentModelPickerResult } from "@/components/task-agent-model-picker";
 import type {
 	RuntimeAgentId,
 	RuntimeClineProviderCatalogItem,
@@ -761,5 +761,71 @@ describe("TaskAgentModelPicker – inherited default reasoning effort", () => {
 
 		expect(container.textContent).toContain("GPT-5.3 Codex");
 		expect(container.textContent).not.toContain("GPT-5.3 Codex (High)");
+	});
+});
+
+describe("TaskAgentModelPicker – selecting a model without reasoning effort", () => {
+	it.each([
+		{ label: "inherited settings", initialSettings: undefined },
+		{ label: "explicit provider and model", initialSettings: { providerId: "lmstudio", modelId: "qwen3.8-27b" } },
+		{
+			label: "a model with reasoning effort",
+			initialSettings: { providerId: "lmstudio", modelId: "reasoning-model", reasoningEffort: "high" as const },
+		},
+	])("retains the selected model with $label", async ({ initialSettings }) => {
+		const onChange = vi.fn();
+		function Harness() {
+			const [settings, setSettings] = useState<RuntimeTaskClineSettings | undefined>(initialSettings);
+			return (
+				<TaskAgentModelPicker
+					agentId="cline"
+					onAgentIdChange={() => {}}
+					clineSettings={settings}
+					onClineSettingsChange={(next) => {
+						onChange(next);
+						setSettings(next);
+					}}
+					agentOptions={[{ value: "", label: "Cline" }]}
+					clineProviderOptions={[{ value: "", label: "LM Studio" }]}
+					clineModelOptions={[
+						{ value: "", label: "qwen3.8-27b" },
+						{ value: "qwen3.8-27b", label: "qwen3.8-27b" },
+						{ value: "qwen3.8-27b-gsq-iq3s", label: "qwen3.8-27b-gsq-iq3s" },
+						{ value: "reasoning-model", label: "Reasoning model" },
+					]}
+					effectiveDefaultModelId="qwen3.8-27b"
+					providerModels={[
+						{ id: "qwen3.8-27b", name: "qwen3.8-27b" },
+						{ id: "qwen3.8-27b-gsq-iq3s", name: "qwen3.8-27b-gsq-iq3s" },
+						{ id: "reasoning-model", name: "Reasoning model", supportsReasoningEffort: true },
+					]}
+					isLoadingProviders={false}
+					isLoadingModels={false}
+					defaultAgentId="cline"
+					defaultProviderId="lmstudio"
+				/>
+			);
+		}
+		await act(async () => root.render(<Harness />));
+		const expand = Array.from(container.querySelectorAll("button")).find((button) =>
+			button.textContent?.includes("Override Agent Settings"),
+		);
+		if (!expand) throw new Error("Missing settings trigger");
+		await act(async () => expand.click());
+		const trigger = document.getElementById("cline-chat-model-picker");
+		if (!trigger) throw new Error("Missing model trigger");
+		await act(async () => trigger.click());
+		const option = Array.from(document.querySelectorAll("button")).find(
+			(button) => button.textContent?.trim() === "qwen3.8-27b-gsq-iq3s",
+		);
+		if (!option) throw new Error("Missing IQ3_S option");
+		onChange.mockClear();
+		await act(async () => option.click());
+		expect(onChange).toHaveBeenCalledTimes(1);
+		expect(onChange).toHaveBeenLastCalledWith({
+			...(initialSettings?.providerId ? { providerId: initialSettings.providerId } : {}),
+			modelId: "qwen3.8-27b-gsq-iq3s",
+		});
+		expect(document.getElementById("cline-chat-model-picker")?.textContent).toContain("qwen3.8-27b-gsq-iq3s");
 	});
 });
