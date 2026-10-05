@@ -9,6 +9,15 @@ import {
 } from "@/state/drag-rules";
 
 describe("drag rules", () => {
+	it("allows backlog drops only for an eligible queued initial turn", () => {
+		expect(isAllowedCrossColumnCardMove("in_progress", "backlog")).toBe(false);
+		expect(isAllowedCrossColumnCardMove("in_progress", "backlog", { canReturnTaskToBacklog: false })).toBe(false);
+		expect(isAllowedCrossColumnCardMove("in_progress", "backlog", { canReturnTaskToBacklog: true })).toBe(true);
+		expect(isCardDropDisabled("backlog", "in_progress", { canReturnActiveDragTaskToBacklog: true })).toBe(false);
+		expect(isCardDropDisabled("backlog", "in_progress", { canReturnActiveDragTaskToBacklog: false })).toBe(true);
+		expect(isCardDropDisabled("backlog", "review", { canReturnActiveDragTaskToBacklog: true })).toBe(true);
+	});
+
 	it("keeps manual in-progress to review drops disabled", () => {
 		expect(isCardDropDisabled("review", "in_progress")).toBe(true);
 	});

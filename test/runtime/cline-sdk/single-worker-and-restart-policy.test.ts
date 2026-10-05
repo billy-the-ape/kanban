@@ -250,6 +250,94 @@ function deferredTurn() {
 }
 
 describe("model turn scheduling", () => {
+	it("rejects returning a queued follow-up with prior execution", async () => {
+		const gate = deferredTurn();
+		const harness = createTaskSessionServiceHarness({
+			onTurn: async ({ turnCount }) => {
+				if (turnCount > 1) await gate.promise;
+				return "done";
+			},
+		});
+		services.push(harness);
+		try {
+			await harness.service.startTaskSession({ taskId: "prior", cwd: "/tmp/worktree", prompt: "initial" });
+			await vi.waitFor(() => expect(harness.host.sentPrompts).toHaveLength(1));
+			await endLastSession(harness.service, harness.host, "prior");
+			await harness.service.startTaskSession({ taskId: "active", cwd: "/tmp/worktree", prompt: "active" });
+			await vi.waitFor(() => expect(harness.host.sentPrompts).toHaveLength(2));
+			await harness.service.sendTaskSessionInput("prior", "continue");
+			await vi.waitFor(() =>
+				expect(harness.service.getSummary("prior")?.latestHookActivity?.hookEventName).toBe("concurrency_waiting"),
+			);
+			expect(harness.service.getSummary("prior")?.latestHookActivity?.canReturnToBacklog).toBe(false);
+			const reset = vi.fn();
+			await expect(harness.service.resetUnstartedQueuedTask("prior", reset)).rejects.toThrow("no prior execution");
+			expect(reset).not.toHaveBeenCalled();
+		} finally {
+			gate.resolve();
+		}
+	});
+
+	it("withdraws an unstarted queue entry without a failure summary and permits a fresh start", async () => {
+		const gate = deferredTurn();
+		const harness = createTaskSessionServiceHarness({
+			onTurn: async () => {
+				await gate.promise;
+				return "done";
+			},
+		});
+		services.push(harness);
+		try {
+			await harness.service.startTaskSession({ taskId: "active", cwd: "/tmp/worktree", prompt: "active" });
+			await vi.waitFor(() => expect(harness.host.sentPrompts).toHaveLength(1));
+			await harness.service.startTaskSession({ taskId: "queued", cwd: "/tmp/worktree", prompt: "queued" });
+			await vi.waitFor(() =>
+				expect(harness.service.getSummary("queued")?.latestHookActivity?.canReturnToBacklog).toBe(true),
+			);
+			await harness.service.resetUnstartedQueuedTask("queued", async (withdraw) => {
+				expect(await withdraw()).toBe(true);
+			});
+			expect(harness.service.getSummary("queued")).toBeNull();
+			expect(harness.service.listMessages("queued")).toEqual([]);
+			gate.resolve();
+			await new Promise<void>((resolve) => setTimeout(resolve, 20));
+			expect(harness.host.sentPrompts).toHaveLength(1);
+			await harness.service.startTaskSession({ taskId: "queued", cwd: "/tmp/new-worktree", prompt: "new start" });
+			await vi.waitFor(() => expect(harness.host.sentPrompts).toHaveLength(2));
+		} finally {
+			gate.resolve();
+		}
+	});
+
+	it("keeps a queued turn intact when prior work blocks the filesystem reset", async () => {
+		const gate = deferredTurn();
+		const harness = createTaskSessionServiceHarness({
+			onTurn: async () => {
+				await gate.promise;
+				return "done";
+			},
+		});
+		services.push(harness);
+		try {
+			await harness.service.startTaskSession({ taskId: "active", cwd: "/tmp/worktree", prompt: "active" });
+			await vi.waitFor(() => expect(harness.host.sentPrompts).toHaveLength(1));
+			await harness.service.startTaskSession({ taskId: "queued", cwd: "/tmp/worktree", prompt: "queued" });
+			await vi.waitFor(() =>
+				expect(harness.service.getSummary("queued")?.latestHookActivity?.canReturnToBacklog).toBe(true),
+			);
+			await expect(
+				harness.service.resetUnstartedQueuedTask("queued", async () => {
+					throw new Error("prior work");
+				}),
+			).rejects.toThrow("prior work");
+			expect(harness.service.getSummary("queued")?.state).toBe("running");
+			gate.resolve();
+			await vi.waitFor(() => expect(harness.host.sentPrompts).toHaveLength(2));
+		} finally {
+			gate.resolve();
+		}
+	});
+
 	it("runs two turns and queues a third without an error, then releases on turn completion", async () => {
 		const gate = deferredTurn();
 		const scheduler = new ClineTurnScheduler(async () => 2);

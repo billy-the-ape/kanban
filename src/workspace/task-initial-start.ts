@@ -10,7 +10,7 @@
  * last outcome, but it does NOT fix a baseline — a retry is allowed and may
  * fetch again.
  */
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 
@@ -208,4 +208,10 @@ export async function getTaskInitialStartStatus(options: {
 		initialStartBaselineFixed: baselineFixed,
 		failure: null,
 	};
+}
+
+/** A never-executed queued start was explicitly withdrawn. */
+export async function clearTaskInitialStartRecord(taskId: string): Promise<void> {
+	await rm(getTaskInitialStartRecordPath(taskId), { force: true });
+	clearInitialStartLiveStage(taskId);
 }

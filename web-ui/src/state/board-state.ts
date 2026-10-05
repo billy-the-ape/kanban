@@ -406,6 +406,7 @@ export function applyDragResult(
 	options?: {
 		programmaticCardMoveInFlight?: ProgrammaticCardMoveInFlight | null;
 		isTaskSessionRunning?: boolean;
+		canReturnTaskToBacklog?: boolean;
 	},
 ): { board: BoardData; moveEvent?: TaskMoveEvent } {
 	const { source, destination, type } = result;
@@ -445,6 +446,7 @@ export function applyDragResult(
 		taskId: result.draggableId,
 		programmaticCardMoveInFlight: options?.programmaticCardMoveInFlight,
 		isTaskSessionRunning: options?.isTaskSessionRunning,
+		canReturnTaskToBacklog: options?.canReturnTaskToBacklog,
 	});
 	if (!isAllowedCrossColumnMove) {
 		return { board };

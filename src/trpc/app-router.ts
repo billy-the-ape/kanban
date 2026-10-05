@@ -317,6 +317,10 @@ export interface RuntimeTrpcContext {
 		getDispatchStatus: (scope: RuntimeTrpcWorkspaceScope) => Promise<RuntimeTaskDispatchStatusResponse>;
 		/** B-9.6: restart reconciliation — relaunch dispatched tasks that lost their session. */
 		reconcileTaskDispatch: (scope: RuntimeTrpcWorkspaceScope) => Promise<RuntimeTaskDispatchReconcileResponse>;
+		returnQueuedTaskToBacklog: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskSessionStopRequest,
+		) => Promise<RuntimeTaskSessionStopResponse>;
 		stopTaskSession: (
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskSessionStopRequest,
@@ -640,6 +644,10 @@ export const runtimeAppRouter = t.router({
 			.mutation(async ({ ctx }) => {
 				return await ctx.runtimeApi.reconcileTaskDispatch(ctx.workspaceScope);
 			}),
+		returnQueuedTaskToBacklog: workspaceProcedure
+			.input(runtimeTaskSessionStopRequestSchema)
+			.output(runtimeTaskSessionStopResponseSchema)
+			.mutation(async ({ ctx, input }) => ctx.runtimeApi.returnQueuedTaskToBacklog(ctx.workspaceScope, input)),
 		stopTaskSession: workspaceProcedure
 			.input(runtimeTaskSessionStopRequestSchema)
 			.output(runtimeTaskSessionStopResponseSchema)

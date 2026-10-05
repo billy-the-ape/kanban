@@ -163,6 +163,7 @@ function createFakeClineSessionRuntime(): FakeClineSessionRuntimeController {
 	const createRuntime = (options: CreateInMemoryClineSessionRuntimeOptions): ClineSessionRuntime => {
 		onTaskEvent = options.onTaskEvent ?? null;
 		return {
+			cancelQueuedUnstartedTask: () => false,
 			async startTaskSession(request: StartClineSessionRuntimeRequest): Promise<StartClineSessionRuntimeResult> {
 				const requestedSessionId = createSessionId(request.taskId);
 				const { prompt: _prompt, images: _images, initialMessages: _initialMessages, ...restartRequest } = request;
@@ -1274,16 +1275,14 @@ describe("InMemoryClineTaskSessionService", () => {
 			prompt: "Initial prompt",
 		});
 
+		await waitForTaskSessionId(runtime, "task-1");
 		const canceled = await service.cancelTaskTurn("task-1");
 		expect(canceled?.state).toBe("idle");
 		expect(canceled?.reviewReason).toBeNull();
 		expect(canceled?.latestHookActivity?.activityText).toBe("Turn canceled");
 
-		const sessionId = await waitForTaskSessionId(runtime, "task-1");
-		runtime.emitAgentEvent(sessionId, {
-			type: "done",
-			reason: "aborted",
-		});
+		expect(runtime.abortTaskSessionMock).toHaveBeenCalledWith("task-1");
+		expect(runtime.getTaskSessionId("task-1")).toBeNull();
 
 		expect(service.getSummary("task-1")?.state).toBe("idle");
 		expect(service.getSummary("task-1")?.reviewReason).toBeNull();
