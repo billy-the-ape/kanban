@@ -703,7 +703,9 @@ async function startTask(input: { cwd: string; taskId: string; projectPath?: str
 			taskId: task.id,
 			baseRef: task.baseRef,
 		});
-		if (!ensured.ok) {
+		// UPD-0: a never-started task's worktree is created by startTaskSession
+		// after the base refresh, so that refusal is expected here.
+		if (!ensured.ok && ensured.category !== "initial_start_preparation_required") {
 			throw new Error(ensured.error ?? "Could not ensure task worktree.");
 		}
 

@@ -141,6 +141,12 @@ export function useTaskSessions({ currentProjectId, setSessions }: UseTaskSessio
 					baseRef: task.baseRef,
 				});
 				if (!payload.ok) {
+					// UPD-0: a never-started task's worktree is created by
+					// runtime.startTaskSession (after the base refresh), so the
+					// refusal is not a failure for a caller that is about to start.
+					if (payload.category === "initial_start_preparation_required") {
+						return { ok: true };
+					}
 					return {
 						ok: false,
 						message: payload.error ?? "Worktree setup failed.",
