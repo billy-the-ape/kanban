@@ -173,6 +173,7 @@ function createFakeClineSessionRuntime(): FakeClineSessionRuntimeController {
 	const createRuntime = (options: CreateInMemoryClineSessionRuntimeOptions): ClineSessionRuntime => {
 		onTaskEvent = options.onTaskEvent ?? null;
 		return {
+			cancelQueuedUnstartedTask: () => false,
 			async startTaskSession(request: StartClineSessionRuntimeRequest): Promise<StartClineSessionRuntimeResult> {
 				const requestedSessionId = createSessionId(request.taskId);
 				const { prompt: _prompt, images: _images, initialMessages: _initialMessages, ...restartRequest } = request;
@@ -1286,16 +1287,14 @@ describe("InMemoryClineTaskSessionService", () => {
 			prompt: "Initial prompt",
 		});
 
+		await waitForTaskSessionId(runtime, "task-1");
 		const canceled = await service.cancelTaskTurn("task-1");
 		expect(canceled?.state).toBe("idle");
 		expect(canceled?.reviewReason).toBeNull();
 		expect(canceled?.latestHookActivity?.activityText).toBe("Turn canceled");
 
-		const sessionId = await waitForTaskSessionId(runtime, "task-1");
-		runtime.emitAgentEvent(sessionId, {
-			type: "done",
-			reason: "aborted",
-		});
+		expect(runtime.abortTaskSessionMock).toHaveBeenCalledWith("task-1");
+		expect(runtime.getTaskSessionId("task-1")).toBeNull();
 
 		expect(service.getSummary("task-1")?.state).toBe("idle");
 		expect(service.getSummary("task-1")?.reviewReason).toBeNull();
@@ -1548,6 +1547,32 @@ describe("InMemoryClineTaskSessionService", () => {
 			expect(runtime.sendTaskSessionInputMock).toHaveBeenCalledTimes(1);
 		});
 		sendDeferred.resolve({ text: "done" });
+	});
+
+	it("stops thinking when startup resolves a failed turn without an error event", async () => {
+		const { service, runtime } = createTrackedService();
+		runtime.startTaskSessionMock.mockImplementationOnce(async (request) => ({
+			sessionId: request.sessionId,
+			result: { finishReason: "error", text: "Tool recovery exhausted" },
+		}));
+		await service.startTaskSession({ taskId: "task-1", cwd: "/tmp/worktree", prompt: "Start" });
+		await vi.waitFor(() => expect(service.getSummary("task-1")?.reviewReason).toBe("error"));
+		expect(service.getSummary("task-1")?.state).toBe("awaiting_review");
+		expect(service.getSummary("task-1")?.warningMessage).toBe("Tool recovery exhausted");
+	});
+
+	it("stops thinking when a follow-up resolves a failed turn without an error event", async () => {
+		const { service, runtime } = createTrackedService();
+		await service.startTaskSession({ taskId: "task-1", cwd: "/tmp/worktree", prompt: "Start" });
+		await vi.waitFor(() => expect(runtime.startTaskSessionMock).toHaveBeenCalledTimes(1));
+		runtime.sendTaskSessionInputMock.mockResolvedValueOnce({
+			finishReason: "error",
+			text: "Tool recovery exhausted",
+		});
+		await service.sendTaskSessionInput("task-1", "Try again");
+		await vi.waitFor(() => expect(service.getSummary("task-1")?.reviewReason).toBe("error"));
+		expect(service.getSummary("task-1")?.state).toBe("awaiting_review");
+		expect(service.getSummary("task-1")?.warningMessage).toBe("Tool recovery exhausted");
 	});
 
 	it("keeps the task resumable when native Cline startup throws", async () => {

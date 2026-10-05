@@ -201,6 +201,39 @@ describe("BoardCard", () => {
 		expect(nextCancelButton).toBeUndefined();
 	});
 
+	it("shows and clears a queue position in place of the implementation badge", async () => {
+		const phaseSummary = { phase: "implementing" as const, needsAttention: false, blockedReason: null };
+		for (const position of [2, 1, null]) {
+			await act(async () => {
+				root.render(
+					<TooltipProvider>
+						<BoardCard
+							card={createCard()}
+							index={0}
+							columnId="in_progress"
+							phaseSummary={phaseSummary}
+							sessionSummary={createSummary("running", {
+								latestHookActivity: {
+									activityText: "Waiting for model capacity",
+									toolName: null,
+									toolInputSummary: null,
+									finalMessage: null,
+									hookEventName: position ? "concurrency_waiting" : "turn_start",
+									notificationType: null,
+									source: "cline-sdk",
+									queuePosition: position,
+								},
+							})}
+						/>
+					</TooltipProvider>,
+				);
+			});
+			expect(container.textContent).toContain(position ? `q #${position}` : "impl");
+			if (position) expect(container.textContent).not.toContain("impl");
+			else expect(container.textContent).not.toContain("q #");
+		}
+	});
+
 	it("shows loading states on the review complete and discard buttons", async () => {
 		await act(async () => {
 			root.render(

@@ -2,7 +2,18 @@ import { Draggable } from "@hello-pangea/dnd";
 import { getRuntimeAgentCatalogEntry } from "@runtime-agent-catalog";
 import { formatClineToolCallLabel } from "@runtime-cline-tool-call-display";
 import { buildTaskWorktreeDisplayPath } from "@runtime-task-worktree-path";
-import { AlertCircle, AlertTriangle, Bot, Check, GitBranch, Pencil, Play, RotateCcw, Trash2 } from "lucide-react";
+import {
+	AlertCircle,
+	AlertTriangle,
+	Bot,
+	Check,
+	GitBranch,
+	Pause,
+	Pencil,
+	Play,
+	RotateCcw,
+	Trash2,
+} from "lucide-react";
 import type { KeyboardEvent, MouseEvent } from "react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
@@ -434,6 +445,9 @@ export function BoardCard({
 			return <AlertTriangle size={12} className="text-status-orange" />;
 		}
 		if (columnId === "in_progress") {
+			if (sessionSummary?.latestHookActivity?.hookEventName === "concurrency_waiting") {
+				return <Pause size={12} className="text-status-orange" />;
+			}
 			if (sessionSummary?.state === "failed") {
 				return <AlertCircle size={12} className="text-status-red" />;
 			}
@@ -637,7 +651,18 @@ export function BoardCard({
 									)}
 								</div>
 								{columnId !== "trash" ? (
-									<TaskPhaseBadge summary={phaseSummary} columnId={columnId} className="shrink-0" />
+									<TaskPhaseBadge
+										summary={phaseSummary}
+										sessionSummary={sessionSummary}
+										queuePosition={
+											sessionSummary?.state === "running" &&
+											sessionSummary.latestHookActivity?.hookEventName === "concurrency_waiting"
+												? sessionSummary.latestHookActivity.queuePosition
+												: null
+										}
+										columnId={columnId}
+										className="shrink-0"
+									/>
 								) : null}
 								{isPreparingInitialStart && initialStartStage ? (
 									<span

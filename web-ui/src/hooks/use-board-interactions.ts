@@ -9,6 +9,7 @@ import { useProgrammaticCardMoves } from "@/hooks/use-programmatic-card-moves";
 import { useReviewAutoActions } from "@/hooks/use-review-auto-actions";
 import type { UseTaskSessionsResult } from "@/hooks/use-task-sessions";
 import { fetchTaskDependentsUnlock, requestTaskWorkspaceMaintenance } from "@/runtime/task-delivery";
+import { returnQueuedTaskToBacklog } from "@/runtime/task-queue";
 import type {
 	RuntimeTaskDependentsUnlock,
 	RuntimeTaskInitialStartStage,
@@ -25,7 +26,7 @@ import {
 	moveTaskToColumn,
 	updateTask,
 } from "@/state/board-state";
-import { isTaskSessionRunning } from "@/state/drag-rules";
+import { canReturnQueuedTaskToBacklog, isTaskSessionRunning } from "@/state/drag-rules";
 import { clearTaskWorkspaceInfo, setTaskWorkspaceInfo } from "@/stores/workspace-metadata-store";
 import type { SendTerminalInputOptions } from "@/terminal/terminal-input";
 import type { BoardCard, BoardColumnId, BoardData } from "@/types";
@@ -581,6 +582,20 @@ export function useBoardInteractions({
 					continue;
 				}
 				const columnId = getTaskColumnId(nextBoard, summary.taskId);
+				// A session can be restored or launched while the board snapshot still
+				// has its card in Backlog. Keep the board in sync with the live session
+				// so the task remains visible and can be opened or controlled.
+				if (
+					summary.state === "running" &&
+					(summary.agentId === "cline" || summary.pid !== null) &&
+					columnId === "backlog"
+				) {
+					const moved = moveTaskToColumn(nextBoard, summary.taskId, "in_progress", { insertAtTop: true });
+					if (moved.moved) {
+						nextBoard = moved.board;
+					}
+					continue;
+				}
 				if (summary.state === "awaiting_review" && columnId === "in_progress") {
 					const programmaticMoveAttempt = tryProgrammaticCardMove(summary.taskId, columnId, "review");
 					if (programmaticMoveAttempt === "started" || programmaticMoveAttempt === "blocked") {
@@ -745,12 +760,30 @@ export function useBoardInteractions({
 			const applied = applyDragResult(board, result, {
 				programmaticCardMoveInFlight,
 				isTaskSessionRunning: isTaskSessionRunning(sessions[result.draggableId]),
+				canReturnTaskToBacklog: canReturnQueuedTaskToBacklog(sessions[result.draggableId]),
 			});
 
 			const moveEvent = applied.moveEvent;
 			if (!moveEvent) {
 				resolvePendingProgrammaticStartMove(result.draggableId, false);
 				setBoard(applied.board);
+				return;
+			}
+
+			if (moveEvent.toColumnId === "backlog" && moveEvent.fromColumnId === "in_progress") {
+				if (!currentProjectId) return;
+				void returnQueuedTaskToBacklog(currentProjectId, moveEvent.taskId)
+					.then((response) => {
+						if (!response.ok) throw new Error(response.error ?? "Could not return task to Backlog.");
+						setSessions((current) => {
+							const next = { ...current };
+							delete next[moveEvent.taskId];
+							return next;
+						});
+						clearTaskWorkspaceInfo(moveEvent.taskId);
+						setBoard((current) => moveTaskToColumn(current, moveEvent.taskId, "backlog").board);
+					})
+					.catch((error: unknown) => notifyError(error instanceof Error ? error.message : String(error)));
 				return;
 			}
 
@@ -820,6 +853,8 @@ export function useBoardInteractions({
 		},
 		[
 			board,
+			currentProjectId,
+			setSessions,
 			consumeProgrammaticCardMove,
 			kickoffTaskInProgress,
 			maybeRequestNotificationPermissionForTaskStart,

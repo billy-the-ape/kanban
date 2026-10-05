@@ -72,13 +72,14 @@ import {
 	parseTaskSessionStopRequest,
 } from "../core/api-validation";
 import { isHomeAgentSessionId } from "../core/home-agent-session";
+import { getTaskColumnId, moveTaskToColumn } from "../core/task-board-mutations";
 import { computeTaskPhase, isDeliveryResumable, type TaskPhaseInput } from "../core/task-diagnostics";
 import { buildTaskDiagnosticsExportBundle } from "../core/task-diagnostics-export";
 import { resolveTaskTitle } from "../core/task-title.js";
 import { lockedFileSystem } from "../fs/locked-file-system";
 import { openInBrowser } from "../server/browser";
 import { getRuntimeHomePath, loadWorkspaceBoardById, mutateWorkspaceState } from "../state/workspace-state";
-import { readTaskDispatchRecord } from "../task-dispatch/dispatch-records";
+import { readTaskDispatchRecord, writeTaskDispatchRecord } from "../task-dispatch/dispatch-records";
 import {
 	collectTaskDispatchSessions,
 	getTaskDispatchStatus,
@@ -93,6 +94,7 @@ import { createVerificationRunner } from "../verification/verification-service";
 import { evaluateDependentsUnlock, getGitDeliveryService, readTaskDeliveryReceipt } from "../workspace/git-delivery";
 import { getTaskInitialStartStatus as readTaskInitialStartStatus } from "../workspace/task-initial-start";
 import { readTaskPreservationRecord } from "../workspace/task-preservation";
+import { resetUnstartedQueuedWorktree } from "../workspace/task-queued-reset";
 import { findTaskBaseRef, readReviewOutcome } from "../workspace/task-review-handoff";
 import {
 	getTaskPreservationInfo,
@@ -192,6 +194,8 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		return buildRuntimeConfigResponse(runtimeConfig, clineProviderSettings, { effectiveContextWindow });
 	};
 
+	const returningTaskIds = new Set<string>();
+	const taskLaunchVersions = new Map<string, number>();
 	// Shared by the tRPC handler (manual starts) and the B-9 dispatch queue, so
 	// queued tasks launch through exactly the code path the UI uses.
 	const startTaskSession: RuntimeTrpcContext["runtimeApi"]["startTaskSession"] = async (workspaceScope, input) => {
@@ -200,6 +204,13 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		let initialStart: RuntimeTaskInitialStartOutcome | null = null;
 		try {
 			const body = parseTaskSessionStartRequest(input);
+			const launchVersion = taskLaunchVersions.get(body.taskId) ?? 0;
+			const assertLaunchCurrent = () => {
+				if (returningTaskIds.has(body.taskId) || launchVersion !== (taskLaunchVersions.get(body.taskId) ?? 0)) {
+					throw new Error("Task was returned to Backlog during launch.");
+				}
+			};
+			if (returningTaskIds.has(body.taskId)) throw new Error("Task is returning to Backlog.");
 			if (body.resumeFromTrash) {
 				deps.broadcastTaskChatCleared?.(workspaceScope.workspaceId, body.taskId);
 			}
@@ -312,6 +323,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				});
 				const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
 				const resolvedClineTitle = resolveTaskTitle(body.taskTitle?.trim(), body.prompt);
+				assertLaunchCurrent();
 				const summary = await clineTaskSessionService.startTaskSession({
 					taskId: body.taskId,
 					cwd: taskCwd,
@@ -367,6 +379,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					initialStart,
 				};
 			}
+			assertLaunchCurrent();
 			const summary = await terminalManager.startTaskSession({
 				taskId: body.taskId,
 				agentId: resolved.agentId,
@@ -897,10 +910,21 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			return response;
 		},
 		startTaskSession: async (workspaceScope, input) => {
+			const launchVersion = taskLaunchVersions.get(input.taskId) ?? 0;
+			if (returningTaskIds.has(input.taskId))
+				return { ok: false, summary: null, initialStart: null, error: "Task is returning to Backlog." };
 			// B-9: a manual start takes the task over from the queue, clearing any
 			// failed/blocked/exhausted dispatch state it had accumulated.
 			if (!isHomeAgentSessionId(input.taskId)) {
 				await releaseTaskFromDispatchQueue(input.taskId).catch(() => null);
+			}
+			if (launchVersion !== (taskLaunchVersions.get(input.taskId) ?? 0)) {
+				return {
+					ok: false,
+					summary: null,
+					initialStart: null,
+					error: "Task was returned to Backlog during launch.",
+				};
 			}
 			return await startTaskSession(workspaceScope, input);
 		},
@@ -1236,6 +1260,59 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				return { ok: false, bundlePath: null, redactions: [], error: message };
+			}
+		},
+		returnQueuedTaskToBacklog: async (workspaceScope, input) => {
+			const body = parseTaskSessionStopRequest(input);
+			if (returningTaskIds.has(body.taskId))
+				return { ok: false, summary: null, error: "Task is already returning to Backlog." };
+			returningTaskIds.add(body.taskId);
+			taskLaunchVersions.set(body.taskId, (taskLaunchVersions.get(body.taskId) ?? 0) + 1);
+			try {
+				const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
+				if (getTaskColumnId(board, body.taskId) !== "in_progress") throw new Error("Task must be in In Progress.");
+				const terminal = await deps.getScopedTerminalManager(workspaceScope);
+				if (terminal.getSummary(body.taskId)) throw new Error("Task has a prior terminal session.");
+				const service = await deps.getScopedClineTaskSessionService(workspaceScope);
+				await service.resetUnstartedQueuedTask(body.taskId, (withdraw) =>
+					resetUnstartedQueuedWorktree({
+						repoPath: workspaceScope.workspacePath,
+						taskId: body.taskId,
+						withdraw,
+					}),
+				);
+				// An explicit deferral must survive dispatch passes and runtime restarts.
+				const card = board.columns.flatMap((column) => column.cards).find((card) => card.id === body.taskId);
+				await writeTaskDispatchRecord({
+					taskId: body.taskId,
+					workspaceId: workspaceScope.workspaceId,
+					baseRef: card?.baseRef ?? "",
+					baseSha: null,
+					attempt: 0,
+					status: "blocked",
+					manuallyDeferred: true,
+					error: "Returned to Backlog by the user; start manually when ready.",
+					prerequisites: [],
+					prompt: null,
+					agentId: "cline",
+					dispatchedAt: Date.now(),
+					updatedAt: Date.now(),
+				});
+				await mutateWorkspaceState<void>(workspaceScope.workspacePath, (state) => {
+					if (getTaskColumnId(state.board, body.taskId) !== "in_progress")
+						throw new Error("Task column changed during reset.");
+					const moved = moveTaskToColumn(state.board, body.taskId, "backlog");
+					const sessions = { ...state.sessions };
+					delete sessions[body.taskId];
+					return { board: moved.board, sessions, value: undefined };
+				});
+				deps.broadcastTaskChatCleared?.(workspaceScope.workspaceId, body.taskId);
+				void deps.broadcastRuntimeWorkspaceStateUpdated?.(workspaceScope.workspaceId, workspaceScope.workspacePath);
+				return { ok: true, summary: null };
+			} catch (error) {
+				return { ok: false, summary: null, error: error instanceof Error ? error.message : String(error) };
+			} finally {
+				returningTaskIds.delete(body.taskId);
 			}
 		},
 		stopTaskSession: async (workspaceScope, input) => {

@@ -76,7 +76,8 @@ interface TurnWaiter {
 	limit: number;
 	resolve: (release: () => void) => void;
 	reject: (error: unknown) => void;
-	onState?: (queued: boolean) => void;
+	onState?: (queued: boolean, queuePosition?: number) => void;
+	queuePosition?: number;
 }
 
 interface TurnPool {
@@ -101,7 +102,7 @@ export class ClineTurnScheduler {
 		taskId: string,
 		target: ClineTurnTarget,
 		operation: (signal: AbortSignal) => Promise<T>,
-		onState?: (queued: boolean) => void,
+		onState?: (queued: boolean, queuePosition?: number) => void,
 		requiresCapacity = true,
 	): Promise<T> {
 		const entry: TurnEntry = { owner, taskId, controller: new AbortController() };
@@ -119,7 +120,6 @@ export class ClineTurnScheduler {
 				pool.waiters.push(waiter);
 				entry.controller.signal.addEventListener("abort", () => this.drain(key, pool), { once: true });
 				this.drain(key, pool);
-				if (pool.waiters.includes(waiter)) onState?.(true);
 			});
 			entry.controller.signal.throwIfAborted();
 			return await operation(entry.controller.signal);
@@ -127,6 +127,17 @@ export class ClineTurnScheduler {
 			this.entries.delete(entry);
 			release?.();
 		}
+	}
+
+	/** Claim only a waiting turn; an admission that already won is never canceled. */
+	cancelQueued(owner: symbol, taskId: string): boolean {
+		for (const pool of this.pools.values()) {
+			const waiter = pool.waiters.find((item) => item.entry.owner === owner && item.entry.taskId === taskId);
+			if (!waiter || waiter.entry.controller.signal.aborted) continue;
+			waiter.entry.controller.abort(new Error("Cline turn canceled."));
+			return true;
+		}
+		return false;
 	}
 
 	cancel(owner: symbol, taskId?: string): void {
@@ -154,6 +165,12 @@ export class ClineTurnScheduler {
 				this.drain(key, pool);
 			});
 		}
+		pool.waiters.forEach((waiter, index) => {
+			const position = index + 1;
+			if (waiter.queuePosition === position) return;
+			waiter.queuePosition = position;
+			waiter.onState?.(true, position);
+		});
 		if (pool.active === 0 && pool.waiters.length === 0) this.pools.delete(key);
 	}
 }

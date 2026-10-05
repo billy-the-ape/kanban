@@ -72,6 +72,18 @@ function runtimeSnapshot(iteration = 1) {
 }
 
 describe("applyClineSessionEvent", () => {
+	it("publishes queue positions and clears them on admission", () => {
+		const entry = createEntry("task-1");
+		for (const queuePosition of [2, 1]) {
+			applyEvent({ entry, event: { type: "kanban_concurrency", queued: true, queuePosition } });
+			expect(entry.summary.state).toBe("running");
+			expect(entry.summary.latestHookActivity?.queuePosition).toBe(queuePosition);
+		}
+		applyEvent({ entry, event: { type: "kanban_concurrency", queued: false } });
+		expect(entry.summary.latestHookActivity?.queuePosition).toBeNull();
+		expect(entry.summary.latestHookActivity?.hookEventName).toBe("turn_start");
+	});
+
 	it("streams assistant text deltas into the active assistant message", () => {
 		const entry = createEntry("task-1");
 
@@ -998,5 +1010,33 @@ describe("applyClineSessionEvent", () => {
 		});
 
 		expect(finishedTools).toHaveLength(0);
+	});
+});
+
+describe("tool recovery terminal event ordering", () => {
+	it("keeps the error and clears thinking when SDK ended follows the failure", () => {
+		const entry = createEntry("task-1");
+		entry.summary.state = "running";
+		applyEvent({
+			entry,
+			event: {
+				type: "agent_event",
+				payload: {
+					sessionId: "session-1",
+					event: { type: "error", error: new Error("Tool recovery exhausted"), recoverable: false },
+				},
+			},
+		});
+		applyEvent({
+			entry,
+			event: { type: "agent_event", payload: { sessionId: "session-1", event: { type: "done", reason: "error" } } },
+		});
+		applyEvent({
+			entry,
+			event: { type: "ended", payload: { sessionId: "session-1", reason: "error", ts: Date.now() } },
+		});
+		expect(entry.summary.state).toBe("awaiting_review");
+		expect(entry.summary.reviewReason).toBe("error");
+		expect(entry.summary.warningMessage).toBe("Tool recovery exhausted");
 	});
 });

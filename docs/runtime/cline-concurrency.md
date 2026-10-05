@@ -73,3 +73,16 @@ curl -fsS 'http://127.0.0.1:8080/props?model=qwen3.8-27b' \
    start fresh turns to return to discovery.
 5. Test a provider without `/props`: tasks serialize and queue without errors.
    A failing turn must release capacity for the next queued task.
+
+Waiting board cards show `q #1`, `q #2`, and so on in place of the phase badge. Positions are FIFO within each endpoint/model pool and update when a waiting turn is canceled or admitted. The normal phase badge returns when the turn starts.
+
+
+## Returning an unstarted queued task to Backlog
+
+Drag an eligible queued card from In Progress to Backlog. Only an initial turn that has never reached the SDK/model is eligible; queued follow-ups, restarts with session history, and tasks with prior work cannot be returned. The runtime checks eligibility again at drop time. If the turn has started since the browser rendered its queue badge, the return is rejected.
+
+For a successful return, Kanban cancels the waiting admission, drains its pending start, removes the clean detached worktree, and clears its prepared baseline and preparation-only recovery metadata. The queued initial chat entry and session summary are cleared. The card keeps its model, prompt, images, base ref and **Update base ref before starting** preference. Its next manual start runs preparation again; with updating enabled, it fetches the current base and creates a new worktree from that baseline.
+
+A dirty worktree, untracked files, actual ignored files/directories, task commits/branches, saved patches, preserved archives, or delivery/session history block the return before cancellation or cleanup. Mirrored ignored dependency/config symlinks are permitted; their source files are not removed. Cleanup uses Git's normal worktree removal, with no forced deletion. If cleanup fails after cancellation, the card stays In Progress in an interrupted state with the error available.
+
+A durable manual deferral prevents automatic backlog dispatch or restart reconciliation from immediately launching the returned card again. Start it manually (including Start all) to clear the deferral. No new settings or environment variables are required; deploy Kanban and refresh the browser.

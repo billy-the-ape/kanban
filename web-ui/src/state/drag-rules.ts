@@ -33,6 +33,7 @@ export interface CardMoveRuleOptions {
 	 * may be moved there by hand. Unknown (undefined) is treated as running.
 	 */
 	isTaskSessionRunning?: boolean;
+	canReturnTaskToBacklog?: boolean;
 }
 
 export function isAllowedCrossColumnCardMove(
@@ -40,6 +41,7 @@ export function isAllowedCrossColumnCardMove(
 	toColumnId: BoardColumnId,
 	options?: CardMoveRuleOptions,
 ): boolean {
+	if (fromColumnId === "in_progress" && toColumnId === "backlog") return options?.canReturnTaskToBacklog === true;
 	if (fromColumnId === "backlog" && toColumnId === "in_progress") {
 		return true;
 	}
@@ -73,6 +75,14 @@ export function isAllowedCrossColumnCardMove(
 	return false;
 }
 
+export function canReturnQueuedTaskToBacklog(summary: RuntimeTaskSessionSummary | null | undefined): boolean {
+	return (
+		summary?.state === "running" &&
+		summary.latestHookActivity?.hookEventName === "concurrency_waiting" &&
+		summary.latestHookActivity.canReturnToBacklog === true
+	);
+}
+
 export function isTaskSessionRunning(summary: RuntimeTaskSessionSummary | null | undefined): boolean {
 	return summary?.state === "running";
 }
@@ -93,6 +103,7 @@ export function isCardDropDisabled(
 		activeDragTaskId?: string | null;
 		programmaticCardMoveInFlight?: ProgrammaticCardMoveInFlight | null;
 		isActiveDragTaskSessionRunning?: boolean;
+		canReturnActiveDragTaskToBacklog?: boolean;
 	},
 ): boolean {
 	if (!activeDragSourceColumnId) {
@@ -102,12 +113,16 @@ export function isCardDropDisabled(
 		taskId: options?.activeDragTaskId,
 		programmaticCardMoveInFlight: options?.programmaticCardMoveInFlight,
 		isTaskSessionRunning: options?.isActiveDragTaskSessionRunning,
+		canReturnTaskToBacklog: options?.canReturnActiveDragTaskToBacklog,
 	};
 	if (columnId === "review") {
 		return !isAllowedCrossColumnCardMove(activeDragSourceColumnId, columnId, moveRuleOptions);
 	}
 	if (columnId === "backlog") {
-		return activeDragSourceColumnId !== "backlog";
+		return (
+			activeDragSourceColumnId !== "backlog" &&
+			!isAllowedCrossColumnCardMove(activeDragSourceColumnId, columnId, moveRuleOptions)
+		);
 	}
 	if (columnId === "in_progress") {
 		if (activeDragSourceColumnId === "backlog" || activeDragSourceColumnId === "in_progress") {

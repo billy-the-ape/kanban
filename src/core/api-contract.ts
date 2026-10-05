@@ -304,6 +304,8 @@ export const runtimeTaskSessionReviewReasonSchema = z
 export type RuntimeTaskSessionReviewReason = z.infer<typeof runtimeTaskSessionReviewReasonSchema>;
 
 export const runtimeTaskHookActivitySchema = z.object({
+	canReturnToBacklog: z.boolean().optional(),
+	queuePosition: z.number().int().positive().nullable().optional(),
 	activityText: z.string().nullable().default(null),
 	toolName: z.string().nullable().default(null),
 	toolInputSummary: z.string().nullable().default(null),
@@ -1452,6 +1454,7 @@ export type RuntimeTaskDispatchPrerequisite = z.infer<typeof runtimeTaskDispatch
  * before the board mutation, so restart reconciliation can always recover.
  */
 export const runtimeTaskDispatchRecordSchema = z.object({
+	manuallyDeferred: z.boolean().optional(),
 	taskId: z.string(),
 	workspaceId: z.string().min(1),
 	/** The card's base ref at dispatch time. */
