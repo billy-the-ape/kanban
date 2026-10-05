@@ -111,7 +111,7 @@ const markdownComponents: Components = {
 	hr: ({ className, ...props }) => <hr className={cn("border-border", className)} {...props} />,
 	code: ({ className, children, ...props }) => {
 		const code = toCodeString(children);
-		const isInline = !className || !className.includes("language-");
+		const isInline = !className?.includes("language-");
 		if (isInline) {
 			return (
 				<code

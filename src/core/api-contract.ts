@@ -2156,6 +2156,8 @@ export const runtimeHookIngestRequestSchema = z.object({
 	workspaceId: z.string(),
 	event: runtimeHookEventSchema,
 	metadata: runtimeTaskHookActivitySchema.partial().optional(),
+	/** Canonical PR URLs detected by the hook CLI (re-parsed server-side; max 10). */
+	pullRequestUrls: z.array(z.string().min(1).max(2048)).max(10).optional(),
 });
 export type RuntimeHookIngestRequest = z.infer<typeof runtimeHookIngestRequestSchema>;
 

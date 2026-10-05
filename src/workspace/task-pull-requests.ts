@@ -9,6 +9,7 @@
 // instead of failing the surrounding operation.
 import type { RuntimeTaskPullRequest, RuntimeTaskPullRequestSource } from "../core/api-contract";
 import type { ParsedPullRequestLink } from "../core/pull-request-links";
+import { parsePullRequestUrl } from "../core/pull-request-links";
 import { addTaskPullRequests } from "../core/task-board-mutations";
 import { loadWorkspaceContext, mutateWorkspaceState } from "../state/workspace-state";
 
@@ -80,5 +81,42 @@ export async function recordTaskPullRequests(
 			`[task-pull-requests] failed to record pull requests for task ${input.taskId}: ${String(error)}\n`,
 		);
 		return NO_OP_RESULT;
+	}
+}
+
+export interface RecordHookPullRequestsInput {
+	/** Raw URLs as sent by the hook CLI (untrusted; re-parsed server-side). */
+	rawUrls: string[];
+	workspaceId: string;
+	workspacePath: string;
+	taskId: string;
+	broadcast: (workspaceId: string, workspacePath: string) => Promise<void> | void;
+}
+
+// PRLINK-2: hook-detected PR URLs. The hook CLI is not trusted to send
+// canonical data, so every URL is re-parsed with the strict parser before
+// recording. Best-effort by contract: recording never fails the hook ingest.
+export async function recordHookPullRequests(input: RecordHookPullRequestsInput): Promise<void> {
+	try {
+		const links = input.rawUrls
+			.map((url) => parsePullRequestUrl(url))
+			.filter((link): link is ParsedPullRequestLink => link !== null);
+		if (links.length === 0) {
+			return;
+		}
+		const result = await recordTaskPullRequests({
+			workspacePath: input.workspacePath,
+			taskId: input.taskId,
+			links,
+			source: "agent_tool",
+		});
+		if (result.changed) {
+			void input.broadcast(input.workspaceId, input.workspacePath);
+		}
+	} catch (error) {
+		// Best-effort: a failure here must never fail the surrounding ingest.
+		process.stderr.write(
+			`[task-pull-requests] failed to record hook pull requests for task ${input.taskId}: ${String(error)}\n`,
+		);
 	}
 }

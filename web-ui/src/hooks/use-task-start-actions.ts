@@ -86,7 +86,7 @@ export function useTaskStartActions({
 	const handleStartTaskFromBoard = useCallback(
 		(taskId: string) => {
 			const selection = findCardSelection(board, taskId);
-			if (!selection || selection.column.id !== "backlog") {
+			if (selection?.column.id !== "backlog") {
 				handleStartTask(taskId);
 				return;
 			}

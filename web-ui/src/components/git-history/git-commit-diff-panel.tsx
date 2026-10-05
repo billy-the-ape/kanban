@@ -67,7 +67,7 @@ function toWorkspaceFileChangeFormat(source: GitCommitDiffSource): RuntimeWorksp
 }
 
 function getCommitFile(source: GitCommitDiffSource | null, path: string): RuntimeGitCommitDiffFile | null {
-	if (!source || source.type !== "commit") {
+	if (source?.type !== "commit") {
 		return null;
 	}
 	return source.files.find((file) => file.path === path) ?? null;

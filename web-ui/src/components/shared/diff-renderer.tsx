@@ -400,7 +400,7 @@ export function buildDisplayItems(rows: UnifiedDiffRow[], expandedBlocks: Expand
 
 	const shouldHideContextAt = (index: number): boolean => {
 		const row = rows[index];
-		if (!row || row.variant !== "context") {
+		if (row?.variant !== "context") {
 			return false;
 		}
 		if (changedIndices.length === 0) {

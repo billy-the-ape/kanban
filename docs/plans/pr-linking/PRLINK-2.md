@@ -3,6 +3,10 @@
 Master plan: `PR_LINKING_PLAN.md` (this is milestone **PL-3**).
 Depends on: **PRLINK-1** (`recordTaskPullRequests` write path; detection/parser from PRLINK-0).
 
+Status: **implemented** — detection runs in the hook CLI, `pullRequestUrls` is on
+`runtimeHookIngestRequestSchema`, and `hooks-api.ts` re-parses and records them
+independently of column transitions.
+
 ## Purpose
 
 Capture PRs created by terminal agents that report tool use through `kanban hooks` (Claude Code first; Codex, Droid, Kiro, and Cline CLI where their hook payloads allow it):
@@ -121,9 +125,54 @@ Manual: on a scratch repo, run a **Claude Code** task that creates a PR via Bash
 
 ## Agent coverage findings (fill in during implementation)
 
-- Claude Code:
-- Cline CLI:
-- Codex:
-- Droid:
-- Kiro:
+Verified against the hook wiring in `src/terminal/agent-session-adapters.ts`,
+`src/terminal/codex-hook-config.ts`, and the hook-event modules, plus the
+installed local agents (only Cline CLI is installed in the implementation
+environment; the others are documented from the code that builds their hook
+payloads).
+
+- Claude Code: **covered.** `PostToolUse` (matcher `*`) → `to_in_progress`
+  (`agent-session-adapters.ts:656`). Claude's hook payload on stdin carries
+  `tool_name`, `tool_input` (e.g. `Bash` → `{ command }`), and `tool_response`
+  (e.g. `{ stdout, stderr, ... }`) — all three are read by
+  `extractHookPullRequestUrls`. MCP tool names (`mcp__github__create_pull_request`)
+  pass through the same `tool_name` field, so the MCP gate in
+  `pull-request-detection.ts` applies (unit-tested). `PostToolUseFailure` is also
+  wired → `to_in_progress`, and its payloads with an `error` string are scanned
+  (covers `gh pr create` failing because the PR already exists, printing the
+  existing URL in stderr).
+- Cline CLI: **partially covered — no tool output in the pipeline today.**
+  The `PostToolUse` script (`buildClinePostToolUseHookScriptContent`,
+  `agent-session-adapters.ts:234`) pipes the full stdin JSON to
+  `kanban hooks notify --event activity --source cline`, so the payload does
+  reach the hook CLI. The script greps for `"(toolName|tool)"`, confirming the
+  payload has a top-level `tool`/`toolName` field; `extractHookToolName` reads
+  it. Whether Cline CLI's `PostToolUse` payload includes the tool output is
+  not evident from anything in this repo (the installed binary is a compiled
+  Bun bundle), and no `tool_response`-shaped field is read today. **Gap:** if
+  the payload carries no output, PR capture cannot fire — falls back to
+  delivery / branch lookup (PL-6) / manual add.
+- Codex: **gap — no tool output reaches detection.** Two paths exist:
+  (1) the session-log watcher (`codex-hook-events.ts`) maps
+  `exec_command_begin`/`exec_command_end` to metadata-only background
+  notifications (`spawnBackgroundKanban` + `appendMetadataFlags`) — the command
+  text lands only in `activityText` (`"Running command: ..."`), never as
+  tool input, and no payload crosses the wire; (2) the configured
+  `PostToolUse` hook (`codex-hook-config.ts` → `kanban hooks codex-hook
+  --event activity --source codex`) does pipe Codex's stdin payload to ingest,
+  but no `tool_response`-shaped output field is observed in that payload.
+  **Gap:** PRs created via Codex shell commands are not captured by hooks;
+  rely on delivery / branch lookup / manual add.
+- Droid: **partially covered.** `PostToolUse` (matcher `*`) → `activity`
+  (`agent-session-adapters.ts:1218`), same command-shape hook as Claude Code,
+  so the payload is piped to stdin and `tool_name`/`tool_input` are read when
+  present (Droid uses a Claude-style payload shape, `Execute` tool for shell).
+  `tool_response` presence in Droid's hook payload is unverified here — **gap
+  if absent**: no output, no detection; falls back as above.
+- Kiro: **gap — no tool output in the pipeline.** `postToolUse` → `activity`
+  (`agent-session-adapters.ts:1316`); `normalizeKiroHookMetadata`
+  (`kiro-hook-events.ts`) extracts only `toolName` and an *input summary* — no
+  tool-output field is read from Kiro payloads anywhere in the codebase.
+  **Gap:** Kiro-created PRs are not captured by hooks; rely on delivery /
+  branch lookup / manual add.
 
