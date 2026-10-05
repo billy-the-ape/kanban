@@ -70,6 +70,13 @@ describe("bounded Cline tool recovery (real SDK agent loop)", () => {
 		expect(JSON.stringify(requests[1].messages)).toContain("gh pr create");
 	});
 
+	it("tells the model how to split an oversized editor call", async () => {
+		const execute = vi.fn().mockResolvedValue({ error: "Editor input too large: new_text was 11721 characters" });
+		const { runtime, requests } = harness("editor", execute);
+		expect((await runtime.run("Edit")).status).toBe("completed");
+		expect(JSON.stringify(requests[1].messages)).toContain("Do NOT resend the same payload");
+	});
+
 	it("permits a successful model repair", async () => {
 		const execute = vi.fn().mockResolvedValueOnce({ error: "bad input" }).mockResolvedValueOnce({ ok: true });
 		const { runtime } = harness("editor", execute, [["editor"], ["editor"]]);

@@ -43,11 +43,15 @@ export function createClineToolFailureRecoveryHooks(): ClineSdkAgentHooks {
 			return terminalError;
 		}
 		repairIteration ??= iteration;
+		const hint = /Editor input too large/i.test(error)
+			? "The editor rejects inputs over 6000 characters. Do NOT resend the same payload: split it into several smaller sequential editor calls (about 100 lines each), or write the content to a new file."
+			: null;
 		return [
 			count === 2
 				? "The last tool call failed twice."
 				: "The last tool call failed. Automatic replay was skipped because its outcome may include side effects.",
 			details,
+			...(hint ? [hint] : []),
 			"Try reformatting the call or using a different tool. You have one repair opportunity; another tool failure will stop this task.",
 			"Before repeating a command or write, check whether it already succeeded (especially PR creation, commits, and pushes). A timeout does not prove it failed remotely.",
 		].join("\n");
