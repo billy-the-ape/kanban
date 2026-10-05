@@ -70,6 +70,18 @@ function runtimeSnapshot(iteration = 1) {
 }
 
 describe("applyClineSessionEvent", () => {
+	it("publishes queue positions and clears them on admission", () => {
+		const entry = createEntry("task-1");
+		for (const queuePosition of [2, 1]) {
+			applyEvent({ entry, event: { type: "kanban_concurrency", queued: true, queuePosition } });
+			expect(entry.summary.state).toBe("running");
+			expect(entry.summary.latestHookActivity?.queuePosition).toBe(queuePosition);
+		}
+		applyEvent({ entry, event: { type: "kanban_concurrency", queued: false } });
+		expect(entry.summary.latestHookActivity?.queuePosition).toBeNull();
+		expect(entry.summary.latestHookActivity?.hookEventName).toBe("turn_start");
+	});
+
 	it("streams assistant text deltas into the active assistant message", () => {
 		const entry = createEntry("task-1");
 

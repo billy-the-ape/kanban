@@ -637,7 +637,17 @@ export function BoardCard({
 									)}
 								</div>
 								{columnId !== "trash" ? (
-									<TaskPhaseBadge summary={phaseSummary} columnId={columnId} className="shrink-0" />
+									<TaskPhaseBadge
+										summary={phaseSummary}
+										queuePosition={
+											sessionSummary?.state === "running" &&
+											sessionSummary.latestHookActivity?.hookEventName === "concurrency_waiting"
+												? sessionSummary.latestHookActivity.queuePosition
+												: null
+										}
+										columnId={columnId}
+										className="shrink-0"
+									/>
 								) : null}
 								{isPreparingInitialStart && initialStartStage ? (
 									<span
