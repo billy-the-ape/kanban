@@ -129,6 +129,17 @@ export class ClineTurnScheduler {
 		}
 	}
 
+	/** Claim only a waiting turn; an admission that already won is never canceled. */
+	cancelQueued(owner: symbol, taskId: string): boolean {
+		for (const pool of this.pools.values()) {
+			const waiter = pool.waiters.find((item) => item.entry.owner === owner && item.entry.taskId === taskId);
+			if (!waiter || waiter.entry.controller.signal.aborted) continue;
+			waiter.entry.controller.abort(new Error("Cline turn canceled."));
+			return true;
+		}
+		return false;
+	}
+
 	cancel(owner: symbol, taskId?: string): void {
 		for (const entry of this.entries) {
 			if (entry.owner === owner && (taskId === undefined || entry.taskId === taskId)) {

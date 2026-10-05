@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { RuntimeConfigState } from "../../../src/config/runtime-config";
-import type { RuntimeTaskSessionSummary } from "../../../src/core/api-contract";
+import type { RuntimeTaskSessionSummary, RuntimeWorkspaceStateResponse } from "../../../src/core/api-contract";
 
 const agentRegistryMocks = vi.hoisted(() => ({
 	resolveAgentCommand: vi.fn(),
@@ -133,8 +133,11 @@ vi.mock("../../../src/server/browser.js", () => ({
 }));
 
 import { buildClineCompactionConfig } from "../../../src/cline-sdk/cline-compaction-config";
+import * as workspaceState from "../../../src/state/workspace-state";
+import * as dispatchRecords from "../../../src/task-dispatch/dispatch-records";
 import type { RuntimeTrpcContext } from "../../../src/trpc/app-router";
 import { type CreateRuntimeApiDependencies, createRuntimeApi } from "../../../src/trpc/runtime-api";
+import * as queuedReset from "../../../src/workspace/task-queued-reset";
 
 function createTestRuntimeApi(
 	deps: Omit<CreateRuntimeApiDependencies, "getUpdateStatus" | "runUpdateNow"> &
@@ -3141,5 +3144,87 @@ describe("createRuntimeApi getTaskPhases (B-10.1)", () => {
 		expect(response.phases["task-hydrated"]?.phase).toBe("idle");
 		expect(response.phases["task-awaiting"]?.phase).toBe("idle");
 		expect(response.phases["task-none"]?.phase).toBe("idle");
+	});
+});
+
+describe("return queued task to Backlog", () => {
+	afterEach(() => vi.restoreAllMocks());
+	it.each([true, false])("updates persisted board only after a safe reset succeeds=%s", async (success) => {
+		const state: RuntimeWorkspaceStateResponse = {
+			repoPath: "/tmp/repo",
+			statePath: "/tmp/state",
+			revision: 1,
+			git: { currentBranch: "main", defaultBranch: "main", branches: ["main"] },
+			board: {
+				dependencies: [],
+				columns: [
+					{ id: "backlog", title: "Backlog", cards: [] },
+					{
+						id: "in_progress",
+						title: "In Progress",
+						cards: [
+							{
+								id: "task-1",
+								title: "Queued",
+								prompt: "work",
+								startInPlanMode: false,
+								baseRef: "main",
+								createdAt: 1,
+								updatedAt: 1,
+							},
+						],
+					},
+				],
+			},
+			sessions: { "task-1": createSummary() },
+		};
+		vi.spyOn(workspaceState, "loadWorkspaceBoardById").mockResolvedValue(state.board);
+		const mutate = vi.spyOn(workspaceState, "mutateWorkspaceState").mockImplementation(async (_cwd, apply) => {
+			const result = apply(state);
+			state.board = result.board;
+			state.sessions = result.sessions ?? state.sessions;
+			return { value: result.value, state, saved: true };
+		});
+		const reset = vi.spyOn(queuedReset, "resetUnstartedQueuedWorktree").mockImplementation(async ({ withdraw }) => {
+			if (!success) throw new Error("Task has prior work");
+			expect(await withdraw()).toBe(true);
+		});
+		const saveDispatch = vi.spyOn(dispatchRecords, "writeTaskDispatchRecord").mockResolvedValue();
+		const clear = vi.fn();
+		const service = {
+			...createClineTaskSessionServiceMock(),
+			resetUnstartedQueuedTask: vi.fn(
+				async (_id: string, apply: (withdraw: () => Promise<boolean>) => Promise<void>) => apply(async () => true),
+			),
+		};
+		const api = createTestRuntimeApi({
+			getActiveWorkspaceId: () => "workspace-1",
+			loadScopedRuntimeConfig: async () => createRuntimeConfigState(),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: async () => ({ getSummary: () => null }) as never,
+			getScopedClineTaskSessionService: async () => service as never,
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+			broadcastTaskChatCleared: clear,
+		});
+		const response = await api.returnQueuedTaskToBacklog(
+			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+			{ taskId: "task-1" },
+		);
+		expect(response.ok).toBe(success);
+		expect(reset).toHaveBeenCalledTimes(1);
+		if (success) {
+			expect(mutate).toHaveBeenCalledTimes(1);
+			expect(state.board.columns[0]?.cards[0]?.id).toBe("task-1");
+			expect(state.sessions["task-1"]).toBeUndefined();
+			expect(saveDispatch).toHaveBeenCalledWith(
+				expect.objectContaining({ manuallyDeferred: true, status: "blocked" }),
+			);
+			expect(clear).toHaveBeenCalledWith("workspace-1", "task-1");
+		} else {
+			expect(mutate).not.toHaveBeenCalled();
+			expect(saveDispatch).not.toHaveBeenCalled();
+			expect(state.sessions["task-1"]).toBeDefined();
+		}
 	});
 });

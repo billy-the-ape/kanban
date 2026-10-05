@@ -119,6 +119,7 @@ export interface ClineTaskSessionService {
 	onSummary(listener: (summary: RuntimeTaskSessionSummary) => void): () => void;
 	onMessage(listener: (taskId: string, message: ClineTaskMessage) => void): () => void;
 	startTaskSession(request: StartClineTaskSessionRequest): Promise<RuntimeTaskSessionSummary>;
+	resetUnstartedQueuedTask(taskId: string, reset: (withdraw: () => Promise<boolean>) => Promise<void>): Promise<void>;
 	stopTaskSession(taskId: string): Promise<RuntimeTaskSessionSummary | null>;
 	abortTaskSession(taskId: string): Promise<RuntimeTaskSessionSummary | null>;
 	cancelTaskTurn(taskId: string): Promise<RuntimeTaskSessionSummary | null>;
@@ -236,6 +237,7 @@ const DEFAULT_CONTEXT_RECOVERY_MAX_ATTEMPTS = 3;
 const COMPACTION_EVENT_PERSIST_INTERVAL_MS = 60_000;
 
 export class InMemoryClineTaskSessionService implements ClineTaskSessionService {
+	private readonly resettingTaskIds = new Set<string>();
 	private readonly pendingTurnCancelTaskIds = new Set<string>();
 	/** Non-throwing SDK failure events observed during the current send. */
 	private readonly pendingContextOverflowByTaskId = new Map<string, string>();
@@ -702,6 +704,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 	}
 
 	async startTaskSession(request: StartClineTaskSessionRequest): Promise<RuntimeTaskSessionSummary> {
+		if (this.resettingTaskIds.has(request.taskId)) throw new Error("Task is returning to Backlog.");
 		const existing = this.messageRepository.getTaskEntry(request.taskId);
 		if (
 			!request.resumeFromTrash &&
@@ -781,6 +784,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		}
 		this.emitSummary(entry.summary);
 
+		const startGeneration = this.turnGenerationByTaskId.get(request.taskId) ?? 0;
 		void this.enqueueTaskTurn(request.taskId, async () => {
 			const assistantCountBeforeStart = entry.messages.filter((message) => message.role === "assistant").length;
 			try {
@@ -823,7 +827,9 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					compaction: request.compaction,
 					compactionSafetyMarginTokens: request.compactionSafetyMarginTokens,
 				};
+				if ((this.turnGenerationByTaskId.get(request.taskId) ?? 0) !== startGeneration) return;
 				const startResult = await this.sessionRuntime.startTaskSession(runtimeStartRequest);
+				if ((this.turnGenerationByTaskId.get(request.taskId) ?? 0) !== startGeneration) return;
 				const warningMessage = formatStartWarnings(startResult.warnings);
 				if (warningMessage) {
 					this.emitSummary(
@@ -845,11 +851,63 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					this.emitMessage(request.taskId, agentMessage);
 				}
 			} catch (error) {
-				this.emitTaskFailure(request.taskId, entry, "start", error);
+				if ((this.turnGenerationByTaskId.get(request.taskId) ?? 0) === startGeneration) {
+					this.emitTaskFailure(request.taskId, entry, "start", error);
+				}
 			}
 		});
 
 		return cloneSummary(entry.summary);
+	}
+
+	async resetUnstartedQueuedTask(
+		taskId: string,
+		reset: (withdraw: () => Promise<boolean>) => Promise<void>,
+	): Promise<void> {
+		const entry = this.messageRepository.getTaskEntry(taskId);
+		if (
+			this.resettingTaskIds.has(taskId) ||
+			!entry ||
+			entry.summary.state !== "running" ||
+			entry.summary.latestHookActivity?.canReturnToBacklog !== true
+		) {
+			throw new Error("Only a queued task with no prior execution can return to Backlog.");
+		}
+		this.resettingTaskIds.add(taskId);
+		let withdrawn = false;
+		try {
+			if (
+				this.sessionRuntime.canRestartTaskSession(taskId) ||
+				(await this.sessionRuntime.readPersistedTaskSession(taskId))
+			) {
+				throw new Error("This task has prior execution and cannot return to Backlog.");
+			}
+			await reset(async () => {
+				if (!this.sessionRuntime.cancelQueuedUnstartedTask(taskId)) return false;
+				withdrawn = true;
+				this.invalidatePendingTaskTurns(taskId);
+				await this.turnDispatchByTaskId.get(taskId);
+				return true;
+			});
+			if (!withdrawn) throw new Error("Queued turn was not withdrawn.");
+			this.providerIdByTaskId.delete(taskId);
+			this.messageRepository.forgetTask(taskId);
+			this.emitSummary(createDefaultSummary(taskId));
+		} catch (error) {
+			if (withdrawn) {
+				this.emitSummary(
+					updateSummary(entry, {
+						state: "interrupted",
+						reviewReason: "interrupted",
+						latestHookActivity: null,
+						warningMessage: `Return to Backlog failed: ${toErrorMessage(error)}`,
+					}),
+				);
+			}
+			throw error;
+		} finally {
+			this.resettingTaskIds.delete(taskId);
+		}
 	}
 
 	async stopTaskSession(taskId: string): Promise<RuntimeTaskSessionSummary | null> {
@@ -938,6 +996,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		mode?: RuntimeTaskSessionMode,
 		images?: RuntimeTaskImage[],
 	): Promise<RuntimeTaskSessionSummary | null> {
+		if (this.resettingTaskIds.has(taskId)) throw new Error("Task is returning to Backlog.");
 		const entry = this.messageRepository.getTaskEntry(taskId);
 		if (!entry) {
 			return null;
