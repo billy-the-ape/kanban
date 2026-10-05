@@ -554,12 +554,14 @@ describe("context overflow recovery through the task session service (B-3)", () 
 	}
 
 	it("uses the provider ceiling and resends a failed prompt only once", async () => {
-		const providerError =
-			"request (9000 tokens) exceeds the available context size (7500 tokens), try increasing it";
+		const providerError = "request (9000 tokens) exceeds the available context size (7500 tokens), try increasing it";
 		expect(readReportedContextLimit(new Error(providerError))).toBe(7500);
 		expect(
 			withoutFailedResend(
-				[{ role: "user", content: "original" }, { role: "user", content: "Open PR" }],
+				[
+					{ role: "user", content: "original" },
+					{ role: "user", content: "Open PR" },
+				],
 				"Open PR",
 			),
 		).toEqual([{ role: "user", content: "original" }]);
@@ -590,7 +592,9 @@ describe("context overflow recovery through the task session service (B-3)", () 
 		expect(secondRecoveryWindow).toBeLessThan(firstRecoveryWindow);
 		const lastSessionId = lastConfig?.sessionId ?? "";
 		const lastMessages = harness.store.messagesFor(lastSessionId);
-		expect(lastMessages.filter((message) => message.role === "user" && message.content === "Open PR")).toHaveLength(1);
+		expect(lastMessages.filter((message) => message.role === "user" && message.content === "Open PR")).toHaveLength(
+			1,
+		);
 	});
 
 	it("recovers provider overflow returned as assistant text, then bounds another returned overflow", async () => {
@@ -614,8 +618,14 @@ describe("context overflow recovery through the task session service (B-3)", () 
 		expect(harness.host.startedConfigs.length).toBe(3);
 		const restarted = harness.store.messagesFor(harness.host.startedConfigs.at(-1)?.sessionId ?? "");
 		expect(restarted.filter((message) => message.role === "user" && message.content === "Open PR")).toHaveLength(1);
-		expect(restarted.some((message) => message.role === "assistant" && message.content === LLAMA_CPP_OVERFLOW_ERROR)).toBe(false);
-		expect(harness.service.listMessages(taskId).some((message) => message.role === "assistant" && message.content === LLAMA_CPP_OVERFLOW_ERROR)).toBe(false);
+		expect(
+			restarted.some((message) => message.role === "assistant" && message.content === LLAMA_CPP_OVERFLOW_ERROR),
+		).toBe(false);
+		expect(
+			harness.service
+				.listMessages(taskId)
+				.some((message) => message.role === "assistant" && message.content === LLAMA_CPP_OVERFLOW_ERROR),
+		).toBe(false);
 		expect(harness.service.getSummary(taskId)?.reviewReason).not.toBe("error");
 	});
 
@@ -638,8 +648,11 @@ describe("context overflow recovery through the task session service (B-3)", () 
 			expect(harness.host.startedConfigs.length).toBe(2);
 			expect(harness.host.sentPrompts.at(-1)?.prompt).toBe("Open PR");
 		});
-		expect(harness.store.messagesFor(harness.host.startedConfigs.at(-1)?.sessionId ?? "")
-			.filter((message) => message.role === "user" && message.content === "Open PR")).toHaveLength(1);
+		expect(
+			harness.store
+				.messagesFor(harness.host.startedConfigs.at(-1)?.sessionId ?? "")
+				.filter((message) => message.role === "user" && message.content === "Open PR"),
+		).toHaveLength(1);
 		expect(harness.service.getSummary(taskId)?.reviewReason).not.toBe("error");
 	});
 
@@ -658,7 +671,11 @@ describe("context overflow recovery through the task session service (B-3)", () 
 		expect(harness.host.sentPrompts.length).toBe(3);
 		expect(harness.service.getSummary(taskId)?.state).toBe("awaiting_review");
 		expect(harness.service.getSummary(taskId)?.warningMessage).toContain("failed after 1 attempt");
-		expect(harness.service.listMessages(taskId).some((message) => message.role === "assistant" && message.content === LLAMA_CPP_OVERFLOW_ERROR)).toBe(false);
+		expect(
+			harness.service
+				.listMessages(taskId)
+				.some((message) => message.role === "assistant" && message.content === LLAMA_CPP_OVERFLOW_ERROR),
+		).toBe(false);
 	});
 
 	it("clears an overflow warning while the replacement turn is active", async () => {
@@ -765,10 +782,7 @@ describe("context overflow recovery through the task session service (B-3)", () 
 		await harness.service.stopTaskSession(taskId);
 		activeGate.resolve();
 		await new Promise((resolve) => setTimeout(resolve, 30));
-		expect(harness.host.sentPrompts.map(({ prompt }) => prompt)).toEqual([
-			"First turn prompt",
-			"Active prompt",
-		]);
+		expect(harness.host.sentPrompts.map(({ prompt }) => prompt)).toEqual(["First turn prompt", "Active prompt"]);
 		expect(harness.service.getSummary(taskId)?.state).toBe("interrupted");
 	});
 

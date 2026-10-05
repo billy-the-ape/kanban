@@ -213,9 +213,7 @@ export function withoutFailedResend(
 	while (end > 0) {
 		const last = messages[end - 1];
 		const failedReply =
-			last?.role === "assistant" &&
-			typeof last.content === "string" &&
-			isContextOverflowError(last.content);
+			last?.role === "assistant" && typeof last.content === "string" && isContextOverflowError(last.content);
 		const userIndex = end - (failedReply ? 2 : 1);
 		const user = messages[userIndex];
 		if (user?.role !== "user" || typeof user.content !== "string" || user.content !== prompt) {

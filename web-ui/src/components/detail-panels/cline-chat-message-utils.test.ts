@@ -1,7 +1,5 @@
 import { getClineToolCallDisplay } from "@runtime-cline-tool-call-display";
 import { describe, expect, it } from "vitest";
-import type { ClineChatMessage } from "@/hooks/use-cline-chat-session";
-import type { RuntimeTaskSessionSummary } from "@/runtime/types";
 import {
 	formatToolInputForDisplay,
 	getCompletedAssistantMessageId,
@@ -9,6 +7,8 @@ import {
 	getToolSummary,
 	parseToolMessageContent,
 } from "@/components/detail-panels/cline-chat-message-utils";
+import type { ClineChatMessage } from "@/hooks/use-cline-chat-session";
+import type { RuntimeTaskSessionSummary } from "@/runtime/types";
 
 describe("parseToolMessageContent", () => {
 	it("parses tool name input output and duration", () => {

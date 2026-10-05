@@ -493,7 +493,12 @@ describe("useTaskEditor", () => {
 		let latestSnapshot: HookSnapshot | null = null;
 		await act(async () => {
 			root.render(
-				<HookHarness initialBoard={createBoard()} onSnapshot={(snapshot) => (latestSnapshot = snapshot)} />,
+				<HookHarness
+					initialBoard={createBoard()}
+					onSnapshot={(snapshot) => {
+						latestSnapshot = snapshot;
+					}}
+				/>,
 			);
 		});
 
@@ -530,7 +535,9 @@ describe("useTaskEditor", () => {
 			root.render(
 				<HookHarness
 					initialBoard={createBoard([missingCard, uncheckedCard])}
-					onSnapshot={(snapshot) => (latestSnapshot = snapshot)}
+					onSnapshot={(snapshot) => {
+						latestSnapshot = snapshot;
+					}}
 				/>,
 			);
 		});
@@ -564,7 +571,9 @@ describe("useTaskEditor", () => {
 			root.render(
 				<HookHarness
 					initialBoard={createBoard([fixedCard])}
-					onSnapshot={(snapshot) => (latestSnapshot = snapshot)}
+					onSnapshot={(snapshot) => {
+						latestSnapshot = snapshot;
+					}}
 					getTaskInitialStartStatus={async (taskId) => ({
 						ok: true,
 						taskId,
