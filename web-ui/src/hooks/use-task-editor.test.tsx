@@ -3,7 +3,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useTaskEditor } from "@/hooks/use-task-editor";
-import type { RuntimeAgentId, RuntimeTaskClineSettings } from "@/runtime/types";
+import type { RuntimeAgentId, RuntimeTaskClineSettings, RuntimeTaskInitialStartStatusResponse } from "@/runtime/types";
 import type { BoardCard, BoardData, TaskAutoReviewMode, TaskImage } from "@/types";
 
 function createTask(taskId: string, prompt: string, createdAt: number, overrides: Partial<BoardCard> = {}): BoardCard {
@@ -39,10 +39,14 @@ interface HookSnapshot {
 	newTaskPrompt: string;
 	newTaskImages: TaskImage[];
 	newTaskBranchRef: string;
+	newTaskUpdateBaseRefBeforeStart: boolean;
+	setNewTaskUpdateBaseRefBeforeStart: (value: boolean) => void;
 	newTaskAgentId: RuntimeAgentId | undefined;
 	newTaskClineSettings: RuntimeTaskClineSettings | undefined;
 	editingTaskId: string | null;
 	editTaskPrompt: string;
+	editTaskUpdateBaseRefBeforeStart: boolean;
+	editTaskInitialBaselineFixed: boolean;
 	editTaskStartInPlanMode: boolean;
 	isEditTaskStartInPlanModeDisabled: boolean;
 	handleOpenCreateTask: () => void;
@@ -71,10 +75,12 @@ function HookHarness({
 	initialBoard,
 	onSnapshot,
 	queueTaskStartAfterEdit,
+	getTaskInitialStartStatus = async () => null,
 }: {
 	initialBoard: BoardData;
 	onSnapshot: (snapshot: HookSnapshot) => void;
 	queueTaskStartAfterEdit?: (taskId: string) => void;
+	getTaskInitialStartStatus?: (taskId: string) => Promise<RuntimeTaskInitialStartStatusResponse | null>;
 }): null {
 	const [board, setBoard] = useState<BoardData>(initialBoard);
 	const [, setSelectedTaskId] = useState<string | null>(null);
@@ -87,6 +93,7 @@ function HookHarness({
 		selectedAgentId: null,
 		setSelectedTaskId,
 		queueTaskStartAfterEdit,
+		getTaskInitialStartStatus,
 	});
 
 	useEffect(() => {
@@ -96,10 +103,14 @@ function HookHarness({
 			newTaskPrompt: editor.newTaskPrompt,
 			newTaskImages: editor.newTaskImages,
 			newTaskBranchRef: editor.newTaskBranchRef,
+			newTaskUpdateBaseRefBeforeStart: editor.newTaskUpdateBaseRefBeforeStart,
+			setNewTaskUpdateBaseRefBeforeStart: editor.setNewTaskUpdateBaseRefBeforeStart,
 			newTaskAgentId: editor.newTaskAgentId,
 			newTaskClineSettings: editor.newTaskClineSettings,
 			editingTaskId: editor.editingTaskId,
 			editTaskPrompt: editor.editTaskPrompt,
+			editTaskUpdateBaseRefBeforeStart: editor.editTaskUpdateBaseRefBeforeStart,
+			editTaskInitialBaselineFixed: editor.editTaskInitialBaselineFixed,
 			editTaskStartInPlanMode: editor.editTaskStartInPlanMode,
 			isEditTaskStartInPlanModeDisabled: editor.isEditTaskStartInPlanModeDisabled,
 			handleOpenCreateTask: editor.handleOpenCreateTask,
@@ -118,6 +129,8 @@ function HookHarness({
 		});
 	}, [
 		board,
+		editor.editTaskUpdateBaseRefBeforeStart,
+		editor.editTaskInitialBaselineFixed,
 		editor.handleCreateTask,
 		editor.handleCreateTasks,
 		editor.handleOpenCreateTask,
@@ -474,5 +487,110 @@ describe("useTaskEditor", () => {
 				reasoningEffort: "medium",
 			});
 		}
+	});
+
+	it("defaults the new-task base refresh option to checked and persists the explicit choice", async () => {
+		let latestSnapshot: HookSnapshot | null = null;
+		await act(async () => {
+			root.render(
+				<HookHarness initialBoard={createBoard()} onSnapshot={(snapshot) => (latestSnapshot = snapshot)} />,
+			);
+		});
+
+		await act(async () => {
+			requireSnapshot(latestSnapshot).handleOpenCreateTask();
+		});
+		// UPD-1.1: the dialog defaults to checked.
+		expect(requireSnapshot(latestSnapshot).newTaskUpdateBaseRefBeforeStart).toBe(true);
+
+		// Unchecking must persist as an explicit false, not vanish as "missing".
+		await act(async () => {
+			requireSnapshot(latestSnapshot).setNewTaskUpdateBaseRefBeforeStart(false);
+			requireSnapshot(latestSnapshot).setNewTaskPrompt("Refactor the settings panel");
+		});
+		let createdId: string | null = null;
+		await act(async () => {
+			createdId = requireSnapshot(latestSnapshot).handleCreateTask();
+		});
+		expect(createdId).toBeTruthy();
+		const createdCard = requireSnapshot(latestSnapshot)
+			.board.columns.find((column) => column.id === "backlog")
+			?.cards.find((card) => card.id === createdId);
+		expect(createdCard?.updateBaseRefBeforeStart).toBe(false);
+		// The user's explicit choice stays in the form for follow-up tasks
+		// ("Create more"), consistent with the other create-form options.
+		expect(requireSnapshot(latestSnapshot).newTaskUpdateBaseRefBeforeStart).toBe(false);
+	});
+
+	it("seeds the edit form from the persisted policy, normalizing missing values to true", async () => {
+		let latestSnapshot: HookSnapshot | null = null;
+		const missingCard = createTask("task-missing", "Missing policy", 1);
+		const uncheckedCard = createTask("task-unchecked", "Unchecked policy", 2, { updateBaseRefBeforeStart: false });
+		await act(async () => {
+			root.render(
+				<HookHarness
+					initialBoard={createBoard([missingCard, uncheckedCard])}
+					onSnapshot={(snapshot) => (latestSnapshot = snapshot)}
+				/>,
+			);
+		});
+
+		// UPD-1.2: missing value normalizes to checked.
+		await act(async () => {
+			requireSnapshot(latestSnapshot).handleOpenEditTask(missingCard);
+		});
+		expect(requireSnapshot(latestSnapshot).editTaskUpdateBaseRefBeforeStart).toBe(true);
+		expect(requireSnapshot(latestSnapshot).editTaskInitialBaselineFixed).toBe(false);
+
+		// A persisted false is preserved.
+		await act(async () => {
+			requireSnapshot(latestSnapshot).handleOpenEditTask(uncheckedCard);
+		});
+		expect(requireSnapshot(latestSnapshot).editTaskUpdateBaseRefBeforeStart).toBe(false);
+
+		await act(async () => {
+			requireSnapshot(latestSnapshot).handleSaveEditedTask();
+		});
+		const savedCard = requireSnapshot(latestSnapshot)
+			.board.columns.find((column) => column.id === "backlog")
+			?.cards.find((card) => card.id === "task-unchecked");
+		expect(savedCard?.updateBaseRefBeforeStart).toBe(false);
+	});
+
+	it("keeps the persisted policy untouched when the initial-start baseline is already fixed", async () => {
+		let latestSnapshot: HookSnapshot | null = null;
+		const fixedCard = createTask("task-fixed", "Fixed baseline", 1, { updateBaseRefBeforeStart: true });
+		await act(async () => {
+			root.render(
+				<HookHarness
+					initialBoard={createBoard([fixedCard])}
+					onSnapshot={(snapshot) => (latestSnapshot = snapshot)}
+					getTaskInitialStartStatus={async (taskId) => ({
+						ok: true,
+						taskId,
+						stage: "ready",
+						baselineSha: null,
+						initialStartBaselineFixed: true,
+						failure: null,
+					})}
+				/>,
+			);
+		});
+
+		await act(async () => {
+			requireSnapshot(latestSnapshot).handleOpenEditTask(fixedCard);
+		});
+		// The server signal flips the checkbox into read-only mode.
+		expect(requireSnapshot(latestSnapshot).editTaskInitialBaselineFixed).toBe(true);
+		expect(requireSnapshot(latestSnapshot).editTaskUpdateBaseRefBeforeStart).toBe(true);
+
+		// Saving with the fixed-baseline guard must leave the card value intact.
+		await act(async () => {
+			requireSnapshot(latestSnapshot).handleSaveEditedTask();
+		});
+		const savedCard = requireSnapshot(latestSnapshot)
+			.board.columns.find((column) => column.id === "backlog")
+			?.cards.find((card) => card.id === "task-fixed");
+		expect(savedCard?.updateBaseRefBeforeStart).toBe(true);
 	});
 });

@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useBoardInteractions } from "@/hooks/use-board-interactions";
 import type { UseTaskSessionsResult } from "@/hooks/use-task-sessions";
 import type {
+	RuntimeTaskInitialStartStage,
 	RuntimeTaskInitialStartStatusResponse,
 	RuntimeTaskSessionSummary,
 	RuntimeWorktreeDeleteResponse,
@@ -78,6 +79,7 @@ interface HookSnapshot {
 	handleStartTask: (taskId: string) => void;
 	handleCardSelect: (taskId: string) => void;
 	handleConfirmClearTrash: () => void;
+	initialStartStageByTaskId: Record<string, RuntimeTaskInitialStartStage>;
 }
 
 function createRect(width: number, height: number): DOMRect {
@@ -151,12 +153,14 @@ function HookHarness({
 			handleStartTask: actions.handleStartTask,
 			handleCardSelect: actions.handleCardSelect,
 			handleConfirmClearTrash: actions.handleConfirmClearTrash,
+			initialStartStageByTaskId: actions.initialStartStageByTaskId,
 		});
 	}, [
 		actions.handleCardSelect,
 		actions.handleConfirmClearTrash,
 		actions.handleRestoreTaskFromTrash,
 		actions.handleStartTask,
+		actions.initialStartStageByTaskId,
 		onSnapshot,
 	]);
 
@@ -527,6 +531,208 @@ describe("useBoardInteractions", () => {
 		expect(started).toBe(true);
 		expect(ensureTaskWorkspace).toHaveBeenCalledWith(backlogTask);
 		expect(startTaskSession).toHaveBeenCalledWith(backlogTask);
+	});
+
+	it("rolls back an optimistically moved card when the base refresh blocks the start (UPD-1)", async () => {
+		let startBacklogTaskWithAnimation: ((task: BoardCard) => Promise<boolean>) | null = null;
+		const stageState: { current: Record<string, RuntimeTaskInitialStartStage> | null } = { current: null };
+
+		useProgrammaticCardMovesMock.mockReturnValue({
+			handleProgrammaticCardMoveReady: () => {},
+			setRequestMoveTaskToTrashHandler: () => {},
+			setRequestCompleteTaskHandler: () => {},
+			tryProgrammaticCardMove: () => "unavailable",
+			consumeProgrammaticCardMove: () => ({}),
+			resolvePendingProgrammaticTrashMove: () => {},
+			resolvePendingProgrammaticCompleteMove: () => {},
+			waitForProgrammaticCardMoveAvailability: async () => {},
+			resetProgrammaticCardMoves: () => {},
+			requestMoveTaskToTrashWithAnimation: async () => {},
+			requestCompleteTaskWithAnimation: async () => {},
+			programmaticCardMoveCycle: 0,
+		});
+
+		useLinkedBacklogTaskActionsMock.mockImplementation(
+			(input: { startBacklogTaskWithAnimation?: (task: BoardCard) => Promise<boolean> }) => {
+				startBacklogTaskWithAnimation = input.startBacklogTaskWithAnimation ?? null;
+				return {
+					handleCreateDependency: () => {},
+					handleDeleteDependency: () => {},
+					confirmMoveTaskToTrash: async () => {},
+					requestMoveTaskToTrash: async () => {},
+					requestCompleteTask: async () => {},
+				};
+			},
+		);
+
+		const board = createBoard();
+		// Apply the functional updates so the final column can be asserted.
+		let currentBoard = board;
+		const setBoard = vi.fn<Dispatch<SetStateAction<BoardData>>>((next) => {
+			currentBoard = typeof next === "function" ? (next as (current: BoardData) => BoardData)(currentBoard) : next;
+		});
+		const ensureTaskWorkspace = vi.fn(async () => ({
+			ok: true as const,
+			response: {
+				ok: true as const,
+				path: "/tmp/task-1",
+				baseRef: "main",
+				baseCommit: "abc123",
+				restoredFromPreservation: false,
+			},
+		}));
+		const getTaskInitialStartStatus = vi.fn(async () => createInitialStartStatus(false));
+		const blockedMessage =
+			"Base ref update blocked for main: The base branch has local commits not on origin. Push or reconcile it, or disable the update option.";
+		const startTaskSession = vi.fn(async () => ({
+			ok: false as const,
+			message: blockedMessage,
+			initialStart: {
+				stage: "blocked" as const,
+				baselineSha: null,
+				refreshed: false,
+				failure: {
+					category: "local_ahead_or_diverged" as const,
+					reason: "The base branch has local commits not on origin.",
+					remedy: "Push or reconcile it, or disable the update option.",
+					selectedRef: "main",
+				},
+			},
+		}));
+
+		const backlogTask = board.columns[0]?.cards[0];
+		if (!backlogTask) {
+			throw new Error("Expected a backlog task.");
+		}
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					board={board}
+					setBoard={setBoard}
+					ensureTaskWorkspace={ensureTaskWorkspace}
+					getTaskInitialStartStatus={getTaskInitialStartStatus}
+					startTaskSession={startTaskSession}
+					// A selected card takes the immediate (optimistic-move) path.
+					selectedCard={{ card: backlogTask, column: { id: "backlog" } }}
+					onSnapshot={(snapshot) => {
+						stageState.current = snapshot.initialStartStageByTaskId;
+					}}
+				/>,
+			);
+		});
+
+		if (!startBacklogTaskWithAnimation) {
+			throw new Error("Expected startBacklogTaskWithAnimation to be provided.");
+		}
+
+		let started = true;
+		await act(async () => {
+			started = await startBacklogTaskWithAnimation!(backlogTask);
+		});
+
+		expect(started).toBe(false);
+		// The structured failure (selected ref + reason + remedy) is surfaced.
+		expect(notifyErrorMock).toHaveBeenCalledWith(blockedMessage);
+		// The card returns from the optimistically entered in_progress to backlog.
+		const inProgressCard = currentBoard.columns
+			.find((column) => column.id === "in_progress")
+			?.cards.find((card) => card.id === "task-1");
+		expect(inProgressCard).toBeUndefined();
+		const backlogCard = currentBoard.columns
+			.find((column) => column.id === "backlog")
+			?.cards.find((card) => card.id === "task-1");
+		expect(backlogCard).toBeTruthy();
+		// The live preparation stage is cleared once the blocked start settles.
+		expect(stageState.current?.["task-1"]).toBeUndefined();
+	});
+
+	it("suppresses duplicate start submissions while a start is in flight (UPD-1)", async () => {
+		let startBacklogTaskWithAnimation: ((task: BoardCard) => Promise<boolean>) | null = null;
+
+		useProgrammaticCardMovesMock.mockReturnValue({
+			handleProgrammaticCardMoveReady: () => {},
+			setRequestMoveTaskToTrashHandler: () => {},
+			setRequestCompleteTaskHandler: () => {},
+			tryProgrammaticCardMove: () => "unavailable",
+			consumeProgrammaticCardMove: () => ({}),
+			resolvePendingProgrammaticTrashMove: () => {},
+			resolvePendingProgrammaticCompleteMove: () => {},
+			waitForProgrammaticCardMoveAvailability: async () => {},
+			resetProgrammaticCardMoves: () => {},
+			requestMoveTaskToTrashWithAnimation: async () => {},
+			requestCompleteTaskWithAnimation: async () => {},
+			programmaticCardMoveCycle: 0,
+		});
+
+		useLinkedBacklogTaskActionsMock.mockImplementation(
+			(input: { startBacklogTaskWithAnimation?: (task: BoardCard) => Promise<boolean> }) => {
+				startBacklogTaskWithAnimation = input.startBacklogTaskWithAnimation ?? null;
+				return {
+					handleCreateDependency: () => {},
+					handleDeleteDependency: () => {},
+					confirmMoveTaskToTrash: async () => {},
+					requestMoveTaskToTrash: async () => {},
+					requestCompleteTask: async () => {},
+				};
+			},
+		);
+
+		const board = createBoard();
+		const setBoard = vi.fn<Dispatch<SetStateAction<BoardData>>>((_nextBoard) => {});
+		const ensureTaskWorkspace = vi.fn(async () => ({
+			ok: true as const,
+			response: {
+				ok: true as const,
+				path: "/tmp/task-1",
+				baseRef: "main",
+				baseCommit: "abc123",
+				restoredFromPreservation: false,
+			},
+		}));
+		const getTaskInitialStartStatus = vi.fn(async () => createInitialStartStatus(false));
+		let resolveStart: ((result: { ok: boolean }) => void) | null = null;
+		const startTaskSession = vi.fn(
+			() =>
+				new Promise<{ ok: boolean }>((resolve) => {
+					resolveStart = resolve;
+				}),
+		);
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					board={board}
+					setBoard={setBoard}
+					ensureTaskWorkspace={ensureTaskWorkspace}
+					getTaskInitialStartStatus={getTaskInitialStartStatus}
+					startTaskSession={startTaskSession}
+				/>,
+			);
+		});
+
+		if (!startBacklogTaskWithAnimation) {
+			throw new Error("Expected startBacklogTaskWithAnimation to be provided.");
+		}
+
+		const backlogTask = board.columns[0]?.cards[0];
+		if (!backlogTask) {
+			throw new Error("Expected a backlog task.");
+		}
+
+		let firstStarted = false;
+		let secondStarted = true;
+		await act(async () => {
+			const firstStart = startBacklogTaskWithAnimation!(backlogTask);
+			// A second submission while the first is in flight is a no-op.
+			secondStarted = await startBacklogTaskWithAnimation!(backlogTask);
+			resolveStart?.({ ok: true });
+			firstStarted = await firstStart;
+		});
+
+		expect(firstStarted).toBe(true);
+		expect(secondStarted).toBe(false);
+		expect(startTaskSession).toHaveBeenCalledTimes(1);
 	});
 
 	it("waits for a new backlog card height to settle before starting animation", async () => {

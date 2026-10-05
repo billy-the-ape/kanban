@@ -4,13 +4,13 @@ Part of the **Update task base ref before starting** feature. The master plan li
 
 | Field | Value |
 | --- | --- |
-| Document revision | 6 |
-| Prepared | 2026-10-03 (revision 2: 2026-10-03, revision 3: 2026-10-04, revision 4: 2026-10-04 implementation record, revision 5: 2026-10-04 review responses, revision 6: 2026-10-04 re-review responses) |
-| Status | Implemented — PR opened targeting `feat/update-base` (re-review responses committed) |
+| Document revision | 7 |
+| Prepared | 2026-10-03 (revision 2: 2026-10-03, revision 3: 2026-10-04, revision 4: 2026-10-04 implementation record, revision 5: 2026-10-04 review responses, revision 6: 2026-10-04 re-review responses, revision 7: 2026-10-04 final state after UPD-1) |
+| Status | Implemented — UPD-1 (the follow-on UI PR) is also implemented on this worktree branch; see [UPD-1.md](./UPD-1.md) |
 | Source baseline | ba3b7151f44f9ed5d1cb4d83590e98388ae2cac7 |
 | Fork | https://github.com/billy-the-ape/kanban |
 | Prerequisites | PLAN.md reviewed and approved |
-| Follow-on | UPD-1 (checkbox, start progress, end-to-end verification) must not start until this PR is merged |
+| Follow-on | UPD-1 (checkbox, start progress, end-to-end verification) — implemented; see UPD-1.md |
 
 ## Objective
 
@@ -474,6 +474,54 @@ original (trimmed) `baseRef` through, so the two phases report a consistent `sel
     base with a `refs/heads/` prefix and a dirty checkout (local-phase `dirty_checkout` failure) and
     asserts `selectedRef` is the selected ref, not the normalized branch.
   - The existing "queues concurrent refreshes…" test is now deterministic (3/3 runs) under the fix.
+
+## Final state after UPD-1 (revision 7)
+
+UPD-1 (checkbox, start progress, end-to-end verification) implemented on top of this work. The runtime
+behavior and contracts above are unchanged; this section records the final state of the UI integration
+points that UPD-0 left to UPD-1.
+
+### Browser start path (use-task-sessions.ts, use-board-interactions.ts)
+
+- `startTaskSession` now sends `updateBaseRefBeforeStart` explicitly in the start request
+  (client-side copy of the card value, normalized `task.updateBaseRefBeforeStart !== false`; the
+  runtime re-reads the persisted board value and prefers it). A blocked base refresh surfaces as
+  `Base ref update blocked for <selected ref>: <reason> <remedy>` built from the structured
+  `initialStart.failure` (no prompt was sent), and the start result carries the
+  `initialStart` outcome through.
+- `kickoffTaskInProgress` keeps the UPD-0.6 fresh-task ensure-skip (driven by
+  `runtime.getTaskInitialStartStatus` → `initialStartBaselineFixed === false`) and now additionally:
+  guards against duplicate start submissions while a start is in flight (`inFlightStartTaskIdsRef`);
+  polls the pollable status every 500 ms while a fresh task is preparing and mirrors the server's
+  live stage into `initialStartStageByTaskId` (no local heuristic — the query is the
+  reconnect/reload snapshot); and rolls an optimistically moved card back to its original column
+  through the established start-failure handling when the start is blocked.
+- Board cards render the live preparation stage (refreshing → creating_worktree →
+  recording_baseline) as a small status chip and disable the start button while preparing.
+
+### Checkbox surfaces (UPD-1.1/1.2)
+
+- `use-task-editor.ts`: loads the persisted card value into the edit form (absent reads as checked),
+  saves it on edit (when the baseline is fixed the persisted value is left untouched), and seeds the
+  create form with the shared checked default. The edit form disables the checkbox with an
+  explanation when the server-computed baseline-fixed signal is true (durable, reload-safe, covers
+  dispatch starts).
+- `task-create-dialog.tsx` / `task-inline-create-card.tsx`: **Update base ref before starting**
+  checkbox below the Worktree base ref selector (create and edit modes). Explicit `false` is
+  persisted on every create path (single, multi-create).
+- `web-ui/src/types/board.ts` and `board-state.ts` are unchanged from the UPD-0 parity work.
+
+### Route naming correction
+
+The pollable preparation-status route is `runtime.taskInitialStartStatus` (a tRPC query); the
+revision-4 notes called it `runtime.getTaskInitialStartStatus`. The context method name
+(`runtimeApi.getTaskInitialStartStatus`) is as documented; the exposed route name is
+`taskInitialStartStatus`.
+
+### User documentation
+
+`README.md` §4 (Start tasks) documents the checkbox, its default, the fixed-baseline read-only
+behavior, and the blocked-update remedy (resolve the fault and start again).
 
 ## Stop conditions
 

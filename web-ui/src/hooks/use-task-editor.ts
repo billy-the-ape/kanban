@@ -1,6 +1,6 @@
 import { deriveTaskTitleFromPrompt } from "@runtime-task-title";
 import type { Dispatch, SetStateAction } from "react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
 	normalizeStoredTaskAutoReviewMode,
@@ -8,12 +8,18 @@ import {
 	TASK_AUTO_REVIEW_MODE_STORAGE_KEY,
 	TASK_START_IN_PLAN_MODE_STORAGE_KEY,
 } from "@/hooks/app-utils";
-import type { RuntimeAgentId, RuntimeTaskClineSettings } from "@/runtime/types";
+import type { RuntimeAgentId, RuntimeTaskClineSettings, RuntimeTaskInitialStartStatusResponse } from "@/runtime/types";
 import { addTaskToColumnWithResult, findCardSelection, updateTask, updateTaskTitle } from "@/state/board-state";
 import { toTelemetrySelectedAgentId, trackTaskCreated } from "@/telemetry/events";
 import type { BoardCard, BoardData, TaskAutoReviewMode, TaskImage } from "@/types";
 import { resolveTaskAutoReviewMode } from "@/types";
 import { useBooleanLocalStorageValue, useRawLocalStorageValue } from "@/utils/react-use";
+
+/**
+ * UPD-0: missing values normalize to true; an explicit false disables the
+ * pre-start base refresh. New tasks start with the option checked.
+ */
+const DEFAULT_NEW_TASK_UPDATE_BASE_REF_BEFORE_START = true;
 
 interface UseTaskEditorInput {
 	board: BoardData;
@@ -24,6 +30,8 @@ interface UseTaskEditorInput {
 	selectedAgentId: RuntimeAgentId | null;
 	setSelectedTaskId: Dispatch<SetStateAction<string | null>>;
 	queueTaskStartAfterEdit?: (taskId: string) => void;
+	/** UPD-1: server-derived initial-start status (baseline-fixed signal gates the edit checkbox). */
+	getTaskInitialStartStatus: (taskId: string) => Promise<RuntimeTaskInitialStartStatusResponse | null>;
 }
 
 interface OpenEditTaskOptions {
@@ -49,6 +57,9 @@ export interface UseTaskEditorResult {
 	isNewTaskStartInPlanModeDisabled: boolean;
 	newTaskBranchRef: string;
 	setNewTaskBranchRef: Dispatch<SetStateAction<string>>;
+	/** UPD-1: new-task pre-start base refresh option (missing card values normalize to true). */
+	newTaskUpdateBaseRefBeforeStart: boolean;
+	setNewTaskUpdateBaseRefBeforeStart: Dispatch<SetStateAction<boolean>>;
 	newTaskAgentId: RuntimeAgentId | undefined;
 	setNewTaskAgentId: Dispatch<SetStateAction<RuntimeAgentId | undefined>>;
 	newTaskClineSettings: RuntimeTaskClineSettings | undefined;
@@ -71,6 +82,11 @@ export interface UseTaskEditorResult {
 	setEditTaskAgentId: Dispatch<SetStateAction<RuntimeAgentId | undefined>>;
 	editTaskClineSettings: RuntimeTaskClineSettings | undefined;
 	setEditTaskClineSettings: Dispatch<SetStateAction<RuntimeTaskClineSettings | undefined>>;
+	/** UPD-1: edit-task pre-start base refresh option (missing card values normalize to true). */
+	editTaskUpdateBaseRefBeforeStart: boolean;
+	setEditTaskUpdateBaseRefBeforeStart: Dispatch<SetStateAction<boolean>>;
+	/** UPD-1: server-derived; a fixed initial-start baseline makes the checkbox read-only. */
+	editTaskInitialBaselineFixed: boolean;
 	handleOpenCreateTask: () => void;
 	handleCancelCreateTask: () => void;
 	handleOpenEditTask: (task: BoardCard, options?: OpenEditTaskOptions) => void;
@@ -92,6 +108,7 @@ export function useTaskEditor({
 	selectedAgentId,
 	setSelectedTaskId,
 	queueTaskStartAfterEdit,
+	getTaskInitialStartStatus,
 }: UseTaskEditorInput): UseTaskEditorResult {
 	const [isInlineTaskCreateOpen, setIsInlineTaskCreateOpen] = useState(false);
 	const [newTaskPrompt, setNewTaskPrompt] = useState("");
@@ -120,6 +137,17 @@ export function useTaskEditor({
 	const [editTaskAutoReviewMode, setEditTaskAutoReviewMode] = useState<TaskAutoReviewMode>("commit");
 	const isEditTaskStartInPlanModeDisabled = false;
 	const [editTaskBranchRef, setEditTaskBranchRef] = useState("");
+	const [newTaskUpdateBaseRefBeforeStart, setNewTaskUpdateBaseRefBeforeStart] = useState(
+		DEFAULT_NEW_TASK_UPDATE_BASE_REF_BEFORE_START,
+	);
+	const [editTaskUpdateBaseRefBeforeStart, setEditTaskUpdateBaseRefBeforeStart] = useState(
+		DEFAULT_NEW_TASK_UPDATE_BASE_REF_BEFORE_START,
+	);
+	// UPD-1: server-derived baseline-fixed signal (durable and reload-safe). A
+	// failed query stays false so the checkbox remains editable; the server
+	// still gates the actual refresh on its own signal.
+	const [editTaskInitialBaselineFixed, setEditTaskInitialBaselineFixed] = useState(false);
+	const editInitialStartStatusTaskIdRef = useRef<string | null>(null);
 
 	const [newTaskAgentId, setNewTaskAgentId] = useState<RuntimeAgentId | undefined>(undefined);
 	const [newTaskClineSettings, setNewTaskClineSettings] = useState<RuntimeTaskClineSettings | undefined>(undefined);
@@ -190,8 +218,9 @@ export function useTaskEditor({
 			return;
 		}
 		const selection = findCardSelection(board, editingTaskId);
-		if (!selection || selection.column.id !== "backlog") {
+		if (selection?.column.id !== "backlog") {
 			setEditingTaskId(null);
+			editInitialStartStatusTaskIdRef.current = null;
 
 			setEditTaskPrompt("");
 			setEditTaskStartInPlanMode(false);
@@ -199,16 +228,20 @@ export function useTaskEditor({
 			setEditTaskAutoReviewMode("commit");
 			setEditTaskImages([]);
 			setEditTaskBranchRef("");
+			setEditTaskUpdateBaseRefBeforeStart(DEFAULT_NEW_TASK_UPDATE_BASE_REF_BEFORE_START);
+			setEditTaskInitialBaselineFixed(false);
 		}
 	}, [board, editingTaskId]);
 
 	const handleOpenCreateTask = useCallback(() => {
 		setEditingTaskId(null);
+		editInitialStartStatusTaskIdRef.current = null;
 		setEditTaskPrompt("");
 		setEditTaskImages([]);
 
 		setNewTaskAgentId(undefined);
 		setNewTaskClineSettings(undefined);
+		setNewTaskUpdateBaseRefBeforeStart(DEFAULT_NEW_TASK_UPDATE_BASE_REF_BEFORE_START);
 		setIsInlineTaskCreateOpen(true);
 	}, []);
 
@@ -220,6 +253,7 @@ export function useTaskEditor({
 		setNewTaskBranchRef(resolvedDefaultTaskBranchRef);
 		setNewTaskAgentId(undefined);
 		setNewTaskClineSettings(undefined);
+		setNewTaskUpdateBaseRefBeforeStart(DEFAULT_NEW_TASK_UPDATE_BASE_REF_BEFORE_START);
 	}, [resolvedDefaultTaskBranchRef]);
 
 	const handleOpenEditTask = useCallback(
@@ -243,12 +277,25 @@ export function useTaskEditor({
 			setEditTaskBranchRef(fallbackBranch);
 			setEditTaskAgentId(task.agentId);
 			setEditTaskClineSettings(task.clineSettings);
+			// UPD-1: load the persisted policy (missing values normalize to
+			// true) and ask the server whether the initial start baseline is
+			// already fixed; a fixed baseline makes the checkbox read-only.
+			setEditTaskUpdateBaseRefBeforeStart(task.updateBaseRefBeforeStart !== false);
+			setEditTaskInitialBaselineFixed(false);
+			const statusTaskId = task.id;
+			editInitialStartStatusTaskIdRef.current = statusTaskId;
+			void getTaskInitialStartStatus(statusTaskId).then((status) => {
+				if (status?.ok && editInitialStartStatusTaskIdRef.current === statusTaskId) {
+					setEditTaskInitialBaselineFixed(status.initialStartBaselineFixed === true);
+				}
+			});
 		},
-		[resolvedDefaultTaskBranchRef, setSelectedTaskId],
+		[getTaskInitialStartStatus, resolvedDefaultTaskBranchRef, setSelectedTaskId],
 	);
 
 	const handleCancelEditTask = useCallback(() => {
 		setEditingTaskId(null);
+		editInitialStartStatusTaskIdRef.current = null;
 
 		setEditTaskPrompt("");
 		setEditTaskStartInPlanMode(false);
@@ -256,6 +303,8 @@ export function useTaskEditor({
 		setEditTaskAutoReviewMode("commit");
 		setEditTaskImages([]);
 		setEditTaskBranchRef("");
+		setEditTaskUpdateBaseRefBeforeStart(DEFAULT_NEW_TASK_UPDATE_BASE_REF_BEFORE_START);
+		setEditTaskInitialBaselineFixed(false);
 	}, []);
 
 	const handleSaveEditedTask = useCallback((): string | null => {
@@ -286,10 +335,14 @@ export function useTaskEditor({
 				agentId: editTaskAgentId,
 				clineSettings: editTaskClineSettings,
 				baseRef,
+				// UPD-1: once the baseline is fixed the option no longer
+				// applies; keep the persisted value untouched.
+				updateBaseRefBeforeStart: editTaskInitialBaselineFixed ? undefined : editTaskUpdateBaseRefBeforeStart,
 			});
 			return updated.updated ? updated.board : currentBoard;
 		});
 		setEditingTaskId(null);
+		editInitialStartStatusTaskIdRef.current = null;
 
 		setEditTaskPrompt("");
 		setEditTaskStartInPlanMode(false);
@@ -299,6 +352,8 @@ export function useTaskEditor({
 		setEditTaskBranchRef("");
 		setEditTaskAgentId(undefined);
 		setEditTaskClineSettings(undefined);
+		setEditTaskUpdateBaseRefBeforeStart(DEFAULT_NEW_TASK_UPDATE_BASE_REF_BEFORE_START);
+		setEditTaskInitialBaselineFixed(false);
 		return savedTaskId;
 	}, [
 		editTaskAgentId,
@@ -306,9 +361,11 @@ export function useTaskEditor({
 		editTaskAutoReviewMode,
 		editTaskBranchRef,
 		editTaskClineSettings,
+		editTaskInitialBaselineFixed,
 		editTaskPrompt,
 		editTaskImages,
 		editTaskStartInPlanMode,
+		editTaskUpdateBaseRefBeforeStart,
 		editingTaskId,
 		resolvedDefaultTaskBranchRef,
 		setBoard,
@@ -353,6 +410,8 @@ export function useTaskEditor({
 				agentId: newTaskAgentId,
 				clineSettings: newTaskClineSettings,
 				baseRef,
+				// UPD-1: persist an explicit policy (unchecked must survive as false).
+				updateBaseRefBeforeStart: newTaskUpdateBaseRefBeforeStart,
 			});
 			setBoard(created.board);
 			trackTaskCreated({
@@ -389,6 +448,7 @@ export function useTaskEditor({
 			newTaskImages,
 			newTaskPrompt,
 			newTaskStartInPlanMode,
+			newTaskUpdateBaseRefBeforeStart,
 			resolvedDefaultTaskBranchRef,
 			selectedAgentId,
 			setBoard,
@@ -419,6 +479,8 @@ export function useTaskEditor({
 					agentId: newTaskAgentId,
 					clineSettings: newTaskClineSettings,
 					baseRef,
+					// UPD-1: persist an explicit policy (unchecked must survive as false).
+					updateBaseRefBeforeStart: newTaskUpdateBaseRefBeforeStart,
 				});
 				updatedBoard = created.board;
 				createdTaskIds.push(created.task.id);
@@ -459,6 +521,7 @@ export function useTaskEditor({
 			newTaskClineSettings,
 			newTaskImages,
 			newTaskStartInPlanMode,
+			newTaskUpdateBaseRefBeforeStart,
 			resolvedDefaultTaskBranchRef,
 			selectedAgentId,
 			setBoard,
@@ -470,8 +533,10 @@ export function useTaskEditor({
 	const resetTaskEditorState = useCallback(() => {
 		setIsInlineTaskCreateOpen(false);
 		setEditingTaskId(null);
+		editInitialStartStatusTaskIdRef.current = null;
 
 		setNewTaskPrompt("");
+		setNewTaskUpdateBaseRefBeforeStart(DEFAULT_NEW_TASK_UPDATE_BASE_REF_BEFORE_START);
 
 		setEditTaskPrompt("");
 		setEditTaskStartInPlanMode(false);
@@ -479,6 +544,8 @@ export function useTaskEditor({
 		setEditTaskAutoReviewMode("commit");
 		setEditTaskImages([]);
 		setEditTaskBranchRef("");
+		setEditTaskUpdateBaseRefBeforeStart(DEFAULT_NEW_TASK_UPDATE_BASE_REF_BEFORE_START);
+		setEditTaskInitialBaselineFixed(false);
 		setEditTaskAgentId(undefined);
 		setEditTaskClineSettings(undefined);
 		setNewTaskImages([]);
@@ -501,6 +568,8 @@ export function useTaskEditor({
 		isNewTaskStartInPlanModeDisabled,
 		newTaskBranchRef,
 		setNewTaskBranchRef,
+		newTaskUpdateBaseRefBeforeStart,
+		setNewTaskUpdateBaseRefBeforeStart,
 		newTaskAgentId,
 		setNewTaskAgentId,
 		newTaskClineSettings,
@@ -519,6 +588,9 @@ export function useTaskEditor({
 		isEditTaskStartInPlanModeDisabled,
 		editTaskBranchRef,
 		setEditTaskBranchRef,
+		editTaskUpdateBaseRefBeforeStart,
+		setEditTaskUpdateBaseRefBeforeStart,
+		editTaskInitialBaselineFixed,
 		editTaskAgentId,
 		setEditTaskAgentId,
 		editTaskClineSettings,
