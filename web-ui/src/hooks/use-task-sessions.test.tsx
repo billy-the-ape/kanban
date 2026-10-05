@@ -6,10 +6,16 @@ import { useTaskSessions } from "@/hooks/use-task-sessions";
 import type { BoardCard } from "@/types";
 
 const startTaskSessionMutateMock = vi.hoisted(() => vi.fn());
+const ensureWorktreeMutateMock = vi.hoisted(() => vi.fn());
 const trackTaskResumedFromTrashMock = vi.hoisted(() => vi.fn());
 
 vi.mock("@/runtime/trpc-client", () => ({
 	getRuntimeTrpcClient: () => ({
+		workspace: {
+			ensureWorktree: {
+				mutate: ensureWorktreeMutateMock,
+			},
+		},
 		runtime: {
 			startTaskSession: {
 				mutate: startTaskSessionMutateMock,
@@ -28,6 +34,7 @@ vi.mock("@/telemetry/events", () => ({
 
 interface HookSnapshot {
 	startTaskSession: ReturnType<typeof useTaskSessions>["startTaskSession"];
+	ensureTaskWorkspace: ReturnType<typeof useTaskSessions>["ensureTaskWorkspace"];
 }
 
 function createTask(): BoardCard {
@@ -53,8 +60,9 @@ function HookHarness({ onSnapshot }: { onSnapshot: (snapshot: HookSnapshot) => v
 	useEffect(() => {
 		onSnapshot({
 			startTaskSession: sessions.startTaskSession,
+			ensureTaskWorkspace: sessions.ensureTaskWorkspace,
 		});
-	}, [onSnapshot, sessions.startTaskSession]);
+	}, [onSnapshot, sessions.startTaskSession, sessions.ensureTaskWorkspace]);
 
 	return null;
 }
@@ -66,6 +74,7 @@ describe("useTaskSessions", () => {
 
 	beforeEach(() => {
 		startTaskSessionMutateMock.mockReset();
+		ensureWorktreeMutateMock.mockReset();
 		trackTaskResumedFromTrashMock.mockReset();
 		startTaskSessionMutateMock.mockResolvedValue({
 			ok: true,
@@ -127,6 +136,71 @@ describe("useTaskSessions", () => {
 		});
 
 		expect(trackTaskResumedFromTrashMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("treats the never-started ensure refusal as ok so the start can create the worktree", async () => {
+		ensureWorktreeMutateMock.mockResolvedValue({
+			ok: false,
+			path: null,
+			baseRef: "main",
+			baseCommit: null,
+			category: "initial_start_preparation_required",
+			error: "Start the task to create its worktree.",
+		});
+		let latestSnapshot: HookSnapshot | null = null;
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					onSnapshot={(snapshot) => {
+						latestSnapshot = snapshot;
+					}}
+				/>,
+			);
+		});
+
+		if (latestSnapshot === null) {
+			throw new Error("Expected a hook snapshot.");
+		}
+
+		let result: Awaited<ReturnType<HookSnapshot["ensureTaskWorkspace"]>> | null = null;
+		await act(async () => {
+			result = (await latestSnapshot?.ensureTaskWorkspace(createTask())) ?? null;
+		});
+
+		expect(result).toEqual({ ok: true });
+	});
+
+	it("still reports other ensure failures", async () => {
+		ensureWorktreeMutateMock.mockResolvedValue({
+			ok: false,
+			path: null,
+			baseRef: "main",
+			baseCommit: null,
+			error: "boom",
+		});
+		let latestSnapshot: HookSnapshot | null = null;
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					onSnapshot={(snapshot) => {
+						latestSnapshot = snapshot;
+					}}
+				/>,
+			);
+		});
+
+		if (latestSnapshot === null) {
+			throw new Error("Expected a hook snapshot.");
+		}
+
+		let result: Awaited<ReturnType<HookSnapshot["ensureTaskWorkspace"]>> | null = null;
+		await act(async () => {
+			result = (await latestSnapshot?.ensureTaskWorkspace(createTask())) ?? null;
+		});
+
+		expect(result).toEqual({ ok: false, message: "boom" });
 	});
 
 	it("does not track regular task starts", async () => {
