@@ -11,6 +11,8 @@ import { estimateTaskSessionGeometry } from "@/runtime/task-session-geometry";
 import { getRuntimeTrpcClient } from "@/runtime/trpc-client";
 import type {
 	RuntimeTaskChatMessage,
+	RuntimeTaskInitialStartOutcome,
+	RuntimeTaskInitialStartStatusResponse,
 	RuntimeTaskSessionMode,
 	RuntimeTaskSessionSummary,
 	RuntimeTaskWorkspaceInfoResponse,
@@ -42,6 +44,8 @@ interface SendTaskSessionInputResult {
 interface StartTaskSessionResult {
 	ok: boolean;
 	message?: string;
+	/** UPD-1: server-reported initial-start preparation outcome (final stage on success, structured failure on a blocked refresh). */
+	initialStart?: RuntimeTaskInitialStartOutcome | null;
 }
 
 interface StartTaskSessionOptions {
@@ -51,6 +55,13 @@ interface StartTaskSessionOptions {
 export interface UseTaskSessionsResult {
 	upsertSession: (summary: RuntimeTaskSessionSummary) => void;
 	ensureTaskWorkspace: (task: BoardCard) => Promise<EnsureTaskWorkspaceResult>;
+	/**
+	 * UPD-0: pollable initial-start preparation status. Callers use
+	 * `initialStartBaselineFixed` to distinguish fresh, unstarted tasks (server-
+	 * derived; never a local heuristic) from tasks that already have a fixed
+	 * baseline and keep the pre-start ensure.
+	 */
+	getTaskInitialStartStatus: (taskId: string) => Promise<RuntimeTaskInitialStartStatusResponse | null>;
 	startTaskSession: (task: BoardCard, options?: StartTaskSessionOptions) => Promise<StartTaskSessionResult>;
 	stopTaskSession: (taskId: string) => Promise<void>;
 	sendTaskSessionInput: (
@@ -162,28 +173,56 @@ export function useTaskSessions({ currentProjectId, setSessions }: UseTaskSessio
 					startInPlanMode: options?.resumeFromTrash ? undefined : task.startInPlanMode,
 					resumeFromTrash: options?.resumeFromTrash,
 					baseRef: task.baseRef,
+					// UPD-1: client-side copy of the persisted card policy; the
+					// runtime re-reads the board value and prefers it when present.
+					updateBaseRefBeforeStart: task.updateBaseRefBeforeStart !== false,
 					cols: geometry.cols,
 					rows: geometry.rows,
 					agentId: task.agentId,
 					clineSettings: task.clineSettings,
 				});
 				if (!payload.ok || !payload.summary) {
+					// UPD-1: a blocked base refresh is a structured failure
+					// (selected ref + reason + remedy) surfaced verbatim.
+					const failure = payload.initialStart?.failure;
+					const message = failure
+						? `Base ref update blocked for ${failure.selectedRef ?? task.baseRef}: ${failure.reason} ${failure.remedy}`
+						: (payload.error ?? "Task session start failed.");
 					return {
 						ok: false,
-						message: payload.error ?? "Task session start failed.",
+						message,
+						initialStart: payload.initialStart,
 					};
 				}
 				upsertSession(payload.summary);
 				if (options?.resumeFromTrash) {
 					trackTaskResumedFromTrash();
 				}
-				return { ok: true };
+				return { ok: true, initialStart: payload.initialStart };
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				return { ok: false, message };
 			}
 		},
 		[currentProjectId, upsertSession],
+	);
+
+	// UPD-0: durable, server-derived preparation status for the start path.
+	// Null on transport errors so callers fall back to the conservative
+	// (ensure-before-start) behavior instead of skipping preparation work.
+	const getTaskInitialStartStatus = useCallback(
+		async (taskId: string): Promise<RuntimeTaskInitialStartStatusResponse | null> => {
+			if (!currentProjectId) {
+				return null;
+			}
+			try {
+				const trpcClient = getRuntimeTrpcClient(currentProjectId);
+				return await trpcClient.runtime.taskInitialStartStatus.query({ taskId });
+			} catch {
+				return null;
+			}
+		},
+		[currentProjectId],
 	);
 
 	const stopTaskSession = useCallback(
@@ -287,6 +326,7 @@ export function useTaskSessions({ currentProjectId, setSessions }: UseTaskSessio
 		upsertSession,
 		ensureTaskWorkspace,
 		startTaskSession,
+		getTaskInitialStartStatus,
 		stopTaskSession,
 		sendTaskSessionInput,
 		sendTaskChatMessage,

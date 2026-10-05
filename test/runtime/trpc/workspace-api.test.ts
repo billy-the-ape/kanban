@@ -5,6 +5,7 @@ import type { RuntimeTaskSessionSummary, RuntimeWorkspaceChangesResponse } from 
 const workspaceTaskWorktreeMocks = vi.hoisted(() => ({
 	resolveTaskCwd: vi.fn(),
 	deleteTaskWorktree: vi.fn(),
+	ensureTaskWorktreeIfDoesntExist: vi.fn(),
 }));
 
 const workspaceChangesMocks = vi.hoisted(() => ({
@@ -16,7 +17,7 @@ const workspaceChangesMocks = vi.hoisted(() => ({
 
 vi.mock("../../../src/workspace/task-worktree.js", () => ({
 	deleteTaskWorktree: workspaceTaskWorktreeMocks.deleteTaskWorktree,
-	ensureTaskWorktreeIfDoesntExist: vi.fn(),
+	ensureTaskWorktreeIfDoesntExist: workspaceTaskWorktreeMocks.ensureTaskWorktreeIfDoesntExist,
 	getTaskWorkspaceInfo: vi.fn(),
 	resolveTaskCwd: workspaceTaskWorktreeMocks.resolveTaskCwd,
 }));
@@ -385,5 +386,67 @@ describe("createWorkspaceApi deleteWorktree (B-5.5)", () => {
 			repoPath: "/tmp/repo",
 			taskId: "task-1",
 		});
+	});
+});
+
+describe("createWorkspaceApi ensureWorktree (UPD-0.5 refusal)", () => {
+	const scope = { workspaceId: "workspace-1", workspacePath: "/tmp/repo" };
+
+	function createApi() {
+		return createWorkspaceApi({
+			ensureTerminalManagerForWorkspace: vi.fn(async () => ({ getSummary: vi.fn(() => null) }) as never),
+			getScopedClineTaskSessionService: vi.fn(async () => ({ getSummary: vi.fn(() => null) }) as never),
+			broadcastRuntimeWorkspaceStateUpdated: vi.fn(),
+			broadcastRuntimeProjectsUpdated: vi.fn(),
+			buildWorkspaceStateSnapshot: vi.fn(),
+		});
+	}
+
+	beforeEach(() => {
+		workspaceTaskWorktreeMocks.ensureTaskWorktreeIfDoesntExist.mockReset();
+	});
+
+	it("passes the fresh-task refusal through unchanged so no worktree is created", async () => {
+		workspaceTaskWorktreeMocks.ensureTaskWorktreeIfDoesntExist.mockResolvedValue({
+			ok: false,
+			path: null,
+			baseRef: "main",
+			baseCommit: null,
+			category: "initial_start_preparation_required",
+			remedy: "Start the task to create its worktree.",
+			error: 'The worktree for task "task-1" is created when the task starts, which prepares its base ref first. Start the task to create its worktree.',
+			restoredFromPreservation: false,
+		});
+
+		const response = await createApi().ensureWorktree(scope, { taskId: "task-1", baseRef: "main" });
+		expect(response.ok).toBe(false);
+		if (response.ok) {
+			throw new Error("Expected the generic ensure to be refused");
+		}
+		expect(response.path).toBeNull();
+		expect(response.category).toBe("initial_start_preparation_required");
+		expect(response.remedy).toBe("Start the task to create its worktree.");
+		expect(workspaceTaskWorktreeMocks.ensureTaskWorktreeIfDoesntExist).toHaveBeenCalledWith({
+			cwd: "/tmp/repo",
+			taskId: "task-1",
+			baseRef: "main",
+		});
+	});
+
+	it("keeps the reuse behavior for tasks that already have a worktree", async () => {
+		workspaceTaskWorktreeMocks.ensureTaskWorktreeIfDoesntExist.mockResolvedValue({
+			ok: true,
+			path: "/tmp/worktrees/repo/task-1",
+			baseRef: "main",
+			baseCommit: "abc123",
+			restoredFromPreservation: false,
+		});
+
+		const response = await createApi().ensureWorktree(scope, { taskId: "task-1", baseRef: "main" });
+		expect(response.ok).toBe(true);
+		if (response.ok) {
+			expect(response.path).toBe("/tmp/worktrees/repo/task-1");
+			expect(response.baseCommit).toBe("abc123");
+		}
 	});
 });

@@ -19,7 +19,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { getGitSyncSummary, runGitSyncAction } from "../../src/workspace/git-sync";
-import { deleteTaskWorktree, ensureTaskWorktreeIfDoesntExist } from "../../src/workspace/task-worktree";
+import { deleteTaskWorktree, prepareInitialTaskWorktree } from "../../src/workspace/task-worktree";
 import { createGitTestEnv } from "../utilities/git-env";
 import { createTempDir } from "../utilities/temp-dir";
 
@@ -104,16 +104,19 @@ async function createDeliveryFixture(prefix: string): Promise<DeliveryFixture> {
 	runGit(repoPath, ["remote", "add", "origin", originPath]);
 	runGit(repoPath, ["push", "-u", "origin", "main"]);
 
+	// UPD-0: the first worktree for a fresh task is created by the start-owned
+	// preparation (the generic ensure now refuses fresh tasks).
 	const ensureWorktree = async (taskId: string): Promise<string> => {
-		const ensured = await ensureTaskWorktreeIfDoesntExist({
+		const prepared = await prepareInitialTaskWorktree({
 			cwd: repoPath,
 			taskId,
 			baseRef: "main",
+			updateBaseRefBeforeStart: false,
 		});
-		if (!ensured.ok || !ensured.path) {
-			throw new Error(`Worktree creation failed: ${ensured.error ?? "unknown"}`);
+		if (!prepared.ok || !prepared.path) {
+			throw new Error(`Worktree creation failed: ${prepared.error ?? "unknown"}`);
 		}
-		return ensured.path;
+		return prepared.path;
 	};
 
 	return {

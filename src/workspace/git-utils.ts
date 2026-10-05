@@ -17,6 +17,8 @@ interface GitCommandResult {
 export interface RunGitOptions {
 	trimStdout?: boolean;
 	env?: NodeJS.ProcessEnv;
+	/** UPD-0: kill the git child after this many milliseconds (bounded network commands). */
+	timeoutMs?: number;
 }
 
 function normalizeProcessExitCode(code: unknown): number {
@@ -40,6 +42,7 @@ export async function runGit(cwd: string, args: string[], options: RunGitOptions
 			encoding: "utf8",
 			maxBuffer: GIT_MAX_BUFFER_BYTES,
 			env: options.env || createGitProcessEnv(),
+			timeout: options.timeoutMs,
 		});
 		const normalizedStdout = String(stdout ?? "").trim();
 		const normalizedStderr = String(stderr ?? "").trim();

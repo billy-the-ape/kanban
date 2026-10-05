@@ -30,7 +30,7 @@ import { getTaskColumnId, moveTaskToColumn } from "../core/task-board-mutations"
 import { lockedFileSystem } from "../fs/locked-file-system";
 import { getWorkspaceDirectoryPath } from "../state/workspace-state";
 import { readGitHeadInfo, runGit } from "../workspace/git-utils";
-import { ensureTaskWorktreeIfDoesntExist, resolveTaskCwd } from "../workspace/task-worktree";
+import { prepareInitialTaskWorktree, resolveTaskCwd } from "../workspace/task-worktree";
 import { clearTaskDispatchRecord, readTaskDispatchRecord, writeTaskDispatchRecord } from "./dispatch-records";
 
 /** B-9.7: automatic launch/recovery attempts per task before the queue gives up. */
@@ -127,6 +127,7 @@ export interface TaskDispatchDeps {
 		taskId: string;
 		baseRef: string;
 		requiredAncestors: string[];
+		updateBaseRefBeforeStart: boolean;
 	}) => Promise<TaskDispatchWorktreePreparation>;
 	/** Broadcast a state update after board mutations (fire-and-forget is fine). */
 	onStateUpdated?: () => void;
@@ -474,12 +475,17 @@ async function describeMissingWorktreeAncestors(
  * ancestry is verified. A missing worktree is created at the resolved base
  * ref (B-5 preservation restore honored); if the restored work predates a
  * delivered prerequisite, the result is a block, not a silent reset.
+ * UPD-0: missing worktrees are created through the start-owned preparation
+ * (persisted refresh policy + fixed-baseline evidence), never the generic
+ * ensure route.
  */
 export async function prepareTaskWorktreeBaseline(options: {
 	workspacePath: string;
 	taskId: string;
 	baseRef: string;
 	requiredAncestors: string[];
+	/** UPD-0: the persisted card policy; honored only for never-started tasks. */
+	updateBaseRefBeforeStart: boolean;
 }): Promise<TaskDispatchWorktreePreparation> {
 	const existingPath = await resolveTaskCwd({
 		cwd: options.workspacePath,
@@ -513,22 +519,32 @@ export async function prepareTaskWorktreeBaseline(options: {
 	if (!resolved.baseSha) {
 		return { ok: false, worktreePath: null, baseSha: null, error: resolved.error };
 	}
-	const ensured = await ensureTaskWorktreeIfDoesntExist({
+	// UPD-0: the start-owned preparation is the only initial-creation path.
+	// It honors the persisted refresh policy and fixed-baseline evidence
+	// (prepared baseline, preservation, patch, receipt, prior session) and
+	// never re-resolves a baseline that was already prepared.
+	const prepared = await prepareInitialTaskWorktree({
 		cwd: options.workspacePath,
 		taskId: options.taskId,
-		baseRef: resolved.baseSha,
+		baseRef: options.baseRef,
+		updateBaseRefBeforeStart: options.updateBaseRefBeforeStart,
 	});
-	if (!ensured.ok) {
-		return { ok: false, worktreePath: null, baseSha: null, error: ensured.error ?? "Worktree creation failed." };
+	if (!prepared.ok || prepared.path === null || prepared.baseCommit === null) {
+		return {
+			ok: false,
+			worktreePath: null,
+			baseSha: null,
+			error: prepared.error ?? "Worktree preparation failed.",
+		};
 	}
 	// B-5: when preserved work is restored or a stored patch is applied, the
 	// baseline is the recorded commit, not the requested base ref.
-	const baseSha = ensured.baseCommit ?? resolved.baseSha;
-	const missing = await describeMissingWorktreeAncestors(ensured.path, options.requiredAncestors, baseSha);
+	const baseSha = prepared.baseCommit;
+	const missing = await describeMissingWorktreeAncestors(prepared.path, options.requiredAncestors, baseSha);
 	if (missing) {
-		return { ok: false, worktreePath: ensured.path, baseSha, error: missing };
+		return { ok: false, worktreePath: prepared.path, baseSha, error: missing };
 	}
-	return { ok: true, worktreePath: ensured.path, baseSha, error: null };
+	return { ok: true, worktreePath: prepared.path, baseSha, error: null };
 }
 // --- fresh-context prompt (B-9.5) -------------------------------------------
 
@@ -637,12 +653,14 @@ async function dispatchSingleTask(
 	const requiredAncestors = extractRequiredAncestors(entry.prerequisites);
 	const prepare =
 		deps.prepareWorktree ??
-		((input: { taskId: string; baseRef: string; requiredAncestors: string[] }) =>
+		((input: { taskId: string; baseRef: string; requiredAncestors: string[]; updateBaseRefBeforeStart: boolean }) =>
 			prepareTaskWorktreeBaseline({ workspacePath: deps.workspacePath, ...input }));
 	const preparation = await prepare({
 		taskId,
 		baseRef: card.baseRef,
 		requiredAncestors,
+		// UPD-0: the persisted card policy is authoritative for dispatch starts.
+		updateBaseRefBeforeStart: card.updateBaseRefBeforeStart !== false,
 	});
 	if (!preparation.ok || !preparation.worktreePath || !preparation.baseSha) {
 		const error = preparation.error ?? "Worktree baseline verification failed.";
@@ -829,8 +847,12 @@ export async function reconcileTaskDispatch(deps: TaskDispatchDeps): Promise<Run
 		const titleByTaskId = collectCardTitles(board);
 		const prepare =
 			deps.prepareWorktree ??
-			((input: { taskId: string; baseRef: string; requiredAncestors: string[] }) =>
-				prepareTaskWorktreeBaseline({ workspacePath: deps.workspacePath, ...input }));
+			((input: {
+				taskId: string;
+				baseRef: string;
+				requiredAncestors: string[];
+				updateBaseRefBeforeStart: boolean;
+			}) => prepareTaskWorktreeBaseline({ workspacePath: deps.workspacePath, ...input }));
 		const relaunchedTaskIds: string[] = [];
 		const skippedTaskIds: string[] = [];
 		for (const card of inProgressColumn?.cards ?? []) {
@@ -861,6 +883,9 @@ export async function reconcileTaskDispatch(deps: TaskDispatchDeps): Promise<Run
 				taskId: card.id,
 				baseRef: record.baseRef,
 				requiredAncestors: extractRequiredAncestors(record.prerequisites),
+				// UPD-0: recovery never re-resolves; the flag only matters for
+				// the (unlikely) never-prepared worktree in the recovery path.
+				updateBaseRefBeforeStart: card.updateBaseRefBeforeStart !== false,
 			});
 			if (!preparation.ok || !preparation.baseSha) {
 				await writeTaskDispatchRecord({

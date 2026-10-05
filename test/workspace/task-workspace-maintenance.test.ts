@@ -8,7 +8,7 @@ import { describe, expect, it } from "vitest";
 import type { RuntimeBoardData, RuntimeGitDeliveryReceipt } from "../../src/core/api-contract";
 import { readTaskPreservationRecord } from "../../src/workspace/task-preservation";
 import { listBlockedTaskCleanups, runTaskWorkspaceMaintenance } from "../../src/workspace/task-workspace-maintenance";
-import { ensureTaskWorktreeIfDoesntExist, taskWorktreeExists } from "../../src/workspace/task-worktree";
+import { prepareInitialTaskWorktree, taskWorktreeExists } from "../../src/workspace/task-worktree";
 import { createGitTestEnv } from "../utilities/git-env";
 import { createTempDir } from "../utilities/temp-dir";
 
@@ -76,13 +76,19 @@ function board(columns: Partial<Record<"review" | "done" | "trash", Array<{ id: 
 	return result;
 }
 
+// UPD-0: initial worktrees are created by the start-owned preparation.
 async function createWorktree(repoPath: string, taskId: string): Promise<string> {
-	const ensured = await ensureTaskWorktreeIfDoesntExist({ cwd: repoPath, taskId, baseRef: "HEAD" });
-	if (!ensured.ok || !ensured.path) {
+	const prepared = await prepareInitialTaskWorktree({
+		cwd: repoPath,
+		taskId,
+		baseRef: "HEAD",
+		updateBaseRefBeforeStart: false,
+	});
+	if (!prepared.ok || !prepared.path) {
 		throw new Error(`worktree for ${taskId} was not created`);
 	}
-	writeFileSync(join(ensured.path, "work.txt"), `${taskId} work\n`, "utf8");
-	return ensured.path;
+	writeFileSync(join(prepared.path, "work.txt"), `${taskId} work\n`, "utf8");
+	return prepared.path;
 }
 
 const deliveredReceipt = (taskId: string, updatedAt: number) =>

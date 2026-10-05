@@ -194,6 +194,7 @@ export default function App(): ReactElement {
 	const {
 		upsertSession,
 		ensureTaskWorkspace,
+		getTaskInitialStartStatus,
 		startTaskSession,
 		stopTaskSession,
 		sendTaskSessionInput,
@@ -323,6 +324,11 @@ export default function App(): ReactElement {
 		setEditTaskAgentId,
 		editTaskClineSettings,
 		setEditTaskClineSettings,
+		newTaskUpdateBaseRefBeforeStart,
+		setNewTaskUpdateBaseRefBeforeStart,
+		editTaskUpdateBaseRefBeforeStart,
+		setEditTaskUpdateBaseRefBeforeStart,
+		editTaskInitialBaselineFixed,
 		handleOpenCreateTask,
 		handleCancelCreateTask,
 		handleOpenEditTask,
@@ -342,6 +348,7 @@ export default function App(): ReactElement {
 		selectedAgentId: runtimeProjectConfig?.selectedAgentId ?? null,
 		setSelectedTaskId,
 		queueTaskStartAfterEdit,
+		getTaskInitialStartStatus,
 	});
 
 	useEffect(() => {
@@ -581,6 +588,7 @@ export default function App(): ReactElement {
 		moveToTrashLoadingById,
 		completeTaskLoadingById,
 		trashTaskCount,
+		initialStartStageByTaskId,
 	} = useBoardInteractions({
 		board,
 		setBoard,
@@ -595,6 +603,7 @@ export default function App(): ReactElement {
 		stopTaskSession,
 		cleanupTaskWorkspace,
 		ensureTaskWorkspace,
+		getTaskInitialStartStatus,
 		startTaskSession,
 		fetchTaskWorkspaceInfo,
 		sendTaskSessionInput,
@@ -788,6 +797,9 @@ export default function App(): ReactElement {
 			branchRef={editTaskBranchRef}
 			branchOptions={createTaskBranchOptions}
 			onBranchRefChange={setEditTaskBranchRef}
+			updateBaseRefBeforeStart={editTaskUpdateBaseRefBeforeStart}
+			onUpdateBaseRefBeforeStartChange={setEditTaskUpdateBaseRefBeforeStart}
+			initialBaselineFixed={editTaskInitialBaselineFixed}
 			agentId={editTaskAgentId}
 			onAgentIdChange={setEditTaskAgentId}
 			clineSettings={editTaskClineSettings}
@@ -943,6 +955,7 @@ export default function App(): ReactElement {
 												taskSessions={sessions}
 												workspacePath={workspacePath}
 												workspaceId={currentProjectId}
+												initialStartStageByTaskId={initialStartStageByTaskId}
 												onCardSelect={handleCardSelect}
 												onCreateTask={handleOpenCreateTask}
 												onStartTask={handleStartTaskFromBoard}
@@ -1144,6 +1157,8 @@ export default function App(): ReactElement {
 					branchRef={newTaskBranchRef}
 					branchOptions={createTaskBranchOptions}
 					onBranchRefChange={setNewTaskBranchRef}
+					updateBaseRefBeforeStart={newTaskUpdateBaseRefBeforeStart}
+					onUpdateBaseRefBeforeStartChange={setNewTaskUpdateBaseRefBeforeStart}
 					agentId={newTaskAgentId}
 					onAgentIdChange={setNewTaskAgentId}
 					clineSettings={newTaskClineSettings}

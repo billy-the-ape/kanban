@@ -5,7 +5,7 @@ import type { MouseEvent as ReactMouseEvent, ReactNode } from "react";
 import { BoardCard } from "@/components/board-card";
 import { Button } from "@/components/ui/button";
 import { ColumnIndicator } from "@/components/ui/column-indicator";
-import type { RuntimeTaskPhaseSummary, RuntimeTaskSessionSummary } from "@/runtime/types";
+import type { RuntimeTaskInitialStartStage, RuntimeTaskPhaseSummary, RuntimeTaskSessionSummary } from "@/runtime/types";
 import { isCardDropDisabled, isTaskSessionRunning, type ProgrammaticCardMoveInFlight } from "@/state/drag-rules";
 import type { BoardCard as BoardCardModel, BoardColumnId, BoardColumn as BoardColumnModel } from "@/types";
 
@@ -43,6 +43,7 @@ export function BoardColumn({
 	workspacePath,
 	defaultClineModelId,
 	taskPhases,
+	initialStartStageByTaskId,
 }: {
 	column: BoardColumnModel;
 	taskSessions: Record<string, RuntimeTaskSessionSummary>;
@@ -78,6 +79,8 @@ export function BoardColumn({
 	defaultClineModelId?: string | null;
 	/** B-10.1: reliable-completion phase summaries for the board chips. */
 	taskPhases?: Record<string, RuntimeTaskPhaseSummary>;
+	/** UPD-1.3: live initial-start preparation stages per task while a start is in flight. */
+	initialStartStageByTaskId?: Record<string, RuntimeTaskInitialStartStage>;
 }): React.ReactElement {
 	const canCreate = column.id === "backlog" && onCreateTask;
 	const canStartAllTasks = column.id === "backlog" && onStartAllTasks;
@@ -185,6 +188,7 @@ export function BoardColumn({
 											columnId={column.id}
 											sessionSummary={taskSessions[card.id]}
 											phaseSummary={taskPhases?.[card.id]}
+											initialStartStage={initialStartStageByTaskId?.[card.id]}
 											onStart={onStartTask}
 											onMoveToTrash={onMoveToTrashTask}
 											onComplete={onCompleteTask}

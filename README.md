@@ -54,6 +54,8 @@ Create a task card manually, or open the sidebar chat and ask your agent to brea
 ### 4. Start tasks
 Hit the play button on a card. Kanban creates an ephemeral worktree just for that task so agents work in parallel without merge conflicts. Under the hood, it also symlinks gitignored files like `node_modules` so you don't have to worry about slow `npm install`s for each copy of your project.
 
+By default, before a task's first start Kanban fetches origin and fast-forwards the task's base ref so the worktree is created from the newest known state. You can toggle this off with the **Update base ref before starting** checkbox in the create-task form or when editing a backlog card; the choice is saved with the card and also applies to automated starts. Once a task has started, its baseline is fixed and the checkbox becomes read-only. If the update can't fast-forward (for example a dirty or diverged base), the task stays in the backlog and the card shows the ref, reason, and how to fix it — resolve the fault and start again.
+
 > [!NOTE]
 > [Symlinks (symbolic links)](https://en.wikipedia.org/wiki/Symbolic_link) are special "shortcuts" pointing to another file or directory, allowing access to the target from a new location without duplicating data. They work great in this case since you typically don't modify gitignored files in day-to-day work, but for when you do then don't use Kanban.
 

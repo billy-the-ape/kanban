@@ -16,7 +16,7 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/components/ui/cn";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip } from "@/components/ui/tooltip";
-import type { RuntimeTaskPhaseSummary, RuntimeTaskSessionSummary } from "@/runtime/types";
+import type { RuntimeTaskInitialStartStage, RuntimeTaskPhaseSummary, RuntimeTaskSessionSummary } from "@/runtime/types";
 import { useTaskWorkspaceSnapshotValue } from "@/stores/workspace-metadata-store";
 import type { BoardCard as BoardCardModel, BoardColumnId } from "@/types";
 import { getTaskAutoReviewCancelButtonLabel } from "@/types";
@@ -51,6 +51,21 @@ const DESCRIPTION_EXPAND_LABEL = "See more";
 const DESCRIPTION_COLLAPSE_LABEL = "Less";
 const DESCRIPTION_COLLAPSE_SUFFIX = `… ${DESCRIPTION_EXPAND_LABEL}`;
 const DESCRIPTION_EXPANDED_SUFFIX = `… ${DESCRIPTION_COLLAPSE_LABEL}`;
+
+// UPD-1.3: in-flight initial-start preparation stages surfaced on the card.
+const INITIAL_START_PREPARING_STAGES: ReadonlySet<RuntimeTaskInitialStartStage> = new Set([
+	"refreshing",
+	"creating_worktree",
+	"recording_baseline",
+]);
+const INITIAL_START_STAGE_LABELS: Record<RuntimeTaskInitialStartStage, string> = {
+	idle: "",
+	refreshing: "Updating base ref",
+	creating_worktree: "Creating worktree",
+	recording_baseline: "Recording baseline",
+	ready: "Ready",
+	blocked: "Base ref blocked",
+};
 
 function reconstructTaskWorktreeDisplayPath(taskId: string, workspacePath: string | null | undefined): string | null {
 	if (!workspacePath) {
@@ -239,6 +254,7 @@ export function BoardCard({
 	workspacePath,
 	defaultClineModelId = null,
 	phaseSummary,
+	initialStartStage,
 }: {
 	card: BoardCardModel;
 	index: number;
@@ -269,6 +285,8 @@ export function BoardCard({
 	defaultClineModelId?: string | null;
 	/** B-10.1: reliable-completion phase for the card chip (null = no phase). */
 	phaseSummary?: RuntimeTaskPhaseSummary;
+	/** UPD-1.3: live initial-start preparation stage while a start is in flight. */
+	initialStartStage?: RuntimeTaskInitialStartStage;
 }): React.ReactElement {
 	const [isHovered, setIsHovered] = useState(false);
 	const [isEditingTitle, setIsEditingTitle] = useState(false);
@@ -284,6 +302,8 @@ export function BoardCard({
 	const isTrashCard = columnId === "trash";
 	const isDoneCard = columnId === "done";
 	const isCardInteractive = !isTrashCard && !isDoneCard;
+	const isPreparingInitialStart =
+		initialStartStage !== undefined && INITIAL_START_PREPARING_STAGES.has(initialStartStage);
 	const descriptionWidth = descriptionRect.width > 0 ? descriptionRect.width : descriptionWidthFallback;
 	const rawSessionActivity = useMemo(() => getCardSessionActivity(sessionSummary), [sessionSummary]);
 	const lastSessionActivityRef = useRef<CardSessionActivity | null>(null);
@@ -619,12 +639,24 @@ export function BoardCard({
 								{columnId !== "trash" ? (
 									<TaskPhaseBadge summary={phaseSummary} columnId={columnId} className="shrink-0" />
 								) : null}
+								{isPreparingInitialStart && initialStartStage ? (
+									<span
+										role="status"
+										aria-label={INITIAL_START_STAGE_LABELS[initialStartStage]}
+										className="inline-flex shrink-0 items-center gap-1 rounded-md border border-border bg-surface-0 px-1.5 py-0.5 text-[11px] text-status-blue"
+									>
+										<Spinner size={10} />
+										{INITIAL_START_STAGE_LABELS[initialStartStage]}
+									</span>
+								) : null}
+
 								{columnId === "backlog" ? (
 									<Button
 										icon={<Play size={14} />}
 										variant="ghost"
 										size="sm"
 										aria-label="Start task"
+										disabled={isPreparingInitialStart}
 										onMouseDown={stopEvent}
 										onClick={(event) => {
 											stopEvent(event);

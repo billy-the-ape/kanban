@@ -22,6 +22,8 @@ export interface RuntimeCreateTaskInput {
 	agentId?: RuntimeAgentId;
 	clineSettings?: RuntimeTaskClineSettings;
 	baseRef: string;
+	/** UPD-0: missing values normalize to true; an explicit false is persisted as false. */
+	updateBaseRefBeforeStart?: boolean;
 }
 
 export interface RuntimeUpdateTaskInput {
@@ -34,6 +36,8 @@ export interface RuntimeUpdateTaskInput {
 	agentId?: RuntimeAgentId | null;
 	clineSettings?: RuntimeTaskClineSettings | null;
 	baseRef: string;
+	/** UPD-0: undefined keeps the card's existing policy; explicit values overwrite. */
+	updateBaseRefBeforeStart?: boolean;
 }
 
 function normalizeTaskAutoReviewMode(value: RuntimeTaskAutoReviewMode | null | undefined): RuntimeTaskAutoReviewMode {
@@ -327,6 +331,8 @@ export function addTaskToColumn(
 		...(input.agentId ? { agentId: input.agentId } : {}),
 		...(input.clineSettings !== undefined ? { clineSettings: cloneTaskClineSettings(input.clineSettings) } : {}),
 		baseRef,
+		// UPD-0: missing normalizes to true; explicit false survives.
+		updateBaseRefBeforeStart: input.updateBaseRefBeforeStart !== false,
 		createdAt: now,
 		updatedAt: now,
 	};
@@ -664,6 +670,12 @@ export function updateTask(
 							? undefined
 							: cloneTaskClineSettings(input.clineSettings),
 				baseRef,
+				// UPD-0: an explicit false must survive; a missing input keeps the
+				// card's policy (normalized so legacy cards read as true).
+				updateBaseRefBeforeStart:
+					input.updateBaseRefBeforeStart === undefined
+						? card.updateBaseRefBeforeStart !== false
+						: input.updateBaseRefBeforeStart,
 				updatedAt: now,
 			};
 			return updatedTask;

@@ -7,7 +7,11 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { getTaskPreservationDir, readTaskPreservationRecord } from "../../src/workspace/task-preservation";
-import { deleteTaskWorktree, ensureTaskWorktreeIfDoesntExist } from "../../src/workspace/task-worktree";
+import {
+	deleteTaskWorktree,
+	ensureTaskWorktreeIfDoesntExist,
+	prepareInitialTaskWorktree,
+} from "../../src/workspace/task-worktree";
 import { createGitTestEnv } from "../utilities/git-env";
 import { createTempDir } from "../utilities/temp-dir";
 
@@ -53,6 +57,22 @@ async function withRepo(run: (repoPath: string) => Promise<void>): Promise<void>
 	}
 }
 
+// UPD-0: the first worktree for a fresh task is created by the start-owned
+// preparation; the generic ensure refuses fresh tasks and only restores or
+// reuses existing state.
+async function startWorktree(repoPath: string, taskId: string): Promise<string> {
+	const prepared = await prepareInitialTaskWorktree({
+		cwd: repoPath,
+		taskId,
+		baseRef: "HEAD",
+		updateBaseRefBeforeStart: false,
+	});
+	if (!prepared.ok || !prepared.path) {
+		throw new Error(`worktree for ${taskId} was not prepared: ${prepared.error ?? ""}`);
+	}
+	return prepared.path;
+}
+
 async function ensureWorktree(repoPath: string, taskId: string): Promise<string> {
 	const ensured = await ensureTaskWorktreeIfDoesntExist({ cwd: repoPath, taskId, baseRef: "HEAD" });
 	if (!ensured.ok || !ensured.path) {
@@ -67,7 +87,7 @@ describe("task work preservation acceptance (B-5.2/B-5.3/B-5.6)", () => {
 	it("restores modified, deleted, hidden, untracked, and binary content exactly", async () => {
 		await withRepo(async (repoPath) => {
 			const taskId = "preserve-all-kinds";
-			const worktree = await ensureWorktree(repoPath, taskId);
+			const worktree = await startWorktree(repoPath, taskId);
 			writeFileSync(join(worktree, "README.md"), "hello, changed\n", "utf8");
 			rmSync(join(worktree, "remove-me.txt"));
 			mkdirSync(join(worktree, ".hidden"), { recursive: true });
@@ -92,7 +112,7 @@ describe("task work preservation acceptance (B-5.2/B-5.3/B-5.6)", () => {
 	it("keeps an unintegrated manual commit recoverable after cleanup (B-5.2/B-5.4)", async () => {
 		await withRepo(async (repoPath) => {
 			const taskId = "preserve-manual-commit";
-			const worktree = await ensureWorktree(repoPath, taskId);
+			const worktree = await startWorktree(repoPath, taskId);
 			writeFileSync(join(worktree, "feature.txt"), "committed work\n", "utf8");
 			runGit(worktree, ["add", "feature.txt"]);
 			runGit(worktree, ["commit", "-qm", "manual task commit"]);
@@ -116,7 +136,7 @@ describe("task work preservation acceptance (B-5.2/B-5.3/B-5.6)", () => {
 	it("blocks cleanup and records why when the preservation write fails (B-5.3)", async () => {
 		await withRepo(async (repoPath) => {
 			const taskId = "preserve-write-fails";
-			const worktree = await ensureWorktree(repoPath, taskId);
+			const worktree = await startWorktree(repoPath, taskId);
 			writeFileSync(join(worktree, "work.txt"), "unsaved work\n", "utf8");
 			// Make the archive write fail: a regular file where the archive must go.
 			const preservationDir = getTaskPreservationDir(taskId);
