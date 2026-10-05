@@ -578,7 +578,8 @@ export function TaskAgentModelPicker({
 													return;
 												}
 												if (!value || !reasoningEnabledModelIdSet.has(value)) {
-													setReasoningEffortWithOverride("");
+													// Model and reasoning settings were already updated together above.
+													setReasoningEffort("");
 												}
 											}}
 											reasoningEnabledModelIds={reasoningEnabledModelIds}
