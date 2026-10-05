@@ -219,7 +219,6 @@ describe("useBoardInteractions", () => {
 		}
 	});
 
-
 	it("moves a running backlog task into In Progress when its session is hydrated", async () => {
 		useProgrammaticCardMovesMock.mockReturnValue({
 			handleProgrammaticCardMoveReady: () => {},
