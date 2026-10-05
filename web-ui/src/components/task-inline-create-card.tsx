@@ -64,6 +64,11 @@ export function TaskInlineCreateCard({
 	branchRef,
 	branchOptions,
 	onBranchRefChange,
+	/** UPD-1: pre-start base refresh policy (missing values render unchecked only via prop omission). */
+	updateBaseRefBeforeStart,
+	onUpdateBaseRefBeforeStartChange,
+	/** UPD-1: server-derived signal; a fixed initial-start baseline makes the checkbox read-only. */
+	initialBaselineFixed,
 	enabled = true,
 	mode = "create",
 	idPrefix = "inline-task",
@@ -96,6 +101,9 @@ export function TaskInlineCreateCard({
 	branchRef: string;
 	branchOptions: TaskBranchOption[];
 	onBranchRefChange: (value: string) => void;
+	updateBaseRefBeforeStart?: boolean;
+	onUpdateBaseRefBeforeStartChange?: (value: boolean) => void;
+	initialBaselineFixed?: boolean;
 	enabled?: boolean;
 	mode?: TaskInlineCardMode;
 	idPrefix?: string;
@@ -117,6 +125,7 @@ export function TaskInlineCreateCard({
 	const autoReviewEnabledId = `${idPrefix}-auto-review-enabled-toggle`;
 	const autoReviewModeId = `${idPrefix}-auto-review-mode-select`;
 	const branchSelectId = `${idPrefix}-branch-select`;
+	const updateBaseRefBeforeStartId = `${idPrefix}-update-base-ref-before-start`;
 	const actionLabel = mode === "edit" ? "Save" : "Create";
 	const [measureRef, cardRect] = useMeasure<HTMLDivElement>();
 	const containerRef = useRef<HTMLDivElement | null>(null);
@@ -272,6 +281,28 @@ export function TaskInlineCreateCard({
 						emptyText="No branches detected"
 					/>
 				</div>
+
+				<label
+					htmlFor={updateBaseRefBeforeStartId}
+					className="flex items-center gap-2 text-[12px] text-text-primary cursor-pointer select-none"
+				>
+					<RadixCheckbox.Root
+						id={updateBaseRefBeforeStartId}
+						aria-label="Update base ref before starting"
+						checked={updateBaseRefBeforeStart === true}
+						onCheckedChange={(checked) => onUpdateBaseRefBeforeStartChange?.(checked === true)}
+						disabled={!enabled || initialBaselineFixed === true}
+						className="flex h-3.5 w-3.5 cursor-pointer items-center justify-center rounded-sm border border-border-bright bg-surface-3 data-[state=checked]:bg-accent data-[state=checked]:border-accent disabled:cursor-default disabled:opacity-40"
+					>
+						<RadixCheckbox.Indicator>
+							<Check size={10} className="text-white" />
+						</RadixCheckbox.Indicator>
+					</RadixCheckbox.Root>
+					<span>Update base ref before starting</span>
+					{initialBaselineFixed ? (
+						<span className="text-[11px] text-text-tertiary">(baseline already fixed)</span>
+					) : null}
+				</label>
 
 				<div className="flex items-center gap-2 flex-wrap">
 					<label

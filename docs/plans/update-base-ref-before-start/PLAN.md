@@ -1,6 +1,8 @@
 # Update task base ref before starting
 
-Status: Proposed; this PR contains the plan only.
+Status: Implemented — UPD-0 (runtime preparation, policy, Git integration) and UPD-1 (checkbox, start
+progress, end-to-end verification) PRs both target `feat/update-base`; see [UPD-0.md](./UPD-0.md) and
+[UPD-1.md](./UPD-1.md) for the implementation records.
 Target: `billy-the-ape/kanban`, `main`.
 Code baseline inspected: `ba3b7151f44f9ed5d1cb4d83590e98388ae2cac7`.
 

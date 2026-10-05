@@ -118,6 +118,9 @@ export function TaskCreateDialog({
 	branchRef,
 	branchOptions,
 	onBranchRefChange,
+	/** UPD-1: pre-start base refresh option (new tasks default to checked). */
+	updateBaseRefBeforeStart,
+	onUpdateBaseRefBeforeStartChange,
 	agentId,
 	onAgentIdChange,
 	clineSettings,
@@ -149,6 +152,8 @@ export function TaskCreateDialog({
 	branchRef: string;
 	branchOptions: BranchSelectOption[];
 	onBranchRefChange: (value: string) => void;
+	updateBaseRefBeforeStart: boolean;
+	onUpdateBaseRefBeforeStartChange: (value: boolean) => void;
 	agentId?: RuntimeAgentId | undefined;
 	onAgentIdChange?: (value: RuntimeAgentId | undefined) => void;
 	clineSettings?: RuntimeTaskClineSettings | undefined;
@@ -170,6 +175,7 @@ export function TaskCreateDialog({
 	const nextFocusIndexRef = useRef<number | null>(null);
 	const startInPlanModeId = useId();
 	const autoReviewEnabledId = useId();
+	const updateBaseRefBeforeStartId = useId();
 	const createMoreId = useId();
 	const [primaryStartAction, setPrimaryStartAction] = useRawLocalStorageValue<TaskCreateStartAction>(
 		LocalStorageKey.TaskCreatePrimaryStartAction,
@@ -544,6 +550,27 @@ export function TaskCreateDialog({
 							emptyText="No branches detected"
 						/>
 					</div>
+
+					<label
+						htmlFor={updateBaseRefBeforeStartId}
+						className="flex items-center gap-2 text-[12px] text-text-primary cursor-pointer select-none"
+					>
+						<RadixCheckbox.Root
+							id={updateBaseRefBeforeStartId}
+							aria-label="Update base ref before starting"
+							checked={updateBaseRefBeforeStart}
+							onCheckedChange={(checked) => onUpdateBaseRefBeforeStartChange(checked === true)}
+							className="flex h-3.5 w-3.5 cursor-pointer items-center justify-center rounded-sm border border-border-bright bg-surface-3 data-[state=checked]:bg-accent data-[state=checked]:border-accent"
+						>
+							<RadixCheckbox.Indicator>
+								<Check size={10} className="text-white" />
+							</RadixCheckbox.Indicator>
+						</RadixCheckbox.Root>
+						Update base ref before starting
+					</label>
+					<p className="-mt-1.5 ml-[22px] text-[11px] text-text-tertiary">
+						Fetch origin and fast-forward the base ref before creating the worktree.
+					</p>
 
 					<div className="flex items-center gap-2 flex-wrap">
 						<label

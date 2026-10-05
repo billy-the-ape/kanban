@@ -189,7 +189,41 @@ describe("useTaskSessions", () => {
 			rows: 40,
 			agentId: undefined,
 			clineSettings: undefined,
+			// UPD-1: the persisted policy is forwarded; missing values normalize to true.
+			updateBaseRefBeforeStart: true,
 		});
+	});
+
+	it("forwards an explicit false base refresh policy when starting a task", async () => {
+		let latestSnapshot: HookSnapshot | null = null;
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					onSnapshot={(snapshot) => {
+						latestSnapshot = snapshot;
+					}}
+				/>,
+			);
+		});
+
+		if (latestSnapshot === null) {
+			throw new Error("Expected a hook snapshot.");
+		}
+
+		await act(async () => {
+			await latestSnapshot?.startTaskSession({
+				...createTask(),
+				updateBaseRefBeforeStart: false,
+			});
+		});
+
+		expect(startTaskSessionMutateMock).toHaveBeenCalledWith(
+			expect.objectContaining({
+				taskId: "task-1",
+				updateBaseRefBeforeStart: false,
+			}),
+		);
 	});
 
 	it("forwards task images when starting a task", async () => {

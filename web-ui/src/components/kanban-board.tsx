@@ -15,7 +15,7 @@ import { BoardColumn } from "@/components/board-column";
 import { DependencyOverlay } from "@/components/dependencies/dependency-overlay";
 import { useDependencyLinking } from "@/components/dependencies/use-dependency-linking";
 import { useTaskPhases } from "@/hooks/use-task-phases";
-import type { RuntimeTaskSessionSummary } from "@/runtime/types";
+import type { RuntimeTaskInitialStartStage, RuntimeTaskSessionSummary } from "@/runtime/types";
 import { canCreateTaskDependency } from "@/state/board-state";
 import { findCardColumnId, type ProgrammaticCardMoveInFlight } from "@/state/drag-rules";
 import type { BoardCard, BoardColumnId, BoardData, BoardDependency } from "@/types";
@@ -59,6 +59,7 @@ export function KanbanBoard({
 	workspacePath,
 	defaultClineModelId,
 	workspaceId,
+	initialStartStageByTaskId,
 }: {
 	data: BoardData;
 	taskSessions: Record<string, RuntimeTaskSessionSummary>;
@@ -91,6 +92,8 @@ export function KanbanBoard({
 	defaultClineModelId?: string | null;
 	/** B-10.1: workspace scope for the batched phase query (null disables chips). */
 	workspaceId?: string | null;
+	/** UPD-1.3: live initial-start preparation stages per task while a start is in flight. */
+	initialStartStageByTaskId?: Record<string, RuntimeTaskInitialStartStage>;
 }): React.ReactElement {
 	const dragOccurredRef = useRef(false);
 	const boardRef = useRef<HTMLElement>(null);
@@ -448,6 +451,7 @@ export function KanbanBoard({
 						workspacePath={workspacePath}
 						defaultClineModelId={defaultClineModelId}
 						taskPhases={taskPhases}
+						initialStartStageByTaskId={initialStartStageByTaskId}
 						onCardClick={(card) => {
 							if (!dragOccurredRef.current) {
 								onCardSelect(card.id);
