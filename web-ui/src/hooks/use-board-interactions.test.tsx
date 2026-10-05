@@ -12,6 +12,9 @@ import type {
 } from "@/runtime/types";
 import type { BoardCard, BoardData } from "@/types";
 
+const returnQueuedTaskMock = vi.hoisted(() => vi.fn());
+vi.mock("@/runtime/task-queue", () => ({ returnQueuedTaskToBacklog: returnQueuedTaskMock }));
+
 const notifyErrorMock = vi.hoisted(() => vi.fn());
 const showAppToastMock = vi.hoisted(() => vi.fn());
 const useLinkedBacklogTaskActionsMock = vi.hoisted(() => vi.fn());
@@ -75,6 +78,7 @@ const NOOP_RUN_AUTO_REVIEW = async (): Promise<boolean> => false;
 const NOOP_INITIAL_START_STATUS = async (): Promise<RuntimeTaskInitialStartStatusResponse | null> => null;
 
 interface HookSnapshot {
+	handleDragEnd: ReturnType<typeof useBoardInteractions>["handleDragEnd"];
 	handleRestoreTaskFromTrash: (taskId: string) => void;
 	handleStartTask: (taskId: string) => void;
 	handleCardSelect: (taskId: string) => void;
@@ -107,8 +111,10 @@ function HookHarness({
 	selectedCard = null,
 	setSelectedTaskIdOverride,
 	onSnapshot,
+	initialSessions = {},
 }: {
 	board: BoardData;
+	initialSessions?: Record<string, RuntimeTaskSessionSummary>;
 	setBoard: Dispatch<SetStateAction<BoardData>>;
 	ensureTaskWorkspace: UseTaskSessionsResult["ensureTaskWorkspace"];
 	getTaskInitialStartStatus?: UseTaskSessionsResult["getTaskInitialStartStatus"];
@@ -119,7 +125,7 @@ function HookHarness({
 	setSelectedTaskIdOverride?: Dispatch<SetStateAction<string | null>>;
 	onSnapshot?: (snapshot: HookSnapshot) => void;
 }): null {
-	const [sessions, setSessions] = useState<Record<string, RuntimeTaskSessionSummary>>({});
+	const [sessions, setSessions] = useState<Record<string, RuntimeTaskSessionSummary>>(initialSessions);
 	const [, setSelectedTaskId] = useState<string | null>(null);
 	const [, setIsClearTrashDialogOpen] = useState(false);
 	const [, setIsGitHistoryOpen] = useState(false);
@@ -149,6 +155,7 @@ function HookHarness({
 
 	useEffect(() => {
 		onSnapshot?.({
+			handleDragEnd: actions.handleDragEnd,
 			handleRestoreTaskFromTrash: actions.handleRestoreTaskFromTrash,
 			handleStartTask: actions.handleStartTask,
 			handleCardSelect: actions.handleCardSelect,
@@ -157,6 +164,7 @@ function HookHarness({
 		});
 	}, [
 		actions.handleCardSelect,
+		actions.handleDragEnd,
 		actions.handleConfirmClearTrash,
 		actions.handleRestoreTaskFromTrash,
 		actions.handleStartTask,
@@ -183,6 +191,7 @@ describe("useBoardInteractions", () => {
 		vi.spyOn(window, "cancelAnimationFrame").mockImplementation((handle: number) => {
 			window.clearTimeout(handle);
 		});
+		returnQueuedTaskMock.mockReset();
 		notifyErrorMock.mockReset();
 		showAppToastMock.mockReset();
 		useLinkedBacklogTaskActionsMock.mockReset();
@@ -209,6 +218,150 @@ describe("useBoardInteractions", () => {
 				previousActEnvironment;
 		}
 	});
+
+	it("moves a running backlog task into In Progress when its session is hydrated", async () => {
+		useProgrammaticCardMovesMock.mockReturnValue({
+			handleProgrammaticCardMoveReady: () => {},
+			setRequestMoveTaskToTrashHandler: () => {},
+			setRequestCompleteTaskHandler: () => {},
+			tryProgrammaticCardMove: () => "unavailable",
+			consumeProgrammaticCardMove: () => ({}),
+			resolvePendingProgrammaticTrashMove: () => {},
+			resolvePendingProgrammaticCompleteMove: () => {},
+			waitForProgrammaticCardMoveAvailability: async () => {},
+			resetProgrammaticCardMoves: () => {},
+			requestMoveTaskToTrashWithAnimation: async () => {},
+			requestCompleteTaskWithAnimation: async () => {},
+			programmaticCardMoveCycle: 0,
+		});
+		useLinkedBacklogTaskActionsMock.mockReturnValue({});
+
+		let board = createBoard();
+		const setBoard = vi.fn<Dispatch<SetStateAction<BoardData>>>((nextBoard) => {
+			board = typeof nextBoard === "function" ? nextBoard(board) : nextBoard;
+		});
+		const task = board.columns.find((column) => column.id === "backlog")?.cards[0];
+		if (!task) throw new Error("Expected a backlog task.");
+		const runningSession: RuntimeTaskSessionSummary = {
+			taskId: task.id,
+			state: "running",
+			agentId: "cline",
+			workspacePath: "/tmp/task",
+			pid: null,
+			startedAt: 1,
+			updatedAt: 2,
+			lastOutputAt: 2,
+			reviewReason: null,
+			exitCode: null,
+			lastHookAt: null,
+			latestHookActivity: null,
+		};
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					board={board}
+					setBoard={setBoard}
+					ensureTaskWorkspace={vi.fn()}
+					startTaskSession={vi.fn()}
+					initialSessions={{ [task.id]: runningSession }}
+				/>,
+			);
+		});
+
+		expect(board.columns.find((column) => column.id === "in_progress")?.cards[0]?.id).toBe(task.id);
+		expect(board.columns.find((column) => column.id === "backlog")?.cards).toHaveLength(0);
+	});
+
+	it.each([true, false])(
+		"moves an eligible queued task only after the backend returns success=%s",
+		async (success) => {
+			useProgrammaticCardMovesMock.mockReturnValue({
+				handleProgrammaticCardMoveReady: () => {},
+				setRequestMoveTaskToTrashHandler: () => {},
+				setRequestCompleteTaskHandler: () => {},
+				consumeProgrammaticCardMove: () => ({}),
+				resetProgrammaticCardMoves: () => {},
+			});
+			useLinkedBacklogTaskActionsMock.mockReturnValue({});
+			const board = createBoard();
+			const task = board.columns[0]?.cards.pop();
+			if (!task || !board.columns[1]) throw new Error("Missing task fixture");
+			board.columns[1].cards.push(task);
+			const setBoard = vi.fn();
+			let actions: HookSnapshot | undefined;
+			let resolveRequest: ((response: { ok: boolean; summary: null; error?: string }) => void) | undefined;
+			returnQueuedTaskMock.mockImplementation(
+				() =>
+					new Promise((resolve) => {
+						resolveRequest = resolve;
+					}),
+			);
+			const summary: RuntimeTaskSessionSummary = {
+				taskId: task.id,
+				state: "running",
+				agentId: "cline",
+				workspacePath: "/tmp/task",
+				pid: null,
+				startedAt: 1,
+				updatedAt: 1,
+				lastOutputAt: null,
+				reviewReason: null,
+				exitCode: null,
+				lastHookAt: 1,
+				latestHookActivity: {
+					activityText: "Waiting for model capacity",
+					toolName: null,
+					toolInputSummary: null,
+					finalMessage: null,
+					hookEventName: "concurrency_waiting",
+					notificationType: null,
+					source: "cline-sdk",
+					queuePosition: 1,
+					canReturnToBacklog: true,
+				},
+			};
+			await act(async () => {
+				root.render(
+					<HookHarness
+						board={board}
+						setBoard={setBoard}
+						ensureTaskWorkspace={vi.fn()}
+						startTaskSession={vi.fn()}
+						initialSessions={{ [task.id]: summary }}
+						onSnapshot={(value) => {
+							actions = value;
+						}}
+					/>,
+				);
+			});
+			setBoard.mockClear();
+			await act(async () => {
+				actions?.handleDragEnd({
+					draggableId: task.id,
+					type: "CARD",
+					source: { droppableId: "in_progress", index: 0 },
+					destination: { droppableId: "backlog", index: 0 },
+					reason: "DROP",
+					mode: "FLUID",
+					combine: null,
+				});
+			});
+			expect(returnQueuedTaskMock).toHaveBeenCalledWith("project-1", task.id);
+			expect(setBoard).not.toHaveBeenCalled();
+			await act(async () => {
+				resolveRequest?.({ ok: success, summary: null, error: success ? undefined : "Task has prior work" });
+			});
+			if (success) {
+				expect(setBoard).toHaveBeenCalled();
+				const updated = setBoard.mock.calls[0]?.[0](board) as BoardData;
+				expect(updated.columns.find((column) => column.id === "backlog")?.cards[0]?.id).toBe(task.id);
+			} else {
+				expect(setBoard).not.toHaveBeenCalled();
+				expect(notifyErrorMock).toHaveBeenCalledWith("Task has prior work");
+			}
+		},
+	);
 
 	it("starts dependency-unblocked tasks even when setBoard updater is deferred", async () => {
 		let startBacklogTaskWithAnimation: ((task: BoardCard) => Promise<boolean>) | null = null;

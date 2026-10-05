@@ -755,10 +755,16 @@ export async function dispatchReadyTasks(deps: TaskDispatchDeps): Promise<Runtim
 	return await lockedFileSystem.withLock(getTaskDispatchLockRequest(deps.workspaceId), async () => {
 		const board = await deps.loadBoard();
 		const readiness = resolveReadyTasks(await buildReadinessInput(deps, board, config));
-		const readyEntries = readiness.filter((entry): entry is ReadyEntry => entry.ready);
+		const deferredRecords = (
+			await Promise.all(readiness.map((entry) => readTaskDispatchRecord(entry.taskId)))
+		).filter((record): record is RuntimeTaskDispatchRecord => record?.manuallyDeferred === true);
+		const deferredById = new Map(deferredRecords.map((record) => [record.taskId, record]));
+		const readyEntries = readiness.filter(
+			(entry): entry is ReadyEntry => entry.ready && !deferredById.has(entry.taskId),
+		);
 		const blockedViews: RuntimeTaskDispatchTaskView[] = readiness
-			.filter((entry) => !entry.ready)
-			.map((entry) => toTaskView(board, entry, blockedReasonOf(entry)));
+			.filter((entry) => !entry.ready || deferredById.has(entry.taskId))
+			.map((entry) => toTaskView(board, entry, deferredById.get(entry.taskId)?.error ?? blockedReasonOf(entry)));
 
 		const activeWorkers = getActiveWorkerTaskIds(await deps.listSessions(), board);
 		const slotsToFill = policy.workerLimit - activeWorkers.length;
@@ -970,10 +976,27 @@ export async function getTaskDispatchStatus(deps: TaskDispatchDeps): Promise<Run
 		workerLimit: policy.workerLimit,
 		activeWorkerTaskId: activeWorkers[0] ?? null,
 		activeWorkerTaskIds: activeWorkers,
-		readyTasks: readiness.filter((entry) => entry.ready).map((entry) => toTaskView(board, entry, null)),
+		readyTasks: readiness
+			.filter(
+				(entry) =>
+					entry.ready &&
+					!loadedRecords.some((record) => record?.taskId === entry.taskId && record.manuallyDeferred),
+			)
+			.map((entry) => toTaskView(board, entry, null)),
 		blockedTasks: readiness
-			.filter((entry) => !entry.ready)
-			.map((entry) => toTaskView(board, entry, blockedReasonOf(entry))),
+			.filter(
+				(entry) =>
+					!entry.ready ||
+					loadedRecords.some((record) => record?.taskId === entry.taskId && record.manuallyDeferred),
+			)
+			.map((entry) =>
+				toTaskView(
+					board,
+					entry,
+					loadedRecords.find((record) => record?.taskId === entry.taskId && record.manuallyDeferred)?.error ??
+						blockedReasonOf(entry),
+				),
+			),
 		records: loadedRecords.filter((record): record is RuntimeTaskDispatchRecord => record !== null),
 	};
 }

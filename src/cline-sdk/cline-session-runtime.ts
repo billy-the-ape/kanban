@@ -171,6 +171,7 @@ export interface ClineSessionRuntime {
 		delivery?: "queue" | "steer",
 	): Promise<unknown>;
 	resumeTaskSession(taskId: string): Promise<ClinePersistedTaskSessionSnapshot | null>;
+	cancelQueuedUnstartedTask(taskId: string): boolean;
 	stopTaskSession(taskId: string): Promise<void>;
 	abortTaskSession(taskId: string): Promise<void>;
 	clearTaskSessions(taskId: string): Promise<void>;
@@ -285,7 +286,13 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			request.taskId,
 			request,
 			(signal) => this.startAdmittedTaskSession(request, signal),
-			(queued, position) => this.emitConcurrencyState(request.taskId, queued, position),
+			(queued, position) =>
+				this.emitConcurrencyState(
+					request.taskId,
+					queued,
+					position,
+					!this.canRestartTaskSession(request.taskId) && !request.initialMessages?.length,
+				),
 			request.prompt.trim().length > 0 || Boolean(toSdkUserImages(request.images)?.length),
 		);
 	}
@@ -573,8 +580,18 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		}
 	}
 
-	private emitConcurrencyState(taskId: string, queued: boolean, queuePosition?: number): void {
-		this.onTaskEvent?.(taskId, { type: "kanban_concurrency", queued, queuePosition });
+	private emitConcurrencyState(
+		taskId: string,
+		queued: boolean,
+		queuePosition?: number,
+		canReturnToBacklog = false,
+	): void {
+		this.onTaskEvent?.(taskId, {
+			type: "kanban_concurrency",
+			queued,
+			queuePosition,
+			canReturnToBacklog: queued && canReturnToBacklog,
+		});
 	}
 
 	async restartTaskSession(input: {
@@ -839,6 +856,13 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 				}
 			}
 		}
+	}
+
+	cancelQueuedUnstartedTask(taskId: string): boolean {
+		if (this.canRestartTaskSession(taskId) || this.getTaskSessionId(taskId)) return false;
+		if (!this.turnScheduler.cancelQueued(this.schedulerOwner, taskId)) return false;
+		this.turnGenerationByTaskId.set(taskId, (this.turnGenerationByTaskId.get(taskId) ?? 0) + 1);
+		return true;
 	}
 
 	async stopTaskSession(taskId: string): Promise<void> {

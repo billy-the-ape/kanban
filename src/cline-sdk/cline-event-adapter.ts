@@ -241,6 +241,7 @@ export function applyClineSessionEvent(input: ApplyClineSessionEventInput): void
 			lastHookAt: now(),
 			latestHookActivity: {
 				queuePosition,
+				canReturnToBacklog: queued && concurrencyEvent.canReturnToBacklog === true,
 				activityText: queued ? "Waiting for model capacity" : "Agent active",
 				toolName: null,
 				toolInputSummary: null,

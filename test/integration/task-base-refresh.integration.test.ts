@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { type LockRequest, lockedFileSystem } from "../../src/fs/locked-file-system";
 import { getTaskInitialStartEvidence, readTaskInitialStartRecord } from "../../src/workspace/task-initial-start";
+import { resetUnstartedQueuedWorktree } from "../../src/workspace/task-queued-reset";
 import {
 	deleteTaskWorktree,
 	ensureTaskWorktreeIfDoesntExist,
@@ -152,6 +153,86 @@ async function acquireHeldLock(request: LockRequest): Promise<() => Promise<void
 }
 
 describe.sequential("task base refresh integration (UPD-0)", () => {
+	it("withdraws a clean queued preparation and fetches a newer base on the next start", async () => {
+		await withTemporaryHome(async () => {
+			const { path: sandbox, cleanup } = createTempDir("kanban-queued-reset-");
+			try {
+				const fixture = createBaseRefreshFixture(sandbox);
+				const taskId = randomUUID();
+				const start = () =>
+					prepareInitialTaskWorktree({
+						cwd: fixture.workspacePath,
+						taskId,
+						baseRef: fixture.baseRef,
+						updateBaseRefBeforeStart: true,
+					});
+				expect((await start()).baseCommit).toBe(fixture.remoteBaseSha);
+				await resetUnstartedQueuedWorktree({ repoPath: fixture.workspacePath, taskId, withdraw: async () => true });
+				expect(existsSync(getTaskWorktreePath(fixture.workspacePath, taskId))).toBe(false);
+				expect(await getTaskInitialStartEvidence(taskId)).toMatchObject({
+					preparedBaselineSha: null,
+					hasPreservationRecord: false,
+				});
+				const advancer = join(sandbox, "advancer");
+				writeFileSync(join(advancer, "newer.txt"), "newer");
+				runGit(advancer, ["add", "."]);
+				runGit(advancer, ["commit", "-m", "advance again"]);
+				runGit(advancer, ["push", "origin", fixture.baseRef]);
+				expect((await start()).baseCommit).toBe(runGit(advancer, ["rev-parse", "HEAD"]));
+			} finally {
+				cleanup();
+			}
+		});
+	});
+
+	it.each(["tracked", "untracked", "ignored", "commit", "admitted"])(
+		"rejects queued reset with %s work or a lost admission race",
+		async (kind) => {
+			await withTemporaryHome(async () => {
+				const { path: sandbox, cleanup } = createTempDir("kanban-queued-reset-reject-");
+				try {
+					const fixture = createBaseRefreshFixture(sandbox);
+					const taskId = randomUUID();
+					await prepareInitialTaskWorktree({
+						cwd: fixture.workspacePath,
+						taskId,
+						baseRef: fixture.baseRef,
+						updateBaseRefBeforeStart: true,
+					});
+					const worktree = getTaskWorktreePath(fixture.workspacePath, taskId);
+					if (kind === "tracked") writeFileSync(join(worktree, "README.md"), "manual edit");
+					if (kind === "untracked") writeFileSync(join(worktree, "manual.txt"), "manual work");
+					if (kind === "ignored") {
+						const exclude = runGit(worktree, ["rev-parse", "--git-path", "info/exclude"]);
+						writeFileSync(exclude, "\nmanual.log\n", { flag: "a" });
+						writeFileSync(join(worktree, "manual.log"), "ignored work");
+					}
+					if (kind === "commit") {
+						writeFileSync(join(worktree, "new.txt"), "commit work");
+						runGit(worktree, ["add", "."]);
+						runGit(worktree, ["commit", "-m", "manual work"]);
+					}
+					let withdrew = false;
+					await expect(
+						resetUnstartedQueuedWorktree({
+							repoPath: fixture.workspacePath,
+							taskId,
+							withdraw: async () => {
+								withdrew = true;
+								return false;
+							},
+						}),
+					).rejects.toThrow();
+					expect(withdrew).toBe(kind === "admitted");
+					expect(existsSync(worktree)).toBe(true);
+					expect((await readTaskInitialStartRecord(taskId))?.baselineSha).toBe(fixture.remoteBaseSha);
+				} finally {
+					cleanup();
+				}
+			});
+		},
+	);
+
 	it("refreshes a stale base and creates the worktree at the post-refresh SHA", async () => {
 		await withTemporaryHome(async () => {
 			const { path: sandboxRoot, cleanup } = createTempDir("kanban-base-refresh-refreshed-");

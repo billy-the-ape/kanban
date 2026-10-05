@@ -375,3 +375,19 @@ export async function measureTaskPreservationBytes(taskId: string): Promise<numb
 	const patch = await findTaskPatch(taskId);
 	return (await measurePathBytes(getTaskPreservationDir(taskId))) + (patch ? await measurePathBytes(patch.path) : 0);
 }
+
+/** Remove only the bookkeeping for a verified clean, never-executed preparation. */
+export async function clearUnstartedTaskPreservation(
+	repoPath: string,
+	taskId: string,
+	baseline: string | null,
+): Promise<void> {
+	const result = await runGit(repoPath, [
+		"update-ref",
+		"-d",
+		getTaskPreservationRefName(taskId),
+		baseline ?? "0".repeat(40),
+	]);
+	if (!result.ok) throw new Error(result.output || "Task recovery ref changed during reset.");
+	await rm(getTaskPreservationManifestPath(taskId), { force: true });
+}

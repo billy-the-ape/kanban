@@ -795,6 +795,22 @@ describe("dispatchReadyTasks", () => {
 		expect(startedTasks).toHaveLength(TASK_DISPATCH_RETRY_CAP + 1);
 	});
 
+	it("keeps a manually deferred backlog task paused through dispatch and reconciliation until manual start", async () => {
+		const { deps, startedTasks } = createTestDeps({ board: linearBoard(), receipts: deliveredReceipts() });
+		await writeTaskDispatchRecord(
+			dispatchRecordFor("b", { status: "blocked", manuallyDeferred: true, error: "Start manually when ready." }),
+		);
+		expect((await dispatchReadyTasks(deps)).dispatchedTaskId).toBeNull();
+		await reconcileTaskDispatch(deps);
+		expect(startedTasks).toHaveLength(0);
+		const status = await getTaskDispatchStatus(deps);
+		expect(status.readyTasks.some((task) => task.taskId === "b")).toBe(false);
+		expect(status.blockedTasks.find((task) => task.taskId === "b")?.blockedReason).toBe("Start manually when ready.");
+		await releaseTaskFromDispatchQueue("b");
+		expect(await readTaskDispatchRecord("b")).toBeNull();
+		expect((await dispatchReadyTasks(deps)).dispatchedTaskId).toBe("b");
+	});
+
 	it("keeps an in-flight queue record when the queue itself starts the task", async () => {
 		await writeTaskDispatchRecord(dispatchRecordFor("b"));
 		await releaseTaskFromDispatchQueue("b");

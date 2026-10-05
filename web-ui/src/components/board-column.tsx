@@ -6,7 +6,12 @@ import { BoardCard } from "@/components/board-card";
 import { Button } from "@/components/ui/button";
 import { ColumnIndicator } from "@/components/ui/column-indicator";
 import type { RuntimeTaskInitialStartStage, RuntimeTaskPhaseSummary, RuntimeTaskSessionSummary } from "@/runtime/types";
-import { isCardDropDisabled, isTaskSessionRunning, type ProgrammaticCardMoveInFlight } from "@/state/drag-rules";
+import {
+	canReturnQueuedTaskToBacklog,
+	isCardDropDisabled,
+	isTaskSessionRunning,
+	type ProgrammaticCardMoveInFlight,
+} from "@/state/drag-rules";
 import type { BoardCard as BoardCardModel, BoardColumnId, BoardColumn as BoardColumnModel } from "@/types";
 
 export function BoardColumn({
@@ -88,6 +93,9 @@ export function BoardColumn({
 	const cardDropType = "CARD";
 	const isDropDisabled = isCardDropDisabled(column.id, activeDragSourceColumnId ?? null, {
 		activeDragTaskId,
+		canReturnActiveDragTaskToBacklog: activeDragTaskId
+			? canReturnQueuedTaskToBacklog(taskSessions[activeDragTaskId])
+			: false,
 		programmaticCardMoveInFlight,
 		isActiveDragTaskSessionRunning: activeDragTaskId
 			? isTaskSessionRunning(taskSessions[activeDragTaskId])
