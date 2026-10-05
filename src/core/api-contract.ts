@@ -268,6 +268,7 @@ export const runtimeTaskSessionReviewReasonSchema = z
 export type RuntimeTaskSessionReviewReason = z.infer<typeof runtimeTaskSessionReviewReasonSchema>;
 
 export const runtimeTaskHookActivitySchema = z.object({
+	queuePosition: z.number().int().positive().nullable().optional(),
 	activityText: z.string().nullable().default(null),
 	toolName: z.string().nullable().default(null),
 	toolInputSummary: z.string().nullable().default(null),

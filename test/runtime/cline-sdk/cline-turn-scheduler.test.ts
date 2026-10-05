@@ -120,7 +120,7 @@ describe("turn queue", () => {
 		const d = run("d");
 		try {
 			await vi.waitFor(() => expect(order).toEqual(["a", "b"]));
-			expect(waiting).toHaveBeenCalledWith(true);
+			expect(waiting).toHaveBeenCalledWith(true, 1);
 			first.resolve();
 			await Promise.all([a, c, d]);
 			expect(order).toEqual(["a", "b", "c", "d"]);
@@ -193,7 +193,7 @@ describe("turn queue", () => {
 		const queued = scheduler.run(owner, "b", target, operation, waiting);
 		const rejected = expect(queued).rejects.toThrow("Cline turn canceled");
 		try {
-			await vi.waitFor(() => expect(waiting).toHaveBeenCalledWith(true));
+			await vi.waitFor(() => expect(waiting).toHaveBeenCalledWith(true, 1));
 			scheduler.cancel(owner);
 			await rejected;
 			hold.resolve();
@@ -218,5 +218,34 @@ describe("turn queue", () => {
 		discovery.resolve();
 		await rejected;
 		expect(operation).not.toHaveBeenCalled();
+	});
+});
+
+describe("queue positions", () => {
+	it("renumbers after cancellation and admission without notifying unchanged positions", async () => {
+		const scheduler = new ClineTurnScheduler(async () => 1);
+		const owner = Symbol();
+		const active = gate();
+		const next = gate();
+		const first = scheduler.run(owner, "active", target, () => active.promise);
+		await Promise.resolve();
+		const states = [vi.fn(), vi.fn(), vi.fn()];
+		const second = scheduler.run(owner, "second", target, async () => {}, states[0]);
+		const canceled = second.catch(() => {});
+		const third = scheduler.run(owner, "third", target, () => next.promise, states[1]);
+		const fourth = scheduler.run(owner, "fourth", target, async () => {}, states[2]);
+		await vi.waitFor(() => expect(states[2]).toHaveBeenLastCalledWith(true, 3));
+		expect(states[0]).toHaveBeenCalledTimes(1);
+		scheduler.cancel(owner, "second");
+		await canceled;
+		expect(states[1]).toHaveBeenLastCalledWith(true, 1);
+		expect(states[2]).toHaveBeenLastCalledWith(true, 2);
+		active.resolve();
+		await first;
+		await vi.waitFor(() => expect(states[1]).toHaveBeenLastCalledWith(false));
+		expect(states[2]).toHaveBeenLastCalledWith(true, 1);
+		next.resolve();
+		await Promise.all([third, fourth]);
+		expect(states[2]).toHaveBeenLastCalledWith(false);
 	});
 });
