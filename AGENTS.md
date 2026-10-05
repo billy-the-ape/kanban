@@ -33,7 +33,7 @@ Architecture opinions
 - Do not optimize for line count alone. Optimize for codebase navigability and clarity.
 
 Git guardrails
-- NEVER commit unless user asks.
+- NEVER commit to main unless user asks.
 
 GitHub issues
 When reading issues:
