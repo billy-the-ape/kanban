@@ -41,6 +41,13 @@ function toPreviewText(value: string | null | undefined, maxLength = 160): strin
 	return normalized.length > maxLength ? `${normalized.slice(0, maxLength - 1).trimEnd()}…` : normalized;
 }
 
+export interface ClineToolFinishedInfo {
+	toolName: string | null;
+	toolInput: unknown;
+	output: string | null;
+	error: string | null;
+}
+
 export interface ApplyClineSessionEventInput {
 	event: unknown;
 	taskId: string;
@@ -49,6 +56,8 @@ export interface ApplyClineSessionEventInput {
 	isClineProvider: boolean;
 	emitSummary: (summary: RuntimeTaskSessionSummary) => void;
 	emitMessage: (taskId: string, message: ClineTaskMessage) => void;
+	/** Optional observer for finished tool calls (detection only; the adapter does no I/O). */
+	onToolFinished?: (tool: ClineToolFinishedInfo) => void;
 }
 
 type ClineSdkChunkEvent = Extract<ClineSdkSessionEvent, { type: "chunk" }>;
@@ -216,6 +225,25 @@ function readToolResult(message: unknown): { output: unknown; error: string | nu
 		output,
 		error: isError ? (extractAgentErrorMessage(output) ?? "Tool execution failed") : null,
 	};
+}
+
+/**
+ * Reduces a tool-result payload to the plain text the onToolFinished
+ * observers need (the SDK emits strings for command tools; structured
+ * results are stringified so URL scanning still works).
+ */
+function toToolOutputText(output: unknown): string | null {
+	if (output === undefined || output === null) {
+		return null;
+	}
+	if (typeof output === "string") {
+		return output;
+	}
+	try {
+		return JSON.stringify(output);
+	} catch {
+		return null;
+	}
 }
 
 export function extractClineSessionId(event: unknown): string | null {
@@ -620,6 +648,9 @@ export function applyClineSessionEvent(input: ApplyClineSessionEventInput): void
 			summaryPatch.reviewReason = null;
 		}
 		emitSummary(input, summaryPatch);
+		// PRLINK-1: surface the finished tool to observers (PR-creation
+		// detection). The adapter stays pure; the observer does the I/O.
+		input.onToolFinished?.({ toolName, toolInput, output: toToolOutputText(toolOutput), error: toolError });
 		return;
 	}
 

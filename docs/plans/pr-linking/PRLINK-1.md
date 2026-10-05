@@ -1,5 +1,15 @@
 # PRLINK-1 — Cline capture (record path + `onToolFinished`)
 
+> **Status: DONE (review blocker addressed).** The original review found that
+> recording against `summary.workspacePath` (the task worktree cwd) silently
+> no-ops and auto-created phantom workspace entries. Recording now uses a
+> per-service `workspacePath` option (the workspace repo root, wired from
+> `scope.workspacePath` in `runtime-server.ts`), and `recordTaskPullRequests`
+> refuses to auto-create a workspace for an unknown path. Final-state notes
+> are at the bottom. Typecheck, `test:fast`, `test/workspace`, and
+> `test/integration` verified (the only failures are two pre-existing,
+> unrelated ones that also fail on the base branch).
+
 Master plan: `PR_LINKING_PLAN.md` (this is milestone **PL-2**).
 Depends on: **PRLINK-0** (contract, parser, detection, board mutations).
 
@@ -139,14 +149,18 @@ broadcastWorkspaceStateUpdated: (workspacePath) =>
   - Repeated call with the same link → `changed: false`, **revision unchanged**, no extra board write.
   - Unknown taskId / unknown workspace path → `{ recorded: false, changed: false }`, no throw.
   - Multiple links in one call keep first-appearance order.
+  - Linked-worktree regression: a real `git worktree add` checkout passed as
+    `workspacePath` is a quiet no-op that never adds a phantom workspace
+    index entry; recording against the repo root reaches the card on the
+    main workspace.
 - **Extend `test/runtime/cline-sdk/cline-event-adapter.test.ts`**:
   - `tool-finished` for `run_commands` invokes `onToolFinished` with toolName, original input (via `entry.toolInputByToolCallId`), and the `readToolResult` output/error.
   - Other agent events (chunk, tool_call, status) do not invoke it; absence of the callback never throws.
 - **Extend `test/runtime/cline-sdk/cline-task-session-service.test.ts`** (unit-style with fakes — **do not boot the real Cline SDK host**; see AGENTS.md Node-22 CI trap):
-  - `run_commands` with `gh pr create` + output URL → `recordTaskPullRequests` invoked with source `agent_tool` and the parsed link (mock/spy the module).
+  - `run_commands` with `gh pr create` + output URL → `recordTaskPullRequests` invoked with source `agent_tool`, the parsed link, and the **workspace repo root from the service options** while the session `cwd` is a worktree-shaped path distinct from it (mock/spy the module).
   - `run_commands` with `gh pr view 205` + PR URL in output → **not** invoked.
-  - Recording result `changed: true` → `broadcastWorkspaceStateUpdated` called with the session's workspacePath; `changed: false` → not called.
-  - Missing `workspacePath` on the summary → no recording attempt.
+  - Recording result `changed: true` → `broadcastWorkspaceStateUpdated` called with the repo path; `changed: false` → not called.
+  - Service constructed without `workspacePath` → no recording attempt.
 
 ## Verification
 
@@ -166,4 +180,45 @@ Manual: on a scratch repo with a GitHub remote, run a Cline task that ends by ru
 - Cline-created PRs (fresh or "already exists") are recorded exactly once; non-creating commands record nothing.
 - Open UIs receive a state broadcast only when the card actually changed.
 - All Cline unit tests stay fake-based (no live SDK host).
+
+## Final-state notes
+
+Deviations from the sketch above, discovered during implementation:
+
+- **Error logging:** the biome `grit/no-console.grit` rule forbids `console.*`
+  in `src/` (except `src/cli.ts`), so the best-effort catch logs via
+  `process.stderr.write("[task-pull-requests] ...")` — the same pattern as
+  `src/commands/hooks.ts` — instead of `console.error`.
+- **Mutation generic:** `mutateWorkspaceState<boolean>` with `value:
+  result.added` (not `{ added: boolean }`), because
+  `RuntimeWorkspaceAtomicMutationResult<T>` must match the returned value's
+  type; `response.saved && response.value` is the "recorded and changed" check.
+- **Adapter output text:** a small `toToolOutputText(output)` helper
+  (string passthrough, `JSON.stringify` fallback, `null` otherwise) reduces
+  the tool-result payload to text before it reaches `onToolFinished`, so URL
+  scanning works for structured results too.
+- **Service:** the options object is stored on the instance
+  (`private readonly options`); `extractCommandStrings` is imported from
+  `./review-tool-policy` (same module the review tool policy uses).
+- **Workspace tests:** revision assertions account for the initial
+  `saveWorkspaceState` bump (`loadWorkspaceState` auto-creates state at
+  revision 0): recorded → `initial.revision + 2`, repeated no-op → still
+  `+ 2`, pure no-op paths → `+ 1`.
+- **Review fix — record against the workspace repo root:** the first
+  version recorded/broadcast against `summary.workspacePath`, which for real
+  tasks is the linked task worktree (`runtime-api.ts` sets `taskCwd` to
+  `prepared.path`). `loadWorkspaceContext` defaults to
+  `autoCreateIfMissing: true`, so that path silently resolved to a different
+  workspace id and auto-created phantom index entries. The service now takes
+  a `workspacePath` option (wired from `scope.workspacePath` in
+  `runtime-server.ts`) and recording is disabled when it is omitted;
+  `recordTaskPullRequests` also pre-checks with
+  `loadWorkspaceContext(path, { autoCreateIfMissing: false })` so a bad path
+  can never add a phantom project.
+- **Pre-existing, unrelated failures** (verified to fail on the base branch
+  too, with these changes stashed):
+  - `test/runtime/server/middleware.test.ts` → "passes through upgrades whose
+    Host and Origin are both allowed"
+  - `test/integration/task-worktree.integration.test.ts` → "resumes a trashed
+    task from the preserved snapshot when the saved patch is invalid"
 
