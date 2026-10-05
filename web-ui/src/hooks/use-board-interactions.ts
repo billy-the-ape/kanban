@@ -585,7 +585,11 @@ export function useBoardInteractions({
 				// A session can be restored or launched while the board snapshot still
 				// has its card in Backlog. Keep the board in sync with the live session
 				// so the task remains visible and can be opened or controlled.
-				if (summary.state === "running" && columnId === "backlog") {
+				if (
+					summary.state === "running" &&
+					(summary.agentId === "cline" || summary.pid !== null) &&
+					columnId === "backlog"
+				) {
 					const moved = moveTaskToColumn(nextBoard, summary.taskId, "in_progress", { insertAtTop: true });
 					if (moved.moved) {
 						nextBoard = moved.board;
