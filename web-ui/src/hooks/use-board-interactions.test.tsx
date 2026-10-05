@@ -253,6 +253,8 @@ describe("useBoardInteractions", () => {
 			lastOutputAt: 2,
 			reviewReason: null,
 			exitCode: null,
+			lastHookAt: null,
+			latestHookActivity: null,
 		};
 
 		await act(async () => {
