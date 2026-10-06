@@ -7,6 +7,7 @@ import type {
 import { parseHookIngestRequest } from "../core/api-validation";
 import { loadWorkspaceContextById } from "../state/workspace-state";
 import type { TerminalSessionManager } from "../terminal/session-manager";
+import { fireReviewPullRequestLookup } from "../workspace/task-pull-request-lookup";
 import { recordHookPullRequests } from "../workspace/task-pull-requests";
 import { captureTaskTurnCheckpoint, deleteTaskTurnCheckpointRef } from "../workspace/turn-checkpoints";
 import type { RuntimeTrpcContext } from "./app-router";
@@ -22,6 +23,8 @@ export interface CreateHooksApiDependencies {
 		turn: number;
 	}) => Promise<RuntimeTaskTurnCheckpoint>;
 	deleteTaskTurnCheckpointRef?: (input: { cwd: string; ref: string }) => Promise<void>;
+	/** PRLINK-5: fires the best-effort branch lookup on review entry (tests inject a spy). */
+	fireReviewPullRequestLookup?: (input: { workspacePath: string; taskId: string }) => void;
 }
 
 function canTransitionTaskForHookEvent(summary: RuntimeTaskSessionSummary, event: RuntimeHookEvent): boolean {
@@ -40,6 +43,7 @@ function canTransitionTaskForHookEvent(summary: RuntimeTaskSessionSummary, event
 export function createHooksApi(deps: CreateHooksApiDependencies): RuntimeTrpcContext["hooksApi"] {
 	const checkpointCapture = deps.captureTaskTurnCheckpoint ?? captureTaskTurnCheckpoint;
 	const checkpointRefDelete = deps.deleteTaskTurnCheckpointRef ?? deleteTaskTurnCheckpointRef;
+	const reviewPullRequestLookup = deps.fireReviewPullRequestLookup ?? fireReviewPullRequestLookup;
 
 	return {
 		ingest: async (input) => {
@@ -119,6 +123,16 @@ export function createHooksApi(deps: CreateHooksApiDependencies): RuntimeTrpcCon
 					} catch {
 						// Best effort checkpointing only.
 					}
+				}
+
+				// PRLINK-5: a review transition on a card with no recorded PRs
+				// gets a best-effort branch lookup. Fire-and-forget: it is never
+				// awaited and its failures are logged, never surfaced.
+				if (event === "to_review") {
+					reviewPullRequestLookup({
+						workspacePath,
+						taskId,
+					});
 				}
 
 				if (body.metadata) {

@@ -24,6 +24,7 @@ import {
 	type RuntimeShortcutPickerIconId,
 } from "@/components/shared/runtime-shortcut-icons";
 import { TaskPullRequestLink } from "@/components/task-pull-request-link";
+import { TaskPullRequestManager } from "@/components/task-pull-request-manager";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/components/ui/cn";
 import { Dialog, DialogBody, DialogFooter, DialogHeader } from "@/components/ui/dialog";
@@ -124,6 +125,8 @@ function GitBranchStatusControl({
 	onToggleGitHistory,
 	isGitHistoryOpen,
 	pullRequests,
+	taskId,
+	workspaceId,
 }: {
 	branchLabel: string;
 	changedFiles: number;
@@ -133,6 +136,9 @@ function GitBranchStatusControl({
 	isGitHistoryOpen?: boolean;
 	/** PRLINK-4: PRs recorded for the selected task (task branch control only). */
 	pullRequests?: RuntimeTaskPullRequest[];
+	/** PRLINK-5: task/workspace scope for the manual link/manage affordance (task control only). */
+	taskId?: string | null;
+	workspaceId?: string | null;
 }): React.ReactElement {
 	const pullRequestList = pullRequests ?? [];
 	const isPullRequestsOverflowing = pullRequestList.length > MAX_INLINE_PULL_REQUESTS;
@@ -158,7 +164,7 @@ function GitBranchStatusControl({
 				>
 					<span className="truncate w-full text-left">{branchLabel}</span>
 				</Button>
-				{inlinePullRequests.length > 0 ? (
+				{pullRequestList.length > 0 || (taskId && workspaceId) ? (
 					<div className="ml-1.5 flex items-center gap-1.5 shrink-0">
 						{inlinePullRequests.map((pullRequest) => (
 							<TaskPullRequestLink
@@ -196,6 +202,9 @@ function GitBranchStatusControl({
 									</RadixPopover.Content>
 								</RadixPopover.Portal>
 							</RadixPopover.Root>
+						) : null}
+						{taskId && workspaceId ? (
+							<TaskPullRequestManager workspaceId={workspaceId} taskId={taskId} pullRequests={pullRequestList} />
 						) : null}
 					</div>
 				) : null}
@@ -235,6 +244,7 @@ function TopBarGitStatusSection({
 	onGitPull,
 	onGitPush,
 	pullRequests,
+	workspaceId,
 }: {
 	showHomeGitSummary: boolean;
 	selectedTaskId: string | null;
@@ -247,6 +257,8 @@ function TopBarGitStatusSection({
 	onGitPush?: () => void;
 	/** PRLINK-4: PRs recorded for the selected task; rendered on the task branch control only. */
 	pullRequests?: RuntimeTaskPullRequest[];
+	/** PRLINK-5: workspace id for the manual PR link/manage affordance. */
+	workspaceId?: string | null;
 }): React.ReactElement | null {
 	const homeGitSummary = useHomeGitSummaryValue();
 	const taskWorkspaceInfo = useTaskWorkspaceInfoValue(selectedTaskId, selectedTaskBaseRef);
@@ -332,6 +344,8 @@ function TopBarGitStatusSection({
 					onToggleGitHistory={onToggleGitHistory}
 					isGitHistoryOpen={isGitHistoryOpen}
 					pullRequests={pullRequests}
+					taskId={selectedTaskId}
+					workspaceId={workspaceId}
 				/>
 			</>
 		);
@@ -376,6 +390,7 @@ export function TopBar({
 	canOpenWorkspace,
 	isOpeningWorkspace,
 	hideProjectDependentActions = false,
+	workspaceId,
 }: {
 	onToggleSidebar?: () => void;
 	onBack?: () => void;
@@ -413,6 +428,8 @@ export function TopBar({
 	canOpenWorkspace: boolean;
 	isOpeningWorkspace: boolean;
 	hideProjectDependentActions?: boolean;
+	/** PRLINK-5: workspace id enabling the manual PR link/manage affordance. */
+	workspaceId?: string | null;
 }): React.ReactElement {
 	const isMobile = useIsMobile();
 	const displayWorkspacePath = workspacePath ? formatPathForDisplay(workspacePath) : null;
@@ -577,6 +594,7 @@ export function TopBar({
 									onGitPull={onGitPull}
 									onGitPush={onGitPush}
 									pullRequests={selectedTaskPullRequests ?? undefined}
+									workspaceId={workspaceId}
 								/>
 							) : null}
 						</>

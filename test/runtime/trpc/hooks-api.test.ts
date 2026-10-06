@@ -347,3 +347,60 @@ describe("createHooksApi pull-request recording", () => {
 		expect(findCardPullRequests(recorded.board, "task-1")).toHaveLength(1);
 	});
 });
+
+// PRLINK-5: hook-triggered review entry fires the best-effort branch lookup
+// (fire-and-forget, injectable).
+describe("createHooksApi review lookup trigger (PRLINK-5)", () => {
+	function createApi(fireReviewPullRequestLookup: (input: { workspacePath: string; taskId: string }) => void) {
+		const transitionedSummary = createSummary({ state: "awaiting_review", reviewReason: "hook" });
+		const manager = {
+			getSummary: vi.fn(() => createSummary({ state: "running" })),
+			transitionToReview: vi.fn(() => transitionedSummary),
+			transitionToRunning: vi.fn(),
+			applyHookActivity: vi.fn(),
+			applyTurnCheckpoint: vi.fn(),
+		} as unknown as TerminalSessionManager;
+		return {
+			manager,
+			api: createHooksApi({
+				getWorkspacePathById: vi.fn(() => "/tmp/repo"),
+				ensureTerminalManagerForWorkspace: vi.fn(async () => manager),
+				broadcastRuntimeWorkspaceStateUpdated: vi.fn(),
+				broadcastTaskReadyForReview: vi.fn(),
+				captureTaskTurnCheckpoint: vi.fn(async () => ({
+					turn: 1,
+					ref: "refs/kanban/checkpoints/task-1/turn/1",
+					commit: "1111111",
+					createdAt: 1,
+				})),
+				deleteTaskTurnCheckpointRef: vi.fn(async () => undefined),
+				fireReviewPullRequestLookup,
+			}),
+		};
+	}
+
+	it("fires the branch lookup exactly on to_review, not on other events", async () => {
+		const fireReviewPullRequestLookup = vi.fn();
+		const { api } = createApi(fireReviewPullRequestLookup);
+
+		await api.ingest({
+			taskId: "task-1",
+			workspaceId: "workspace-1",
+			event: "to_in_progress",
+		});
+		expect(fireReviewPullRequestLookup).not.toHaveBeenCalled();
+
+		const response = await api.ingest({
+			taskId: "task-1",
+			workspaceId: "workspace-1",
+			event: "to_review",
+		});
+
+		expect(response).toEqual({ ok: true });
+		expect(fireReviewPullRequestLookup).toHaveBeenCalledTimes(1);
+		expect(fireReviewPullRequestLookup).toHaveBeenCalledWith({
+			workspacePath: "/tmp/repo",
+			taskId: "task-1",
+		});
+	});
+});
