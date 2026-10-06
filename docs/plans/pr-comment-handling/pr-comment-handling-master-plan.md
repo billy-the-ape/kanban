@@ -46,14 +46,15 @@ dispatched fingerprint. Transfer does not silently replay an instruction already
 Uncertain execution is failed with a visible resume requirement; there is no automatic repair
 budget to reset.
 
-## Collection and debounce (COMMENT-0)
+## Collection and debounce
 
 Use the foundation observer and eligibility table: metadata and eligible published feedback
 only for active task-derived subscriptions. No separate poller or repository-wide scan.
 Read submitted review bodies, inline review threads and PR conversation comments with complete
 pagination. Ignore unpublished reviews, resolved/deleted threads, empty approval-only feedback,
 known bot/status noise and recognized output from the repair itself. Human comments are eligible;
-reviewer bots require the configured trusted allowlist. No model call is needed to classify each
+apply the foundation's fixed bot policy (bot review/inline feedback included, bot conversation
+chatter excluded). Do not add a bot configuration decision here. No model call is needed to classify each
 comment before dispatch: the agent evaluates actual advice during its normal turn.
 
 Fingerprint eligible additions/edits using a deterministic sorted aggregate of provider IDs,
@@ -72,16 +73,40 @@ and those times. A running writer/model capacity wait may postpone actual execut
 that deadline. Feedback arriving after a dispatch forms the next pending aggregate.
 
 At due time, perform a successful fresh read and revalidate owner, task/link/settings, PR open
-state and eligible feedback. A partial API failure cannot dispatch. COMMENT-0 exposes pending
-count/deadline using the current GitHub snapshot; it sends no agent instruction.
+state and eligible feedback. A partial API failure cannot dispatch. The collection module exposes pending
+count/deadline from the current GitHub snapshot;
+the dispatch module below owns instruction submission.
 
-## Exact instruction and agent workflow (COMMENT-1)
+### Fingerprint and dispatch contract (settled)
+
+Fingerprint is a structured dedupe descriptor, not a bare string: SHA-256 of sorted eligible
+event-version tokens, latest updatedAt watermark, and sorted version tokens at that exact
+watermark timestamp. Tokens are kind + provider ID + updatedAt + body digest. Preserve the
+last-dispatched boundary tokens when events are deleted; a new token at the same timestamp
+still triggers, while surviving old tokens/deletion alone do not. This is compact transport
+dedupe data, not per-comment fix state. Versions before the watermark are already dispatched;
+GitHub edit timestamps advance versions. Freeze deterministic numeric/timestamp ordering in tests.
+
+The aggregate captured at instruction submission is the dispatched one; later observed versions
+remain pending regardless of whether the agent happens to see them. Never replace that captured
+aggregate with the newest snapshot merely because the turn completes. Failures and API partial
+results do not advance the consumed watermark.
+
+Dispatch adds only dispatchId, attemptedAt, captured fingerprint, owner revision, status,
+turn reference and error. attemptedAt is null while provably unsent; persist it immediately
+before invoking normal chat send. Attach dispatchId to existing chat message metadata as an
+optional automation correlation ID (no separate transcript store). Hook normal message acceptance
+to record its turn reference promptly; do not wait for the async send promise to resolve.
+If restart finds attemptedAt but no trustworthy message/turn evidence, fail for explicit resume.
+No send-idempotency system or blind replay is required.
+
+## Exact instruction and agent workflow
 
 Use this template, substituting the validated selected PR URL:
 
 > Address comments on the linked PR: {url}. Check the feedback against the current code and
 > original task requirements. Fix valid issues, explain any disagreements, and update the
-> same PR.
+> same PR. Explain changes and disagreements in task chat; do not post PR comments.
 
 Send this as a normal task follow-up. Reuse the existing conversation/session, original task
 context, repository instructions, model/provider settings, tool permissions and compaction.
@@ -110,6 +135,24 @@ Existing verification/delivery behavior remains in force; do not weaken it or in
 5. New eligible feedback waits for a later debounced follow-up. Unchanged unresolved comments
    do not retrigger merely because the agent declined them or GitHub threads remain open.
 
+### Code path and execution rules
+
+Route automated follow-ups through the same backend sendTaskChatMessage implementation in
+`src/trpc/runtime-api.ts`, including sendTaskSessionInput and rebindPersistedTaskSession recovery.
+Extract a reusable backend function if needed; do not call a browser hook or loopback HTTP.
+Set the existing runtimeTaskSessionMode to `act` for this instruction, preserving provider/model/
+reasoning/rules/permissions.
+Do not refresh/recreate a task worktree during a follow-up. If continuation fails, expose the
+existing error and require manual recovery rather than starting a contextless replacement task.
+Normal SDK turn events drive status/board transitions; preserve the in-flight task guard.
+
+For initial queued intent, enabling/PR association alone never interrupts a writer. Before send,
+refresh metadata/feedback and ownership. While model capacity is queued, new eligible feedback
+is pending for the next instruction; do not mutate the accepted chat message. An active human
+follow-up can clear the automatic failure only when explicitly marked as Resume comment handling,
+not merely because another message happened to succeed. The button resumes once, rechecking PR/
+scope and retaining fingerprint history; no generic checkbox toggle resets failure.
+
 ## Failure, cancellation and restart
 
 Keep existing turn/tool retry/time limits; introduce no new three-round/two-no-progress counters,
@@ -129,15 +172,17 @@ Stop active work through existing safe cancellation, retaining edits/history. A 
 never receives another automatic comment follow-up, including after Done → Review history access.
 An installed merge consumer waits for shared quiescence; comments alone return to In Review.
 
-## Implementation slices
+## Implementation PR boundary
 
-| ID | Scope | Depends on | Acceptance |
-| --- | --- | --- | --- |
-| COMMENT-0 | Aggregate feedback fingerprint, debounce and pending visibility in PR record | FOUNDATION-0 + FOUNDATION-1 | One stable aggregate; unchanged feedback never replays |
-| COMMENT-1 | Normal task follow-up prompt, admission, owner exclusion and interrupted-run visibility | COMMENT-0 + existing task continuation APIs | Same manual workflow; one owner/turn; no blind restart retry |
+One implementation PR: **COMMENT-0 — debounced normal PR-comment follow-up**. Combine collection,
+debounce, prompt submission, normal continuation, queueing, ownership and restart/error handling.
+Depends on FOUNDATION-0 and FOUNDATION-1 only; no MERGE dependency. Earlier separate COMMENT-1
+is folded into this PR and must not be scheduled as a second card.
 
-No separate comment workflow data store or dependency on MERGE slices. Both feature series
-remain independently implementable after the foundation.
+Implement in this order: consume foundation snapshots → compute aggregate/deadline → persist
+queued intent → dispatch through normal chat continuation → record turn acceptance/outcome →
+wire task detail diagnostics/resume → run the tests below. No task breakout documents are
+created here; the user's agent will create them using this boundary.
 
 ## Verification and rollout
 

@@ -4,7 +4,7 @@ Updated: 2026-10-06. Status: proposed; documentation only. Repository: `billy-th
 
 ## Goal and independent feature boundary
 
-Finish opted-in tasks after a reviewed linked PR merges, then release linked successor tasks
+Finish opted-in tasks after a linked PR merges, then release linked successor tasks
 against verified merged code. Preserve manual Done → In Review history access without repeated
 completion or successor launch. This feature never merges PRs.
 
@@ -48,38 +48,36 @@ that behavior must be suppressed for tasks waiting for merge.
 
 The foundation owns card preferences, selected Automation PR, one canonical PR record with
 validated task bindings, authorized snapshots, polling subscriptions and operation gates. Do not
-implement those again here. Register the merge consumer, requesting metadata/review sources,
-and use its revision-checked task merge binding plus existing completion/dispatch receipts.
+implement those again here. Register the merge consumer, requesting PR metadata only,
+and use its revision-checked task merge binding consumed by existing dispatch APIs.
 Comment execution state remains minimal in that same PR record; this feature adds no comment ledger.
 
-Auto finish on merge remains false by default and editable in In Progress/In Review.
+Auto complete task when PR is merged remains false by default and editable in In Progress/In Review.
 The foundation prevents legacy PR-delivery/clean-tree automatic Done while this workflow is
-enabled. This feature owns reviewed completion, successor dispatch and historical reopening.
+enabled. This feature owns confirmed-merge completion, successor dispatch and historical reopening.
 Observe the foundation's polling stop/resume table and bounded terminal reconciliation;
 never add a feature timer or a completion retry loop that extends terminal API reads.
 
 When one PR belongs to multiple tasks, each eligible merge consumer may finish its own card
-using its own validated specification/linkage and evidence; completion/dispatch receipts remain
+using its own validated task/linkage and merge evidence; completion/dispatch evidence remains
 task-scoped. Reuse the shared PR quiescence gate so neither card completes while any tracked
 writer on that head has unresolved work. This does not grant either task repair ownership.
 
-## Merge completion (MERGE-1)
+## Merge completion
 
 1. Freshly confirm the selected PR is merged; closed-unmerged and draft/open remain In Review.
-2. Require qualifying submitted review evidence on the final pre-merge head SHA. Reuse an
-   existing trustworthy review receipt where available; otherwise require a GitHub APPROVED
-   review on that SHA by a non-author reviewer, not dismissed, with no unresolved current
-   CHANGES_REQUESTED review. Allow a configured trusted reviewer bot; self-approval, comments,
-   stale approval and a model's completion claim do not qualify. Persist exact evidence IDs/SHA.
-   A merge without qualifying review remains blocked for manual inspection: preserve the
-   established rule that unreviewed work must never become automatically Done.
+2. The enabled checkbox plus confirmed merge is the complete acceptance rule. Do not require
+   an APPROVED review, final-head review evidence, resolved threads, a human merger, passing
+   CI checks or a second user confirmation. A human or bot merge is equally eligible. Review/
+   merge policy belongs to GitHub or the user's workflow. If manual completion is desired,
+   leave this checkbox unchecked; no card movement or successor launch follows this PR merge.
 3. Consume foundation terminal invalidation and acquire its quiescence gate. The foundation
    cancels undispatched write intents, prevents new writes and requests orderly safe stop of
    tracked task writers, verification and delivery, even with no comment consumer installed.
    Reconcile and preserve dirty/untracked or unpublished work before completing. Uncertain side effects
    or post-merge edits block for manual handling; never force-clean the worktree.
 4. Persist a completion receipt containing task/workspace/repository identity, selected PR,
-   final head, reviewed evidence, merge/base identity, merge SHA, timestamp and generation.
+   final head, merge/base identity, merge SHA, timestamp and generation.
 5. Apply a revision-checked board transition through existing completion/preservation APIs,
    broadcast the updated board, then request the backend dispatch pass. Persist effect stages
    so restart after receipt, board movement or dispatch cannot lose or repeat the transition.
@@ -90,9 +88,59 @@ completion without discarding evidence. Enabling on an already merged PR can com
 all gates pass, except a previously consumed/reopened generation. No automatic GitHub merge,
 review submission or branch deletion is introduced.
 
-## Successor handoff and history (MERGE-2)
+## Fixed completion and dispatcher contract
 
-Extend B-9 readiness to accept explicit reviewed-merge completion receipts while retaining
+Store mergeCompletion in the PR record's task binding, with schema version, workspace/task/link
+generation, selected PR identity, finalHeadSha, base repository/ref, mergeCommitSha, mergedAt,
+observedAt, status (pending/completed/blocked), completedAt and concise error. No review fields.
+Use that binding as the authoritative merge receipt; existing dispatch records own child launch
+state. Board state and record writes need not be one filesystem transaction: persist pending →
+apply idempotent board move → mark completed → dispatch. Startup reconciles each stage.
+
+Extract one backend completeTaskFromMergedPr operation. Invoke it on fresh terminal observation,
+startup pending reconciliation and explicit completion resume. Revalidate checkbox, task column,
+PR/link generation and shared quiescence. Use existing preservation/stop APIs and authoritative
+mutateWorkspaceState board writes followed by broadcastRuntimeWorkspaceStateUpdated.
+Preserve actual dirty/untracked or unpublished work and block visibly when unresolved; never
+silently discard work to satisfy the merge rule. These are data-preservation gates, not approval
+gates. If target fetch later fails, the parent remains Done and its child stays blocked/queued
+with the fetch error; do not undo valid parent completion.
+
+Extend dispatchReadyTasks with an explicit merged_pr trigger and candidateTaskIds derived from
+direct linked dependents of completed merge bindings. This path runs even when
+taskDispatchPolicy.enabled or gitDeliveryPolicy.enabled is false; enabling PR merge tracking
+must not require enabling deterministic PR creation/delivery. Do not auto-enable either policy
+or launch unrelated backlog cards. For non-merge prerequisites retain their existing delivery/
+no-op readiness rules. All prerequisite cards must be Done; Trash/missing/cycles/manual deferral
+block. Do not run a second browser launcher for these candidates.
+
+Use the existing taskDispatchPolicy.workerLimit (configured value, otherwise 1) as the independent
+workspace launch cap, even in this trigger path. Reuse endpoint/model queue for actual turns;
+a saturated model can leave an admitted child In Progress with q #N. A worker-cap wait remains
+Backlog with a dispatch-wait reason, not a fake model queue position. Persist dispatch ownership
+before the board move/start; board move is server-owned and precedes startTaskSession.
+Use the child's existing agent/model/plan-mode settings and normal start API.
+
+Re-run candidate passes after merge completion, relevant board/dependency change, worker/turn
+release, model admission cancellation and runtime startup. Only eligible undispatched children
+launch, once. Preserve existing retry cap/manual deferral. If prerequisites are reopened before
+a child starts, cancel its pending admission and retain its backlog/blocked intent; never remove
+prior work to do this. Already admitted/running children keep their existing state/history.
+
+For baseline preparation, fetch the exact base ref into remote-tracking refs under the existing
+base-preparation lock. Require Git merge-base --is-ancestor for mergeCommitSha against the resolved
+successor baseline. GitHub merge_commit_sha is the landed merge/squash commit or last rebase
+commit after a confirmed merge; do not substitute original PR head ancestry. Missing/unreachable
+merge SHA blocks rather than guesses. Retain the child's selected base: fetch its origin-backed
+branch and verify it contains all merged prerequisites; a pinned/incompatible base blocks with
+an action to update it. Do not silently select a different branch or pull into a dirty checkout.
+Normal fresh start creates its worktree at that verified SHA; existing prior-work worktrees are
+checked, not reset. Preparation-only untouched worktrees use the existing safe reset/reprepare
+path. The optional base-refresh checkbox cannot waive required dependency freshness.
+
+## Successor handoff and history
+
+Extend B-9 readiness to accept explicit confirmed-merge completion receipts while retaining
 existing delivery/no-op modes for other tasks. The runtime, not browser hooks, owns this handoff
 even when the old reliable dispatcher policy is disabled; offer the needed backend dispatch
 path for merged prerequisites without requiring deterministic PR creation for agent-created PRs.
@@ -127,27 +175,27 @@ Moving it manually to Done may release waiting children once, using retained val
 History inspection must not trigger base-refresh or delivery side effects. Preserve existing
 worktree recovery where needed for detail access.
 
-## Implementation slices
+## Implementation PR boundary
 
-Each row is one implementation PR/card; all are planned and unchecked. No additional breakout
-files or cards are created by this document. Reinspect the latest source and list concrete
-changes, validation and deployment requirements in every implementation PR.
+One implementation PR: **MERGE-1 — confirmed merge completion and successor handoff**.
+Combine receipt/board completion, legacy completion arbitration, merged baseline resolution,
+successor dispatch/queueing and manual history reopening. Depends on FOUNDATION-0 and
+FOUNDATION-1 only; no COMMENT dependency. Former MERGE-2 is folded into this PR; former
+MERGE-0 is the separate foundation. Do not schedule either obsolete slice.
 
-| ID | Scope | Depends on | Acceptance |
-| --- | --- | --- | --- |
-| MERGE-1 | Reviewed merge receipt and completion using foundation gates | FOUNDATION-0 + FOUNDATION-1 | Exactly-once reviewed completion; errors and unsafe work block |
-| MERGE-2 | Backend successor integration, merged baseline and manual reopen suppression | MERGE-1 | Fresh squash/rebase-safe handoff, queueing and Done → Review history |
-
-The old MERGE-0 shared slice is replaced by the separate foundation plan. Neither merge slice
-requires COMMENT-0/COMMENT-1. Merge standalone qualification must pass with no comment consumer.
+Implement in order: consume confirmed metadata → complete through quiescence/preservation →
+record receipt and board outcome → extend dispatcher receipt/baseline logic → wire triggers
+and queued restart reconciliation → preserve history reopening → run tests below.
+Do not create task breakout documents; the user's agent will generate them.
 
 ## Verification
 
 - Foundation contract integration: merge consumer alone and alongside a fake comment consumer;
   task-scoped completion for two tasks sharing a PR; terminal observation cannot race a shared
   head writer or exceed read limits; stopped subscriptions remain stopped after history reopen.
-- Lifecycle tests: open/draft/closed-unmerged vs merged; final-SHA approval, stale/dismissed/self
-  approval and unresolved change requests; live/dirty task; toggle-off race; duplicate polls;
+- Lifecycle tests: open/draft/closed-unmerged vs merged; no approval, stale approval, unresolved
+  review requests and bot merge all complete when enabled; disabled remains unchanged;
+  live/dirty task, toggle-off race and duplicate polls;
   crash at each receipt/move/dispatch boundary; no early Done after PR delivery or clean tree.
 - Dispatch tests with real temporary Git repositories: merge, squash and rebase landed results;
   stale/pre-created and dirty worktrees; fetch failure and incompatible base; diamond dependencies;
@@ -155,7 +203,7 @@ requires COMMENT-0/COMMENT-1. Merge standalone qualification must pass with no c
 - UI/API tests: independent editable checkboxes in both active columns; stale board saves;
   no-PR/ambiguous/unsupported/blocked reasons; Done → Review survives polling/restart without
   bounce, duplicate PR prompt, hidden agent startup or repeated child launch.
-- End-to-end disposable PR: enable merge tracking, publish a reviewed PR, leave the browser
+- End-to-end disposable PR: enable merge tracking, publish a PR with no formal approval, leave the browser
   closed, merge externally, confirm Done and successor running/queued on the merged baseline.
   Reopen parent to inspect history and restart the runtime; it stays In Review.
 
@@ -167,11 +215,11 @@ required CI. Scripted fixtures prove lifecycle plumbing, not model review qualit
 
 This PR is planning only: no environment variables, dependencies, migration or deployment.
 The foundation supplies false-default settings, records, 60-second polling and runtime auth.
-Merge implementation adds only its task merge binding/receipt schema and completion/handoff
-behavior. Document final trusted-reviewer policy, storage upgrades and deployment/rollback in
+Merge implementation adds only its task merge binding schema and completion/handoff
+behavior. Document storage upgrades and deployment/rollback in
 implementation PRs. Merge tracking requires read access and no PR push permission.
 
-Roll out collection without effects, then one reviewed-merge pilot, then successor queue tests.
+Roll out collection without effects, then one merge-completion pilot, then successor queue tests.
 Disable either task checkbox independently; preserve records/work/history. Before binary rollback,
 drain live actions and confirm older versions preserve unknown server fields/record versions.
 After actual service/device changes, append a final task to update
