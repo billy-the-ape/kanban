@@ -2,215 +2,164 @@
 
 Updated: 2026-10-06. Status: proposed; documentation only. Repository: `billy-the-ape/kanban`.
 
-## Goal, boundaries and dependencies
+## Goal and dependencies
 
-When a task generates/links a PR and **Auto address comments** is enabled, collect actionable
-feedback, wait two minutes for a stable batch, then repair scoped defects on the same PR.
-Show In Progress during repair and In Review after verified publication. Use bounded backend
-work that survives browser closure and service restart.
+Automate the existing instruction “Address comments on the PR.” When Auto address comments
+is enabled, wait for feedback to settle, then send one short follow-up through the task's
+normal agent workflow. The agent reads GitHub, assesses the feedback, makes appropriate changes
+and updates the same PR as it does when instructed manually.
 
-This is separate from **Auto finish on merge**. It may operate with that checkbox off and never
-merges PRs or completes tasks because feedback was addressed, checks passed or a tree is clean.
-The [GitHub PR tracking foundation](../github-pr-tracking/github-pr-tracking-master-plan.md)
-owns shared observation, task settings, selected Automation PR, schemas, subscriptions and
-repair ownership/gates. Require both FOUNDATION-0 and FOUNDATION-1 after landed PR linking.
-Then this feature and merge tracking can be built in parallel and ship in either order.
-No merge consumer is required: terminal cancellation is supplied by the foundation.
+Require both FOUNDATION-0 and FOUNDATION-1 in the
+[GitHub tracking foundation](../github-pr-tracking/github-pr-tracking-master-plan.md).
+After that, this feature and [merge tracking](../pr-merge-tracking/pr-merge-tracking-master-plan.md)
+can be implemented in parallel and ship independently. Terminal cancellation and owner exclusion
+come from the foundation; no merge consumer is required.
 
-These plans supersede overlapping scope in unmerged
-[PR #21](https://github.com/billy-the-ape/kanban/pull/21). Keep its bounded repair principles
-but use PR-linking's card identities instead of another mapping; replace its five-minute
-debounce with the two-minute default requested here. Gateway review Action/report work is an
-optional feedback producer, not a dependency for ordinary human GitHub comments. No need to
-implement auto-replies, new gateway contracts or another reviewer engine in this series.
+This replaces the earlier fresh-repair pipeline/per-comment ledger proposal in this plan and
+overlapping scope in [PR #21](https://github.com/billy-the-ape/kanban/pull/21).
+GitHub is the source of truth for comments, reviews, discussions and fix commits. Do not add
+a separate reviewer engine, structured per-comment result format, repair disposition database,
+new deterministic publication pipeline or lifecycle repair-budget subsystem.
 
-Source baseline and shared integration paths are listed in the foundation plan. Additionally
-inspect `src/cline-sdk/cline-task-session-service.ts`, the existing review/session/verification
-services, `src/workspace/task-review-handoff.ts`, delivery receipts and prompt receipt handling.
-Reverify APIs before edits; absence of a usable primitive must be reported as a dependency,
-not hidden by assuming a plan is implemented.
+## Minimal persistence in the PR tracking record
 
-## Settings and user behavior
+The foundation's canonical PR record contains the comment automation block below. It is shared
+by all linked tasks; only the chosen repair owner may mutate/dispatch it. Nothing in this workflow
+creates a task-sidecar comment ledger.
 
-`autoAddressComments` is optional on persisted cards, false when missing. The **Auto address
-comments** checkbox remains editable during In Progress, model-capacity waiting and In Review.
-It is independent of `autoFinishOnMerge`, Auto PR, and existing Auto review controls. It does
-not require those creation controls: a correctly linked manually created PR can be selected.
-Persist settings through the shared revision-checked API; never require session restart.
+| Field | Purpose |
+| --- | --- |
+| repairOwner | Existing foundation workspace/task identity and ownership revision |
+| pendingFeedbackFingerprint | Aggregate digest/watermark of eligible new/edited feedback waiting for dispatch |
+| debounceDeadline / firstPendingAt | Two-minute quiet time and ten-minute maximum wait |
+| lastDispatchedFeedbackFingerprint | Suppress dispatch of the same feedback after polling, toggle or restart |
+| dispatch | queued/running/completed/failed status, dispatched fingerprint, existing session/turn reference, ownership revision and concise error |
 
-Enable triggers a fresh scan of currently published, unresolved feedback, including comments
-posted before enabling. Resolved/deleted or already-addressed versions do not replay. Disable
-cancels pending batches/admissions immediately; an active repair stops at the next safe boundary
-without discarding edits or replaying ambiguous pushes. Settings changes cannot waive locks,
-checks or lifecycle budgets. A visible **Resume automatic repairs** action can explicitly reset
-an exhausted budget after operator inspection; toggling the checkbox cannot reset it.
+Record status describes instruction execution, not proof that every comment was fixed.
+GitHub and the existing task transcript/check/delivery history hold the substantive outcome.
+Reuse normal session/queue references; do not copy transcripts, comment bodies, candidate trees,
+per-item addressed/rejected flags or verification/publication stages into this block.
+Schema version and record revision are supplied by the foundation, not a separate workflow store.
 
-For no eligible selected PR, missing access, unsupported agent/provider, branch mismatch or
-ambiguity, retain the checkbox and show the blocking reason. First automatic repair support
-targets native Cline with the existing capacity/session primitives. External terminal agents
-must not be advertised as supported until equivalent durable dispatch and cancellation are
-implemented and tested; they retain manual feedback handling and visible diagnostics.
+Disabling/re-enabling comments, transferring ownership or reopening a card preserves the last
+dispatched fingerprint. Transfer does not silently replay an instruction already sent.
+Uncertain execution is failed with a visible resume requirement; there is no automatic repair
+budget to reset.
 
-## Polling lifecycle
+## Collection and debounce (COMMENT-0)
 
-Use the shared observer's polling eligibility, stop and resume rules in the foundation plan.
-Register the comment consumer with metadata/feedback sources; do not add another polling loop.
-Only In Progress/In Review subscriptions with an enabled consumer observe open/draft PRs.
-Backlog/Done/Trash, both options disabled, and terminal PRs stop recurring observation.
-Merged/closed PRs immediately stop feedback reads and pending repairs; only an enabled merge
-consumer may need bounded completion reconciliation. Retain versions and dispositions when
-polling stops. History reopen, service restart and checkbox toggles do not rearm terminal PRs.
-Explicit Resume PR tracking performs a one-time read and resumes recurring observation only
-for a confirmed eligible open/draft PR; it does not reset repair limits or launch a turn itself.
+Use the foundation observer and eligibility table: metadata and eligible published feedback
+only for active task-derived subscriptions. No separate poller or repository-wide scan.
+Read submitted review bodies, inline review threads and PR conversation comments with complete
+pagination. Ignore unpublished reviews, resolved/deleted threads, empty approval-only feedback,
+known bot/status noise and recognized output from the repair itself. Human comments are eligible;
+reviewer bots require the configured trusted allowlist. No model call is needed to classify each
+comment before dispatch: the agent evaluates actual advice during its normal turn.
 
-## Feedback normalization and debounce (COMMENT-0)
+Fingerprint eligible additions/edits using a deterministic sorted aggregate of provider IDs,
+updated timestamps and body digests. The aggregate includes a latest-update watermark for
+detecting new/edited feedback; do not use PR head changes as new feedback. Raw comments are fetched
+from GitHub and may be held in transient snapshots, not duplicated in durable workflow storage.
+Duplicate polls, resolution/deletion alone, own pushes and unrelated status updates do not
+trigger another instruction. Drop removed feedback from a pending aggregate; if none remains,
+cancel the pending dispatch. Preserve the dispatched watermark when previously dispatched
+feedback disappears so surviving old comments do not look new after restart.
 
-Consume shared observer snapshots of submitted review bodies, inline review comments/threads
-and PR conversation comments. The foundation already normalizes canonical identity, event/review/
-thread IDs, author/times/digests, commit/path/line and resolution; consume that schema without
-renormalizing or introducing provider-specific reads here.
-Persist seen, pending, reserved and addressed versions separately. Reading is not addressing.
-An edited comment becomes a new version; duplicate provider reads do not create new work.
-Do not double-count a review body and its inline comments as duplicate instructions.
+On first enable, currently published eligible feedback can form a batch; an already dispatched
+aggregate does not replay. New/edited eligible feedback sets a deadline **120 seconds after its
+last change**, with **600 seconds maximum wait** from firstPendingAt. Persist only the aggregate
+and those times. A running writer/model capacity wait may postpone actual execution beyond
+that deadline. Feedback arriving after a dispatch forms the next pending aggregate.
 
-Human feedback on the selected PR is eligible; bots require an explicit trusted reviewer
-allowlist. Ignore approvals without requests, pending reviews, resolved/deleted comments,
-own repair output, CI status chatter and known generated summaries. Candidate text is assessed
-for actionable in-scope requests inside the bounded repair turn; no extra model call per comment.
-An empty CHANGES_REQUESTED review is a visible request for clarification, not an endless repair.
-Outdated inline feedback is checked against current code before editing, not blindly applied.
-PR text is untrusted input and cannot override task requirements, tool approvals or permissions.
+At due time, perform a successful fresh read and revalidate owner, task/link/settings, PR open
+state and eligible feedback. A partial API failure cannot dispatch. COMMENT-0 exposes pending
+count/deadline using the current GitHub snapshot; it sends no agent instruction.
 
-Use **120 seconds of quiet** after the latest eligible addition/edit. Reset only for a real
-eligible version change, not each poll or an unrelated status update. Persist first-pending time,
-last-change time and due time. Add a **600-second maximum batch wait** from the first eligible
-event so a continuously active reviewer cannot starve repair. Dispatch takes the latest stable
-snapshot available at that boundary; new events afterward remain pending for the next batch.
-Actual start may be later due to writer ownership/model capacity; display that distinction.
+## Exact instruction and agent workflow (COMMENT-1)
 
-On due time, refresh PR head, published feedback and thread states with complete successful
-pagination. Drop resolved/deleted feedback and reconcile edited versions. A changed head makes
-the batch stale and requires reassessment on that head; never run against a cached old tree.
-Persist batch identity, selected-PR/settings generation, base head, event versions and due time
-before admission. Backend timers derive from durable records; startup catches up due batches.
-COMMENT-0 only collects and exposes batches; it never launches an agent.
+Use this template, substituting the validated selected PR URL:
 
-## Repair execution (COMMENT-1)
+> Address comments on the linked PR: {url}. Check the feedback against the current code and
+> original task requirements. Fix valid issues, explain any disagreements, and update the
+> same PR.
 
-1. Require this task to be the foundation's explicit automatic repair owner. Claim a durable
-   batch lease plus fenced task/PR/head operation reservation; another linked task cannot repair.
-   Recheck checkbox, selected PR, open/unmerged state,
-   current head and column. Backlog, Trash, Done, manual pause and historical reopen block.
-   A live writer, review, verification, delivery or manual Git action retains ownership;
-   feedback waits without being injected into its turn. Shared branch ownership also blocks
-   conflicts across tasks/workspaces, not just a writer on this task's worktree.
-2. Verify the actual remote head repository/branch and reconcile delivery mappings. A fork PR
-   or PR outside the task's delivery repository needs verified writable mapping; otherwise
-   block. Preserve local edits and never reset/rebase user work to match a remote branch.
-3. Queue through the same endpoint/model admission as implementation and review. Use current
-   task model/provider/rules/permissions, cancellation and `q #N` badges. A follow-up repair
-   with history is not eligible for the untouched-initial-task Backlog reset path. Persist
-   intent and reconcile after restart; the in-memory queue is not the durable scheduler.
-4. Once admitted, move Review → In Progress and run a fresh scoped repair session with the
-   approved original task requirements, exact current PR head, concise handoff, feedback URLs,
-   normalized versions and remaining budget. Preserve the original transcript and associate
-   the repair transcript with task history. Do not reset the task or resend Auto PR prompts.
-5. Assess each item: fix an in-scope defect, record that it is already satisfied, or give a
-   concise evidence-backed rejection. Scope changes, unclear requirements and unsafe advice
-   stop visibly for human handling. Never execute arbitrary feedback commands as authority.
-6. Run configured deterministic verification against the candidate tree, preserving existing
-   review/check gates. On success, commit and push to the same PR branch through delivery
-   services; suppress new PR creation, local target integration and premature Done behavior.
-   Compare remote head before push and stop on external drift. No force-push or hidden stash.
-7. Persist candidate, verification and publication evidence before marking feedback addressed.
-   For a valid no-change disposition record the rationale and checked head without inventing
-   a commit. Return to In Review after successful publication/disposition and await review of
-   the new head. Failed or blocked repairs return to In Review with a visible failure; do not
-   leave Thinking or `impl` active when no turn is running.
+Send this as a normal task follow-up. Reuse the existing conversation/session, original task
+context, repository instructions, model/provider settings, tool permissions and compaction.
+If the session needs recovery, use the existing task continuation path; do not introduce a
+mandatory fresh repair session. If original task context cannot be recovered, fail visibly.
+Do not attach the full master plan or prescribe a machine-readable response.
 
-No automatic public replies or thread resolution are required in v1; expose per-item dispositions,
-commit/check links and blocked reasons locally. In particular, a thread left unresolved by the
-reviewer does not rerun forever: its addressed version remains consumed until edited or an
-explicit new actionable follow-up appears. New feedback during a run forms the next batch.
+Allow the normal agent workflow to inspect comments, edit, run checks, commit and push the
+same PR under existing permissions. There is no new “backend owns all commits/pushes” split,
+no requirement to reply publicly to each item and no mandatory disposition vocabulary.
+The expected response is the usual concise explanation of changes, disagreements and checks.
+Existing verification/delivery behavior remains in force; do not weaken it or invent results.
 
-## Bounds, races and recovery
+1. Require the selected foundation repair owner and validate this task's writable PR/head
+   mapping. Acquire the existing task/PR/head reservation. Wait while any conflicting writer,
+   review or manual operation is active; do not inject feedback mid-turn.
+2. Persist queued dispatch intent, fingerprint and owner revision before sending. Use the
+   existing model admission queue and q #N visibility. Recheck cancellation and linkage at
+   admission. Automatic follow-ups with prior history cannot use untouched-task Backlog reset.
+3. Submit exactly one instruction and capture its normal session/turn reference. Preserve
+   lastDispatchedFeedbackFingerprint as soon as acceptance is confirmed. An unknown send
+   outcome is failed/needs-resume, never blindly retried.
+4. Use existing running-turn lifecycle for Review → In Progress and completion → In Review.
+   A normal agent turn completion marks this dispatch completed; it does not mark every review
+   item addressed or move the card to Done. Existing prompt receipts prevent duplicate Auto PR.
+5. New eligible feedback waits for a later debounced follow-up. Unchanged unresolved comments
+   do not retrigger merely because the agent declined them or GitHub threads remain open.
 
-Default maximum is **three automatic repair batches per task/selected PR lifecycle** and stop
-after **two consecutive no-progress rounds**. “Progress” is verified/published relevant changes
-or a new evidence-backed terminal disposition; unchanged repetition is not progress. Persist
-budget spend before starting a turn; failed runs still consume it. Inherited turn time/token,
-tool retry and verification bounds remain enforced. Success, new comments, head changes,
-restarts and checkbox toggles do not replenish the lifecycle budget. Surface remaining budget.
+## Failure, cancellation and restart
 
-Persist stages: pending → reserved → queued → repairing → verifying → publishing → addressed,
-with blocked/needs-human and cancellation outcomes. A claim/lease is not proof that a push
-succeeded. If a response is lost after commit/push, reconcile Git, remote head and the expected
-candidate receipt before retrying. Unknown outcomes enter needs-human rather than replaying
-the entire repair. On restart, adopt verified live ownership or resume a safe pending stage;
-never duplicate a live session or blindly reexecute an uncertain turn.
+Keep existing turn/tool retry/time limits; introduce no new three-round/two-no-progress counters,
+per-comment receipts or separate repair stage machine. A failed dispatch stops automatic comment
+instructions for this PR until explicit Resume comment handling or a manual follow-up resolves it.
+New comments, checkbox toggles and owner transfer cannot silently bypass that failure.
 
-If the PR merges/closes during debounce or queueing, cancel the intent. During repair or push,
-stop at a safe boundary and reconcile unpublished/dirty work through foundation terminal
-invalidation/gates, including when no merge feature is installed. This feature never moves
-cards to Done; an installed merge consumer uses the same gate for its separate transition. A merged PR cannot trigger further comment repairs, even
-when the user reopens its card from Done for history. Unchecking either option does not toggle
-the other. Pausing/trashing/removing a PR cancels queued work and cannot silently relaunch it.
+At restart, use the recorded normal turn reference to reconcile known live/completed execution.
+A pending aggregate or provably unsent queued intent can resume after eligibility checks.
+If a running turn or send/push outcome cannot be established, show an error requiring user
+resume rather than rerunning the prompt. Resume uses the same normal instruction path and
+current GitHub state; it does not wipe the last dispatched fingerprint or silently resend old
+work. An explicit operator choice can retry interrupted feedback after inspecting GitHub/worktree.
+
+Disable, pause, trash, unlink, owner transfer or terminal PR observation cancels queued dispatch.
+Stop active work through existing safe cancellation, retaining edits/history. A merged/closed PR
+never receives another automatic comment follow-up, including after Done → Review history access.
+An installed merge consumer waits for shared quiescence; comments alone return to In Review.
 
 ## Implementation slices
 
-Each row is one implementation PR/card, planned and unchecked. Keep the count small; create
-individual task documents only when the user requests breakout.
-
 | ID | Scope | Depends on | Acceptance |
 | --- | --- | --- | --- |
-| COMMENT-0 | Actionable feedback classification, durable batches, two-minute debounce and visibility | FOUNDATION-0 + FOUNDATION-1 | One stable batch; old eligible feedback included; restart and edit-safe collection |
-| COMMENT-1 | Bounded native Cline repair, admission, verification, same-PR push and recovery | COMMENT-0 + existing session/verification/delivery contracts | One writer; checks gate publication; no duplicate run/push or early Done |
+| COMMENT-0 | Aggregate feedback fingerprint, debounce and pending visibility in PR record | FOUNDATION-0 + FOUNDATION-1 | One stable aggregate; unchanged feedback never replays |
+| COMMENT-1 | Normal task follow-up prompt, admission, owner exclusion and interrupted-run visibility | COMMENT-0 + existing task continuation APIs | Same manual workflow; one owner/turn; no blind restart retry |
 
-Ownership selection/transfer is implemented by the foundation. Only the selected owner stores
-pending repair batches and spends budget. Explicit transfer carries addressed versions and spent
-budget forward, invalidates old intents/fencing tokens and reassesses the new task's approved
-scope. Do not reset limits by choosing another task or silently inherit its specification.
-Persist consumer fields under the comment namespace using foundation mutation APIs. No MERGE
-slice is a dependency; prove terminal stopping and In Review return with merge absent.
+No separate comment workflow data store or dependency on MERGE slices. Both feature series
+remain independently implementable after the foundation.
 
-## Verification and manual pilot
+## Verification and rollout
 
-- Ownership integration: two linked tasks across workspaces yield only one repairing task;
-  owner contention/disable/unlink/transfer use foundation blockers; stale ownership cannot push;
-  transfer retains consumed feedback and budget. Run comments alone and with a fake merge consumer.
-- Polling lifecycle: inactive columns and terminal PRs produce no recurring feedback reads;
-  a shared PR remains observable for another eligible card; restart/history inspection cannot
-  rearm a terminal subscription; explicit resume of an externally reopened PR preserves budgets.
-- Fake clock/provider: multiple comments batched, edits reset quiet timer, duplicate polls do
-  not; max wait; pagination failure; resolution/deletion/outdated feedback; submitted review
-  bodies and inline threads; untrusted bot/status noise; enable backfill and disable race.
-- Session fixtures: currently running writer, manual edits and remote drift; capacity wait
-  with `q #N`; pause/trash cancellation; restored settings and transcript; verified same-PR
-  changes and no-change dispositions; failed checks; scope escalation; visible terminal error.
-- Restart at every reservation/turn/verification/publication boundary, including successful
-  push with lost response. Assert persisted budgets, no repeated addressed versions and one
-  writer/session. Toggle-off/on and manual Done → Review do not reset or rearm consumed work.
-- Merge during debounce, queue, execution and delivery; no further repair after merge,
-  no automatic completion with auto-finish disabled, and no competing merge transition.
-- Disposable end-to-end PR: enable comments, submit several review comments within two minutes,
-  confirm one fresh repair and same-PR commit after checks, then In Review. Submit another
-  comment during repair; it waits as the next batch. Saturate model slots and verify queueing.
-  Exhaust the repair budget, inspect the blocker, then explicitly resume once.
+- Multiple new/edited comments reset quiet time; duplicate polls do not; max wait and partial
+  pagination failure; deletion/resolution alone and own push cannot requeue old comments.
+- Two tasks/workspaces linked to one PR share reads but only one sends the prompt; transfer,
+  toggles and restart preserve the dispatched fingerprint.
+- Exact prompt is sent through normal continuation with task settings/rules and transcript
+  intact; running task waits; model saturation shows q #N; cancellation prevents late launch.
+- Accepted prompt with lost response or unknown running state fails visibly without resend;
+  known unsent intent can resume; failed state blocks even if new comments arrive.
+- Completed instruction returns to In Review without requiring structured output or all GitHub
+  threads resolved; no early Done or additional PR. Merge/close stops dispatch with merge absent.
+- Disposable pilot: leave several comments within two minutes, observe one ordinary follow-up,
+  same-PR update and normal explanation. New comments during that turn wait for the next batch.
+  Restart with an ambiguous interrupted turn and verify a visible resume requirement.
 
-Use isolated HOME/USERPROFILE, sanitized Git subprocess environments, focused backend/UI
-tests, typechecks, Biome on changed supported files and required CI. A real local-model pilot
-must validate repair usefulness; scripted fixtures prove orchestration only.
+Use focused backend/UI tests, typechecks and repository Biome checks for supported files.
+Isolate HOME/USERPROFILE and Git subprocess environments. Planning changes no runtime settings,
+environment variables or deployment. Proposed timing stays 120/600 seconds; only the PR record
+gains this minimal comment block. Document actual storage/schema changes and auth read/push
+permissions in implementation PRs; pilot one task before expanding.
 
-## Rollout and operations
-
-Planning adds no deployment requirements. Implementation defaults the task checkbox off;
-proposed runtime policy values are 120-second quiet time, 600-second max wait, three batches
-and two no-progress rounds. Reuse existing configuration conventions, and document final names,
-record version/storage, auth read/push permissions and rollout/rollback in each implementation PR.
-No new environment variables or packages are presumed necessary; justify any additions.
-Kanban runtime auth is separate from chat OAuth. No inbound listener is required.
-
-Inspect batches first, pilot one repair task, then expand. Disable scheduling, drain or safely
-stop live work and retain records before rollback. Follow the shared plan's final operational
-task: after actual service/device changes, update `billy-the-ape/homelab-documentation` via a
-Ready for Review PR recording deployed configuration, permissions, admission and rollback.
+After actual service/device changes, update `billy-the-ape/homelab-documentation` through a
+Ready for Review PR with deployed configuration, storage, permissions and rollback.

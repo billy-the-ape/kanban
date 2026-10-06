@@ -46,10 +46,11 @@ that behavior must be suppressed for tasks waiting for merge.
 
 ## Foundation contract used by this feature
 
-The foundation owns card preferences, selected Automation PR, durable task tracking records,
-shared authorized snapshots, runtime-wide polling subscriptions and operation gates. Do not
+The foundation owns card preferences, selected Automation PR, one canonical PR record with
+validated task bindings, authorized snapshots, polling subscriptions and operation gates. Do not
 implement those again here. Register the merge consumer, requesting metadata/review sources,
-and use its revision-checked task namespace for completion receipts/stages.
+and use its revision-checked task merge binding plus existing completion/dispatch receipts.
+Comment execution state remains minimal in that same PR record; this feature adds no comment ledger.
 
 Auto finish on merge remains false by default and editable in In Progress/In Review.
 The foundation prevents legacy PR-delivery/clean-tree automatic Done while this workflow is
@@ -119,7 +120,7 @@ resuming; never launch a successor twice or depend on the in-memory admission qu
 
 Done → In Review remains manually available and retains settings, PR links, transcript,
 receipts and preserved work. Persist a manual-reopen marker before exposing Review; the same
-merged PR cannot immediately send it back to Done. Reopening must not reset repair budgets,
+merged PR cannot immediately send it back to Done. Reopening must not clear comment dispatch markers,
 replay Auto PR, start an agent or trigger already-dispatched successors. Already running children
 are unaffected; children not yet dispatched wait while the prerequisite is back in Review.
 Moving it manually to Done may release waiting children once, using retained valid evidence.
@@ -166,7 +167,7 @@ required CI. Scripted fixtures prove lifecycle plumbing, not model review qualit
 
 This PR is planning only: no environment variables, dependencies, migration or deployment.
 The foundation supplies false-default settings, records, 60-second polling and runtime auth.
-Merge implementation adds only its consumer namespace/receipt schema and completion/handoff
+Merge implementation adds only its task merge binding/receipt schema and completion/handoff
 behavior. Document final trusted-reviewer policy, storage upgrades and deployment/rollback in
 implementation PRs. Merge tracking requires read access and no PR push permission.
 
