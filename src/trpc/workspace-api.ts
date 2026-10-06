@@ -613,9 +613,12 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 						workspaceScope.workspacePath,
 					);
 				}
+				// The reason is what the explicit Refresh toasts; it is never
+				// surfaced for the automatic review-entry lookup.
 				return {
 					ok: true,
 					updated: result.recorded,
+					reason: result.reason,
 				} satisfies RuntimeTaskPullRequestsRefreshResponse;
 			} catch (error) {
 				return {

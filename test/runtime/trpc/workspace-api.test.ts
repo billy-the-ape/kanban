@@ -694,17 +694,28 @@ describe("createWorkspaceApi PR linking (PRLINK-5)", () => {
 
 	it("refreshTaskPullRequests runs the branch lookup and reports changes", async () => {
 		prLinkMocks.loadWorkspaceBoardById.mockResolvedValue(createBoard("task-1"));
-		prLinkMocks.lookupTaskPullRequests.mockResolvedValue({ recorded: 2 });
+		prLinkMocks.lookupTaskPullRequests.mockResolvedValue({ recorded: 2, reason: "updated" });
 		const { api, broadcast } = createApi();
 
 		const response = await api.refreshTaskPullRequests(scope, { taskId: "task-1" });
 
-		expect(response).toEqual({ ok: true, updated: 2 });
+		expect(response).toEqual({ ok: true, updated: 2, reason: "updated" });
 		expect(prLinkMocks.lookupTaskPullRequests).toHaveBeenCalledWith({
 			workspacePath: "/tmp/repo",
 			taskId: "task-1",
 		});
 		expect(broadcast).toHaveBeenCalledWith("workspace-1", "/tmp/repo");
+	});
+
+	it("passes the lookup reason through so the explicit Refresh can toast it", async () => {
+		prLinkMocks.loadWorkspaceBoardById.mockResolvedValue(createBoard("task-1"));
+		prLinkMocks.lookupTaskPullRequests.mockResolvedValue({ recorded: 0, reason: "none_found" });
+		const { api, broadcast } = createApi();
+
+		const response = await api.refreshTaskPullRequests(scope, { taskId: "task-1" });
+
+		expect(response).toEqual({ ok: true, updated: 0, reason: "none_found" });
+		expect(broadcast).not.toHaveBeenCalled();
 	});
 
 	it("refreshTaskPullRequests rejects unknown tasks", async () => {

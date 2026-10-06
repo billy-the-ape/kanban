@@ -27,6 +27,12 @@ const KNOWN_PROVIDER_HOSTS: Record<string, RuntimeTaskPullRequestProvider> = {
 // path/query/fragment boundary; this rejects `/pull/new/<branch>` (printed by
 // `git push`), `/compare/...`, `/issues/<n>`, and missing or empty numbers.
 // `http://` is accepted and canonicalized to `https://`.
+//
+// Known limitation: canonicalization always rewrites to `https://`, and the
+// host pattern does not match explicit ports (e.g. `ghe.local:8443`), so
+// self-hosted instances served on plain http or custom ports do not parse.
+// Fine for github.com / gitlab.com / bitbucket.org; treat as a follow-up if
+// self-hosted support is exercised.
 const GITHUB_PULL_URL_PATTERN = /^https?:\/\/([a-z0-9.-]+)\/([^/?#\s]+)\/([^/?#\s]+)\/pull\/(\d+)(?:[/?#]\S*)?$/i;
 const GITLAB_MERGE_REQUEST_URL_PATTERN = /^https?:\/\/([a-z0-9.-]+)\/(.+?)\/-\/merge_requests\/(\d+)(?:[/?#]\S*)?$/i;
 const BITBUCKET_PULL_REQUEST_URL_PATTERN =

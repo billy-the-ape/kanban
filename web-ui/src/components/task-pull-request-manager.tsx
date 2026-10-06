@@ -8,7 +8,12 @@ import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { getRuntimeTrpcClient } from "@/runtime/trpc-client";
 import type { RuntimeTaskPullRequest } from "@/runtime/types";
-import { formatPullRequestLabel, getPullRequestKey, validatePullRequestUrlShape } from "@/utils/task-pull-requests";
+import {
+	formatPullRequestLabel,
+	getPullRequestKey,
+	getPullRequestRefreshMessage,
+	validatePullRequestUrlShape,
+} from "@/utils/task-pull-requests";
 
 interface TaskPullRequestManagerProps {
 	workspaceId: string;
@@ -94,8 +99,15 @@ export function TaskPullRequestManager({ workspaceId, taskId, pullRequests }: Ta
 		setRefreshing(true);
 		try {
 			const response = await getRuntimeTrpcClient(workspaceId).workspace.refreshTaskPullRequests.mutate({ taskId });
-			if (!response.ok && response.error) {
-				showAppToast({ intent: "warning", message: response.error });
+			if (!response.ok) {
+				showAppToast({ intent: "warning", message: response.error || "Refresh failed." });
+				return;
+			}
+			// The lookup reason is only consumed by this explicit action; the
+			// board already reflects updated/unchanged outcomes via broadcast.
+			const message = getPullRequestRefreshMessage(response.reason);
+			if (message) {
+				showAppToast({ intent: "primary", message });
 			}
 		} catch (error) {
 			showAppToast({

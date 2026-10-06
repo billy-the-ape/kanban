@@ -2,7 +2,7 @@
 
 **Status: Implemented.** See "Final state" below for what shipped.
 
-Master plan: `PR_LINKING_PLAN.md` (this is milestone **PL-4**).
+Master plan: `PR_LINKING_PLAN.md`.
 Depends on: **PRLINK-1** (`recordTaskPullRequests` write path; parser from PRLINK-0).
 Note: this milestone is fork-specific (B-8 deterministic delivery does not exist upstream).
 

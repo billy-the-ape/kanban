@@ -151,7 +151,7 @@ describe("lookupTaskPullRequests", () => {
 			gh,
 		});
 
-		expect(result.recorded).toBe(2);
+		expect(result).toMatchObject({ recorded: 2, reason: "updated" });
 		expect(gh).toHaveBeenCalledWith(
 			[
 				"pr",
@@ -190,7 +190,7 @@ describe("lookupTaskPullRequests", () => {
 			branch: "task/branch-1",
 			gh: createGhRunner([{ url: "https://github.com/owner/repo/pull/12", title: "Old title", state: "OPEN" }]),
 		});
-		expect(first.recorded).toBe(1);
+		expect(first).toMatchObject({ recorded: 1, reason: "updated" });
 
 		const second = await lookupTaskPullRequests({
 			workspacePath,
@@ -198,7 +198,7 @@ describe("lookupTaskPullRequests", () => {
 			branch: "task/branch-1",
 			gh: createGhRunner([{ url: "https://github.com/owner/repo/pull/12", title: "New title", state: "MERGED" }]),
 		});
-		expect(second.recorded).toBe(1);
+		expect(second).toMatchObject({ recorded: 1, reason: "updated" });
 
 		const afterRefresh = await loadWorkspaceState(workspacePath);
 		const entry = findCardPullRequests(afterRefresh.board, "task-1")?.[0];
@@ -211,8 +211,43 @@ describe("lookupTaskPullRequests", () => {
 			branch: "task/branch-1",
 			gh: createGhRunner([{ url: "https://github.com/owner/repo/pull/12", title: "New title", state: "MERGED" }]),
 		});
-		expect(third.recorded).toBe(0);
+		expect(third).toMatchObject({ recorded: 0, reason: "unchanged" });
 		expect((await loadWorkspaceState(workspacePath)).revision).toBe(afterRefresh.revision);
+	});
+
+	it("does not churn when gh omits the title for a stored entry that has one", async () => {
+		await lookupTaskPullRequests({
+			workspacePath,
+			taskId: "task-1",
+			branch: "task/branch-1",
+			gh: createGhRunner([{ url: "https://github.com/owner/repo/pull/12", title: "Kept title", state: "OPEN" }]),
+		});
+		const revisionAfterFirst = (await loadWorkspaceState(workspacePath)).revision;
+
+		const result = await lookupTaskPullRequests({
+			workspacePath,
+			taskId: "task-1",
+			branch: "task/branch-1",
+			// gh can return no title; the stored title must survive and the
+			// missing title must not count as a change.
+			gh: createGhRunner([{ url: "https://github.com/owner/repo/pull/12", state: "OPEN" }]),
+		});
+
+		expect(result).toMatchObject({ recorded: 0, reason: "unchanged" });
+		const entry = findCardPullRequests((await loadWorkspaceState(workspacePath)).board, "task-1")?.[0];
+		expect(entry?.title).toBe("Kept title");
+		expect((await loadWorkspaceState(workspacePath)).revision).toBe(revisionAfterFirst);
+	});
+
+	it("reports none_found when gh succeeds without matching PRs", async () => {
+		const result = await lookupTaskPullRequests({
+			workspacePath,
+			taskId: "task-1",
+			branch: "task/branch-1",
+			gh: createGhRunner([]),
+		});
+
+		expect(result).toMatchObject({ recorded: 0, reason: "none_found" });
 	});
 
 	it("no-ops when gh is missing or fails, leaving state untouched", async () => {
@@ -224,7 +259,7 @@ describe("lookupTaskPullRequests", () => {
 			branch: "task/branch-1",
 			gh: vi.fn(async () => ({ ok: false, stdout: "", stderr: "", exitCode: 127, missingBinary: true })),
 		});
-		expect(missing.recorded).toBe(0);
+		expect(missing).toMatchObject({ recorded: 0, reason: "no_gh" });
 
 		const failed = await lookupTaskPullRequests({
 			workspacePath,
@@ -232,21 +267,21 @@ describe("lookupTaskPullRequests", () => {
 			branch: "task/branch-1",
 			gh: vi.fn(async () => ({ ok: false, stdout: "", stderr: "not logged in", exitCode: 1, missingBinary: false })),
 		});
-		expect(failed.recorded).toBe(0);
+		expect(failed).toMatchObject({ recorded: 0, reason: "gh_failed" });
 
 		const state = await loadWorkspaceState(workspacePath);
 		expect(state.revision).toBe(revisionBefore);
 		expect(findCardPullRequests(state.board, "task-1")).toBeUndefined();
 	});
 
-	it("no-ops when the task is missing or the worktree cannot be resolved", async () => {
+	it("no-ops when the task is missing, the worktree is gone, or the branch is unresolvable", async () => {
 		const missingTask = await lookupTaskPullRequests({
 			workspacePath,
 			taskId: "nope",
 			branch: "task/branch-1",
 			gh: createGhRunner([{ url: "https://github.com/owner/repo/pull/12", state: "OPEN" }]),
 		});
-		expect(missingTask.recorded).toBe(0);
+		expect(missingTask).toMatchObject({ recorded: 0, reason: "no_task" });
 
 		taskWorktreeMocks.resolveTaskCwd.mockRejectedValueOnce(new Error('Task worktree not found for task "task-1".'));
 		const noWorktree = await lookupTaskPullRequests({
@@ -255,7 +290,26 @@ describe("lookupTaskPullRequests", () => {
 			branch: "task/branch-1",
 			gh: createGhRunner([{ url: "https://github.com/owner/repo/pull/12", state: "OPEN" }]),
 		});
-		expect(noWorktree.recorded).toBe(0);
+		expect(noWorktree).toMatchObject({ recorded: 0, reason: "no_worktree" });
+
+		// The mocked worktree path does not exist, so real git rev-parse
+		// fails and branch resolution yields null.
+		const noBranch = await lookupTaskPullRequests({
+			workspacePath,
+			taskId: "task-1",
+			gh: createGhRunner([{ url: "https://github.com/owner/repo/pull/12", state: "OPEN" }]),
+		});
+		expect(noBranch).toMatchObject({ recorded: 0, reason: "no_branch" });
+		expect(
+			(
+				await lookupTaskPullRequests({
+					workspacePath,
+					taskId: "   ",
+					branch: "task/branch-1",
+					gh: createGhRunner([]),
+				})
+			).reason,
+		).toBe("no_task");
 	});
 });
 

@@ -173,12 +173,12 @@ export function ClineChatComposer({
 	}, [activeToken?.kind, activeToken?.query, activeToken?.start]);
 
 	useEffect(() => {
-		if (activeToken?.kind !== "mention") {
+		if (!activeToken || activeToken.kind !== "mention") {
 			mentionSearchRequestIdRef.current += 1;
 			setMentionSuggestions([]);
 			setIsMentionSearchLoading(false);
 		}
-		if (activeToken?.kind !== "slash") {
+		if (!activeToken || activeToken.kind !== "slash") {
 			slashCommandsRequestIdRef.current += 1;
 			setSlashSuggestions([]);
 			setIsSlashSearchLoading(false);
@@ -222,7 +222,7 @@ export function ClineChatComposer({
 
 	useDebouncedEffect(
 		() => {
-			if (activeToken?.kind !== "mention" || !workspaceId) {
+			if (!activeToken || activeToken.kind !== "mention" || !workspaceId) {
 				return;
 			}
 			const requestId = ++mentionSearchRequestIdRef.current;
@@ -262,7 +262,7 @@ export function ClineChatComposer({
 
 	useDebouncedEffect(
 		() => {
-			if (activeToken?.kind !== "slash") {
+			if (!activeToken || activeToken.kind !== "slash") {
 				return;
 			}
 			const requestKey = workspaceId ?? "__global__";

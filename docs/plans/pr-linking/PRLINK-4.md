@@ -2,7 +2,7 @@
 
 **Status: DONE (implemented; all web-ui tests + typecheck green, biome-formatted).**
 
-Master plan: `PR_LINKING_PLAN.md` (this is milestone **PL-5**).
+Master plan: `PR_LINKING_PLAN.md`.
 Depends on: **PRLINK-0** (contract field + helpers). Can land in parallel with PRLINK-1…PRLINK-3 — seed `pullRequests` in test data; no capture path is required to render.
 
 ## Purpose

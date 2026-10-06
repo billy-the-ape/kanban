@@ -5,7 +5,9 @@ import {
 	formatPullRequestLabel,
 	getLatestPullRequest,
 	getPullRequestKey,
+	getPullRequestRefreshMessage,
 	getPullRequestTooltipLines,
+	validatePullRequestUrlShape,
 } from "@/utils/task-pull-requests";
 
 const MINUTE_MS = 60 * 1000;
@@ -85,6 +87,41 @@ describe("getPullRequestKey", () => {
 		const different = createPullRequest({ number: 124 });
 		expect(getPullRequestKey(first)).toBe(getPullRequestKey(same));
 		expect(getPullRequestKey(first)).not.toBe(getPullRequestKey(different));
+	});
+});
+
+describe("validatePullRequestUrlShape", () => {
+	it("accepts PR/MR URLs for the supported providers", () => {
+		expect(validatePullRequestUrlShape("https://github.com/owner/repo/pull/123")).toBeNull();
+		expect(validatePullRequestUrlShape("https://gitlab.com/group/repo/-/merge_requests/45")).toBeNull();
+		expect(validatePullRequestUrlShape("https://bitbucket.org/owner/repo/pull-requests/7")).toBeNull();
+	});
+
+	it("rejects empty, non-URL, and non-PR URLs", () => {
+		expect(validatePullRequestUrlShape("")).toBe("Enter a pull request URL.");
+		expect(validatePullRequestUrlShape("https://github.com/owner/repo/issues/3")).toBe(
+			"URL does not look like a pull request or merge request link.",
+		);
+		expect(validatePullRequestUrlShape("https://github.com/owner/repo/pull/new/branch")).toBe(
+			"URL does not look like a pull request or merge request link.",
+		);
+	});
+});
+
+describe("getPullRequestRefreshMessage", () => {
+	it("maps lookup failure reasons to info messages", () => {
+		expect(getPullRequestRefreshMessage("none_found")).toBe("No pull requests found for this branch");
+		expect(getPullRequestRefreshMessage("no_gh")).toBe("GitHub CLI (gh) not found");
+		expect(getPullRequestRefreshMessage("gh_failed")).toBe("Could not query GitHub");
+		expect(getPullRequestRefreshMessage("no_worktree")).toBe("Task worktree no longer exists");
+		expect(getPullRequestRefreshMessage("no_branch")).toBe("Could not determine the current branch");
+	});
+
+	it("returns null when the board already reflects the outcome", () => {
+		expect(getPullRequestRefreshMessage("updated")).toBeNull();
+		expect(getPullRequestRefreshMessage("unchanged")).toBeNull();
+		expect(getPullRequestRefreshMessage("failed")).toBeNull();
+		expect(getPullRequestRefreshMessage(undefined)).toBeNull();
 	});
 });
 

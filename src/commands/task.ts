@@ -696,7 +696,7 @@ async function startTask(input: { cwd: string; taskId: string; projectPath?: str
 	}
 
 	const existingSession = runtimeState.sessions[task.id] ?? null;
-	const shouldStartSession = existingSession?.state !== "running";
+	const shouldStartSession = !existingSession || existingSession.state !== "running";
 
 	if (shouldStartSession) {
 		const ensured = await runtimeClient.workspace.ensureWorktree.mutate({

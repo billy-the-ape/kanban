@@ -1,6 +1,6 @@
 # PRLINK-0 — Contract, parser, detection, board mutations
 
-Master plan: `PR_LINKING_PLAN.md` (this is milestone **PL-1**).
+Master plan: `PR_LINKING_PLAN.md`.
 Depends on: nothing. This is the first milestone and must land before any runtime writer (PRLINK-1 through PRLINK-3).
 
 ## Status: implemented

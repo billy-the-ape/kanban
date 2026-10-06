@@ -181,10 +181,30 @@ export const runtimeTaskPullRequestsRefreshRequestSchema = z.object({
 });
 export type RuntimeTaskPullRequestsRefreshRequest = z.infer<typeof runtimeTaskPullRequestsRefreshRequestSchema>;
 
+/**
+ * Why a branch lookup produced its result. Set on ok refresh responses so the
+ * explicit Refresh action can toast it; the automatic review-entry lookup
+ * ignores it.
+ */
+export const runtimeTaskPullRequestRefreshReasonSchema = z.enum([
+	"no_task",
+	"no_worktree",
+	"no_branch",
+	"no_gh",
+	"gh_failed",
+	"none_found",
+	"unchanged",
+	"updated",
+	"failed",
+]);
+export type RuntimeTaskPullRequestRefreshReason = z.infer<typeof runtimeTaskPullRequestRefreshReasonSchema>;
+
 export const runtimeTaskPullRequestsRefreshResponseSchema = z.object({
 	ok: z.boolean(),
 	/** Number of PR entries that changed (added or snapshot-updated). */
 	updated: z.number().int().nonnegative(),
+	/** Present on ok responses; drives the explicit Refresh toast. */
+	reason: runtimeTaskPullRequestRefreshReasonSchema.optional(),
 	error: z.string().optional(),
 });
 export type RuntimeTaskPullRequestsRefreshResponse = z.infer<typeof runtimeTaskPullRequestsRefreshResponseSchema>;

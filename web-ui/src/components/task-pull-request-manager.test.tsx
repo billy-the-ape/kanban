@@ -229,4 +229,64 @@ describe("TaskPullRequestManager", () => {
 			expect.objectContaining({ intent: "warning", message: "Refresh failed." }),
 		);
 	});
+
+	it("toasts the lookup reason when an explicit refresh cannot find PRs", async () => {
+		trpcClientMocks.refreshTaskPullRequests.mockResolvedValue({
+			ok: true,
+			updated: 0,
+			reason: "none_found",
+		});
+
+		await act(async () => {
+			renderManager([]);
+		});
+
+		await openPopover(container);
+		const refreshButton = document.body.querySelector("[data-testid='task-pr-refresh-button']");
+		expect(refreshButton).toBeTruthy();
+		await clickElement(refreshButton as Element);
+
+		expect(appToasterMocks.showAppToast).toHaveBeenCalledWith(
+			expect.objectContaining({ intent: "primary", message: "No pull requests found for this branch" }),
+		);
+	});
+
+	it("toasts a warning fallback when refresh fails without an error message", async () => {
+		trpcClientMocks.refreshTaskPullRequests.mockResolvedValue({
+			ok: false,
+			updated: 0,
+		});
+
+		await act(async () => {
+			renderManager([]);
+		});
+
+		await openPopover(container);
+		const refreshButton = document.body.querySelector("[data-testid='task-pr-refresh-button']");
+		expect(refreshButton).toBeTruthy();
+		await clickElement(refreshButton as Element);
+
+		expect(appToasterMocks.showAppToast).toHaveBeenCalledWith(
+			expect.objectContaining({ intent: "warning", message: "Refresh failed." }),
+		);
+	});
+
+	it("stays silent when a refresh leaves the board unchanged", async () => {
+		trpcClientMocks.refreshTaskPullRequests.mockResolvedValue({
+			ok: true,
+			updated: 0,
+			reason: "unchanged",
+		});
+
+		await act(async () => {
+			renderManager([]);
+		});
+
+		await openPopover(container);
+		const refreshButton = document.body.querySelector("[data-testid='task-pr-refresh-button']");
+		expect(refreshButton).toBeTruthy();
+		await clickElement(refreshButton as Element);
+
+		expect(appToasterMocks.showAppToast).not.toHaveBeenCalled();
+	});
 });
