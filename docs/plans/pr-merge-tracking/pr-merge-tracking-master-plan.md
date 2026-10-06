@@ -2,20 +2,17 @@
 
 Updated: 2026-10-06. Status: proposed; documentation only. Repository: `billy-the-ape/kanban`.
 
-## Goal and feature split
+## Goal and independent feature boundary
 
-Observe linked GitHub PRs in the backend, finish opted-in tasks after a reviewed PR merges,
-and release linked successor tasks against the merged code. Preserve manual Done → In Review
-movement for history inspection without repeating completion or successor launches.
+Finish opted-in tasks after a reviewed linked PR merges, then release linked successor tasks
+against verified merged code. Preserve manual Done → In Review history access without repeated
+completion or successor launch. This feature never merges PRs.
 
-Implement two independently selectable features sharing one backend observer:
-
-- **PR merge tracking** (this plan): collection, task settings, merge completion and successor handoff.
-- **[PR comment handling](../pr-comment-handling/pr-comment-handling-master-plan.md)**:
-  debounced feedback batches and bounded repairs using the same observer.
-
-Merge tracking is the smaller deterministic feature and should ship first. Comment handling
-depends on shared collection, not on enabling merge completion. Neither feature merges PRs.
+First complete the [GitHub PR tracking foundation](../github-pr-tracking/github-pr-tracking-master-plan.md)
+(FOUNDATION-0 and FOUNDATION-1). After that, merge tracking and
+[comment handling](../pr-comment-handling/pr-comment-handling-master-plan.md) can be built
+in parallel and ship in either order. Merge tracking requires no comment implementation:
+consume foundation snapshots/gates and existing completion/dispatch services only.
 
 ## Dependencies and existing work
 
@@ -28,7 +25,7 @@ depends on shared collection, not on enabling merge completion. Neither feature 
 - [Model capacity queue](../../runtime/cline-concurrency.md): endpoint/model FIFO admission,
   automatic slot discovery, cancellation and `q #N` badges.
 - [PR #21](https://github.com/billy-the-ape/kanban/pull/21) contains an older unmerged
-  feedback/repair proposal. These two plans supersede its overlapping monitoring, repair and
+  feedback/repair proposal. These three plans supersede its overlapping monitoring, repair and
   merge lifecycle design for this implementation. Do not run both card series or create a
   second task/PR mapping. Keep #21 as historical rationale; no closure/merge is implied.
 - [PR #29](https://github.com/billy-the-ape/kanban/pull/29) proposes broader history viewing.
@@ -47,117 +44,23 @@ type and baseline resolver are required. Do not fabricate a legacy delivery rece
 that behavior must be suppressed for tasks waiting for merge.
 `web-ui/src/state/drag-rules.ts` already permits Done → Review.
 
-## Task controls and ownership
+## Foundation contract used by this feature
 
-| Checkbox | Persisted field | Default | Behavior |
-| --- | --- | --- | --- |
-| Auto address comments | `autoAddressComments` | false | Enables the companion feedback workflow |
-| Auto finish on merge | `autoFinishOnMerge` | false | Enables reviewed-merge completion |
+The foundation owns card preferences, selected Automation PR, durable task tracking records,
+shared authorized snapshots, runtime-wide polling subscriptions and operation gates. Do not
+implement those again here. Register the merge consumer, requesting metadata/review sources,
+and use its revision-checked task namespace for completion receipts/stages.
 
-Both controls are independent booleans visible in task create/edit and detail settings,
-editable throughout In Progress and In Review, including queued tasks. Keep enabled choices
-when no PR exists; show “Waiting for linked PR.” They activate once an eligible PR is linked.
-Old cards with missing fields behave as false; no bulk enable or session restart required.
-Allow saving these preferences during a running turn without restarting that turn.
+Auto finish on merge remains false by default and editable in In Progress/In Review.
+The foundation prevents legacy PR-delivery/clean-tree automatic Done while this workflow is
+enabled. This feature owns reviewed completion, successor dispatch and historical reopening.
+Observe the foundation's polling stop/resume table and bounded terminal reconciliation;
+never add a feature timer or a completion retry loop that extends terminal API reads.
 
-Use a dedicated revision-checked task-settings mutation. Preserve server-owned links,
-snapshots, automation records and settings against unrelated stale whole-board saves.
-Store progress/counters in backend records, not client localStorage or session summaries.
-Toggle changes and PR removal invalidate queued intents; revalidate at execution time.
-
-When auto-finish is enabled, PR creation/push and a clean worktree mean In Review, never Done.
-Comment repair alone also leaves the task In Review until manual completion or opted-in merge
-completion. Prevent browser, CLI and deterministic delivery automation from competing with
-this lifecycle. Explicit manual completion remains available with existing safeguards.
-
-## Shared observer contract (MERGE-0)
-
-Create one runtime-owned service per managed workspace, running with the browser closed.
-Poll linked eligible GitHub PRs every 60 seconds, deduplicating API reads by canonical identity
-across eligible tasks. Startup and enabling a checkbox reconcile only eligible subscriptions;
-these events never restart a stopped terminal subscription by themselves.
-Use PR-linking identity (`provider`, `host`, repository, number) as the authoritative key.
-Never infer association from title, current branch name or the latest UI link alone.
-
-First release supports github.com. Other provider/host links stay visible but report
-“Automation unsupported”; never send a GitHub credential to an arbitrary linked host.
-Reuse explicitly configured runtime authentication through a backend adapter (existing
-noninteractive gh/API facilities where suitable). This chat's OAuth does not authenticate
-the installed Kanban service. Missing access must show a blocked state, not silent success.
-Read PR metadata, submitted reviews, conversation comments and inline review threads with
-complete pagination. Pending unpublished reviews are not feedback. Expose normalized snapshots
-and versioned events to both consumers; the observer itself never starts an agent or moves cards.
-
-Persist metadata: PR head SHA, head/base repository and ref, open/closed/draft/merged status,
-merged timestamp, merge commit SHA, review evidence and checked-at time. Persist feedback IDs,
-versions/digests and thread resolution for the companion feature. UI snapshots are labelled
-as of a time; destructive lifecycle decisions require a successful fresh authoritative read.
-Use conditional reads, bounded timeouts, jitter and rate-limit/Retry-After backoff. Authentication,
-404/access ambiguity, network and partial-page failures retain last state and pause decisions.
-Do not treat missing/failed API data as closed or merged. Record timestamps and sanitized errors.
-
-Task records contain schema version, settings revision, selected automation PR, collection
-cursors, blocked reason, pending intent, and durable completion/reopen markers. Shared snapshots
-can be cached by PR; task consumption remains separately owned. Restart reconciliation and
-per-task leases prevent duplicate effects. Do not hold workspace locks during network calls.
-Apply the fetched result only after rereading task settings, linkage and current revision.
-
-### Polling eligibility, stop and resume rules
-
-Do not scan all repository PRs or poll every stored link. Maintain task subscriptions only
-for the selected Automation PR. Reevaluate eligibility on board moves, checkbox changes,
-link selection/removal and each poll; check again before issuing a queued API request.
-
-| Task / selected PR state | Recurring polling |
-| --- | --- |
-| In Progress or In Review, PR open/draft, at least one checkbox enabled | Every 60 seconds, subject to backoff |
-| Merged PR with auto-finish enabled and completion reconciliation pending | Temporarily, only for bounded reconciliation |
-| Merged PR already handled, or with no enabled merge-completion consumer | Stop |
-| PR closed without merging | Stop |
-| Task in Backlog, Done or Trash | Stop |
-| Both task checkboxes disabled | Stop |
-| No selected eligible PR, unsupported host or ambiguous selection | No PR polling; expose the blocker |
-
-Open/draft PRs remain observable while an agent is working or waiting for model capacity.
-Collection does not grant repair execution permission; existing writer/approval gates remain.
-Fetch feedback sources only for comment consumers and review evidence for merge consumers.
-Once merge/close is confirmed, stop comment collection and cancel pending repair batches.
-A comment-only task needs no further recurring reads after its PR becomes terminal.
-
-Persist terminal observation and subscription stop reason so restart cannot rearm them.
-Merged completion reconciliation is not indefinite polling: reuse authoritative stored evidence
-for local preservation/board/dispatch stages. If additional remote evidence is necessary,
-allow at most three reconciliation reads per terminal episode with normal backoff, then
-stop and expose a needs-human reason. Missing qualifying review, unsafe local work or another
-manual blocker stops immediately; it must not spend API requests indefinitely. API failures
-before terminal state is established remain under ordinary backoff, never a fabricated terminal
-stop. Stopping observation retains pending evidence, receipts and history.
-
-Done → In Review for history never resumes observation of the same handled merged PR.
-Explicit **Resume PR tracking** may request a fresh one-time reconciliation for a stopped
-subscription; recurring polling resumes only if that read confirms an open/draft PR and
-the task/checkbox eligibility still holds. This supports detecting an externally reopened PR
-without periodic reads of closed PRs. Selecting a genuinely new linked Automation PR starts
-a new eligible subscription. Returning an otherwise eligible nonterminal card to an active
-column can resume its subscription. Checkbox off/on, restart or ordinary history inspection
-must not clear a terminal stop or a consumed completion generation. Explicit tracking resume
-does not reset repair budgets or authorize duplicate completion/successor dispatch.
-
-Cancel scheduled reads when their last eligible consumer disappears. For a PR shared by
-several cards, remove only that card's subscription; keep deduplicated reads while another
-card remains eligible. In-flight responses must revalidate each consumer before applying
-state or scheduling effects. Retained snapshots may be displayed without resuming polling.
-
-### Several linked PRs
-
-PR linking permits many links, including cross-repository links. If exactly one link matches
-the task's repository and actual delivery/head branch, select it automatically. Otherwise
-require an explicit **Automation PR** choice from linked PRs and show an ambiguity blocker.
-One selected PR drives both controls; other links remain historical/reference links.
-Never finish because an unrelated or older linked PR merged. Validate manual selection against
-the task's delivery/worktree branch; cross-repository reference PRs cannot authorize repair or
-handoff. On replacement/removal, invalidate pending work and require reconciliation. A genuinely
-new selected PR starts a new completion generation; the same PR never rearms by toggling settings.
+When one PR belongs to multiple tasks, each eligible merge consumer may finish its own card
+using its own validated specification/linkage and evidence; completion/dispatch receipts remain
+task-scoped. Reuse the shared PR quiescence gate so neither card completes while any tracked
+writer on that head has unresolved work. This does not grant either task repair ownership.
 
 ## Merge completion (MERGE-1)
 
@@ -169,9 +72,10 @@ new selected PR starts a new completion generation; the same PR never rearms by 
    stale approval and a model's completion claim do not qualify. Persist exact evidence IDs/SHA.
    A merge without qualifying review remains blocked for manual inspection: preserve the
    established rule that unreviewed work must never become automatically Done.
-3. Cancel undispatched feedback intents. If a task writer, verification or delivery is live,
-   prevent new writes and request orderly stop through the existing lifecycle. Reconcile and
-   preserve dirty/untracked or unpublished work before completing. Uncertain side effects
+3. Consume foundation terminal invalidation and acquire its quiescence gate. The foundation
+   cancels undispatched write intents, prevents new writes and requests orderly safe stop of
+   tracked task writers, verification and delivery, even with no comment consumer installed.
+   Reconcile and preserve dirty/untracked or unpublished work before completing. Uncertain side effects
    or post-merge edits block for manual handling; never force-clean the worktree.
 4. Persist a completion receipt containing task/workspace/repository identity, selected PR,
    final head, reviewed evidence, merge/base identity, merge SHA, timestamp and generation.
@@ -230,18 +134,17 @@ changes, validation and deployment requirements in every implementation PR.
 
 | ID | Scope | Depends on | Acceptance |
 | --- | --- | --- | --- |
-| MERGE-0 | Shared observer, durable settings/records, both controls and PR selection; no effects | Landed PR-linking contracts | Browser-closed collection, pagination, restart and stale-save safety |
-| MERGE-1 | Reviewed merge receipt, completion ownership and delivery-auto-Done arbitration | MERGE-0 | Exactly-once reviewed completion; errors and unsafe work block |
+| MERGE-1 | Reviewed merge receipt and completion using foundation gates | FOUNDATION-0 + FOUNDATION-1 | Exactly-once reviewed completion; errors and unsafe work block |
 | MERGE-2 | Backend successor integration, merged baseline and manual reopen suppression | MERGE-1 | Fresh squash/rebase-safe handoff, queueing and Done → Review history |
+
+The old MERGE-0 shared slice is replaced by the separate foundation plan. Neither merge slice
+requires COMMENT-0/COMMENT-1. Merge standalone qualification must pass with no comment consumer.
 
 ## Verification
 
-- Observer eligibility tests: zero recurring reads for Backlog/Done/Trash, both options off,
-  handled merges and closed-unmerged PRs; bounded terminal reconciliation; stop survives restart;
-  history reopen does not rearm; explicit resume detects a reopened PR; shared eligible consumers
-  retain deduplicated reads; late responses cannot rearm an ineligible task.
-- Fake-provider tests: pagination, duplicate/out-of-order snapshots, backoff, auth/404 failure,
-  stale settings/link changes, multiple links, unsupported hosts and service restart.
+- Foundation contract integration: merge consumer alone and alongside a fake comment consumer;
+  task-scoped completion for two tasks sharing a PR; terminal observation cannot race a shared
+  head writer or exceed read limits; stopped subscriptions remain stopped after history reopen.
 - Lifecycle tests: open/draft/closed-unmerged vs merged; final-SHA approval, stale/dismissed/self
   approval and unresolved change requests; live/dirty task; toggle-off race; duplicate polls;
   crash at each receipt/move/dispatch boundary; no early Done after PR delivery or clean tree.
@@ -262,10 +165,10 @@ required CI. Scripted fixtures prove lifecycle plumbing, not model review qualit
 ## Rollout, deployment and documentation
 
 This PR is planning only: no environment variables, dependencies, migration or deployment.
-Implementation adds optional card booleans and versioned backend records with false defaults.
-Use existing runtime config conventions for proposed 60-second polling and trusted-bot policy;
-document final names, storage and authenticated API permissions in implementation PRs. Merge
-tracking requires read access; repair later requires push access. No inbound ports or new hub.
+The foundation supplies false-default settings, records, 60-second polling and runtime auth.
+Merge implementation adds only its consumer namespace/receipt schema and completion/handoff
+behavior. Document final trusted-reviewer policy, storage upgrades and deployment/rollback in
+implementation PRs. Merge tracking requires read access and no PR push permission.
 
 Roll out collection without effects, then one reviewed-merge pilot, then successor queue tests.
 Disable either task checkbox independently; preserve records/work/history. Before binary rollback,

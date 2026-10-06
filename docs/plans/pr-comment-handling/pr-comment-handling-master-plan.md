@@ -11,10 +11,11 @@ work that survives browser closure and service restart.
 
 This is separate from **Auto finish on merge**. It may operate with that checkbox off and never
 merges PRs or completes tasks because feedback was addressed, checks passed or a tree is clean.
-The [PR merge tracking plan](../pr-merge-tracking/pr-merge-tracking-master-plan.md) owns shared
-observation, task settings, selected automation PR, completion and successor handoff.
-Its MERGE-0 is the shared dependency; MERGE-1/MERGE-2 need not land before comment handling.
-Both series require landed [PR linking](../pr-linking/PR_LINKING_PLAN.md) contracts.
+The [GitHub PR tracking foundation](../github-pr-tracking/github-pr-tracking-master-plan.md)
+owns shared observation, task settings, selected Automation PR, schemas, subscriptions and
+repair ownership/gates. Require both FOUNDATION-0 and FOUNDATION-1 after landed PR linking.
+Then this feature and merge tracking can be built in parallel and ship in either order.
+No merge consumer is required: terminal cancellation is supplied by the foundation.
 
 These plans supersede overlapping scope in unmerged
 [PR #21](https://github.com/billy-the-ape/kanban/pull/21). Keep its bounded repair principles
@@ -23,7 +24,7 @@ debounce with the two-minute default requested here. Gateway review Action/repor
 optional feedback producer, not a dependency for ordinary human GitHub comments. No need to
 implement auto-replies, new gateway contracts or another reviewer engine in this series.
 
-Source baseline and core integration paths are listed in the companion plan. Additionally
+Source baseline and shared integration paths are listed in the foundation plan. Additionally
 inspect `src/cline-sdk/cline-task-session-service.ts`, the existing review/session/verification
 services, `src/workspace/task-review-handoff.ts`, delivery receipts and prompt receipt handling.
 Reverify APIs before edits; absence of a usable primitive must be reported as a dependency,
@@ -52,7 +53,8 @@ implemented and tested; they retain manual feedback handling and visible diagnos
 
 ## Polling lifecycle
 
-Use the shared observer's polling eligibility, stop and resume rules in the merge plan.
+Use the shared observer's polling eligibility, stop and resume rules in the foundation plan.
+Register the comment consumer with metadata/feedback sources; do not add another polling loop.
 Only In Progress/In Review subscriptions with an enabled consumer observe open/draft PRs.
 Backlog/Done/Trash, both options disabled, and terminal PRs stop recurring observation.
 Merged/closed PRs immediately stop feedback reads and pending repairs; only an enabled merge
@@ -64,8 +66,9 @@ for a confirmed eligible open/draft PR; it does not reset repair limits or launc
 ## Feedback normalization and debounce (COMMENT-0)
 
 Consume shared observer snapshots of submitted review bodies, inline review comments/threads
-and PR conversation comments. Normalize canonical PR identity, provider event/review/thread ID,
-author, created/updated time, body digest, reviewed commit/path/line and resolution status.
+and PR conversation comments. The foundation already normalizes canonical identity, event/review/
+thread IDs, author/times/digests, commit/path/line and resolution; consume that schema without
+renormalizing or introducing provider-specific reads here.
 Persist seen, pending, reserved and addressed versions separately. Reading is not addressing.
 An edited comment becomes a new version; duplicate provider reads do not create new work.
 Do not double-count a review body and its inline comments as duplicate instructions.
@@ -94,10 +97,13 @@ COMMENT-0 only collects and exposes batches; it never launches an agent.
 
 ## Repair execution (COMMENT-1)
 
-1. Claim a durable per-task batch lease. Recheck checkbox, selected PR, open/unmerged state,
+1. Require this task to be the foundation's explicit automatic repair owner. Claim a durable
+   batch lease plus fenced task/PR/head operation reservation; another linked task cannot repair.
+   Recheck checkbox, selected PR, open/unmerged state,
    current head and column. Backlog, Trash, Done, manual pause and historical reopen block.
    A live writer, review, verification, delivery or manual Git action retains ownership;
-   feedback waits without being injected into its turn. There is one writer per task/worktree.
+   feedback waits without being injected into its turn. Shared branch ownership also blocks
+   conflicts across tasks/workspaces, not just a writer on this task's worktree.
 2. Verify the actual remote head repository/branch and reconcile delivery mappings. A fork PR
    or PR outside the task's delivery repository needs verified writable mapping; otherwise
    block. Preserve local edits and never reset/rebase user work to match a remote branch.
@@ -144,8 +150,9 @@ the entire repair. On restart, adopt verified live ownership or resume a safe pe
 never duplicate a live session or blindly reexecute an uncertain turn.
 
 If the PR merges/closes during debounce or queueing, cancel the intent. During repair or push,
-stop at a safe boundary and reconcile unpublished/dirty work. Merge completion owns the final
-transition and cannot race a writer. A merged PR cannot trigger further comment repairs, even
+stop at a safe boundary and reconcile unpublished/dirty work through foundation terminal
+invalidation/gates, including when no merge feature is installed. This feature never moves
+cards to Done; an installed merge consumer uses the same gate for its separate transition. A merged PR cannot trigger further comment repairs, even
 when the user reopens its card from Done for history. Unchecking either option does not toggle
 the other. Pausing/trashing/removing a PR cancels queued work and cannot silently relaunch it.
 
@@ -156,11 +163,21 @@ individual task documents only when the user requests breakout.
 
 | ID | Scope | Depends on | Acceptance |
 | --- | --- | --- | --- |
-| COMMENT-0 | Normalization, durable versions/batches, two-minute debounce and visibility | PR linking + MERGE-0 | One stable batch; old eligible feedback included; restart and edit-safe collection |
+| COMMENT-0 | Actionable feedback classification, durable batches, two-minute debounce and visibility | FOUNDATION-0 + FOUNDATION-1 | One stable batch; old eligible feedback included; restart and edit-safe collection |
 | COMMENT-1 | Bounded native Cline repair, admission, verification, same-PR push and recovery | COMMENT-0 + existing session/verification/delivery contracts | One writer; checks gate publication; no duplicate run/push or early Done |
+
+Ownership selection/transfer is implemented by the foundation. Only the selected owner stores
+pending repair batches and spends budget. Explicit transfer carries addressed versions and spent
+budget forward, invalidates old intents/fencing tokens and reassesses the new task's approved
+scope. Do not reset limits by choosing another task or silently inherit its specification.
+Persist consumer fields under the comment namespace using foundation mutation APIs. No MERGE
+slice is a dependency; prove terminal stopping and In Review return with merge absent.
 
 ## Verification and manual pilot
 
+- Ownership integration: two linked tasks across workspaces yield only one repairing task;
+  owner contention/disable/unlink/transfer use foundation blockers; stale ownership cannot push;
+  transfer retains consumed feedback and budget. Run comments alone and with a fake merge consumer.
 - Polling lifecycle: inactive columns and terminal PRs produce no recurring feedback reads;
   a shared PR remains observable for another eligible card; restart/history inspection cannot
   rearm a terminal subscription; explicit resume of an externally reopened PR preserves budgets.
