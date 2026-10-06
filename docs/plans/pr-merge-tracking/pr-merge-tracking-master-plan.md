@@ -1,6 +1,6 @@
 # PR merge tracking — master plan
 
-Updated: 2026-10-05. Status: proposed; documentation only. Repository: `billy-the-ape/kanban`.
+Updated: 2026-10-06. Status: proposed; documentation only. Repository: `billy-the-ape/kanban`.
 
 ## Goal and feature split
 
@@ -74,7 +74,8 @@ this lifecycle. Explicit manual completion remains available with existing safeg
 
 Create one runtime-owned service per managed workspace, running with the browser closed.
 Poll linked eligible GitHub PRs every 60 seconds, deduplicating API reads by canonical identity
-across tasks; startup and enabling a checkbox request an immediate reconciliation.
+across eligible tasks. Startup and enabling a checkbox reconcile only eligible subscriptions;
+these events never restart a stopped terminal subscription by themselves.
 Use PR-linking identity (`provider`, `host`, repository, number) as the authoritative key.
 Never infer association from title, current branch name or the latest UI link alone.
 
@@ -100,6 +101,52 @@ cursors, blocked reason, pending intent, and durable completion/reopen markers. 
 can be cached by PR; task consumption remains separately owned. Restart reconciliation and
 per-task leases prevent duplicate effects. Do not hold workspace locks during network calls.
 Apply the fetched result only after rereading task settings, linkage and current revision.
+
+### Polling eligibility, stop and resume rules
+
+Do not scan all repository PRs or poll every stored link. Maintain task subscriptions only
+for the selected Automation PR. Reevaluate eligibility on board moves, checkbox changes,
+link selection/removal and each poll; check again before issuing a queued API request.
+
+| Task / selected PR state | Recurring polling |
+| --- | --- |
+| In Progress or In Review, PR open/draft, at least one checkbox enabled | Every 60 seconds, subject to backoff |
+| Merged PR with auto-finish enabled and completion reconciliation pending | Temporarily, only for bounded reconciliation |
+| Merged PR already handled, or with no enabled merge-completion consumer | Stop |
+| PR closed without merging | Stop |
+| Task in Backlog, Done or Trash | Stop |
+| Both task checkboxes disabled | Stop |
+| No selected eligible PR, unsupported host or ambiguous selection | No PR polling; expose the blocker |
+
+Open/draft PRs remain observable while an agent is working or waiting for model capacity.
+Collection does not grant repair execution permission; existing writer/approval gates remain.
+Fetch feedback sources only for comment consumers and review evidence for merge consumers.
+Once merge/close is confirmed, stop comment collection and cancel pending repair batches.
+A comment-only task needs no further recurring reads after its PR becomes terminal.
+
+Persist terminal observation and subscription stop reason so restart cannot rearm them.
+Merged completion reconciliation is not indefinite polling: reuse authoritative stored evidence
+for local preservation/board/dispatch stages. If additional remote evidence is necessary,
+allow at most three reconciliation reads per terminal episode with normal backoff, then
+stop and expose a needs-human reason. Missing qualifying review, unsafe local work or another
+manual blocker stops immediately; it must not spend API requests indefinitely. API failures
+before terminal state is established remain under ordinary backoff, never a fabricated terminal
+stop. Stopping observation retains pending evidence, receipts and history.
+
+Done → In Review for history never resumes observation of the same handled merged PR.
+Explicit **Resume PR tracking** may request a fresh one-time reconciliation for a stopped
+subscription; recurring polling resumes only if that read confirms an open/draft PR and
+the task/checkbox eligibility still holds. This supports detecting an externally reopened PR
+without periodic reads of closed PRs. Selecting a genuinely new linked Automation PR starts
+a new eligible subscription. Returning an otherwise eligible nonterminal card to an active
+column can resume its subscription. Checkbox off/on, restart or ordinary history inspection
+must not clear a terminal stop or a consumed completion generation. Explicit tracking resume
+does not reset repair budgets or authorize duplicate completion/successor dispatch.
+
+Cancel scheduled reads when their last eligible consumer disappears. For a PR shared by
+several cards, remove only that card's subscription; keep deduplicated reads while another
+card remains eligible. In-flight responses must revalidate each consumer before applying
+state or scheduling effects. Retained snapshots may be displayed without resuming polling.
 
 ### Several linked PRs
 
@@ -189,6 +236,10 @@ changes, validation and deployment requirements in every implementation PR.
 
 ## Verification
 
+- Observer eligibility tests: zero recurring reads for Backlog/Done/Trash, both options off,
+  handled merges and closed-unmerged PRs; bounded terminal reconciliation; stop survives restart;
+  history reopen does not rearm; explicit resume detects a reopened PR; shared eligible consumers
+  retain deduplicated reads; late responses cannot rearm an ineligible task.
 - Fake-provider tests: pagination, duplicate/out-of-order snapshots, backoff, auth/404 failure,
   stale settings/link changes, multiple links, unsupported hosts and service restart.
 - Lifecycle tests: open/draft/closed-unmerged vs merged; final-SHA approval, stale/dismissed/self

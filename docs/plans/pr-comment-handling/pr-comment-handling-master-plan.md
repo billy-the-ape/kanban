@@ -1,6 +1,6 @@
 # PR comment handling — master plan
 
-Updated: 2026-10-05. Status: proposed; documentation only. Repository: `billy-the-ape/kanban`.
+Updated: 2026-10-06. Status: proposed; documentation only. Repository: `billy-the-ape/kanban`.
 
 ## Goal, boundaries and dependencies
 
@@ -49,6 +49,17 @@ ambiguity, retain the checkbox and show the blocking reason. First automatic rep
 targets native Cline with the existing capacity/session primitives. External terminal agents
 must not be advertised as supported until equivalent durable dispatch and cancellation are
 implemented and tested; they retain manual feedback handling and visible diagnostics.
+
+## Polling lifecycle
+
+Use the shared observer's polling eligibility, stop and resume rules in the merge plan.
+Only In Progress/In Review subscriptions with an enabled consumer observe open/draft PRs.
+Backlog/Done/Trash, both options disabled, and terminal PRs stop recurring observation.
+Merged/closed PRs immediately stop feedback reads and pending repairs; only an enabled merge
+consumer may need bounded completion reconciliation. Retain versions and dispositions when
+polling stops. History reopen, service restart and checkbox toggles do not rearm terminal PRs.
+Explicit Resume PR tracking performs a one-time read and resumes recurring observation only
+for a confirmed eligible open/draft PR; it does not reset repair limits or launch a turn itself.
 
 ## Feedback normalization and debounce (COMMENT-0)
 
@@ -150,6 +161,9 @@ individual task documents only when the user requests breakout.
 
 ## Verification and manual pilot
 
+- Polling lifecycle: inactive columns and terminal PRs produce no recurring feedback reads;
+  a shared PR remains observable for another eligible card; restart/history inspection cannot
+  rearm a terminal subscription; explicit resume of an externally reopened PR preserves budgets.
 - Fake clock/provider: multiple comments batched, edits reset quiet timer, duplicate polls do
   not; max wait; pagination failure; resolution/deletion/outdated feedback; submitted review
   bodies and inline threads; untrusted bot/status noise; enable backfill and disable race.
