@@ -859,6 +859,7 @@ export default function App(): ReactElement {
 						runtimeHint={navbarRuntimeHint}
 						selectedTaskId={selectedCard?.card.id ?? null}
 						selectedTaskBaseRef={selectedCard?.card.baseRef ?? null}
+						selectedTaskPullRequests={selectedCard?.card.pullRequests ?? null}
 						showHomeGitSummary={!hasNoProjects && !selectedCard}
 						runningGitAction={selectedCard || hasNoProjects ? null : runningGitAction}
 						onGitFetch={

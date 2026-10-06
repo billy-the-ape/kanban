@@ -3,7 +3,12 @@ import { createShortTaskId } from "@runtime-task-id";
 import * as runtimeTaskState from "@runtime-task-state";
 
 import { createInitialBoardData } from "@/data/board-data";
-import type { RuntimeAgentId, RuntimeClineReasoningEffort, RuntimeTaskClineSettings } from "@/runtime/types";
+import type {
+	RuntimeAgentId,
+	RuntimeClineReasoningEffort,
+	RuntimeTaskClineSettings,
+	RuntimeTaskPullRequest,
+} from "@/runtime/types";
 import { isAllowedCrossColumnCardMove, type ProgrammaticCardMoveInFlight } from "@/state/drag-rules";
 import {
 	type BoardCard,
@@ -145,6 +150,75 @@ function normalizeTaskClineSettings(input: {
 	};
 }
 
+function normalizeTaskPullRequests(rawPullRequests: unknown): RuntimeTaskPullRequest[] | undefined {
+	if (!Array.isArray(rawPullRequests)) {
+		return undefined;
+	}
+	const pullRequests: RuntimeTaskPullRequest[] = [];
+	for (const rawPullRequest of rawPullRequests) {
+		if (!rawPullRequest || typeof rawPullRequest !== "object") {
+			continue;
+		}
+		const pullRequest = rawPullRequest as {
+			provider?: unknown;
+			host?: unknown;
+			repository?: unknown;
+			number?: unknown;
+			url?: unknown;
+			source?: unknown;
+			createdAt?: unknown;
+			title?: unknown;
+			state?: unknown;
+			stateCheckedAt?: unknown;
+		};
+		const provider =
+			pullRequest.provider === "github" || pullRequest.provider === "gitlab" || pullRequest.provider === "bitbucket"
+				? pullRequest.provider
+				: null;
+		const source =
+			pullRequest.source === "agent_tool" ||
+			pullRequest.source === "delivery" ||
+			pullRequest.source === "manual" ||
+			pullRequest.source === "branch_lookup"
+				? pullRequest.source
+				: null;
+		const state =
+			pullRequest.state === "open" ||
+			pullRequest.state === "closed" ||
+			pullRequest.state === "merged" ||
+			pullRequest.state === "draft"
+				? pullRequest.state
+				: null;
+		if (
+			!provider ||
+			!source ||
+			typeof pullRequest.host !== "string" ||
+			typeof pullRequest.repository !== "string" ||
+			typeof pullRequest.number !== "number" ||
+			!Number.isInteger(pullRequest.number) ||
+			pullRequest.number <= 0 ||
+			typeof pullRequest.url !== "string"
+		) {
+			continue;
+		}
+		pullRequests.push({
+			provider,
+			host: pullRequest.host,
+			repository: pullRequest.repository,
+			number: pullRequest.number,
+			url: pullRequest.url,
+			source,
+			createdAt: typeof pullRequest.createdAt === "number" ? pullRequest.createdAt : 0,
+			...(typeof pullRequest.title === "string" && pullRequest.title ? { title: pullRequest.title } : {}),
+			...(state ? { state } : {}),
+			...(state && typeof pullRequest.stateCheckedAt === "number"
+				? { stateCheckedAt: pullRequest.stateCheckedAt }
+				: {}),
+		});
+	}
+	return pullRequests.length > 0 ? pullRequests : undefined;
+}
+
 function normalizeCard(rawCard: unknown): BoardCard | null {
 	if (!rawCard || typeof rawCard !== "object") {
 		return null;
@@ -165,6 +239,7 @@ function normalizeCard(rawCard: unknown): BoardCard | null {
 		clineProviderId?: unknown;
 		clineModelId?: unknown;
 		clineReasoningEffort?: unknown;
+		pullRequests?: unknown;
 		createdAt?: unknown;
 		updatedAt?: unknown;
 	};
@@ -202,6 +277,9 @@ function normalizeCard(rawCard: unknown): BoardCard | null {
 		baseRef,
 		...(typeof card.agentId === "string" && card.agentId ? { agentId: card.agentId as RuntimeAgentId } : {}),
 		...(clineSettings !== undefined ? { clineSettings } : {}),
+		...(normalizeTaskPullRequests(card.pullRequests) !== undefined
+			? { pullRequests: normalizeTaskPullRequests(card.pullRequests) }
+			: {}),
 		...(typeof card.updateBaseRefBeforeStart === "boolean"
 			? { updateBaseRefBeforeStart: card.updateBaseRefBeforeStart }
 			: {}),

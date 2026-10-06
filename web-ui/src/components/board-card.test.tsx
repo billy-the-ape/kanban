@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { BoardCard } from "@/components/board-card";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import type { RuntimeTaskSessionSummary } from "@/runtime/types";
+import type { RuntimeTaskPullRequest, RuntimeTaskSessionSummary } from "@/runtime/types";
 import type { ReviewTaskWorkspaceSnapshot } from "@/types";
 
 let mockWorkspaceSnapshot: ReviewTaskWorkspaceSnapshot | undefined;
@@ -774,5 +774,180 @@ describe("BoardCard", () => {
 
 		expect(container.textContent).toContain("checking the next file");
 		expect(container.textContent).not.toContain("Agent:");
+	});
+});
+function createPullRequest(overrides?: Partial<RuntimeTaskPullRequest>): RuntimeTaskPullRequest {
+	return {
+		provider: "github",
+		host: "github.com",
+		repository: "cline/kanban",
+		number: 123,
+		url: "https://github.com/cline/kanban/pull/123",
+		source: "manual",
+		createdAt: 1,
+		...overrides,
+	};
+}
+
+function getCardHeaderRow(container: HTMLElement): HTMLDivElement | null {
+	const shell = container.querySelector(".kb-board-card-shell");
+	const cardBody = shell?.firstElementChild as HTMLDivElement | null;
+	return cardBody?.firstElementChild as HTMLDivElement | null;
+}
+
+describe("BoardCard pull request links", () => {
+	let container: HTMLDivElement;
+	let root: Root;
+	let previousActEnvironment: boolean | undefined;
+
+	beforeEach(() => {
+		mockWorkspaceSnapshot = undefined;
+		mockMeasureWidths = [240, 240, 240];
+		mockMeasureCallCount = 0;
+		previousActEnvironment = (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
+			.IS_REACT_ACT_ENVIRONMENT;
+		(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+		container = document.createElement("div");
+		document.body.appendChild(container);
+		root = createRoot(container);
+		vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(() => ({
+			x: 0,
+			y: 0,
+			left: 0,
+			top: 0,
+			width: 240,
+			height: 32,
+			right: 240,
+			bottom: 32,
+			toJSON: () => ({}),
+		}));
+	});
+
+	afterEach(() => {
+		act(() => {
+			root.unmount();
+		});
+		vi.restoreAllMocks();
+		container.remove();
+		if (previousActEnvironment === undefined) {
+			delete (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT;
+		} else {
+			(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT =
+				previousActEnvironment;
+		}
+	});
+
+	it("shows the latest compact PR link before the phase badge in the header", async () => {
+		const phaseSummary = { phase: "implementing" as const, needsAttention: false, blockedReason: null };
+		const first = createPullRequest({ number: 123, url: "https://github.com/cline/kanban/pull/123" });
+		const latest = createPullRequest({ number: 456, url: "https://github.com/cline/kanban/pull/456" });
+
+		await act(async () => {
+			root.render(
+				<TooltipProvider>
+					<BoardCard
+						card={createCard({ pullRequests: [first, latest] })}
+						index={0}
+						columnId="in_progress"
+						phaseSummary={phaseSummary}
+					/>
+				</TooltipProvider>,
+			);
+		});
+
+		const headerRow = getCardHeaderRow(container);
+		expect(headerRow).toBeTruthy();
+		const anchor = headerRow?.querySelector("a") as HTMLAnchorElement | null;
+		expect(anchor).toBeInstanceOf(HTMLAnchorElement);
+		expect(anchor?.textContent).toBe("#456");
+		expect(anchor?.getAttribute("href")).toBe("https://github.com/cline/kanban/pull/456");
+		expect(anchor?.getAttribute("target")).toBe("_blank");
+		expect(anchor?.getAttribute("rel")).toBe("noopener noreferrer");
+
+		const phaseBadge = container.querySelector('[aria-label="implementing"]');
+		expect(phaseBadge).toBeTruthy();
+		const followsAnchor =
+			anchor && phaseBadge ? anchor.compareDocumentPosition(phaseBadge) & Node.DOCUMENT_POSITION_FOLLOWING : 0;
+		expect(followsAnchor).toBeTruthy();
+	});
+
+	it("shows only the latest of multiple PRs on the card", async () => {
+		await act(async () => {
+			root.render(
+				<TooltipProvider>
+					<BoardCard
+						card={createCard({
+							pullRequests: [
+								createPullRequest({ number: 1, url: "https://github.com/cline/kanban/pull/1" }),
+								createPullRequest({ number: 2, url: "https://github.com/cline/kanban/pull/2" }),
+								createPullRequest({ number: 3, url: "https://github.com/cline/kanban/pull/3" }),
+							],
+						})}
+						index={0}
+						columnId="review"
+					/>
+				</TooltipProvider>,
+			);
+		});
+
+		const anchors = container.querySelectorAll(".kb-board-card-shell a");
+		expect(anchors.length).toBe(1);
+		expect(anchors[0]?.textContent).toBe("#3");
+	});
+
+	it("shows the link on trash cards without inheriting the title strike-through", async () => {
+		await act(async () => {
+			root.render(
+				<TooltipProvider>
+					<BoardCard card={createCard({ pullRequests: [createPullRequest()] })} index={0} columnId="trash" />
+				</TooltipProvider>,
+			);
+		});
+
+		const anchor = container.querySelector(".kb-board-card-shell a") as HTMLAnchorElement | null;
+		expect(anchor).toBeInstanceOf(HTMLAnchorElement);
+		expect(anchor?.textContent).toBe("#123");
+		expect(anchor?.getAttribute("target")).toBe("_blank");
+		expect(anchor?.getAttribute("rel")).toBe("noopener noreferrer");
+		expect(anchor?.classList.contains("line-through")).toBe(false);
+
+		const title = container.querySelector(".kb-board-card-shell p");
+		expect(title?.classList.contains("line-through")).toBe(true);
+	});
+
+	it("does not trigger card selection or handlers when interacting with the PR link", async () => {
+		const onClick = vi.fn();
+		const onDependencyPointerDown = vi.fn();
+
+		await act(async () => {
+			root.render(
+				<TooltipProvider>
+					<BoardCard
+						card={createCard({ pullRequests: [createPullRequest()] })}
+						index={0}
+						columnId="backlog"
+						onClick={onClick}
+						onDependencyPointerDown={onDependencyPointerDown}
+					/>
+				</TooltipProvider>,
+			);
+		});
+
+		const anchor = container.querySelector(".kb-board-card-shell a") as HTMLAnchorElement | null;
+		expect(anchor).toBeInstanceOf(HTMLAnchorElement);
+		await act(async () => {
+			anchor?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, metaKey: true }));
+			anchor?.click();
+		});
+		expect(onClick).not.toHaveBeenCalled();
+		expect(onDependencyPointerDown).not.toHaveBeenCalled();
+	});
+
+	it("renders no PR anchor when the card has no pull requests", async () => {
+		await act(async () => {
+			root.render(<BoardCard card={createCard()} index={0} columnId="backlog" />);
+		});
+
+		expect(container.querySelector(".kb-board-card-shell a")).toBeNull();
 	});
 });
