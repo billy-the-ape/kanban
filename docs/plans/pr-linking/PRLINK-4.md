@@ -1,5 +1,7 @@
 # PRLINK-4 — UI: PR links in top bar and board card
 
+**Status: DONE (implemented; all web-ui tests + typecheck green, biome-formatted).**
+
 Master plan: `PR_LINKING_PLAN.md` (this is milestone **PL-5**).
 Depends on: **PRLINK-0** (contract field + helpers). Can land in parallel with PRLINK-1…PRLINK-3 — seed `pullRequests` in test data; no capture path is required to render.
 
@@ -147,4 +149,29 @@ Manual: seed a scratch workspace's `board.json` with 1, 3, and 6 `pullRequests` 
 - Links open in a new tab with `rel="noopener noreferrer"`; propagation stopped on cards.
 - Only design tokens used; no inline styles; no new runtime dependencies (Radix popover + Lucide already in use).
 - Existing mock card factories still compile (field optional) — `npm run web:typecheck` green without touching unrelated mocks.
+
+## Final state (implementation notes)
+
+Implemented as planned, with these additions found during implementation:
+
+1. **Client-side plumbing was missing and is now in place.** The plan assumed `card.pullRequests` would reach the UI. In reality the local board model drops unknown fields: `BoardCard` in `web-ui/src/types/board.ts` had no `pullRequests` field, and `normalizeCard` in `web-ui/src/state/board-state.ts` never carried it through the server→client mapping. Added:
+   - `pullRequests?: RuntimeTaskPullRequest[]` to the local `BoardCard` interface.
+   - `normalizeTaskPullRequests()` in `board-state.ts` (skips malformed entries, drops missing/empty arrays to `undefined`) and its propagation in `normalizeCard` — matching the existing `normalizeTaskImages`/`normalizeTaskClineSettings` pattern.
+2. **`getPullRequestKey()`** added to `web-ui/src/utils/task-pull-requests.ts` for stable React keys (provider|host|repository|number, host/repository case-insensitive), replacing the PRLINK-0 `identityOf` reference (which is server-side).
+3. **Tooltip content** renders one `<div className="whitespace-nowrap">` per line (repo#n, title, "state as of <age>"); the age uses a local approximate formatter (`just now`, `Nm ago`, `Nh ago`, `Nd ago`, `Nw ago`, `Ny ago`).
+4. **Overflow trigger** is a small `<button>` (not the `Button` primitive) with `aria-label="Show N more pull requests"` and `text-text-tertiary` styling; the popover reuses the file's existing Radix popover pattern.
+5. **Top-bar tests** seed the real `workspace-metadata-store` (`replaceWorkspaceMetadata` / `resetWorkspaceMetadataStore`) so the task branch control renders, and pass `onToggleGitHistory` (the PR links only render in the branch-Button variant, which App always uses).
+
+Files changed:
+
+- `web-ui/src/utils/task-pull-requests.ts` (+ colocated `.test.ts`)
+- `web-ui/src/components/task-pull-request-link.tsx`
+- `web-ui/src/components/top-bar.tsx` (control/section/TopBar props + overflow popover)
+- `web-ui/src/components/board-card.tsx` (compact link before `TaskPhaseBadge`)
+- `web-ui/src/App.tsx` (`selectedTaskPullRequests` wiring)
+- `web-ui/src/types/board.ts` (`BoardCard.pullRequests`)
+- `web-ui/src/state/board-state.ts` (normalization + propagation)
+- `web-ui/src/components/board-card.test.tsx`, `web-ui/src/components/top-bar.test.tsx` (extended)
+
+Verification run in this worktree: `npm run web:typecheck` green; `vitest run` in `web-ui` 571/571 passing; `npx @biomejs/biome check --write --unsafe .` applied.
 
