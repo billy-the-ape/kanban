@@ -4,9 +4,21 @@ type Tool = ClineSdkAgentAfterToolContext["tool"];
 const REPLAY_SAFE_TOOLS = new Set(["read_files", "search_codebase", "fetch_web_content"]);
 /** A call that has timed out this many times (the original plus one retry) ends the run. */
 const MAX_TIMEOUTS_PER_CALL = 2;
-// "time out" is deliberately not matched: the SDK's own validation errors mention it in prose
-// (e.g. "...less likely to be truncated or time out"), and those are fixable by the model.
-const TIMEOUT_PATTERN = /\btimed out\b|\btimeout\b|\bETIMEDOUT\b|\bESOCKETTIMEDOUT\b|\bdeadline exceeded\b/i;
+/** The same call failing with the same error this many times in a row, with no successful tool call between, ends the run. */
+const MAX_IDENTICAL_FAILURES = 3;
+/**
+ * Timeouts are recognised by the exact shapes the SDK and Kanban's MCP layer emit, one error line at a time.
+ * A free-text search is wrong here: stderr, file paths, regexes, and echoed model input routinely contain
+ * "timeout" / "timed out" (`Test timed out in 5000ms`, `src/utils/timeout.ts`, `--timeout=5`) and are the
+ * model's to fix, not transient failures. Optional leading `Prefix: ` covers the SDK's `Command failed: ...`
+ * style wrappers and Kanban's `MCP server "x" failed: ...`.
+ */
+const TIMEOUT_LINE_PATTERNS = [
+	/^(?:[A-Za-z_ ]{1,40}: )?(?:Command|File read|Search|Web fetch|Editor operation|apply_patch|Skills operation|submit_and_exit|Request) timed out after \d+ ?ms\b/,
+	/^(?:MCP server "[^"\n]*" failed: )?MCP error -32001: Request timed out\b/,
+	/^(?:MCP server "[^"\n]*" failed: )?MCP request timed out for "[^"\n]*"/,
+	/^(?:Error fetching web content: )?HTTP (?:408|504|524)\b/,
+];
 
 function record(value: unknown): Record<string, unknown> | null {
 	return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -31,10 +43,12 @@ export function readClineToolFailure(output: unknown): string | null {
 /**
  * Only timeouts are transient. Every other failure (bad input, oversized edit, missing file, unknown tool)
  * is the model's to fix: it sees the error in the ordinary tool result and adapts, so it is never retried
- * or counted here.
+ * and only the repeated-failure guard counts it.
  */
 export function isClineToolTimeout(error: string | null): error is string {
-	return error !== null && TIMEOUT_PATTERN.test(error);
+	return (
+		error?.split("\n").some((line) => TIMEOUT_LINE_PATTERNS.some((pattern) => pattern.test(line.trim()))) ?? false
+	);
 }
 
 function summarize(value: unknown): string {
@@ -46,20 +60,38 @@ function errorText(error: unknown): string {
 	return summarize(error);
 }
 
+/** Strike key. Unlike `summarize`, never truncated, so distinct long inputs do not share a strike. */
+function callKey(toolName: string, input: unknown): string {
+	return `${toolName}\n${JSON.stringify(input) ?? ""}`;
+}
+
 /**
  * Local SDK hooks that bound *timeout* recovery only. A timed-out replay-safe tool is retried once inside tool
  * execution; any other timed-out tool goes back to the model with instructions to verify side effects before
  * retrying. A call (same tool and input) that times out again after that retry ends the run. All other tool
- * errors pass through untouched so the model can repair them itself. Reset only on a new user turn.
+ * errors pass through untouched so the model can repair them itself; only the same call failing with the same
+ * error repeatedly, with no successful tool call in between, ends the run. Reset only on a new user turn.
  */
 export function createClineToolFailureRecoveryHooks(): ClineSdkAgentHooks {
 	const wrapped = new WeakSet<Tool>();
 	const attempts = new Map<string, number>();
 	const timeouts = new Map<string, { count: number; iteration: number }>();
+	// Keyed by call + error text. Cleared entirely by any successful tool call.
+	const identicalFailures = new Map<string, { count: number; iteration: number }>();
 	let terminalError: string | null = null;
 
-	function callKey(toolName: string, input: unknown): string {
-		return `${toolName}\n${summarize(input)}`;
+	function repeatedFailure(toolName: string, input: unknown, error: string, iteration: number): string | null {
+		const key = `${callKey(toolName, input)}\n${error}`;
+		const previous = identicalFailures.get(key);
+		// Identical calls in one batch share a single strike.
+		const count = previous && previous.iteration === iteration ? previous.count : (previous?.count ?? 0) + 1;
+		identicalFailures.set(key, { count, iteration });
+		if (count < MAX_IDENTICAL_FAILURES) return null;
+		terminalError = [
+			`Tool call failed ${MAX_IDENTICAL_FAILURES} times in a row with the same error and no successful tool call in between.`,
+			`Tool: ${toolName}\nInput: ${summarize(input)}\nError: ${summarize(error)}`,
+		].join("\n");
+		return terminalError;
 	}
 
 	function timeoutFailure(
@@ -132,19 +164,23 @@ export function createClineToolFailureRecoveryHooks(): ClineSdkAgentHooks {
 			const error = readClineToolFailure(result.output) ?? (result.isError ? summarize(result.output) : null);
 			const count = attempts.get(toolCall.toolCallId) ?? 1;
 			attempts.delete(toolCall.toolCallId);
-			if (!isClineToolTimeout(error)) {
-				// A call that went through (or failed for a model-fixable reason) is no longer on its timeout strike.
-				if (!error) timeouts.delete(callKey(toolCall.toolName, input));
+			// A call blocked by the terminal error was never executed; leave its result alone.
+			if (terminalError) return;
+			if (!error) {
+				// Progress: this call is off its timeout strike and every failure streak starts over.
+				timeouts.delete(callKey(toolCall.toolName, input));
+				identicalFailures.clear();
 				return;
 			}
+			const recovery = isClineToolTimeout(error)
+				? timeoutFailure(toolCall.toolName, input, error, count, snapshot.iteration)
+				: repeatedFailure(toolCall.toolName, input, error, snapshot.iteration);
+			if (!recovery) return;
 			return {
 				result: {
 					...result,
 					isError: true,
-					output: {
-						recovery: timeoutFailure(toolCall.toolName, input, error, count, snapshot.iteration),
-						output: result.output,
-					},
+					output: { recovery, output: result.output },
 				},
 			};
 		},

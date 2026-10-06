@@ -201,13 +201,14 @@ export function loadClineSdkRulesForSystemPrompt(service: ClineSdkUserInstructio
 }
 
 /**
- * The SDK's `editor` tool rejects `new_text` over 6000 characters, and Kanban's tool-failure recovery
- * allows only one repair, so an oversized edit (typically appending a whole new test suite) fails the
- * task. The SDK's default prompt does not mention the limit, so state it up front.
+ * The SDK's `editor` tool rejects `new_text` over 6000 characters, and the SDK's default prompt does not
+ * mention the limit, so an agent appending a whole new test suite in one call gets a rejected edit and has to
+ * recover. Instruct a lower figure than the hard limit: models undercount characters, and telling them 6000
+ * still lands over it.
  */
 export const CLINE_EDITOR_SIZE_GUIDANCE = [
 	"Editor tool limits:",
-	"- Keep `new_text` (and `old_text`) in each `editor` call under 6000 characters; larger calls are rejected and repeating them fails the task.",
+	"- Keep `new_text` (and `old_text`) in each `editor` call under 5000 characters. Larger calls are rejected, and the model tends to undercount, so stay comfortably below the limit.",
 	"- To add a large block (a new test suite, a big function), split it into several sequential edits of roughly 100 lines each, anchoring each on the last unique line you just added, or put it in a new file.",
 	"- Prefer a new, separate file for large additions instead of growing an already large file.",
 ].join("\n");
