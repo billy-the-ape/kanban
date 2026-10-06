@@ -255,6 +255,7 @@ function normalizeCard(rawCard: unknown): BoardCard | null {
 	if (!title) {
 		return null;
 	}
+	const pullRequests = normalizeTaskPullRequests(card.pullRequests);
 	const clineSettings = normalizeTaskClineSettings({
 		rawSettings: card.clineSettings,
 		legacyProviderId: card.clineProviderId,
@@ -277,9 +278,7 @@ function normalizeCard(rawCard: unknown): BoardCard | null {
 		baseRef,
 		...(typeof card.agentId === "string" && card.agentId ? { agentId: card.agentId as RuntimeAgentId } : {}),
 		...(clineSettings !== undefined ? { clineSettings } : {}),
-		...(normalizeTaskPullRequests(card.pullRequests) !== undefined
-			? { pullRequests: normalizeTaskPullRequests(card.pullRequests) }
-			: {}),
+		...(pullRequests !== undefined ? { pullRequests } : {}),
 		...(typeof card.updateBaseRefBeforeStart === "boolean"
 			? { updateBaseRefBeforeStart: card.updateBaseRefBeforeStart }
 			: {}),

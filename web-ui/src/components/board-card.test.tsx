@@ -776,6 +776,7 @@ describe("BoardCard", () => {
 		expect(container.textContent).not.toContain("Agent:");
 	});
 });
+
 function createPullRequest(overrides?: Partial<RuntimeTaskPullRequest>): RuntimeTaskPullRequest {
 	return {
 		provider: "github",

@@ -135,6 +135,7 @@ describe("TopBar script shortcut onboarding", () => {
 		expect(onOpenSettings).toHaveBeenCalledTimes(1);
 	});
 });
+
 function createTaskPullRequest(number: number, overrides?: Partial<RuntimeTaskPullRequest>): RuntimeTaskPullRequest {
 	return {
 		provider: "github",
@@ -252,6 +253,7 @@ describe("TopBar pull request links", () => {
 			prGroup && diffSummary ? prGroup.compareDocumentPosition(diffSummary) & Node.DOCUMENT_POSITION_FOLLOWING : 0,
 		).toBeTruthy();
 	});
+
 	it("collapses more than 3 PRs into the latest 2 links plus a +N popover", async () => {
 		const pullRequests = [1, 2, 3, 4, 5].map((number) => createTaskPullRequest(number));
 
