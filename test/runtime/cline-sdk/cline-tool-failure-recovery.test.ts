@@ -2,6 +2,7 @@ import { type AgentModel, type AgentModelRequest, AgentRuntime, type AgentTool }
 import { describe, expect, it, vi } from "vitest";
 import {
 	createClineToolFailureRecoveryHooks,
+	isClineToolTimeout,
 	readClineToolFailure,
 } from "../../../src/cline-sdk/cline-tool-failure-recovery";
 
@@ -46,16 +47,16 @@ describe("bounded Cline tool recovery (real SDK agent loop)", () => {
 		expect(JSON.stringify(requests[1].messages)).not.toContain("failed twice");
 	});
 
-	it("gives the model the call details after two failures and stops on the repaired call's failure", async () => {
-		const execute = vi.fn().mockRejectedValue(new Error("Invalid file range"));
+	it("gives the model the call details after two timeouts and stops when the retried call times out again", async () => {
+		const execute = vi.fn().mockRejectedValue(new Error("Read timed out after 30000ms"));
 		const { runtime, requests } = harness("read_files", execute, [["read_files"], ["read_files"]]);
 		const result = await runtime.run("Start");
 		expect(execute).toHaveBeenCalledTimes(3);
 		expect(requests).toHaveLength(2);
-		expect(JSON.stringify(requests[1].messages)).toContain("failed twice");
-		expect(JSON.stringify(requests[1].messages)).toContain("Invalid file range");
+		expect(JSON.stringify(requests[1].messages)).toContain("timed out twice");
+		expect(JSON.stringify(requests[1].messages)).toContain("Read timed out after 30000ms");
 		expect(result.status).toBe("failed");
-		expect(result.error?.message).toContain("Tool recovery exhausted");
+		expect(result.error?.message).toContain("timed out again after one retry");
 		expect(result.messages.filter((message) => message.role === "tool")).toHaveLength(2);
 	});
 
@@ -70,11 +71,53 @@ describe("bounded Cline tool recovery (real SDK agent loop)", () => {
 		expect(JSON.stringify(requests[1].messages)).toContain("gh pr create");
 	});
 
-	it("tells the model how to split an oversized editor call", async () => {
-		const execute = vi.fn().mockResolvedValue({ error: "Editor input too large: new_text was 11721 characters" });
-		const { runtime, requests } = harness("editor", execute);
-		expect((await runtime.run("Edit")).status).toBe("completed");
-		expect(JSON.stringify(requests[1].messages)).toContain("Do NOT resend the same payload");
+	it("passes model-fixable errors straight through without replay, repair budget or run failure", async () => {
+		const execute = vi
+			.fn()
+			.mockResolvedValueOnce({ error: "Editor input too large: new_text was 11721 characters ... or time out." })
+			.mockRejectedValueOnce(new Error("old_text not found"))
+			.mockResolvedValueOnce({ error: "Invalid file range" })
+			.mockResolvedValueOnce({ ok: true });
+		const { runtime, requests } = harness("read_files", execute, [
+			["read_files"],
+			["read_files"],
+			["read_files"],
+			["read_files"],
+		]);
+		const result = await runtime.run("Edit");
+		expect(result.status).toBe("completed");
+		expect(execute).toHaveBeenCalledTimes(4);
+		expect(requests).toHaveLength(5);
+		const transcript = JSON.stringify(requests[4].messages);
+		expect(transcript).toContain("Editor input too large");
+		expect(transcript).toContain("old_text not found");
+		expect(transcript).not.toContain("recovery");
+		expect(transcript).not.toContain("repair opportunity");
+	});
+
+	it("allows the retried call to succeed and re-arms the strike for later timeouts of the same call", async () => {
+		const execute = vi
+			.fn()
+			.mockResolvedValueOnce({ error: "Command timed out" })
+			.mockResolvedValueOnce({ ok: true })
+			.mockResolvedValueOnce({ error: "Command timed out" })
+			.mockResolvedValueOnce({ ok: true });
+		const { runtime } = harness("run_commands", execute, [
+			["run_commands"],
+			["run_commands"],
+			["run_commands"],
+			["run_commands"],
+		]);
+		expect((await runtime.run("Run")).status).toBe("completed");
+		expect(execute).toHaveBeenCalledTimes(4);
+	});
+
+	it("does not treat prose mentioning 'time out' as a timeout", () => {
+		expect(isClineToolTimeout("Editor input too large ... less likely to be truncated or time out.")).toBe(false);
+		expect(isClineToolTimeout("Command failed: Command timed out after 30000ms")).toBe(true);
+		expect(isClineToolTimeout("connect ETIMEDOUT 1.2.3.4:443")).toBe(true);
+		expect(isClineToolTimeout("Request timeout")).toBe(true);
+		expect(isClineToolTimeout(null)).toBe(false);
 	});
 
 	it("permits a successful model repair", async () => {
@@ -92,21 +135,27 @@ describe("bounded Cline tool recovery (real SDK agent loop)", () => {
 		expect(requests).toHaveLength(2);
 	});
 
-	it("handles unknown tools that bypass tool hooks", async () => {
+	it("lets the model see and repair unknown tool calls", async () => {
 		const { runtime, requests } = harness("read_files", vi.fn(), [["missing"], ["missing"]]);
 		const result = await runtime.run("Start");
-		expect(requests).toHaveLength(2);
+		expect(requests).toHaveLength(3);
 		expect(JSON.stringify(requests[1].messages)).toContain("Unknown tool");
-		expect(result.status).toBe("failed");
+		expect(result.status).toBe("completed");
 	});
 
 	it("does not bypass rejected tool approvals", async () => {
 		const execute = vi.fn();
+		let calls = 0;
 		const tool: AgentTool = { name: "read_files", description: "Test", inputSchema: {}, execute };
 		const model: AgentModel = {
 			async *stream() {
-				yield { type: "tool-call-delta", toolCallId: "denied", toolName: "read_files", inputText: "{}" };
-				yield { type: "finish", reason: "tool-calls" };
+				if (calls++ === 0) {
+					yield { type: "tool-call-delta", toolCallId: "denied", toolName: "read_files", inputText: "{}" };
+					yield { type: "finish", reason: "tool-calls" };
+					return;
+				}
+				yield { type: "text-delta", text: "Done" };
+				yield { type: "finish", reason: "stop" };
 			},
 		};
 		const runtime = new AgentRuntime({
@@ -116,7 +165,7 @@ describe("bounded Cline tool recovery (real SDK agent loop)", () => {
 			toolPolicies: { read_files: { autoApprove: false } },
 			requestToolApproval: async () => ({ approved: false, reason: "Denied" }),
 		});
-		expect((await runtime.run("Start")).status).toBe("failed");
+		await runtime.run("Start");
 		expect(execute).not.toHaveBeenCalled();
 	});
 
