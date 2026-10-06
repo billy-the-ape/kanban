@@ -10,6 +10,7 @@
 import type { RuntimeTaskPullRequest, RuntimeTaskPullRequestSource } from "../core/api-contract";
 import type { ParsedPullRequestLink } from "../core/pull-request-links";
 import { parsePullRequestUrl } from "../core/pull-request-links";
+import type { RuntimeTaskPullRequestSnapshotUpdate } from "../core/task-board-mutations";
 import { addTaskPullRequests } from "../core/task-board-mutations";
 import { loadWorkspaceContext, mutateWorkspaceState } from "../state/workspace-state";
 
@@ -18,6 +19,13 @@ export interface RecordTaskPullRequestsInput {
 	taskId: string;
 	links: ParsedPullRequestLink[];
 	source: RuntimeTaskPullRequestSource;
+	/**
+	 * Optional snapshot applied to every recorded link (delivery provides the
+	 * gh title, and `state: "open"` for a PR found via the open-state dedupe
+	 * query). Missing snapshot fields are never overwritten on re-record:
+	 * `addTaskPullRequests` only backfills them.
+	 */
+	snapshot?: RuntimeTaskPullRequestSnapshotUpdate;
 	now?: number;
 }
 
@@ -34,16 +42,29 @@ function toRuntimePullRequests(
 	links: ParsedPullRequestLink[],
 	source: RuntimeTaskPullRequestSource,
 	now: number,
+	snapshot?: RuntimeTaskPullRequestSnapshotUpdate,
 ): RuntimeTaskPullRequest[] {
-	return links.map((link) => ({
-		provider: link.provider,
-		host: link.host,
-		repository: link.repository,
-		number: link.number,
-		url: link.url,
-		source,
-		createdAt: now,
-	}));
+	return links.map((link) => {
+		const entry: RuntimeTaskPullRequest = {
+			provider: link.provider,
+			host: link.host,
+			repository: link.repository,
+			number: link.number,
+			url: link.url,
+			source,
+			createdAt: now,
+		};
+		if (snapshot?.title !== undefined) {
+			entry.title = snapshot.title;
+		}
+		if (snapshot?.state !== undefined) {
+			entry.state = snapshot.state;
+		}
+		if (snapshot?.stateCheckedAt !== undefined) {
+			entry.stateCheckedAt = snapshot.stateCheckedAt;
+		}
+		return entry;
+	});
 }
 
 export async function recordTaskPullRequests(
@@ -62,7 +83,7 @@ export async function recordTaskPullRequests(
 			const result = addTaskPullRequests(
 				state.board,
 				input.taskId,
-				toRuntimePullRequests(input.links, input.source, now),
+				toRuntimePullRequests(input.links, input.source, now, input.snapshot),
 				now,
 			);
 			// save: false on a no-op so repeated detections do not bump the

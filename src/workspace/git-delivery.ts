@@ -44,11 +44,13 @@ import type {
 import { runtimeGitDeliveryReceiptSchema } from "../core/api-contract";
 import { createGitProcessEnv } from "../core/git-process-env";
 import { parsePullRequestUrl } from "../core/pull-request-links";
+import type { RuntimeTaskPullRequestSnapshotUpdate } from "../core/task-board-mutations";
 import { resolveTaskTitle } from "../core/task-title";
 import { lockedFileSystem } from "../fs/locked-file-system";
 import { getTaskWorktreesHomePath, loadWorkspaceBoardById } from "../state/workspace-state";
 import { runGit } from "./git-utils";
 import { readTaskPreservationRecord } from "./task-preservation";
+import { recordTaskPullRequests } from "./task-pull-requests";
 import { computeCandidateTreeHash, readReviewHandoff, readReviewOutcome } from "./task-review-handoff";
 import { prepareWorktreeEnvironment } from "./task-worktree";
 import { normalizeTaskIdForWorktreePath } from "./task-worktree-path";
@@ -156,6 +158,12 @@ export interface StartGitDeliveryInput {
 	runCombinedVerification?: (
 		input: GitDeliveryCombinedVerificationInput,
 	) => Promise<GitDeliveryCombinedVerificationResult>;
+	/**
+	 * PRLINK-3: fired after the delivery-opened/found PR is recorded on the
+	 * card (only when the board actually changed), so the runtime can notify
+	 * connected clients without waiting for the next state change.
+	 */
+	onPullRequestRecorded?: (workspaceId: string, workspacePath: string) => void;
 }
 
 /** B-11.5: the combined tree a diverged integration produced, for re-verification. */
@@ -424,6 +432,11 @@ function isProcessAlive(pid: number): boolean {
 	} catch (error) {
 		return (error as NodeJS.ErrnoException).code === "EPERM";
 	}
+}
+
+/** PRLINK-3: the receipt-shaped PR outcome plus the snapshot title where gh provided one. */
+export interface OpenPullRequestResult extends NonNullable<RuntimeGitDeliveryReceipt["pr"]> {
+	title: string | null;
 }
 
 export class GitDeliveryService {
@@ -1360,6 +1373,7 @@ export class GitDeliveryService {
 		receipt: RuntimeGitDeliveryReceipt,
 		evidence: EvidenceRecorder,
 	): Promise<RuntimeTaskDeliveryStartResponse> {
+		let prTitle: string | null = null;
 		if (!input.policy.requirePullRequest) {
 			receipt.pr = { status: "not_required", number: null, url: null, error: null };
 		} else if (!input.policy.pushRequired) {
@@ -1372,7 +1386,9 @@ export class GitDeliveryService {
 			evidence("pr", receipt.pr.error ?? "PR skipped.");
 		} else {
 			const taskTitle = await this.readTaskTitle(input.workspaceId, input.taskId);
-			receipt.pr = await this.openPullRequest(input, receipt, taskTitle);
+			const result = await this.openPullRequest(input, receipt, taskTitle);
+			prTitle = result.title;
+			receipt.pr = { status: result.status, number: result.number, url: result.url, error: result.error };
 			if (receipt.pr.status === "failed") {
 				// B-8.9: preserve the pushed commit on PR creation failure.
 				evidence("pr", `PR creation failed (push is preserved): ${receipt.pr.error ?? "unknown gh error"}`);
@@ -1382,25 +1398,85 @@ export class GitDeliveryService {
 		}
 		receipt.stage = "pr";
 		receipt.updatedAt = Date.now();
+		// PRLINK-3: the PR this delivery opened or found lands on the task
+		// card; not_required / skipped / failed record nothing.
+		if (receipt.pr.status === "created" || receipt.pr.status === "existing") {
+			await this.recordDeliveredPullRequest(input, receipt, prTitle);
+		}
 		await persistDeliveryReceipt(receipt);
 		return { ok: true, receipt, error: null };
+	}
+
+	/**
+	 * PRLINK-3: record the PR this delivery opened or found on the task card
+	 * with `source: "delivery"`. Best-effort by contract: `recordTaskPullRequests`
+	 * never throws, and the extra guard keeps any state-write failure away
+	 * from the delivery outcome, receipt, and response.
+	 */
+	private async recordDeliveredPullRequest(
+		input: StartGitDeliveryInput,
+		receipt: RuntimeGitDeliveryReceipt,
+		prTitle: string | null,
+	): Promise<void> {
+		if (!receipt.pr?.url) {
+			return;
+		}
+		const link = parsePullRequestUrl(receipt.pr.url);
+		if (!link) {
+			return;
+		}
+		// The dedupe query filters --state open, so the existing path carries
+		// an accurate state snapshot; the created path leaves state to the
+		// first refresh (PRLINK-5). stateCheckedAt rides with state only.
+		const snapshot: RuntimeTaskPullRequestSnapshotUpdate =
+			receipt.pr.status === "existing"
+				? {
+						title: prTitle ?? undefined,
+						state: "open",
+						stateCheckedAt: receipt.updatedAt,
+					}
+				: { title: prTitle ?? undefined };
+		try {
+			const result = await recordTaskPullRequests({
+				workspacePath: input.repoPath,
+				taskId: input.taskId,
+				links: [link],
+				source: "delivery",
+				snapshot,
+				now: receipt.updatedAt,
+			});
+			if (result.changed) {
+				input.onPullRequestRecorded?.(input.workspaceId, input.repoPath);
+			}
+		} catch (error) {
+			process.stderr.write(
+				`[git-delivery] failed to record delivered pull request for task ${input.taskId}: ${String(error)}\n`,
+			);
+		}
 	}
 
 	private async openPullRequest(
 		input: StartGitDeliveryInput,
 		receipt: RuntimeGitDeliveryReceipt,
 		taskTitle: string | null,
-	): Promise<NonNullable<RuntimeGitDeliveryReceipt["pr"]>> {
+	): Promise<OpenPullRequestResult> {
 		const base = input.policy.pullRequestBaseBranch;
 		const head = receipt.destinationBranch;
 		const baseArgs = base ? ["--base", base] : [];
 		// B-8.9: deduplicate by head/base — an open PR wins over creation.
+		// PRLINK-3: the title is fetched for the card snapshot.
 		const existing = await this.gh(
-			["pr", "list", "--head", head, ...baseArgs, "--state", "open", "--json", "number,url", "--limit", "1"],
+			["pr", "list", "--head", head, ...baseArgs, "--state", "open", "--json", "number,url,title", "--limit", "1"],
 			input.repoPath,
 		);
 		if (existing.missingBinary) {
-			return { status: "skipped", number: null, url: null, error: "gh CLI is not installed; PR creation skipped." };
+			return {
+				status: "skipped",
+				number: null,
+				url: null,
+				error: "gh CLI is not installed; PR creation skipped.",
+				title: null,
+			};
 		}
 		if (existing.ok) {
 			const match = parseGhJsonArray(existing.stdout)[0];
@@ -1410,6 +1486,7 @@ export class GitDeliveryService {
 					number: match.number,
 					url: typeof match.url === "string" ? match.url : null,
 					error: null,
+					title: typeof match.title === "string" ? match.title : null,
 				};
 			}
 		}
@@ -1435,6 +1512,7 @@ export class GitDeliveryService {
 				error: createResult.missingBinary
 					? "gh CLI is not installed; PR creation skipped."
 					: (createResult.stderr || "gh pr create failed").slice(0, DELIVERY_ERROR_DETAIL_MAX_CHARS),
+				title: null,
 			};
 		}
 		const url = createResult.stdout.match(/https?:\/\/\S+/)?.[0] ?? null;
@@ -1443,6 +1521,7 @@ export class GitDeliveryService {
 			number: url !== null ? (parsePullRequestUrl(url)?.number ?? null) : null,
 			url,
 			error: null,
+			title: prTitle,
 		};
 	}
 }
