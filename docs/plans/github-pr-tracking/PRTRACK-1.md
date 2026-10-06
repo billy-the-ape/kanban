@@ -12,8 +12,11 @@ represents a single PR.
 | Status | planned; no milestone started |
 | Source baseline | 49a2ca05c6c2927da2194aaec8bd1e45e6fa2928 (main) |
 | Fork | https://github.com/billy-the-ape/kanban |
-| Prerequisites | PRTRACK-0 (FOUNDATION-0) landed: record store, gh adapter, read-only coordinator |
+| Prerequisites | PRTRACK-0 (FOUNDATION-0) landed: record store, gh adapter, read-only coordinator; PR #49 PR-linking contracts landed (through PRTRACK-0's prerequisite) |
 | Follow-on | COMMENT-0 and MERGE-1 proceed independently and in parallel from their own plan folders after this PR lands |
+
+As the master plan states, this plan (with the comment and merge plans) supersedes overlapping
+scope in unmerged PR #21 — do not run both task series.
 
 ## Purpose
 
@@ -37,8 +40,10 @@ comment-handling and merge-tracking features will build on:
    with the PR-driven lifecycle; legacy premature Done is gated behind consumer ownership.
 
 Consumer registration is **explicit**; the two real feature consumers stay unregistered in this
-PR (fake consumers in tests). An enabled checkbox for an uninstalled consumer shows
-"Feature unavailable" and creates no API demand.
+PR (fake consumers in tests). Terminology used throughout: a checkbox is **enabled** when it
+is persisted true on the card, and **disabled** when it is non-interactive because its
+consumer is not installed. An enabled checkbox for an uninstalled consumer shows "Feature
+unavailable" and creates no API demand.
 
 ## Fixed decisions carried in from the master plan
 
@@ -56,16 +61,21 @@ PR (fake consumers in tests). An enabled checkbox for an uninstalled consumer sh
   the same PR never rearms by toggling settings.
 - One automatic repair owner per PR. Exactly one valid task enables comments with no owner →
   atomic assignment. Multiple candidates → block all with "Choose repair owner"; never choose by
-  poll timing, backlog order, or task ID. Owner is retained until explicit transfer/release;
-  owner disable/pause/trash/unlink stops its work but never transfers authority; owner deletion
-  blocks remaining candidates until explicit reassignment.
+  poll timing, backlog order, or task ID. Owner is retained until explicit transfer or release
+  (release = `transferRepairOwner` to none, with the same drain/invalidate/reconcile
+  preconditions as transfer); owner disable/pause/trash/unlink stops its work but never
+  transfers authority; owner deletion blocks remaining candidates until explicit reassignment.
 - Mutation arbitration: PR gate keyed by canonical PR; remote write gate keyed by canonical
   head repository + ref (also preventing distinct PRs on the same branch from writing
   concurrently). Durable fenced intent reservations instead of holding filesystem mutexes while
   awaiting model slots or network I/O. Durable reservations are revalidated under the
   tracking-registry mutex immediately before execution; never nest registry and task locks.
-  Observed merge/close centrally invalidates queued write intents, blocks new admissions, and
-  requests safe cancellation of live tracked operations.
+  Fixed lock order: task ownership → PR gate → head-ref gate; the tracking-registry mutex is
+  taken only for short record CAS operations and is never held while acquiring any of the
+  other three. Observed merge/close centrally invalidates queued write intents, blocks new
+  admissions, and requests safe cancellation of live tracked operations. Replacing or removing
+  the selected PR invalidates pending work and requires reconciliation before any further
+  action.
 - The completion label is **Auto complete task when PR is merged**; the persisted field stays
   `autoFinishOnMerge`.
 - First comment support is native Cline only; other task agents show comments unsupported but
@@ -93,10 +103,22 @@ Allowed:
   execution history)
 - `src/task-dispatch/task-dispatch-service.ts` — worker policy/readiness integration for the
   shared lifecycle gates
+- `src/workspace/git-delivery.ts` — gate the deterministic delivery completion path (legacy
+  clean-tree/PR-delivery completion) behind the shared lifecycle arbitration
+- `src/commands/task.ts` — gate the CLI completion path (`completeTaskById` /
+  `completeTaskAndGetReadyLinkedTaskIds`) behind the shared lifecycle arbitration
+- `src/verification/verification-service.ts` — reserve verification starts against durable
+  reservations so verification never races a reserved write target
+- `src/server/runtime-server.ts` / `src/server/workspace-registry.ts` — coordinator start/stop,
+  workspace-removal and runtime-disposal reconciliation hooks, and the consumer-registry
+  lifecycle
 - `web-ui/` — task create/edit and detail settings checkboxes, "Waiting for linked PR",
-  "Feature unavailable" disabled states, ambiguity blocker, repair-owner selector, Resume PR
-  tracking, snapshot as-of labelling, and blocker surfaces in the existing detail
-  warning/status areas
+  "Feature unavailable"/"comments unsupported"/"Automation unsupported" disabled states,
+  auth-blocker display, ambiguity blocker, repair-owner selector, Resume PR tracking,
+  snapshot as-of labelling, and blocker surfaces in the existing detail warning/status areas;
+  plus the gate in `web-ui/src/hooks/use-review-auto-actions.ts` that keeps legacy premature
+  Done from completing a task whose linked PR workflow is owned by an installed enabled
+  consumer
 - Tests under `test/` and `web-ui` hook/component tests
 
 Explicit non-goals:
@@ -135,8 +157,9 @@ Explicit non-goals:
   enabled consumer.
 - `web-ui/src/state/drag-rules.ts` — preserved Done → Review movement; manual completion
   keeps its existing safeguards.
-  `src/fs/locked-file-system.ts` — distinct locks need distinct `path` values (proper-lockfile
+- `src/fs/locked-file-system.ts` — distinct locks need distinct `path` values (proper-lockfile
   keys its in-process map by `path`, not the lockfile name).
+
 ## Implementation tasks (in this order)
 
 - [ ] PRTRACK-1.1 **Revision-checked preference and selection APIs.** Add
@@ -152,9 +175,28 @@ Explicit non-goals:
       (one-shot fresh reconciliation for a stopped subscription; never clears dispatch
       failure/deduplication or authorizes duplicate completion), and `getTaskTrackingState`
       (revision-checked diagnostics: eligibility, blockers, owner, reservation, snapshot
-      freshness). No selected-PR tracking state in browser localStorage.
-- [ ] PRTRACK-1.2 **Live task-derived subscriptions.** Replace PRTRACK-0's fake subscriptions:
-      on startup enumerate current managed workspaces/cards, validate links/preferences, join
+      freshness, and installed consumers/capabilities per consumer kind plus per-task agent
+      support — the signal the UI's "Feature unavailable"/"comments unsupported" states
+      read). If the installed-consumer list is carried in `RuntimeConfigResponse`, remember
+      the `as unknown as` mock trap (uncast test mocks bypass tsc and crash at render time).
+      No selected-PR tracking state in browser localStorage.
+- [ ] PRTRACK-1.2 **Consumer registry and frozen API surface.** Implement
+      `registerConsumer(kind, capabilities)` / `unregisterConsumer` with per-consumer required
+      read sources — demand rule: both consumers request metadata; only the comment consumer
+      requests feedback/review/thread reads; a comment-only task needs no further recurring
+      reads once its PR is terminal. Add the snapshot endpoints `getAuthorizedSnapshot` /
+      `refreshSnapshot` (access-scoped versioned normalized data, refresh coalesced through
+      the coordinator) and the two record mutators `updatePrCommentDispatch` /
+      `updateTaskMergeBinding` (revision-checked updates inside the PR record that preserve
+      other fields/bindings; no generic sidecar workflow store). Add `subscribeTaskSnapshot` /
+      `subscribeTerminalInvalidation` with durable replay cursors persisted per consumer kind
+      on each task binding in the PR record; events are hints and consumers reconcile
+      authoritative state on startup. This registry is the "installed consumers" input for
+      1.3 and must land before it.
+- [ ] PRTRACK-1.3 **Live task-derived subscriptions.** Replace PRTRACK-0's fake subscriptions
+      as the production demand source (they remain the test seam for the coordinator suites —
+      do not delete the PRTRACK-0 tests): on startup enumerate current managed workspaces/cards,
+      validate links/preferences, join
       matching PR records, and rebuild the in-memory index solely from eligible current tasks
       and installed consumers. Reconcile live on board moves, checkbox changes, link
       selection/removal, workspace removal, and runtime disposal; reevaluate before every read.
@@ -162,10 +204,11 @@ Explicit non-goals:
       settings changes; stop API work when the last eligible subscriber leaves; drop transient
       feedback snapshots immediately when their last subscriber leaves without calling GitHub.
       Retain the minimal PR record while any current task links it (including inactive/history
-      cards) so terminal/fingerprint markers survive. A fetched result is applied only after
-      rereading task settings, linkage, and current revision; in-flight responses revalidate
-      each consumer before applying state or scheduling effects.
-- [ ] PRTRACK-1.3 **Owner selection, transfer, and reservations.** Durable repair-owner
+      cards) so terminal/fingerprint markers survive. Reading cards from other workspaces'
+      boards must not hold a workspace lock across any network call. A fetched result is
+      applied only after rereading task settings, linkage, and current revision; in-flight
+      responses revalidate each consumer before applying state or scheduling effects.
+- [ ] PRTRACK-1.4 **Owner selection, transfer, and reservations.** Durable repair-owner
       selection: exactly-one-candidate atomic assignment; multi-candidate "Choose repair owner"
       ambiguity block; revision-checked **Repair owner** selector listing linked tasks with
       workspace labels; owner validity requires the task selects this PR and has a verified
@@ -174,7 +217,10 @@ Explicit non-goals:
       tasks' intents invalidated, running/queued writer actions drained, and ambiguous
       commit/push reconciled; persist the new fencing generation and transfer handoff atomically
       in the same PR record; retain pending/last-dispatched fingerprints and failure status;
-      transfer never authorizes scope changes, a repair turn, or replay of dispatched feedback.
+      pending feedback is reassessed under the new task's specification, and one task's
+      approved specification is never silently copied into another; transfer never
+      authorizes scope changes, a repair turn, or replay of dispatched feedback. Replacing or
+      removing the selected PR invalidates pending work and requires reconciliation.
       A lease timeout alone cannot grant ownership: verify prior process/session exit and remote
       side effects first, otherwise needs-human.
       Fenced operation reservations: `reservePrOperation` / `validateReservation` /
@@ -183,37 +229,48 @@ Explicit non-goals:
       turn and known completion/cancellation. Existing activity on any linked task sharing the
       write target blocks admission with an explicit busy result or safe cancellation/drain,
       never simultaneous writes. Gates: PR gate keyed by canonical PR; remote write gate keyed
-      by canonical head repository + ref. Acquire task ownership and shared PR/head branch
-      ownership in a documented fixed lock order; persist fenced intent reservations instead of
-      holding filesystem mutexes while awaiting model slots or network I/O; revalidate durable
-      reservations under the tracking-registry mutex immediately before execution. Observed
+      by canonical head repository + ref. Fixed lock order: task ownership → PR gate →
+      head-ref gate; the tracking-registry mutex is taken only for short record CAS operations
+      and is never held while acquiring any of the other three. Persist fenced intent
+      reservations instead of holding filesystem mutexes while awaiting model slots or network
+      I/O; revalidate durable reservations under the tracking-registry mutex immediately
+      before execution. Observed
       merge/close centrally invalidates queued write intents, prevents new admissions, and
       requests safe cancellation of live tracked operations, preserving unpublished work.
       External tools outside Kanban cannot be locked: compare remote/local state and stop on
       drift.
-- [ ] PRTRACK-1.4 **Task lifecycle gates.** Shared arbitration: when either installed enabled
+- [ ] PRTRACK-1.5 **Task lifecycle gates.** Shared arbitration: when either installed enabled
       consumer owns a linked PR workflow, legacy automatic clean-tree/PR-delivery completion
       cannot run (browser auto-actions, CLI, and deterministic delivery all gated); manual
       completion retains existing safeguards including preserved Done → Review movement.
-      When `autoFinishOnMerge` is enabled, PR creation/push with a clean worktree means
-      In Review, never Done; comment repair alone also leaves the task In Review until manual
+      When `autoFinishOnMerge` is persisted true **and the merge consumer is installed**,
+      PR creation/push with a clean worktree means In Review, never Done; **with the merge
+      consumer uninstalled, legacy behavior is unchanged** (a persisted true checkbox alone
+      never strands a card). Comment repair alone also leaves the task In Review until manual
       completion or opted-in merge completion. Merge consumers record manual-reopen/consumed
       generations through the shared mutators (`updateTaskMergeBinding`); reserved comment
-      operations and merge completion cannot overlap. The gate must work with zero real
-      consumers installed (fake consumers in tests).
-- [ ] PRTRACK-1.5 **UI.** Both checkboxes in task create/edit and detail settings, independent,
-      default false, editable throughout In Progress and In Review including queued tasks;
-      enabled choice with no PR shows "Waiting for linked PR"; uninstalled consumer shows the
-      checkbox disabled with "Feature unavailable" and an explanation (no API demand created).
-      Ambiguity blocker for multiple matching links; explicit Automation PR choice;
+      operations and merge completion cannot overlap. Merge consumers wait for verified
+      quiescence using `subscribeTerminalInvalidation` plus an exclusive
+      `reservePrOperation` — they never call a comment-service API. The gate must work with
+      zero real consumers installed (fake consumers in tests).
+- [ ] PRTRACK-1.6 **UI.** Both checkboxes in task create/edit and detail settings, independent,
+      default false, editable throughout In Progress and In Review including queued tasks,
+      subject to the consumer being installed; enabled choice with no PR shows "Waiting for
+      linked PR"; the installed-consumer/capability signal comes from `getTaskTrackingState`
+      (per consumer kind and per-task agent support) and is the only state that renders an
+      active checkbox; uninstalled consumer shows the checkbox disabled with "Feature
+      unavailable" and an explanation (no API demand created); tasks running non-native-Cline
+      agents show comments **unsupported** while merge completion stays available; non-
+      github.com hosts/providers show "Automation unsupported"; the visible auth blocker is
+      surfaced. Ambiguity blocker for multiple matching links; explicit Automation PR choice;
       "Repairs owned by <workspace/task>" display on non-owner tasks; repair-owner selector;
       Resume PR tracking action (one-shot fresh reconciliation; recurring polling resumes only
       on confirmed open/draft + eligibility); snapshots labelled as of a time; all blockers in
       the existing detail warning/status surfaces with concise reasons. Tailwind tokens,
       `@/components/ui` primitives, `lucide-react` icons; conditional state via `cn()`.
-- [ ] PRTRACK-1.6 **Fake-consumer and task lifecycle integration tests.** Cover the acceptance
-      rows below with independently registered fake consumers (merge-only, comment-only, both,
-      neither) and real task/board changes driving subscription demand.
+- [ ] PRTRACK-1.7 **Fake-consumer and task lifecycle integration tests.** Cover the acceptance
+      rows below with independently registered fake consumers (merge-only, comment-only,
+      both, neither) and real task/board changes driving subscription demand.
 
 ## Frozen consumer API (input/result schemas land in this PR)
 
@@ -224,8 +281,10 @@ follow-up, never a hidden dependency between the features. No feature imports th
 implementation.
 
 - `registerConsumer(kind, capabilities)` / `unregisterConsumer` — explicit runtime capability
-  and required read sources; subscriptions remain task-derived. Merge requests metadata only.
-  Both real consumers stay unregistered until their own PR lands.
+  and required read sources; subscriptions remain task-derived. Demand: both consumers request
+  metadata; only the comment consumer requests feedback/review/thread reads; a comment-only
+  task needs no further recurring reads once its PR is terminal. Merge requests metadata
+  only. Both real consumers stay unregistered until their own PR lands.
 - `getTaskTrackingState` / `updateTaskPrSettings` / `selectAutomationPr` / `resumePrTracking` —
   revision-checked settings, selection, diagnostics, and one-shot terminal resume.
 - `getAuthorizedSnapshot` / `refreshSnapshot` — access-scoped versioned normalized data with
@@ -233,11 +292,14 @@ implementation.
 - `updatePrCommentDispatch` / `updateTaskMergeBinding` — revision-checked updates inside the PR
   record, preserving other fields/bindings; no generic sidecar workflow store.
 - `selectRepairOwner` / `transferRepairOwner` — validated explicit durable assignment and
-  handoff.
+  handoff (a transfer to none is the explicit release path).
 - `reservePrOperation` / `validateReservation` / `releasePrOperation` — fenced task/PR/head
   ownership with busy/blocked/stale outcomes, cancellation, and reconciliation.
 - `subscribeTaskSnapshot` / `subscribeTerminalInvalidation` — versioned notifications plus
-  durable replay cursors; events are hints, consumers reconcile authoritative state on startup.
+  durable replay cursors persisted per consumer kind on each task binding in the PR record;
+  events are hints, consumers reconcile authoritative state on startup. Merge consumers use
+  terminal invalidation plus exclusive reservation to wait for verified quiescence — never
+  a comment-service API.
 ## Acceptance and tests (PRTRACK-1 rows)
 
 Unit suites must not boot real SDK hosts; tests touching workspace state, task worktrees,
@@ -251,10 +313,11 @@ Git test environment. At minimum:
 | One PR, two tasks across workspaces | Shared in-flight read; independent task bindings; both settings updates revision-checked and unrelated fields preserved; stale whole-board save cannot clobber server-owned fields |
 | Two comment candidates for one PR | Automatic repair blocked on both with "Choose repair owner"; only the explicitly selected owner can reserve; other task shows "Repairs owned by <workspace/task>" and never launches a second repair |
 | Restart with an assigned owner | Owner retained; disabling/trashing the owner stops work without silent handoff; deleting the owner blocks remaining candidates until explicit reassignment |
-| Owner transfer | Both intents invalidated, writer actions drained, ambiguous push reconciled; new fencing generation and handoff persisted atomically; pending/last-dispatched fingerprints and failure status retained; no scope change, repair turn, or replay authorized |
+| Owner transfer | Both intents invalidated, writer actions drained, ambiguous push reconciled; new fencing generation and handoff persisted atomically; pending/last-dispatched fingerprints and failure status retained; pending feedback reassessed under the new task's specification; no scope change, repair turn, or replay authorized |
 | PR and shared-head locks | Competing writers/reviews/delivery/manual actions, queued cancellation, lease expiry with unknown live process, stale fencing, and lost push response all produce no unsafe takeover; distinct PRs on the same head branch cannot write concurrently |
 | Merge consumer alone, comment alone, both, neither | No unresolved feature dependency; each consumer registers independently and remains disabled independently; terminal invalidation cancels queued writes and safe-cancels live operations without requiring the other feature installed |
-| Legacy automation vs PR lifecycle | With an installed enabled consumer owning a linked PR workflow, legacy automatic clean-tree/PR-delivery completion cannot run from browser, CLI, or deterministic delivery; `autoFinishOnMerge` enabled → PR creation/push + clean worktree leaves the task In Review, never Done; manual completion keeps its safeguards |
+| Legacy automation vs PR lifecycle | With an installed enabled consumer owning a linked PR workflow, legacy automatic clean-tree/PR-delivery completion cannot run from browser, CLI, or deterministic delivery; `autoFinishOnMerge` persisted true + merge consumer installed → PR creation/push + clean worktree leaves the task In Review, never Done; manual completion keeps its safeguards |
+| Auto-finish persisted true, merge consumer uninstalled | Legacy clean-tree completion behavior unchanged (no stranding); checkbox shown disabled with "Feature unavailable" |
 | Checkbox/selection lifecycle | Default false; old cards read false without migration; enabled with no PR shows "Waiting for linked PR"; uninstalled consumer shows "Feature unavailable" disabled; ambiguity blocks with multiple matching links; same PR never rearms a consumed completion generation by toggling |
 | Resume PR tracking | One fresh read; recurring polling resumes only on confirmed open/draft + eligibility; terminal stop and consumed markers never cleared; externally reopened PR detectable without periodic reads of closed PRs |
 | In-flight read after consumer loss | Each remaining consumer revalidated before applying state/scheduling effects; none applied for departed consumers |
@@ -265,18 +328,22 @@ end-to-end pilots remain in the comment and merge plans.
 
 ## Settings, rollout, and documentation
 
-No environment variables, secrets, or deployment actions. Document in the PR description: the
-optional false-default card settings and their old-card behavior, storage upgrade (PR records
-from PRTRACK-0 plus card fields), locking and the fixed lock order, the unavailable-consumer
-UI, and rollback (drain operations; preserve newer unknown fields and record versions). Both
-feature consumers remain independently disabled until COMMENT-0 / MERGE-1 land.
+No new environment variables, secrets, or configuration. Document in the PR description: the
+optional false-default card settings and their old-card behavior, the installed-consumer
+signal source (per consumer kind and per-task agent support, via `getTaskTrackingState` or
+`RuntimeConfigResponse`), storage upgrade (PR records from PRTRACK-0 plus card fields),
+locking and the fixed lock order, the unavailable/unsupported-consumer UI, and rollback
+(drain operations; preserve newer unknown fields and record versions). Both feature consumers
+remain independently disabled until COMMENT-0 / MERGE-1 land; rollout keeps them unregistered
+and validates with fake consumers only.
 
 ## Handoff
 
 Record: changed files, the new card fields and their server-owned merge point, every consumer
-API route and its frozen schema, the lock order and gate keys, the lifecycle-gate hook points
-(browser/CLI/delivery), the UI surface inventory, test commands and results, and any baseline
-drift discovered against 49a2ca05c6c2927da2194aaec8bd1e45e6fa2928. COMMENT-0 and MERGE-1 can
+API route and its frozen schema, the fixed lock order and gate keys (and the registry-mutex
+CAS scoping), the lifecycle-gate hook points (browser/CLI/delivery), the installed-consumer
+signal source, the UI surface inventory, test commands and results, and any baseline drift
+discovered against 49a2ca05c6c2927da2194aaec8bd1e45e6fa2928. COMMENT-0 and MERGE-1 can
 then start in parallel; each adds consumer modules and targeted existing API integrations only.
 
 ## Stop conditions

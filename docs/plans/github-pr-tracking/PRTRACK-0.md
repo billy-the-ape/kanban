@@ -12,13 +12,13 @@ represents a single PR.
 | Status | planned; no milestone started |
 | Source baseline | 49a2ca05c6c2927da2194aaec8bd1e45e6fa2928 (main) |
 | Fork | https://github.com/billy-the-ape/kanban |
-| Prerequisites | Landed PR-linking contracts (`docs/plans/pr-linking/`); this PR supersedes overlapping scope in unmerged PR #21 — do not run both task series |
+| Prerequisites | PR #49 (still open) supplies the landed PR-linking contracts (`docs/plans/pr-linking/`); verify `getPullRequestIdentityKey` exists before starting. This plan (with the comment and merge plans) supersedes overlapping scope in unmerged PR #21 — do not run both task series |
 | Follow-on | PRTRACK-1 (FOUNDATION-1), then COMMENT-0 and MERGE-1 in parallel from their own plan folders |
 
 The foundation totals two implementation PRs in this folder. The master plan's "total of four
-implementation PRs" counts COMMENT-0 and MERGE-1, which live in
-`docs/plans/pr-comment-handling/` and `docs/plans/pr-merge-tracking/`. Both foundation PRs must
-land before either feature series starts.
+implementation PRs" counts these two foundation PRs plus COMMENT-0 and MERGE-1, the latter two
+living in `docs/plans/pr-comment-handling/` and `docs/plans/pr-merge-tracking/`. Both
+foundation PRs must land before either feature series starts.
 
 ## Purpose
 
@@ -32,10 +32,15 @@ Ship the read-only half of the shared PR tracking foundation:
    60-second polling, in-flight read coalescing, access-scope isolation, the polling eligibility
    table, terminal stop/resume rules, and orphan-record safety.
 
-**No user-visible behavior ships in this PR.** No task preference fields or checkboxes, no
-consumer registration API, no owner/reservation operations, no repair dispatch, no card moves,
-no PR writes, no merges, no agent launches. Fake/inspect-only subscriptions prove the
-mechanics; the real task-derived subscriptions and consumer API are PRTRACK-1.
+**No new UI, API, or consumer behavior ships in this PR.** No task preference fields or
+checkboxes, no consumer registration API, no owner/reservation operations, no repair dispatch,
+no card moves, no PR writes, no merges, no agent launches. Fake/inspect-only subscriptions
+prove the mechanics; the real task-derived subscriptions and consumer API are PRTRACK-1.
+
+This PR still ships *visible* failure states, but nowhere near a user yet: auth and scheduler
+blockers are held as coordinator state (PRTRACK-1's `getTaskTrackingState` later surfaces
+them), and a scheduler-lock failure additionally emits a startup log/stderr line. There is no
+UI, trpc, or consumer API in this PR to render them.
 
 ## Fixed decisions carried in from the master plan
 
@@ -51,17 +56,25 @@ architecture or product rules.
 - **Credential scope:** the service account's one active github.com credential context. An opaque
   nonsecret `accessScopeId` follows the authenticated account/configuration revision; snapshots
   invalidate on auth-context change. Never persist tokens. Disjoint scopes get separate
-  reads/caches and never leak data into each other; mutation ownership still keys by PR across
-  scopes.
+  reads/caches and never leak data into each other; this PR holds exactly one PR record keyed
+  by canonical PR regardless of how many scopes read it (scoped snapshots live inside it), and
+  durable mutation ownership (PRTRACK-1) keys by the same canonical PR across scopes.
 - **Reads:** PR metadata from `repos/{owner}/{repo}/pulls/{number}`. Published review bodies,
-  inline comments/thread resolution, and conversation comments only when a comment owner is
-  eligible (plumbed now, demanded by consumers later). Paginated REST plus GraphQL thread
+  inline comments/thread resolution, and conversation comments only when a (fake) subscription
+  requests feedback sources — real demand arrives via the PRTRACK-1 consumer registry.
+  Paginated REST plus GraphQL thread
   resolution via gh; retain per-source completeness — publish a snapshot only after all pages
   succeed. Four read requests maximum in flight runtime-wide.
 - **Cadence/backoff:** poll 60 seconds with jitter; transient failures back off
   60/120/240/480/900 seconds capped at 900; honor longer Retry-After/reset deadlines. Terminal
   reconciliation permits at most three additional remote reads per episode, then stop and expose
   a needs-human reason.
+- **Bot/feedback policy:** accept non-empty *submitted* review bodies and inline review feedback
+  from human and GitHub bot accounts; ignore empty/approval-only review events, unpublished or
+  pending reviews, and resolved threads; accept human conversation comments but ignore bot
+  conversation/status chatter; no reviewer-bot allowlist; do not exclude a human comment solely
+  because it uses the service's own account. The foundation normalizes this feedback with
+  classification metadata; consumers apply the policy (COMMENT-0).
 - **Record:** schema version 1, SHA-256 key digest, revision-checked atomic updates. Serialize
   shared record/reservation changes with a single tracking-registry mutex; release it before
   acquiring existing task/Git locks or awaiting network/model work. Never nest registry and task
@@ -82,6 +95,8 @@ Allowed:
   coordinator, eligibility/stop rules
 - `src/server/runtime-server.ts`, `src/server/workspace-registry.ts` — coordinator
   registration/start/stop and the scheduler lock for the automation storage root
+  `join(getRuntimeHomePath(), "pr-tracking")` (the lock's proper-lockfile `path` is that same
+  directory; the on-disk lockfile name is set separately via `lockfilePath`)
 - `src/state/workspace-state.ts` — reuse `getRuntimeHomePath()` and the existing atomic
   JSON/lock helpers; no board schema changes in this PR
 - Tests under `test/` (runtime, integration, trpc as needed)
@@ -103,16 +118,19 @@ Explicit non-goals:
   (`getPullRequestIdentityKey` in `src/core/pull-request-links.ts`) is the authoritative PR key.
 - `src/state/workspace-state.ts` — `getRuntimeHomePath()` and the atomic JSON read-modify-write
   helpers. Trap: `mutateWorkspaceState` returns a response object, not the value.
-- `src/workspace/git-delivery.ts` — the existing direct gh/Git execution pattern (direct exec,
-  sanitized noninteractive Git environment, bounded output). Reuse that convention; do not
-  refactor it.
+- `src/workspace/git-delivery.ts` — follow its direct-exec/argument-array convention and
+  `createGitProcessEnv()` from `src/core/git-process-env.ts` (which only strips repo-routing
+  variables like `GIT_DIR`/`GIT_WORK_TREE`; it does not make gh noninteractive). Its
+  `runGhCommand` has no timeout and a 1 MiB `maxBuffer` — the 30-second timeout, 8 MiB bound,
+  and noninteractive gh settings are new for this adapter. Do not refactor `git-delivery.ts`.
 - `src/fs/locked-file-system.ts` — wraps proper-lockfile, which keys its in-process lock map by
   the resolved `path` argument, not the lockfile name. Each distinct lock needs a distinct
   `path`; the on-disk lockfile name is controlled separately via `lockfilePath`.
 - `src/server/runtime-server.ts` / `src/server/workspace-registry.ts` — where per-runtime
   singletons start and stop; the coordinator joins this lifecycle.
-  `src/task-dispatch/task-dispatch-service.ts` — worker policy/readiness reference only; not
+- `src/task-dispatch/task-dispatch-service.ts` — worker policy/readiness reference only; not
   wired in this PR.
+
 ## Implementation tasks (in this order)
 
 - [ ] PRTRACK-0.1 **Canonical PR identity and record schema.** Reuse the PR-linking identity as
@@ -121,62 +139,112 @@ Explicit non-goals:
       snapshots keyed by `accessScopeId` (`checkedAt`, head/base repository/ref, head SHA, PR
       state open/closed/draft/merged, merged timestamp, merge commit SHA); task bindings
       (`workspaceId`+`taskId`) with terminal stop/reopen/completion markers and monotonic link
-      generations (reselecting the same handled PR cannot erase consumed markers); the minimal
-      comment automation block (`repairOwner`, `pendingFeedbackFingerprint`, `debounceDeadline`,
-      `firstPendingAt`, `lastDispatchedFeedbackFingerprint`, dispatch status/reference/error);
-      and the current owner/operation reservation block. No comment bodies, per-item
-      dispositions, batch ledgers, or repair-budget counters are durable fields.
+      generations (reselecting the same handled PR cannot erase consumed markers).
+      Declare here the field shapes downstream plans freeze (field semantics are normatively
+      frozen by the comment and merge plans; these names/shapes are the declared contract
+      surface, so PRTRACK-1's no-storage-change non-goal holds):
+      - comment automation block: `repairOwner` (workspaceId/taskId + owner revision),
+        `pendingFeedbackFingerprint` and `lastDispatchedFeedbackFingerprint` as a structured
+        dedupe descriptor (digest + latest-`updatedAt` watermark + sorted version tokens at
+        that watermark — not a bare string), `debounceDeadline`, `firstPendingAt`, and the
+        dispatch descriptor (`dispatchId`, `attemptedAt` null while provably unsent, captured
+        fingerprint, owner revision, `status` queued/running/completed/failed, turn/session
+        reference, concise error);
+      - merge binding on each task binding: `mergeCompletion` (schema version,
+        workspaceId/taskId/link generation, selected PR identity, `finalHeadSha`, base
+        repository/ref, `mergeCommitSha`, `mergedAt`, `observedAt`, `status`
+        pending/completed/blocked, `completedAt`, concise error);
+      - owner/operation reservation block: owner revision, fencing generation, reservation
+        state, and transfer handoff marker;
+      - durable replay cursors live on each task binding in the PR record, per consumer kind.
+      No comment bodies, per-item dispositions, batch ledgers, or repair-budget counters are
+      durable fields.
 - [ ] PRTRACK-0.2 **Durable record store.** Persist at
       `join(getRuntimeHomePath(), "pr-tracking", "prs", <sha256(canonicalPrKey)> + ".json")`
       using the existing atomic JSON/lock helpers under the single tracking-registry mutex.
       Revision-checked updates that preserve unrelated fields and check revision/generation/owner.
       Validate the composite identity against record contents: malformed/unsupported records
       block tracking and never create subscriptions. Startup enumerates current managed
-      workspaces/cards and joins matching PR records — never enumerate PR records to discover
-      tasks. Orphan records cannot schedule work; delete an orphan record only after 24 hours
-      with no task links and no live/uncertain operation; an unresolved operation blocks
-      cleanup and requires manual reconciliation.
+      workspaces/cards and joins matching PR records **read-only, solely to classify orphan
+      records** (does any current card, active or history, still link this PR?) and decide
+      retention/cleanup — subscription rebuild from cards is PRTRACK-1.3; never enumerate PR
+      records to discover tasks. Orphan records cannot schedule work; the 24-hour clock starts
+      when a record is first observed orphaned (persisted on the record); delete an orphan
+      record only after 24 hours with no task links and no live/uncertain operation; an
+      unresolved operation blocks cleanup and requires manual reconciliation.
 - [ ] PRTRACK-0.3 **GitHub gh adapter.** Noninteractive `gh api --hostname github.com` via
-      direct execFile with the sanitized Git environment from `git-delivery.ts`, cwd at the
-      owning repository, 30-second timeout, 8 MiB per-page bound. Complete pagination for REST
-      lists and GraphQL thread resolution; per-source ETag/conditional reads; completeness
-      tracked per source. Structured failure categories: auth (missing gh/credentials → visible
-      blocker, no login retries), 404/access ambiguity, network, partial-page — each retains
-      last state and pauses decisions; never treat missing/failed data as closed or merged.
-      Sanitized errors with timestamps. Runtime-wide cap of four in-flight reads.
+      direct execFile following the `git-delivery.ts`/`createGitProcessEnv()` convention;
+      because the existing `runGhCommand` has no timeout and a 1 MiB `maxBuffer`, the
+      30-second timeout, 8 MiB per-page bound, and noninteractive gh environment (prompt
+      disabled, no browser login) are new here, and `execFile` timeout/`maxBuffer` error codes
+      map into the failure taxonomy below. cwd: a deterministic choice among the local
+      repositories of the canonical repo (the full `repos/{owner}/{repo}` request path makes
+      cwd irrelevant to the request; it only selects the credential context). Complete
+      pagination for REST lists and GraphQL thread resolution; per-source ETag/conditional
+      reads; completeness tracked per source. Structured failure categories: auth (missing
+      gh/credentials → visible blocker, no login retries), rate limit (429/abuse, honor
+      Retry-After/reset deadline), 404/access ambiguity, network, timeout/buffer-bound,
+      partial-page — each retains last state and pauses decisions; never treat missing/failed
+      data as closed or merged. Sanitized errors with timestamps. Runtime-wide cap of four
+      in-flight reads.
 - [ ] PRTRACK-0.4 **Normalized transient snapshots.** Versioned, access-scoped normalized
-      metadata (and, when a comment owner is eligible, review/conversation/thread feedback)
-      with freshness/completeness. Full feedback/thread snapshots are transient and refetched;
-      only durable aggregate fingerprints are persisted for scheduling deduplication. Publish a
-      snapshot only after all of a source's pages succeed. Explicit refreshes join the same
-      in-flight read; disjoint `accessScopeId`s get disjoint reads/caches with no data leak.
-      Snapshots are labelled as-of a time; destructive lifecycle decisions (later consumers)
-      require a fresh authoritative read.
+      metadata (and, when a (fake) subscription requests feedback sources,
+      review/conversation/thread feedback) with freshness/completeness. The normalized
+      feedback model carries per event: author kind (human/bot) and whether it is the
+      service's own account, review state (submitted vs pending), thread resolved/deleted
+      flags, `updatedAt`, and a body digest — the foundation normalizes and exposes the full
+      feedback with that classification metadata; the bot policy filters downstream (COMMENT-0
+      applies it to this normalized data), never here. Full feedback/thread snapshots are
+      transient and refetched; only durable aggregate fingerprints are persisted for
+      scheduling deduplication. Publish a snapshot only after all of a source's pages succeed.
+      Explicit refreshes join the same in-flight read; disjoint `accessScopeId`s get disjoint
+      reads/caches with no data leak. Snapshots are labelled as-of a time, expire by
+      `checkedAt`/ETag freshness (an expired snapshot is refetched, never reused for
+      decisions), and invalidate on auth-context change; destructive lifecycle decisions
+      (later consumers) require a fresh authoritative read.
 - [ ] PRTRACK-0.5 **Single runtime-wide coordinator.** One coordinator per Kanban runtime
       covering all managed workspaces — not one timer per workspace or card. One canonical PR
       linked by tasks in different workspaces produces one scheduled/in-flight read per source
       per access scope; fan out the versioned snapshot to separately validated task consumers.
-      Demand is the union of eligible subscribers; cancel scheduled reads when the last eligible
-      consumer leaves (for a PR shared by several cards, remove only that card's subscription).
-      Enforce a scheduler lock on the automation storage root: a second Kanban process sharing
-      that root shows a blocked startup; do not claim cross-host protection.
+      Demand is the union of eligible subscribers; cancel scheduled reads when the last
+      eligible consumer leaves (for a PR shared by several cards, remove only that card's
+      subscription). Enforce a scheduler lock on the automation storage root
+      `join(getRuntimeHomePath(), "pr-tracking")` (proper-lockfile `path` = that directory).
+      The lock is acquired lazily on the first eligible subscription, and a failure blocks
+      only the PR-tracking scheduler — never the runtime, board, or startup — with a visible
+      log/stderr line; a second Kanban process on the same root keeps serving normally with
+      tracking disabled. Do not claim cross-host protection.
 - [ ] PRTRACK-0.6 **Eligibility, backoff, terminal stop/resume.** Implement the master plan's
-      eligibility table as coordinator rules driven by subscription state: In Progress/In Review
-      + open/draft PR + at least one enabled checkbox → poll every 60 s (subject to backoff);
-      merged with pending completion reconciliation → bounded temporary polling (≤3 remote
-      reads per terminal episode); merged already handled, closed without merge, task in
-      Backlog/Done/Trash, both checkboxes off, or no selected eligible PR/unsupported host/
-      ambiguous selection → stop (or no polling with a visible blocker). Reevaluate eligibility
-      before every read. Persist terminal observation and stop reason so restart cannot rearm;
-      API failures before terminal state remain under ordinary backoff, never a fabricated
-      terminal stop. Explicit resume requests one fresh read; recurring polling resumes only if
-      that read confirms open/draft and eligibility still holds. Transient failures back off
-      60/120/240/480/900 capped at 900, honoring longer Retry-After/reset deadlines; add jitter.
+      eligibility table as coordinator rules driven by subscription state. The subscription
+      descriptor records *which* checkbox/consumer is enabled (comment, merge, both) — not
+      just "at least one": In Progress/In Review + open/draft PR + at least one enabled
+      checkbox → poll every 60 s (subject to backoff); merged PR **with auto-finish enabled**
+      and completion reconciliation pending → bounded temporary polling (≤3 remote reads per
+      terminal episode); merged already handled, **or with no enabled merge-completion
+      consumer**, closed without merge, task in Backlog/Done/Trash, both checkboxes off, or no
+      selected eligible PR/unsupported host/ambiguous selection → stop (or no polling with a
+      visible blocker); a comment-only task needs no further recurring reads once its PR is
+      terminal. Reevaluate eligibility before every read. Persist terminal observation and
+      stop reason so restart cannot rearm; API failures before terminal state remain under
+      ordinary backoff, never a fabricated terminal stop. Returning an otherwise eligible
+      nonterminal card to an active column can resume its subscription; selecting a genuinely
+      new linked Automation PR starts a new eligible subscription. Open/draft PRs remain
+      observable while an agent is working or waiting for model capacity — polling is never
+      gated on turn state. Resume here is a coordinator-level primitive (the public
+      `resumePrTracking` API/UI is PRTRACK-1.1/1.6): it requests one fresh read; recurring
+      polling resumes only if that read confirms open/draft and eligibility still holds.
+      Transient failures back off 60/120/240/480/900 capped at 900, honoring longer
+      Retry-After/reset deadlines; add jitter.
 - [ ] PRTRACK-0.7 **Provider/store/coordinator tests.** Fake subscriptions (and, for adapter
       tests, a fake `gh` executable on PATH — never real network) prove: complete pagination;
       cross-workspace dedupe and shared in-flight refresh; backoff schedule including
-      Retry-After; eligibility table transitions; terminal limits and restart no-rearm; orphan,
-      corrupt-key, deleted-workspace, and last-subscriber-during-in-flight cases.
+      Retry-After; eligibility table transitions (including the auto-finish qualifier, the
+      no-merge-consumer stop, and comment-only terminal stop); terminal limits and restart
+      no-rearm; column-return and new-PR-selection resume rules; cache expiry and auth-context
+      invalidation (old-scope snapshots invalidated, new scope reads fresh, nothing persisted
+      that identifies a token); ETag/304 conditional reads (snapshot retained, no completeness
+      regression); orphan, corrupt-key, deleted-workspace, and last-subscriber-during-
+      in-flight cases.
 ## Acceptance and tests (PRTRACK-0 rows)
 
 Unit suites must not boot real SDK hosts; tests touching workspace/home state redirect
@@ -186,16 +254,20 @@ Unit suites must not boot real SDK hosts; tests touching workspace/home state re
 | Scenario | Required result |
 | --- | --- |
 | One PR linked by two tasks in different workspaces, same access scope | Exactly one metadata request/page sequence; both task bindings appear independently in one PR record; snapshot fanned out to both |
-| Same PR, two disjoint access scopes | Two authorized reads/caches; no private data crosses scopes; mutation ownership still keys by PR |
+| Same PR, two disjoint access scopes | One PR record keyed by canonical PR; two authorized reads/caches with scoped snapshots inside it; no private data crosses scopes (durable mutation ownership across scopes is asserted in PRTRACK-1.4) |
+| Auth-context change | Old scope's snapshots invalidated; new scope reads fresh; nothing persisted identifies a token |
+| ETag/304 conditional read | Snapshot retained on 304 with no completeness regression; expired snapshot refetched before any decision |
+| Column return / new PR selection | Returning an eligible nonterminal card to an active column resumes its subscription; selecting a genuinely new linked Automation PR starts a new eligible subscription |
+| Comment-only task, PR terminal | No further recurring reads after merge or close; terminal observation persisted |
 | Explicit refresh while a poll is in flight | Coalesced into the same in-flight read; no duplicate request |
 | PR record with no linked live task, corrupt key/generation, deleted workspace, stale board save | No orphan polling, no invented subscription, no stale state effect; malformed record blocks tracking |
 | Last subscriber removed during an in-flight read | Response revalidates consumers; no state or scheduling effect applied; transient feedback dropped immediately without a GitHub call |
-| Eligibility table transitions (column moves, checkbox off/on, link removal, unsupported host, ambiguous selection) | Zero recurring reads in every stopped state; blockers exposed; no polling invented |
+| Eligibility table transitions (column moves, checkbox off/on, link removal, unsupported host, ambiguous selection, auto-finish on/off, no enabled merge consumer) | Zero recurring reads in every stopped state; blockers exposed; no polling invented |
 | Merged terminal episode | At most three reconciliation reads with normal backoff; then stop with a needs-human reason where evidence is incomplete; stop reason persisted |
 | Restart after terminal stop; Done → In Review history move; checkbox off/on | No rearm of a stopped subscription; no reset of consumed markers; only explicit resume performs one fresh read |
 | Transient 429/network failure | Backoff ladder 60/120/240/480/900 capped at 900; longer Retry-After honored; last snapshot retained; no fabricated terminal state |
 | Missing gh/credentials | Visible auth blocker; no repeated login attempts; no silent success |
-| Second Kanban process on the same automation storage root | Scheduler lock blocks its startup with a visible reason |
+| Second Kanban process on the same automation storage root | Lock acquired lazily on the first eligible subscription; the second process keeps serving normally while only its PR-tracking scheduler is blocked, with a visible log/stderr line |
 | Orphan record retention | No links + no live/uncertain operation + 24 h elapsed → deleted; any live/uncertain operation → retained and blocked from cleanup |
 
 Run: targeted `test/runtime` / `test/integration` suites, backend and web typechecks, Biome for
@@ -205,12 +277,16 @@ merge plans.
 
 ## Settings, rollout, and documentation
 
-No environment variables, secrets, or deployment actions. The PR introduces optional versioned
-record files under the runtime home; document in the PR description: the storage location and
-schema version, the auth source and read permissions required (existing host gh auth), the
-tracking-registry mutex and lock ordering, the scheduler-lock blocked-startup behavior for a
-second process, and rollback (records are inert without consumers; preserve newer unknown fields
-and record versions on older code).
+No new environment variables, secrets, or configuration. Deployment prerequisite: the service
+account's existing host `gh` credential must have read access to the linked repositories;
+otherwise tracking reports the visible auth blocker and stays blocked. The PR introduces
+optional versioned record files under the runtime home; document in the PR description: the
+storage location and schema version, the auth source and read permissions required (existing
+host gh auth), the tracking-registry mutex and lock ordering, the scheduler-lock behavior for
+a second process (lazy acquisition, scheduler-only block), and rollback (records are inert
+without consumers; preserve newer unknown fields and record versions on older code). Rollout
+starts with fake/inspect-only consumers to validate orphan cleanup and multi-workspace
+deduplication, then enables each feature on its own pilot.
 
 ## Handoff
 
