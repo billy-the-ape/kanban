@@ -245,6 +245,7 @@ Explicit non-goals:
       that identifies a token); ETag/304 conditional reads (snapshot retained, no completeness
       regression); orphan, corrupt-key, deleted-workspace, and last-subscriber-during-
       in-flight cases.
+
 ## Acceptance and tests (PRTRACK-0 rows)
 
 Unit suites must not boot real SDK hosts; tests touching workspace/home state redirect
@@ -286,7 +287,10 @@ host gh auth), the tracking-registry mutex and lock ordering, the scheduler-lock
 a second process (lazy acquisition, scheduler-only block), and rollback (records are inert
 without consumers; preserve newer unknown fields and record versions on older code). Rollout
 starts with fake/inspect-only consumers to validate orphan cleanup and multi-workspace
-deduplication, then enables each feature on its own pilot.
+deduplication, then enables each feature on its own pilot. After actual service/device
+changes, append the operational task: update `billy-the-ape/homelab-documentation` through a
+Ready for Review PR with actual storage/config/auth references, concurrency behavior, and
+rollback.
 
 ## Handoff
 

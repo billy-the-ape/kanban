@@ -300,6 +300,7 @@ implementation.
   events are hints, consumers reconcile authoritative state on startup. Merge consumers use
   terminal invalidation plus exclusive reservation to wait for verified quiescence — never
   a comment-service API.
+
 ## Acceptance and tests (PRTRACK-1 rows)
 
 Unit suites must not boot real SDK hosts; tests touching workspace state, task worktrees,
@@ -335,7 +336,9 @@ signal source (per consumer kind and per-task agent support, via `getTaskTrackin
 locking and the fixed lock order, the unavailable/unsupported-consumer UI, and rollback
 (drain operations; preserve newer unknown fields and record versions). Both feature consumers
 remain independently disabled until COMMENT-0 / MERGE-1 land; rollout keeps them unregistered
-and validates with fake consumers only.
+and validates with fake consumers only. After actual service/device changes, append the
+operational task: update `billy-the-ape/homelab-documentation` through a Ready for Review PR
+with actual storage/config/auth references, concurrency behavior, and rollback.
 
 ## Handoff
 
