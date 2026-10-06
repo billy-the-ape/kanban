@@ -351,4 +351,45 @@ describe("TopBar pull request links", () => {
 		expect(container.textContent).toContain("main");
 		expect(container.querySelectorAll("a").length).toBe(0);
 	});
+	it("shows the link-PR affordance when the task and workspace are scoped", async () => {
+		await act(async () => {
+			renderTopBar(root, {
+				onToggleGitHistory: () => {},
+				selectedTaskId: "task-pr-1",
+				selectedTaskBaseRef: "main",
+				workspaceId: "workspace-1",
+			});
+		});
+
+		expect(container.querySelector("[data-testid='task-pr-link-pr-button']")).toBeTruthy();
+	});
+
+	it("shows the manage button instead of Link PR when PRs are recorded", async () => {
+		await act(async () => {
+			renderTopBar(root, {
+				onToggleGitHistory: () => {},
+				selectedTaskId: "task-pr-1",
+				selectedTaskBaseRef: "main",
+				workspaceId: "workspace-1",
+				selectedTaskPullRequests: [createTaskPullRequest(1)],
+			});
+		});
+
+		expect(container.querySelector("[data-testid='task-pr-manage-button']")).toBeTruthy();
+		expect(container.querySelector("[data-testid='task-pr-link-pr-button']")).toBeNull();
+	});
+
+	it("hides the manual link affordance when the workspace scope is missing", async () => {
+		await act(async () => {
+			renderTopBar(root, {
+				onToggleGitHistory: () => {},
+				selectedTaskId: "task-pr-1",
+				selectedTaskBaseRef: "main",
+				selectedTaskPullRequests: [createTaskPullRequest(1)],
+			});
+		});
+
+		expect(container.querySelector("[data-testid='task-pr-manage-button']")).toBeNull();
+		expect(container.querySelector("[data-testid='task-pr-link-pr-button']")).toBeNull();
+	});
 });

@@ -29,6 +29,38 @@ vi.mock("../../../src/workspace/get-workspace-changes.js", () => ({
 	getWorkspaceChangesFromRef: workspaceChangesMocks.getWorkspaceChangesFromRef,
 }));
 
+const prLinkMocks = vi.hoisted(() => ({
+	loadWorkspaceBoardById: vi.fn(),
+	saveWorkspaceState: vi.fn(),
+	mutateWorkspaceState: vi.fn(),
+	recordTaskPullRequests: vi.fn(),
+	lookupTaskPullRequests: vi.fn(),
+	fireReviewPullRequestLookup: vi.fn(),
+	findTasksEnteringReviewWithoutPullRequests: vi.fn(),
+	removeTaskPullRequest: vi.fn(),
+}));
+
+vi.mock("../../../src/state/workspace-state.js", () => ({
+	loadWorkspaceBoardById: prLinkMocks.loadWorkspaceBoardById,
+	saveWorkspaceState: prLinkMocks.saveWorkspaceState,
+	mutateWorkspaceState: prLinkMocks.mutateWorkspaceState,
+	WorkspaceStateConflictError: class WorkspaceStateConflictError extends Error {},
+}));
+
+vi.mock("../../../src/workspace/task-pull-requests.js", () => ({
+	recordTaskPullRequests: prLinkMocks.recordTaskPullRequests,
+}));
+
+vi.mock("../../../src/workspace/task-pull-request-lookup.js", () => ({
+	findTasksEnteringReviewWithoutPullRequests: prLinkMocks.findTasksEnteringReviewWithoutPullRequests,
+	fireReviewPullRequestLookup: prLinkMocks.fireReviewPullRequestLookup,
+	lookupTaskPullRequests: prLinkMocks.lookupTaskPullRequests,
+}));
+
+vi.mock("../../../src/core/task-board-mutations.js", () => ({
+	removeTaskPullRequest: prLinkMocks.removeTaskPullRequest,
+}));
+
 import { createWorkspaceApi } from "../../../src/trpc/workspace-api";
 
 function createSummary(overrides: Partial<RuntimeTaskSessionSummary> = {}): RuntimeTaskSessionSummary {
@@ -448,5 +480,281 @@ describe("createWorkspaceApi ensureWorktree (UPD-0.5 refusal)", () => {
 			expect(response.path).toBe("/tmp/worktrees/repo/task-1");
 			expect(response.baseCommit).toBe("abc123");
 		}
+	});
+});
+
+// PRLINK-5: manual PR linking, removal, refresh, and the fire-and-forget
+// branch lookup triggered on review entry. All board reads/writes are
+// mocked; the real API code under test is the trpc layer.
+describe("createWorkspaceApi PR linking (PRLINK-5)", () => {
+	const scope = { workspaceId: "workspace-1", workspacePath: "/tmp/repo" };
+	type TestPullRequest = import("../../../src/core/api-contract").RuntimeTaskPullRequest;
+
+	function createBoard(
+		taskId: string,
+		pullRequests: TestPullRequest[] = [],
+	): import("../../../src/core/api-contract").RuntimeBoardData {
+		return {
+			columns: [
+				{ id: "backlog", title: "Backlog", cards: [] },
+				{ id: "in_progress", title: "In Progress", cards: [] },
+				{
+					id: "review",
+					title: "Review",
+					cards: [
+						{
+							id: taskId,
+							title: "Task",
+							prompt: "Task prompt",
+							startInPlanMode: false,
+							baseRef: "main",
+							createdAt: 1,
+							updatedAt: 1,
+							...(pullRequests.length > 0 ? { pullRequests } : {}),
+						},
+					],
+				},
+				{ id: "trash", title: "Done", cards: [] },
+			],
+			dependencies: [],
+		};
+	}
+
+	function createApi(broadcast: (workspaceId: string, workspacePath: string) => void | Promise<void> = vi.fn()) {
+		return {
+			broadcast,
+			api: createWorkspaceApi({
+				ensureTerminalManagerForWorkspace: vi.fn(async () => ({ listSummaries: vi.fn(() => []) }) as never),
+				getScopedClineTaskSessionService: vi.fn(async () => ({ getSummary: vi.fn(() => null) }) as never),
+				broadcastRuntimeWorkspaceStateUpdated: broadcast,
+				broadcastRuntimeProjectsUpdated: vi.fn(),
+				buildWorkspaceStateSnapshot: vi.fn(),
+			}),
+		};
+	}
+
+	beforeEach(() => {
+		prLinkMocks.loadWorkspaceBoardById.mockReset();
+		prLinkMocks.saveWorkspaceState.mockReset();
+		prLinkMocks.mutateWorkspaceState.mockReset();
+		prLinkMocks.recordTaskPullRequests.mockReset();
+		prLinkMocks.lookupTaskPullRequests.mockReset();
+		prLinkMocks.fireReviewPullRequestLookup.mockReset();
+		prLinkMocks.findTasksEnteringReviewWithoutPullRequests.mockReset();
+		prLinkMocks.removeTaskPullRequest.mockReset();
+	});
+
+	it("addTaskPullRequest rejects unknown tasks without writing", async () => {
+		prLinkMocks.loadWorkspaceBoardById.mockResolvedValue(createBoard("task-2"));
+		const { api } = createApi();
+
+		const response = await api.addTaskPullRequest(scope, {
+			taskId: "task-1",
+			url: "https://github.com/owner/repo/pull/9",
+		});
+
+		expect(response).toEqual({ ok: false, error: 'Task "task-1" not found', pullRequest: null });
+		expect(prLinkMocks.recordTaskPullRequests).not.toHaveBeenCalled();
+	});
+
+	it("addTaskPullRequest rejects URLs the strict parser does not accept", async () => {
+		prLinkMocks.loadWorkspaceBoardById.mockResolvedValue(createBoard("task-1"));
+		const { api } = createApi();
+
+		const response = await api.addTaskPullRequest(scope, {
+			taskId: "task-1",
+			url: "https://example.com/not-a-pr",
+		});
+
+		expect(response).toEqual({ ok: false, error: "Not a valid pull request URL.", pullRequest: null });
+		expect(prLinkMocks.recordTaskPullRequests).not.toHaveBeenCalled();
+	});
+
+	it("addTaskPullRequest records with source manual and broadcasts", async () => {
+		const board = createBoard("task-1");
+		const entry: TestPullRequest = {
+			provider: "github",
+			host: "github.com",
+			repository: "owner/repo",
+			number: 9,
+			url: "https://github.com/owner/repo/pull/9",
+			source: "manual",
+			createdAt: 1,
+		};
+		prLinkMocks.loadWorkspaceBoardById
+			.mockResolvedValueOnce(board)
+			.mockResolvedValueOnce(createBoard("task-1", [entry]));
+		prLinkMocks.recordTaskPullRequests.mockResolvedValue({ changed: true });
+		const { api, broadcast } = createApi();
+
+		const response = await api.addTaskPullRequest(scope, {
+			taskId: "task-1",
+			url: "https://github.com/owner/repo/pull/9",
+		});
+
+		expect(response.ok).toBe(true);
+		if (!response.ok) {
+			throw new Error("Expected the add to succeed");
+		}
+		expect(response.pullRequest).toMatchObject({
+			provider: "github",
+			host: "github.com",
+			repository: "owner/repo",
+			number: 9,
+			url: "https://github.com/owner/repo/pull/9",
+			source: "manual",
+		});
+		expect(prLinkMocks.recordTaskPullRequests).toHaveBeenCalledWith({
+			workspacePath: "/tmp/repo",
+			taskId: "task-1",
+			links: [expect.anything()],
+			source: "manual",
+		});
+		expect(broadcast).toHaveBeenCalledWith("workspace-1", "/tmp/repo");
+	});
+
+	it("addTaskPullRequest treats a duplicate as success without broadcasting", async () => {
+		const entry: TestPullRequest = {
+			provider: "github",
+			host: "github.com",
+			repository: "owner/repo",
+			number: 9,
+			url: "https://github.com/owner/repo/pull/9",
+			source: "manual",
+			createdAt: 1,
+		};
+		prLinkMocks.loadWorkspaceBoardById.mockResolvedValue(createBoard("task-1", [entry]));
+		prLinkMocks.recordTaskPullRequests.mockResolvedValue({ changed: false });
+		const { api, broadcast } = createApi();
+
+		const response = await api.addTaskPullRequest(scope, {
+			taskId: "task-1",
+			url: "https://github.com/owner/repo/pull/9#discussion_r1",
+		});
+
+		expect(response.ok).toBe(true);
+		expect(broadcast).not.toHaveBeenCalled();
+	});
+
+	it("removeTaskPullRequest removes the recorded link and broadcasts", async () => {
+		const board = createBoard("task-1", [
+			{
+				provider: "github",
+				host: "github.com",
+				repository: "owner/repo",
+				number: 9,
+				url: "https://github.com/owner/repo/pull/9",
+				source: "manual",
+				createdAt: 1,
+			},
+		]);
+		prLinkMocks.loadWorkspaceBoardById.mockResolvedValue(board);
+		prLinkMocks.removeTaskPullRequest.mockImplementation((b: unknown, taskId: string) => ({
+			board: b,
+			taskId,
+			removed: true,
+		}));
+		prLinkMocks.mutateWorkspaceState.mockImplementation(
+			async (_cwd: string, mutator: (current: unknown) => unknown) => {
+				const result = mutator({ board }) as { board: unknown; value: boolean; save: boolean };
+				return { saved: result.save, value: result.value, board: result.board };
+			},
+		);
+		const { api, broadcast } = createApi();
+
+		const response = await api.removeTaskPullRequest(scope, {
+			taskId: "task-1",
+			url: "https://github.com/owner/repo/pull/9",
+		});
+
+		expect(response).toEqual({ ok: true, pullRequest: null });
+		expect(prLinkMocks.removeTaskPullRequest).toHaveBeenCalledWith(board, "task-1", expect.any(String));
+		expect(broadcast).toHaveBeenCalledWith("workspace-1", "/tmp/repo");
+	});
+
+	it("removeTaskPullRequest rejects when no matching link is recorded", async () => {
+		const board = createBoard("task-1");
+		prLinkMocks.loadWorkspaceBoardById.mockResolvedValue(board);
+		prLinkMocks.removeTaskPullRequest.mockImplementation((b: unknown) => ({ board: b, removed: false }));
+		prLinkMocks.mutateWorkspaceState.mockResolvedValue({ saved: false, value: false, board });
+		const { api, broadcast } = createApi();
+
+		const response = await api.removeTaskPullRequest(scope, {
+			taskId: "task-1",
+			url: "https://github.com/owner/repo/pull/9",
+		});
+
+		expect(response).toEqual({
+			ok: false,
+			error: "No matching pull request is recorded for this task.",
+			pullRequest: null,
+		});
+		expect(broadcast).not.toHaveBeenCalled();
+	});
+
+	it("refreshTaskPullRequests runs the branch lookup and reports changes", async () => {
+		prLinkMocks.loadWorkspaceBoardById.mockResolvedValue(createBoard("task-1"));
+		prLinkMocks.lookupTaskPullRequests.mockResolvedValue({ recorded: 2 });
+		const { api, broadcast } = createApi();
+
+		const response = await api.refreshTaskPullRequests(scope, { taskId: "task-1" });
+
+		expect(response).toEqual({ ok: true, updated: 2 });
+		expect(prLinkMocks.lookupTaskPullRequests).toHaveBeenCalledWith({
+			workspacePath: "/tmp/repo",
+			taskId: "task-1",
+		});
+		expect(broadcast).toHaveBeenCalledWith("workspace-1", "/tmp/repo");
+	});
+
+	it("refreshTaskPullRequests rejects unknown tasks", async () => {
+		prLinkMocks.loadWorkspaceBoardById.mockResolvedValue(createBoard("task-2"));
+		const { api } = createApi();
+
+		const response = await api.refreshTaskPullRequests(scope, { taskId: "task-1" });
+
+		expect(response).toEqual({ ok: false, updated: 0, error: 'Task "task-1" not found' });
+		expect(prLinkMocks.lookupTaskPullRequests).not.toHaveBeenCalled();
+	});
+
+	it("saveState fires the branch lookup for tasks newly entering review without PRs", async () => {
+		const board = createBoard("task-1");
+		prLinkMocks.loadWorkspaceBoardById.mockResolvedValue(board);
+		prLinkMocks.findTasksEnteringReviewWithoutPullRequests.mockReturnValue(["task-1"]);
+		prLinkMocks.saveWorkspaceState.mockResolvedValue({
+			repoPath: "/tmp/repo",
+			statePath: "/tmp/repo/state.json",
+			git: { currentBranch: "main", defaultBranch: null, branches: [] },
+			board,
+			sessions: {},
+			revision: 2,
+		});
+		const { api } = createApi();
+
+		await api.saveState(scope, { board, sessions: {}, expectedRevision: 1 });
+
+		expect(prLinkMocks.fireReviewPullRequestLookup).toHaveBeenCalledWith({
+			workspacePath: "/tmp/repo",
+			taskId: "task-1",
+		});
+	});
+
+	it("saveState does not fire the branch lookup when no task enters review", async () => {
+		const board = createBoard("task-1");
+		prLinkMocks.loadWorkspaceBoardById.mockResolvedValue(board);
+		prLinkMocks.findTasksEnteringReviewWithoutPullRequests.mockReturnValue([]);
+		prLinkMocks.saveWorkspaceState.mockResolvedValue({
+			repoPath: "/tmp/repo",
+			statePath: "/tmp/repo/state.json",
+			git: { currentBranch: "main", defaultBranch: null, branches: [] },
+			board,
+			sessions: {},
+			revision: 2,
+		});
+		const { api } = createApi();
+
+		await api.saveState(scope, { board, sessions: {}, expectedRevision: 1 });
+
+		expect(prLinkMocks.fireReviewPullRequestLookup).not.toHaveBeenCalled();
 	});
 });

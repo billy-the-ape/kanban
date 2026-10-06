@@ -21,6 +21,25 @@ export function getPullRequestKey(pullRequest: RuntimeTaskPullRequest): string {
 }
 
 /**
+ * Lightweight client-side shape check for the "link a PR" input (PRLINK-5):
+ * http(s) URL that looks like a GitHub/GitLab/Bitbucket PR or MR link.
+ * The server re-parses with the strict parser and is authoritative.
+ */
+export function validatePullRequestUrlShape(url: string): string | null {
+	const trimmed = url.trim();
+	if (!trimmed) {
+		return "Enter a pull request URL.";
+	}
+	if (!/^https?:\/\//i.test(trimmed)) {
+		return "URL must start with http:// or https://.";
+	}
+	if (!/(\/pull\/|\/pull-requests\/|\/-\/merge_requests\/)/.test(trimmed)) {
+		return "URL does not look like a pull request or merge request link.";
+	}
+	return null;
+}
+
+/**
  * "PR #123" / "#123" for GitHub and Bitbucket; "MR !123" / "!123" for GitLab.
  */
 export function formatPullRequestLabel(pullRequest: RuntimeTaskPullRequest, variant: "full" | "compact"): string {

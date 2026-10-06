@@ -160,6 +160,35 @@ export const runtimeTaskPullRequestSchema = z.object({
 });
 export type RuntimeTaskPullRequest = z.infer<typeof runtimeTaskPullRequestSchema>;
 
+// PRLINK-5: manual PR link management. The server re-parses the URL with the
+// strict shared parser and is authoritative; raw client text is never stored.
+export const runtimeTaskPullRequestLinkRequestSchema = z.object({
+	taskId: z.string(),
+	url: z.string().min(1).max(2048),
+});
+export type RuntimeTaskPullRequestLinkRequest = z.infer<typeof runtimeTaskPullRequestLinkRequestSchema>;
+
+export const runtimeTaskPullRequestLinkResponseSchema = z.object({
+	ok: z.boolean(),
+	error: z.string().optional(),
+	/** The recorded entry (re-read from the board) or the existing identical one; null for remove / not-found. */
+	pullRequest: runtimeTaskPullRequestSchema.nullable(),
+});
+export type RuntimeTaskPullRequestLinkResponse = z.infer<typeof runtimeTaskPullRequestLinkResponseSchema>;
+
+export const runtimeTaskPullRequestsRefreshRequestSchema = z.object({
+	taskId: z.string(),
+});
+export type RuntimeTaskPullRequestsRefreshRequest = z.infer<typeof runtimeTaskPullRequestsRefreshRequestSchema>;
+
+export const runtimeTaskPullRequestsRefreshResponseSchema = z.object({
+	ok: z.boolean(),
+	/** Number of PR entries that changed (added or snapshot-updated). */
+	updated: z.number().int().nonnegative(),
+	error: z.string().optional(),
+});
+export type RuntimeTaskPullRequestsRefreshResponse = z.infer<typeof runtimeTaskPullRequestsRefreshResponseSchema>;
+
 export const runtimeBoardCardSchema = z
 	.object({
 		id: z.string(),
