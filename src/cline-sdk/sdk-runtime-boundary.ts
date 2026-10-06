@@ -207,7 +207,11 @@ export function loadClineSdkRulesForSystemPrompt(service: ClineSdkUserInstructio
  * still lands over it.
  */
 export const CLINE_EDITOR_SIZE_GUIDANCE = [
-	"Editor tool limits:",
+	"Editor tool usage and limits:",
+	"- To replace text in an existing file, include `path`, `old_text`, and `new_text` in the actual editor tool arguments. `old_text` must be the exact existing text to replace and match exactly once; read the file first if needed.",
+	"- Mentioning `old_text` in reasoning or prose does not supply it to the tool. Before sending an editor call, verify that its JSON arguments contain `old_text` for a replacement edit.",
+	"- Omit `old_text` only when creating a file that does not exist, or when inserting text using `insert_line`. `path` plus `new_text` alone cannot edit an existing file.",
+	"- If the tool reports missing `old_text`, rebuild the arguments with an explicit `old_text` string, or use `insert_line` for an intended insertion. Do not repeat the same incomplete call or assume the tool removed a parameter; JSON property order does not matter.",
 	"- Keep `new_text` (and `old_text`) in each `editor` call under 5000 characters. Larger calls are rejected, and the model tends to undercount, so stay comfortably below the limit.",
 	"- To add a large block (a new test suite, a big function), split it into several sequential edits of roughly 100 lines each, anchoring each on the last unique line you just added, or put it in a new file.",
 	"- Prefer a new, separate file for large additions instead of growing an already large file.",
