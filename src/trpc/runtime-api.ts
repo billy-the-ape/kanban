@@ -1033,6 +1033,11 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 							verificationRequired: scopedRuntimeConfig.verification?.enabled === "required",
 						},
 						commitMessage: body.commitMessage,
+						// PRLINK-3: surface the delivery-recorded PR on the card
+						// without a reload; only fires when the board changed.
+						onPullRequestRecorded: (workspaceId, workspacePath) => {
+							void deps.broadcastRuntimeWorkspaceStateUpdated?.(workspaceId, workspacePath);
+						},
 						// B-11.5: rerun the required checks against the combined tree
 						// once parallel work has been integrated (diverged path only).
 						runCombinedVerification:
