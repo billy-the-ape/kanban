@@ -77,8 +77,10 @@ architecture or product rules.
   classification metadata; consumers apply the policy (COMMENT-0).
 - **Record:** schema version 1, SHA-256 key digest, revision-checked atomic updates. Serialize
   shared record/reservation changes with a single tracking-registry mutex; release it before
-  acquiring existing task/Git locks or awaiting network/model work. Never nest registry and task
-  locks. Do not hold workspace locks during network calls.
+  acquiring existing task/Git locks or awaiting network/model work. Nesting is one-way only: a
+  short record CAS may run under the registry mutex while a PR/head-ref gate is already held
+  (gates → registry permitted), but the registry mutex is never held while acquiring a gate or
+  task lock (registry → gates/task never). Do not hold workspace locks during network calls.
 - **Identity:** canonical PR key = provider + lowercase host/repository + positive PR number,
   reused from PR linking. Never infer association from title, branch name, or the latest UI link.
   Owner/binding identity always includes workspaceId and taskId.
@@ -94,9 +96,11 @@ Allowed:
 - `src/pr-tracking/` (new) — identity, record store, gh adapter, transient snapshots,
   coordinator, eligibility/stop rules
 - `src/server/runtime-server.ts`, `src/server/workspace-registry.ts` — coordinator
-  registration/start/stop and the scheduler lock for the automation storage root
-  `join(getRuntimeHomePath(), "pr-tracking")` (the lock's proper-lockfile `path` is that same
-  directory; the on-disk lockfile name is set separately via `lockfilePath`)
+  registration/start/stop, the scheduler lock for the automation storage root
+  `join(getRuntimeHomePath(), "pr-tracking")` (proper-lockfile `path` = that directory), and
+  the tracking-registry mutex (proper-lockfile `path` = `join(getRuntimeHomePath(),
+  "pr-tracking", "registry")` — distinct from the scheduler lock's `path`; on-disk lockfile
+  names are set separately via `lockfilePath`)
 - `src/state/workspace-state.ts` — reuse `getRuntimeHomePath()` and the existing atomic
   JSON/lock helpers; no board schema changes in this PR
 - Tests under `test/` (runtime, integration, trpc as needed)
@@ -135,8 +139,9 @@ Explicit non-goals:
 
 - [ ] PRTRACK-0.1 **Canonical PR identity and record schema.** Reuse the PR-linking identity as
       the `canonicalPrKey`; define the version-1 `GitHubPrTrackingRecord` contract in
-      `src/core/api-contract.ts`: `schemaVersion`/`revision`; PR identity; authorized metadata
-      snapshots keyed by `accessScopeId` (`checkedAt`, head/base repository/ref, head SHA, PR
+      `src/core/api-contract.ts`: `schemaVersion`/`revision`; PR identity; `orphanedAt`
+      (timestamp the record was first observed orphaned — starts the 24-hour retention
+      clock); authorized metadata snapshots keyed by `accessScopeId` (`checkedAt`, head/base repository/ref, head SHA, PR
       state open/closed/draft/merged, merged timestamp, merge commit SHA); task bindings
       (`workspaceId`+`taskId`) with terminal stop/reopen/completion markers and monotonic link
       generations (reselecting the same handled PR cannot erase consumed markers).
@@ -177,9 +182,10 @@ Explicit non-goals:
       because the existing `runGhCommand` has no timeout and a 1 MiB `maxBuffer`, the
       30-second timeout, 8 MiB per-page bound, and noninteractive gh environment (prompt
       disabled, no browser login) are new here, and `execFile` timeout/`maxBuffer` error codes
-      map into the failure taxonomy below. cwd: a deterministic choice among the local
-      repositories of the canonical repo (the full `repos/{owner}/{repo}` request path makes
-      cwd irrelevant to the request; it only selects the credential context). Complete
+      map into the failure taxonomy below. cwd: pick one of the local repositories of the
+      canonical repo deterministically — cwd has no effect on the request or the credentials
+      (the full `repos/{owner}/{repo}` path makes the request absolute, and `gh` takes
+      credentials from its environment/config for `--hostname`). Complete
       pagination for REST lists and GraphQL thread resolution; per-source ETag/conditional
       reads; completeness tracked per source. Structured failure categories: auth (missing
       gh/credentials → visible blocker, no login retries), rate limit (429/abuse, honor
@@ -197,11 +203,14 @@ Explicit non-goals:
       applies it to this normalized data), never here. Full feedback/thread snapshots are
       transient and refetched; only durable aggregate fingerprints are persisted for
       scheduling deduplication. Publish a snapshot only after all of a source's pages succeed.
-      Explicit refreshes join the same in-flight read; disjoint `accessScopeId`s get disjoint
-      reads/caches with no data leak. Snapshots are labelled as-of a time, expire by
-      `checkedAt`/ETag freshness (an expired snapshot is refetched, never reused for
-      decisions), and invalidate on auth-context change; destructive lifecycle decisions
-      (later consumers) require a fresh authoritative read.
+      Explicit refreshes join the same in-flight read; `accessScopeId` is an opaque hash of
+      host + authenticated login + gh config/environment revision (never token material), and
+      disjoint `accessScopeId`s get disjoint reads/caches with no data leak. Snapshots are
+      labelled as-of a time; a snapshot is stale once its `checkedAt` is older than one poll
+      interval plus backoff jitter (a named constant — a stale snapshot may still be displayed
+      as-of its time but is refetched before any decision), and snapshots invalidate on
+      auth-context change; destructive lifecycle decisions (later consumers) require a fresh
+      authoritative read.
 - [ ] PRTRACK-0.5 **Single runtime-wide coordinator.** One coordinator per Kanban runtime
       covering all managed workspaces — not one timer per workspace or card. One canonical PR
       linked by tasks in different workspaces produces one scheduled/in-flight read per source
@@ -209,9 +218,11 @@ Explicit non-goals:
       Demand is the union of eligible subscribers; cancel scheduled reads when the last
       eligible consumer leaves (for a PR shared by several cards, remove only that card's
       subscription). Enforce a scheduler lock on the automation storage root
-      `join(getRuntimeHomePath(), "pr-tracking")` (proper-lockfile `path` = that directory).
-      The lock is acquired lazily on the first eligible subscription, and a failure blocks
-      only the PR-tracking scheduler — never the runtime, board, or startup — with a visible
+      `join(getRuntimeHomePath(), "pr-tracking")` (proper-lockfile `path` = that directory —
+      distinct from the tracking-registry mutex's `path`). The lock is acquired lazily on the
+      first eligible subscription, and a failure blocks only the PR-tracking *scheduler*
+      startup — never the runtime, board, or process startup; this is a deliberate refinement
+      of the master's "show a blocked startup for a second process" — with a visible
       log/stderr line; a second Kanban process on the same root keeps serving normally with
       tracking disabled. Do not claim cross-host protection.
 - [ ] PRTRACK-0.6 **Eligibility, backoff, terminal stop/resume.** Implement the master plan's
@@ -294,8 +305,9 @@ rollback.
 
 ## Handoff
 
-Record: changed files, the record location/format and schema version, the lock scope and its
-distinct `path` choice, the coordinator lifecycle registration point, the failure-category
+Record: changed files, the record location/format and schema version, both lock scopes
+(scheduler lock and tracking-registry mutex) and their distinct `path` choices, the
+coordinator lifecycle registration point, the failure-category
 taxonomy, test commands and results, and any baseline drift discovered against
 49a2ca05c6c2927da2194aaec8bd1e45e6fa2928. PRTRACK-1 then adds task preferences, live
 task-derived subscriptions, owner/reservation operations, the consumer API, and lifecycle gates

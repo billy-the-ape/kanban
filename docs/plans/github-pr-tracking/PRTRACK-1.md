@@ -67,15 +67,20 @@ unavailable" and creates no API demand.
   transfers authority; owner deletion blocks remaining candidates until explicit reassignment.
 - Mutation arbitration: PR gate keyed by canonical PR; remote write gate keyed by canonical
   head repository + ref (also preventing distinct PRs on the same branch from writing
-  concurrently). Durable fenced intent reservations instead of holding filesystem mutexes while
-  awaiting model slots or network I/O. Durable reservations are revalidated under the
-  tracking-registry mutex immediately before execution; never nest registry and task locks.
-  Fixed lock order: task ownership → PR gate → head-ref gate; the tracking-registry mutex is
-  taken only for short record CAS operations and is never held while acquiring any of the
-  other three. Observed merge/close centrally invalidates queued write intents, blocks new
-  admissions, and requests safe cancellation of live tracked operations. Replacing or removing
-  the selected PR invalidates pending work and requires reconciliation before any further
-  action.
+  concurrently). Gates are durable fenced intent reservations persisted in the PR record —
+  no separate filesystem gate mutexes are held while awaiting model slots or network I/O.
+  Gate acquire/validate/release and durable-reservation revalidation are short CAS operations
+  under the single tracking-registry mutex, taken immediately before execution. Nesting is
+  one-way only: while holding a gate, the registry mutex may be taken for a CAS (gates →
+  registry permitted); the registry mutex is never held while acquiring a gate or task lock
+  (registry → gates/task never). Because the head-ref gate spans distinct PRs but
+  reservations live in per-PR records, acquiring it validates under the single global
+  registry mutex every record whose head mapping matches the same canonical head repository
+  + ref, serializing sibling records on the gate. Fixed order for the non-CAS locks: task
+  ownership → PR gate → head-ref gate. Observed merge/close centrally invalidates queued write
+  intents, blocks new admissions, and requests safe cancellation of live tracked operations.
+  Replacing or removing the selected PR invalidates pending work and requires reconciliation
+  before any further action.
 - The completion label is **Auto complete task when PR is merged**; the persisted field stays
   `autoFinishOnMerge`.
 - First comment support is native Cline only; other task agents show comments unsupported but
@@ -152,6 +157,12 @@ Explicit non-goals:
   shared lifecycle gate must gate (legacy clean-tree/PR-delivery completion).
 - `src/task-dispatch/task-dispatch-service.ts` — automated completion/dispatch paths the gate
   must cover.
+- `src/commands/task.ts` — CLI completion entry points (`completeTaskById` /
+  `completeTaskAndGetReadyLinkedTaskIds`); the shared lifecycle gate must also block CLI-driven
+  completion of tasks whose linked PR workflow is owned by an installed enabled consumer.
+- `src/verification/verification-service.ts` — verification runner
+  (`VerificationService`/`createVerificationRunner`); reserve verification starts against
+  durable reservations so verification never races a reserved write target.
 - `web-ui/src/hooks/use-review-auto-actions.ts` — legacy premature Done; must be gated so
   browser automation cannot complete a task whose linked PR workflow is owned by an installed
   enabled consumer.
@@ -229,12 +240,16 @@ Explicit non-goals:
       turn and known completion/cancellation. Existing activity on any linked task sharing the
       write target blocks admission with an explicit busy result or safe cancellation/drain,
       never simultaneous writes. Gates: PR gate keyed by canonical PR; remote write gate keyed
-      by canonical head repository + ref. Fixed lock order: task ownership → PR gate →
-      head-ref gate; the tracking-registry mutex is taken only for short record CAS operations
-      and is never held while acquiring any of the other three. Persist fenced intent
-      reservations instead of holding filesystem mutexes while awaiting model slots or network
-      I/O; revalidate durable reservations under the tracking-registry mutex immediately
-      before execution. Observed
+      by canonical head repository + ref. Gates are durable fenced reservation entries in
+      the PR record (no separate filesystem gate locks); acquire/validate/release and the
+      before-execution revalidation of durable reservations are short CAS operations under
+      the tracking-registry mutex. Nesting is one-way: holding a gate, the registry mutex may
+      be taken for a CAS (gates → registry permitted); the registry mutex is never held
+      while acquiring a gate or task lock (registry → gates/task never). The head-ref gate
+      spans distinct PRs, so acquiring it validates, under the single global registry mutex,
+      every record whose head mapping matches the same canonical head repository + ref —
+      sibling records serialize on the gate even though reservations are per-PR. Fixed order
+      for the non-CAS locks: task ownership → PR gate → head-ref gate. Observed
       merge/close centrally invalidates queued write intents, prevents new admissions, and
       requests safe cancellation of live tracked operations, preserving unpublished work.
       External tools outside Kanban cannot be locked: compare remote/local state and stop on
@@ -322,6 +337,16 @@ Git test environment. At minimum:
 | Checkbox/selection lifecycle | Default false; old cards read false without migration; enabled with no PR shows "Waiting for linked PR"; uninstalled consumer shows "Feature unavailable" disabled; ambiguity blocks with multiple matching links; same PR never rearms a consumed completion generation by toggling |
 | Resume PR tracking | One fresh read; recurring polling resumes only on confirmed open/draft + eligibility; terminal stop and consumed markers never cleared; externally reopened PR detectable without periodic reads of closed PRs |
 | In-flight read after consumer loss | Each remaining consumer revalidated before applying state/scheduling effects; none applied for departed consumers |
+| Consumer registry demand rule | Merge-only consumer → metadata reads only; comment consumer → feedback/review/thread sources; unregistering or uninstalling a consumer removes exactly its demand; zero demand → zero API reads |
+| Snapshot API through trpc | `getAuthorizedSnapshot` returns access-scoped, versioned data labelled with freshness/completeness; `refreshSnapshot` coalesces into the single in-flight read with no duplicate request |
+| Record mutators | `updatePrCommentDispatch` / `updateTaskMergeBinding` reject stale revision, wrong generation, and non-owner callers; unrelated fields and bindings preserved in the persisted record |
+| Subscriptions and replay cursors | `subscribeTaskSnapshot` / `subscribeTerminalInvalidation` emit versioned events; after restart, replay resumes from the persisted per-consumer-kind cursor; events are hints and consumers reconcile authoritative state on startup |
+| Merge quiescence | With zero comment consumers installed, merge completion waits on terminal invalidation plus an exclusive `reservePrOperation` and proceeds only after drain; no comment-service API is called |
+| Mutation ownership across scopes | Same PR visible under two access scopes → one owner/reservation state keyed by canonical PR; a claim from either scope validates against that one record; no duplicate owner |
+| Lock-order violation | Acquiring a gate or task lock while holding the tracking-registry mutex, or reversing the task → PR → head-ref order, is rejected; no deadlock and no unsafe takeover |
+| Non-native-Cline agent | Comments shown as **comments unsupported** for the task; merge completion remains available and functional |
+| Non-github.com host/provider | Link shows "Automation unsupported"; no subscription and no API reads |
+| Auth blocker display | Missing gh/credentials surfaces the visible auth blocker in the task detail surface; no login attempts, no silent success |
 
 Run: targeted backend/runtime/trpc test files, `web-ui` hook/component suites, backend and web
 typechecks, Biome for the changed files, and the repository's required checks. Feature-specific
