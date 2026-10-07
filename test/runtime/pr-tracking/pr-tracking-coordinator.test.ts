@@ -87,7 +87,7 @@ function makeMetadata(state: GitHubPrMetadataSnapshot["state"], scopeId: string,
 
 interface FakeAdapterConfig {
 	scopeResult: AccessScopeResult | ((callIndex: number) => AccessScopeResult);
-	metadata?: (callIndex: number) => MetadataReadResult;
+	metadata?: (callIndex: number, prNumber: number) => MetadataReadResult;
 	metadataGate?: () => Promise<void>;
 	list?: (source: "reviews" | "conversationComments" | "inlineComments", callIndex: number) => FeedbackReadResult;
 	threads?: (callIndex: number) => FeedbackReadResult;
@@ -128,7 +128,8 @@ function makeFakeAdapter(config: FakeAdapterConfig): FakeAdapter {
 				await config.metadataGate();
 			}
 			return (
-				config.metadata?.(counts.metadata.length - 1) ?? makeMetadata("open", scope.accessScopeId, parsed.number)
+				config.metadata?.(counts.metadata.length - 1, parsed.number) ??
+				makeMetadata("open", scope.accessScopeId, parsed.number)
 			);
 		},
 		readRestListSource: async (
@@ -161,7 +162,7 @@ function makeFakeAdapter(config: FakeAdapterConfig): FakeAdapter {
 interface HarnessOptions {
 	scope?: AccessScope;
 	scopeResult?: AccessScopeResult | ((callIndex: number) => AccessScopeResult);
-	metadata?: (callIndex: number) => MetadataReadResult;
+	metadata?: (callIndex: number, prNumber: number) => MetadataReadResult;
 	metadataGate?: () => Promise<void>;
 	list?: (source: "reviews" | "conversationComments" | "inlineComments", callIndex: number) => FeedbackReadResult;
 	threads?: (callIndex: number) => FeedbackReadResult;
@@ -351,7 +352,7 @@ describe("pr-tracking-coordinator", () => {
 		expect(coordinatorB.getSnapshotsForTask("ws-2", "task-2")?.metadata?.accessScopeId).toBe("scope-B");
 	});
 
-	it("retains last state on unchanged conditional reads", async () => {
+	it("retains last state and stays fresh on unchanged conditional reads", async () => {
 		const harness = makeCoordinator({
 			metadata: (n) => (n === 0 ? makeMetadata("open", "scope-A", 49) : { kind: "not_modified" }),
 		});
@@ -370,10 +371,11 @@ describe("pr-tracking-coordinator", () => {
 		const nextPollAt = coordinator.getState().polls[0]?.nextPollAt ?? 0;
 		expect(nextPollAt).toBeGreaterThanOrEqual(BASE_TIME + 3 * POLL_MS - 10_000);
 		expect(nextPollAt).toBeLessThan(BASE_TIME + 3 * POLL_MS + 10_000);
-		// The last successful metadata is retained (now older than the staleness
-		// window because the second read was not_modified).
+		// The last successful metadata is retained, and the not_modified
+		// confirmation advances freshness: a healthy PR is not stale in its
+		// steady state.
 		expect(coordinator.getSnapshotsForTask("ws-1", "task-1")?.metadata?.headSha).toBe("head-49");
-		expect(coordinator.getSnapshotsForTask("ws-1", "task-1")?.isStale).toBe(true);
+		expect(coordinator.getSnapshotsForTask("ws-1", "task-1")?.isStale).toBe(false);
 	});
 
 	it("resumes polling when a task returns to an active column and picks up a newly selected PR", async () => {
@@ -643,7 +645,7 @@ describe("pr-tracking-coordinator", () => {
 		expect(errors.some((line) => line.includes("scheduler lock"))).toBe(true);
 	});
 
-	it("classifies orphan records on startup: linked records stay, unlinked records age out", async () => {
+	it("classifies orphan records after the first eligible subscription: linked records stay, unlinked records age out", async () => {
 		const store = new InMemoryPrRecordStore({ now: () => Date.now() });
 		const linkedKey = "github|github.com|cline/kanban|71";
 		const unlinkedKey = "github|github.com|cline/kanban|72";
@@ -676,8 +678,9 @@ describe("pr-tracking-coordinator", () => {
 		const boards: Array<{ workspaceId: string; board: RuntimeBoardData }> = [
 			{ workspaceId: "ws-1", board: boardWithCards([{ id: "task-71", column: "in_progress", pr: 71 }]) },
 		];
-		// Hold the startup pass at the board-listing step so the test never reads
-		// the store concurrently with the pass's writes (same lock request).
+		// Hold the orphan pass at the board-listing step so the test never
+		// reads the store concurrently with the pass's writes (same lock
+		// request).
 		const passState: { release: (() => void) | null } = { release: null };
 		const passGate = new Promise<void>((resolve) => {
 			passState.release = resolve;
@@ -691,7 +694,10 @@ describe("pr-tracking-coordinator", () => {
 				},
 			}).coordinator,
 		);
+		// start() acquires nothing: the orphan pass starts lazily right after
+		// the FIRST eligible subscription takes the scheduler lock.
 		await coordinator.start();
+		expect((await coordinator.addSubscription(descriptor())).status).toBe("active");
 		passState.release?.();
 		// Wait for the background pass to finish (its lock acquisition does
 		// real I/O whose fake-clock duration varies under load).
@@ -723,7 +729,7 @@ describe("pr-tracking-coordinator", () => {
 		const c1: GitHubPrNormalizedFeedbackEvent = { ...i1, kind: "conversation_comment", providerId: "c1" };
 		const r1: GitHubPrNormalizedFeedbackEvent = { ...i1, kind: "review", providerId: "r1" };
 		const r2: GitHubPrNormalizedFeedbackEvent = { ...i1, kind: "review", providerId: "r2" };
-		const threadState = (resolved: boolean) => new Map([["i1", { resolved, outdated: false, deleted: false }]]);
+		const threadState = (resolved: boolean) => new Map([["i1", { resolved, outdated: false }]]);
 		const harness = makeCoordinator({
 			list: (source, callIndex) => {
 				if (source === "reviews") {
@@ -803,34 +809,51 @@ describe("pr-tracking-coordinator", () => {
 		expect(poll?.nextPollAt).not.toBeNull();
 	});
 
-	it("stops all polls on an access failure and re-probes on explicit refresh", async () => {
+	it("blocks only the failing PR on an access failure; the other PR keeps polling", async () => {
+		const reads: Record<number, number> = { 49: 0, 50: 0 };
 		const harness = makeCoordinator({
-			metadata: (n) => {
-				if (n === 1) {
+			metadata: (_n, prNumber) => {
+				reads[prNumber] = (reads[prNumber] ?? 0) + 1;
+				// PR 49's second read is 403; everything else succeeds.
+				if (prNumber === 49 && reads[49] === 2) {
 					return { kind: "failed", failure: failure("access", { message: "HTTP 403: permission denied" }) };
 				}
-				return makeMetadata("open", "scope-A", 49);
+				return makeMetadata("open", "scope-A", prNumber);
 			},
 		});
 		const coordinator = track(harness.coordinator);
 		expect((await coordinator.addSubscription(descriptor())).status).toBe("active");
+		expect(
+			(
+				await coordinator.addSubscription(
+					descriptor({ taskId: "task-2", canonicalPrKey: "github|github.com|cline/kanban|50" }),
+				)
+			).status,
+		).toBe("active");
 
-		await pollOnce(); // read 0: ok
-		expect(coordinator.getState().accessBlocker).toBeNull();
-		await pollOnce(); // read 1: access failure → ALL polls cancelled
-		expect(coordinator.getState().accessBlocker).toBe("HTTP 403: permission denied");
-		expect(coordinator.getState().polls.every((poll) => poll.nextPollAt === null)).toBe(true);
+		await pollOnce(); // both PRs read fine
+		expect(coordinator.getState().polls.every((poll) => poll.accessBlocker === null)).toBe(true);
+		await pollOnce(); // PR 49 hits 403, PR 50 succeeds
 
-		// Ticks without an explicit refresh read nothing.
+		// Access is per-(PR, scope): only PR 49's poll stops.
+		const blocked = coordinator.getState().polls.find((poll) => poll.prKey === PR49);
+		const other = coordinator.getState().polls.find((poll) => poll.prKey === "github|github.com|cline/kanban|50");
+		expect(blocked?.accessBlocker).toBe("HTTP 403: permission denied");
+		expect(blocked?.nextPollAt).toBeNull();
+		expect(other?.accessBlocker).toBeNull();
+		expect(other?.nextPollAt).not.toBeNull();
+
+		// Ticks read only the healthy PR.
+		const readsOf50 = harness.fake.metadataCallsFor(50);
 		await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
 		await settle();
-		expect(harness.fake.metadataCalls()).toBe(2);
+		expect(harness.fake.metadataCallsFor(49)).toBe(2);
+		expect(harness.fake.metadataCallsFor(50)).toBeGreaterThan(readsOf50);
 
-		// An explicit refresh re-probes and clears the blocker.
+		// An explicit refresh re-probes and re-arms the blocked PR.
 		await coordinator.refresh(PR49, "scope-A");
-		expect(coordinator.getState().accessBlocker).toBeNull();
-		expect(harness.fake.metadataCalls()).toBe(3);
-		expect(coordinator.getState().polls[0]?.nextPollAt).not.toBeNull();
+		expect(coordinator.getState().polls.find((poll) => poll.prKey === PR49)?.accessBlocker).toBeNull();
+		expect(coordinator.getState().polls.find((poll) => poll.prKey === PR49)?.nextPollAt).not.toBeNull();
 	});
 
 	it("re-probes the identity on refresh and clears a sticky auth blocker without restart", async () => {
@@ -906,10 +929,11 @@ describe("pr-tracking-coordinator", () => {
 		expect(harness.fake.metadataFreshFlags()).toEqual([false, true]);
 	});
 
-	it("only In Progress and In Review cards keep a record linked for orphan classification", async () => {
+	it("any current card, in any column, keeps a record linked for orphan classification", async () => {
 		const store = new InMemoryPrRecordStore({ now: () => Date.now() });
 		const reviewLinkedKey = "github|github.com|cline/kanban|81";
-		const backlogOnlyKey = "github|github.com|cline/kanban|82";
+		const backlogLinkedKey = "github|github.com|cline/kanban|82";
+		const unlinkedKey = "github|github.com|cline/kanban|83";
 		await store.createRecord({
 			canonicalPrKey: reviewLinkedKey,
 			provider: "github",
@@ -918,11 +942,18 @@ describe("pr-tracking-coordinator", () => {
 			number: 81,
 		});
 		await store.createRecord({
-			canonicalPrKey: backlogOnlyKey,
+			canonicalPrKey: backlogLinkedKey,
 			provider: "github",
 			host: "github.com",
 			repository: "cline/kanban",
 			number: 82,
+		});
+		await store.createRecord({
+			canonicalPrKey: unlinkedKey,
+			provider: "github",
+			host: "github.com",
+			repository: "cline/kanban",
+			number: 83,
 		});
 		const boards: Array<{ workspaceId: string; board: RuntimeBoardData }> = [
 			{
@@ -934,24 +965,32 @@ describe("pr-tracking-coordinator", () => {
 			},
 		];
 		const coordinator = track(makeCoordinator({ store, listBoards: async () => boards }).coordinator);
-		await coordinator.start();
+		// The orphan pass starts after the first eligible subscription.
+		expect((await coordinator.addSubscription(descriptor())).status).toBe("active");
 		// Wait for the background pass to finish (real lock I/O under load).
 		await waitFor(async () => {
-			const probe = await store.loadRecord(backlogOnlyKey);
+			const probe = await store.loadRecord(unlinkedKey);
 			return probe.ok && probe.record.orphanedAt !== null;
 		});
 
-		const linked = await store.loadRecord(reviewLinkedKey);
-		expect(linked.ok).toBe(true);
-		if (linked.ok) {
-			expect(linked.record.orphanedAt).toBeNull();
+		// Both linked records stay un-orphaned regardless of column: a card in
+		// history (backlog) is still "current".
+		const reviewLinked = await store.loadRecord(reviewLinkedKey);
+		expect(reviewLinked.ok).toBe(true);
+		if (reviewLinked.ok) {
+			expect(reviewLinked.record.orphanedAt).toBeNull();
 		}
-		// The backlog card does NOT keep the record linked: orphanedAt is set
-		// (not deleted yet because the clock is fresh).
-		const backlog = await store.loadRecord(backlogOnlyKey);
-		expect(backlog.ok).toBe(true);
-		if (backlog.ok) {
-			expect(backlog.record.orphanedAt).not.toBeNull();
+		const backlogLinked = await store.loadRecord(backlogLinkedKey);
+		expect(backlogLinked.ok).toBe(true);
+		if (backlogLinked.ok) {
+			expect(backlogLinked.record.orphanedAt).toBeNull();
+		}
+		// The unlinked record gets the retention clock started (not deleted
+		// yet because the clock is fresh).
+		const unlinked = await store.loadRecord(unlinkedKey);
+		expect(unlinked.ok).toBe(true);
+		if (unlinked.ok) {
+			expect(unlinked.record.orphanedAt).not.toBeNull();
 		}
 	});
 
@@ -980,8 +1019,9 @@ describe("pr-tracking-coordinator", () => {
 			if (added.status === "blocked") {
 				expect(added.blocker).toBe("scheduler");
 			}
-			// The startup orphan pass must not mark the unlinked record while
-			// this runtime cannot be the sole scheduler.
+			// No orphan pass can run while this runtime cannot be the sole
+			// scheduler: no eligible subscription ever acquired the lock, so
+			// the unlinked record must stay untouched.
 			await coordinator.start();
 			await settle();
 			const record = await store.loadRecord(PR49);
@@ -992,5 +1032,168 @@ describe("pr-tracking-coordinator", () => {
 		} finally {
 			await release();
 		}
+	});
+
+	it("retains a changed source's events when another source fails in the same cycle", async () => {
+		const r1: GitHubPrNormalizedFeedbackEvent = {
+			kind: "review",
+			providerId: "r1",
+			authorLogin: "human",
+			authorKind: "human",
+			isOwnAccount: false,
+			reviewState: "submitted",
+			threadResolved: null,
+			threadDeleted: null,
+			threadOutdated: null,
+			updatedAt: 1,
+			bodyDigest: "digest-r1",
+		};
+		const r2: GitHubPrNormalizedFeedbackEvent = { ...r1, providerId: "r2" };
+		const c1: GitHubPrNormalizedFeedbackEvent = { ...r1, kind: "conversation_comment", providerId: "c1" };
+		const i1: GitHubPrNormalizedFeedbackEvent = { ...r1, kind: "inline_comment", providerId: "i1" };
+		const harness = makeCoordinator({
+			list: (source, callIndex) => {
+				if (source === "reviews") {
+					if (callIndex === 0) {
+						return { kind: "ok", events: [r1], bodyDigest: "reviews-1" };
+					}
+					if (callIndex === 1) {
+						return { kind: "ok", events: [r1, r2], bodyDigest: "reviews-2" };
+					}
+					// The adapter recorded the reviews-2 digest in cycle 2, so
+					// cycle 3's non-fresh read reports not_modified.
+					return { kind: "not_modified" };
+				}
+				if (source === "conversationComments") {
+					if (callIndex === 1) {
+						return { kind: "failed", failure: failure("network") };
+					}
+					return { kind: "ok", events: [c1], bodyDigest: "conversation" };
+				}
+				return callIndex === 0 ? { kind: "ok", events: [i1], bodyDigest: "inline" } : { kind: "not_modified" };
+			},
+		});
+		const coordinator = track(harness.coordinator);
+		expect((await coordinator.addSubscription(descriptor())).status).toBe("active");
+
+		await pollOnce();
+		let snapshot = coordinator.getSnapshotsForTask("ws-1", "task-1");
+		expect(snapshot?.feedback?.map((event) => event.providerId)).toEqual(["r1", "c1", "i1"]);
+
+		// Cycle 2: reviews CHANGED (r2 added) but conversation FAILS. The
+		// publish is withheld, yet the changed events must be retained.
+		await pollOnce();
+		snapshot = coordinator.getSnapshotsForTask("ws-1", "task-1");
+		expect(snapshot?.feedback?.map((event) => event.providerId)).toEqual(["r1", "c1", "i1"]);
+		const poll = coordinator.getState().polls[0];
+		expect(poll?.consecutiveFailures).toBe(1);
+		expect(poll?.nextPollAt).not.toBeNull();
+
+		// Cycle 3: everything recovers; r2 must still appear (the retained
+		// changed events survived the failed cycle, so cycle 3's
+		// not_modified reviews read contributes r1+r2).
+		await vi.advanceTimersByTimeAsync(POLL_MS); // backoff > 60s
+		await settle();
+		await pollOnce();
+		snapshot = coordinator.getSnapshotsForTask("ws-1", "task-1");
+		expect(snapshot?.feedback?.map((event) => event.providerId)).toEqual(["r1", "r2", "c1", "i1"]);
+	});
+
+	it("re-subscribing after unsubscribe forces fresh reads and repopulates feedback", async () => {
+		const r1: GitHubPrNormalizedFeedbackEvent = {
+			kind: "review",
+			providerId: "r1",
+			authorLogin: "human",
+			authorKind: "human",
+			isOwnAccount: false,
+			reviewState: "submitted",
+			threadResolved: null,
+			threadDeleted: null,
+			threadOutdated: null,
+			updatedAt: 1,
+			bodyDigest: "digest-r1",
+		};
+		const c1: GitHubPrNormalizedFeedbackEvent = { ...r1, kind: "conversation_comment", providerId: "c1" };
+		const i1: GitHubPrNormalizedFeedbackEvent = { ...r1, kind: "inline_comment", providerId: "i1" };
+		const harness = makeCoordinator({
+			list: (source) =>
+				source === "reviews"
+					? { kind: "ok", events: [r1], bodyDigest: "reviews" }
+					: source === "conversationComments"
+						? { kind: "ok", events: [c1], bodyDigest: "conversation" }
+						: { kind: "ok", events: [i1], bodyDigest: "inline" },
+		});
+		const coordinator = track(harness.coordinator);
+		expect((await coordinator.addSubscription(descriptor())).status).toBe("active");
+
+		await pollOnce();
+		let snapshot = coordinator.getSnapshotsForTask("ws-1", "task-1");
+		expect(snapshot?.feedback?.map((event) => event.providerId)).toEqual(["r1", "c1", "i1"]);
+
+		// Last subscriber leaves: transient feedback drops immediately.
+		await coordinator.removeSubscription("ws-1", "task-1");
+		expect(coordinator.getSnapshotsForTask("ws-1", "task-1")).toBeNull();
+
+		// Re-subscribing must force FRESH reads for every source: the adapter
+		// digest cache outlives the dropped retained events, so without the
+		// fresh flag every source would report not_modified and feedback
+		// could never repopulate.
+		expect((await coordinator.addSubscription(descriptor())).status).toBe("active");
+		await pollOnce();
+		snapshot = coordinator.getSnapshotsForTask("ws-1", "task-1");
+		expect(snapshot?.feedback?.map((event) => event.providerId)).toEqual(["r1", "c1", "i1"]);
+	});
+
+	it("advances snapshot freshness on not_modified metadata reads", async () => {
+		const harness = makeCoordinator({
+			metadata: (n) => (n === 0 ? makeMetadata("open", "scope-A", 49) : { kind: "not_modified" }),
+		});
+		const coordinator = track(harness.coordinator);
+		expect((await coordinator.addSubscription(descriptor())).status).toBe("active");
+
+		await pollOnce(); // fresh authoritative read
+		const snapshot = coordinator.getSnapshotsForTask("ws-1", "task-1");
+		expect(snapshot?.isStale).toBe(false);
+		const firstCheckedAt = snapshot?.checkedAt ?? null;
+
+		// A poll that only confirms "unchanged" must still advance freshness:
+		// a healthy PR must not read as stale in its steady state.
+		await pollOnce();
+		expect(harness.fake.metadataCalls()).toBe(2);
+		expect(harness.fake.metadataFreshFlags()).toEqual([false, false]);
+		const secondSnapshot = coordinator.getSnapshotsForTask("ws-1", "task-1");
+		expect(secondSnapshot?.isStale).toBe(false);
+		expect(secondSnapshot?.checkedAt).not.toBe(firstCheckedAt);
+		const secondCheckedAt = secondSnapshot?.checkedAt ?? null;
+		if (secondCheckedAt !== null && firstCheckedAt !== null) {
+			expect(secondCheckedAt).toBeGreaterThan(firstCheckedAt);
+		}
+		// The persisted snapshot carries the advanced checkedAt too.
+		const record = await harness.store.loadRecord(PR49);
+		expect(record.ok).toBe(true);
+		if (record.ok && secondCheckedAt !== null) {
+			expect(record.record.snapshots["scope-A"]?.checkedAt).toBe(secondCheckedAt);
+		}
+	});
+
+	it("re-keys stranded subscriptions to the resolved scope when the account switches", async () => {
+		const scopeA = { accessScopeId: "scope-A", login: "alice", tokenSource: "GH_TOKEN" };
+		const scopeB = { accessScopeId: "scope-B", login: "bob", tokenSource: "GH_TOKEN" };
+		const harness = makeCoordinator({
+			scope: scopeA,
+			scopeResult: (callIndex) => (callIndex === 0 ? { ok: true, scope: scopeA } : { ok: true, scope: scopeB }),
+		});
+		const coordinator = track(harness.coordinator);
+		expect((await coordinator.addSubscription(descriptor())).status).toBe("active");
+		await pollOnce();
+		expect(harness.coordinator.getSnapshotsForTask("ws-1", "task-1")?.metadata?.accessScopeId).toBe("scope-A");
+
+		// The user switches accounts mid-session; an explicit refresh
+		// re-probes and resolves scope-B. The old-scope poll state is
+		// invalidated, but the subscription itself is re-keyed to scope-B so
+		// it is not stranded forever.
+		await coordinator.refresh(PR49, "scope-A");
+		const sub = coordinator.getState().subscriptions.find((item) => item.workspaceId === "ws-1");
+		expect(sub?.accessScopeId).toBe("scope-B");
 	});
 });

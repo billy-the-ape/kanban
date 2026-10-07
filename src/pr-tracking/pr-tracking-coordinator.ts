@@ -126,6 +126,14 @@ interface PrPollState {
 	 * digest).
 	 */
 	freshSources: Set<PrFeedbackSource>;
+	/**
+	 * Access blocker for THIS (PR, scope) only: the resolved identity exists
+	 * but cannot see this data (e.g. HTTP 403 permission denied on one
+	 * repository). Access is a per-repository condition, so only this poll
+	 * is cancelled; an explicit refresh re-probes the API (a permission
+	 * change does not require a new auth context).
+	 */
+	accessBlocker: string | null;
 	/** Metadata must be re-read freshly this cycle. */
 	metadataNeedsFresh: boolean;
 }
@@ -134,13 +142,6 @@ export interface CoordinatorState {
 	started: boolean;
 	schedulerBlocked: boolean;
 	authBlocker: string | null;
-	/**
-	 * Access blocker: the resolved identity exists but cannot see the data
-	 * (e.g. HTTP 403 permission denied). Like auth, cancels all polling, but
-	 * an explicit refresh re-probes the API (a permission change does not
-	 * require a new auth context).
-	 */
-	accessBlocker: string | null;
 	subscriptions: Array<{
 		workspaceId: string;
 		taskId: string;
@@ -156,6 +157,7 @@ export interface CoordinatorState {
 		consecutiveFailures: number;
 		rateLimitDeadline: number | null;
 		metadataState: GitHubPrMetadataSnapshot["state"] | null;
+		accessBlocker: string | null;
 	}>;
 }
 
@@ -196,9 +198,9 @@ export class PrTrackingCoordinator {
 	private schedulerLockRelease: (() => Promise<void>) | null = null;
 	private schedulerBlocked = false;
 	private authBlocker: string | null = null;
-	private accessBlocker: string | null = null;
 	private started = false;
 	private stopping = false;
+	private orphanPassStarted = false;
 
 	constructor(deps: CreatePrTrackingCoordinatorDependencies = {}) {
 		this.adapter = deps.adapter ?? createGitHubGhAdapter();
@@ -227,15 +229,13 @@ export class PrTrackingCoordinator {
 	}
 
 	/**
-	 * Start the coordinator. Never blocks or fails runtime startup: the
-	 * startup pass only classifies orphan records, and the scheduler lock is
-	 * acquired lazily on the first eligible subscription.
+	 * Start the coordinator. Never blocks or fails runtime startup and
+	 * acquires no lock: the scheduler lock is acquired lazily on the first
+	 * eligible subscription, and the orphan pass runs once after that first
+	 * successful acquisition.
 	 */
 	async start(): Promise<void> {
 		this.started = true;
-		void this.runOrphanClassificationPass().catch((error: unknown) => {
-			this.warn(`PR tracking startup pass failed: ${String(error)}`);
-		});
 	}
 
 	async stop(): Promise<void> {
@@ -308,6 +308,7 @@ export class PrTrackingCoordinator {
 				snapshotCheckedAt: null,
 				sourceEvents: { reviews: null, conversation: null, inline: null, threads: null },
 				freshSources: new Set(),
+				accessBlocker: null,
 				metadataNeedsFresh: false,
 			};
 			this.polls.set(key, state);
@@ -374,13 +375,22 @@ export class PrTrackingCoordinator {
 	/**
 	 * A newly resolved identity invalidates prior snapshots: drop transient
 	 * poll state for any other scope (metadata, feedback, thread state) so
-	 * data is never shown for the wrong account, and clear auth/access
-	 * blockers (the identity resolved successfully).
+	 * data is never shown for the wrong account, clear auth/access blockers
+	 * (the identity resolved successfully), and re-key every tracked
+	 * subscription to the resolved scope (the runtime follows its active
+	 * credential; old-scope subscriptions must not be stranded).
 	 */
 	private applyScopeChange(scope: AccessScope, previousScope: AccessScope | null): void {
 		this.authBlocker = null;
-		this.accessBlocker = null;
+		for (const state of this.polls.values()) {
+			state.accessBlocker = null;
+		}
 		if (!previousScope || previousScope.accessScopeId === scope.accessScopeId) {
+			for (const sub of this.subscriptions.values()) {
+				if (sub.accessScopeId !== scope.accessScopeId) {
+					sub.accessScopeId = scope.accessScopeId;
+				}
+			}
 			return;
 		}
 		for (const [key, state] of this.polls) {
@@ -389,6 +399,11 @@ export class PrTrackingCoordinator {
 			}
 			this.clearTimer(state);
 			this.polls.delete(key);
+		}
+		for (const sub of this.subscriptions.values()) {
+			if (sub.accessScopeId !== scope.accessScopeId) {
+				sub.accessScopeId = scope.accessScopeId;
+			}
 		}
 	}
 
@@ -520,6 +535,15 @@ export class PrTrackingCoordinator {
 			blocker: null,
 		});
 		await this.reevaluate(descriptor.canonicalPrKey, scope.accessScopeId);
+		// The orphan pass runs ONCE per runtime, right after the first
+		// successful lazy scheduler-lock acquisition (the lock is already
+		// held, so ensureSchedulerLock inside is a no-op).
+		if (!this.orphanPassStarted) {
+			this.orphanPassStarted = true;
+			void this.runOrphanClassificationPass().catch((error: unknown) => {
+				this.warn(`PR tracking orphan pass failed: ${String(error)}`);
+			});
+		}
 		return { status: "active" };
 	}
 
@@ -542,8 +566,12 @@ export class PrTrackingCoordinator {
 
 	/**
 	 * Remove a subscription. When the last subscription for a PR leaves, the
-	 * transient feedback snapshot is dropped immediately (no GitHub call) and
-	 * the record is marked orphaned if no live card still links the PR.
+	 * transient feedback snapshot is dropped immediately (no GitHub call),
+	 * and the next re-subscribe forces FRESH reads for all sources: the
+	 * adapter's body-digest cache outlives the dropped retained events, so
+	 * without a fresh flag every source would report not_modified forever
+	 * and feedback could never repopulate. The record is also marked
+	 * orphaned if no live card still links the PR.
 	 */
 	async removeSubscription(workspaceId: string, taskId: string): Promise<void> {
 		const sub = this.subscriptions.get(this.subscriptionKey(workspaceId, taskId));
@@ -558,7 +586,7 @@ export class PrTrackingCoordinator {
 					state.feedback = null;
 					state.feedbackCompleteness = null;
 					state.sourceEvents = { reviews: null, conversation: null, inline: null, threads: null };
-					state.freshSources.clear();
+					state.freshSources = new Set(["reviews", "conversationComments", "inlineComments", "threads"]);
 				}
 			}
 			await this.markOrphanIfUnlinked(sub.canonicalPrKey);
@@ -566,19 +594,16 @@ export class PrTrackingCoordinator {
 	}
 
 	/**
-	 * Collect canonical PR keys linked by cards in In Progress / In Review
-	 * across currently managed workspaces. A read failure propagates (no
-	 * silent empty set — orphan marking must never run on a partial board
-	 * view).
+	 * Collect canonical PR keys linked by ANY current card (active or
+	 * history, any column) across currently managed workspaces. A read
+	 * failure propagates (no silent empty set — orphan marking must never
+	 * run on a partial board view).
 	 */
 	private async collectLinkedPrKeys(): Promise<Set<string>> {
 		const linkedKeys = new Set<string>();
 		const boards = await this.listBoards();
 		for (const { board } of boards) {
 			for (const column of board.columns) {
-				if (column.id !== "in_progress" && column.id !== "review") {
-					continue;
-				}
 				for (const card of column.cards) {
 					for (const pr of card.pullRequests ?? []) {
 						linkedKeys.add(getPullRequestIdentityKey(pr));
@@ -590,10 +615,10 @@ export class PrTrackingCoordinator {
 	}
 
 	/**
-	 * Startup orphan classification: join managed In Progress/In Review
-	 * cards with PR records and start/clear the 24-hour retention clock.
-	 * Never schedules work and never enumerates PR records to discover
-	 * tasks.
+	 * Orphan classification: join managed cards (any column) with PR records
+	 * and start/clear the 24-hour retention clock. Runs once per runtime
+	 * after the first successful lazy scheduler-lock acquisition. Never
+	 * schedules work and never enumerates PR records to discover tasks.
 	 */
 	private async runOrphanClassificationPass(): Promise<void> {
 		// Shared-record mutations require the scheduler lock: a second
@@ -656,7 +681,7 @@ export class PrTrackingCoordinator {
 	private async reevaluate(prKey: string, accessScopeId: string): Promise<void> {
 		const state = this.getPollState(prKey, accessScopeId);
 		const subs = this.activeSubscriptionsFor(prKey, accessScopeId);
-		if (subs.length === 0 || this.authBlocker !== null || this.accessBlocker !== null || this.schedulerBlocked) {
+		if (subs.length === 0 || this.authBlocker !== null || state.accessBlocker !== null || this.schedulerBlocked) {
 			this.clearTimer(state);
 			return;
 		}
@@ -672,6 +697,20 @@ export class PrTrackingCoordinator {
 			return;
 		}
 		this.scheduleNext(state);
+	}
+
+	/**
+	 * Re-evaluate every tracked (PR, scope). Called whenever a GLOBAL blocker
+	 * (auth) clears so the polls that were cancelled by it re-arm.
+	 */
+	private async reevaluateAll(): Promise<void> {
+		const keys = [...this.polls.keys()];
+		for (const key of keys) {
+			const state = this.polls.get(key);
+			if (state) {
+				await this.reevaluate(state.prKey, state.accessScopeId);
+			}
+		}
 	}
 
 	/**
@@ -883,8 +922,23 @@ export class PrTrackingCoordinator {
 			} else {
 				state.metadataNeedsFresh = false;
 			}
+		} else {
+			// "not_modified": GitHub confirmed the metadata is unchanged, so
+			// freshness advances even though no new body was read — a
+			// healthy PR must not read as stale in its steady state (almost
+			// every poll is not_modified).
+			const checkedAt = this.now();
+			state.snapshotCheckedAt = checkedAt;
+			if (state.metadata) {
+				const updated = await this.store.setMetadataSnapshot(prKey, {
+					...state.metadata,
+					checkedAt,
+				});
+				if (!updated.ok) {
+					state.metadataNeedsFresh = true;
+				}
+			}
 		}
-		// "not_modified" keeps last metadata (snapshot retained).
 		const prState = state.metadata?.state ?? null;
 
 		const wantsFeedback = verdictsBefore.some((verdict) => verdict.subscription.consumers.comments);
@@ -910,7 +964,14 @@ export class PrTrackingCoordinator {
 			state.consecutiveFailures = 0;
 			// A successful authoritative read proves the current credential
 			// works: a sticky auth blocker must clear without a restart.
+			const authWasBlocked = this.authBlocker !== null;
 			this.authBlocker = null;
+			// And this (PR, scope) is accessible: clear its per-poll blocker.
+			state.accessBlocker = null;
+			if (authWasBlocked) {
+				// The global blocker cleared: re-arm every poll it cancelled.
+				await this.reevaluateAll();
+			}
 		}
 		await this.reevaluate(prKey, accessScopeId);
 	}
@@ -959,6 +1020,25 @@ export class PrTrackingCoordinator {
 						failure: { category: "network" as const, message: "missing PR node id", at: this.now() },
 					}),
 		]);
+		// Persist each source's events as soon as THAT source returns ok —
+		// before the failed-source check — so a source that changed is never
+		// lost because a different source failed in the same cycle (the
+		// adapter already recorded the new body digest for it; without the
+		// stored events the next cycle would report not_modified against the
+		// stale retention and drop the change permanently). Only the PUBLISH
+		// is withheld when any source fails.
+		if (reviews.kind === "ok") {
+			state.sourceEvents.reviews = reviews.events;
+		}
+		if (conversation.kind === "ok") {
+			state.sourceEvents.conversation = conversation.events;
+		}
+		if (inline.kind === "ok") {
+			state.sourceEvents.inline = inline.events;
+		}
+		if (threads.kind === "ok_threads") {
+			state.sourceEvents.threads = threads.threads;
+		}
 		const failedSources: Array<GhAdapterFailure> = [];
 		for (const result of [reviews, conversation, inline, threads]) {
 			if (result.kind === "failed") {
@@ -973,23 +1053,11 @@ export class PrTrackingCoordinator {
 		}
 		// Latest known thread state: fresh read wins, else the retained map.
 		const threadState = threads.kind === "ok_threads" ? threads.threads : state.sourceEvents.threads;
-		if (threads.kind === "ok_threads") {
-			state.sourceEvents.threads = threads.threads;
-		}
 		// Per-source retained events; `not_modified` falls back to the last
 		// successfully-read events for that source.
 		const reviewsEvents = reviews.kind === "ok" ? reviews.events : state.sourceEvents.reviews;
 		const conversationEvents = conversation.kind === "ok" ? conversation.events : state.sourceEvents.conversation;
 		const inlineEvents = inline.kind === "ok" ? inline.events : state.sourceEvents.inline;
-		if (reviews.kind === "ok") {
-			state.sourceEvents.reviews = reviews.events;
-		}
-		if (conversation.kind === "ok") {
-			state.sourceEvents.conversation = conversation.events;
-		}
-		if (inline.kind === "ok") {
-			state.sourceEvents.inline = inline.events;
-		}
 		// Publish only when every source has events (freshly read or
 		// retained from a prior complete read); thread state must be known.
 		if (reviewsEvents === null || conversationEvents === null || inlineEvents === null || threadState === null) {
@@ -1007,10 +1075,11 @@ export class PrTrackingCoordinator {
 	}
 
 	/**
-	 * Apply the latest known thread resolution/outdated/deleted flags to
-	 * inline comment events (in-memory only). Retained events already carry
-	 * the flags from their publish time; fresh events may be corrected here
-	 * when the threads source was fresher than the inline read.
+	 * Apply the latest known thread resolution/outdated flags to inline
+	 * comment events (in-memory only). Retained events already carry the
+	 * flags from their publish time; fresh events may be corrected here when
+	 * the threads source was fresher than the inline read. `threadDeleted`
+	 * is always null: GitHub exposes no deleted-thread signal.
 	 */
 	private applyThreadFlags(
 		events: GitHubPrNormalizedFeedbackEvent[],
@@ -1027,7 +1096,7 @@ export class PrTrackingCoordinator {
 			return {
 				...event,
 				threadResolved: info.resolved,
-				threadDeleted: info.deleted,
+				threadDeleted: null,
 				threadOutdated: info.outdated,
 			};
 		});
@@ -1102,10 +1171,11 @@ export class PrTrackingCoordinator {
 	}
 
 	/**
-	 * Classify a read failure: auth and access blockers stop ALL polling for
-	 * the runtime (the identity exists but is not authenticated, or cannot
-	 * see the data — e.g. 403 permission denied); other failures back off
-	 * only this (PR, scope).
+	 * Classify a read failure. `auth` is a runtime-wide condition (the
+	 * credential is bad everywhere): it stops ALL polling. `access` is a
+	 * per-(PR, scope) condition (e.g. 403 on one repository): only that poll
+	 * stops, the others keep running. Other failures back off only this
+	 * (PR, scope).
 	 */
 	private handleFailure(state: PrPollState, failure: GhAdapterFailure): void {
 		if (failure.category === "auth") {
@@ -1115,9 +1185,9 @@ export class PrTrackingCoordinator {
 			return;
 		}
 		if (failure.category === "access") {
-			this.accessBlocker = failure.message;
-			this.warn(`PR tracking access blocker: ${failure.message}`);
-			this.cancelAllPolls();
+			state.accessBlocker = failure.message;
+			this.warn(`PR tracking access blocker for ${state.prKey}: ${failure.message}`);
+			this.clearTimer(state);
 			return;
 		}
 		state.consecutiveFailures += 1;
@@ -1151,13 +1221,19 @@ export class PrTrackingCoordinator {
 		// the identity (a re-login or `gh auth switch` is now detected); a
 		// successful resolution clears the auth blocker and, when the
 		// credential identity changed, invalidates the old scope's state.
-		this.accessBlocker = null;
+		const wasBlocked = this.authBlocker !== null || state.accessBlocker !== null;
+		state.accessBlocker = null;
 		this.authBlocker = null;
 		const scopeResult = await this.ensureScope(accessScopeId !== "unresolved" ? accessScopeId : undefined, true);
 		if (!scopeResult.ok) {
 			// The re-probe failed: the blocker is re-set by ensureScope and
 			// polling stays cancelled until the next explicit refresh/resume.
 			return;
+		}
+		if (wasBlocked && this.authBlocker === null) {
+			// A blocker cleared: re-arm the polls it cancelled, not just the
+			// one being refreshed.
+			await this.reevaluateAll();
 		}
 		if (state.pollInFlight) {
 			// Another refresh started its cycle while we re-probed: coalesce.
@@ -1190,6 +1266,8 @@ export class PrTrackingCoordinator {
 		}
 		// Auth may have recovered since the last failure; force a fresh
 		// identity probe so re-login / account switches are detected.
+		const priorState = this.polls.get(this.pollKey(sub.canonicalPrKey, sub.accessScopeId));
+		const wasBlocked = this.authBlocker !== null || priorState?.accessBlocker !== null;
 		const scopeResult = await this.ensureScope(
 			sub.accessScopeId === "unresolved" ? undefined : sub.accessScopeId,
 			true,
@@ -1208,6 +1286,9 @@ export class PrTrackingCoordinator {
 			return { ok: false, reason: "no_binding" };
 		}
 		const state = this.getPollState(sub.canonicalPrKey, sub.accessScopeId);
+		// A successful fresh authoritative read proves this (PR, scope) is
+		// accessible: clear the per-poll access blocker.
+		state.accessBlocker = null;
 		const scope = this.scopes.get(sub.accessScopeId) ?? scopeResult.scope;
 		const result = await this.adapter.readPrMetadata(parsed, scope, { fresh: true });
 		if (result.kind === "failed") {
@@ -1229,7 +1310,13 @@ export class PrTrackingCoordinator {
 			return { ok: false, reason: "ineligible" };
 		}
 		await this.store.setTaskTerminalStop(sub.canonicalPrKey, { workspaceId, taskId }, null);
-		await this.reevaluate(sub.canonicalPrKey, sub.accessScopeId);
+		if (wasBlocked && this.authBlocker === null) {
+			// A blocker cleared: re-arm every poll it cancelled, not just the
+			// one being resumed.
+			await this.reevaluateAll();
+		} else {
+			await this.reevaluate(sub.canonicalPrKey, sub.accessScopeId);
+		}
 		return { ok: true, resumed: true };
 	}
 
@@ -1267,7 +1354,6 @@ export class PrTrackingCoordinator {
 			started: this.started,
 			schedulerBlocked: this.schedulerBlocked,
 			authBlocker: this.authBlocker,
-			accessBlocker: this.accessBlocker,
 			subscriptions: [...this.subscriptions.values()].map((sub) => ({
 				workspaceId: sub.workspaceId,
 				taskId: sub.taskId,
@@ -1283,6 +1369,7 @@ export class PrTrackingCoordinator {
 				consecutiveFailures: state.consecutiveFailures,
 				rateLimitDeadline: state.rateLimitDeadline,
 				metadataState: state.metadata?.state ?? null,
+				accessBlocker: state.accessBlocker,
 			})),
 		};
 	}

@@ -141,20 +141,22 @@ export function normalizeReviews(rawItems: unknown[], ownAccountLogin: string): 
  * by BOTH the GraphQL node id (`comments.nodes.id`) and the numeric
  * `databaseId` (equal to the REST comment `id` as a string), because the
  * REST list and the GraphQL thread query expose different id spaces.
- * `outdated` (diff moved under the comment) is distinct from `deleted`.
+ * `outdated` (diff moved under the comment) is carried separately. GitHub
+ * exposes no "deleted thread" signal on `PullRequestReviewThread` — a
+ * deleted comment simply stops appearing in the REST list — so the
+ * normalized `threadDeleted` flag is always `null` for now.
  */
 export interface PrThreadInfo {
 	resolved: boolean;
 	outdated: boolean;
-	deleted: boolean;
 }
 
 /**
  * Normalize inline review comments, attaching thread flags. The thread map
  * may be keyed by GraphQL node id or by numeric database id; look the comment
- * up by `node_id` first, then by its REST numeric id. A comment present in
- * the REST list is by definition not deleted, so `threadDeleted` is only
- * populated from an explicit thread signal (null when unknown).
+ * up by `node_id` first, then by its REST numeric id. `threadDeleted` is
+ * always `null`: there is no deleted-thread signal to read (a deleted
+ * comment disappears from the REST list instead).
  */
 export function normalizeInlineComments(
 	rawItems: unknown[],
@@ -180,7 +182,7 @@ export function normalizeInlineComments(
 			isOwnAccount: author.login === ownAccountLogin,
 			reviewState: null,
 			threadResolved: thread ? thread.resolved : null,
-			threadDeleted: thread ? thread.deleted : null,
+			threadDeleted: null,
 			threadOutdated: thread ? thread.outdated : null,
 			updatedAt: asIsoMs(comment?.updated_at) ?? asIsoMs(comment?.created_at) ?? 0,
 			bodyDigest: feedbackBodyDigest(asString(comment?.body) ?? ""),

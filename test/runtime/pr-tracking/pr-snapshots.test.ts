@@ -107,7 +107,7 @@ describe("pr-snapshots", () => {
 		expect(r3?.authorKind).toBe("bot");
 	});
 
-	it("classifies inline comments and attaches thread resolved/deleted/outdated flags", () => {
+	it("classifies inline comments and attaches thread resolved/outdated flags", () => {
 		// REST list items carry numeric ids + node ids; the thread map from
 		// GraphQL is keyed by node id, so lookup must join on the node id.
 		const events = normalizeInlineComments(
@@ -124,18 +124,20 @@ describe("pr-snapshots", () => {
 			],
 			"me",
 			new Map([
-				["PRC_900001", { resolved: true, outdated: false, deleted: false }],
-				["PRC_900002", { resolved: false, outdated: false, deleted: true }],
-				["PRC_900003", { resolved: false, outdated: true, deleted: false }],
+				["PRC_900001", { resolved: true, outdated: false }],
+				["PRC_900002", { resolved: false, outdated: false }],
+				["PRC_900003", { resolved: false, outdated: true }],
 			]),
 		);
 		expect(events).toHaveLength(3);
 		expect(events[0]?.threadResolved).toBe(true);
-		expect(events[0]?.threadDeleted).toBe(false);
+		// threadDeleted is always null: GitHub exposes no deleted-thread
+		// signal (a deleted comment disappears from the REST list).
+		expect(events[0]?.threadDeleted).toBeNull();
+		expect(events[1]?.threadDeleted).toBeNull();
 		expect(events[0]?.threadOutdated).toBe(false);
 		expect(events[0]?.bodyDigest).toBe(feedbackBodyDigest("nit: rename"));
 		expect(events[1]?.isOwnAccount).toBe(true);
-		expect(events[1]?.threadDeleted).toBe(true);
 		expect(events[2]?.threadOutdated).toBe(true);
 	});
 

@@ -7,7 +7,7 @@ represents a single PR.
 
 | Field | Value |
 | --- | --- |
-| Document revision | 2 |
+| Document revision | 3 |
 | Prepared | 2026-10-06 |
 | Status | Implemented — PR opened targeting `feat/pr-tracking-base` |
 | Source baseline | 49a2ca05c6c2927da2194aaec8bd1e45e6fa2928 (main) |
@@ -439,6 +439,51 @@ store, never clobbered.
   this runtime's scheduler instead of throwing from a timer callback.
 - Test fixtures mirror real gh/GitHub output (modern `gh api user` JSON with a
   hyphenated login, uppercase review states, node-id-keyed threads).
+
+**PR 64 review responses (third round)**
+
+- `readReviewThreads` now unwraps the full GitHub response body
+  (`result.data.node.reviewThreads`): the previous code read `result.node`,
+  which is never present in `gh api graphql` output, so the thread map was
+  always empty and thread resolution/outdated flags never applied. Test
+  fixtures now carry the real `{data: {node: …}}` shape, and a new
+  `test/runtime/pr-tracking/pr-graphql-queries.test.ts` validates every
+  GraphQL document in the adapter module against GitHub's published schema
+  (`@octokit/graphql-schema`, added as a devDependency) so invalid fields are
+  caught offline.
+- The `deleted` field is removed from the thread map: GitHub exposes no
+  deleted-thread signal (verified against the published schema — no
+  `deleted` on `PullRequestReviewThread`, no `PullRequestReviewComment`
+  field either). `threadDeleted` is now always `null`; a deleted comment
+  simply disappears from the REST list.
+- Access failures are now per-`(PR, scope)` instead of runtime-wide: only
+  the failing poll stops (`accessBlocker` moved onto `PrPollState`), other
+  PRs keep polling. The auth blocker stays global (a credential is either
+  good or bad everywhere). `CoordinatorState.accessBlocker` was removed in
+  favor of a per-poll `accessBlocker`.
+- The orphan pass is no longer a startup task: `start()` acquires nothing,
+  and the pass runs exactly once per runtime right after the FIRST eligible
+  subscription takes the (lazy) scheduler lock — the lock already existed
+  before the pass, so no second process can race its record writes.
+- Orphan classification joins ANY current card (active or history, any
+  column) rather than only In Progress / In Review cards.
+- The stale label now reflects "no healthy authoritative signal this cycle"
+  instead of "metadata body is older than 90s": a `not_modified` metadata
+  confirmation advances `snapshotCheckedAt` (and persists it), so a healthy
+  PR never reads as stale in its steady state; only real read failures age
+  the label.
+- Per-source retention is no longer all-or-nothing: each source's freshly
+  read events are stored before the failed-source check, so a source that
+  changed in a cycle where a DIFFERENT source failed is retained (previously
+  it was dropped forever because the adapter's body digest already moved
+  past it). Unsubscribe/re-subscribe also forces fresh reads for all four
+  sources, so feedback repopulates after the last subscriber leaves and
+  returns.
+- An explicit `refresh`/`resumePrTracking` that clears a blocker re-arms ALL
+  polls that blocker cancelled (a new `reevaluateAll`), not just the one
+  being refreshed; a successful poll cycle does the same for a cleared
+  auth blocker. `applyScopeChange` re-keys stranded subscriptions to the
+  resolved scope so an account switch does not leave them blocked forever.
 
 **Deviations/refinements noted during implementation**
 

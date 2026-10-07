@@ -345,9 +345,9 @@ export class GitHubGhAdapter {
 			const result = await this.runner(args, this.cwd);
 			const outcome = this.classifyExit(result);
 			if (outcome.kind === "json") {
-				const data = outcome.data as { errors?: Array<{ message?: string }> };
-				const message = (data.errors ?? []).map((item) => String(item.message ?? "")).join("; ");
-				if (data.errors && data.errors.length > 0) {
+				const body = outcome.data as { errors?: Array<{ message?: string }>; data?: unknown };
+				const message = (body.errors ?? []).map((item) => String(item.message ?? "")).join("; ");
+				if (body.errors && body.errors.length > 0) {
 					if (/rate limit|secondary/i.test(message)) {
 						const resetAt = await this.fetchRateLimitReset();
 						return {
@@ -371,6 +371,9 @@ export class GitHubGhAdapter {
 						failure: { category: "network", message: sanitizeErrorDetail(message), at: this.now() },
 					};
 				}
+				// `gh api graphql` prints GitHub's FULL response body
+				// ({data: {node: …}}): unwrap so callers read the inner data.
+				return { kind: "json", data: body.data ?? outcome.data, stdout: outcome.stdout };
 			}
 			return outcome;
 		} finally {
@@ -386,13 +389,6 @@ export class GitHubGhAdapter {
 	 * multi-account rewrite and lists every account (first-match could pick
 	 * an inactive one). 401, missing binary, or missing login are the auth
 	 * blocker.
-	 */
-	/**
-	 * Resolve the authenticated github.com access scope (noninteractive).
-	 * Identity comes from `gh api user` (stable JSON, always the ACTIVE
-	 * credential) — never by scraping human-oriented `gh auth status` text,
-	 * whose format changed (`account` vs `as`) and which lists every account
-	 * under multi-account setups.
 	 */
 	async resolveAccessScope(): Promise<AccessScopeResult> {
 		const at = this.now();
@@ -588,7 +584,6 @@ export class GitHubGhAdapter {
 							id?: string | null;
 							isResolved?: boolean;
 							isOutdated?: boolean;
-							deleted?: boolean;
 							comments?: {
 								pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
 								nodes?: Array<{ id?: string | null; databaseId?: number | null }>;
@@ -605,13 +600,7 @@ export class GitHubGhAdapter {
 				const info: PrThreadInfo = {
 					resolved: threadNode.isResolved === true,
 					outdated: threadNode.isOutdated === true,
-					deleted: threadNode.deleted === true,
 				};
-				// Deleted threads expose no comments; keep the thread node id
-				// keyed so retained events can still be flagged.
-				if (info.deleted) {
-					threads.set(threadNode.id, info);
-				}
 				const commentNodes: Array<{ id?: string | null; databaseId?: number | null }> = [
 					...(threadNode.comments?.nodes ?? []),
 				];
@@ -678,7 +667,11 @@ export class GitHubGhAdapter {
 	}
 }
 
-const THREADS_QUERY = `
+/**
+ * Exported so tests can validate every GraphQL document in this module
+ * against GitHub's published schema (@octokit/graphql-schema).
+ */
+export const THREADS_QUERY = `
 query($nodeId: ID!, $after: String) {
   node(id: $nodeId) {
     ... on PullRequest {
@@ -691,7 +684,6 @@ query($nodeId: ID!, $after: String) {
           id
           isResolved
           isOutdated
-          deleted
           comments(first: 100) {
             pageInfo {
               hasNextPage
@@ -709,7 +701,7 @@ query($nodeId: ID!, $after: String) {
 }
 `;
 
-const THREAD_COMMENTS_QUERY = `
+export const THREAD_COMMENTS_QUERY = `
 query($threadId: ID!, $after: String) {
   node(id: $threadId) {
     ... on PullRequestReviewThread {

@@ -318,42 +318,45 @@ describe("github-gh-adapter", () => {
 	});
 
 	it("paginates GraphQL review threads into a per-comment thread map", async () => {
+		// Fixtures mirror `gh api graphql` output: the FULL GitHub response
+		// body, {data: {node: …}}.
 		const page1 = JSON.stringify({
-			node: {
-				reviewThreads: {
-					pageInfo: { hasNextPage: true, endCursor: "cursor-1" },
-					nodes: [
-						{
-							id: "t1",
-							isResolved: true,
-							isOutdated: false,
-							deleted: false,
-							comments: { nodes: [{ id: "c1" }, { id: "c2" }] },
-						},
-						{
-							id: "t2",
-							isResolved: false,
-							isOutdated: true,
-							deleted: false,
-							comments: { nodes: [{ id: "c3" }] },
-						},
-					],
+			data: {
+				node: {
+					reviewThreads: {
+						pageInfo: { hasNextPage: true, endCursor: "cursor-1" },
+						nodes: [
+							{
+								id: "t1",
+								isResolved: true,
+								isOutdated: false,
+								comments: { nodes: [{ id: "c1" }, { id: "c2" }] },
+							},
+							{
+								id: "t2",
+								isResolved: false,
+								isOutdated: true,
+								comments: { nodes: [{ id: "c3" }] },
+							},
+						],
+					},
 				},
 			},
 		});
 		const page2 = JSON.stringify({
-			node: {
-				reviewThreads: {
-					pageInfo: { hasNextPage: false, endCursor: "cursor-2" },
-					nodes: [
-						{
-							id: "t3",
-							isResolved: false,
-							isOutdated: false,
-							deleted: false,
-							comments: { nodes: [{ id: "c4" }] },
-						},
-					],
+			data: {
+				node: {
+					reviewThreads: {
+						pageInfo: { hasNextPage: false, endCursor: "cursor-2" },
+						nodes: [
+							{
+								id: "t3",
+								isResolved: false,
+								isOutdated: false,
+								comments: { nodes: [{ id: "c4" }] },
+							},
+						],
+					},
 				},
 			},
 		});
@@ -370,34 +373,34 @@ describe("github-gh-adapter", () => {
 		if (result.kind !== "ok_threads") {
 			return;
 		}
-		expect(result.threads.get("c1")).toEqual({ resolved: true, outdated: false, deleted: false });
-		expect(result.threads.get("c3")).toEqual({ resolved: false, outdated: true, deleted: false });
-		expect(result.threads.get("c4")).toEqual({ resolved: false, outdated: false, deleted: false });
+		expect(result.threads.get("c1")).toEqual({ resolved: true, outdated: false });
+		expect(result.threads.get("c3")).toEqual({ resolved: false, outdated: true });
+		expect(result.threads.get("c4")).toEqual({ resolved: false, outdated: false });
 		expect(calls).toHaveLength(2);
 		expect(calls[1]?.args).toContain("after=cursor-1");
 	});
 
-	it("flags deleted threads and retains thread node ids for retained events", async () => {
+	it("does not key deleted threads: GitHub has no deleted-thread signal", async () => {
 		const body = JSON.stringify({
-			node: {
-				reviewThreads: {
-					pageInfo: { hasNextPage: false, endCursor: null },
-					nodes: [
-						{
-							id: "t1",
-							isResolved: false,
-							isOutdated: false,
-							deleted: true,
-							comments: { nodes: [] },
-						},
-						{
-							id: "t2",
-							isResolved: false,
-							isOutdated: false,
-							deleted: false,
-							comments: { nodes: [{ id: "c1" }] },
-						},
-					],
+			data: {
+				node: {
+					reviewThreads: {
+						pageInfo: { hasNextPage: false, endCursor: null },
+						nodes: [
+							{
+								id: "t1",
+								isResolved: false,
+								isOutdated: false,
+								comments: { nodes: [] },
+							},
+							{
+								id: "t2",
+								isResolved: false,
+								isOutdated: false,
+								comments: { nodes: [{ id: "c1" }] },
+							},
+						],
+					},
 				},
 			},
 		});
@@ -408,24 +411,27 @@ describe("github-gh-adapter", () => {
 		if (result.kind !== "ok_threads") {
 			return;
 		}
-		expect(result.threads.get("t1")).toEqual({ resolved: false, outdated: false, deleted: true });
-		expect(result.threads.get("c1")).toEqual({ resolved: false, outdated: false, deleted: false });
+		// An empty thread contributes no keys (nothing to flag); a deleted
+		// comment simply disappears from the REST list instead.
+		expect(result.threads.has("t1")).toBe(false);
+		expect(result.threads.get("c1")).toEqual({ resolved: false, outdated: false });
 	});
 
 	it("keeps last thread state on unchanged conditional reads and refetches with fresh", async () => {
 		const body = JSON.stringify({
-			node: {
-				reviewThreads: {
-					pageInfo: { hasNextPage: false, endCursor: null },
-					nodes: [
-						{
-							id: "t1",
-							isResolved: false,
-							isOutdated: false,
-							deleted: false,
-							comments: { nodes: [{ id: "c1" }] },
-						},
-					],
+			data: {
+				node: {
+					reviewThreads: {
+						pageInfo: { hasNextPage: false, endCursor: null },
+						nodes: [
+							{
+								id: "t1",
+								isResolved: false,
+								isOutdated: false,
+								comments: { nodes: [{ id: "c1" }] },
+							},
+						],
+					},
 				},
 			},
 		});
