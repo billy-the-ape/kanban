@@ -7,9 +7,9 @@ represents a single PR.
 
 | Field | Value |
 | --- | --- |
-| Document revision | 1 |
+| Document revision | 2 |
 | Prepared | 2026-10-06 |
-| Status | planned; no milestone started |
+| Status | Implemented — PR opened targeting `feat/pr-tracking-base` |
 | Source baseline | 49a2ca05c6c2927da2194aaec8bd1e45e6fa2928 (main) |
 | Fork | https://github.com/billy-the-ape/kanban |
 | Prerequisites | PR #49 (still open) supplies the landed PR-linking contracts (`docs/plans/pr-linking/`); verify `getPullRequestIdentityKey` exists before starting. This plan (with the comment and merge plans) supersedes overlapping scope in unmerged PR #21 — do not run both task series |
@@ -140,7 +140,7 @@ Explicit non-goals:
 
 ## Implementation tasks (in this order)
 
-- [ ] PRTRACK-0.1 **Canonical PR identity and record schema.** Reuse the PR-linking identity as
+- [x] PRTRACK-0.1 **Canonical PR identity and record schema.** Reuse the PR-linking identity as
       the `canonicalPrKey`; define the version-1 `GitHubPrTrackingRecord` contract in
       `src/core/api-contract.ts`: `schemaVersion`/`revision`; PR identity; `orphanedAt`
       (timestamp the record was first observed orphaned — starts the 24-hour retention
@@ -168,7 +168,7 @@ Explicit non-goals:
       - durable replay cursors live on each task binding in the PR record, per consumer kind.
       No comment bodies, per-item dispositions, batch ledgers, or repair-budget counters are
       durable fields.
-- [ ] PRTRACK-0.2 **Durable record store.** Persist at
+- [x] PRTRACK-0.2 **Durable record store.** Persist at
       `join(getRuntimeHomePath(), "pr-tracking", "prs", <sha256(canonicalPrKey)> + ".json")`
       using the existing atomic JSON/lock helpers under the single tracking-registry mutex.
       Revision-checked updates that preserve unrelated fields and check revision/generation/owner.
@@ -181,7 +181,7 @@ Explicit non-goals:
       when a record is first observed orphaned (persisted on the record); delete an orphan
       record only after 24 hours with no task links and no live/uncertain operation; an
       unresolved operation blocks cleanup and requires manual reconciliation.
-- [ ] PRTRACK-0.3 **GitHub gh adapter.** Noninteractive `gh api --hostname github.com` via
+- [x] PRTRACK-0.3 **GitHub gh adapter.** Noninteractive `gh api --hostname github.com` via
       direct execFile following the `git-delivery.ts`/`createGitProcessEnv()` convention;
       because the existing `runGhCommand` has no timeout and a 1 MiB `maxBuffer`, the
       30-second timeout, 8 MiB per-page bound, and noninteractive gh environment (prompt
@@ -197,7 +197,7 @@ Explicit non-goals:
       partial-page — each retains last state and pauses decisions; never treat missing/failed
       data as closed or merged. Sanitized errors with timestamps. Runtime-wide cap of four
       in-flight reads.
-- [ ] PRTRACK-0.4 **Normalized transient snapshots.** Versioned, access-scoped normalized
+- [x] PRTRACK-0.4 **Normalized transient snapshots.** Versioned, access-scoped normalized
       metadata (and, when a (fake) subscription requests feedback sources,
       review/conversation/thread feedback) with freshness/completeness. The normalized
       feedback model carries per event: author kind (human/bot) and whether it is the
@@ -215,7 +215,7 @@ Explicit non-goals:
       as-of its time but is refetched before any decision), and snapshots invalidate on
       auth-context change; destructive lifecycle decisions (later consumers) require a fresh
       authoritative read.
-- [ ] PRTRACK-0.5 **Single runtime-wide coordinator.** One coordinator per Kanban runtime
+- [x] PRTRACK-0.5 **Single runtime-wide coordinator.** One coordinator per Kanban runtime
       covering all managed workspaces — not one timer per workspace or card. One canonical PR
       linked by tasks in different workspaces produces one scheduled/in-flight read per source
       per access scope; fan out the versioned snapshot to separately validated task consumers.
@@ -229,7 +229,7 @@ Explicit non-goals:
       of the master's "show a blocked startup for a second process" — with a visible
       log/stderr line; a second Kanban process on the same root keeps serving normally with
       tracking disabled. Do not claim cross-host protection.
-- [ ] PRTRACK-0.6 **Eligibility, backoff, terminal stop/resume.** Implement the master plan's
+- [x] PRTRACK-0.6 **Eligibility, backoff, terminal stop/resume.** Implement the master plan's
       eligibility table as coordinator rules driven by subscription state. The subscription
       descriptor records *which* checkbox/consumer is enabled (comment, merge, both) — not
       just "at least one": In Progress/In Review + open/draft PR + at least one enabled
@@ -250,7 +250,7 @@ Explicit non-goals:
       polling resumes only if that read confirms open/draft and eligibility still holds.
       Transient failures back off 60/120/240/480/900 capped at 900, honoring longer
       Retry-After/reset deadlines; add jitter.
-- [ ] PRTRACK-0.7 **Provider/store/coordinator tests.** Fake subscriptions (and, for adapter
+- [x] PRTRACK-0.7 **Provider/store/coordinator tests.** Fake subscriptions (and, for adapter
       tests, a fake `gh` executable on PATH — never real network) prove: complete pagination;
       cross-workspace dedupe and shared in-flight refresh; backoff schedule including
       Retry-After; eligibility table transitions (including the auto-finish qualifier, the
@@ -326,3 +326,75 @@ against this read-only foundation.
   suite — rework the fixture instead.
 - The PR-linking identity helpers are not yet landed — this PR is blocked; do not re-implement
   PR identity locally.
+
+## Final implementation record (handoff)
+
+Landed on branch `feat/prtrack-0-foundation`, PR opened against `feat/pr-tracking-base`.
+
+**Changed files**
+
+- `src/core/api-contract.ts` — version-1 `GitHubPrTrackingRecord` contract
+  (`githubPrTrackingRecordSchema`): `schemaVersion`/`revision`, PR identity, `orphanedAt`,
+  access-scoped metadata snapshots, task bindings with terminal stop/reopen/merge-completion
+  markers, monotonic link generations, comment-automation block, and the reservation block.
+  Provider-free contract types only; no runtime behavior.
+- `src/pr-tracking/` (new)
+  - `pr-identity.ts` — canonical PR key parse/build/digest reusing the PR-linking identity
+    (`getPullRequestIdentityKey` in `src/core/pull-request-links.ts`) and
+    `recordIdentityMatchesKey` validation.
+  - `pr-record-store.ts` — `PrRecordStore` (revision-checked atomic updates under the
+    tracking-registry mutex), `getPrTrackingRootPath()`,
+    `getPrTrackingSchedulerLockRequest()`, `getPrTrackingRegistryMutexRequest()`, and the
+    24-hour orphan-retention constant.
+  - `github-gh-adapter.ts` — `GitHubGhAdapter`/`createGhAdapter`: noninteractive
+    `gh api --hostname github.com` via direct `execFile` + `createGitProcessEnv()`, 30-second
+    timeout, 8 MiB per-page bound, full REST + GraphQL pagination, per-source ETag/conditional
+    reads, structured `GhAdapterFailure` taxonomy (auth, rate_limit with reset deadline,
+    not_found, network, timeout, buffer_bound, partial_page), runtime-wide four-read
+    in-flight cap.
+  - `pr-snapshots.ts` — normalized access-scoped metadata/feedback snapshots,
+    freshness/staleness (`PR_SNAPSHOT_STALE_AFTER_MS` = one poll interval + jitter), body
+    digests, and `prKeyDigest`.
+  - `pr-tracking-coordinator.ts` — `createPrTrackingCoordinator`: one runtime-wide
+    coordinator; per-`(prKey, accessScopeId)` poll state; demand-union eligibility
+    re-evaluated before every read; 60 s cadence with jitter; 60/120/240/480/900 s backoff
+    capped at 900; rate-limit reset deadlines override backoff; terminal stop reasons
+    persisted (no rearm on restart); merged reconciliation capped at three reads per
+    episode; explicit `refresh` coalesces into the in-flight read; `resumePrTracking`
+    performs one fresh authoritative read; orphan classification pass at `start()`.
+- `src/server/runtime-server.ts` — coordinator created in the server startup path,
+  `start()` awaited (non-blocking: orphan pass is background, scheduler lock lazy),
+  `stop()` awaited in `close()` before the runtime state hub closes. `workspace-registry.ts`
+  needed no changes.
+- `test/runtime/pr-tracking/` (new) — `pr-identity`, `pr-record-store`, `pr-snapshots`,
+  `github-gh-adapter` (fake `gh` executable on PATH; no real network), and
+  `pr-tracking-coordinator` (fake timers + fake adapter; temp store roots) suites.
+
+**Record location/format.** `join(getRuntimeHomePath(), "pr-tracking", "prs",
+<sha256(canonicalPrKey)> + ".json")`, schema version 1, revision-checked. Rollback: records
+are inert without consumers; unknown fields/versions are preserved by the revision-checked
+store, never clobbered.
+
+**Lock scopes (distinct `path`s — proper-lockfile keys its in-process map by `path`).**
+
+- Scheduler lock: `path = join(getRuntimeHomePath(), "pr-tracking")` (directory), on-disk
+  lockfile `.scheduler.lock`. Acquired lazily on first eligible subscription; a failure
+  blocks only the PR-tracking scheduler (state `schedulerBlocked`, add-subscription returns
+  `blocked`), never the runtime, with a visible log line.
+- Tracking-registry mutex: `path = join(getRuntimeHomePath(), "pr-tracking", "registry")`
+  (directory), on-disk lockfile `registry/.registry.lock`. Serializes all shared record
+  updates; never held while awaiting network/model work.
+
+**Test results.** `npx vitest run test/runtime/pr-tracking/` — 5 files / 56 tests passing.
+`npx tsc --noEmit` clean. `npx @biomejs/biome check` clean for all changed files.
+
+**Deviations/refinements noted during implementation**
+
+- Coordinator error logging goes through an injectable `logError` callback (default no-op);
+  the runtime server routes it to the existing `deps.warn` abstraction instead of a direct
+  `console.error` (Biome forbids direct console calls in `src/`).
+- The coordinator accepts an injectable `schedulerLockRequest` (and store, clocks, RNG) for
+  testability; production defaults match the fixed decisions above.
+- No baseline drift found against 49a2ca05c6c2927da2194aaec8bd1e45e6fa2928; the PR-linking
+  identity helpers were already landed.
+
