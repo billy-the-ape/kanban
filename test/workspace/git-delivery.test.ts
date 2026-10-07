@@ -8,8 +8,18 @@ import { join, resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import type { RuntimeGitDeliveryPolicy, RuntimeReviewHandoffArtifact } from "../../src/core/api-contract";
-import { getTaskWorktreesHomePath } from "../../src/state/workspace-state";
+import type {
+	RuntimeBoardData,
+	RuntimeGitDeliveryPolicy,
+	RuntimeReviewHandoffArtifact,
+} from "../../src/core/api-contract";
+import {
+	getTaskWorktreesHomePath,
+	getWorkspacesRootPath,
+	listWorkspaceIndexEntries,
+	loadWorkspaceState,
+	saveWorkspaceState,
+} from "../../src/state/workspace-state";
 import {
 	evaluateDependentsUnlock,
 	type GhCommandResult,
@@ -1199,5 +1209,318 @@ describe("GitDeliveryService", () => {
 				fixture.cleanup();
 			}
 		});
+	});
+});
+
+describe("PRLINK-3: delivery PR capture", () => {
+	function createDeliveryBoard(taskId: string): RuntimeBoardData {
+		return {
+			columns: [
+				{
+					id: "backlog",
+					title: "Backlog",
+					cards: [
+						{
+							id: taskId,
+							title: "Delivery Task",
+							prompt: "Delivery task prompt",
+							startInPlanMode: false,
+							baseRef: "main",
+							createdAt: Date.now(),
+							updatedAt: Date.now(),
+						},
+					],
+				},
+				{ id: "in_progress", title: "In Progress", cards: [] },
+				{ id: "review", title: "Review", cards: [] },
+				{ id: "trash", title: "Done", cards: [] },
+			],
+			dependencies: [],
+		};
+	}
+
+	/** Registers the fixture repo as a workspace and returns its workspace id. */
+	async function registerDeliveryWorkspace(fixture: DeliveryFixture, taskId: string): Promise<string> {
+		const initial = await loadWorkspaceState(fixture.repoPath);
+		await saveWorkspaceState(fixture.repoPath, {
+			board: createDeliveryBoard(taskId),
+			sessions: {},
+			expectedRevision: initial.revision,
+		});
+		const [entry] = await listWorkspaceIndexEntries();
+		return entry?.workspaceId ?? "workspace-1";
+	}
+
+	function findCardPullRequests(board: RuntimeBoardData, taskId: string) {
+		return board.columns.flatMap((column) => column.cards).find((card) => card.id === taskId)?.pullRequests;
+	}
+
+	const okGh = (stdout: string): GhCommandResult => ({
+		ok: true,
+		stdout,
+		stderr: "",
+		exitCode: 0,
+		missingBinary: false,
+	});
+
+	it("records the PR it opens on the task card with a title snapshot (created path)", async () => {
+		const fixture = await createDeliveryFixture();
+		try {
+			const taskId = "task-pr-created";
+			await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
+			await persistFixtureHandoff(fixture, taskId);
+			const workspaceId = await registerDeliveryWorkspace(fixture, taskId);
+			await writeFile(join(fixture.worktreePath, "task.txt"), "task work\n", "utf8");
+
+			const broadcastCalls: Array<{ workspaceId: string; workspacePath: string }> = [];
+			const gh = async (args: string[]): Promise<GhCommandResult> =>
+				okGh(args[1] === "list" ? "[]" : "https://github.com/o/r/pull/42");
+			const service = new GitDeliveryService({ gh });
+			const response = await service.startDelivery({
+				taskId,
+				workspaceId,
+				repoPath: fixture.repoPath,
+				worktreePath: fixture.worktreePath,
+				baseRef: "main",
+				policy: deliveryPolicy({ requirePullRequest: true }),
+				onPullRequestRecorded: (broadcastWorkspaceId, workspacePath) => {
+					broadcastCalls.push({ workspaceId: broadcastWorkspaceId, workspacePath });
+				},
+			});
+
+			expect(response.ok).toBe(true);
+			expect(response.receipt?.pr).toEqual({
+				status: "created",
+				number: 42,
+				url: "https://github.com/o/r/pull/42",
+				error: null,
+			});
+			const board = (await loadWorkspaceState(fixture.repoPath)).board;
+			const pullRequests = findCardPullRequests(board, taskId);
+			expect(pullRequests).toHaveLength(1);
+			expect(pullRequests?.[0]).toMatchObject({
+				provider: "github",
+				host: "github.com",
+				repository: "o/r",
+				number: 42,
+				url: "https://github.com/o/r/pull/42",
+				source: "delivery",
+				// The snapshot title is the composed gh PR title from the card title.
+				title: "Delivery Task (kanban task-pr-created)",
+			});
+			// The created path records no state snapshot (refresh is PRLINK-5).
+			expect(pullRequests?.[0]?.state).toBeUndefined();
+			expect(pullRequests?.[0]?.stateCheckedAt).toBeUndefined();
+			expect(broadcastCalls).toEqual([{ workspaceId, workspacePath: fixture.repoPath }]);
+		} finally {
+			fixture.cleanup();
+		}
+	});
+
+	it("records a pre-existing PR with a title and open-state snapshot from gh pr list (existing path)", async () => {
+		const fixture = await createDeliveryFixture();
+		try {
+			const taskId = "task-pr-existing";
+			await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
+			await persistFixtureHandoff(fixture, taskId);
+			const workspaceId = await registerDeliveryWorkspace(fixture, taskId);
+			await writeFile(join(fixture.worktreePath, "task.txt"), "task work\n", "utf8");
+
+			const calls: string[][] = [];
+			const gh = async (args: string[]): Promise<GhCommandResult> => {
+				calls.push(args);
+				return okGh(
+					args[1] === "list"
+						? JSON.stringify([{ number: 42, url: "https://github.com/o/r/pull/42", title: "Existing PR title" }])
+						: "https://github.com/o/r/pull/42",
+				);
+			};
+			const service = new GitDeliveryService({ gh });
+			const response = await service.startDelivery({
+				taskId,
+				workspaceId,
+				repoPath: fixture.repoPath,
+				worktreePath: fixture.worktreePath,
+				baseRef: "main",
+				policy: deliveryPolicy({ requirePullRequest: true, pullRequestBaseBranch: "main" }),
+			});
+
+			expect(response.ok).toBe(true);
+			expect(response.receipt?.pr).toEqual({
+				status: "existing",
+				number: 42,
+				url: "https://github.com/o/r/pull/42",
+				error: null,
+			});
+			// The dedupe query asks for the title alongside number and url.
+			const listCall = calls.find((args) => args[1] === "list");
+			expect(listCall).toContain("number,url,title");
+
+			const receipt = response.receipt;
+			const board = (await loadWorkspaceState(fixture.repoPath)).board;
+			const pullRequests = findCardPullRequests(board, taskId);
+			expect(pullRequests).toHaveLength(1);
+			expect(pullRequests?.[0]).toMatchObject({
+				url: "https://github.com/o/r/pull/42",
+				source: "delivery",
+				title: "Existing PR title",
+				// The dedupe query filters --state open, so this is accurate.
+				state: "open",
+			});
+			expect(pullRequests?.[0]?.stateCheckedAt).toBe(receipt?.updatedAt);
+		} finally {
+			fixture.cleanup();
+		}
+	});
+
+	it("records nothing when the PR is not required or skipped", async () => {
+		const fixture = await createDeliveryFixture();
+		try {
+			const taskId = "task-pr-none";
+			await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
+			await persistFixtureHandoff(fixture, taskId);
+			const workspaceId = await registerDeliveryWorkspace(fixture, taskId);
+			await writeFile(join(fixture.worktreePath, "task.txt"), "task work\n", "utf8");
+
+			const ghCalls: string[][] = [];
+			const gh = async (args: string[]): Promise<GhCommandResult> => {
+				ghCalls.push(args);
+				return okGh("https://github.com/o/r/pull/42");
+			};
+			const service = new GitDeliveryService({ gh });
+			const notRequired = await service.startDelivery({
+				taskId,
+				workspaceId,
+				repoPath: fixture.repoPath,
+				worktreePath: fixture.worktreePath,
+				baseRef: "main",
+				policy: deliveryPolicy(),
+			});
+			expect(notRequired.ok).toBe(true);
+			expect(notRequired.receipt?.pr?.status).toBe("not_required");
+
+			await writeFile(join(fixture.worktreePath, "task2.txt"), "more work\n", "utf8");
+			const skipped = await service.startDelivery({
+				taskId,
+				workspaceId,
+				repoPath: fixture.repoPath,
+				worktreePath: fixture.worktreePath,
+				baseRef: "main",
+				policy: deliveryPolicy({ requirePullRequest: true, pushRequired: false }),
+			});
+			expect(skipped.receipt?.pr?.status).toBe("skipped");
+
+			// Neither path may call gh or touch the card.
+			expect(ghCalls).toHaveLength(0);
+			const board = (await loadWorkspaceState(fixture.repoPath)).board;
+			expect(findCardPullRequests(board, taskId)).toBeUndefined();
+		} finally {
+			fixture.cleanup();
+		}
+	});
+
+	it("keeps the delivery outcome intact when recording the PR fails (best-effort isolation)", async () => {
+		const fixture = await createDeliveryFixture();
+		try {
+			const taskId = "task-pr-corrupt";
+			await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
+			await persistFixtureHandoff(fixture, taskId);
+			const workspaceId = await registerDeliveryWorkspace(fixture, taskId);
+			// Corrupt the persisted board so the recording write cannot succeed.
+			const boardPath = join(getWorkspacesRootPath(), workspaceId, "board.json");
+			await writeFile(boardPath, "{ not valid json", "utf8");
+			await writeFile(join(fixture.worktreePath, "task.txt"), "task work\n", "utf8");
+
+			const gh = async (args: string[]): Promise<GhCommandResult> =>
+				okGh(args[1] === "list" ? "[]" : "https://github.com/o/r/pull/42");
+			const service = new GitDeliveryService({ gh });
+			let broadcastCount = 0;
+			const response = await service.startDelivery({
+				taskId,
+				workspaceId,
+				repoPath: fixture.repoPath,
+				worktreePath: fixture.worktreePath,
+				baseRef: "main",
+				policy: deliveryPolicy({ requirePullRequest: true }),
+				onPullRequestRecorded: () => {
+					broadcastCount += 1;
+				},
+			});
+
+			// The receipt stage and PR outcome are unaffected by the write failure.
+			expect(response.ok).toBe(true);
+			expect(response.receipt?.stage).toBe("pr");
+			expect(response.receipt?.pr).toEqual({
+				status: "created",
+				number: 42,
+				url: "https://github.com/o/r/pull/42",
+				error: null,
+			});
+			expect(broadcastCount).toBe(0);
+		} finally {
+			fixture.cleanup();
+		}
+	});
+
+	it("keeps a single card entry without revision churn when delivery runs twice for the same PR", async () => {
+		const fixture = await createDeliveryFixture();
+		try {
+			const taskId = "task-pr-rerun";
+			await runGit(fixture.repoPath, ["branch", "feature/b8", fixture.baseSha]);
+			await persistFixtureHandoff(fixture, taskId);
+			const workspaceId = await registerDeliveryWorkspace(fixture, taskId);
+			await writeFile(join(fixture.worktreePath, "task.txt"), "task work\n", "utf8");
+
+			let listResult = "[]";
+			let broadcastCount = 0;
+			const gh = async (args: string[]): Promise<GhCommandResult> =>
+				okGh(args[1] === "list" ? listResult : "https://github.com/o/r/pull/42");
+			const service = new GitDeliveryService({ gh });
+			const start = () =>
+				service.startDelivery({
+					taskId,
+					workspaceId,
+					repoPath: fixture.repoPath,
+					worktreePath: fixture.worktreePath,
+					baseRef: "main",
+					policy: deliveryPolicy({ requirePullRequest: true }),
+					onPullRequestRecorded: () => {
+						broadcastCount += 1;
+					},
+				});
+
+			// First run opens the PR.
+			const created = await start();
+			expect(created.receipt?.pr?.status).toBe("created");
+			const afterFirst = await loadWorkspaceState(fixture.repoPath);
+			expect(findCardPullRequests(afterFirst.board, taskId)).toHaveLength(1);
+			expect(broadcastCount).toBe(1);
+
+			// Second run finds the pre-existing PR: the entry is backfilled with
+			// the state snapshot exactly once (a single revision bump).
+			listResult = JSON.stringify([
+				{ number: 42, url: "https://github.com/o/r/pull/42", title: "Existing PR title" },
+			]);
+			await writeFile(join(fixture.worktreePath, "task2.txt"), "more work\n", "utf8");
+			const existing = await start();
+			expect(existing.receipt?.pr?.status).toBe("existing");
+			const afterSecond = await loadWorkspaceState(fixture.repoPath);
+			const pullRequests = findCardPullRequests(afterSecond.board, taskId);
+			expect(pullRequests).toHaveLength(1);
+			expect(pullRequests?.[0]?.state).toBe("open");
+			expect(afterSecond.revision).toBe(afterFirst.revision + 1);
+			expect(broadcastCount).toBe(2);
+
+			// Third run is a steady-state no-op: no entry churn, no revision bump.
+			await writeFile(join(fixture.worktreePath, "task3.txt"), "final work\n", "utf8");
+			const steady = await start();
+			expect(steady.receipt?.pr?.status).toBe("existing");
+			const afterThird = await loadWorkspaceState(fixture.repoPath);
+			expect(findCardPullRequests(afterThird.board, taskId)).toHaveLength(1);
+			expect(afterThird.revision).toBe(afterSecond.revision);
+			expect(broadcastCount).toBe(2);
+		} finally {
+			fixture.cleanup();
+		}
 	});
 });

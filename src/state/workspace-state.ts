@@ -9,6 +9,7 @@ import {
 	type RuntimeBoardColumnId,
 	type RuntimeBoardData,
 	type RuntimeGitRepositoryInfo,
+	type RuntimeTaskPullRequest,
 	type RuntimeTaskSessionSummary,
 	type RuntimeWorkspaceStateResponse,
 	type RuntimeWorkspaceStateSaveRequest,
@@ -683,6 +684,45 @@ export async function loadWorkspaceState(cwd: string): Promise<RuntimeWorkspaceS
 	return toWorkspaceStateResponse(context, board, sessions, meta.revision);
 }
 
+/**
+ * Server-owned card field — the one documented exception to "the client
+ * owns the board": `pullRequests` are recorded by the runtime (tool-call
+ * detection, deterministic delivery, branch lookup, manual add). A client
+ * save built from a stale board must never erase or forge them, so the
+ * persisted list replaces any client-supplied value for existing cards,
+ * and new cards never accept `pullRequests` from create input. All PR
+ * link writes go through `mutateWorkspaceState` + the PR board mutations.
+ */
+function mergeServerOwnedPullRequests(
+	clientBoard: RuntimeBoardData,
+	persistedBoard: RuntimeBoardData,
+): RuntimeBoardData {
+	const persistedByTaskId = new Map<string, RuntimeTaskPullRequest[] | undefined>();
+	for (const column of persistedBoard.columns) {
+		for (const card of column.cards) {
+			persistedByTaskId.set(card.id, card.pullRequests);
+		}
+	}
+	return {
+		...clientBoard,
+		columns: clientBoard.columns.map((column) => ({
+			...column,
+			cards: column.cards.map((card) => {
+				const persisted = persistedByTaskId.get(card.id);
+				if (persisted !== undefined) {
+					return { ...card, pullRequests: persisted.map((pullRequest) => ({ ...pullRequest })) };
+				}
+				if (card.pullRequests === undefined) {
+					return card;
+				}
+				const mergedCard = { ...card };
+				delete mergedCard.pullRequests;
+				return mergedCard;
+			}),
+		})),
+	};
+}
+
 export async function saveWorkspaceState(
 	cwd: string,
 	payload: RuntimeWorkspaceStateSaveRequest,
@@ -701,7 +741,7 @@ export async function saveWorkspaceState(
 		) {
 			throw new WorkspaceStateConflictError(expectedRevision, currentMeta.revision);
 		}
-		const board = parsedPayload.board;
+		const board = mergeServerOwnedPullRequests(parsedPayload.board, await readWorkspaceBoard(context.workspaceId));
 		const sessions = parsedPayload.sessions;
 		const nextRevision = currentMeta.revision + 1;
 		const nextMeta: WorkspaceStateMeta = {

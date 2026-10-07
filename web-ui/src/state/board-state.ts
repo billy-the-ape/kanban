@@ -1,9 +1,15 @@
 import type { DropResult } from "@hello-pangea/dnd";
+import { runtimeTaskPullRequestSchema } from "@runtime-contract";
 import { createShortTaskId } from "@runtime-task-id";
 import * as runtimeTaskState from "@runtime-task-state";
 
 import { createInitialBoardData } from "@/data/board-data";
-import type { RuntimeAgentId, RuntimeClineReasoningEffort, RuntimeTaskClineSettings } from "@/runtime/types";
+import type {
+	RuntimeAgentId,
+	RuntimeClineReasoningEffort,
+	RuntimeTaskClineSettings,
+	RuntimeTaskPullRequest,
+} from "@/runtime/types";
 import { isAllowedCrossColumnCardMove, type ProgrammaticCardMoveInFlight } from "@/state/drag-rules";
 import {
 	type BoardCard,
@@ -145,6 +151,23 @@ function normalizeTaskClineSettings(input: {
 	};
 }
 
+function normalizeTaskPullRequests(rawPullRequests: unknown): RuntimeTaskPullRequest[] | undefined {
+	if (!Array.isArray(rawPullRequests)) {
+		return undefined;
+	}
+	const pullRequests: RuntimeTaskPullRequest[] = [];
+	for (const rawPullRequest of rawPullRequests) {
+		// The shared contract schema is the single source of truth for the
+		// shape; drop any entry the client persisted in an invalid form.
+		const parsed = runtimeTaskPullRequestSchema.safeParse(rawPullRequest);
+		if (!parsed.success) {
+			continue;
+		}
+		pullRequests.push(parsed.data);
+	}
+	return pullRequests.length > 0 ? pullRequests : undefined;
+}
+
 function normalizeCard(rawCard: unknown): BoardCard | null {
 	if (!rawCard || typeof rawCard !== "object") {
 		return null;
@@ -165,6 +188,7 @@ function normalizeCard(rawCard: unknown): BoardCard | null {
 		clineProviderId?: unknown;
 		clineModelId?: unknown;
 		clineReasoningEffort?: unknown;
+		pullRequests?: unknown;
 		createdAt?: unknown;
 		updatedAt?: unknown;
 	};
@@ -180,6 +204,7 @@ function normalizeCard(rawCard: unknown): BoardCard | null {
 	if (!title) {
 		return null;
 	}
+	const pullRequests = normalizeTaskPullRequests(card.pullRequests);
 	const clineSettings = normalizeTaskClineSettings({
 		rawSettings: card.clineSettings,
 		legacyProviderId: card.clineProviderId,
@@ -202,6 +227,7 @@ function normalizeCard(rawCard: unknown): BoardCard | null {
 		baseRef,
 		...(typeof card.agentId === "string" && card.agentId ? { agentId: card.agentId as RuntimeAgentId } : {}),
 		...(clineSettings !== undefined ? { clineSettings } : {}),
+		...(pullRequests !== undefined ? { pullRequests } : {}),
 		...(typeof card.updateBaseRefBeforeStart === "boolean"
 			? { updateBaseRefBeforeStart: card.updateBaseRefBeforeStart }
 			: {}),

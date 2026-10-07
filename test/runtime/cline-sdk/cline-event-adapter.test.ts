@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyClineSessionEvent } from "../../../src/cline-sdk/cline-event-adapter";
+import { applyClineSessionEvent, type ClineToolFinishedInfo } from "../../../src/cline-sdk/cline-event-adapter";
 import {
 	type ClineTaskMessage,
 	type ClineTaskSessionEntry,
@@ -24,6 +24,7 @@ function applyEvent(input: {
 	event: unknown;
 	pendingTurnCancelTaskIds?: Set<string>;
 	isClineProvider?: boolean;
+	onToolFinished?: (tool: ClineToolFinishedInfo) => void;
 }) {
 	const taskId = input.taskId ?? "task-1";
 	const entry = input.entry ?? createEntry(taskId);
@@ -43,6 +44,7 @@ function applyEvent(input: {
 		emitMessage: (_taskId, message) => {
 			messages.push(message);
 		},
+		onToolFinished: input.onToolFinished,
 	});
 
 	return {
@@ -812,6 +814,202 @@ describe("applyClineSessionEvent", () => {
 		expect(result.entry.summary.warningMessage).toBe("Unauthorized");
 		expect(result.entry.summary.latestHookActivity?.finalMessage).toBe("Unauthorized");
 		expect(result.entry.activeAssistantMessageId).toBeNull();
+	});
+
+	it("invokes onToolFinished for tool-finished with the original input and tool result", () => {
+		const entry = createEntry("task-1");
+		const finishedTools: ClineToolFinishedInfo[] = [];
+
+		applyEvent({
+			entry,
+			event: {
+				type: "agent_event",
+				payload: {
+					sessionId: "session-1",
+					event: {
+						type: "tool-started",
+						snapshot: runtimeSnapshot(),
+						iteration: 1,
+						toolCall: {
+							type: "tool-call",
+							toolCallId: "tool-1",
+							toolName: "run_commands",
+							input: { commands: ["gh pr create --title 'Fix'"] },
+						},
+					},
+				},
+			},
+			onToolFinished: (tool) => finishedTools.push(tool),
+		});
+		expect(finishedTools).toHaveLength(0);
+
+		applyEvent({
+			entry,
+			event: {
+				type: "agent_event",
+				payload: {
+					sessionId: "session-1",
+					event: {
+						type: "tool-finished",
+						snapshot: runtimeSnapshot(),
+						iteration: 1,
+						toolCall: {
+							type: "tool-call",
+							toolCallId: "tool-1",
+							toolName: "run_commands",
+							input: { commands: ["gh pr create --title 'Fix'"] },
+						},
+						message: {
+							id: "msg-tool-1",
+							role: "tool",
+							content: [
+								{
+									type: "tool-result",
+									toolCallId: "tool-1",
+									toolName: "run_commands",
+									output: "Created https://github.com/owner/repo/pull/12",
+								},
+							],
+							createdAt: 1,
+						},
+					},
+				},
+			},
+			onToolFinished: (tool) => finishedTools.push(tool),
+		});
+
+		expect(finishedTools).toEqual([
+			{
+				toolName: "run_commands",
+				toolInput: { commands: ["gh pr create --title 'Fix'"] },
+				output: "Created https://github.com/owner/repo/pull/12",
+				error: null,
+			},
+		]);
+	});
+
+	it("reports tool-finished errors and stringifies structured outputs", () => {
+		const entry = createEntry("task-1");
+		const finishedTools: ClineToolFinishedInfo[] = [];
+
+		applyEvent({
+			entry,
+			event: {
+				type: "agent_event",
+				payload: {
+					sessionId: "session-1",
+					event: {
+						type: "tool-finished",
+						snapshot: runtimeSnapshot(),
+						iteration: 1,
+						toolCall: { type: "tool-call", toolCallId: "tool-2", toolName: "run_commands" },
+						message: {
+							id: "msg-tool-2",
+							role: "tool",
+							content: [
+								{
+									type: "tool-result",
+									toolCallId: "tool-2",
+									toolName: "run_commands",
+									isError: true,
+									output: "gh: auth failed",
+								},
+							],
+							createdAt: 1,
+						},
+					},
+				},
+			},
+			onToolFinished: (tool) => finishedTools.push(tool),
+		});
+
+		expect(finishedTools).toEqual([
+			{ toolName: "run_commands", toolInput: undefined, output: "gh: auth failed", error: "gh: auth failed" },
+		]);
+	});
+
+	it("does not invoke onToolFinished for other agent events and tolerates its absence", () => {
+		const entry = createEntry("task-1");
+		const finishedTools: ClineToolFinishedInfo[] = [];
+
+		// No callback at all: must never throw.
+		applyEvent({
+			entry,
+			event: {
+				type: "agent_event",
+				payload: {
+					sessionId: "session-1",
+					event: {
+						type: "tool-finished",
+						snapshot: runtimeSnapshot(),
+						iteration: 1,
+						toolCall: { type: "tool-call", toolCallId: "tool-3", toolName: "Read" },
+						message: {
+							id: "msg-tool-3",
+							role: "tool",
+							content: [{ type: "tool-result", toolCallId: "tool-3", output: "file contents" }],
+							createdAt: 1,
+						},
+					},
+				},
+			},
+		});
+		expect(finishedTools).toHaveLength(0);
+
+		applyEvent({
+			entry,
+			event: {
+				type: "agent_event",
+				payload: {
+					sessionId: "session-1",
+					event: {
+						type: "tool-started",
+						snapshot: runtimeSnapshot(),
+						iteration: 1,
+						toolCall: { type: "tool-call", toolCallId: "tool-4", toolName: "Read", input: {} },
+					},
+				},
+			},
+			onToolFinished: (tool) => finishedTools.push(tool),
+		});
+		applyEvent({
+			entry,
+			event: {
+				type: "agent_event",
+				payload: {
+					sessionId: "session-1",
+					event: {
+						type: "content_start",
+						contentType: "tool",
+						toolName: "Read",
+						toolCallId: "tool-5",
+						input: {},
+					},
+				},
+			},
+			onToolFinished: (tool) => finishedTools.push(tool),
+		});
+		applyEvent({
+			entry,
+			event: {
+				type: "agent_event",
+				payload: {
+					sessionId: "session-1",
+					event: { type: "status", status: "running", iteration: 1 },
+				},
+			},
+			onToolFinished: (tool) => finishedTools.push(tool),
+		});
+		applyEvent({
+			entry,
+			event: {
+				type: "chunk",
+				payload: { sessionId: "session-1", stream: "agent", chunk: "hello" },
+			},
+			onToolFinished: (tool) => finishedTools.push(tool),
+		});
+
+		expect(finishedTools).toHaveLength(0);
 	});
 });
 

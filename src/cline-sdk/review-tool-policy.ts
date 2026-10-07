@@ -45,9 +45,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * Normalizes a `run_commands` tool input to raw command strings. The SDK
  * accepts a string, an array, a `{ commands: [...] }` object, or structured
  * `{ command, args }` entries; all variants are reduced to joined strings
- * so the deny checks below work uniformly.
+ * so command scans work uniformly. Exported for reuse by the PR-creation
+ * detection gate (PRLINK-0).
  */
-function extractCommandStrings(input: unknown): string[] {
+export function extractCommandStrings(input: unknown): string[] {
 	const commands: string[] = [];
 	const collect = (value: unknown): void => {
 		if (typeof value === "string") {

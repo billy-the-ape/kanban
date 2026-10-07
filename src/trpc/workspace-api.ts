@@ -1,11 +1,14 @@
 import { TRPCError } from "@trpc/server";
 import type { ClineTaskSessionService } from "../cline-sdk/cline-task-session-service";
 import type {
+	RuntimeBoardData,
 	RuntimeGitCheckoutResponse,
 	RuntimeGitDiscardResponse,
 	RuntimeGitSummaryResponse,
 	RuntimeGitSyncAction,
 	RuntimeGitSyncResponse,
+	RuntimeTaskPullRequestLinkResponse,
+	RuntimeTaskPullRequestsRefreshResponse,
 	RuntimeTaskSessionSummary,
 	RuntimeWorkspaceChangesMode,
 	RuntimeWorkspaceFileSearchResponse,
@@ -14,11 +17,20 @@ import type {
 import {
 	parseGitCheckoutRequest,
 	parseTaskPreservationRequest,
+	parseTaskPullRequestLinkRequest,
+	parseTaskPullRequestsRefreshRequest,
 	parseWorktreeDeleteRequest,
 	parseWorktreeEnsureRequest,
 } from "../core/api-validation";
+import { getPullRequestIdentityKey, parsePullRequestUrl } from "../core/pull-request-links";
+import { removeTaskPullRequest } from "../core/task-board-mutations";
 import { isTaskWriterActive } from "../server/task-writer-activity";
-import { loadWorkspaceBoardById, saveWorkspaceState, WorkspaceStateConflictError } from "../state/workspace-state";
+import {
+	loadWorkspaceBoardById,
+	mutateWorkspaceState,
+	saveWorkspaceState,
+	WorkspaceStateConflictError,
+} from "../state/workspace-state";
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import {
 	createEmptyWorkspaceChangesResponse,
@@ -30,6 +42,12 @@ import { readTaskDeliveryReceipt } from "../workspace/git-delivery";
 import { getCommitDiff, getGitLog, getGitRefs } from "../workspace/git-history";
 import { discardGitChanges, getGitSyncSummary, runGitCheckoutAction, runGitSyncAction } from "../workspace/git-sync";
 import { searchWorkspaceFiles } from "../workspace/search-workspace-files";
+import {
+	findTasksEnteringReviewWithoutPullRequests,
+	fireReviewPullRequestLookup,
+	lookupTaskPullRequests,
+} from "../workspace/task-pull-request-lookup";
+import { recordTaskPullRequests } from "../workspace/task-pull-requests";
 import { listBlockedTaskCleanups, runTaskWorkspaceMaintenance } from "../workspace/task-workspace-maintenance";
 import {
 	deleteTaskWorktree,
@@ -202,6 +220,10 @@ function isMissingTaskWorktreeError(error: unknown): boolean {
 		return false;
 	}
 	return error.message.startsWith("Task worktree not found for task ");
+}
+
+function taskExistsOnBoard(board: RuntimeBoardData, taskId: string): boolean {
+	return board.columns.some((column) => column.cards.some((card) => card.id === taskId));
 }
 
 export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): RuntimeTrpcContext["workspaceApi"] {
@@ -423,6 +445,9 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 				for (const summary of terminalManager.listSummaries()) {
 					input.sessions[summary.taskId] = summary;
 				}
+				// PRLINK-5: capture the pre-save board so we can detect cards that
+				// just moved into Review without PRs (best-effort lookup trigger).
+				const previousBoard = await loadWorkspaceBoardById(workspaceScope.workspaceId);
 				const response = await saveWorkspaceState(workspaceScope.workspacePath, input);
 				void deps.broadcastRuntimeWorkspaceStateUpdated(workspaceScope.workspaceId, workspaceScope.workspacePath);
 				void deps.broadcastRuntimeProjectsUpdated(workspaceScope.workspaceId);
@@ -432,6 +457,15 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 					workspaceId: workspaceScope.workspaceId,
 					workspacePath: workspaceScope.workspacePath,
 				});
+				// PRLINK-5: a card entering Review without PRs gets a best-effort
+				// branch lookup. Fire-and-forget: the save response is never delayed.
+				for (const taskId of findTasksEnteringReviewWithoutPullRequests(previousBoard, response.board)) {
+					fireReviewPullRequestLookup({
+						workspacePath: workspaceScope.workspacePath,
+						taskId,
+					});
+				}
+
 				return response;
 			} catch (error) {
 				if (error instanceof WorkspaceStateConflictError) {
@@ -444,6 +478,154 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 					});
 				}
 				throw error;
+			}
+		},
+		// PRLINK-5: manual PR link add. The server re-parses the URL with the
+		// strict shared parser (authoritative); invalid URLs are never stored.
+		addTaskPullRequest: async (workspaceScope, input): Promise<RuntimeTaskPullRequestLinkResponse> => {
+			try {
+				const body = parseTaskPullRequestLinkRequest(input);
+				const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
+				if (!taskExistsOnBoard(board, body.taskId)) {
+					return {
+						ok: false,
+						error: `Task "${body.taskId}" not found`,
+						pullRequest: null,
+					} satisfies RuntimeTaskPullRequestLinkResponse;
+				}
+				const parsed = parsePullRequestUrl(body.url);
+				if (!parsed) {
+					return {
+						ok: false,
+						error: "Not a valid pull request URL.",
+						pullRequest: null,
+					} satisfies RuntimeTaskPullRequestLinkResponse;
+				}
+				const result = await recordTaskPullRequests({
+					workspacePath: workspaceScope.workspacePath,
+					taskId: body.taskId,
+					links: [parsed],
+					source: "manual",
+				});
+				if (result.changed) {
+					void deps.broadcastRuntimeWorkspaceStateUpdated(
+						workspaceScope.workspaceId,
+						workspaceScope.workspacePath,
+					);
+				}
+				// Re-read from the board: the recorded entry, or the existing
+				// identical one on a duplicate add (no revision bump).
+				const recorded =
+					(await loadWorkspaceBoardById(workspaceScope.workspaceId)).columns
+						.flatMap((column) => column.cards)
+						.find((card) => card.id === body.taskId)?.pullRequests ?? [];
+				const pullRequest =
+					recorded.find((entry) => getPullRequestIdentityKey(entry) === getPullRequestIdentityKey(parsed)) ?? null;
+				if (!pullRequest) {
+					return {
+						ok: false,
+						error: "Could not record the pull request.",
+						pullRequest: null,
+					} satisfies RuntimeTaskPullRequestLinkResponse;
+				}
+				return {
+					ok: true,
+					pullRequest,
+				} satisfies RuntimeTaskPullRequestLinkResponse;
+			} catch (error) {
+				return {
+					ok: false,
+					error: error instanceof Error ? error.message : String(error),
+					pullRequest: null,
+				} satisfies RuntimeTaskPullRequestLinkResponse;
+			}
+		},
+		// PRLINK-5: manual PR link remove. Unknown URL -> ok: false (no throw),
+		// matching the neighboring routes' error style.
+		removeTaskPullRequest: async (workspaceScope, input): Promise<RuntimeTaskPullRequestLinkResponse> => {
+			try {
+				const body = parseTaskPullRequestLinkRequest(input);
+				const parsed = parsePullRequestUrl(body.url);
+				if (!parsed) {
+					return {
+						ok: false,
+						error: "Not a valid pull request URL.",
+						pullRequest: null,
+					} satisfies RuntimeTaskPullRequestLinkResponse;
+				}
+				const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
+				if (!taskExistsOnBoard(board, body.taskId)) {
+					return {
+						ok: false,
+						error: `Task "${body.taskId}" not found`,
+						pullRequest: null,
+					} satisfies RuntimeTaskPullRequestLinkResponse;
+				}
+				// This mutation has no "add" counterpart in recordTaskPullRequests,
+				// so it is the documented direct mutateWorkspaceState call outside
+				// the record path (PRLINK-5).
+				const identityKey = getPullRequestIdentityKey(parsed);
+				const response = await mutateWorkspaceState<boolean>(workspaceScope.workspacePath, (state) => {
+					const result = removeTaskPullRequest(state.board, body.taskId, identityKey);
+					return { board: result.board, value: result.removed, save: result.removed };
+				});
+				if (response.saved) {
+					void deps.broadcastRuntimeWorkspaceStateUpdated(
+						workspaceScope.workspaceId,
+						workspaceScope.workspacePath,
+					);
+				}
+				return response.value
+					? ({ ok: true, pullRequest: null } satisfies RuntimeTaskPullRequestLinkResponse)
+					: ({
+							ok: false,
+							error: "No matching pull request is recorded for this task.",
+							pullRequest: null,
+						} satisfies RuntimeTaskPullRequestLinkResponse);
+			} catch (error) {
+				return {
+					ok: false,
+					error: error instanceof Error ? error.message : String(error),
+					pullRequest: null,
+				} satisfies RuntimeTaskPullRequestLinkResponse;
+			}
+		},
+		// PRLINK-5: opt-in refresh. User-initiated, so a bounded await (the 10s
+		// gh timeout inside the lookup) is fine.
+		refreshTaskPullRequests: async (workspaceScope, input): Promise<RuntimeTaskPullRequestsRefreshResponse> => {
+			try {
+				const body = parseTaskPullRequestsRefreshRequest(input);
+				const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
+				if (!taskExistsOnBoard(board, body.taskId)) {
+					return {
+						ok: false,
+						updated: 0,
+						error: `Task "${body.taskId}" not found`,
+					} satisfies RuntimeTaskPullRequestsRefreshResponse;
+				}
+				const result = await lookupTaskPullRequests({
+					workspacePath: workspaceScope.workspacePath,
+					taskId: body.taskId,
+				});
+				if (result.recorded > 0) {
+					void deps.broadcastRuntimeWorkspaceStateUpdated(
+						workspaceScope.workspaceId,
+						workspaceScope.workspacePath,
+					);
+				}
+				// The reason is what the explicit Refresh toasts; it is never
+				// surfaced for the automatic review-entry lookup.
+				return {
+					ok: true,
+					updated: result.recorded,
+					reason: result.reason,
+				} satisfies RuntimeTaskPullRequestsRefreshResponse;
+			} catch (error) {
+				return {
+					ok: false,
+					updated: 0,
+					error: error instanceof Error ? error.message : String(error),
+				} satisfies RuntimeTaskPullRequestsRefreshResponse;
 			}
 		},
 		loadWorkspaceChanges: async (workspaceScope) => {

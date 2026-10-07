@@ -130,6 +130,85 @@ function normalizeRuntimeTaskClineSettings(input: {
 	};
 }
 
+export const runtimeTaskPullRequestProviderSchema = z.enum(["github", "gitlab", "bitbucket"]);
+export type RuntimeTaskPullRequestProvider = z.infer<typeof runtimeTaskPullRequestProviderSchema>;
+
+export const runtimeTaskPullRequestSourceSchema = z.enum(["agent_tool", "delivery", "manual", "branch_lookup"]);
+export type RuntimeTaskPullRequestSource = z.infer<typeof runtimeTaskPullRequestSourceSchema>;
+
+/**
+ * A pull request linked to a task card. Recorded by the runtime (tool-call
+ * detection, deterministic delivery, branch lookup) or added manually; the
+ * card-level `pullRequests` array is server-owned (see workspace-state save).
+ */
+export const runtimeTaskPullRequestSchema = z.object({
+	provider: runtimeTaskPullRequestProviderSchema,
+	/** "github.com", or a GHE / self-hosted GitLab host (lowercase). */
+	host: z.string(),
+	/** "owner/repo" (GitLab may be "group/subgroup/repo"). */
+	repository: z.string(),
+	number: z.number().int().positive(),
+	/** Canonical URL produced by the shared parser, never raw agent text. */
+	url: z.string(),
+	source: runtimeTaskPullRequestSourceSchema,
+	/** First time Kanban recorded this link. */
+	createdAt: z.number(),
+	// Optional snapshot; may be stale. Populated by delivery/branch lookup/refresh only.
+	title: z.string().optional(),
+	state: z.enum(["open", "closed", "merged", "draft"]).optional(),
+	stateCheckedAt: z.number().optional(),
+});
+export type RuntimeTaskPullRequest = z.infer<typeof runtimeTaskPullRequestSchema>;
+
+// PRLINK-5: manual PR link management. The server re-parses the URL with the
+// strict shared parser and is authoritative; raw client text is never stored.
+export const runtimeTaskPullRequestLinkRequestSchema = z.object({
+	taskId: z.string(),
+	url: z.string().min(1).max(2048),
+});
+export type RuntimeTaskPullRequestLinkRequest = z.infer<typeof runtimeTaskPullRequestLinkRequestSchema>;
+
+export const runtimeTaskPullRequestLinkResponseSchema = z.object({
+	ok: z.boolean(),
+	error: z.string().optional(),
+	/** The recorded entry (re-read from the board) or the existing identical one; null for remove / not-found. */
+	pullRequest: runtimeTaskPullRequestSchema.nullable(),
+});
+export type RuntimeTaskPullRequestLinkResponse = z.infer<typeof runtimeTaskPullRequestLinkResponseSchema>;
+
+export const runtimeTaskPullRequestsRefreshRequestSchema = z.object({
+	taskId: z.string(),
+});
+export type RuntimeTaskPullRequestsRefreshRequest = z.infer<typeof runtimeTaskPullRequestsRefreshRequestSchema>;
+
+/**
+ * Why a branch lookup produced its result. Set on ok refresh responses so the
+ * explicit Refresh action can toast it; the automatic review-entry lookup
+ * ignores it.
+ */
+export const runtimeTaskPullRequestRefreshReasonSchema = z.enum([
+	"no_task",
+	"no_worktree",
+	"no_branch",
+	"no_gh",
+	"gh_failed",
+	"none_found",
+	"unchanged",
+	"updated",
+	"failed",
+]);
+export type RuntimeTaskPullRequestRefreshReason = z.infer<typeof runtimeTaskPullRequestRefreshReasonSchema>;
+
+export const runtimeTaskPullRequestsRefreshResponseSchema = z.object({
+	ok: z.boolean(),
+	/** Number of PR entries that changed (added or snapshot-updated). */
+	updated: z.number().int().nonnegative(),
+	/** Present on ok responses; drives the explicit Refresh toast. */
+	reason: runtimeTaskPullRequestRefreshReasonSchema.optional(),
+	error: z.string().optional(),
+});
+export type RuntimeTaskPullRequestsRefreshResponse = z.infer<typeof runtimeTaskPullRequestsRefreshResponseSchema>;
+
 export const runtimeBoardCardSchema = z
 	.object({
 		id: z.string(),
@@ -151,6 +230,12 @@ export const runtimeBoardCardSchema = z
 		 * true; an explicit false is honored as-is.
 		 */
 		updateBaseRefBeforeStart: z.boolean().optional(),
+		/**
+		 * Pull requests linked to this task. Server-owned: the runtime records
+		 * links through board mutations and `saveWorkspaceState` restores the
+		 * persisted list over any client-supplied value (see workspace-state).
+		 */
+		pullRequests: z.array(runtimeTaskPullRequestSchema).optional(),
 		createdAt: z.number(),
 		updatedAt: z.number(),
 	})
@@ -2123,6 +2208,8 @@ export const runtimeHookIngestRequestSchema = z.object({
 	workspaceId: z.string(),
 	event: runtimeHookEventSchema,
 	metadata: runtimeTaskHookActivitySchema.partial().optional(),
+	/** Canonical PR URLs detected by the hook CLI (re-parsed server-side; max 10). */
+	pullRequestUrls: z.array(z.string().min(1).max(2048)).max(10).optional(),
 });
 export type RuntimeHookIngestRequest = z.infer<typeof runtimeHookIngestRequestSchema>;
 

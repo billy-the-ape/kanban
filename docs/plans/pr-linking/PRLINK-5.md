@@ -1,6 +1,6 @@
 # PRLINK-5 — Manual add/remove and optional refresh
 
-Master plan: `PR_LINKING_PLAN.md` (this is milestone **PL-6**).
+Master plan: `PR_LINKING_PLAN.md`.
 Depends on: **PRLINK-4** (top-bar PR link UI to hang the affordance on) and **PRLINK-1** (`recordTaskPullRequests`).
 
 ## Purpose
@@ -138,4 +138,20 @@ Manual (end-to-end, scratch repo with GitHub remote):
 ## Future (explicitly out of scope here)
 
 Auto-moving a card to Done when its PR merges — open question #6 in the master plan; tracked as a separate follow-up milestone, not this one.
+## Future (explicitly out of scope here)
+
+Auto-moving a card to Done when its PR merges — open question #6 in the master plan; tracked as a separate follow-up milestone, not this one.
+
+## Final state (implemented)
+
+Implemented as `feat/pr-link-5` against `feat/task-pr-links`. Final shape (differences from the sketch above are noted):
+
+- **Contract/validation**: `runtimeTaskPullRequestLinkRequestSchema` / `runtimeTaskPullRequestLinkResponseSchema` / `runtimeTaskPullRequestsRefreshRequestSchema` / `runtimeTaskPullRequestsRefreshResponseSchema` in `src/core/api-contract.ts`; `parseTaskPullRequestLinkRequest` / `parseTaskPullRequestsRefreshRequest` in `src/core/api-validation.ts`.
+- **tRPC (`src/trpc/workspace-api.ts`, wired in `src/trpc/app-router.ts`)**: `addTaskPullRequest`, `removeTaskPullRequest`, `refreshTaskPullRequests` as `workspaceProcedure` mutations. Add re-parses with the strict server parser, records via `recordTaskPullRequests(..., source: "manual")`, and returns the recorded (or pre-existing duplicate) entry re-read from the board. Remove is the documented direct `mutateWorkspaceState` + `removeTaskPullRequest` board mutation (`save: result.removed`). Unknown task / invalid URL / no match → `ok: false` with a message, never a throw; broadcast only on actual change.
+- **Lookup (`src/workspace/task-pull-request-lookup.ts`)**: `lookupTaskPullRequests` (injectable `gh`, bounded 10s gh / 5s git, direct `execFile` only) records new entries via `addTaskPullRequests` (`source: "branch_lookup"`, snapshot `{ title, state, stateCheckedAt }`) and refreshes stale existing snapshots via `updateTaskPullRequestSnapshot` inside **one** atomic `mutateWorkspaceState` (`save: changed > 0`, so repeated lookups never bump the revision). This is a documented exception to the single-write-path rule in `task-pull-requests.ts`. `fireReviewPullRequestLookup` is the fire-and-forget wrapper: it reads the board, skips missing cards and cards that already have PRs, then runs the lookup; every failure path logs at debug and returns `{ recorded: 0 }`. `findTasksEnteringReviewWithoutPullRequests(previousBoard, nextBoard)` is the pure diff helper for the save trigger.
+- **Triggers**: `src/trpc/hooks-api.ts` fires `fireReviewPullRequestLookup` on a successful `to_review` transition (injectable dep, defaulted to the real wrapper — the card/no-PR pre-check lives inside the wrapper rather than in the hook). `workspace-api.ts` `saveState` captures the pre-save board and fires the lookup for every task `findTasksEnteringReviewWithoutPullRequests` reports. Neither is awaited; both broadcasts still fire exactly as before.
+- **UI**: `web-ui/src/components/task-pull-request-manager.tsx` holds the Radix popover (URL input with live shape validation via `validatePullRequestUrlShape`, recorded list with per-entry `X` remove, `Refresh` button with in-flight spinner); server errors surface inline plus `showAppToast`. `top-bar.tsx` renders the affordance in the task branch control only, and only when both the task id and workspace id are scoped (`App.tsx` threads `workspaceId`): `Link PR` button when the task has no PRs, ghost `+` "Manage pull requests" button when it does. PR links themselves (PRLINK-4) still render whenever present, even without the workspace scope.
+- **Tests**: new `test/workspace/task-pull-request-lookup.test.ts` (temp `HOME`, fake gh, real workspace state files; covers recording/dedupe, snapshot refresh without revision churn, missing/failing gh, missing task/worktree, the review-entry diff, and the fire-and-forget pre-checks); extended `test/runtime/trpc/workspace-api.test.ts` (all three mutations incl. unknown task, invalid URL, duplicate no-broadcast, remove no-match, refresh, and both saveState trigger paths), `test/runtime/trpc/hooks-api.test.ts` (`to_review` fires the lookup exactly once, other events do not), new `web-ui/src/components/task-pull-request-manager.test.tsx` (add success/failure, client-side validation, remove + toast, refresh + warning toast), extended `web-ui/src/components/top-bar.test.tsx` (affordance shown/hidden by scoping, manage-vs-link variant).
+- **Verification run**: server `tsc` clean; `vitest` green across `test/runtime/trpc`, `test/workspace` (172), `test/runtime` core/validation/board-mutation + workspace integration suites (87), and the full `web-ui` suite (579 tests / 74 files). `pnpm format` (Biome) applied.
+
 

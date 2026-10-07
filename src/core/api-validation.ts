@@ -30,6 +30,8 @@ import {
 	type RuntimeTaskDiagnosticsRequest,
 	type RuntimeTaskPhasesRequest,
 	type RuntimeTaskPreservationRequest,
+	type RuntimeTaskPullRequestLinkRequest,
+	type RuntimeTaskPullRequestsRefreshRequest,
 	type RuntimeTaskReviewInfoRequest,
 	type RuntimeTaskReviewStartRequest,
 	type RuntimeTaskSessionInputRequest,
@@ -71,6 +73,8 @@ import {
 	runtimeTaskDiagnosticsRequestSchema,
 	runtimeTaskPhasesRequestSchema,
 	runtimeTaskPreservationRequestSchema,
+	runtimeTaskPullRequestLinkRequestSchema,
+	runtimeTaskPullRequestsRefreshRequestSchema,
 	runtimeTaskReviewInfoRequestSchema,
 	runtimeTaskReviewStartRequestSchema,
 	runtimeTaskSessionInputRequestSchema,
@@ -714,6 +718,35 @@ export function parseHookIngestRequest(value: unknown): RuntimeHookIngestRequest
 		taskId,
 		workspaceId,
 		metadata,
+	};
+}
+
+export function parseTaskPullRequestLinkRequest(value: unknown): RuntimeTaskPullRequestLinkRequest {
+	const parsed = parseWithSchema(runtimeTaskPullRequestLinkRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	const url = parsed.url.trim();
+	if (!taskId) {
+		throw new Error("Missing taskId");
+	}
+	if (!url) {
+		throw new Error("Missing pull request URL");
+	}
+	return {
+		...parsed,
+		taskId,
+		url,
+	};
+}
+
+export function parseTaskPullRequestsRefreshRequest(value: unknown): RuntimeTaskPullRequestsRefreshRequest {
+	const parsed = parseWithSchema(runtimeTaskPullRequestsRefreshRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Missing taskId");
+	}
+	return {
+		...parsed,
+		taskId,
 	};
 }
 
