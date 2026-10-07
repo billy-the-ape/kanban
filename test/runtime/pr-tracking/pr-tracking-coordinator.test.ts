@@ -1,6 +1,7 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as lockfile from "proper-lockfile";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
@@ -85,7 +86,7 @@ function makeMetadata(state: GitHubPrMetadataSnapshot["state"], scopeId: string,
 }
 
 interface FakeAdapterConfig {
-	scopeResult: AccessScopeResult;
+	scopeResult: AccessScopeResult | ((callIndex: number) => AccessScopeResult);
 	metadata?: (callIndex: number) => MetadataReadResult;
 	metadataGate?: () => Promise<void>;
 	list?: (source: "reviews" | "conversationComments" | "inlineComments", callIndex: number) => FeedbackReadResult;
@@ -114,7 +115,7 @@ function makeFakeAdapter(config: FakeAdapterConfig): FakeAdapter {
 	const fake = {
 		resolveAccessScope: async () => {
 			counts.scope += 1;
-			return config.scopeResult;
+			return typeof config.scopeResult === "function" ? config.scopeResult(counts.scope - 1) : config.scopeResult;
 		},
 		readPrMetadata: async (
 			parsed: { number: number },
@@ -159,7 +160,7 @@ function makeFakeAdapter(config: FakeAdapterConfig): FakeAdapter {
 
 interface HarnessOptions {
 	scope?: AccessScope;
-	scopeResult?: AccessScopeResult;
+	scopeResult?: AccessScopeResult | ((callIndex: number) => AccessScopeResult);
 	metadata?: (callIndex: number) => MetadataReadResult;
 	metadataGate?: () => Promise<void>;
 	list?: (source: "reviews" | "conversationComments" | "inlineComments", callIndex: number) => FeedbackReadResult;
@@ -179,7 +180,7 @@ interface Harness {
 
 function makeCoordinator(options: HarnessOptions = {}): Harness {
 	const scope: AccessScope = options.scope ?? { accessScopeId: "scope-A", login: "alice", tokenSource: "GH_TOKEN" };
-	const scopeResult: AccessScopeResult = options.scopeResult ?? { ok: true, scope };
+	const scopeResult = options.scopeResult ?? { ok: true, scope };
 	const fake = makeFakeAdapter({
 		scopeResult,
 		metadata: options.metadata,
@@ -250,6 +251,21 @@ async function settle(iterations = 120): Promise<void> {
 async function pollOnce(): Promise<void> {
 	await vi.advanceTimersByTimeAsync(POLL_MS);
 	await settle();
+}
+
+/**
+ * Advance the fake clock (flushing real fs/lockfile I/O) until `probe`
+ * passes or the budget of settle windows runs out. Background startup
+ * passes do real lockfile work whose completion takes an indeterminate
+ * number of fake-clock steps under parallel test load.
+ */
+async function waitFor(probe: () => Promise<boolean>, budget = 40): Promise<void> {
+	for (let i = 0; i < budget; i += 1) {
+		if (await probe()) {
+			return;
+		}
+		await settle();
+	}
 }
 
 function failure(category: GhAdapterFailure["category"], extra: Partial<GhAdapterFailure> = {}): GhAdapterFailure {
@@ -677,7 +693,9 @@ describe("pr-tracking-coordinator", () => {
 		);
 		await coordinator.start();
 		passState.release?.();
-		await settle();
+		// Wait for the background pass to finish (its lock acquisition does
+		// real I/O whose fake-clock duration varies under load).
+		await waitFor(async () => (await store.loadRecord(unlinkedKey)).ok === false);
 
 		expect((await store.loadRecord(linkedKey)).ok).toBe(true);
 		expect(await store.loadRecord(unlinkedKey)).toEqual({ ok: false, reason: "not_found" });
@@ -815,6 +833,55 @@ describe("pr-tracking-coordinator", () => {
 		expect(coordinator.getState().polls[0]?.nextPollAt).not.toBeNull();
 	});
 
+	it("re-probes the identity on refresh and clears a sticky auth blocker without restart", async () => {
+		const harness = makeCoordinator({
+			metadata: (n) =>
+				n === 0
+					? { kind: "failed", failure: failure("auth", { message: "HTTP 401: token expired" }) }
+					: makeMetadata("open", "scope-A", 49),
+		});
+		const coordinator = track(harness.coordinator);
+		expect((await coordinator.addSubscription(descriptor())).status).toBe("active");
+
+		// An auth-category read failure stops ALL polling and is sticky.
+		await pollOnce();
+		expect(coordinator.getState().authBlocker).toBe("HTTP 401: token expired");
+		expect(coordinator.getState().polls.every((poll) => poll.nextPollAt === null)).toBe(true);
+
+		// An explicit refresh re-probes the identity (scope call #2) and a
+		// successful read clears the blocker, re-arming polling.
+		await coordinator.refresh(PR49, "scope-A");
+		expect(harness.fake.scopeCalls()).toBe(2);
+		expect(coordinator.getState().authBlocker).toBeNull();
+		expect(harness.fake.metadataCalls()).toBe(2);
+		expect(coordinator.getState().polls[0]?.nextPollAt).not.toBeNull();
+	});
+
+	it("invalidates old-scope snapshots when an account switch is detected on refresh", async () => {
+		const scopeA = { accessScopeId: "scope-A", login: "alice", tokenSource: "GH_TOKEN" };
+		const scopeB = { accessScopeId: "scope-B", login: "bob", tokenSource: "GH_TOKEN" };
+		const harness = makeCoordinator({
+			scope: scopeA,
+			scopeResult: (callIndex) => (callIndex === 0 ? { ok: true, scope: scopeA } : { ok: true, scope: scopeB }),
+		});
+		const coordinator = track(harness.coordinator);
+		expect((await coordinator.addSubscription(descriptor())).status).toBe("active");
+		await pollOnce();
+		expect(harness.coordinator.getSnapshotsForTask("ws-1", "task-1")?.metadata?.accessScopeId).toBe("scope-A");
+		const readsSoFar = harness.fake.metadataCalls();
+
+		// The user switches accounts; an explicit refresh re-probes the
+		// identity and resolves the NEW scope. The requested old scope no
+		// longer matches, so no further reads happen for it.
+		await coordinator.refresh(PR49, "scope-A");
+		expect(harness.fake.scopeCalls()).toBe(2);
+		expect(harness.fake.metadataCalls()).toBe(readsSoFar);
+		// Old-scope in-memory snapshots are invalidated (never shown for the
+		// wrong account).
+		expect(harness.coordinator.getSnapshotsForTask("ws-1", "task-1")?.metadata).toBeNull();
+		expect(coordinator.getState().authBlocker).toBeNull();
+	});
+
 	it("forces a fresh re-read after a failed metadata snapshot write", async () => {
 		class FailingSnapshotStore extends InMemoryPrRecordStore {
 			private failuresRemaining = 1;
@@ -868,7 +935,11 @@ describe("pr-tracking-coordinator", () => {
 		];
 		const coordinator = track(makeCoordinator({ store, listBoards: async () => boards }).coordinator);
 		await coordinator.start();
-		await settle();
+		// Wait for the background pass to finish (real lock I/O under load).
+		await waitFor(async () => {
+			const probe = await store.loadRecord(backlogOnlyKey);
+			return probe.ok && probe.record.orphanedAt !== null;
+		});
 
 		const linked = await store.loadRecord(reviewLinkedKey);
 		expect(linked.ok).toBe(true);
@@ -881,6 +952,45 @@ describe("pr-tracking-coordinator", () => {
 		expect(backlog.ok).toBe(true);
 		if (backlog.ok) {
 			expect(backlog.record.orphanedAt).not.toBeNull();
+		}
+	});
+
+	it("does not mutate shared records while the scheduler is locked by another process", async () => {
+		const store = new InMemoryPrRecordStore({ now: () => Date.now() });
+		await store.createRecord({
+			canonicalPrKey: PR49,
+			provider: "github",
+			host: "github.com",
+			repository: "cline/kanban",
+			number: 49,
+		});
+		const lockPath = join(root, "lock-blocked-mutation");
+		mkdirSync(lockPath, { recursive: true });
+		const release = await lockfile.lock(lockPath, {
+			stale: 10 * 60 * 1000,
+			retries: 0,
+			realpath: false,
+			lockfilePath: join(lockPath, ".scheduler.lock"),
+		});
+		try {
+			const harness = makeCoordinator({ store, schedulerLockPath: lockPath });
+			const coordinator = track(harness.coordinator);
+			const added = await coordinator.addSubscription(descriptor());
+			expect(added.status).toBe("blocked");
+			if (added.status === "blocked") {
+				expect(added.blocker).toBe("scheduler");
+			}
+			// The startup orphan pass must not mark the unlinked record while
+			// this runtime cannot be the sole scheduler.
+			await coordinator.start();
+			await settle();
+			const record = await store.loadRecord(PR49);
+			expect(record.ok).toBe(true);
+			if (record.ok) {
+				expect(record.record.orphanedAt).toBeNull();
+			}
+		} finally {
+			await release();
 		}
 	});
 });

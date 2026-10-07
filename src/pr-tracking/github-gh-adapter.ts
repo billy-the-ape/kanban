@@ -387,52 +387,61 @@ export class GitHubGhAdapter {
 	 * an inactive one). 401, missing binary, or missing login are the auth
 	 * blocker.
 	 */
-	/** Resolve the authenticated github.com access scope (noninteractive). */
+	/**
+	 * Resolve the authenticated github.com access scope (noninteractive).
+	 * Identity comes from `gh api user` (stable JSON, always the ACTIVE
+	 * credential) — never by scraping human-oriented `gh auth status` text,
+	 * whose format changed (`account` vs `as`) and which lists every account
+	 * under multi-account setups.
+	 */
 	async resolveAccessScope(): Promise<AccessScopeResult> {
 		const at = this.now();
 		await this.acquireSlot();
 		try {
-			const result = await this.runner(["auth", "status", "--hostname", GITHUB_TRACKING_HOST], this.cwd);
-			if (result.missingBinary) {
-				return {
-					ok: false,
-					failure: { category: "auth", message: "gh CLI is not installed (ENOENT)", at },
-				};
-			}
-			if (!result.ok) {
+			const result = await this.runner(["api", "--hostname", GITHUB_TRACKING_HOST, "user"], this.cwd);
+			const outcome = this.classifyExit(result);
+			if (outcome.kind === "failure") {
+				// Missing binary, 401, or any other failure on the identity
+				// endpoint is an auth-context blocker for tracking.
 				return {
 					ok: false,
 					failure: {
+						...outcome.failure,
 						category: "auth",
-						message: sanitizeErrorDetail(result.stderr || "gh auth status failed"),
-						at,
+						message:
+							outcome.failure.category === "auth"
+								? outcome.failure.message
+								: `identity resolution failed (${outcome.failure.category}): ${outcome.failure.message}`,
 					},
 				};
 			}
-			const match = result.stdout.match(/Logged in to ([\w.-]+) as (\w+) \(([^)]+)\)/);
-			if (!match) {
+			const data = outcome.kind === "json" ? (outcome.data as { login?: unknown }) : null;
+			if (!data || typeof data.login !== "string" || data.login.length === 0) {
 				return {
 					ok: false,
-					failure: {
-						category: "auth",
-						message: sanitizeErrorDetail(result.stdout || "no authenticated GitHub account found"),
-						at,
-					},
+					failure: { category: "auth", message: "gh api user returned no authenticated login", at },
 				};
 			}
-			const [, host, login, tokenSource] = match;
-			const scopeHost = host ?? GITHUB_TRACKING_HOST;
-			return {
-				ok: true,
-				scope: {
-					accessScopeId: sha256Digest(`${scopeHost}|${login}|${tokenSource}`),
-					login: login ?? "unknown",
-					tokenSource: tokenSource ?? "unknown",
-				},
-			};
+			return { ok: true, scope: this.buildAccessScope(data.login) };
 		} finally {
 			this.releaseSlot();
 		}
+	}
+
+	/**
+	 * Build the opaque access scope for a resolved login. The scope id tracks
+	 * the authenticated account AND the credential/env revision (a digest of
+	 * the token environment — never the token material itself), so a token
+	 * rotation or `gh auth switch` to another account yields a new scope and
+	 * invalidates the old one.
+	 */
+	private buildAccessScope(login: string): AccessScope {
+		const configRevision = sha256Digest([process.env.GH_TOKEN ?? "", process.env.GITHUB_TOKEN ?? ""].join("|"));
+		return {
+			accessScopeId: sha256Digest(`${GITHUB_TRACKING_HOST}|${login}|${configRevision}`),
+			login,
+			tokenSource: `gh-config-${configRevision.slice(0, 12)}`,
+		};
 	}
 
 	private bodyDigestCache = new Map<string, string>();

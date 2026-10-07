@@ -89,7 +89,7 @@ describe("pr-snapshots", () => {
 					body: "",
 					updated_at: "2026-10-06T00:00:00Z",
 				},
-				{ id: "r3", state: "pending", user: { login: "bot[bot]", type: "Bot" }, body: null },
+				{ id: "r3", state: "PENDING", user: { login: "bot[bot]", type: "Bot" }, body: null },
 			],
 			"me",
 		);
@@ -108,23 +108,25 @@ describe("pr-snapshots", () => {
 	});
 
 	it("classifies inline comments and attaches thread resolved/deleted/outdated flags", () => {
+		// REST list items carry numeric ids + node ids; the thread map from
+		// GraphQL is keyed by node id, so lookup must join on the node id.
 		const events = normalizeInlineComments(
 			[
 				{
-					id: "i1",
-					node_id: "i1",
+					id: 900001,
+					node_id: "PRC_900001",
 					user: { login: "human", type: "User" },
 					body: "nit: rename",
 					updated_at: "2026-10-06T00:00:00Z",
 				},
-				{ id: "i2", node_id: "i2", user: { login: "me", type: "User" }, body: "" },
-				{ id: "i3", node_id: "i3", user: { login: "human", type: "User" }, body: "moved" },
+				{ id: 900002, node_id: "PRC_900002", user: { login: "me", type: "User" }, body: "" },
+				{ id: 900003, node_id: "PRC_900003", user: { login: "human", type: "User" }, body: "moved" },
 			],
 			"me",
 			new Map([
-				["i1", { resolved: true, outdated: false, deleted: false }],
-				["i2", { resolved: false, outdated: false, deleted: true }],
-				["i3", { resolved: false, outdated: true, deleted: false }],
+				["PRC_900001", { resolved: true, outdated: false, deleted: false }],
+				["PRC_900002", { resolved: false, outdated: false, deleted: true }],
+				["PRC_900003", { resolved: false, outdated: true, deleted: false }],
 			]),
 		);
 		expect(events).toHaveLength(3);

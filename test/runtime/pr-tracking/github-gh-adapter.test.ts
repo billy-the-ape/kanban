@@ -98,7 +98,7 @@ describe("github-gh-adapter", () => {
 	it("resolves the opaque access scope without persisting token material", async () => {
 		const calls: ScriptedCall[] = [];
 		const adapter = adapterFor(
-			[{ kind: "ok", stdout: "gh is authenticated\nLogged in to github.com as me (GH_TOKEN)\n" }],
+			[{ kind: "ok", stdout: JSON.stringify({ login: "billy-the-ape", id: 42, type: "User" }) }],
 			calls,
 		);
 		const result = await adapter.resolveAccessScope();
@@ -106,9 +106,10 @@ describe("github-gh-adapter", () => {
 		if (!result.ok) {
 			return;
 		}
-		expect(result.scope.login).toBe("me");
-		expect(result.scope.tokenSource).toBe("GH_TOKEN");
+		// Hyphenated logins round-trip (legacy auth-status scraping rejected them).
+		expect(result.scope.login).toBe("billy-the-ape");
 		expect(result.scope.accessScopeId).toMatch(/^[0-9a-f]{64}$/);
+		expect(result.scope.tokenSource).not.toContain("token-material-secret");
 		expect(JSON.stringify(result.scope)).not.toContain("token-material-secret");
 	});
 
@@ -127,6 +128,14 @@ describe("github-gh-adapter", () => {
 		expect(unauthResult.ok).toBe(false);
 		if (!unauthResult.ok) {
 			expect(unauthResult.failure.category).toBe("auth");
+		}
+
+		const calls3: ScriptedCall[] = [];
+		const badCreds = adapterFor([{ kind: "stderr", stderr: "HTTP 401: Bad credentials" }], calls3);
+		const badCredsResult = await badCreds.resolveAccessScope();
+		expect(badCredsResult.ok).toBe(false);
+		if (!badCredsResult.ok) {
+			expect(badCredsResult.failure.category).toBe("auth");
 		}
 	});
 

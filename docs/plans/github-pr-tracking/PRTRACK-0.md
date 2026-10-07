@@ -348,10 +348,13 @@ Landed on branch `feat/prtrack-0-foundation`, PR opened against `feat/pr-trackin
     24-hour orphan-retention constant.
   - `github-gh-adapter.ts` — `GitHubGhAdapter`/`createGhAdapter`: noninteractive
     `gh api --hostname github.com` via direct `execFile` + `createGitProcessEnv()`, 30-second
-    timeout, 8 MiB per-page bound, full REST + GraphQL pagination, per-source ETag/conditional
-    reads, structured `GhAdapterFailure` taxonomy (auth, rate_limit with reset deadline,
-    not_found, network, timeout, buffer_bound, partial_page), runtime-wide four-read
-    in-flight cap.
+    timeout, 8 MiB per-page bound, full REST + GraphQL pagination, per-source
+    body-hash conditional reads (DEVIATION: the gh CLI does not expose response
+    headers, so `If-None-Match`/304 cannot be used; an unchanged full body is
+    deduped by SHA-256 and reported as `not_modified` — no rate-limit savings,
+    real ETags/Retry-After deferred), structured `GhAdapterFailure` taxonomy
+    (auth, access, rate_limit with reset deadline, not_found, network, timeout,
+    buffer_bound, partial_page), runtime-wide four-read in-flight cap.
   - `pr-snapshots.ts` — normalized access-scoped metadata/feedback snapshots,
     freshness/staleness (`PR_SNAPSHOT_STALE_AFTER_MS` = one poll interval + jitter), body
     digests, and `prKeyDigest`.
@@ -390,7 +393,7 @@ store, never clobbered.
   (directory), on-disk lockfile `registry/.registry.lock`. Serializes all shared record
   updates; never held while awaiting network/model work.
 
-**Test results.** `npx vitest run test/runtime/pr-tracking/` — 5 files / 64 tests passing.
+**Test results.** `npx vitest run test/runtime/pr-tracking/` — 5 files / 67 tests passing.
 `npx tsc --noEmit` clean. `npx @biomejs/biome check` clean for all changed files.
 
 **PR 64 review responses (second round)**
@@ -415,6 +418,27 @@ store, never clobbered.
 - Coordinator tests now use the deterministic `InMemoryPrRecordStore` (fake timers
   with exact timing; a second runtime with a different access scope shares the same
   store object); the disk store keeps its own suite for fs/CAS behavior.
+- Identity resolution uses `gh api user` (stable JSON, always the active
+  credential) instead of scraping `gh auth status` text; the access scope id also
+  tracks a digest of the token environment, so a rotation/account switch yields a
+  new scope.
+- The sticky auth blocker now re-probes on explicit `refresh`/`resumePrTracking`
+  (`ensureScope(..., forceFresh)`): a successful resolution clears the blocker, and
+  a changed `accessScopeId` invalidates the old scope's in-memory snapshots. A
+  successful poll cycle also clears the auth blocker.
+- Adapter: Node 22 `ERR_CHILD_PROCESS_STDIO_MAXBUFFER` is classified `buffer_bound`;
+  non-rate-limit `403`/`451` are classified `access`; a closed-draft PR normalizes
+  to `closed` (closed wins over draft); REST review states are matched
+  case-insensitively (`PENDING` etc.).
+- `createRecord` is a single atomic revision-checked update (no
+  check-then-act across two lock acquisitions); all record-level schemas are
+  `.passthrough()` so unknown fields from newer builds survive updates.
+- A scheduler-blocked process no longer mutates shared records: the scheduler check
+  happens before `upsertTaskBinding` (and the startup orphan pass is gated on the
+  scheduler lock). The scheduler lock has an `onCompromised` handler that blocks
+  this runtime's scheduler instead of throwing from a timer callback.
+- Test fixtures mirror real gh/GitHub output (modern `gh api user` JSON with a
+  hyphenated login, uppercase review states, node-id-keyed threads).
 
 **Deviations/refinements noted during implementation**
 

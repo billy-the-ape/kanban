@@ -331,20 +331,27 @@ export class PrTrackingCoordinator {
 
 	private async ensureScope(
 		requestedScopeId?: string,
+		forceFresh = false,
 	): Promise<{ ok: true; scope: AccessScope } | { ok: false; blocker: "auth" | "scope" }> {
-		if (this.scopeFailure) {
-			return { ok: false, blocker: "auth" };
-		}
-		if (this.scopeCache) {
-			if (!requestedScopeId || this.scopeCache.accessScopeId === requestedScopeId) {
-				this.scopes.set(this.scopeCache.accessScopeId, this.scopeCache);
-				return { ok: true, scope: this.scopeCache };
+		if (!forceFresh) {
+			if (this.scopeFailure) {
+				return { ok: false, blocker: "auth" };
 			}
-			const known = this.scopes.get(requestedScopeId);
-			if (known) {
-				return { ok: true, scope: known };
+			if (this.scopeCache) {
+				if (!requestedScopeId || this.scopeCache.accessScopeId === requestedScopeId) {
+					this.scopes.set(this.scopeCache.accessScopeId, this.scopeCache);
+					return { ok: true, scope: this.scopeCache };
+				}
+				const known = this.scopes.get(requestedScopeId);
+				if (known) {
+					return { ok: true, scope: known };
+				}
+				return { ok: false, blocker: "scope" };
 			}
-			return { ok: false, blocker: "scope" };
+		} else {
+			// Explicit re-probe: a re-login, token rotation, or `gh auth
+			// switch` since the last failure/resolution must be detected.
+			this.scopeFailure = null;
 		}
 		const resolved = await this.adapter.resolveAccessScope();
 		if (!resolved.ok) {
@@ -589,6 +596,12 @@ export class PrTrackingCoordinator {
 	 * tasks.
 	 */
 	private async runOrphanClassificationPass(): Promise<void> {
+		// Shared-record mutations require the scheduler lock: a second
+		// process must never mark or delete orphan records.
+		await this.ensureSchedulerLock();
+		if (this.schedulerBlocked) {
+			return;
+		}
 		const linkedKeys = await this.collectLinkedPrKeys();
 		const { records } = await this.store.listRecords();
 		for (const record of records) {
@@ -618,6 +631,14 @@ export class PrTrackingCoordinator {
 	}
 
 	private async markOrphanIfUnlinked(canonicalPrKey: string): Promise<void> {
+		// Shared-record mutation: skip entirely while scheduler-blocked.
+		if (this.schedulerBlocked) {
+			return;
+		}
+		await this.ensureSchedulerLock();
+		if (this.schedulerBlocked) {
+			return;
+		}
 		const linkedKeys = await this.collectLinkedPrKeys();
 		if (linkedKeys.has(canonicalPrKey)) {
 			return;
@@ -887,6 +908,9 @@ export class PrTrackingCoordinator {
 		}
 		if (!this.stopping && feedbackOk) {
 			state.consecutiveFailures = 0;
+			// A successful authoritative read proves the current credential
+			// works: a sticky auth blocker must clear without a restart.
+			this.authBlocker = null;
 		}
 		await this.reevaluate(prKey, accessScopeId);
 	}
@@ -1122,10 +1146,24 @@ export class PrTrackingCoordinator {
 		if (this.stopping) {
 			return;
 		}
-		// Re-probe: a prior access/auth blocker must not suppress an explicit
-		// refresh; a successful cycle clears the blocker.
-		this.scopeFailure = null;
+		// Re-probe: a prior access/auth blocker must not suppress an
+		// explicit refresh. Clearing scopeFailure lets ensureScope re-resolve
+		// the identity (a re-login or `gh auth switch` is now detected); a
+		// successful resolution clears the auth blocker and, when the
+		// credential identity changed, invalidates the old scope's state.
 		this.accessBlocker = null;
+		this.authBlocker = null;
+		const scopeResult = await this.ensureScope(accessScopeId !== "unresolved" ? accessScopeId : undefined, true);
+		if (!scopeResult.ok) {
+			// The re-probe failed: the blocker is re-set by ensureScope and
+			// polling stays cancelled until the next explicit refresh/resume.
+			return;
+		}
+		if (state.pollInFlight) {
+			// Another refresh started its cycle while we re-probed: coalesce.
+			await state.pollInFlight;
+			return;
+		}
 		const job = this.performPollCycle(state);
 		state.pollInFlight = job;
 		try {
@@ -1150,9 +1188,12 @@ export class PrTrackingCoordinator {
 		if (sub.blocker === "unsupported_host") {
 			return { ok: false, reason: "unsupported_host" };
 		}
-		// Auth may have recovered since the last failure.
-		this.scopeFailure = null;
-		const scopeResult = await this.ensureScope(sub.accessScopeId === "unresolved" ? undefined : sub.accessScopeId);
+		// Auth may have recovered since the last failure; force a fresh
+		// identity probe so re-login / account switches are detected.
+		const scopeResult = await this.ensureScope(
+			sub.accessScopeId === "unresolved" ? undefined : sub.accessScopeId,
+			true,
+		);
 		if (!scopeResult.ok) {
 			return { ok: false, reason: scopeResult.blocker };
 		}
