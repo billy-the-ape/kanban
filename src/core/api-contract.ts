@@ -130,6 +130,85 @@ function normalizeRuntimeTaskClineSettings(input: {
 	};
 }
 
+export const runtimeTaskPullRequestProviderSchema = z.enum(["github", "gitlab", "bitbucket"]);
+export type RuntimeTaskPullRequestProvider = z.infer<typeof runtimeTaskPullRequestProviderSchema>;
+
+export const runtimeTaskPullRequestSourceSchema = z.enum(["agent_tool", "delivery", "manual", "branch_lookup"]);
+export type RuntimeTaskPullRequestSource = z.infer<typeof runtimeTaskPullRequestSourceSchema>;
+
+/**
+ * A pull request linked to a task card. Recorded by the runtime (tool-call
+ * detection, deterministic delivery, branch lookup) or added manually; the
+ * card-level `pullRequests` array is server-owned (see workspace-state save).
+ */
+export const runtimeTaskPullRequestSchema = z.object({
+	provider: runtimeTaskPullRequestProviderSchema,
+	/** "github.com", or a GHE / self-hosted GitLab host (lowercase). */
+	host: z.string(),
+	/** "owner/repo" (GitLab may be "group/subgroup/repo"). */
+	repository: z.string(),
+	number: z.number().int().positive(),
+	/** Canonical URL produced by the shared parser, never raw agent text. */
+	url: z.string(),
+	source: runtimeTaskPullRequestSourceSchema,
+	/** First time Kanban recorded this link. */
+	createdAt: z.number(),
+	// Optional snapshot; may be stale. Populated by delivery/branch lookup/refresh only.
+	title: z.string().optional(),
+	state: z.enum(["open", "closed", "merged", "draft"]).optional(),
+	stateCheckedAt: z.number().optional(),
+});
+export type RuntimeTaskPullRequest = z.infer<typeof runtimeTaskPullRequestSchema>;
+
+// PRLINK-5: manual PR link management. The server re-parses the URL with the
+// strict shared parser and is authoritative; raw client text is never stored.
+export const runtimeTaskPullRequestLinkRequestSchema = z.object({
+	taskId: z.string(),
+	url: z.string().min(1).max(2048),
+});
+export type RuntimeTaskPullRequestLinkRequest = z.infer<typeof runtimeTaskPullRequestLinkRequestSchema>;
+
+export const runtimeTaskPullRequestLinkResponseSchema = z.object({
+	ok: z.boolean(),
+	error: z.string().optional(),
+	/** The recorded entry (re-read from the board) or the existing identical one; null for remove / not-found. */
+	pullRequest: runtimeTaskPullRequestSchema.nullable(),
+});
+export type RuntimeTaskPullRequestLinkResponse = z.infer<typeof runtimeTaskPullRequestLinkResponseSchema>;
+
+export const runtimeTaskPullRequestsRefreshRequestSchema = z.object({
+	taskId: z.string(),
+});
+export type RuntimeTaskPullRequestsRefreshRequest = z.infer<typeof runtimeTaskPullRequestsRefreshRequestSchema>;
+
+/**
+ * Why a branch lookup produced its result. Set on ok refresh responses so the
+ * explicit Refresh action can toast it; the automatic review-entry lookup
+ * ignores it.
+ */
+export const runtimeTaskPullRequestRefreshReasonSchema = z.enum([
+	"no_task",
+	"no_worktree",
+	"no_branch",
+	"no_gh",
+	"gh_failed",
+	"none_found",
+	"unchanged",
+	"updated",
+	"failed",
+]);
+export type RuntimeTaskPullRequestRefreshReason = z.infer<typeof runtimeTaskPullRequestRefreshReasonSchema>;
+
+export const runtimeTaskPullRequestsRefreshResponseSchema = z.object({
+	ok: z.boolean(),
+	/** Number of PR entries that changed (added or snapshot-updated). */
+	updated: z.number().int().nonnegative(),
+	/** Present on ok responses; drives the explicit Refresh toast. */
+	reason: runtimeTaskPullRequestRefreshReasonSchema.optional(),
+	error: z.string().optional(),
+});
+export type RuntimeTaskPullRequestsRefreshResponse = z.infer<typeof runtimeTaskPullRequestsRefreshResponseSchema>;
+
 export const runtimeBoardCardSchema = z
 	.object({
 		id: z.string(),
@@ -151,6 +230,12 @@ export const runtimeBoardCardSchema = z
 		 * true; an explicit false is honored as-is.
 		 */
 		updateBaseRefBeforeStart: z.boolean().optional(),
+		/**
+		 * Pull requests linked to this task. Server-owned: the runtime records
+		 * links through board mutations and `saveWorkspaceState` restores the
+		 * persisted list over any client-supplied value (see workspace-state).
+		 */
+		pullRequests: z.array(runtimeTaskPullRequestSchema).optional(),
 		createdAt: z.number(),
 		updatedAt: z.number(),
 	})
@@ -2123,6 +2208,8 @@ export const runtimeHookIngestRequestSchema = z.object({
 	workspaceId: z.string(),
 	event: runtimeHookEventSchema,
 	metadata: runtimeTaskHookActivitySchema.partial().optional(),
+	/** Canonical PR URLs detected by the hook CLI (re-parsed server-side; max 10). */
+	pullRequestUrls: z.array(z.string().min(1).max(2048)).max(10).optional(),
 });
 export type RuntimeHookIngestRequest = z.infer<typeof runtimeHookIngestRequestSchema>;
 
@@ -2364,3 +2451,291 @@ export const runtimeDiagnosticsExportResponseSchema = z.object({
 	error: z.string().nullable(),
 });
 export type RuntimeDiagnosticsExportResponse = z.infer<typeof runtimeDiagnosticsExportResponseSchema>;
+
+// ── PRTRACK-0: GitHub PR tracking foundation (provider-free contract) ─────────
+//
+// The durable record is keyed by the canonical PR identity produced by
+// `getPullRequestIdentityKey` (src/core/pull-request-links.ts). Field shapes for
+// the comment automation block, task merge binding, and owner/operation
+// reservation block are declared here; their semantics are normatively frozen by
+// the comment-handling and merge-tracking plans (PRTRACK-1 must not change
+// storage).
+
+/** Schema version of the durable GitHub PR tracking record. */
+export const GITHUB_PR_TRACKING_RECORD_SCHEMA_VERSION = 1;
+
+/**
+ * Durable metadata snapshot of the PR, scoped to one opaque accessScopeId
+ * (hash of host + authenticated login + credential source — never token
+ * material). Stored inside the record keyed by accessScopeId.
+ */
+export const githubPrMetadataSnapshotSchema = z
+	.object({
+		accessScopeId: z.string(),
+		checkedAt: z.number(),
+		state: z.enum(["open", "closed", "draft", "merged"]),
+		headRepository: z.string().nullable(),
+		headRef: z.string().nullable(),
+		baseRepository: z.string().nullable(),
+		baseRef: z.string().nullable(),
+		headSha: z.string().nullable(),
+		mergedAt: z.number().nullable(),
+		mergeCommitSha: z.string().nullable(),
+	})
+	.passthrough();
+export type GitHubPrMetadataSnapshot = z.infer<typeof githubPrMetadataSnapshotSchema>;
+
+/**
+ * Structured feedback dedupe descriptor (frozen by the comment plan): SHA-256
+ * digest of the sorted eligible event-version tokens, the latest-`updatedAt`
+ * watermark, and the sorted version tokens at that exact watermark. Never a
+ * bare string.
+ */
+export const githubPrFeedbackFingerprintSchema = z
+	.object({
+		digest: z.string(),
+		latestUpdatedAt: z.number(),
+		tokensAtWatermark: z.array(z.string()),
+	})
+	.passthrough();
+export type GitHubPrFeedbackFingerprint = z.infer<typeof githubPrFeedbackFingerprintSchema>;
+
+export const githubPrTaskIdentitySchema = z.object({
+	workspaceId: z.string(),
+	taskId: z.string(),
+});
+export type GitHubPrTaskIdentity = z.infer<typeof githubPrTaskIdentitySchema>;
+
+/** Comment automation block (semantics frozen by the comment plan). */
+export const githubPrCommentDispatchStatusSchema = z.enum(["queued", "running", "completed", "failed"]);
+export type GitHubPrCommentDispatchStatus = z.infer<typeof githubPrCommentDispatchStatusSchema>;
+
+export const githubPrCommentDispatchSchema = z
+	.object({
+		dispatchId: z.string(),
+		/** Null while provably unsent; persisted immediately before invoking chat send. */
+		attemptedAt: z.number().nullable(),
+		fingerprint: githubPrFeedbackFingerprintSchema,
+		ownerRevision: z.number(),
+		status: githubPrCommentDispatchStatusSchema,
+		turnReference: z.string().nullable(),
+		error: z.string().nullable(),
+	})
+	.passthrough();
+export type GitHubPrCommentDispatch = z.infer<typeof githubPrCommentDispatchSchema>;
+
+export const githubPrCommentAutomationSchema = z
+	.object({
+		repairOwner: githubPrTaskIdentitySchema
+			.extend({
+				ownerRevision: z.number(),
+			})
+			.nullable(),
+		pendingFeedbackFingerprint: githubPrFeedbackFingerprintSchema.nullable(),
+		lastDispatchedFeedbackFingerprint: githubPrFeedbackFingerprintSchema.nullable(),
+		debounceDeadline: z.number().nullable(),
+		firstPendingAt: z.number().nullable(),
+		dispatch: githubPrCommentDispatchSchema.nullable(),
+	})
+	.passthrough();
+export type GitHubPrCommentAutomation = z.infer<typeof githubPrCommentAutomationSchema>;
+
+/** Merge completion binding on a task binding (semantics frozen by the merge plan). */
+export const githubPrMergeCompletionStatusSchema = z.enum(["pending", "completed", "blocked"]);
+export type GitHubPrMergeCompletionStatus = z.infer<typeof githubPrMergeCompletionStatusSchema>;
+
+export const githubPrMergeCompletionSchema = z
+	.object({
+		schemaVersion: z.literal(GITHUB_PR_TRACKING_RECORD_SCHEMA_VERSION),
+		workspaceId: z.string(),
+		taskId: z.string(),
+		linkGeneration: z.number().int().nonnegative(),
+		/** Canonical PR identity this binding was selected against. */
+		prKey: z.string(),
+		finalHeadSha: z.string().nullable(),
+		baseRepository: z.string().nullable(),
+		baseRef: z.string().nullable(),
+		mergeCommitSha: z.string().nullable(),
+		mergedAt: z.number().nullable(),
+		observedAt: z.number(),
+		status: githubPrMergeCompletionStatusSchema,
+		completedAt: z.number().nullable(),
+		error: z.string().nullable(),
+	})
+	.passthrough();
+export type GitHubPrMergeCompletion = z.infer<typeof githubPrMergeCompletionSchema>;
+
+/**
+ * Owner/operation reservation block (fenced durable intent). Reservations are
+ * record entries mutated through short CAS operations under the single
+ * tracking-registry mutex; they are never held while awaiting network/model work.
+ */
+export const githubPrOperationReservationStateSchema = z.enum(["none", "reserved"]);
+export type GitHubPrOperationReservationState = z.infer<typeof githubPrOperationReservationStateSchema>;
+
+export const githubPrOperationReservationSchema = z
+	.object({
+		ownerRevision: z.number().int().nonnegative(),
+		fencingGeneration: z.number().int().nonnegative(),
+		state: githubPrOperationReservationStateSchema,
+		reservedBy: githubPrTaskIdentitySchema.nullable(),
+		/** Operation kind holding the reservation (e.g. "comment_followup"). */
+		reservedOperation: z.string().nullable(),
+		/** Set while an explicit repair-owner transfer handoff is in progress. */
+		transferHandoff: z
+			.object({
+				fromWorkspaceId: z.string(),
+				fromTaskId: z.string(),
+				toWorkspaceId: z.string(),
+				toTaskId: z.string(),
+				handedOffAt: z.number(),
+			})
+			.passthrough()
+			.nullable(),
+	})
+	.passthrough();
+export type GitHubPrOperationReservation = z.infer<typeof githubPrOperationReservationSchema>;
+
+/** Durable replay cursors live on each task binding, per consumer kind. */
+export const githubPrReplayCursorsSchema = z
+	.object({
+		comments: z.number().int().nonnegative().optional(),
+		merge: z.number().int().nonnegative().optional(),
+	})
+	.passthrough();
+export type GitHubPrReplayCursors = z.infer<typeof githubPrReplayCursorsSchema>;
+
+export const githubPrTerminalStopReasonSchema = z.enum([
+	/** Transient: bounded merge-reconciliation episode still within its read budget. */
+	"merged_reconciling",
+	/** Terminal: reconciliation read budget exhausted without resolution (needs human). */
+	"merged_unresolved",
+	/** Terminal: merge completion already consumed for this binding. */
+	"merged_completed",
+	/** Terminal: PR closed without merging. */
+	"closed_unmerged",
+	/** Task in Backlog/Done/Trash. */
+	"inactive_task",
+	/** Both task checkboxes disabled. */
+	"no_enabled_consumers",
+	/** Unsupported provider/host or ambiguous PR selection. */
+	"unsupported_host",
+	"ambiguous_selection",
+]);
+export type GitHubPrTerminalStopReason = z.infer<typeof githubPrTerminalStopReasonSchema>;
+
+export const githubPrTaskBindingSchema = z
+	.object({
+		workspaceId: z.string(),
+		taskId: z.string(),
+		/**
+		 * Monotonic per-binding link generation. Re-establishing a subscription for
+		 * the same handled PR increments the generation without erasing consumed
+		 * markers (terminalStop / mergeCompletion survive).
+		 */
+		linkGeneration: z.number().int().nonnegative(),
+		linkedAt: z.number(),
+		/** Persisted terminal observation + stop reason; restart cannot rearm from it. */
+		terminalStop: z
+			.object({
+				reason: githubPrTerminalStopReasonSchema,
+				observedAt: z.number(),
+				/** Remote reads used by the terminal reconciliation episode. */
+				reconciliationReads: z.number().int().nonnegative(),
+			})
+			.passthrough()
+			.nullable(),
+		mergeCompletion: githubPrMergeCompletionSchema.nullable(),
+		replayCursors: githubPrReplayCursorsSchema,
+	})
+	.passthrough();
+export type GitHubPrTaskBinding = z.infer<typeof githubPrTaskBindingSchema>;
+
+/**
+ * The durable GitHub PR tracking record: one per canonical PR identity, stored
+ * under the runtime home, schema version 1, revision-checked atomic updates.
+ * All record-level objects are passthrough: fields added by newer builds are
+ * preserved through revision-checked updates instead of being stripped.
+ */
+export const githubPrTrackingRecordSchema = z
+	.object({
+		schemaVersion: z.literal(GITHUB_PR_TRACKING_RECORD_SCHEMA_VERSION),
+		revision: z.number().int().nonnegative(),
+		updatedAt: z.number(),
+		canonicalPrKey: z.string(),
+		provider: z.literal("github"),
+		host: z.string(),
+		repository: z.string(),
+		number: z.number().int().positive(),
+		/**
+		 * Timestamp the record was first observed orphaned (no current card links
+		 * this PR); starts the 24-hour retention clock. Null while linked.
+		 */
+		orphanedAt: z.number().nullable(),
+		/** Authorized metadata snapshots keyed by opaque accessScopeId. */
+		snapshots: z.record(z.string(), githubPrMetadataSnapshotSchema),
+		taskBindings: z.array(githubPrTaskBindingSchema),
+		commentAutomation: githubPrCommentAutomationSchema,
+		reservation: githubPrOperationReservationSchema,
+	})
+	.passthrough();
+export type GitHubPrTrackingRecord = z.infer<typeof githubPrTrackingRecordSchema>;
+
+// ── Transient normalized observation types (never persisted whole) ───────────
+
+/** Author classification carried by every normalized feedback event. */
+export const githubPrFeedbackAuthorKindSchema = z.enum(["human", "bot"]);
+export type GitHubPrFeedbackAuthorKind = z.infer<typeof githubPrFeedbackAuthorKindSchema>;
+
+/**
+ * Normalized feedback event. The foundation normalizes and exposes the full
+ * feedback with classification metadata; the bot/eligibility policy is applied
+ * downstream (COMMENT-0), never by the foundation.
+ */
+export const githubPrNormalizedFeedbackEventSchema = z.object({
+	kind: z.enum(["review", "inline_comment", "conversation_comment"]),
+	providerId: z.string(),
+	authorLogin: z.string(),
+	authorKind: githubPrFeedbackAuthorKindSchema,
+	/** True when the author is the service's own authenticated account. */
+	isOwnAccount: z.boolean(),
+	/** Reviews only: submitted (published) vs pending (unpublished). */
+	reviewState: z.enum(["submitted", "pending"]).nullable(),
+	/** Inline comments only: thread resolved flag (null when not thread-scoped). */
+	threadResolved: z.boolean().nullable(),
+	/**
+	 * Inline comments only: thread deleted flag. Outdated (diff moved) is NOT
+	 * treated as deleted and is carried separately in `threadOutdated`.
+	 */
+	threadDeleted: z.boolean().nullable(),
+	/** Inline comments only: thread outdated flag (diff moved under the comment). */
+	threadOutdated: z.boolean().nullable(),
+	updatedAt: z.number(),
+	/** SHA-256 digest of the event body (bodies themselves stay transient). */
+	bodyDigest: z.string(),
+});
+export type GitHubPrNormalizedFeedbackEvent = z.infer<typeof githubPrNormalizedFeedbackEventSchema>;
+
+/** Per-source completeness: a snapshot publishes only after all pages succeed. */
+export const githubPrFeedbackCompletenessSchema = z.object({
+	reviews: z.boolean(),
+	conversationComments: z.boolean(),
+	inlineComments: z.boolean(),
+	threads: z.boolean(),
+});
+export type GitHubPrFeedbackCompleteness = z.infer<typeof githubPrFeedbackCompletenessSchema>;
+
+/**
+ * Transient normalized snapshot (metadata + optional feedback) labelled as-of
+ * `checkedAt`. Stale once older than one poll interval plus backoff jitter;
+ * invalidated on auth-context change.
+ */
+export const githubPrNormalizedSnapshotSchema = z.object({
+	canonicalPrKey: z.string(),
+	accessScopeId: z.string(),
+	checkedAt: z.number(),
+	metadata: githubPrMetadataSnapshotSchema,
+	feedback: z.array(githubPrNormalizedFeedbackEventSchema).nullable(),
+	feedbackCompleteness: githubPrFeedbackCompletenessSchema.nullable(),
+});
+export type GitHubPrNormalizedSnapshot = z.infer<typeof githubPrNormalizedSnapshotSchema>;

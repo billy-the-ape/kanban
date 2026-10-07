@@ -23,6 +23,7 @@ import {
 	resolveClineModelDisplayName,
 } from "@/components/detail-panels/cline-model-picker-options";
 import { TaskPhaseBadge } from "@/components/task-phase-badge";
+import { TaskPullRequestLink } from "@/components/task-pull-request-link";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/components/ui/cn";
 import { Spinner } from "@/components/ui/spinner";
@@ -39,6 +40,7 @@ import {
 	normalizePromptForDisplay,
 	truncateTaskPromptLabel,
 } from "@/utils/task-prompt";
+import { getLatestPullRequest } from "@/utils/task-pull-requests";
 import { DEFAULT_TEXT_MEASURE_FONT, measureTextWidth, readElementFontShorthand } from "@/utils/text-measure";
 
 interface CardSessionActivity {
@@ -311,6 +313,8 @@ export function BoardCard({
 	const [isDescriptionExpanded, setIsDescriptionExpanded] = useState(false);
 	const reviewWorkspaceSnapshot = useTaskWorkspaceSnapshotValue(card.id);
 	const isTrashCard = columnId === "trash";
+	// PRLINK-4: most recent recorded PR shown as a compact link in the card header.
+	const latestPullRequest = getLatestPullRequest(card);
 	const isDoneCard = columnId === "done";
 	const isCardInteractive = !isTrashCard && !isDoneCard;
 	const isPreparingInitialStart =
@@ -650,6 +654,13 @@ export function BoardCard({
 										</p>
 									)}
 								</div>
+								{latestPullRequest ? (
+									<TaskPullRequestLink
+										pullRequest={latestPullRequest}
+										variant="compact"
+										className="shrink-0"
+									/>
+								) : null}
 								{columnId !== "trash" ? (
 									<TaskPhaseBadge
 										summary={phaseSummary}

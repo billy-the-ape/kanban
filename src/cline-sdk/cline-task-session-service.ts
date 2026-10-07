@@ -11,7 +11,9 @@ import type {
 	RuntimeTaskTurnCheckpoint,
 } from "../core/api-contract";
 import { isHomeAgentSessionId } from "../core/home-agent-session";
+import { detectCreatedPullRequests } from "../core/pull-request-detection";
 import { resolveHomeAgentAppendSystemPrompt } from "../prompts/append-system-prompt";
+import { recordTaskPullRequests } from "../workspace/task-pull-requests";
 import { captureTaskTurnCheckpoint, deleteTaskTurnCheckpointRef } from "../workspace/turn-checkpoints";
 import {
 	type CompactClineConversationMessagesResult,
@@ -63,6 +65,7 @@ import {
 	type ClineWatcherRegistry,
 	createClineWatcherRegistry,
 } from "./cline-watcher-registry";
+import { extractCommandStrings } from "./review-tool-policy";
 import { SDK_DEFAULT_MODEL_ID, SDK_DEFAULT_PROVIDER_ID } from "./sdk-provider-boundary";
 import {
 	type ClineSdkPersistedMessage,
@@ -167,6 +170,18 @@ export interface CreateInMemoryClineTaskSessionServiceOptions {
 	 * the user. Defaults to DEFAULT_CONTEXT_RECOVERY_MAX_ATTEMPTS.
 	 */
 	contextRecoveryMaxAttempts?: number;
+	/**
+	 * PRLINK-1: the repo root of this service instance's workspace — NOT a
+	 * task session's cwd, which is usually a linked worktree. Cline-created
+	 * PRs are recorded against this path and state updates are broadcast
+	 * for it. When omitted, PR capture is disabled for this service.
+	 */
+	workspacePath?: string | null;
+	/**
+	 * PRLINK-1: broadcast board state to open UIs after server-side card
+	 * writes (e.g. PR recording from Cline tool calls).
+	 */
+	broadcastWorkspaceStateUpdated?: (workspacePath: string) => void;
 }
 
 function toErrorMessage(error: unknown): string {
@@ -259,8 +274,10 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 	 */
 	private readonly latestCompactionByTaskId = new Map<string, RuntimeClineContextCompactionEvent>();
 	private readonly compactionPersistedAtByTaskId = new Map<string, number>();
+	private readonly options: CreateInMemoryClineTaskSessionServiceOptions;
 
 	constructor(options: CreateInMemoryClineTaskSessionServiceOptions = {}) {
+		this.options = options;
 		if (
 			options.contextRecoveryMaxAttempts !== undefined &&
 			(!Number.isInteger(options.contextRecoveryMaxAttempts) || options.contextRecoveryMaxAttempts < 1)
@@ -1445,6 +1462,38 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			},
 			emitMessage: (taskIdFromEvent: string, message: ClineTaskMessage) => {
 				this.emitMessage(taskIdFromEvent, message);
+			},
+			// PRLINK-1: PR-creation capture for Cline tool calls. Detection is a
+			// pure string scan, so this gate is cheap for every tool; only
+			// PR-creating commands produce links to record.
+			onToolFinished: (tool) => {
+				const links = detectCreatedPullRequests({
+					toolName: tool.toolName,
+					commands: extractCommandStrings(tool.toolInput),
+					// stderr is folded into the scanned text because `gh pr
+					// create` prints the "already exists" PR URL to stderr.
+					output: [tool.output, tool.error].filter((part): part is string => Boolean(part)).join("\n") || null,
+				});
+				if (links.length === 0) {
+					return;
+				}
+				// Record against the workspace repo root that owns this
+				// service instance: a task session's cwd is usually a linked
+				// worktree and is not where the workspace state (and the
+				// card) live.
+				const workspacePath = this.options.workspacePath;
+				if (!workspacePath) {
+					return;
+				}
+				void recordTaskPullRequests({ workspacePath, taskId, links, source: "agent_tool" })
+					.then((result) => {
+						if (result.changed) {
+							this.options.broadcastWorkspaceStateUpdated?.(workspacePath);
+						}
+					})
+					.catch(() => {
+						// recordTaskPullRequests is best-effort by contract; nothing to escalate.
+					});
 			},
 		});
 		const currentSummary = entry.summary;

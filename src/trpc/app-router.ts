@@ -95,6 +95,10 @@ import type {
 	RuntimeTaskPhasesResponse,
 	RuntimeTaskPreservationInfoResponse,
 	RuntimeTaskPreservationRequest,
+	RuntimeTaskPullRequestLinkRequest,
+	RuntimeTaskPullRequestLinkResponse,
+	RuntimeTaskPullRequestsRefreshRequest,
+	RuntimeTaskPullRequestsRefreshResponse,
 	RuntimeTaskReviewInfoRequest,
 	RuntimeTaskReviewInfoResponse,
 	RuntimeTaskReviewStartRequest,
@@ -212,6 +216,10 @@ import {
 	runtimeTaskPhasesResponseSchema,
 	runtimeTaskPreservationInfoResponseSchema,
 	runtimeTaskPreservationRequestSchema,
+	runtimeTaskPullRequestLinkRequestSchema,
+	runtimeTaskPullRequestLinkResponseSchema,
+	runtimeTaskPullRequestsRefreshRequestSchema,
+	runtimeTaskPullRequestsRefreshResponseSchema,
 	runtimeTaskReviewInfoRequestSchema,
 	runtimeTaskReviewInfoResponseSchema,
 	runtimeTaskReviewStartRequestSchema,
@@ -463,6 +471,21 @@ export interface RuntimeTrpcContext {
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeGitCommitDiffRequest,
 		) => Promise<RuntimeGitCommitDiffResponse>;
+		/** PRLINK-5: manually link a PR URL to a task (source: "manual"). */
+		addTaskPullRequest: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskPullRequestLinkRequest,
+		) => Promise<RuntimeTaskPullRequestLinkResponse>;
+		/** PRLINK-5: manually remove a recorded PR link from a task. */
+		removeTaskPullRequest: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskPullRequestLinkRequest,
+		) => Promise<RuntimeTaskPullRequestLinkResponse>;
+		/** PRLINK-5: re-run the branch lookup for a task (opt-in refresh). */
+		refreshTaskPullRequests: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskPullRequestsRefreshRequest,
+		) => Promise<RuntimeTaskPullRequestsRefreshResponse>;
 	};
 	projectsApi: {
 		listProjects: (preferredWorkspaceId: string | null) => Promise<RuntimeProjectsResponse>;
@@ -878,6 +901,25 @@ export const runtimeAppRouter = t.router({
 			.output(runtimeWorkspaceStateResponseSchema)
 			.mutation(async ({ ctx, input }) => {
 				return await ctx.workspaceApi.saveState(ctx.workspaceScope, input);
+			}),
+		// PRLINK-5: manual PR link management (add/remove/refresh).
+		addTaskPullRequest: workspaceProcedure
+			.input(runtimeTaskPullRequestLinkRequestSchema)
+			.output(runtimeTaskPullRequestLinkResponseSchema)
+			.mutation(async ({ ctx, input }) => {
+				return await ctx.workspaceApi.addTaskPullRequest(ctx.workspaceScope, input);
+			}),
+		removeTaskPullRequest: workspaceProcedure
+			.input(runtimeTaskPullRequestLinkRequestSchema)
+			.output(runtimeTaskPullRequestLinkResponseSchema)
+			.mutation(async ({ ctx, input }) => {
+				return await ctx.workspaceApi.removeTaskPullRequest(ctx.workspaceScope, input);
+			}),
+		refreshTaskPullRequests: workspaceProcedure
+			.input(runtimeTaskPullRequestsRefreshRequestSchema)
+			.output(runtimeTaskPullRequestsRefreshResponseSchema)
+			.mutation(async ({ ctx, input }) => {
+				return await ctx.workspaceApi.refreshTaskPullRequests(ctx.workspaceScope, input);
 			}),
 		getWorkspaceChanges: workspaceProcedure.output(runtimeWorkspaceChangesResponseSchema).query(async ({ ctx }) => {
 			return await ctx.workspaceApi.loadWorkspaceChanges(ctx.workspaceScope);

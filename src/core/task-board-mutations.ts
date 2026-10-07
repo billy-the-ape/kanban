@@ -7,7 +7,9 @@ import type {
 	RuntimeTaskAutoReviewMode,
 	RuntimeTaskClineSettings,
 	RuntimeTaskImage,
+	RuntimeTaskPullRequest,
 } from "./api-contract";
+import { getPullRequestIdentityKey } from "./pull-request-links";
 import { createRandomHexId, createUniqueTaskId } from "./task-id";
 import { resolveTaskTitle } from "./task-title";
 
@@ -697,6 +699,225 @@ export function updateTask(
 			columns,
 		},
 		task: updatedTask,
+		updated: true,
+	};
+}
+
+// --- PRLINK-0: pull request links --------------------------------------------
+
+/** Hard cap on stored pull requests per task card. */
+const MAX_TASK_PULL_REQUESTS = 20;
+
+export interface RuntimeTaskPullRequestSnapshotUpdate {
+	title?: string;
+	state?: RuntimeTaskPullRequest["state"];
+	stateCheckedAt?: number;
+}
+
+export interface RuntimeAddTaskPullRequestsResult {
+	board: RuntimeBoardData;
+	task: RuntimeBoardCard | null;
+	added: boolean;
+}
+
+export interface RuntimeRemoveTaskPullRequestResult {
+	board: RuntimeBoardData;
+	task: RuntimeBoardCard | null;
+	removed: boolean;
+}
+
+export interface RuntimeUpdateTaskPullRequestSnapshotResult {
+	board: RuntimeBoardData;
+	task: RuntimeBoardCard | null;
+	updated: boolean;
+}
+
+function replaceTaskCard(board: RuntimeBoardData, taskId: string, nextTask: RuntimeBoardCard): RuntimeBoardData {
+	const columns = board.columns.map((column) =>
+		column.cards.some((card) => card.id === taskId)
+			? { ...column, cards: column.cards.map((card) => (card.id === taskId ? nextTask : card)) }
+			: column,
+	);
+	return { ...board, columns };
+}
+
+/**
+ * Fills only the snapshot fields missing from `current` with values from
+ * `incoming`. Returns null when nothing changes. The stored identity
+ * (provider/host/repository/number/source/createdAt) is never overwritten.
+ */
+function backfillPullRequestSnapshot(
+	current: RuntimeTaskPullRequest,
+	incoming: RuntimeTaskPullRequest,
+): RuntimeTaskPullRequest | null {
+	let changed = false;
+	const next: RuntimeTaskPullRequest = { ...current };
+	if (next.title === undefined && incoming.title !== undefined) {
+		next.title = incoming.title;
+		changed = true;
+	}
+	if (next.state === undefined && incoming.state !== undefined) {
+		next.state = incoming.state;
+		changed = true;
+	}
+	if (next.stateCheckedAt === undefined && incoming.stateCheckedAt !== undefined) {
+		next.stateCheckedAt = incoming.stateCheckedAt;
+		changed = true;
+	}
+	return changed ? next : null;
+}
+
+/**
+ * Records pull requests against a task. Deduped by identity key: an existing
+ * entry keeps its position, `createdAt`, and `source` and only backfills
+ * missing snapshot fields. New entries append (first-appearance order is
+ * preserved across interleaved adds). When the cap is exceeded, the oldest
+ * non-manual entry is dropped first; only an all-manual list evicts its
+ * oldest manual entry. `added` is true only when the stored array changed.
+ */
+export function addTaskPullRequests(
+	board: RuntimeBoardData,
+	taskId: string,
+	pullRequests: RuntimeTaskPullRequest[],
+	now: number = Date.now(),
+): RuntimeAddTaskPullRequestsResult {
+	const normalizedTaskId = taskId.trim();
+	const found = normalizedTaskId ? findTaskLocation(board, normalizedTaskId) : null;
+	if (!found) {
+		return { board, task: null, added: false };
+	}
+	const task = found.task;
+	if (pullRequests.length === 0) {
+		return { board, task, added: false };
+	}
+
+	const nextPullRequests = [...(task.pullRequests ?? [])];
+	const positionByKey = new Map<string, number>();
+	nextPullRequests.forEach((pullRequest, index) => {
+		positionByKey.set(getPullRequestIdentityKey(pullRequest), index);
+	});
+
+	let changed = false;
+	for (const incoming of pullRequests) {
+		const key = getPullRequestIdentityKey(incoming);
+		const existingIndex = positionByKey.get(key);
+		if (existingIndex === undefined) {
+			positionByKey.set(key, nextPullRequests.length);
+			nextPullRequests.push({ ...incoming });
+			changed = true;
+			continue;
+		}
+		const existing = nextPullRequests[existingIndex];
+		if (existing !== undefined) {
+			const backfilled = backfillPullRequestSnapshot(existing, incoming);
+			if (backfilled !== null) {
+				nextPullRequests[existingIndex] = backfilled;
+				changed = true;
+			}
+		}
+	}
+
+	while (nextPullRequests.length > MAX_TASK_PULL_REQUESTS) {
+		let dropIndex = nextPullRequests.findIndex((pullRequest) => pullRequest.source !== "manual");
+		if (dropIndex === -1) {
+			dropIndex = 0;
+		}
+		nextPullRequests.splice(dropIndex, 1);
+		changed = true;
+	}
+
+	if (!changed) {
+		return { board, task, added: false };
+	}
+	const nextTask: RuntimeBoardCard = { ...task, pullRequests: nextPullRequests, updatedAt: now };
+	return {
+		board: replaceTaskCard(board, normalizedTaskId, nextTask),
+		task: nextTask,
+		added: true,
+	};
+}
+
+/** Removes a stored pull request by identity key (case-insensitive). */
+export function removeTaskPullRequest(
+	board: RuntimeBoardData,
+	taskId: string,
+	identityKey: string,
+	now: number = Date.now(),
+): RuntimeRemoveTaskPullRequestResult {
+	const normalizedTaskId = taskId.trim();
+	const found = normalizedTaskId ? findTaskLocation(board, normalizedTaskId) : null;
+	if (!found) {
+		return { board, task: null, removed: false };
+	}
+	const task = found.task;
+	const existing = task.pullRequests;
+	if (!existing) {
+		return { board, task, removed: false };
+	}
+	const nextPullRequests = existing.filter((pullRequest) => getPullRequestIdentityKey(pullRequest) !== identityKey);
+	if (nextPullRequests.length === existing.length) {
+		return { board, task, removed: false };
+	}
+	const nextTask: RuntimeBoardCard = { ...task, pullRequests: nextPullRequests, updatedAt: now };
+	return {
+		board: replaceTaskCard(board, normalizedTaskId, nextTask),
+		task: nextTask,
+		removed: true,
+	};
+}
+
+/**
+ * Updates the stored snapshot for one pull request. Only provided fields are
+ * set; when `title` or `state` is provided without `stateCheckedAt`, the
+ * stamp is set to `now`.
+ */
+export function updateTaskPullRequestSnapshot(
+	board: RuntimeBoardData,
+	taskId: string,
+	identityKey: string,
+	snapshot: RuntimeTaskPullRequestSnapshotUpdate,
+	now: number = Date.now(),
+): RuntimeUpdateTaskPullRequestSnapshotResult {
+	const normalizedTaskId = taskId.trim();
+	const found = normalizedTaskId ? findTaskLocation(board, normalizedTaskId) : null;
+	if (!found) {
+		return { board, task: null, updated: false };
+	}
+	const task = found.task;
+	const existing = task.pullRequests;
+	if (
+		!existing ||
+		(snapshot.title === undefined && snapshot.state === undefined && snapshot.stateCheckedAt === undefined)
+	) {
+		return { board, task, updated: false };
+	}
+	let foundMatch = false;
+	const nextPullRequests = existing.map((pullRequest) => {
+		if (getPullRequestIdentityKey(pullRequest) !== identityKey) {
+			return pullRequest;
+		}
+		foundMatch = true;
+		const next: RuntimeTaskPullRequest = { ...pullRequest };
+		if (snapshot.title !== undefined) {
+			next.title = snapshot.title;
+		}
+		if (snapshot.state !== undefined) {
+			next.state = snapshot.state;
+		}
+		if (snapshot.stateCheckedAt !== undefined) {
+			next.stateCheckedAt = snapshot.stateCheckedAt;
+		} else if (snapshot.title !== undefined || snapshot.state !== undefined) {
+			next.stateCheckedAt = now;
+		}
+		return next;
+	});
+	if (!foundMatch) {
+		return { board, task, updated: false };
+	}
+	const nextTask: RuntimeBoardCard = { ...task, pullRequests: nextPullRequests, updatedAt: now };
+	return {
+		board: replaceTaskCard(board, normalizedTaskId, nextTask),
+		task: nextTask,
 		updated: true,
 	};
 }

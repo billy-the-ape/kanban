@@ -1,6 +1,8 @@
 # PRLINK-3 — Delivery capture (B-8)
 
-Master plan: `PR_LINKING_PLAN.md` (this is milestone **PL-4**).
+**Status: Implemented.** See "Final state" below for what shipped.
+
+Master plan: `PR_LINKING_PLAN.md`.
 Depends on: **PRLINK-1** (`recordTaskPullRequests` write path; parser from PRLINK-0).
 Note: this milestone is fork-specific (B-8 deterministic delivery does not exist upstream).
 
@@ -85,4 +87,23 @@ Manual: scratch repo with GitHub remote and delivery policy `requirePullRequest`
 - Title snapshot populated on both `created` and `existing` paths where gh provides it.
 - Delivery outcome, receipt, and error handling are unaffected by PR recording (best-effort, verified by test).
 - Delivery receipts contract unchanged.
+
+## Final state
+
+Implemented per the plan; all acceptance criteria met. What shipped:
+
+- **`src/workspace/task-pull-requests.ts`** — `RecordTaskPullRequestsInput` gained an optional `snapshot: RuntimeTaskPullRequestSnapshotUpdate` (title/state/stateCheckedAt) merged into each recorded link in `toRuntimePullRequests`. The single-write-path property is preserved: the snapshot rides on the existing record call; `addTaskPullRequests` still dedupes and backfills missing snapshot fields on re-record.
+- **`src/workspace/git-delivery.ts`**
+  - The `gh pr list` dedupe query now fetches `number,url,title`; `openPullRequest` returns an `OpenPullRequestResult` (receipt-shaped PR tuple + `title: string | null`). Title sources: `created` → the composed `prTitle`; `existing` → `title` from the list result; `skipped`/`failed` → null. The `RuntimeGitDeliveryReceipt` contract is unchanged.
+  - New `recordDeliveredPullRequest` step in `finishPr`, run only when `receipt.pr.status` is `created` or `existing` (and a URL parses): records the link with `source: "delivery"` and `now: receipt.updatedAt`; the `existing` path also snapshots `state: "open"` + `stateCheckedAt: receipt.updatedAt` (the dedupe query filters `--state open`); the `created` path snapshots title only (state comes from the PRLINK-5 refresh). Wrapped in try/catch on top of `recordTaskPullRequests`' best-effort contract, so a state-write failure can never affect the delivery outcome, receipt, or response.
+  - New optional `StartGitDeliveryInput.onPullRequestRecorded(workspaceId, workspacePath)` seam, fired only when the board actually changed.
+- **`src/trpc/runtime-api.ts`** — `startTaskDelivery` wires `onPullRequestRecorded` to a fire-and-forget `deps.broadcastRuntimeWorkspaceStateUpdated?.(...)`, so connected clients see the PR link without a reload.
+- **`test/workspace/git-delivery.test.ts`** — new "PRLINK-3: delivery PR capture" suite (5 tests, HOME-redirected fixtures):
+  - created path → one card entry, source `delivery`, composed title snapshot, no state fields, broadcast fired once;
+  - existing path → one card entry with the gh-listed title, `state: "open"`, `stateCheckedAt === receipt.updatedAt`, and the `--json number,url,title` query asserted;
+  - `not_required`/`skipped` → no gh calls, no card entry;
+  - corrupted `board.json` → delivery still `ok: true` with `stage: "pr"` and the created PR receipt (best-effort isolation, no broadcast);
+  - three deliveries for the same PR → single entry, one revision bump for the state backfill, then steady-state no-churn (no further revision bumps, no extra broadcasts).
+
+Verification run: `npx @biomejs/biome check src test` clean, `npm run typecheck` clean, `npx vitest run test/workspace` (39 tests) plus the PRLINK-0/2 PR suites (`pull-request-links`, `pull-request-detection`, `hooks-pull-request-detection`, 36 tests) all pass.
 

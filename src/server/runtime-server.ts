@@ -29,6 +29,7 @@ import {
 	getKanbanRuntimeTls,
 	isKanbanRemoteHost,
 } from "../core/runtime-endpoint";
+import { createPrTrackingCoordinator } from "../pr-tracking/pr-tracking-coordinator";
 import {
 	checkRateLimit,
 	clearRateLimit,
@@ -159,11 +160,18 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		let service = clineTaskSessionServiceByWorkspaceId.get(scope.workspaceId);
 		if (!service) {
 			service = createInMemoryClineTaskSessionService({
+				// PRLINK-1: record Cline-created PRs against the workspace's
+				// repo root (task session cwds are linked worktrees).
+				workspacePath: scope.workspacePath,
 				watcherRegistry: clineWatcherRegistry,
 				// B-2.8: restarts re-resolve the launch config (context limit,
 				// compaction policy, credentials) from the current provider
 				// settings instead of replaying the start-time snapshot.
 				resolveClineLaunchConfig: (overrides) => clineProviderService.resolveLaunchConfig(overrides),
+				// PRLINK-1: open UIs pick up server-side card writes (Cline PR
+				// recording) without a reload; only fired when the card changed.
+				broadcastWorkspaceStateUpdated: (workspacePath) =>
+					void deps.runtimeStateHub.broadcastRuntimeWorkspaceStateUpdated(scope.workspaceId, workspacePath),
 			});
 			clineTaskSessionServiceByWorkspaceId.set(scope.workspaceId, service);
 			deps.runtimeStateHub.trackClineTaskSessionService(scope.workspaceId, scope.workspacePath, service);
@@ -601,6 +609,15 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 	// B-5.7/B-5.9: background maintenance; close() waits for it so no git
 	// subprocess outlives the server.
 	const startupMaintenance = runStartupTaskWorkspaceMaintenance(deps.warn);
+	// PR tracking foundation (PRTRACK-0): one runtime-wide coordinator.
+	// Starts idle with no subscriptions (fake/inspect-only demand is test
+	// scoped; PRTRACK-1 registers task-derived subscriptions). Startup never
+	// blocks: the orphan pass is background and the scheduler lock is lazy.
+	const prTrackingCoordinator = createPrTrackingCoordinator({
+		warn: (message) => deps.warn(`[pr-tracking] ${message}`),
+		logError: (message) => deps.warn(`[pr-tracking] ${message}`),
+	});
+	await prTrackingCoordinator.start();
 	const activeWorkspaceId = deps.workspaceRegistry.getActiveWorkspaceId();
 	const url = activeWorkspaceId
 		? buildKanbanRuntimeUrl(`/${encodeURIComponent(activeWorkspaceId)}`)
@@ -617,6 +634,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			);
 			clineTaskSessionServiceByWorkspaceId.clear();
 			await clineWatcherRegistry.close();
+			await prTrackingCoordinator.stop();
 			await deps.runtimeStateHub.close();
 			await terminalWebSocketBridge.close();
 			await new Promise<void>((resolveClose, rejectClose) => {
