@@ -484,6 +484,11 @@ store, never clobbered.
   being refreshed; a successful poll cycle does the same for a cleared
   auth blocker. `applyScopeChange` re-keys stranded subscriptions to the
   resolved scope so an account switch does not leave them blocked forever.
+- The in-flight cap now hands a freed slot DIRECTLY to the next waiter
+  (the counter is untouched on hand-off), so `inFlight` can never
+  temporarily exceed the limit in the window between a release and the
+  woken waiter's resume. Also removed a duplicated JSDoc block on
+  `resolveAccessScope`.
 
 **Deviations/refinements noted during implementation**
 

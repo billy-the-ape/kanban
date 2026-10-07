@@ -191,7 +191,7 @@ export class GitHubGhAdapter {
 	private readonly cwd: string;
 	private readonly inFlightLimit: number;
 	private inFlight = 0;
-	private waiters: Array<() => void> = [];
+	private waiters: Array<{ wake: () => void; handedSlot: boolean }> = [];
 	private cachedRateLimitResetAt: number | null = null;
 
 	constructor(options: GitHubGhAdapterOptions = {}) {
@@ -206,23 +206,39 @@ export class GitHubGhAdapter {
 		this.inFlightLimit = options.inFlightLimit ?? PR_MAX_IN_FLIGHT_READS;
 	}
 
+	/**
+	 * In-flight read cap. `inFlight` counts the slots currently held,
+	 * INCLUDING slots already handed to a woken-but-not-yet-resumed waiter,
+	 * so it never exceeds `inFlightLimit`.
+	 */
 	private async acquireSlot(): Promise<void> {
 		if (this.inFlight < this.inFlightLimit) {
 			this.inFlight += 1;
 			return;
 		}
+		const entry: { wake: () => void; handedSlot: boolean } = { wake: () => {}, handedSlot: false };
+		this.waiters.push(entry);
 		await new Promise<void>((resolve) => {
-			this.waiters.push(resolve);
+			entry.wake = resolve;
 		});
-		this.inFlight += 1;
+		if (!entry.handedSlot) {
+			// Defensive: a waiter is only woken via a direct hand-off.
+			this.inFlight += 1;
+		}
 	}
 
 	private releaseSlot(): void {
-		this.inFlight -= 1;
 		const next = this.waiters.shift();
 		if (next) {
-			next();
+			// Hand the freed slot directly to the waiter without touching
+			// the counter: a fresh acquireSlot cannot steal the slot in the
+			// window before the waiter resumes, so the cap is never
+			// temporarily exceeded.
+			next.handedSlot = true;
+			next.wake();
+			return;
 		}
+		this.inFlight -= 1;
 	}
 
 	private classifyExit(result: GhRunnerCommandResult): RestCallOutcome {

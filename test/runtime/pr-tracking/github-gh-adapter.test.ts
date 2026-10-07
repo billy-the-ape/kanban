@@ -317,6 +317,61 @@ describe("github-gh-adapter", () => {
 		expect(calls).toHaveLength(4);
 	});
 
+	it("never exceeds the cap while handing a slot to a woken waiter", async () => {
+		// 49 and 50 hold both slots (gated); 51 and 52 wait. When 49 releases,
+		// its slot must be handed directly to 51 BEFORE 51 resumes — a fresh
+		// caller landing in that window must queue, not jump past the cap
+		// (the old decrement-then-increment hand-off let the count exceed it).
+		let inFlight = 0;
+		let observedMax = 0;
+		const gate49: { release: (() => void) | null } = { release: null };
+		const gate50: { release: (() => void) | null } = { release: null };
+		const g49 = new Promise<void>((resolve) => {
+			gate49.release = resolve;
+		});
+		const g50 = new Promise<void>((resolve) => {
+			gate50.release = resolve;
+		});
+		const runner = async (args: string[], _cwd: string): Promise<GhRunnerCommandResult> => {
+			inFlight += 1;
+			observedMax = Math.max(observedMax, inFlight);
+			if (args.includes("pulls/49")) {
+				await g49;
+			}
+			if (args.includes("pulls/50")) {
+				await g50;
+			}
+			inFlight -= 1;
+			return {
+				ok: true,
+				stdout: JSON.stringify({ state: "open", head: { sha: "x" }, base: { ref: "main" } }),
+				stderr: "",
+				exitCode: 0,
+				missingBinary: false,
+			};
+		};
+		const adapter = createGitHubGhAdapter({
+			ghRunner: runner,
+			now: () => NOW,
+			cwd: "/tmp/fake-repo",
+			inFlightLimit: 2,
+		});
+		const first = adapter.readPrMetadata(PARSED, SCOPE); // 49: holds slot 1
+		const second = adapter.readPrMetadata({ ...PARSED, number: 50 }, SCOPE); // 50: slot 2
+		const third = adapter.readPrMetadata({ ...PARSED, number: 51 }, SCOPE); // waits
+		const fourth = adapter.readPrMetadata({ ...PARSED, number: 52 }, SCOPE); // waits
+		// Let 51/52 enter the waiter queue.
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		// 49 releases its slot; the woken waiter (51) has not resumed yet.
+		gate49.release?.();
+		// Land a fresh caller in the hand-off window.
+		await Promise.resolve();
+		const fifth = adapter.readPrMetadata({ ...PARSED, number: 53 }, SCOPE);
+		gate50.release?.();
+		await Promise.all([first, second, third, fourth, fifth]);
+		expect(observedMax).toBeLessThanOrEqual(2);
+	});
+
 	it("paginates GraphQL review threads into a per-comment thread map", async () => {
 		// Fixtures mirror `gh api graphql` output: the FULL GitHub response
 		// body, {data: {node: …}}.
