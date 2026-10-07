@@ -2469,18 +2469,20 @@ export const GITHUB_PR_TRACKING_RECORD_SCHEMA_VERSION = 1;
  * (hash of host + authenticated login + credential source — never token
  * material). Stored inside the record keyed by accessScopeId.
  */
-export const githubPrMetadataSnapshotSchema = z.object({
-	accessScopeId: z.string(),
-	checkedAt: z.number(),
-	state: z.enum(["open", "closed", "draft", "merged"]),
-	headRepository: z.string().nullable(),
-	headRef: z.string().nullable(),
-	baseRepository: z.string().nullable(),
-	baseRef: z.string().nullable(),
-	headSha: z.string().nullable(),
-	mergedAt: z.number().nullable(),
-	mergeCommitSha: z.string().nullable(),
-});
+export const githubPrMetadataSnapshotSchema = z
+	.object({
+		accessScopeId: z.string(),
+		checkedAt: z.number(),
+		state: z.enum(["open", "closed", "draft", "merged"]),
+		headRepository: z.string().nullable(),
+		headRef: z.string().nullable(),
+		baseRepository: z.string().nullable(),
+		baseRef: z.string().nullable(),
+		headSha: z.string().nullable(),
+		mergedAt: z.number().nullable(),
+		mergeCommitSha: z.string().nullable(),
+	})
+	.passthrough();
 export type GitHubPrMetadataSnapshot = z.infer<typeof githubPrMetadataSnapshotSchema>;
 
 /**
@@ -2489,11 +2491,13 @@ export type GitHubPrMetadataSnapshot = z.infer<typeof githubPrMetadataSnapshotSc
  * watermark, and the sorted version tokens at that exact watermark. Never a
  * bare string.
  */
-export const githubPrFeedbackFingerprintSchema = z.object({
-	digest: z.string(),
-	latestUpdatedAt: z.number(),
-	tokensAtWatermark: z.array(z.string()),
-});
+export const githubPrFeedbackFingerprintSchema = z
+	.object({
+		digest: z.string(),
+		latestUpdatedAt: z.number(),
+		tokensAtWatermark: z.array(z.string()),
+	})
+	.passthrough();
 export type GitHubPrFeedbackFingerprint = z.infer<typeof githubPrFeedbackFingerprintSchema>;
 
 export const githubPrTaskIdentitySchema = z.object({
@@ -2506,53 +2510,59 @@ export type GitHubPrTaskIdentity = z.infer<typeof githubPrTaskIdentitySchema>;
 export const githubPrCommentDispatchStatusSchema = z.enum(["queued", "running", "completed", "failed"]);
 export type GitHubPrCommentDispatchStatus = z.infer<typeof githubPrCommentDispatchStatusSchema>;
 
-export const githubPrCommentDispatchSchema = z.object({
-	dispatchId: z.string(),
-	/** Null while provably unsent; persisted immediately before invoking chat send. */
-	attemptedAt: z.number().nullable(),
-	fingerprint: githubPrFeedbackFingerprintSchema,
-	ownerRevision: z.number(),
-	status: githubPrCommentDispatchStatusSchema,
-	turnReference: z.string().nullable(),
-	error: z.string().nullable(),
-});
+export const githubPrCommentDispatchSchema = z
+	.object({
+		dispatchId: z.string(),
+		/** Null while provably unsent; persisted immediately before invoking chat send. */
+		attemptedAt: z.number().nullable(),
+		fingerprint: githubPrFeedbackFingerprintSchema,
+		ownerRevision: z.number(),
+		status: githubPrCommentDispatchStatusSchema,
+		turnReference: z.string().nullable(),
+		error: z.string().nullable(),
+	})
+	.passthrough();
 export type GitHubPrCommentDispatch = z.infer<typeof githubPrCommentDispatchSchema>;
 
-export const githubPrCommentAutomationSchema = z.object({
-	repairOwner: githubPrTaskIdentitySchema
-		.extend({
-			ownerRevision: z.number(),
-		})
-		.nullable(),
-	pendingFeedbackFingerprint: githubPrFeedbackFingerprintSchema.nullable(),
-	lastDispatchedFeedbackFingerprint: githubPrFeedbackFingerprintSchema.nullable(),
-	debounceDeadline: z.number().nullable(),
-	firstPendingAt: z.number().nullable(),
-	dispatch: githubPrCommentDispatchSchema.nullable(),
-});
+export const githubPrCommentAutomationSchema = z
+	.object({
+		repairOwner: githubPrTaskIdentitySchema
+			.extend({
+				ownerRevision: z.number(),
+			})
+			.nullable(),
+		pendingFeedbackFingerprint: githubPrFeedbackFingerprintSchema.nullable(),
+		lastDispatchedFeedbackFingerprint: githubPrFeedbackFingerprintSchema.nullable(),
+		debounceDeadline: z.number().nullable(),
+		firstPendingAt: z.number().nullable(),
+		dispatch: githubPrCommentDispatchSchema.nullable(),
+	})
+	.passthrough();
 export type GitHubPrCommentAutomation = z.infer<typeof githubPrCommentAutomationSchema>;
 
 /** Merge completion binding on a task binding (semantics frozen by the merge plan). */
 export const githubPrMergeCompletionStatusSchema = z.enum(["pending", "completed", "blocked"]);
 export type GitHubPrMergeCompletionStatus = z.infer<typeof githubPrMergeCompletionStatusSchema>;
 
-export const githubPrMergeCompletionSchema = z.object({
-	schemaVersion: z.literal(GITHUB_PR_TRACKING_RECORD_SCHEMA_VERSION),
-	workspaceId: z.string(),
-	taskId: z.string(),
-	linkGeneration: z.number().int().nonnegative(),
-	/** Canonical PR identity this binding was selected against. */
-	prKey: z.string(),
-	finalHeadSha: z.string().nullable(),
-	baseRepository: z.string().nullable(),
-	baseRef: z.string().nullable(),
-	mergeCommitSha: z.string().nullable(),
-	mergedAt: z.number().nullable(),
-	observedAt: z.number(),
-	status: githubPrMergeCompletionStatusSchema,
-	completedAt: z.number().nullable(),
-	error: z.string().nullable(),
-});
+export const githubPrMergeCompletionSchema = z
+	.object({
+		schemaVersion: z.literal(GITHUB_PR_TRACKING_RECORD_SCHEMA_VERSION),
+		workspaceId: z.string(),
+		taskId: z.string(),
+		linkGeneration: z.number().int().nonnegative(),
+		/** Canonical PR identity this binding was selected against. */
+		prKey: z.string(),
+		finalHeadSha: z.string().nullable(),
+		baseRepository: z.string().nullable(),
+		baseRef: z.string().nullable(),
+		mergeCommitSha: z.string().nullable(),
+		mergedAt: z.number().nullable(),
+		observedAt: z.number(),
+		status: githubPrMergeCompletionStatusSchema,
+		completedAt: z.number().nullable(),
+		error: z.string().nullable(),
+	})
+	.passthrough();
 export type GitHubPrMergeCompletion = z.infer<typeof githubPrMergeCompletionSchema>;
 
 /**
@@ -2563,31 +2573,36 @@ export type GitHubPrMergeCompletion = z.infer<typeof githubPrMergeCompletionSche
 export const githubPrOperationReservationStateSchema = z.enum(["none", "reserved"]);
 export type GitHubPrOperationReservationState = z.infer<typeof githubPrOperationReservationStateSchema>;
 
-export const githubPrOperationReservationSchema = z.object({
-	ownerRevision: z.number().int().nonnegative(),
-	fencingGeneration: z.number().int().nonnegative(),
-	state: githubPrOperationReservationStateSchema,
-	reservedBy: githubPrTaskIdentitySchema.nullable(),
-	/** Operation kind holding the reservation (e.g. "comment_followup"). */
-	reservedOperation: z.string().nullable(),
-	/** Set while an explicit repair-owner transfer handoff is in progress. */
-	transferHandoff: z
-		.object({
-			fromWorkspaceId: z.string(),
-			fromTaskId: z.string(),
-			toWorkspaceId: z.string(),
-			toTaskId: z.string(),
-			handedOffAt: z.number(),
-		})
-		.nullable(),
-});
+export const githubPrOperationReservationSchema = z
+	.object({
+		ownerRevision: z.number().int().nonnegative(),
+		fencingGeneration: z.number().int().nonnegative(),
+		state: githubPrOperationReservationStateSchema,
+		reservedBy: githubPrTaskIdentitySchema.nullable(),
+		/** Operation kind holding the reservation (e.g. "comment_followup"). */
+		reservedOperation: z.string().nullable(),
+		/** Set while an explicit repair-owner transfer handoff is in progress. */
+		transferHandoff: z
+			.object({
+				fromWorkspaceId: z.string(),
+				fromTaskId: z.string(),
+				toWorkspaceId: z.string(),
+				toTaskId: z.string(),
+				handedOffAt: z.number(),
+			})
+			.passthrough()
+			.nullable(),
+	})
+	.passthrough();
 export type GitHubPrOperationReservation = z.infer<typeof githubPrOperationReservationSchema>;
 
 /** Durable replay cursors live on each task binding, per consumer kind. */
-export const githubPrReplayCursorsSchema = z.object({
-	comments: z.number().int().nonnegative().optional(),
-	merge: z.number().int().nonnegative().optional(),
-});
+export const githubPrReplayCursorsSchema = z
+	.object({
+		comments: z.number().int().nonnegative().optional(),
+		merge: z.number().int().nonnegative().optional(),
+	})
+	.passthrough();
 export type GitHubPrReplayCursors = z.infer<typeof githubPrReplayCursorsSchema>;
 
 export const githubPrTerminalStopReasonSchema = z.enum([
@@ -2609,54 +2624,61 @@ export const githubPrTerminalStopReasonSchema = z.enum([
 ]);
 export type GitHubPrTerminalStopReason = z.infer<typeof githubPrTerminalStopReasonSchema>;
 
-export const githubPrTaskBindingSchema = z.object({
-	workspaceId: z.string(),
-	taskId: z.string(),
-	/**
-	 * Monotonic per-binding link generation. Re-establishing a subscription for
-	 * the same handled PR increments the generation without erasing consumed
-	 * markers (terminalStop / mergeCompletion survive).
-	 */
-	linkGeneration: z.number().int().nonnegative(),
-	linkedAt: z.number(),
-	/** Persisted terminal observation + stop reason; restart cannot rearm from it. */
-	terminalStop: z
-		.object({
-			reason: githubPrTerminalStopReasonSchema,
-			observedAt: z.number(),
-			/** Remote reads used by the terminal reconciliation episode. */
-			reconciliationReads: z.number().int().nonnegative(),
-		})
-		.nullable(),
-	mergeCompletion: githubPrMergeCompletionSchema.nullable(),
-	replayCursors: githubPrReplayCursorsSchema,
-});
+export const githubPrTaskBindingSchema = z
+	.object({
+		workspaceId: z.string(),
+		taskId: z.string(),
+		/**
+		 * Monotonic per-binding link generation. Re-establishing a subscription for
+		 * the same handled PR increments the generation without erasing consumed
+		 * markers (terminalStop / mergeCompletion survive).
+		 */
+		linkGeneration: z.number().int().nonnegative(),
+		linkedAt: z.number(),
+		/** Persisted terminal observation + stop reason; restart cannot rearm from it. */
+		terminalStop: z
+			.object({
+				reason: githubPrTerminalStopReasonSchema,
+				observedAt: z.number(),
+				/** Remote reads used by the terminal reconciliation episode. */
+				reconciliationReads: z.number().int().nonnegative(),
+			})
+			.passthrough()
+			.nullable(),
+		mergeCompletion: githubPrMergeCompletionSchema.nullable(),
+		replayCursors: githubPrReplayCursorsSchema,
+	})
+	.passthrough();
 export type GitHubPrTaskBinding = z.infer<typeof githubPrTaskBindingSchema>;
 
 /**
  * The durable GitHub PR tracking record: one per canonical PR identity, stored
  * under the runtime home, schema version 1, revision-checked atomic updates.
+ * All record-level objects are passthrough: fields added by newer builds are
+ * preserved through revision-checked updates instead of being stripped.
  */
-export const githubPrTrackingRecordSchema = z.object({
-	schemaVersion: z.literal(GITHUB_PR_TRACKING_RECORD_SCHEMA_VERSION),
-	revision: z.number().int().nonnegative(),
-	updatedAt: z.number(),
-	canonicalPrKey: z.string(),
-	provider: z.literal("github"),
-	host: z.string(),
-	repository: z.string(),
-	number: z.number().int().positive(),
-	/**
-	 * Timestamp the record was first observed orphaned (no current card links
-	 * this PR); starts the 24-hour retention clock. Null while linked.
-	 */
-	orphanedAt: z.number().nullable(),
-	/** Authorized metadata snapshots keyed by opaque accessScopeId. */
-	snapshots: z.record(z.string(), githubPrMetadataSnapshotSchema),
-	taskBindings: z.array(githubPrTaskBindingSchema),
-	commentAutomation: githubPrCommentAutomationSchema,
-	reservation: githubPrOperationReservationSchema,
-});
+export const githubPrTrackingRecordSchema = z
+	.object({
+		schemaVersion: z.literal(GITHUB_PR_TRACKING_RECORD_SCHEMA_VERSION),
+		revision: z.number().int().nonnegative(),
+		updatedAt: z.number(),
+		canonicalPrKey: z.string(),
+		provider: z.literal("github"),
+		host: z.string(),
+		repository: z.string(),
+		number: z.number().int().positive(),
+		/**
+		 * Timestamp the record was first observed orphaned (no current card links
+		 * this PR); starts the 24-hour retention clock. Null while linked.
+		 */
+		orphanedAt: z.number().nullable(),
+		/** Authorized metadata snapshots keyed by opaque accessScopeId. */
+		snapshots: z.record(z.string(), githubPrMetadataSnapshotSchema),
+		taskBindings: z.array(githubPrTaskBindingSchema),
+		commentAutomation: githubPrCommentAutomationSchema,
+		reservation: githubPrOperationReservationSchema,
+	})
+	.passthrough();
 export type GitHubPrTrackingRecord = z.infer<typeof githubPrTrackingRecordSchema>;
 
 // ── Transient normalized observation types (never persisted whole) ───────────
@@ -2681,8 +2703,13 @@ export const githubPrNormalizedFeedbackEventSchema = z.object({
 	reviewState: z.enum(["submitted", "pending"]).nullable(),
 	/** Inline comments only: thread resolved flag (null when not thread-scoped). */
 	threadResolved: z.boolean().nullable(),
-	/** Inline comments only: thread deleted/outdated flag. */
+	/**
+	 * Inline comments only: thread deleted flag. Outdated (diff moved) is NOT
+	 * treated as deleted and is carried separately in `threadOutdated`.
+	 */
 	threadDeleted: z.boolean().nullable(),
+	/** Inline comments only: thread outdated flag (diff moved under the comment). */
+	threadOutdated: z.boolean().nullable(),
 	updatedAt: z.number(),
 	/** SHA-256 digest of the event body (bodies themselves stay transient). */
 	bodyDigest: z.string(),

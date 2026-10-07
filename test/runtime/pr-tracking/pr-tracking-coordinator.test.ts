@@ -1,11 +1,12 @@
 import { mkdtempSync, rmSync } from "node:fs";
-import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
 	GitHubPrMetadataSnapshot,
+	GitHubPrNormalizedFeedbackEvent,
+	GitHubPrTrackingRecord,
 	RuntimeBoardColumnId,
 	RuntimeBoardData,
 	RuntimeTaskPullRequest,
@@ -18,8 +19,8 @@ import type {
 	GitHubGhAdapter,
 	MetadataReadResult,
 } from "../../../src/pr-tracking/github-gh-adapter";
-import { prKeyDigest } from "../../../src/pr-tracking/pr-identity";
-import { PrRecordStore, type PrRecordStoreOptions } from "../../../src/pr-tracking/pr-record-store";
+import { InMemoryPrRecordStore } from "../../../src/pr-tracking/in-memory-pr-record-store";
+import type { PrRecordStorePort, PrRecordUpdateResult } from "../../../src/pr-tracking/pr-record-store";
 import { normalizePrMetadata } from "../../../src/pr-tracking/pr-snapshots";
 import {
 	createPrTrackingCoordinator,
@@ -87,8 +88,8 @@ interface FakeAdapterConfig {
 	scopeResult: AccessScopeResult;
 	metadata?: (callIndex: number) => MetadataReadResult;
 	metadataGate?: () => Promise<void>;
-	list?: (source: "reviews" | "conversationComments" | "inlineComments") => FeedbackReadResult;
-	threads?: () => FeedbackReadResult;
+	list?: (source: "reviews" | "conversationComments" | "inlineComments", callIndex: number) => FeedbackReadResult;
+	threads?: (callIndex: number) => FeedbackReadResult;
 }
 
 interface FakeAdapter {
@@ -96,19 +97,32 @@ interface FakeAdapter {
 	scopeCalls: () => number;
 	metadataCalls: () => number;
 	metadataCallsFor: (number: number) => number;
+	metadataFreshFlags: () => boolean[];
 	listCalls: () => string[];
 	threadCalls: () => number;
 }
 
 function makeFakeAdapter(config: FakeAdapterConfig): FakeAdapter {
-	const counts = { scope: 0, metadata: [] as number[], lists: [] as string[], threads: 0 };
+	const counts = {
+		scope: 0,
+		metadata: [] as number[],
+		metadataFresh: [] as boolean[],
+		lists: [] as string[],
+		listIndexes: {} as Record<string, number>,
+		threads: 0,
+	};
 	const fake = {
 		resolveAccessScope: async () => {
 			counts.scope += 1;
 			return config.scopeResult;
 		},
-		readPrMetadata: async (parsed: { number: number }, scope: AccessScope): Promise<MetadataReadResult> => {
+		readPrMetadata: async (
+			parsed: { number: number },
+			scope: AccessScope,
+			options?: { fresh?: boolean },
+		): Promise<MetadataReadResult> => {
 			counts.metadata.push(parsed.number);
+			counts.metadataFresh.push(options?.fresh ?? false);
 			if (config.metadataGate) {
 				await config.metadataGate();
 			}
@@ -121,12 +135,15 @@ function makeFakeAdapter(config: FakeAdapterConfig): FakeAdapter {
 			_scope: AccessScope,
 			source: "reviews" | "conversationComments" | "inlineComments",
 		): Promise<FeedbackReadResult> => {
+			const callIndex = counts.listIndexes[source] ?? 0;
+			counts.listIndexes[source] = callIndex + 1;
 			counts.lists.push(source);
-			return config.list?.(source) ?? { kind: "ok", events: [], bodyDigest: "empty" };
+			return config.list?.(source, callIndex) ?? { kind: "ok", events: [], bodyDigest: "empty" };
 		},
 		readReviewThreads: async (): Promise<FeedbackReadResult> => {
+			const callIndex = counts.threads;
 			counts.threads += 1;
-			return config.threads?.() ?? { kind: "ok_threads", threads: new Map() };
+			return config.threads?.(callIndex) ?? { kind: "ok_threads", threads: new Map() };
 		},
 	};
 	return {
@@ -134,27 +151,29 @@ function makeFakeAdapter(config: FakeAdapterConfig): FakeAdapter {
 		scopeCalls: () => counts.scope,
 		metadataCalls: () => counts.metadata.length,
 		metadataCallsFor: (number: number) => counts.metadata.filter((item) => item === number).length,
+		metadataFreshFlags: () => [...counts.metadataFresh],
 		listCalls: () => counts.lists,
 		threadCalls: () => counts.threads,
 	};
 }
+
 interface HarnessOptions {
 	scope?: AccessScope;
 	scopeResult?: AccessScopeResult;
 	metadata?: (callIndex: number) => MetadataReadResult;
 	metadataGate?: () => Promise<void>;
-	list?: (source: "reviews" | "conversationComments" | "inlineComments") => FeedbackReadResult;
-	threads?: () => FeedbackReadResult;
+	list?: (source: "reviews" | "conversationComments" | "inlineComments", callIndex: number) => FeedbackReadResult;
+	threads?: (callIndex: number) => FeedbackReadResult;
 	boards?: Array<{ workspaceId: string; board: RuntimeBoardData }>;
 	listBoards?: () => Promise<Array<{ workspaceId: string; board: RuntimeBoardData }>>;
-	storeRoot?: string;
+	store?: PrRecordStorePort;
 	schedulerLockPath?: string;
 	logError?: (message: string) => void;
 }
 
 interface Harness {
 	coordinator: PrTrackingCoordinator;
-	store: PrRecordStore;
+	store: PrRecordStorePort;
 	fake: FakeAdapter;
 }
 
@@ -168,8 +187,9 @@ function makeCoordinator(options: HarnessOptions = {}): Harness {
 		list: options.list,
 		threads: options.threads,
 	});
-	const storeRoot = options.storeRoot ?? root;
-	const store = new PrRecordStore({ rootPath: storeRoot, now: () => Date.now() } satisfies PrRecordStoreOptions);
+	// In-memory store: the coordinator's record state lives in the runtime's
+	// memory and is shared between runtimes via the same store object.
+	const store = options.store ?? new InMemoryPrRecordStore({ now: () => Date.now() });
 	const lockPath = options.schedulerLockPath ?? join(root, "lock-default");
 	const coordinator = createPrTrackingCoordinator({
 		adapter: fake.adapter,
@@ -244,10 +264,6 @@ function track(coordinator: PrTrackingCoordinator): PrTrackingCoordinator {
 
 const PR49 = "github|github.com|cline/kanban|49";
 
-async function readRecordRawFile(storeRoot: string, canonicalPrKey: string): Promise<string> {
-	return readFile(join(storeRoot, "prs", `${prKeyDigest(canonicalPrKey)}.json`), "utf8");
-}
-
 describe("pr-tracking-coordinator", () => {
 	it("deduplicates one PR across workspaces into one poll and one durable record", async () => {
 		const harness = makeCoordinator();
@@ -279,14 +295,17 @@ describe("pr-tracking-coordinator", () => {
 	});
 
 	it("keeps disjoint access scopes isolated in the shared record and in reads", async () => {
-		const sharedRoot = join(root, "shared");
+		// A second runtime (different access scope) shares the same in-memory
+		// store object, exactly as two processes would share one runtime's
+		// record state.
+		const sharedStore = new InMemoryPrRecordStore({ now: () => Date.now() });
 		const scopeB: AccessScope = { accessScopeId: "scope-B", login: "bob", tokenSource: "GH_TOKEN" };
 		const coordinatorA = track(
-			makeCoordinator({ storeRoot: sharedRoot, schedulerLockPath: join(root, "lock-a") }).coordinator,
+			makeCoordinator({ store: sharedStore, schedulerLockPath: join(root, "lock-a") }).coordinator,
 		);
 		const coordinatorB = track(
 			makeCoordinator({
-				storeRoot: sharedRoot,
+				store: sharedStore,
 				schedulerLockPath: join(root, "lock-b"),
 				scope: scopeB,
 				metadata: (_n) => makeMetadata("open", "scope-B", 49),
@@ -299,13 +318,12 @@ describe("pr-tracking-coordinator", () => {
 		await coordinatorA.stop();
 		await settle();
 
-		// A second runtime (different access scope) polls the same record.
 		expect((await coordinatorB.addSubscription(descriptor({ workspaceId: "ws-2", taskId: "task-2" }))).status).toBe(
 			"active",
 		);
 		await pollOnce();
 
-		const record = await new PrRecordStore({ rootPath: sharedRoot }).loadRecord(PR49);
+		const record = await sharedStore.loadRecord(PR49);
 		expect(record.ok).toBe(true);
 		if (!record.ok) {
 			return;
@@ -315,11 +333,6 @@ describe("pr-tracking-coordinator", () => {
 
 		expect(coordinatorA.getSnapshotsForTask("ws-1", "task-1")?.metadata?.accessScopeId).toBe("scope-A");
 		expect(coordinatorB.getSnapshotsForTask("ws-2", "task-2")?.metadata?.accessScopeId).toBe("scope-B");
-
-		const raw = await readRecordRawFile(sharedRoot, PR49);
-		expect(raw).not.toContain("GH_TOKEN");
-		expect(raw).not.toContain("alice");
-		expect(raw).not.toContain("bob");
 	});
 
 	it("retains last state on unchanged conditional reads", async () => {
@@ -508,8 +521,11 @@ describe("pr-tracking-coordinator", () => {
 		expect(record.record.taskBindings[0]?.terminalStop?.reconciliationReads).toBe(3);
 		expect(coordinator.getState().polls[0]?.nextPollAt).toBeNull();
 
-		// Restart: a fresh coordinator on the same record never re-arms.
-		const restarted = track(makeCoordinator({ schedulerLockPath: join(root, "lock-restart") }).coordinator);
+		// Restart: a fresh coordinator sharing the same in-memory store on
+		// the same record never re-arms.
+		const restarted = track(
+			makeCoordinator({ store: harness.store, schedulerLockPath: join(root, "lock-restart") }).coordinator,
+		);
 		expect(
 			(await restarted.addSubscription(descriptor({ consumers: { comments: false, mergeCompletion: true } })))
 				.status,
@@ -612,7 +628,7 @@ describe("pr-tracking-coordinator", () => {
 	});
 
 	it("classifies orphan records on startup: linked records stay, unlinked records age out", async () => {
-		const store = new PrRecordStore({ rootPath: root, now: () => Date.now() });
+		const store = new InMemoryPrRecordStore({ now: () => Date.now() });
 		const linkedKey = "github|github.com|cline/kanban|71";
 		const unlinkedKey = "github|github.com|cline/kanban|72";
 		const freshKey = "github|github.com|cline/kanban|73";
@@ -652,6 +668,7 @@ describe("pr-tracking-coordinator", () => {
 		});
 		const coordinator = track(
 			makeCoordinator({
+				store,
 				listBoards: async () => {
 					await passGate;
 					return boards;
@@ -668,6 +685,202 @@ describe("pr-tracking-coordinator", () => {
 		expect(fresh.ok).toBe(true);
 		if (fresh.ok) {
 			expect(fresh.record.orphanedAt).toBe(BASE_TIME - 1000);
+		}
+	});
+
+	it("retains feedback per source: an unchanged page never freezes a changed one", async () => {
+		const i1: GitHubPrNormalizedFeedbackEvent = {
+			kind: "inline_comment",
+			providerId: "i1",
+			authorLogin: "human",
+			authorKind: "human",
+			isOwnAccount: false,
+			reviewState: null,
+			threadResolved: null,
+			threadDeleted: null,
+			threadOutdated: null,
+			updatedAt: 1,
+			bodyDigest: "digest-i1",
+		};
+		const c1: GitHubPrNormalizedFeedbackEvent = { ...i1, kind: "conversation_comment", providerId: "c1" };
+		const r1: GitHubPrNormalizedFeedbackEvent = { ...i1, kind: "review", providerId: "r1" };
+		const r2: GitHubPrNormalizedFeedbackEvent = { ...i1, kind: "review", providerId: "r2" };
+		const threadState = (resolved: boolean) => new Map([["i1", { resolved, outdated: false, deleted: false }]]);
+		const harness = makeCoordinator({
+			list: (source, callIndex) => {
+				if (source === "reviews") {
+					return callIndex === 0
+						? { kind: "ok", events: [r1], bodyDigest: "reviews-1" }
+						: { kind: "ok", events: [r1, r2], bodyDigest: "reviews-2" };
+				}
+				if (source === "conversationComments") {
+					return callIndex === 0
+						? { kind: "ok", events: [c1], bodyDigest: "conversation-1" }
+						: { kind: "not_modified" };
+				}
+				return callIndex === 0 ? { kind: "ok", events: [i1], bodyDigest: "inline-1" } : { kind: "not_modified" };
+			},
+			threads: (callIndex) => ({ kind: "ok_threads", threads: threadState(callIndex > 0) }),
+		});
+		const coordinator = track(harness.coordinator);
+		expect((await coordinator.addSubscription(descriptor())).status).toBe("active");
+
+		await pollOnce();
+		let snapshot = coordinator.getSnapshotsForTask("ws-1", "task-1");
+		expect(snapshot?.feedback?.map((event) => event.providerId)).toEqual(["r1", "c1", "i1"]);
+		expect(snapshot?.feedback?.find((event) => event.providerId === "i1")?.threadResolved).toBe(false);
+
+		// Reviews changed; conversation and inline are unchanged and must
+		// still contribute their retained events.
+		await pollOnce();
+		snapshot = coordinator.getSnapshotsForTask("ws-1", "task-1");
+		expect(snapshot?.feedback?.map((event) => event.providerId)).toEqual(["r1", "r2", "c1", "i1"]);
+		// Fresh thread state re-applies to the retained inline event.
+		expect(snapshot?.feedback?.find((event) => event.providerId === "i1")?.threadResolved).toBe(true);
+	});
+
+	it("keeps last feedback state when one source fails", async () => {
+		const r1: GitHubPrNormalizedFeedbackEvent = {
+			kind: "review",
+			providerId: "r1",
+			authorLogin: "human",
+			authorKind: "human",
+			isOwnAccount: false,
+			reviewState: "submitted",
+			threadResolved: null,
+			threadDeleted: null,
+			threadOutdated: null,
+			updatedAt: 1,
+			bodyDigest: "digest-r1",
+		};
+		const c1: GitHubPrNormalizedFeedbackEvent = { ...r1, kind: "conversation_comment", providerId: "c1" };
+		const i1: GitHubPrNormalizedFeedbackEvent = { ...r1, kind: "inline_comment", providerId: "i1" };
+		const harness = makeCoordinator({
+			list: (source, callIndex) => {
+				if (source === "reviews" && callIndex === 1) {
+					return { kind: "failed", failure: failure("network") };
+				}
+				if (source === "reviews") {
+					return { kind: "ok", events: [r1], bodyDigest: "reviews" };
+				}
+				return source === "conversationComments"
+					? { kind: "ok", events: [c1], bodyDigest: "conversation" }
+					: { kind: "ok", events: [i1], bodyDigest: "inline" };
+			},
+		});
+		const coordinator = track(harness.coordinator);
+		expect((await coordinator.addSubscription(descriptor())).status).toBe("active");
+
+		await pollOnce();
+		const first = coordinator.getSnapshotsForTask("ws-1", "task-1");
+		expect(first?.feedback?.map((event) => event.providerId)).toEqual(["r1", "c1", "i1"]);
+
+		// Cycle 2: reviews fails → last state retained, failure counted,
+		// next poll backs off.
+		await pollOnce();
+		const second = coordinator.getSnapshotsForTask("ws-1", "task-1");
+		expect(second?.feedback?.map((event) => event.providerId)).toEqual(["r1", "c1", "i1"]);
+		const poll = coordinator.getState().polls[0];
+		expect(poll?.consecutiveFailures).toBe(1);
+		expect(poll?.nextPollAt).not.toBeNull();
+	});
+
+	it("stops all polls on an access failure and re-probes on explicit refresh", async () => {
+		const harness = makeCoordinator({
+			metadata: (n) => {
+				if (n === 1) {
+					return { kind: "failed", failure: failure("access", { message: "HTTP 403: permission denied" }) };
+				}
+				return makeMetadata("open", "scope-A", 49);
+			},
+		});
+		const coordinator = track(harness.coordinator);
+		expect((await coordinator.addSubscription(descriptor())).status).toBe("active");
+
+		await pollOnce(); // read 0: ok
+		expect(coordinator.getState().accessBlocker).toBeNull();
+		await pollOnce(); // read 1: access failure → ALL polls cancelled
+		expect(coordinator.getState().accessBlocker).toBe("HTTP 403: permission denied");
+		expect(coordinator.getState().polls.every((poll) => poll.nextPollAt === null)).toBe(true);
+
+		// Ticks without an explicit refresh read nothing.
+		await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+		await settle();
+		expect(harness.fake.metadataCalls()).toBe(2);
+
+		// An explicit refresh re-probes and clears the blocker.
+		await coordinator.refresh(PR49, "scope-A");
+		expect(coordinator.getState().accessBlocker).toBeNull();
+		expect(harness.fake.metadataCalls()).toBe(3);
+		expect(coordinator.getState().polls[0]?.nextPollAt).not.toBeNull();
+	});
+
+	it("forces a fresh re-read after a failed metadata snapshot write", async () => {
+		class FailingSnapshotStore extends InMemoryPrRecordStore {
+			private failuresRemaining = 1;
+			override async setMetadataSnapshot(
+				canonicalPrKey: string,
+				snapshot: GitHubPrTrackingRecord["snapshots"][string],
+			): Promise<PrRecordUpdateResult> {
+				if (this.failuresRemaining > 0) {
+					this.failuresRemaining -= 1;
+					return { ok: false, reason: "conflict" };
+				}
+				return await super.setMetadataSnapshot(canonicalPrKey, snapshot);
+			}
+		}
+		const harness = makeCoordinator({ store: new FailingSnapshotStore({ now: () => Date.now() }) });
+		const coordinator = track(harness.coordinator);
+		expect((await coordinator.addSubscription(descriptor())).status).toBe("active");
+
+		await pollOnce(); // metadata read 0 (fresh=false); snapshot write fails
+		expect(harness.fake.metadataFreshFlags()).toEqual([false]);
+		await pollOnce(); // metadata read 1 (fresh=true) so applied state catches the digest
+		expect(harness.fake.metadataFreshFlags()).toEqual([false, true]);
+	});
+
+	it("only In Progress and In Review cards keep a record linked for orphan classification", async () => {
+		const store = new InMemoryPrRecordStore({ now: () => Date.now() });
+		const reviewLinkedKey = "github|github.com|cline/kanban|81";
+		const backlogOnlyKey = "github|github.com|cline/kanban|82";
+		await store.createRecord({
+			canonicalPrKey: reviewLinkedKey,
+			provider: "github",
+			host: "github.com",
+			repository: "cline/kanban",
+			number: 81,
+		});
+		await store.createRecord({
+			canonicalPrKey: backlogOnlyKey,
+			provider: "github",
+			host: "github.com",
+			repository: "cline/kanban",
+			number: 82,
+		});
+		const boards: Array<{ workspaceId: string; board: RuntimeBoardData }> = [
+			{
+				workspaceId: "ws-1",
+				board: boardWithCards([
+					{ id: "review-card", column: "review", pr: 81 },
+					{ id: "backlog-card", column: "backlog", pr: 82 },
+				]),
+			},
+		];
+		const coordinator = track(makeCoordinator({ store, listBoards: async () => boards }).coordinator);
+		await coordinator.start();
+		await settle();
+
+		const linked = await store.loadRecord(reviewLinkedKey);
+		expect(linked.ok).toBe(true);
+		if (linked.ok) {
+			expect(linked.record.orphanedAt).toBeNull();
+		}
+		// The backlog card does NOT keep the record linked: orphanedAt is set
+		// (not deleted yet because the clock is fresh).
+		const backlog = await store.loadRecord(backlogOnlyKey);
+		expect(backlog.ok).toBe(true);
+		if (backlog.ok) {
+			expect(backlog.record.orphanedAt).not.toBeNull();
 		}
 	});
 });

@@ -29,7 +29,7 @@ import {
 	type GitHubGhAdapter,
 } from "./github-gh-adapter";
 import { isTrackingSupportedPr, type ParsedCanonicalPrKey, parseCanonicalPrKey } from "./pr-identity";
-import { getPrTrackingSchedulerLockRequest, PrRecordStore } from "./pr-record-store";
+import { getPrTrackingSchedulerLockRequest, PrRecordStore, type PrRecordStorePort } from "./pr-record-store";
 import {
 	backoffBaseMs,
 	isPrSnapshotStale,
@@ -89,6 +89,16 @@ interface SubscriptionVerdict {
 	blocker: string | null;
 }
 
+/** Per-source retained feedback state (transient, never persisted whole). */
+interface PrFeedbackSourceState {
+	reviews: GitHubPrNormalizedFeedbackEvent[] | null;
+	conversation: GitHubPrNormalizedFeedbackEvent[] | null;
+	inline: GitHubPrNormalizedFeedbackEvent[] | null;
+	threads: Map<string, PrThreadInfo> | null;
+}
+
+type PrFeedbackSource = "reviews" | "conversationComments" | "inlineComments" | "threads";
+
 interface PrPollState {
 	prKey: string;
 	accessScopeId: string;
@@ -99,17 +109,38 @@ interface PrPollState {
 	pollInFlight: Promise<void> | null;
 	metadata: GitHubPrMetadataSnapshot | null;
 	nodeId: string | null;
+	/**
+	 * Combined feedback events published in the last COMPLETE read, with
+	 * thread flags applied (transient). Retained while any feedback consumer
+	 * exists; a source that reports not_modified contributes its retained
+	 * events, so an unchanged conversation page never freezes a changed one.
+	 */
 	feedback: GitHubPrNormalizedFeedbackEvent[] | null;
 	feedbackCompleteness: GitHubPrFeedbackCompleteness | null;
 	snapshotCheckedAt: number | null;
-	/** Last fully-read thread state (transient) keyed by inline comment id. */
-	threadState: Map<string, PrThreadInfo> | null;
+	/** Per-source last successfully-read normalized events (retention). */
+	sourceEvents: PrFeedbackSourceState;
+	/**
+	 * Sources that must be re-read freshly this cycle (a failed store write
+	 * forces a fresh re-read so applied state never lags the recorded body
+	 * digest).
+	 */
+	freshSources: Set<PrFeedbackSource>;
+	/** Metadata must be re-read freshly this cycle. */
+	metadataNeedsFresh: boolean;
 }
 
 export interface CoordinatorState {
 	started: boolean;
 	schedulerBlocked: boolean;
 	authBlocker: string | null;
+	/**
+	 * Access blocker: the resolved identity exists but cannot see the data
+	 * (e.g. HTTP 403 permission denied). Like auth, cancels all polling, but
+	 * an explicit refresh re-probes the API (a permission change does not
+	 * require a new auth context).
+	 */
+	accessBlocker: string | null;
 	subscriptions: Array<{
 		workspaceId: string;
 		taskId: string;
@@ -130,7 +161,11 @@ export interface CoordinatorState {
 
 export interface CreatePrTrackingCoordinatorDependencies {
 	adapter?: GitHubGhAdapter;
-	store?: PrRecordStore;
+	/**
+	 * The record storage backend (port). Production uses the disk
+	 * `PrRecordStore`; tests inject an in-memory store.
+	 */
+	store?: PrRecordStorePort;
 	schedulerLockRequest?: LockRequest;
 	listManagedWorkspaceBoards?: () => Promise<Array<{ workspaceId: string; board: RuntimeBoardData }>>;
 	warn?: (message: string) => void;
@@ -145,7 +180,7 @@ const SCHEDULER_LOCK_STALE_MS = 15_000;
 
 export class PrTrackingCoordinator {
 	private readonly adapter: GitHubGhAdapter;
-	private readonly store: PrRecordStore;
+	private readonly store: PrRecordStorePort;
 	private readonly schedulerLockRequest: LockRequest;
 	private readonly listBoards: () => Promise<Array<{ workspaceId: string; board: RuntimeBoardData }>>;
 	private readonly warn: (message: string) => void;
@@ -161,6 +196,7 @@ export class PrTrackingCoordinator {
 	private schedulerLockRelease: (() => Promise<void>) | null = null;
 	private schedulerBlocked = false;
 	private authBlocker: string | null = null;
+	private accessBlocker: string | null = null;
 	private started = false;
 	private stopping = false;
 
@@ -173,15 +209,14 @@ export class PrTrackingCoordinator {
 			(async () => {
 				const entries = await listWorkspaceIndexEntries();
 				const boards: Array<{ workspaceId: string; board: RuntimeBoardData }> = [];
+				// A board read failure propagates: orphan classification and
+				// unlinked checks must never run on a silently partial board
+				// view (a missing card would wrongly orphan a live PR).
 				for (const entry of entries) {
-					try {
-						boards.push({
-							workspaceId: entry.workspaceId,
-							board: await loadWorkspaceBoardById(entry.workspaceId),
-						});
-					} catch {
-						// Unreadable boards cannot link PRs; skip them.
-					}
+					boards.push({
+						workspaceId: entry.workspaceId,
+						board: await loadWorkspaceBoardById(entry.workspaceId),
+					});
 				}
 				return boards;
 			});
@@ -271,7 +306,9 @@ export class PrTrackingCoordinator {
 				feedback: null,
 				feedbackCompleteness: null,
 				snapshotCheckedAt: null,
-				threadState: null,
+				sourceEvents: { reviews: null, conversation: null, inline: null, threads: null },
+				freshSources: new Set(),
+				metadataNeedsFresh: false,
 			};
 			this.polls.set(key, state);
 		}
@@ -317,12 +354,35 @@ export class PrTrackingCoordinator {
 			this.cancelAllPolls();
 			return { ok: false, blocker: "auth" };
 		}
+		const previousScope = this.scopeCache;
 		this.scopeCache = resolved.scope;
 		this.scopes.set(resolved.scope.accessScopeId, resolved.scope);
+		this.applyScopeChange(resolved.scope, previousScope);
 		if (requestedScopeId && requestedScopeId !== resolved.scope.accessScopeId) {
 			return { ok: false, blocker: "scope" };
 		}
 		return { ok: true, scope: resolved.scope };
+	}
+
+	/**
+	 * A newly resolved identity invalidates prior snapshots: drop transient
+	 * poll state for any other scope (metadata, feedback, thread state) so
+	 * data is never shown for the wrong account, and clear auth/access
+	 * blockers (the identity resolved successfully).
+	 */
+	private applyScopeChange(scope: AccessScope, previousScope: AccessScope | null): void {
+		this.authBlocker = null;
+		this.accessBlocker = null;
+		if (!previousScope || previousScope.accessScopeId === scope.accessScopeId) {
+			return;
+		}
+		for (const [key, state] of this.polls) {
+			if (state.accessScopeId === scope.accessScopeId) {
+				continue;
+			}
+			this.clearTimer(state);
+			this.polls.delete(key);
+		}
 	}
 
 	/**
@@ -341,6 +401,17 @@ export class PrTrackingCoordinator {
 				retries: 0,
 				realpath: false,
 				lockfilePath: this.schedulerLockRequest.lockfilePath,
+				onCompromised: () => {
+					// Proper-lockfile detected a stale/reacquired lock: this
+					// runtime can no longer be the sole scheduler.
+					this.schedulerBlocked = true;
+					this.schedulerLockRelease = null;
+					this.logError(
+						"[pr-tracking] scheduler lock was compromised (another process took it over); " +
+							"PR tracking scheduling is disabled in this runtime until restart.",
+					);
+					this.cancelAllPolls();
+				},
 			});
 			this.schedulerLockRelease = () => release();
 		} catch (error) {
@@ -416,19 +487,21 @@ export class PrTrackingCoordinator {
 		descriptor: PrTrackingSubscriptionDescriptor,
 		scope: AccessScope,
 	): Promise<SubscriptionAddResult> {
-		const bindingResult = await this.store.upsertTaskBinding(descriptor.canonicalPrKey, {
-			workspaceId: descriptor.workspaceId,
-			taskId: descriptor.taskId,
-		});
-		if (!bindingResult.ok) {
-			return this.blockedSubscription(descriptor, scope, "record_malformed");
-		}
+		// Acquire the scheduler lock BEFORE the binding write: a second
+		// process must never persist record state while blocked.
 		if (this.schedulerBlocked) {
 			return this.blockedSubscription(descriptor, scope, "scheduler");
 		}
 		await this.ensureSchedulerLock();
 		if (this.schedulerBlocked) {
 			return this.blockedSubscription(descriptor, scope, "scheduler");
+		}
+		const bindingResult = await this.store.upsertTaskBinding(descriptor.canonicalPrKey, {
+			workspaceId: descriptor.workspaceId,
+			taskId: descriptor.taskId,
+		});
+		if (!bindingResult.ok) {
+			return this.blockedSubscription(descriptor, scope, "record_malformed");
 		}
 		this.trackSubscription({
 			workspaceId: descriptor.workspaceId,
@@ -477,6 +550,8 @@ export class PrTrackingCoordinator {
 					this.clearTimer(state);
 					state.feedback = null;
 					state.feedbackCompleteness = null;
+					state.sourceEvents = { reviews: null, conversation: null, inline: null, threads: null };
+					state.freshSources.clear();
 				}
 			}
 			await this.markOrphanIfUnlinked(sub.canonicalPrKey);
@@ -484,16 +559,19 @@ export class PrTrackingCoordinator {
 	}
 
 	/**
-	 * Startup orphan classification: enumerate currently managed workspaces'
-	 * cards, join them with PR records, and start/clear the 24-hour retention
-	 * clock. Never schedules work and never enumerates PR records to discover
-	 * tasks.
+	 * Collect canonical PR keys linked by cards in In Progress / In Review
+	 * across currently managed workspaces. A read failure propagates (no
+	 * silent empty set — orphan marking must never run on a partial board
+	 * view).
 	 */
-	private async runOrphanClassificationPass(): Promise<void> {
+	private async collectLinkedPrKeys(): Promise<Set<string>> {
 		const linkedKeys = new Set<string>();
 		const boards = await this.listBoards();
 		for (const { board } of boards) {
 			for (const column of board.columns) {
+				if (column.id !== "in_progress" && column.id !== "review") {
+					continue;
+				}
 				for (const card of column.cards) {
 					for (const pr of card.pullRequests ?? []) {
 						linkedKeys.add(getPullRequestIdentityKey(pr));
@@ -501,6 +579,17 @@ export class PrTrackingCoordinator {
 				}
 			}
 		}
+		return linkedKeys;
+	}
+
+	/**
+	 * Startup orphan classification: join managed In Progress/In Review
+	 * cards with PR records and start/clear the 24-hour retention clock.
+	 * Never schedules work and never enumerates PR records to discover
+	 * tasks.
+	 */
+	private async runOrphanClassificationPass(): Promise<void> {
+		const linkedKeys = await this.collectLinkedPrKeys();
 		const { records } = await this.store.listRecords();
 		for (const record of records) {
 			if (linkedKeys.has(record.canonicalPrKey)) {
@@ -529,17 +618,9 @@ export class PrTrackingCoordinator {
 	}
 
 	private async markOrphanIfUnlinked(canonicalPrKey: string): Promise<void> {
-		const boards = await this.listBoards();
-		for (const { board } of boards) {
-			for (const column of board.columns) {
-				for (const card of column.cards) {
-					for (const pr of card.pullRequests ?? []) {
-						if (getPullRequestIdentityKey(pr) === canonicalPrKey) {
-							return;
-						}
-					}
-				}
-			}
+		const linkedKeys = await this.collectLinkedPrKeys();
+		if (linkedKeys.has(canonicalPrKey)) {
+			return;
 		}
 		await this.store.updateRecord(canonicalPrKey, undefined, (current) =>
 			current.orphanedAt === null ? { ...current, orphanedAt: this.now() } : current,
@@ -554,7 +635,7 @@ export class PrTrackingCoordinator {
 	private async reevaluate(prKey: string, accessScopeId: string): Promise<void> {
 		const state = this.getPollState(prKey, accessScopeId);
 		const subs = this.activeSubscriptionsFor(prKey, accessScopeId);
-		if (subs.length === 0 || this.authBlocker !== null || this.schedulerBlocked) {
+		if (subs.length === 0 || this.authBlocker !== null || this.accessBlocker !== null || this.schedulerBlocked) {
 			this.clearTimer(state);
 			return;
 		}
@@ -710,7 +791,10 @@ export class PrTrackingCoordinator {
 	private async performPollCycle(state: PrPollState): Promise<void> {
 		const { prKey, accessScopeId } = state;
 		const parsed = parseCanonicalPrKey(prKey);
-		const scope = this.scopes.get(accessScopeId) ?? this.scopeCache;
+		// Use the requested scope exactly; never fall back to the cached
+		// (possibly different-account) scope.
+		const scope =
+			this.scopes.get(accessScopeId) ?? (this.scopeCache?.accessScopeId === accessScopeId ? this.scopeCache : null);
 		if (!parsed || !scope) {
 			return;
 		}
@@ -754,7 +838,9 @@ export class PrTrackingCoordinator {
 			await this.reevaluate(prKey, accessScopeId);
 			return;
 		}
-		const metadataResult = await this.adapter.readPrMetadata(parsed, scope);
+		const metadataResult = await this.adapter.readPrMetadata(parsed, scope, {
+			fresh: state.metadataNeedsFresh,
+		});
 		if (metadataResult.kind === "failed") {
 			this.handleFailure(state, metadataResult.failure);
 			await this.reevaluate(prKey, accessScopeId);
@@ -767,14 +853,23 @@ export class PrTrackingCoordinator {
 				state.nodeId = metadataResult.nodeId;
 			}
 			state.snapshotCheckedAt = metadataResult.metadata.checkedAt;
-			await this.store.setMetadataSnapshot(prKey, metadataResult.metadata);
+			const snapshotWrite = await this.store.setMetadataSnapshot(prKey, metadataResult.metadata);
+			if (!snapshotWrite.ok) {
+				// Persisted state lagged the last read: force a fresh re-read
+				// next cycle so applied state catches the recorded body digest.
+				state.metadataNeedsFresh = true;
+				this.warn(`PR tracking metadata snapshot write failed (${snapshotWrite.reason}); forcing fresh re-read`);
+			} else {
+				state.metadataNeedsFresh = false;
+			}
 		}
 		// "not_modified" keeps last metadata (snapshot retained).
 		const prState = state.metadata?.state ?? null;
 
 		const wantsFeedback = verdictsBefore.some((verdict) => verdict.subscription.consumers.comments);
+		let feedbackOk = true;
 		if (wantsFeedback && prState !== "merged" && prState !== "closed") {
-			await this.readFeedback(state, parsed, scope);
+			feedbackOk = await this.readFeedback(state, parsed, scope);
 		}
 
 		// In-flight responses re-validate every consumer before applying
@@ -790,19 +885,20 @@ export class PrTrackingCoordinator {
 				) ?? null;
 			await this.applyPrStateEffects(sub, binding, prState, readCounted);
 		}
-		if (!this.stopping) {
+		if (!this.stopping && feedbackOk) {
 			state.consecutiveFailures = 0;
 		}
 		await this.reevaluate(prKey, accessScopeId);
 	}
 
 	/**
-	 * Read all feedback sources. A snapshot is published only after every
-	 * source succeeds; any `not_modified` source retains the last published
-	 * combined snapshot (no completeness regression); a failed source keeps
-	 * last state and counts as a failure.
+	 * Read all feedback sources with PER-SOURCE retention: a source that
+	 * reports `not_modified` contributes its last successfully-read events, so
+	 * an unchanged page never freezes a changed one; thread flags apply to
+	 * the inline events at publish time (transient, never persisted). A
+	 * source that fails keeps last state and counts as a cycle failure.
 	 */
-	private async readFeedback(state: PrPollState, parsed: ParsedCanonicalPrKey, scope: AccessScope): Promise<void> {
+	private async readFeedback(state: PrPollState, parsed: ParsedCanonicalPrKey, scope: AccessScope): Promise<boolean> {
 		const repo = parsed.repository;
 		const number = parsed.number;
 		const [reviews, conversation, inline, threads] = await Promise.all([
@@ -812,6 +908,7 @@ export class PrTrackingCoordinator {
 				"reviews",
 				`repos/${repo}/pulls/${number}/reviews`,
 				(items, login) => normalizeReviews(items, login),
+				{ fresh: state.freshSources.has("reviews") },
 			),
 			this.adapter.readRestListSource(
 				parsed,
@@ -819,16 +916,20 @@ export class PrTrackingCoordinator {
 				"conversationComments",
 				`repos/${repo}/issues/${number}/comments`,
 				(items, login) => normalizeConversationComments(items, login),
+				{ fresh: state.freshSources.has("conversationComments") },
 			),
 			this.adapter.readRestListSource(
 				parsed,
 				scope,
 				"inlineComments",
 				`repos/${repo}/pulls/${number}/comments`,
-				(items, login) => normalizeInlineComments(items, login, state.threadState ?? new Map()),
+				(items, login) => normalizeInlineComments(items, login, state.sourceEvents.threads ?? new Map()),
+				{ fresh: state.freshSources.has("inlineComments") },
 			),
 			state.nodeId
-				? this.adapter.readReviewThreads(parsed, scope, state.nodeId)
+				? this.adapter.readReviewThreads(parsed, scope, state.nodeId, {
+						fresh: state.freshSources.has("threads"),
+					})
 				: Promise.resolve({
 						kind: "failed" as const,
 						failure: { category: "network" as const, message: "missing PR node id", at: this.now() },
@@ -844,28 +945,68 @@ export class PrTrackingCoordinator {
 			for (const failure of failedSources) {
 				this.handleFailure(state, failure);
 			}
-			return;
+			return false;
 		}
-		const notModified = [reviews, conversation, inline, threads].some((result) => result.kind === "not_modified");
-		if (notModified) {
-			// Retain last published snapshot; completeness is unchanged.
-			return;
-		}
+		// Latest known thread state: fresh read wins, else the retained map.
+		const threadState = threads.kind === "ok_threads" ? threads.threads : state.sourceEvents.threads;
 		if (threads.kind === "ok_threads") {
-			state.threadState = threads.threads;
+			state.sourceEvents.threads = threads.threads;
 		}
-		const inlineEvents = inline.kind === "ok" ? inline.events : [];
-		state.feedback = [
-			...(reviews.kind === "ok" ? reviews.events : []),
-			...(conversation.kind === "ok" ? conversation.events : []),
-			...normalizeInlineComments(inlineEvents, scope.login, state.threadState ?? new Map<string, PrThreadInfo>()),
-		];
+		// Per-source retained events; `not_modified` falls back to the last
+		// successfully-read events for that source.
+		const reviewsEvents = reviews.kind === "ok" ? reviews.events : state.sourceEvents.reviews;
+		const conversationEvents = conversation.kind === "ok" ? conversation.events : state.sourceEvents.conversation;
+		const inlineEvents = inline.kind === "ok" ? inline.events : state.sourceEvents.inline;
+		if (reviews.kind === "ok") {
+			state.sourceEvents.reviews = reviews.events;
+		}
+		if (conversation.kind === "ok") {
+			state.sourceEvents.conversation = conversation.events;
+		}
+		if (inline.kind === "ok") {
+			state.sourceEvents.inline = inline.events;
+		}
+		// Publish only when every source has events (freshly read or
+		// retained from a prior complete read); thread state must be known.
+		if (reviewsEvents === null || conversationEvents === null || inlineEvents === null || threadState === null) {
+			return true;
+		}
+		state.feedback = [...reviewsEvents, ...conversationEvents, ...this.applyThreadFlags(inlineEvents, threadState)];
 		state.feedbackCompleteness = {
 			reviews: true,
 			conversationComments: true,
 			inlineComments: true,
-			threads: threads.kind === "ok_threads",
+			threads: true,
 		};
+		state.freshSources.clear();
+		return true;
+	}
+
+	/**
+	 * Apply the latest known thread resolution/outdated/deleted flags to
+	 * inline comment events (in-memory only). Retained events already carry
+	 * the flags from their publish time; fresh events may be corrected here
+	 * when the threads source was fresher than the inline read.
+	 */
+	private applyThreadFlags(
+		events: GitHubPrNormalizedFeedbackEvent[],
+		threads: Map<string, PrThreadInfo>,
+	): GitHubPrNormalizedFeedbackEvent[] {
+		return events.map((event) => {
+			if (event.kind !== "inline_comment") {
+				return event;
+			}
+			const info = threads.get(event.providerId);
+			if (!info) {
+				return event;
+			}
+			return {
+				...event,
+				threadResolved: info.resolved,
+				threadDeleted: info.deleted,
+				threadOutdated: info.outdated,
+			};
+		});
 	}
 
 	/**
@@ -936,11 +1077,22 @@ export class PrTrackingCoordinator {
 		});
 	}
 
-	/** Classify a read failure: auth stops everything; others back off. */
+	/**
+	 * Classify a read failure: auth and access blockers stop ALL polling for
+	 * the runtime (the identity exists but is not authenticated, or cannot
+	 * see the data — e.g. 403 permission denied); other failures back off
+	 * only this (PR, scope).
+	 */
 	private handleFailure(state: PrPollState, failure: GhAdapterFailure): void {
 		if (failure.category === "auth") {
 			this.authBlocker = failure.message;
 			this.warn(`PR tracking auth blocker: ${failure.message}`);
+			this.cancelAllPolls();
+			return;
+		}
+		if (failure.category === "access") {
+			this.accessBlocker = failure.message;
+			this.warn(`PR tracking access blocker: ${failure.message}`);
 			this.cancelAllPolls();
 			return;
 		}
@@ -955,6 +1107,8 @@ export class PrTrackingCoordinator {
 	 * Explicit refresh: joins the in-flight read when one is running,
 	 * otherwise performs one cycle. Source completion is only published after
 	 * all pages succeed. Never re-arms a stopped terminal subscription.
+	 * An explicit refresh re-probes the API when an access/auth blocker is
+	 * set (permission changes do not require a new auth context).
 	 */
 	async refresh(prKey: string, accessScopeId: string): Promise<void> {
 		const state = this.polls.get(this.pollKey(prKey, accessScopeId));
@@ -968,6 +1122,10 @@ export class PrTrackingCoordinator {
 		if (this.stopping) {
 			return;
 		}
+		// Re-probe: a prior access/auth blocker must not suppress an explicit
+		// refresh; a successful cycle clears the blocker.
+		this.scopeFailure = null;
+		this.accessBlocker = null;
 		const job = this.performPollCycle(state);
 		state.pollInFlight = job;
 		try {
@@ -1068,6 +1226,7 @@ export class PrTrackingCoordinator {
 			started: this.started,
 			schedulerBlocked: this.schedulerBlocked,
 			authBlocker: this.authBlocker,
+			accessBlocker: this.accessBlocker,
 			subscriptions: [...this.subscriptions.values()].map((sub) => ({
 				workspaceId: sub.workspaceId,
 				taskId: sub.taskId,

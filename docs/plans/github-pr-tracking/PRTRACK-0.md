@@ -368,7 +368,12 @@ Landed on branch `feat/prtrack-0-foundation`, PR opened against `feat/pr-trackin
   needed no changes.
 - `test/runtime/pr-tracking/` (new) — `pr-identity`, `pr-record-store`, `pr-snapshots`,
   `github-gh-adapter` (fake `gh` executable on PATH; no real network), and
-  `pr-tracking-coordinator` (fake timers + fake adapter; temp store roots) suites.
+  `pr-tracking-coordinator` (fake timers + fake adapter; in-memory store) suites.
+  - `in-memory-pr-record-store.ts` — `InMemoryPrRecordStore`, a deterministic
+    `PrRecordStoreBase` backend (same CAS semantics, no fs I/O / lockfile timers)
+    so coordinator tests run under fake timers with exact timing and shared-state
+    assertions (two coordinators, one store object). Production keeps the disk
+    `PrRecordStore`; the in-memory store is test-only.
 
 **Record location/format.** `join(getRuntimeHomePath(), "pr-tracking", "prs",
 <sha256(canonicalPrKey)> + ".json")`, schema version 1, revision-checked. Rollback: records
@@ -385,8 +390,31 @@ store, never clobbered.
   (directory), on-disk lockfile `registry/.registry.lock`. Serializes all shared record
   updates; never held while awaiting network/model work.
 
-**Test results.** `npx vitest run test/runtime/pr-tracking/` — 5 files / 56 tests passing.
+**Test results.** `npx vitest run test/runtime/pr-tracking/` — 5 files / 64 tests passing.
 `npx tsc --noEmit` clean. `npx @biomejs/biome check` clean for all changed files.
+
+**PR 64 review responses (second round)**
+
+- Per-source feedback retention: the coordinator keeps the last successfully-read events
+  per source (`reviews` / `conversationComments` / `inlineComments` / `threads`) and
+  publishes the union; a source reporting `not_modified` (or a failed source keeping
+  last state) never freezes the changed ones. Fresh-thread flags are re-applied to
+  retained inline events at publish time.
+- A failed feedback source counts as a cycle failure (backoff ladder) instead of being
+  silently swallowed by the success path.
+- A failed metadata snapshot write sets a per-PR `metadataNeedsFresh` flag so the next
+  read is forced fresh and the applied state catches the recorded body digest.
+- Access failures (`403`/`451`, category `access`) stop ALL polling (every poll
+  cancelled, visible `accessBlocker` in state) instead of retrying on the backoff
+  ladder; an explicit refresh re-probes and clears the blocker.
+- Orphan classification joins managed boards across workspaces and counts only
+  In Progress / In Review cards as live links (a Done card does not keep polling).
+- Adapter thread reads paginate comments within a thread (no 100-comment truncation)
+  and carry `resolved` / `outdated` / `deleted` separately (`outdated` is not
+  treated as deleted); deleted threads keep their node id in the thread map.
+- Coordinator tests now use the deterministic `InMemoryPrRecordStore` (fake timers
+  with exact timing; a second runtime with a different access scope shares the same
+  store object); the disk store keeps its own suite for fs/CAS behavior.
 
 **Deviations/refinements noted during implementation**
 

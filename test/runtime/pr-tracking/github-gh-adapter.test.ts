@@ -314,8 +314,20 @@ describe("github-gh-adapter", () => {
 				reviewThreads: {
 					pageInfo: { hasNextPage: true, endCursor: "cursor-1" },
 					nodes: [
-						{ isResolved: true, isOutdated: false, comments: { nodes: [{ id: "c1" }, { id: "c2" }] } },
-						{ isResolved: false, isOutdated: true, comments: { nodes: [{ id: "c3" }] } },
+						{
+							id: "t1",
+							isResolved: true,
+							isOutdated: false,
+							deleted: false,
+							comments: { nodes: [{ id: "c1" }, { id: "c2" }] },
+						},
+						{
+							id: "t2",
+							isResolved: false,
+							isOutdated: true,
+							deleted: false,
+							comments: { nodes: [{ id: "c3" }] },
+						},
 					],
 				},
 			},
@@ -324,7 +336,15 @@ describe("github-gh-adapter", () => {
 			node: {
 				reviewThreads: {
 					pageInfo: { hasNextPage: false, endCursor: "cursor-2" },
-					nodes: [{ isResolved: false, isOutdated: false, comments: { nodes: [{ id: "c4" }] } }],
+					nodes: [
+						{
+							id: "t3",
+							isResolved: false,
+							isOutdated: false,
+							deleted: false,
+							comments: { nodes: [{ id: "c4" }] },
+						},
+					],
 				},
 			},
 		});
@@ -341,11 +361,90 @@ describe("github-gh-adapter", () => {
 		if (result.kind !== "ok_threads") {
 			return;
 		}
-		expect(result.threads.get("c1")).toEqual({ resolved: true, deleted: false });
-		expect(result.threads.get("c3")).toEqual({ resolved: false, deleted: true });
-		expect(result.threads.get("c4")).toEqual({ resolved: false, deleted: false });
+		expect(result.threads.get("c1")).toEqual({ resolved: true, outdated: false, deleted: false });
+		expect(result.threads.get("c3")).toEqual({ resolved: false, outdated: true, deleted: false });
+		expect(result.threads.get("c4")).toEqual({ resolved: false, outdated: false, deleted: false });
 		expect(calls).toHaveLength(2);
 		expect(calls[1]?.args).toContain("after=cursor-1");
+	});
+
+	it("flags deleted threads and retains thread node ids for retained events", async () => {
+		const body = JSON.stringify({
+			node: {
+				reviewThreads: {
+					pageInfo: { hasNextPage: false, endCursor: null },
+					nodes: [
+						{
+							id: "t1",
+							isResolved: false,
+							isOutdated: false,
+							deleted: true,
+							comments: { nodes: [] },
+						},
+						{
+							id: "t2",
+							isResolved: false,
+							isOutdated: false,
+							deleted: false,
+							comments: { nodes: [{ id: "c1" }] },
+						},
+					],
+				},
+			},
+		});
+		const calls: ScriptedCall[] = [];
+		const adapter = adapterFor([{ kind: "ok", stdout: body }], calls);
+		const result = await adapter.readReviewThreads(PARSED, SCOPE, "PR_123");
+		expect(result.kind).toBe("ok_threads");
+		if (result.kind !== "ok_threads") {
+			return;
+		}
+		expect(result.threads.get("t1")).toEqual({ resolved: false, outdated: false, deleted: true });
+		expect(result.threads.get("c1")).toEqual({ resolved: false, outdated: false, deleted: false });
+	});
+
+	it("keeps last thread state on unchanged conditional reads and refetches with fresh", async () => {
+		const body = JSON.stringify({
+			node: {
+				reviewThreads: {
+					pageInfo: { hasNextPage: false, endCursor: null },
+					nodes: [
+						{
+							id: "t1",
+							isResolved: false,
+							isOutdated: false,
+							deleted: false,
+							comments: { nodes: [{ id: "c1" }] },
+						},
+					],
+				},
+			},
+		});
+		const calls: ScriptedCall[] = [];
+		const adapter = adapterFor([{ kind: "ok", stdout: body }], calls);
+		const first = await adapter.readReviewThreads(PARSED, SCOPE, "PR_123");
+		expect(first.kind).toBe("ok_threads");
+		const second = await adapter.readReviewThreads(PARSED, SCOPE, "PR_123");
+		expect(second.kind).toBe("not_modified");
+		const fresh = await adapter.readReviewThreads(PARSED, SCOPE, "PR_123", { fresh: true });
+		expect(fresh.kind).toBe("ok_threads");
+	});
+
+	it("classifies 403 and 451 responses as access blockers (not auth)", async () => {
+		const cases: Array<[string, GhAdapterFailureCategory]> = [
+			["HTTP 403: permission denied", "access"],
+			["HTTP 403: Rate limit exceeded", "rate_limit"],
+			["HTTP 451: unavailable by rule", "access"],
+		];
+		for (const [stderr, category] of cases) {
+			const calls: ScriptedCall[] = [];
+			const adapter = adapterFor([{ kind: "stderr", stderr }], calls);
+			const result = await adapter.readPrMetadata(PARSED, SCOPE);
+			expect(result.kind).toBe("failed");
+			if (result.kind === "failed") {
+				expect(result.failure.category).toBe(category);
+			}
+		}
 	});
 
 	it("exposes the default 30s timeout and 8 MiB bound", () => {

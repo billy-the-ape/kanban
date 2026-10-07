@@ -3,10 +3,18 @@
 // Reads go through `gh api --hostname github.com` via direct execFile with a
 // sanitized, prompt-disabled environment (never an interactive shell), a
 // 30-second timeout, and an 8 MiB output bound per page. At most four read
-// requests may be in flight runtime-wide. The gh CLI does not expose HTTP
-// headers, so "conditional reads" compare the SHA-256 of the previous full
-// response body: an unchanged body is reported as `not_modified` and the
-// caller retains its last snapshot (no completeness regression).
+// requests may be in flight runtime-wide.
+//
+// Known deviation from the plan's "per-source ETag/conditional reads": the gh
+// CLI does not expose response headers (no `If-None-Match` / `Retry-After`),
+// so "conditional reads" compare the SHA-256 of the previous full response
+// body: an unchanged body is reported as `not_modified` and the caller keeps
+// its last state. Every poll still performs a full GET (no rate-limit credit
+// for 304s). The coordinator compensates: `not_modified` sources contribute
+// their retained events, and any failed store write forces a `fresh` re-read
+// so applied state never lags the recorded body digest. Rate-limit deadlines
+// come from the `/rate_limit` endpoint (primary core window); the 900 s
+// backoff cap covers secondary limits that endpoint does not report.
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -43,6 +51,7 @@ export type GhAdapterFailureCategory =
 	| "auth"
 	| "rate_limit"
 	| "not_found"
+	| "access"
 	| "network"
 	| "timeout"
 	| "buffer_bound"
@@ -145,7 +154,12 @@ function createDefaultGhRunner(timeoutMs: number, maxBufferBytes: number): GhApi
 					timeout: true,
 				};
 			}
-			if (/maxBuffer size exceeded/.test(message)) {
+			// Node 12+ reports ERR_CHILD_PROCESS_STDIO_MAXBUFFER ("stdout maxBuffer
+			// length exceeded"); match the code, not just legacy message text.
+			if (
+				candidate.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" ||
+				/ERR_CHILD_PROCESS_STDIO_MAXBUFFER|maxBuffer (size|length) exceeded/.test(message)
+			) {
 				return {
 					ok: false,
 					stdout: "",
@@ -260,15 +274,29 @@ export class GitHubGhAdapter {
 				},
 			};
 		}
+		// A 403 (SAML enforcement, missing repo access, ...) or a 451
+		// (content unavailable by rule) is a permission problem, not a
+		// transient network failure: surface it as a visible access blocker
+		// instead of retrying on the ordinary backoff ladder forever.
+		if (/HTTP 403|HTTP 451/i.test(result.stderr)) {
+			return { kind: "failure", failure: { category: "access", message: detail, at } };
+		}
 		return {
 			kind: "failure",
 			failure: { category: "network", message: detail || `gh exited ${result.exitCode}`, at },
 		};
 	}
 
-	/** Best-effort rate-limit reset deadline; never throws. */
-	async refreshRateLimitReset(): Promise<number | null> {
-		const outcome = await this.callRest("rate_limit");
+	/**
+	 * Best-effort rate-limit reset deadline; never throws. Runs WITHOUT
+	 * holding a read slot: the in-flight reads are exactly the ones that get
+	 * throttled, so taking a slot here would deadlock the cap when every
+	 * slot is busy with rate-limit failures. The `rate_limit` endpoint is
+	 * not itself rate limited, so a direct runner call is safe.
+	 */
+	private async fetchRateLimitReset(): Promise<number | null> {
+		const result = await this.runner(["api", "--hostname", GITHUB_TRACKING_HOST, "rate_limit"], this.cwd);
+		const outcome = this.classifyExit(result);
 		if (outcome.kind !== "json") {
 			return null;
 		}
@@ -281,14 +309,21 @@ export class GitHubGhAdapter {
 		return this.cachedRateLimitResetAt;
 	}
 
+	/** Public best-effort rate-limit reset deadline; never throws. */
+	async refreshRateLimitReset(): Promise<number | null> {
+		return await this.fetchRateLimitReset();
+	}
+
 	/** One REST call through gh (single page or single object). */
 	async callRest(endpoint: string): Promise<RestCallOutcome> {
 		await this.acquireSlot();
 		try {
 			const result = await this.runner(["api", "--hostname", GITHUB_TRACKING_HOST, endpoint], this.cwd);
 			const outcome = this.classifyExit(result);
-			if (outcome.kind === "failure" && outcome.failure.category === "rate_limit" && !this.cachedRateLimitResetAt) {
-				const resetAt = await this.refreshRateLimitReset();
+			if (outcome.kind === "failure" && outcome.failure.category === "rate_limit") {
+				// Refresh on EVERY rate-limit failure (never cached forever):
+				// the next throttled window an hour later carries a new reset.
+				const resetAt = await this.fetchRateLimitReset();
 				if (resetAt !== null) {
 					outcome.failure.rateLimitResetAt = resetAt;
 				}
@@ -314,9 +349,15 @@ export class GitHubGhAdapter {
 				const message = (data.errors ?? []).map((item) => String(item.message ?? "")).join("; ");
 				if (data.errors && data.errors.length > 0) {
 					if (/rate limit|secondary/i.test(message)) {
+						const resetAt = await this.fetchRateLimitReset();
 						return {
 							kind: "failure",
-							failure: { category: "rate_limit", message: sanitizeErrorDetail(message), at: this.now() },
+							failure: {
+								category: "rate_limit",
+								message: sanitizeErrorDetail(message),
+								at: this.now(),
+								...(resetAt !== null ? { rateLimitResetAt: resetAt } : {}),
+							},
 						};
 					}
 					if (/not found/i.test(message)) {
@@ -337,6 +378,15 @@ export class GitHubGhAdapter {
 		}
 	}
 
+	/**
+	 * Resolve the authenticated github.com access scope (noninteractive).
+	 * Identity comes from the same adapter path as every other read —
+	 * `gh api user` (stable JSON, always the ACTIVE credential) — instead of
+	 * scraping `gh auth status` text, which changed format with the
+	 * multi-account rewrite and lists every account (first-match could pick
+	 * an inactive one). 401, missing binary, or missing login are the auth
+	 * blocker.
+	 */
 	/** Resolve the authenticated github.com access scope (noninteractive). */
 	async resolveAccessScope(): Promise<AccessScopeResult> {
 		const at = this.now();
@@ -494,8 +544,11 @@ export class GitHubGhAdapter {
 	}
 
 	/**
-	 * Read review-thread resolution/outdated state via paginated GraphQL,
-	 * keyed by inline comment id.
+	 * Read review-thread resolution/outdated state via paginated GraphQL.
+	 * The returned map is keyed by BOTH the GraphQL node id and the numeric
+	 * `databaseId` (REST `id` as string) for every comment in the thread, and
+	 * `outdated` is carried separately from `resolved`. Comment pages within
+	 * a thread are paginated too, so very long threads are not truncated.
 	 */
 	async readReviewThreads(
 		parsed: ParsedCanonicalPrKey,
@@ -523,21 +576,80 @@ export class GitHubGhAdapter {
 					reviewThreads?: {
 						pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
 						nodes?: Array<{
+							id?: string | null;
 							isResolved?: boolean;
 							isOutdated?: boolean;
-							comments?: { nodes?: Array<{ id?: string | null }> };
+							deleted?: boolean;
+							comments?: {
+								pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+								nodes?: Array<{ id?: string | null; databaseId?: number | null }>;
+							};
 						}>;
 					};
 				};
 			};
 			const page = data.node?.reviewThreads;
 			for (const threadNode of page?.nodes ?? []) {
-				for (const comment of threadNode.comments?.nodes ?? []) {
-					if (typeof comment.id === "string" && comment.id.length > 0) {
-						threads.set(comment.id, {
-							resolved: threadNode.isResolved === true,
-							deleted: threadNode.isOutdated === true,
-						});
+				if (typeof threadNode.id !== "string" || threadNode.id.length === 0) {
+					continue;
+				}
+				const info: PrThreadInfo = {
+					resolved: threadNode.isResolved === true,
+					outdated: threadNode.isOutdated === true,
+					deleted: threadNode.deleted === true,
+				};
+				// Deleted threads expose no comments; keep the thread node id
+				// keyed so retained events can still be flagged.
+				if (info.deleted) {
+					threads.set(threadNode.id, info);
+				}
+				const commentNodes: Array<{ id?: string | null; databaseId?: number | null }> = [
+					...(threadNode.comments?.nodes ?? []),
+				];
+				// Paginate comments within the thread (very long threads).
+				let commentsAfter = threadNode.comments?.pageInfo?.endCursor;
+				let commentsHasNext = threadNode.comments?.pageInfo?.hasNextPage === true;
+				while (commentsHasNext && typeof commentsAfter === "string" && commentsAfter.length > 0) {
+					const commentOutcome = await this.callGraphql(THREAD_COMMENTS_QUERY, {
+						threadId: threadNode.id,
+						after: commentsAfter,
+					});
+					if (commentOutcome.kind === "not_modified") {
+						return { kind: "not_modified" };
+					}
+					if (commentOutcome.kind === "failure") {
+						return { kind: "failed", failure: commentOutcome.failure };
+					}
+					const commentData = commentOutcome.data as {
+						node?: {
+							comments?: {
+								pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+								nodes?: Array<{ id?: string | null; databaseId?: number | null }>;
+							};
+						};
+					};
+					const extra = commentData.node?.comments;
+					if (!extra) {
+						break;
+					}
+					commentNodes.push(...(extra.nodes ?? []));
+					commentsHasNext = extra.pageInfo?.hasNextPage === true;
+					const nextAfter = extra.pageInfo?.endCursor;
+					if (typeof nextAfter !== "string" || nextAfter === commentsAfter) {
+						break;
+					}
+					commentsAfter = nextAfter;
+					if (commentNodes.length > 100 * 100) {
+						break; // safety guard against runaway pagination
+					}
+				}
+				for (const comment of commentNodes) {
+					if (typeof comment.id !== "string" || comment.id.length === 0) {
+						continue;
+					}
+					threads.set(comment.id, info);
+					if (typeof comment.databaseId === "number") {
+						threads.set(String(comment.databaseId), info);
 					}
 				}
 			}
@@ -570,11 +682,36 @@ query($nodeId: ID!, $after: String) {
           id
           isResolved
           isOutdated
+          deleted
           comments(first: 100) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
             nodes {
               id
+              databaseId
             }
           }
+        }
+      }
+    }
+  }
+}
+`;
+
+const THREAD_COMMENTS_QUERY = `
+query($threadId: ID!, $after: String) {
+  node(id: $threadId) {
+    ... on PullRequestReviewThread {
+      comments(first: 100, after: $after) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          id
+          databaseId
         }
       }
     }

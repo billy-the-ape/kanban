@@ -107,29 +107,34 @@ describe("pr-snapshots", () => {
 		expect(r3?.authorKind).toBe("bot");
 	});
 
-	it("classifies inline comments and attaches thread resolved/deleted flags", () => {
+	it("classifies inline comments and attaches thread resolved/deleted/outdated flags", () => {
 		const events = normalizeInlineComments(
 			[
 				{
 					id: "i1",
+					node_id: "i1",
 					user: { login: "human", type: "User" },
 					body: "nit: rename",
 					updated_at: "2026-10-06T00:00:00Z",
 				},
-				{ id: "i2", user: { login: "me", type: "User" }, body: "" },
+				{ id: "i2", node_id: "i2", user: { login: "me", type: "User" }, body: "" },
+				{ id: "i3", node_id: "i3", user: { login: "human", type: "User" }, body: "moved" },
 			],
 			"me",
 			new Map([
-				["i1", { resolved: true, deleted: false }],
-				["i2", { resolved: false, deleted: true }],
+				["i1", { resolved: true, outdated: false, deleted: false }],
+				["i2", { resolved: false, outdated: false, deleted: true }],
+				["i3", { resolved: false, outdated: true, deleted: false }],
 			]),
 		);
-		expect(events).toHaveLength(2);
+		expect(events).toHaveLength(3);
 		expect(events[0]?.threadResolved).toBe(true);
 		expect(events[0]?.threadDeleted).toBe(false);
+		expect(events[0]?.threadOutdated).toBe(false);
 		expect(events[0]?.bodyDigest).toBe(feedbackBodyDigest("nit: rename"));
 		expect(events[1]?.isOwnAccount).toBe(true);
 		expect(events[1]?.threadDeleted).toBe(true);
+		expect(events[2]?.threadOutdated).toBe(true);
 	});
 
 	it("classifies conversation comments, keeping bots with classification metadata", () => {

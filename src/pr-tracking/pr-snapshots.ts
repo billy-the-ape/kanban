@@ -81,12 +81,14 @@ export function normalizePrMetadata(raw: unknown, accessScopeId: string, checked
 	const baseRepo = typeof base?.repo === "object" && base.repo !== null ? (base.repo as RawObject) : null;
 	const merged = pr.merged === true;
 	const draft = pr.draft === true;
+	// Closed wins over draft: GitHub keeps `draft: true` on closed draft PRs,
+	// and a closed-unmerged PR must never read as pollable "draft".
 	const state: GitHubPrMetadataSnapshot["state"] = merged
 		? "merged"
-		: draft
-			? "draft"
-			: pr.state === "closed"
-				? "closed"
+		: pr.state === "closed"
+			? "closed"
+			: draft
+				? "draft"
 				: "open";
 	return {
 		accessScopeId,
@@ -114,7 +116,9 @@ export function normalizeReviews(rawItems: unknown[], ownAccountLogin: string): 
 		const author = authorInfo(review?.user);
 		const updatedAt =
 			asIsoMs(review?.updated_at) ?? asIsoMs(review?.submitted_at) ?? asIsoMs(review?.created_at) ?? 0;
-		const pending = review?.state === "pending";
+		// REST review states are uppercase (PENDING, APPROVED, ...); compare
+		// case-insensitively so unpublished reviews are flagged correctly.
+		const pending = String(review?.state ?? "").toUpperCase() === "PENDING";
 		events.push({
 			kind: "review",
 			providerId: id,
@@ -124,6 +128,7 @@ export function normalizeReviews(rawItems: unknown[], ownAccountLogin: string): 
 			reviewState: pending ? "pending" : "submitted",
 			threadResolved: null,
 			threadDeleted: null,
+			threadOutdated: null,
 			updatedAt,
 			bodyDigest: feedbackBodyDigest(asString(review?.body) ?? ""),
 		});
@@ -131,13 +136,26 @@ export function normalizeReviews(rawItems: unknown[], ownAccountLogin: string): 
 	return events;
 }
 
-/** GraphQL-derived thread state keyed by inline comment id. */
+/**
+ * GraphQL-derived thread state keyed by inline comment id. The map is keyed
+ * by BOTH the GraphQL node id (`comments.nodes.id`) and the numeric
+ * `databaseId` (equal to the REST comment `id` as a string), because the
+ * REST list and the GraphQL thread query expose different id spaces.
+ * `outdated` (diff moved under the comment) is distinct from `deleted`.
+ */
 export interface PrThreadInfo {
 	resolved: boolean;
+	outdated: boolean;
 	deleted: boolean;
 }
 
-/** Normalize inline review comments, attaching thread resolved/deleted flags. */
+/**
+ * Normalize inline review comments, attaching thread flags. The thread map
+ * may be keyed by GraphQL node id or by numeric database id; look the comment
+ * up by `node_id` first, then by its REST numeric id. A comment present in
+ * the REST list is by definition not deleted, so `threadDeleted` is only
+ * populated from an explicit thread signal (null when unknown).
+ */
 export function normalizeInlineComments(
 	rawItems: unknown[],
 	ownAccountLogin: string,
@@ -151,7 +169,9 @@ export function normalizeInlineComments(
 			continue;
 		}
 		const author = authorInfo(comment?.user);
-		const thread = threadsById.get(String(comment?.id));
+		const thread =
+			threadsById.get(asString(comment?.node_id) ?? "") ??
+			(typeof comment?.id === "number" ? threadsById.get(String(comment.id)) : undefined);
 		events.push({
 			kind: "inline_comment",
 			providerId: id,
@@ -161,6 +181,7 @@ export function normalizeInlineComments(
 			reviewState: null,
 			threadResolved: thread ? thread.resolved : null,
 			threadDeleted: thread ? thread.deleted : null,
+			threadOutdated: thread ? thread.outdated : null,
 			updatedAt: asIsoMs(comment?.updated_at) ?? asIsoMs(comment?.created_at) ?? 0,
 			bodyDigest: feedbackBodyDigest(asString(comment?.body) ?? ""),
 		});
@@ -190,6 +211,7 @@ export function normalizeConversationComments(
 			reviewState: null,
 			threadResolved: null,
 			threadDeleted: null,
+			threadOutdated: null,
 			updatedAt: asIsoMs(comment?.updated_at) ?? asIsoMs(comment?.created_at) ?? 0,
 			bodyDigest: feedbackBodyDigest(asString(comment?.body) ?? ""),
 		});
