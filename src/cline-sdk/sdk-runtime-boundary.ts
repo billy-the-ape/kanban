@@ -200,6 +200,23 @@ export function loadClineSdkRulesForSystemPrompt(service: ClineSdkUserInstructio
 	return formatRulesForSystemPrompt(rules);
 }
 
+/**
+ * The SDK's `editor` tool rejects `new_text` over 6000 characters, and the SDK's default prompt does not
+ * mention the limit, so an agent appending a whole new test suite in one call gets a rejected edit and has to
+ * recover. Instruct a lower figure than the hard limit: models undercount characters, and telling them 6000
+ * still lands over it.
+ */
+export const CLINE_EDITOR_SIZE_GUIDANCE = [
+	"Editor tool usage and limits:",
+	"- To replace text in an existing file, include `path`, `old_text`, and `new_text` in the actual editor tool arguments. `old_text` must be the exact existing text to replace and match exactly once; read the file first if needed.",
+	"- Mentioning `old_text` in reasoning or prose does not supply it to the tool. Before sending an editor call, verify that its JSON arguments contain `old_text` for a replacement edit.",
+	"- Omit `old_text` only when creating a file that does not exist, or when inserting text using `insert_line`. `path` plus `new_text` alone cannot edit an existing file.",
+	"- If the tool reports missing `old_text`, rebuild the arguments with an explicit `old_text` string, or use `insert_line` for an intended insertion. Do not repeat the same incomplete call or assume the tool removed a parameter; JSON property order does not matter.",
+	"- Keep `new_text` (and `old_text`) in each `editor` call under 5000 characters. Larger calls are rejected, and the model tends to undercount, so stay comfortably below the limit.",
+	"- To add a large block (a new test suite, a big function), split it into several sequential edits of roughly 100 lines each, anchoring each on the last unique line you just added, or put it in a new file.",
+	"- Prefer a new, separate file for large additions instead of growing an already large file.",
+].join("\n");
+
 export async function resolveClineSdkSystemPrompt(input: {
 	cwd: string;
 	providerId: string;
@@ -210,11 +227,12 @@ export async function resolveClineSdkSystemPrompt(input: {
 	// its repo-aware behavior in the same way the official CLI does.
 	const shouldAppendWorkspaceMetadata = input.providerId === "cline";
 	const workspaceMetadata = shouldAppendWorkspaceMetadata ? await buildWorkspaceMetadata(input.cwd) : "";
-	return getClineDefaultSystemPrompt({
+	const defaultPrompt = getClineDefaultSystemPrompt({
 		ide: "Kanban",
 		rootPath: input.cwd,
 		providerId: input.providerId,
 		metadata: workspaceMetadata,
 		rules: input.rules ?? "",
 	});
+	return `${defaultPrompt}\n\n${CLINE_EDITOR_SIZE_GUIDANCE}`;
 }

@@ -19,6 +19,8 @@ TypeScript principles
 - NEVER remove or downgrade code to fix type errors from outdated dependencies. Upgrade the dependency instead.
 
 Code quality
+- Use `npm run format` first whenever lint or formatting is a concern, and only fix whatever remains after.
+- Tool parameter inputs, especially editor, should be kept below 5000 characters
 - Write production-quality code, not prototypes
 - Break components into small, single-responsibility files. 
 - Extract shared logic into hooks and utilities. 
