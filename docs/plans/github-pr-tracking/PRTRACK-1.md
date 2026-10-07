@@ -71,16 +71,17 @@ unavailable" and creates no API demand.
   no separate filesystem gate mutexes are held while awaiting model slots or network I/O.
   Gate acquire/validate/release and durable-reservation revalidation are short CAS operations
   under the single tracking-registry mutex, taken immediately before execution. Nesting is
-  one-way only: while holding a gate, the registry mutex may be taken for a CAS (gates →
-  registry permitted); the registry mutex is never held while acquiring a gate or task lock
-  (registry → gates/task never). Because the head-ref gate spans distinct PRs but
-  reservations live in per-PR records, acquiring it validates under the single global
-  registry mutex every record whose head mapping matches the same canonical head repository
-  + ref, serializing sibling records on the gate. Fixed order for the non-CAS locks: task
-  ownership → PR gate → head-ref gate. Observed merge/close centrally invalidates queued write
-  intents, blocks new admissions, and requests safe cancellation of live tracked operations.
-  Replacing or removing the selected PR invalidates pending work and requires reconciliation
-  before any further action.
+  one-way only (refining the master's blanket "never nest registry and task locks"): task
+  ownership or a held gate may be followed by a registry CAS (task/gates → registry
+  permitted); the registry mutex is never held while acquiring a task or Git lock or while
+  awaiting model/network work (registry → task/Git never). Because the head-ref gate spans
+  distinct PRs but reservations live in per-PR records, acquiring it validates under the
+  single global registry mutex every record whose head mapping matches the same canonical
+  head repository + ref, serializing sibling records on the gate. Fixed acquisition order:
+  task ownership → PR gate → head-ref gate (each gate acquisition is itself a registry CAS).
+  Observed merge/close centrally invalidates queued write intents, blocks new admissions, and
+  requests safe cancellation of live tracked operations. Replacing or removing the selected PR
+  invalidates pending work and requires reconciliation before any further action.
 - The completion label is **Auto complete task when PR is merged**; the persisted field stays
   `autoFinishOnMerge`.
 - First comment support is native Cline only; other task agents show comments unsupported but
@@ -243,13 +244,14 @@ Explicit non-goals:
       by canonical head repository + ref. Gates are durable fenced reservation entries in
       the PR record (no separate filesystem gate locks); acquire/validate/release and the
       before-execution revalidation of durable reservations are short CAS operations under
-      the tracking-registry mutex. Nesting is one-way: holding a gate, the registry mutex may
-      be taken for a CAS (gates → registry permitted); the registry mutex is never held
-      while acquiring a gate or task lock (registry → gates/task never). The head-ref gate
-      spans distinct PRs, so acquiring it validates, under the single global registry mutex,
-      every record whose head mapping matches the same canonical head repository + ref —
-      sibling records serialize on the gate even though reservations are per-PR. Fixed order
-      for the non-CAS locks: task ownership → PR gate → head-ref gate. Observed
+      the tracking-registry mutex. Nesting is one-way: task ownership or a held gate may be
+      followed by a registry CAS (task/gates → registry permitted); the registry mutex is
+      never held while acquiring a task or Git lock or while awaiting model/network work
+      (registry → task/Git never). The head-ref gate spans distinct PRs, so acquiring it
+      validates, under the single global registry mutex, every record whose head mapping
+      matches the same canonical head repository + ref — sibling records serialize on the
+      gate even though reservations are per-PR. Fixed acquisition order: task ownership → PR
+      gate → head-ref gate (each gate acquisition is itself a registry CAS). Observed
       merge/close centrally invalidates queued write intents, prevents new admissions, and
       requests safe cancellation of live tracked operations, preserving unpublished work.
       External tools outside Kanban cannot be locked: compare remote/local state and stop on
@@ -343,7 +345,7 @@ Git test environment. At minimum:
 | Subscriptions and replay cursors | `subscribeTaskSnapshot` / `subscribeTerminalInvalidation` emit versioned events; after restart, replay resumes from the persisted per-consumer-kind cursor; events are hints and consumers reconcile authoritative state on startup |
 | Merge quiescence | With zero comment consumers installed, merge completion waits on terminal invalidation plus an exclusive `reservePrOperation` and proceeds only after drain; no comment-service API is called |
 | Mutation ownership across scopes | Same PR visible under two access scopes → one owner/reservation state keyed by canonical PR; a claim from either scope validates against that one record; no duplicate owner |
-| Lock-order violation | Acquiring a gate or task lock while holding the tracking-registry mutex, or reversing the task → PR → head-ref order, is rejected; no deadlock and no unsafe takeover |
+| Lock-order violation | Acquiring a task or Git lock (or awaiting model/network work) while holding the tracking-registry mutex, or reversing the task → PR gate → head-ref gate order, is rejected; gate acquisition itself (a registry CAS) succeeds; no deadlock and no unsafe takeover |
 | Non-native-Cline agent | Comments shown as **comments unsupported** for the task; merge completion remains available and functional |
 | Non-github.com host/provider | Link shows "Automation unsupported"; no subscription and no API reads |
 | Auth blocker display | Missing gh/credentials surfaces the visible auth blocker in the task detail surface; no login attempts, no silent success |

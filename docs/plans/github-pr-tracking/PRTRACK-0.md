@@ -77,10 +77,13 @@ architecture or product rules.
   classification metadata; consumers apply the policy (COMMENT-0).
 - **Record:** schema version 1, SHA-256 key digest, revision-checked atomic updates. Serialize
   shared record/reservation changes with a single tracking-registry mutex; release it before
-  acquiring existing task/Git locks or awaiting network/model work. Nesting is one-way only: a
-  short record CAS may run under the registry mutex while a PR/head-ref gate is already held
-  (gates → registry permitted), but the registry mutex is never held while acquiring a gate or
-  task lock (registry → gates/task never). Do not hold workspace locks during network calls.
+  acquiring existing task/Git locks or awaiting network/model work. Nesting is one-way only
+  (this refines the master's blanket "never nest registry and task locks"): a short record CAS
+  may run under the registry mutex while task ownership or a PR/head-ref gate reservation is
+  already held (task/gates → registry permitted), but the registry mutex is never held while
+  acquiring a task or Git lock or while awaiting network/model work (registry → task/Git
+  never). Gate reservations are record entries, so acquiring one is itself a CAS under the
+  mutex. Do not hold workspace locks during network calls.
 - **Identity:** canonical PR key = provider + lowercase host/repository + positive PR number,
   reused from PR linking. Never infer association from title, branch name, or the latest UI link.
   Owner/binding identity always includes workspaceId and taskId.
@@ -141,8 +144,9 @@ Explicit non-goals:
       the `canonicalPrKey`; define the version-1 `GitHubPrTrackingRecord` contract in
       `src/core/api-contract.ts`: `schemaVersion`/`revision`; PR identity; `orphanedAt`
       (timestamp the record was first observed orphaned — starts the 24-hour retention
-      clock); authorized metadata snapshots keyed by `accessScopeId` (`checkedAt`, head/base repository/ref, head SHA, PR
-      state open/closed/draft/merged, merged timestamp, merge commit SHA); task bindings
+      clock); authorized metadata snapshots keyed by `accessScopeId` (`checkedAt`, head/base
+      repository/ref, head SHA, PR state open/closed/draft/merged, merged timestamp, merge
+      commit SHA); task bindings
       (`workspaceId`+`taskId`) with terminal stop/reopen/completion markers and monotonic link
       generations (reselecting the same handled PR cannot erase consumed markers).
       Declare here the field shapes downstream plans freeze (field semantics are normatively
