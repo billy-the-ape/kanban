@@ -7,9 +7,9 @@ represents a single PR.
 
 | Field | Value |
 | --- | --- |
-| Document revision | 1 |
+| Document revision | 2 |
 | Prepared | 2026-10-06 |
-| Status | planned; no milestone started |
+| Status | implemented in this worktree (branch targets `feat/pr-tracking-base`) |
 | Source baseline | 49a2ca05c6c2927da2194aaec8bd1e45e6fa2928 (main) |
 | Fork | https://github.com/billy-the-ape/kanban |
 | Prerequisites | PRTRACK-0 (FOUNDATION-0) landed: record store, gh adapter, read-only coordinator; PR #49 PR-linking contracts landed (through PRTRACK-0's prerequisite) |
@@ -174,7 +174,7 @@ Explicit non-goals:
 
 ## Implementation tasks (in this order)
 
-- [ ] PRTRACK-1.1 **Revision-checked preference and selection APIs.** Add
+- [x] PRTRACK-1.1 **Revision-checked preference and selection APIs.** Add
       `autoAddressComments`, `autoFinishOnMerge`, `selectedAutomationPrKey`, and
       `settingsRevision` to the board card contract (all optional; absent reads as false /
       unset). Implement a dedicated revision-checked task-settings mutation through
@@ -192,7 +192,7 @@ Explicit non-goals:
       read). If the installed-consumer list is carried in `RuntimeConfigResponse`, remember
       the `as unknown as` mock trap (uncast test mocks bypass tsc and crash at render time).
       No selected-PR tracking state in browser localStorage.
-- [ ] PRTRACK-1.2 **Consumer registry and frozen API surface.** Implement
+- [x] PRTRACK-1.2 **Consumer registry and frozen API surface.** Implement
       `registerConsumer(kind, capabilities)` / `unregisterConsumer` with per-consumer required
       read sources — demand rule: both consumers request metadata; only the comment consumer
       requests feedback/review/thread reads; a comment-only task needs no further recurring
@@ -205,7 +205,7 @@ Explicit non-goals:
       on each task binding in the PR record; events are hints and consumers reconcile
       authoritative state on startup. This registry is the "installed consumers" input for
       1.3 and must land before it.
-- [ ] PRTRACK-1.3 **Live task-derived subscriptions.** Replace PRTRACK-0's fake subscriptions
+- [x] PRTRACK-1.3 **Live task-derived subscriptions.** Replace PRTRACK-0's fake subscriptions
       as the production demand source (they remain the test seam for the coordinator suites —
       do not delete the PRTRACK-0 tests): on startup enumerate current managed workspaces/cards,
       validate links/preferences, join
@@ -220,7 +220,7 @@ Explicit non-goals:
       boards must not hold a workspace lock across any network call. A fetched result is
       applied only after rereading task settings, linkage, and current revision; in-flight
       responses revalidate each consumer before applying state or scheduling effects.
-- [ ] PRTRACK-1.4 **Owner selection, transfer, and reservations.** Durable repair-owner
+- [x] PRTRACK-1.4 **Owner selection, transfer, and reservations.** Durable repair-owner
       selection: exactly-one-candidate atomic assignment; multi-candidate "Choose repair owner"
       ambiguity block; revision-checked **Repair owner** selector listing linked tasks with
       workspace labels; owner validity requires the task selects this PR and has a verified
@@ -256,7 +256,7 @@ Explicit non-goals:
       requests safe cancellation of live tracked operations, preserving unpublished work.
       External tools outside Kanban cannot be locked: compare remote/local state and stop on
       drift.
-- [ ] PRTRACK-1.5 **Task lifecycle gates.** Shared arbitration: when either installed enabled
+- [x] PRTRACK-1.5 **Task lifecycle gates.** Shared arbitration: when either installed enabled
       consumer owns a linked PR workflow, legacy automatic clean-tree/PR-delivery completion
       cannot run (browser auto-actions, CLI, and deterministic delivery all gated); manual
       completion retains existing safeguards including preserved Done → Review movement.
@@ -270,7 +270,7 @@ Explicit non-goals:
       quiescence using `subscribeTerminalInvalidation` plus an exclusive
       `reservePrOperation` — they never call a comment-service API. The gate must work with
       zero real consumers installed (fake consumers in tests).
-- [ ] PRTRACK-1.6 **UI.** Both checkboxes in task create/edit and detail settings, independent,
+- [x] PRTRACK-1.6 **UI.** Both checkboxes in task create/edit and detail settings, independent,
       default false, editable throughout In Progress and In Review including queued tasks,
       subject to the consumer being installed; enabled choice with no PR shows "Waiting for
       linked PR"; the installed-consumer/capability signal comes from `getTaskTrackingState`
@@ -285,7 +285,7 @@ Explicit non-goals:
       on confirmed open/draft + eligibility); snapshots labelled as of a time; all blockers in
       the existing detail warning/status surfaces with concise reasons. Tailwind tokens,
       `@/components/ui` primitives, `lucide-react` icons; conditional state via `cn()`.
-- [ ] PRTRACK-1.7 **Fake-consumer and task lifecycle integration tests.** Cover the acceptance
+- [x] PRTRACK-1.7 **Fake-consumer and task lifecycle integration tests.** Cover the acceptance
       rows below with independently registered fake consumers (merge-only, comment-only,
       both, neither) and real task/board changes driving subscription demand.
 
@@ -369,12 +369,66 @@ with actual storage/config/auth references, concurrency behavior, and rollback.
 
 ## Handoff
 
-Record: changed files, the new card fields and their server-owned merge point, every consumer
-API route and its frozen schema, the fixed lock order and gate keys (and the registry-mutex
-CAS scoping), the lifecycle-gate hook points (browser/CLI/delivery), the installed-consumer
-signal source, the UI surface inventory, test commands and results, and any baseline drift
-discovered against 49a2ca05c6c2927da2194aaec8bd1e45e6fa2928. COMMENT-0 and MERGE-1 can
-then start in parallel; each adds consumer modules and targeted existing API integrations only.
+Implemented in this worktree (PR targets `feat/pr-tracking-base`). Record:
+
+- **Changed files.** New: `src/pr-tracking/pr-consumer-registry.ts`,
+  `pr-lifecycle-gate.ts`, `pr-owner-selection.ts`, `pr-reservations.ts`,
+  `pr-task-subscriptions.ts`, `src/trpc/pr-tracking-api.ts`,
+  `test/runtime/pr-tracking/pr-track1-foundation.test.ts`,
+  `web-ui/src/components/detail-panels/task-pr-tracking-panel.tsx`,
+  `web-ui/src/utils/pr-tracking.ts`. Modified: `src/core/api-contract.ts`,
+  `src/core/task-board-mutations.ts`, `src/state/workspace-state.ts`,
+  `src/pr-tracking/{in-memory-pr-record-store,pr-record-store,pr-tracking-coordinator}.ts`,
+  `src/trpc/{app-router,runtime-api,workspace-api}.ts`, `src/server/runtime-server.ts`,
+  `src/commands/task.ts`, `web-ui/src/App.tsx`, `web-ui/src/components/{card-detail-view,task-create-dialog,task-inline-create-card}.tsx`,
+  `web-ui/src/hooks/{use-board-interactions,use-review-auto-actions,use-task-editor}.ts`,
+  `web-ui/src/state/board-state.ts`, `web-ui/src/types/board.ts`.
+- **New card fields and merge point.** `autoAddressComments`, `autoFinishOnMerge`,
+  `selectedAutomationPrKey`, `settingsRevision` (all optional on
+  `runtimeBoardCardSchema`; absent reads false / unselected / 0). Server-owned
+  carry-forward in `saveWorkspaceState` (`mergeServerOwnedPrSettings`) restores the
+  persisted values over stale whole-board saves, same pattern as `pullRequests`.
+- **Consumer API routes (frozen schemas).** Under `runtimeAppRouter` →
+  `workspace.prTracking`: `setTaskPrSettings`, `selectTaskAutomationPr`,
+  `resumeTaskPrTracking`, `getTaskTrackingState`, `getTaskPrSnapshot`,
+  `refreshTaskPrSnapshot`, `updateTaskCommentDispatch`, `updateTaskMergeBinding`,
+  `selectRepairOwner`, `transferRepairOwner`, `reservePrOperation`,
+  `validatePrOperation`, `releasePrOperation`, `readPrSnapshotEvents`. The
+  installed-consumer list is also exposed on `RuntimeConfigResponse.installedPrConsumers`
+  (empty until COMMENT-0 / MERGE-1 register).
+- **Lock order and gate keys.** Fixed acquisition order task ownership → PR gate
+  (canonical PR key) → head-ref gate (canonical head repository + ref), each
+  gate acquisition a short CAS under the single tracking-registry mutex
+  (`PrRecordStoreBase.withRegistryTransaction`); the registry mutex is never held
+  while acquiring task/Git locks or awaiting model/network work. Sibling records
+  sharing a head ref serialize on the gate under the global registry mutex.
+- **Lifecycle-gate hook points.** Browser: `web-ui/src/hooks/use-review-auto-actions.ts`
+  (`computePrLifecycleGatedTaskIds`). CLI: `src/commands/task.ts`
+  (`completeTaskById`). Deterministic delivery: `src/workspace/git-delivery.ts` +
+  `src/task-dispatch/task-dispatch-service.ts` (`checkPrDeliveryReservation`).
+  All read the installed-consumer registry through
+  `evaluatePrLifecycleGate` / `isPrLifecycleGated`; with zero consumers installed
+  every gate is a no-op (legacy behavior unchanged).
+- **Installed-consumer signal source.** `getTaskTrackingState` per consumer kind
+  plus per-task agent support; `RuntimeConfigResponse.installedPrConsumers`
+  drives the create/edit dialog checkbox availability ("Feature unavailable").
+- **UI surface inventory.** Task create dialog + inline edit card: both
+  checkboxes (disabled with "(feature unavailable)" when the consumer is not
+  installed). Detail view: `TaskPrTrackingPanel` — checkbox toggles, snapshot
+  as-of label with manual refresh, "Waiting for linked PR", ambiguity blocker
+  with Automation PR selector, "Repairs owned by <workspace/task>", Resume PR
+  tracking, auth/unsupported blocker surfaces.
+- **Test commands and results.** `npx vitest run test/runtime/pr-tracking`
+  (87 tests pass, incl. 13 new PRTRACK-1 foundation tests); `npm run test:fast`
+  (1052/1053 — the one failure, `test/runtime/server/middleware.test.ts`
+  socket-upgrade case, fails identically on the clean base branch:
+  environment-dependent, not a regression); `npm run typecheck` and
+  `npm run web:typecheck` clean; `npm run web:test` (586 tests pass); Biome clean.
+- **Baseline drift.** None beyond PRTRACK-0; no storage-format changes beyond
+  PRTRACK-0's record schema (reservation/owner blocks already present).
+
+COMMENT-0 and MERGE-1 can now start in parallel; each adds consumer modules and
+targeted existing API integrations only.
 
 ## Stop conditions
 

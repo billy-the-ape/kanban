@@ -14,10 +14,12 @@ import type {
 	GitHubPrFeedbackCompleteness,
 	GitHubPrMetadataSnapshot,
 	GitHubPrNormalizedFeedbackEvent,
+	GitHubPrNormalizedSnapshot,
 	GitHubPrTaskBinding,
 	GitHubPrTerminalStopReason,
 	RuntimeBoardColumnId,
 	RuntimeBoardData,
+	RuntimePrSnapshotEvent,
 } from "../core/api-contract";
 import { getPullRequestIdentityKey } from "../core/pull-request-links";
 import type { LockRequest } from "../fs/locked-file-system";
@@ -201,6 +203,14 @@ export class PrTrackingCoordinator {
 	private started = false;
 	private stopping = false;
 	private orphanPassStarted = false;
+	/**
+	 * PRTRACK-1: transient per-subscription snapshot/terminal event logs
+	 * (hints). Durable replay cursors persist per consumer kind on the task
+	 * binding; these logs only replay within a session.
+	 */
+	private readonly snapshotEvents = new Map<string, RuntimePrSnapshotEvent[]>();
+	private readonly snapshotSeq = new Map<string, number>();
+	private static readonly SNAPSHOT_EVENT_LIMIT = 1000;
 
 	constructor(deps: CreatePrTrackingCoordinatorDependencies = {}) {
 		this.adapter = deps.adapter ?? createGitHubGhAdapter();
@@ -287,6 +297,126 @@ export class PrTrackingCoordinator {
 			}
 		}
 		return count;
+	}
+
+	// --- PRTRACK-1: snapshot events, subscriptions, and authorized reads ---
+
+	/**
+	 * Read-only view of the current subscriptions (task-derived demand),
+	 * including consumer flags, for reconciliation and diagnostics.
+	 */
+	listSubscriptions(): Array<{
+		workspaceId: string;
+		taskId: string;
+		accessScopeId: string;
+		canonicalPrKey: string;
+		column: RuntimeBoardColumnId;
+		consumers: Record<PrTrackingConsumerKind, boolean>;
+		blocker: string | null;
+	}> {
+		return [...this.subscriptions.values()].map((sub) => ({
+			workspaceId: sub.workspaceId,
+			taskId: sub.taskId,
+			canonicalPrKey: sub.canonicalPrKey,
+			accessScopeId: sub.accessScopeId,
+			column: sub.column,
+			consumers: { ...sub.consumers },
+			blocker: sub.blocker,
+		}));
+	}
+
+	private emitSnapshotEvent(sub: TrackedSubscription, event: Omit<RuntimePrSnapshotEvent, "seq">): void {
+		const key = this.subscriptionKey(sub.workspaceId, sub.taskId);
+		const seq = (this.snapshotSeq.get(key) ?? 0) + 1;
+		this.snapshotSeq.set(key, seq);
+		const log = this.snapshotEvents.get(key) ?? [];
+		log.push({ ...event, seq });
+		while (log.length > PrTrackingCoordinator.SNAPSHOT_EVENT_LIMIT) {
+			log.shift();
+		}
+		this.snapshotEvents.set(key, log);
+	}
+
+	/**
+	 * Authorized, versioned snapshot read for one subscribed task. The data
+	 * comes from the coordinator's in-memory poll state (the same read every
+	 * consumer sees); `isStale` reports whether a fresh read is pending.
+	 */
+	getTaskAuthorizedSnapshot(
+		workspaceId: string,
+		taskId: string,
+	): {
+		version: number | null;
+		snapshot: GitHubPrNormalizedSnapshot | null;
+		checkedAt: number | null;
+		isStale: boolean;
+	} {
+		const sub = this.subscriptions.get(this.subscriptionKey(workspaceId, taskId));
+		if (!sub) {
+			return { version: null, snapshot: null, checkedAt: null, isStale: true };
+		}
+		const state = this.polls.get(this.pollKey(sub.canonicalPrKey, sub.accessScopeId));
+		if (!state || !state.metadata) {
+			return { version: null, snapshot: null, checkedAt: null, isStale: true };
+		}
+		const snapshot: GitHubPrNormalizedSnapshot = {
+			canonicalPrKey: sub.canonicalPrKey,
+			accessScopeId: sub.accessScopeId,
+			checkedAt: state.snapshotCheckedAt ?? state.metadata.checkedAt,
+			metadata: state.metadata,
+			feedback: state.feedback,
+			feedbackCompleteness: state.feedbackCompleteness,
+		};
+		return {
+			version: state.snapshotCheckedAt,
+			snapshot,
+			checkedAt: state.snapshotCheckedAt,
+			isStale: state.snapshotCheckedAt === null || isPrSnapshotStale(state.snapshotCheckedAt, this.now()),
+		};
+	}
+
+	/**
+	 * Versioned subscription: replay events with seq > fromCursor and advance
+	 * the durable per-consumer replay cursor on the task binding. Events are
+	 * HINTS — consumers must reconcile authoritative state on startup and
+	 * after any hint.
+	 */
+	async readTaskSnapshotEvents(
+		workspaceId: string,
+		taskId: string,
+		consumer: "comments" | "merge",
+		fromCursor: number = 0,
+	): Promise<{ events: RuntimePrSnapshotEvent[]; nextCursor: number }> {
+		const sub = this.subscriptions.get(this.subscriptionKey(workspaceId, taskId));
+		if (!sub) {
+			return { events: [], nextCursor: fromCursor };
+		}
+		const key = this.subscriptionKey(workspaceId, taskId);
+		const log = this.snapshotEvents.get(key) ?? [];
+		const events = log.filter((event) => event.seq > fromCursor).map((event) => ({ ...event }));
+		const nextCursor = events.length > 0 ? events[events.length - 1].seq : fromCursor;
+		if (nextCursor > fromCursor) {
+			// Best-effort durable cursor: a failed write only means the same
+			// hints replay again next session (authoritative reconciliation
+			// on startup is the safety net).
+			await this.store
+				.updateTaskBinding(sub.canonicalPrKey, { workspaceId, taskId }, undefined, (item) => ({
+					...item,
+					replayCursors: {
+						...item.replayCursors,
+						[consumer]: nextCursor,
+					},
+				}))
+				.then((result) => {
+					if (!result.ok) {
+						this.warn(`PR tracking replay cursor update failed (${result.reason})`);
+					}
+				})
+				.catch((error: unknown) => {
+					this.warn(`PR tracking replay cursor update failed: ${String(error)}`);
+				});
+		}
+		return { events, nextCursor };
 	}
 
 	private getPollState(prKey: string, accessScopeId: string): PrPollState {
@@ -959,6 +1089,14 @@ export class PrTrackingCoordinator {
 					(item) => item.workspaceId === sub.workspaceId && item.taskId === sub.taskId,
 				) ?? null;
 			await this.applyPrStateEffects(sub, binding, prState, readCounted);
+			// PRTRACK-1: publish a snapshot hint for every active subscriber.
+			this.emitSnapshotEvent(sub, {
+				kind: "snapshot",
+				version: recordAfter.record.revision,
+				checkedAt: state.snapshotCheckedAt,
+				prState,
+				terminalReason: null,
+			});
 		}
 		if (!this.stopping && feedbackOk) {
 			state.consecutiveFailures = 0;
@@ -1131,6 +1269,7 @@ export class PrTrackingCoordinator {
 					observedAt: this.now(),
 					reconciliationReads: 0,
 				});
+				this.emitTerminalInvalidation(sub, "closed_unmerged");
 			}
 			return;
 		}
@@ -1142,6 +1281,7 @@ export class PrTrackingCoordinator {
 					observedAt: this.now(),
 					reconciliationReads: 0,
 				});
+				this.emitTerminalInvalidation(sub, "no_enabled_consumers");
 			}
 			return;
 		}
@@ -1152,6 +1292,7 @@ export class PrTrackingCoordinator {
 					observedAt: this.now(),
 					reconciliationReads: existing?.reconciliationReads ?? 0,
 				});
+				this.emitTerminalInvalidation(sub, "merged_completed");
 			}
 			return;
 		}
@@ -1167,6 +1308,18 @@ export class PrTrackingCoordinator {
 			reason: "merged_reconciling",
 			observedAt: this.now(),
 			reconciliationReads: nextReads,
+		});
+		this.emitTerminalInvalidation(sub, "merged_reconciling");
+	}
+
+	/** PRTRACK-1: publish a terminal-invalidation hint to the subscription. */
+	private emitTerminalInvalidation(sub: TrackedSubscription, reason: GitHubPrTerminalStopReason): void {
+		this.emitSnapshotEvent(sub, {
+			kind: "terminal_invalidation",
+			version: null,
+			checkedAt: this.now(),
+			prState: null,
+			terminalReason: reason,
 		});
 	}
 

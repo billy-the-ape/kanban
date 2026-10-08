@@ -36,6 +36,9 @@ export interface TaskDraft {
 	baseRef: string;
 	/** UPD-0: undefined keeps the existing card policy on update; create normalizes missing to true. */
 	updateBaseRefBeforeStart?: boolean;
+	/** PRTRACK-1: server-owned PR automation preferences (explicit values win on save). */
+	autoAddressComments?: boolean;
+	autoFinishOnMerge?: boolean;
 }
 
 export interface TaskMoveEvent {
@@ -189,6 +192,9 @@ function normalizeCard(rawCard: unknown): BoardCard | null {
 		clineModelId?: unknown;
 		clineReasoningEffort?: unknown;
 		pullRequests?: unknown;
+		autoAddressComments?: unknown;
+		autoFinishOnMerge?: unknown;
+		selectedAutomationPrKey?: unknown;
 		createdAt?: unknown;
 		updatedAt?: unknown;
 	};
@@ -228,6 +234,13 @@ function normalizeCard(rawCard: unknown): BoardCard | null {
 		...(typeof card.agentId === "string" && card.agentId ? { agentId: card.agentId as RuntimeAgentId } : {}),
 		...(clineSettings !== undefined ? { clineSettings } : {}),
 		...(pullRequests !== undefined ? { pullRequests } : {}),
+		// PRTRACK-1: server-owned PR automation fields carry through the
+		// normalize (the server re-owns them on save).
+		...(typeof card.autoAddressComments === "boolean" ? { autoAddressComments: card.autoAddressComments } : {}),
+		...(typeof card.autoFinishOnMerge === "boolean" ? { autoFinishOnMerge: card.autoFinishOnMerge } : {}),
+		...(typeof card.selectedAutomationPrKey === "string" && card.selectedAutomationPrKey
+			? { selectedAutomationPrKey: card.selectedAutomationPrKey }
+			: {}),
 		...(typeof card.updateBaseRefBeforeStart === "boolean"
 			? { updateBaseRefBeforeStart: card.updateBaseRefBeforeStart }
 			: {}),
@@ -380,6 +393,9 @@ export function addTaskToColumnWithResult(
 			clineSettings: draft.clineSettings,
 			baseRef: draft.baseRef,
 			updateBaseRefBeforeStart: draft.updateBaseRefBeforeStart,
+			// PRTRACK-1: server-owned PR automation preferences.
+			autoAddressComments: draft.autoAddressComments,
+			autoFinishOnMerge: draft.autoFinishOnMerge,
 		},
 		createBrowserUuid,
 	);
@@ -595,6 +611,10 @@ export function updateTask(board: BoardData, taskId: string, draft: TaskDraft): 
 					draft.updateBaseRefBeforeStart === undefined
 						? card.updateBaseRefBeforeStart
 						: draft.updateBaseRefBeforeStart,
+				// PRTRACK-1: server-owned PR automation preferences.
+				autoAddressComments:
+					draft.autoAddressComments === undefined ? card.autoAddressComments : draft.autoAddressComments,
+				autoFinishOnMerge: draft.autoFinishOnMerge === undefined ? card.autoFinishOnMerge : draft.autoFinishOnMerge,
 				updatedAt: Date.now(),
 			};
 		});

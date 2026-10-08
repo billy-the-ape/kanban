@@ -9,6 +9,7 @@ import { ColumnContextPanel } from "@/components/detail-panels/column-context-pa
 import { type DiffLineComment, DiffViewerPanel } from "@/components/detail-panels/diff-viewer-panel";
 import { FileTreePanel } from "@/components/detail-panels/file-tree-panel";
 import { TaskDiagnosticsPanel } from "@/components/detail-panels/task-diagnostics-panel";
+import { TaskPrTrackingPanel } from "@/components/detail-panels/task-pr-tracking-panel";
 import { TaskReviewControl } from "@/components/detail-panels/task-review-control";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/components/ui/cn";
@@ -871,6 +872,13 @@ export function CardDetailView({
 			>
 				{/* B-10: collapsible diagnostics strip (phase, git, preserved work, context, actions). */}
 				<TaskDiagnosticsPanel workspaceId={currentProjectId} taskId={selection.card.id} />
+				{/* PRTRACK-1: PR tracking settings + state (checkboxes, blocker, repair owner). */}
+				<TaskPrTrackingPanel
+					workspaceId={currentProjectId}
+					taskId={selection.card.id}
+					card={selection.card}
+					installedConsumers={runtimeConfig?.installedPrConsumers ?? []}
+				/>
 				{gitHistoryPanel ? (
 					<div className="flex min-h-0 flex-1 overflow-hidden">{gitHistoryPanel}</div>
 				) : (

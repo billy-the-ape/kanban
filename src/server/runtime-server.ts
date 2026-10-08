@@ -29,6 +29,10 @@ import {
 	getKanbanRuntimeTls,
 	isKanbanRemoteHost,
 } from "../core/runtime-endpoint";
+import { PrConsumerRegistry } from "../pr-tracking/pr-consumer-registry";
+import { findTaskCard, resolveCardAutomationPrKey } from "../pr-tracking/pr-owner-selection";
+import { PrRecordStore } from "../pr-tracking/pr-record-store";
+import { reconcileTaskSubscriptions } from "../pr-tracking/pr-task-subscriptions";
 import { createPrTrackingCoordinator } from "../pr-tracking/pr-tracking-coordinator";
 import {
 	checkRateLimit,
@@ -42,11 +46,12 @@ import {
 	validatePasscode,
 	validateSession,
 } from "../security/passcode-manager";
-import { loadWorkspaceContextById } from "../state/workspace-state";
+import { listWorkspaceIndexEntries, loadWorkspaceBoardById, loadWorkspaceContextById } from "../state/workspace-state";
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { createTerminalWebSocketBridge } from "../terminal/ws-server";
 import { type RuntimeTrpcContext, type RuntimeTrpcWorkspaceScope, runtimeAppRouter } from "../trpc/app-router";
 import { createHooksApi } from "../trpc/hooks-api";
+import { createPrTrackingApi } from "../trpc/pr-tracking-api";
 import { createProjectsApi } from "../trpc/projects-api";
 import { createRuntimeApi } from "../trpc/runtime-api";
 import { createWorkspaceApi } from "../trpc/workspace-api";
@@ -263,6 +268,41 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		deps.workspaceRegistry.clearActiveWorkspace();
 	};
 
+	// PRTRACK-1: runtime-wide PR tracking state (coordinator + durable record
+	// store + consumer registry). One coordinator serves every workspace; the
+	// trpc API and board-save reconciliation share these singletons.
+	let prTrackingState: {
+		coordinator: ReturnType<typeof createPrTrackingCoordinator>;
+		store: PrRecordStore;
+		registry: PrConsumerRegistry;
+	} | null = null;
+	const getPrTrackingState = () => {
+		if (!prTrackingState) {
+			prTrackingState = {
+				coordinator: createPrTrackingCoordinator({
+					warn: (message) => deps.warn(`[pr-tracking] ${message}`),
+					logError: (message) => deps.warn(`[pr-tracking] ${message}`),
+				}),
+				store: new PrRecordStore(),
+				registry: new PrConsumerRegistry(),
+			};
+		}
+		return prTrackingState;
+	};
+
+	// The boards of every managed workspace (task-derived subscription demand).
+	const listManagedWorkspaceBoards = async () => {
+		const entries = await listWorkspaceIndexEntries();
+		const boards: Array<{ workspaceId: string; board: Awaited<ReturnType<typeof loadWorkspaceBoardById>> }> = [];
+		for (const entry of entries) {
+			boards.push({
+				workspaceId: entry.workspaceId,
+				board: await loadWorkspaceBoardById(entry.workspaceId),
+			});
+		}
+		return boards;
+	};
+
 	// B-9: shared by per-request contexts and the post-startup reconciliation pass.
 	const buildRuntimeApi = () =>
 		createRuntimeApi({
@@ -284,6 +324,45 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			broadcastRuntimeWorkspaceStateUpdated: deps.runtimeStateHub.broadcastRuntimeWorkspaceStateUpdated,
 			warnTaskDispatchError: (error) => {
 				deps.warn(`[task-dispatch] Queue pass failed: ${error instanceof Error ? error.message : String(error)}`);
+			},
+			// PRTRACK-1: installed-consumer signal + shared lifecycle gate for
+			// deterministic delivery.
+			getInstalledPrConsumers: () =>
+				getPrTrackingState()
+					.registry.listInstalled()
+					.map((registration) => ({
+						kind: registration.kind,
+						requiredReadSources: registration.requiredReadSources,
+					})),
+			checkPrDeliveryReservation: async (scope, taskId) => {
+				const board = await loadWorkspaceBoardById(scope.workspaceId).catch(() => null);
+				if (!board) {
+					return { busy: false, reason: null };
+				}
+				const found = findTaskCard(board, taskId);
+				if (!found) {
+					return { busy: false, reason: null };
+				}
+				const resolved = resolveCardAutomationPrKey(found.card);
+				if (!resolved.key) {
+					return { busy: false, reason: null };
+				}
+				const loaded = await getPrTrackingState().store.loadRecord(resolved.key);
+				if (!loaded.ok) {
+					return { busy: false, reason: null };
+				}
+				const reservation = loaded.record.reservation;
+				if (reservation.state !== "reserved" || !reservation.reservedBy) {
+					return { busy: false, reason: null };
+				}
+				const holder = reservation.reservedBy;
+				if (holder.workspaceId === scope.workspaceId && holder.taskId === taskId) {
+					return { busy: false, reason: null };
+				}
+				return {
+					busy: true,
+					reason: `The task's PR write target is reserved by ${holder.workspaceId}/${holder.taskId}; retry after it drains.`,
+				};
 			},
 		});
 
@@ -309,6 +388,19 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 								error instanceof Error ? error.message : String(error)
 							}`,
 						);
+					});
+				},
+				// PRTRACK-1: reconcile task-derived PR tracking subscriptions after
+				// a board change (card created/moved/checkboxes changed).
+				runPrTrackingReconcilePass: (scope) => {
+					void reconcileTaskSubscriptions(getPrTrackingState().coordinator, {
+						listBoards: listManagedWorkspaceBoards,
+						installedConsumers: () => ({
+							comments: getPrTrackingState().registry.isInstalled("comments"),
+							mergeCompletion: getPrTrackingState().registry.isInstalled("mergeCompletion"),
+						}),
+					}).catch((error) => {
+						deps.warn(`[pr-tracking] Reconcile pass failed for ${scope.workspaceId}: ${error}`);
 					});
 				},
 			}),
@@ -341,6 +433,25 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				ensureTerminalManagerForWorkspace: deps.ensureTerminalManagerForWorkspace,
 				broadcastRuntimeWorkspaceStateUpdated: deps.runtimeStateHub.broadcastRuntimeWorkspaceStateUpdated,
 				broadcastTaskReadyForReview: deps.runtimeStateHub.broadcastTaskReadyForReview,
+			}),
+			prTrackingApi: createPrTrackingApi({
+				getPrTrackingCoordinator: () => getPrTrackingState().coordinator,
+				getPrTrackingStore: () => getPrTrackingState().store,
+				getPrConsumerRegistry: () => getPrTrackingState().registry,
+				listManagedWorkspaceBoards,
+				broadcastRuntimeWorkspaceStateUpdated: (scope) =>
+					deps.runtimeStateHub.broadcastRuntimeWorkspaceStateUpdated(scope.workspaceId, scope.workspacePath),
+				isTaskWriterActive: async (workspaceId, taskId) => {
+					const workspacePath = deps.workspaceRegistry.getWorkspacePathById(workspaceId);
+					if (!workspacePath) {
+						return false;
+					}
+					const scope = { workspaceId, workspacePath };
+					return isTaskWriterActive(taskId, {
+						clineTaskSessionService: await getScopedClineTaskSessionService(scope),
+						terminalManager: await getScopedTerminalManager(scope),
+					});
+				},
 			}),
 		};
 	};
@@ -609,15 +720,22 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 	// B-5.7/B-5.9: background maintenance; close() waits for it so no git
 	// subprocess outlives the server.
 	const startupMaintenance = runStartupTaskWorkspaceMaintenance(deps.warn);
-	// PR tracking foundation (PRTRACK-0): one runtime-wide coordinator.
-	// Starts idle with no subscriptions (fake/inspect-only demand is test
-	// scoped; PRTRACK-1 registers task-derived subscriptions). Startup never
-	// blocks: the orphan pass is background and the scheduler lock is lazy.
-	const prTrackingCoordinator = createPrTrackingCoordinator({
-		warn: (message) => deps.warn(`[pr-tracking] ${message}`),
-		logError: (message) => deps.warn(`[pr-tracking] ${message}`),
-	});
+	// PRTRACK-0/1: one runtime-wide PR tracking coordinator (created lazily
+	// with the durable record store and consumer registry). Starts idle;
+	// task-derived subscriptions are reconciled at startup in the background.
+	const { coordinator: prTrackingCoordinator, registry: prTrackingRegistry } = getPrTrackingState();
 	await prTrackingCoordinator.start();
+	// PRTRACK-1: reconcile task-derived subscriptions at startup (background,
+	// fire-and-forget; never blocks startup).
+	void reconcileTaskSubscriptions(prTrackingCoordinator, {
+		listBoards: listManagedWorkspaceBoards,
+		installedConsumers: () => ({
+			comments: prTrackingRegistry.isInstalled("comments"),
+			mergeCompletion: prTrackingRegistry.isInstalled("mergeCompletion"),
+		}),
+	}).catch((error) => {
+		deps.warn(`[pr-tracking] Startup reconcile failed: ${error}`);
+	});
 	const activeWorkspaceId = deps.workspaceRegistry.getActiveWorkspaceId();
 	const url = activeWorkspaceId
 		? buildKanbanRuntimeUrl(`/${encodeURIComponent(activeWorkspaceId)}`)

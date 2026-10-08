@@ -6,6 +6,7 @@ import { basename, join, resolve } from "node:path";
 import { z } from "zod";
 
 import {
+	type RuntimeBoardCard,
 	type RuntimeBoardColumnId,
 	type RuntimeBoardData,
 	type RuntimeGitRepositoryInfo,
@@ -723,6 +724,58 @@ function mergeServerOwnedPullRequests(
 	};
 }
 
+/**
+ * PRTRACK-1: server-owned PR automation settings — the same documented
+ * exception as `pullRequests`. `selectedAutomationPrKey` and
+ * `settingsRevision` are written only through the dedicated PR mutations
+ * under the workspace lock, so a stale whole board save restores the
+ * persisted values. The two preference booleans are additionally settable by
+ * the task create/edit dialogs: an explicit client boolean wins, an absent
+ * value falls back to the persisted server-owned value (new cards with no
+ * explicit value keep no PR settings).
+ */
+function mergeServerOwnedPrSettings(clientBoard: RuntimeBoardData, persistedBoard: RuntimeBoardData): RuntimeBoardData {
+	const persistedByTaskId = new Map<string, RuntimeBoardCard>();
+	for (const column of persistedBoard.columns) {
+		for (const card of column.cards) {
+			persistedByTaskId.set(card.id, card);
+		}
+	}
+	return {
+		...clientBoard,
+		columns: clientBoard.columns.map((column) => ({
+			...column,
+			cards: column.cards.map((card) => {
+				const persisted = persistedByTaskId.get(card.id);
+				const mergedCard: RuntimeBoardCard = {
+					...card,
+					autoAddressComments:
+						typeof card.autoAddressComments === "boolean"
+							? card.autoAddressComments
+							: persisted?.autoAddressComments,
+					autoFinishOnMerge:
+						typeof card.autoFinishOnMerge === "boolean" ? card.autoFinishOnMerge : persisted?.autoFinishOnMerge,
+					selectedAutomationPrKey: persisted?.selectedAutomationPrKey,
+					settingsRevision: persisted?.settingsRevision,
+				};
+				if (mergedCard.autoAddressComments === undefined) {
+					delete mergedCard.autoAddressComments;
+				}
+				if (mergedCard.autoFinishOnMerge === undefined) {
+					delete mergedCard.autoFinishOnMerge;
+				}
+				if (mergedCard.selectedAutomationPrKey === undefined) {
+					delete mergedCard.selectedAutomationPrKey;
+				}
+				if (mergedCard.settingsRevision === undefined) {
+					delete mergedCard.settingsRevision;
+				}
+				return mergedCard;
+			}),
+		})),
+	};
+}
+
 export async function saveWorkspaceState(
 	cwd: string,
 	payload: RuntimeWorkspaceStateSaveRequest,
@@ -741,7 +794,11 @@ export async function saveWorkspaceState(
 		) {
 			throw new WorkspaceStateConflictError(expectedRevision, currentMeta.revision);
 		}
-		const board = mergeServerOwnedPullRequests(parsedPayload.board, await readWorkspaceBoard(context.workspaceId));
+		const persistedBoard = await readWorkspaceBoard(context.workspaceId);
+		const board = mergeServerOwnedPrSettings(
+			mergeServerOwnedPullRequests(parsedPayload.board, persistedBoard),
+			persistedBoard,
+		);
 		const sessions = parsedPayload.sessions;
 		const nextRevision = currentMeta.revision + 1;
 		const nextMeta: WorkspaceStateMeta = {

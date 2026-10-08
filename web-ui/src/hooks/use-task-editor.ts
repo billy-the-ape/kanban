@@ -54,6 +54,11 @@ export interface UseTaskEditorResult {
 	setNewTaskAutoReviewEnabled: Dispatch<SetStateAction<boolean>>;
 	newTaskAutoReviewMode: TaskAutoReviewMode;
 	setNewTaskAutoReviewMode: Dispatch<SetStateAction<TaskAutoReviewMode>>;
+	/** PRTRACK-1: PR automation preferences for new tasks (server-owned; default off). */
+	newTaskPrAutoAddressComments: boolean;
+	setNewTaskPrAutoAddressComments: Dispatch<SetStateAction<boolean>>;
+	newTaskPrAutoFinishOnMerge: boolean;
+	setNewTaskPrAutoFinishOnMerge: Dispatch<SetStateAction<boolean>>;
 	isNewTaskStartInPlanModeDisabled: boolean;
 	newTaskBranchRef: string;
 	setNewTaskBranchRef: Dispatch<SetStateAction<string>>;
@@ -75,6 +80,11 @@ export interface UseTaskEditorResult {
 	setEditTaskAutoReviewEnabled: Dispatch<SetStateAction<boolean>>;
 	editTaskAutoReviewMode: TaskAutoReviewMode;
 	setEditTaskAutoReviewMode: Dispatch<SetStateAction<TaskAutoReviewMode>>;
+	/** PRTRACK-1: PR automation preferences for the edited task. */
+	editTaskPrAutoAddressComments: boolean;
+	setEditTaskPrAutoAddressComments: Dispatch<SetStateAction<boolean>>;
+	editTaskPrAutoFinishOnMerge: boolean;
+	setEditTaskPrAutoFinishOnMerge: Dispatch<SetStateAction<boolean>>;
 	isEditTaskStartInPlanModeDisabled: boolean;
 	editTaskBranchRef: string;
 	setEditTaskBranchRef: Dispatch<SetStateAction<string>>;
@@ -126,6 +136,8 @@ export function useTaskEditor({
 		"commit",
 		normalizeStoredTaskAutoReviewMode,
 	);
+	const [newTaskPrAutoAddressComments, setNewTaskPrAutoAddressComments] = useState(false);
+	const [newTaskPrAutoFinishOnMerge, setNewTaskPrAutoFinishOnMerge] = useState(false);
 	const isNewTaskStartInPlanModeDisabled = false;
 	const [newTaskBranchRef, setNewTaskBranchRef] = useState("");
 	const [lastCreatedTaskBranchByProjectId, setLastCreatedTaskBranchByProjectId] = useState<Record<string, string>>({});
@@ -135,6 +147,8 @@ export function useTaskEditor({
 	const [editTaskStartInPlanMode, setEditTaskStartInPlanMode] = useState(false);
 	const [editTaskAutoReviewEnabled, setEditTaskAutoReviewEnabled] = useState(false);
 	const [editTaskAutoReviewMode, setEditTaskAutoReviewMode] = useState<TaskAutoReviewMode>("commit");
+	const [editTaskPrAutoAddressComments, setEditTaskPrAutoAddressComments] = useState(false);
+	const [editTaskPrAutoFinishOnMerge, setEditTaskPrAutoFinishOnMerge] = useState(false);
 	const isEditTaskStartInPlanModeDisabled = false;
 	const [editTaskBranchRef, setEditTaskBranchRef] = useState("");
 	const [newTaskUpdateBaseRefBeforeStart, setNewTaskUpdateBaseRefBeforeStart] = useState(
@@ -273,6 +287,8 @@ export function useTaskEditor({
 			setEditTaskStartInPlanMode(task.startInPlanMode);
 			setEditTaskAutoReviewEnabled(task.autoReviewEnabled === true);
 			setEditTaskAutoReviewMode(resolveTaskAutoReviewMode(task.autoReviewMode));
+			setEditTaskPrAutoAddressComments(task.autoAddressComments === true);
+			setEditTaskPrAutoFinishOnMerge(task.autoFinishOnMerge === true);
 			const fallbackBranch = task.baseRef || resolvedDefaultTaskBranchRef;
 			setEditTaskBranchRef(fallbackBranch);
 			setEditTaskAgentId(task.agentId);
@@ -301,6 +317,8 @@ export function useTaskEditor({
 		setEditTaskStartInPlanMode(false);
 		setEditTaskAutoReviewEnabled(false);
 		setEditTaskAutoReviewMode("commit");
+		setEditTaskPrAutoAddressComments(false);
+		setEditTaskPrAutoFinishOnMerge(false);
 		setEditTaskImages([]);
 		setEditTaskBranchRef("");
 		setEditTaskUpdateBaseRefBeforeStart(DEFAULT_NEW_TASK_UPDATE_BASE_REF_BEFORE_START);
@@ -332,6 +350,9 @@ export function useTaskEditor({
 				autoReviewEnabled: editTaskAutoReviewEnabled,
 				autoReviewMode: editTaskAutoReviewMode,
 				images: editTaskImages,
+				// PRTRACK-1: server-owned PR automation preferences (explicit booleans win on save).
+				autoAddressComments: editTaskPrAutoAddressComments,
+				autoFinishOnMerge: editTaskPrAutoFinishOnMerge,
 				agentId: editTaskAgentId,
 				clineSettings: editTaskClineSettings,
 				baseRef,
@@ -359,6 +380,8 @@ export function useTaskEditor({
 		editTaskAgentId,
 		editTaskAutoReviewEnabled,
 		editTaskAutoReviewMode,
+		editTaskPrAutoAddressComments,
+		editTaskPrAutoFinishOnMerge,
 		editTaskBranchRef,
 		editTaskClineSettings,
 		editTaskInitialBaselineFixed,
@@ -412,6 +435,9 @@ export function useTaskEditor({
 				baseRef,
 				// UPD-1: persist an explicit policy (unchecked must survive as false).
 				updateBaseRefBeforeStart: newTaskUpdateBaseRefBeforeStart,
+				// PRTRACK-1: server-owned PR automation preferences.
+				autoAddressComments: newTaskPrAutoAddressComments,
+				autoFinishOnMerge: newTaskPrAutoFinishOnMerge,
 			});
 			setBoard(created.board);
 			trackTaskCreated({
@@ -443,6 +469,8 @@ export function useTaskEditor({
 			newTaskAgentId,
 			newTaskAutoReviewEnabled,
 			newTaskAutoReviewMode,
+			newTaskPrAutoAddressComments,
+			newTaskPrAutoFinishOnMerge,
 			newTaskBranchRef,
 			newTaskClineSettings,
 			newTaskImages,
@@ -481,6 +509,9 @@ export function useTaskEditor({
 					baseRef,
 					// UPD-1: persist an explicit policy (unchecked must survive as false).
 					updateBaseRefBeforeStart: newTaskUpdateBaseRefBeforeStart,
+					// PRTRACK-1: server-owned PR automation preferences.
+					autoAddressComments: newTaskPrAutoAddressComments,
+					autoFinishOnMerge: newTaskPrAutoFinishOnMerge,
 				});
 				updatedBoard = created.board;
 				createdTaskIds.push(created.task.id);
@@ -517,6 +548,8 @@ export function useTaskEditor({
 			newTaskAgentId,
 			newTaskAutoReviewEnabled,
 			newTaskAutoReviewMode,
+			newTaskPrAutoAddressComments,
+			newTaskPrAutoFinishOnMerge,
 			newTaskBranchRef,
 			newTaskClineSettings,
 			newTaskImages,
@@ -565,6 +598,10 @@ export function useTaskEditor({
 		setNewTaskAutoReviewEnabled,
 		newTaskAutoReviewMode,
 		setNewTaskAutoReviewMode,
+		newTaskPrAutoAddressComments,
+		setNewTaskPrAutoAddressComments,
+		newTaskPrAutoFinishOnMerge,
+		setNewTaskPrAutoFinishOnMerge,
 		isNewTaskStartInPlanModeDisabled,
 		newTaskBranchRef,
 		setNewTaskBranchRef,
@@ -585,6 +622,10 @@ export function useTaskEditor({
 		setEditTaskAutoReviewEnabled,
 		editTaskAutoReviewMode,
 		setEditTaskAutoReviewMode,
+		editTaskPrAutoAddressComments,
+		setEditTaskPrAutoAddressComments,
+		editTaskPrAutoFinishOnMerge,
+		setEditTaskPrAutoFinishOnMerge,
 		isEditTaskStartInPlanModeDisabled,
 		editTaskBranchRef,
 		setEditTaskBranchRef,
