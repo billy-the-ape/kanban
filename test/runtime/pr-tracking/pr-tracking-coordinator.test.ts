@@ -552,6 +552,30 @@ describe("pr-tracking-coordinator", () => {
 		expect(harness.fake.metadataCalls()).toBe(3);
 		expect(restarted.getState().polls.every((poll) => poll.nextPollAt === null)).toBe(true);
 	});
+	it("resumes replay above the persisted cursor after a restart", async () => {
+		const harness = makeCoordinator();
+		const coordinator = track(harness.coordinator);
+		expect((await coordinator.addSubscription(descriptor())).status).toBe("active");
+
+		// First session: the poll emits a snapshot hint (seq 1) and reading it
+		// persists the per-consumer replay cursor on the binding.
+		await pollOnce();
+		const first = await coordinator.readTaskSnapshotEvents("ws-1", "task-1", "comments");
+		expect(first.events.map((event) => event.seq)).toEqual([1]);
+		expect(first.nextCursor).toBe(1);
+
+		// Restart: a fresh coordinator sharing the same store reseeds its
+		// in-memory event sequence from the persisted cursor, so already
+		// consumed hints are never replayed again.
+		const restarted = track(
+			makeCoordinator({ store: harness.store, schedulerLockPath: join(root, "lock-restart") }).coordinator,
+		);
+		expect((await restarted.addSubscription(descriptor())).status).toBe("active");
+		await pollOnce();
+		const resumed = await restarted.readTaskSnapshotEvents("ws-1", "task-1", "comments");
+		expect(resumed.events.map((event) => event.seq)).toEqual([2]);
+		expect(resumed.nextCursor).toBe(2);
+	});
 
 	it("backs off through the 60/120/240/480/900s ladder on repeated failures", async () => {
 		const callTimes: number[] = [];

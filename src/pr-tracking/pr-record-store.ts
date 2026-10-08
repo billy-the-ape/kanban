@@ -99,6 +99,19 @@ export interface PrRecordIo {
 }
 
 /**
+ * PRTRACK-1: registry-level access for multi-record transactions. Used by
+ * the fenced operation reservations: the head-ref write gate must be
+ * validated against ALL records whose head mapping matches, atomically with
+ * the PR-gate write, under the single global registry mutex.
+ */
+export interface PrRegistryAccess {
+	loadState(canonicalPrKey: string): Promise<PrRecordState>;
+	write(canonicalPrKey: string, record: GitHubPrTrackingRecord): Promise<void>;
+	remove(canonicalPrKey: string): Promise<void>;
+	listRecords(): Promise<GitHubPrTrackingRecord[]>;
+}
+
+/**
  * Storage port for the durable PR tracking record. The coordinator depends on
  * this interface; `PrRecordStore` (disk) is the production backend and
  * `InMemoryPrRecordStore` is a deterministic backend for tests.
@@ -139,6 +152,13 @@ export interface PrRecordStorePort {
 			reconciliationReads: number;
 		} | null,
 	): Promise<PrRecordUpdateResult>;
+	/**
+	 * PRTRACK-1: run a multi-record operation atomically under the tracking
+	 * registry mutex. Gate acquisitions that must validate sibling records
+	 * (the head-ref write gate) use this so the check-then-write stays atomic
+	 * with respect to every single-record CAS operation.
+	 */
+	withRegistryTransaction<T>(op: (registry: PrRegistryAccess) => T | Promise<T>): Promise<T>;
 }
 
 function emptyCommentAutomation(): GitHubPrTrackingRecord["commentAutomation"] {
@@ -180,6 +200,10 @@ export abstract class PrRecordStoreBase implements PrRecordStorePort {
 		op: (state: PrRecordState, io: PrRecordIo) => T | Promise<T>,
 	): Promise<T>;
 	abstract listRecords(): Promise<{ records: GitHubPrTrackingRecord[]; malformedFiles: string[] }>;
+	/**
+	 * PRTRACK-1: multi-record transaction under the registry mutex.
+	 */
+	abstract withRegistryTransaction<T>(op: (registry: PrRegistryAccess) => T | Promise<T>): Promise<T>;
 
 	/**
 	 * Load a record, validating the composite identity against the key.
@@ -480,38 +504,61 @@ export class PrRecordStore extends PrRecordStoreBase {
 	 * names of malformed ones (used solely for startup orphan classification).
 	 */
 	async listRecords(): Promise<{ records: GitHubPrTrackingRecord[]; malformedFiles: string[] }> {
-		return await lockedFileSystem.withLock(this.registryMutexRequest(), async () => {
-			let entries: string[];
+		return await lockedFileSystem.withLock(this.registryMutexRequest(), () => this.listRecordsUnlocked());
+	}
+
+	private async listRecordsUnlocked(): Promise<{ records: GitHubPrTrackingRecord[]; malformedFiles: string[] }> {
+		let entries: string[];
+		try {
+			entries = await readdir(this.recordsPath);
+		} catch (error) {
+			if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
+				return { records: [], malformedFiles: [] };
+			}
+			throw error;
+		}
+		const records: GitHubPrTrackingRecord[] = [];
+		const malformedFiles: string[] = [];
+		for (const entry of entries.sort()) {
+			if (!entry.endsWith(".json")) {
+				continue;
+			}
+			const raw = await readFile(join(this.recordsPath, entry), "utf8");
+			let parsed: unknown;
 			try {
-				entries = await readdir(this.recordsPath);
-			} catch (error) {
-				if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
-					return { records: [], malformedFiles: [] };
-				}
-				throw error;
+				parsed = JSON.parse(raw);
+			} catch {
+				malformedFiles.push(entry);
+				continue;
 			}
-			const records: GitHubPrTrackingRecord[] = [];
-			const malformedFiles: string[] = [];
-			for (const entry of entries.sort()) {
-				if (!entry.endsWith(".json")) {
-					continue;
-				}
-				const raw = await readFile(join(this.recordsPath, entry), "utf8");
-				let parsed: unknown;
-				try {
-					parsed = JSON.parse(raw);
-				} catch {
-					malformedFiles.push(entry);
-					continue;
-				}
-				const record = githubPrTrackingRecordSchema.safeParse(parsed);
-				if (!record.success || !recordIdentityMatchesKey(record.data, record.data.canonicalPrKey)) {
-					malformedFiles.push(entry);
-					continue;
-				}
-				records.push(record.data);
+			const record = githubPrTrackingRecordSchema.safeParse(parsed);
+			if (!record.success || !recordIdentityMatchesKey(record.data, record.data.canonicalPrKey)) {
+				malformedFiles.push(entry);
+				continue;
 			}
-			return { records, malformedFiles };
+			records.push(record.data);
+		}
+		return { records, malformedFiles };
+	}
+
+	/**
+	 * PRTRACK-1: multi-record transaction under the registry mutex. The disk
+	 * backend holds the same lock single-record CAS operations hold, so a
+	 * gate check spanning sibling records is atomic with respect to them.
+	 */
+	async withRegistryTransaction<T>(op: (registry: PrRegistryAccess) => T | Promise<T>): Promise<T> {
+		return await lockedFileSystem.withLock(this.registryMutexRequest(), async () => {
+			const registry: PrRegistryAccess = {
+				loadState: (key) => this.readRecordStateUnlocked(key),
+				write: async (key, record) => {
+					await lockedFileSystem.writeJsonFileAtomic(this.recordPath(key), record, { lock: null });
+				},
+				remove: async (key) => {
+					await rm(this.recordPath(key), { force: true });
+				},
+				listRecords: async () => (await this.listRecordsUnlocked()).records,
+			};
+			return await op(registry);
 		});
 	}
 }

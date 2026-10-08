@@ -236,6 +236,29 @@ export const runtimeBoardCardSchema = z
 		 * persisted list over any client-supplied value (see workspace-state).
 		 */
 		pullRequests: z.array(runtimeTaskPullRequestSchema).optional(),
+		/**
+		 * PRTRACK-1: "Auto address comments" task preference. Optional so old
+		 * cards read as false without migration; server-owned (restored over
+		 * stale whole-board saves).
+		 */
+		autoAddressComments: z.boolean().optional(),
+		/**
+		 * PRTRACK-1: "Auto complete task when PR is merged" task preference.
+		 * Optional so old cards read as false without migration; server-owned.
+		 */
+		autoFinishOnMerge: z.boolean().optional(),
+		/**
+		 * PRTRACK-1: the one selected Automation PR (canonical PR identity key)
+		 * driving both preferences. Absent = unselected (auto-select applies).
+		 * Server-owned.
+		 */
+		selectedAutomationPrKey: z.string().optional(),
+		/**
+		 * PRTRACK-1: monotonically increasing revision of the server-owned PR
+		 * settings block (preferences + selected PR). Absent reads as 0; used
+		 * for the dedicated revision-checked settings mutation. Server-owned.
+		 */
+		settingsRevision: z.number().int().nonnegative().optional(),
 		createdAt: z.number(),
 		updatedAt: z.number(),
 	})
@@ -1675,11 +1698,43 @@ export const runtimeReliableCompletionStatusSchema = z.object({
 });
 export type RuntimeReliableCompletionStatus = z.infer<typeof runtimeReliableCompletionStatusSchema>;
 
+/**
+ * Consumer kind. Registration is explicit at runtime; both real consumers stay
+ * unregistered until their own PR lands (tests use fake consumers).
+ */
+export const runtimePrConsumerKindSchema = z.enum(["comments", "mergeCompletion"]);
+export type RuntimePrConsumerKind = z.infer<typeof runtimePrConsumerKindSchema>;
+
+/**
+ * Per-consumer required read sources (the demand rule): every installed
+ * consumer requests metadata; only the comment consumer requests the
+ * feedback/review/thread sources.
+ */
+export const runtimePrConsumerReadSourceSchema = z.enum([
+	"metadata",
+	"reviews",
+	"conversationComments",
+	"inlineComments",
+	"threads",
+]);
+export type RuntimePrConsumerReadSource = z.infer<typeof runtimePrConsumerReadSourceSchema>;
+
+export const runtimePrInstalledConsumerSchema = z.object({
+	kind: runtimePrConsumerKindSchema,
+	requiredReadSources: z.array(runtimePrConsumerReadSourceSchema),
+});
+export type RuntimePrInstalledConsumer = z.infer<typeof runtimePrInstalledConsumerSchema>;
 export const runtimeConfigResponseSchema = z.object({
 	selectedAgentId: runtimeAgentIdSchema,
 	selectedShortcutLabel: z.string().nullable(),
 	agentAutonomousModeEnabled: z.boolean(),
 	debugModeEnabled: z.boolean().optional(),
+	/**
+	 * PRTRACK-1: the installed PR tracking consumers (empty until COMMENT-0 /
+	 * MERGE-1 register theirs). Optional so uncast legacy mocks keep working;
+	 * absent reads as "none installed" (legacy behavior).
+	 */
+	installedPrConsumers: z.array(runtimePrInstalledConsumerSchema).optional(),
 	effectiveCommand: z.string().nullable(),
 	globalConfigPath: z.string(),
 	projectConfigPath: z.string().nullable(),
@@ -2600,7 +2655,7 @@ export type GitHubPrOperationReservation = z.infer<typeof githubPrOperationReser
 export const githubPrReplayCursorsSchema = z
 	.object({
 		comments: z.number().int().nonnegative().optional(),
-		merge: z.number().int().nonnegative().optional(),
+		mergeCompletion: z.number().int().nonnegative().optional(),
 	})
 	.passthrough();
 export type GitHubPrReplayCursors = z.infer<typeof githubPrReplayCursorsSchema>;
@@ -2739,3 +2794,413 @@ export const githubPrNormalizedSnapshotSchema = z.object({
 	feedbackCompleteness: githubPrFeedbackCompletenessSchema.nullable(),
 });
 export type GitHubPrNormalizedSnapshot = z.infer<typeof githubPrNormalizedSnapshotSchema>;
+
+// ── PRTRACK-1: frozen consumer API (request/response contracts) ────────────
+//
+// These schemas freeze the consumer surface the comment-handling (COMMENT-0)
+// and merge-tracking (MERGE-1) features build on. Downstream features add
+// consumer modules and targeted existing API integrations, never new pollers,
+// settings plumbing, or ownership primitives.
+
+// ── Settings, selection, resume, tracking state ─────────────────────────────
+
+export const runtimeTaskPrSettingsRequestSchema = z.object({
+	taskId: z.string().min(1),
+	/** undefined = keep current; explicit boolean overwrites. */
+	autoAddressComments: z.boolean().optional(),
+	/** undefined = keep current; explicit boolean overwrites. */
+	autoFinishOnMerge: z.boolean().optional(),
+	/**
+	 * Revision-checked: must equal the card's current `settingsRevision`
+	 * (absent reads as 0). A mismatch is a conflict, never a silent overwrite.
+	 */
+	expectedSettingsRevision: z.number().int().nonnegative().optional(),
+});
+export type RuntimeTaskPrSettingsRequest = z.infer<typeof runtimeTaskPrSettingsRequestSchema>;
+
+export const runtimeTaskPrSettingsResponseSchema = z.object({
+	ok: z.boolean(),
+	taskId: z.string(),
+	autoAddressComments: z.boolean(),
+	autoFinishOnMerge: z.boolean(),
+	selectedAutomationPrKey: z.string().nullable(),
+	settingsRevision: z.number().int().nonnegative(),
+	/** "conflict" (stale expectedSettingsRevision) | "missing_task" | "invalid". */
+	reason: z.enum(["conflict", "missing_task", "invalid"]).nullable(),
+	error: z.string().nullable(),
+});
+export type RuntimeTaskPrSettingsResponse = z.infer<typeof runtimeTaskPrSettingsResponseSchema>;
+
+export const runtimeTaskAutomationPrSelectRequestSchema = z.object({
+	taskId: z.string().min(1),
+	/**
+	 * Canonical PR key to select explicitly. Absent = auto-select: when
+	 * exactly one link matches the task's repository and actual
+	 * delivery/head branch, it is selected; otherwise the response reports
+	 * the ambiguity blocker. Null = clear the selection.
+	 */
+	prKey: z.string().nullable().optional(),
+	expectedSettingsRevision: z.number().int().nonnegative().optional(),
+});
+export type RuntimeTaskAutomationPrSelectRequest = z.infer<typeof runtimeTaskAutomationPrSelectRequestSchema>;
+
+export const runtimeTaskAutomationPrSelectResponseSchema = z.object({
+	ok: z.boolean(),
+	taskId: z.string(),
+	selectedAutomationPrKey: z.string().nullable(),
+	settingsRevision: z.number().int().nonnegative(),
+	/** Canonical keys of links eligible for selection (task repo + head branch match). */
+	candidates: z.array(z.string()),
+	/** "ambiguous" when multiple candidates exist and no explicit choice was given. */
+	blocker: z.enum(["ambiguous", "unsupported_host", "no_matching_link", "conflict", "missing_task"]).nullable(),
+	error: z.string().nullable(),
+});
+export type RuntimeTaskAutomationPrSelectResponse = z.infer<typeof runtimeTaskAutomationPrSelectResponseSchema>;
+
+export const runtimeTaskPrTrackingResumeRequestSchema = z.object({
+	taskId: z.string().min(1),
+});
+export type RuntimeTaskPrTrackingResumeRequest = z.infer<typeof runtimeTaskPrTrackingResumeRequestSchema>;
+
+export const runtimeTaskPrTrackingResumeResponseSchema = z.object({
+	ok: z.boolean(),
+	/** True when the one-shot fresh read confirmed open/draft and eligibility holds. */
+	resumed: z.boolean(),
+	/** "no_subscription" | "auth" | "scope" | "record" | "no_binding" | "still_terminal" | "ineligible" | "unsupported_host" | "failed". */
+	reason: z
+		.enum([
+			"no_subscription",
+			"auth",
+			"scope",
+			"record",
+			"no_binding",
+			"still_terminal",
+			"ineligible",
+			"unsupported_host",
+			"failed",
+		])
+		.nullable(),
+	error: z.string().nullable(),
+});
+export type RuntimeTaskPrTrackingResumeResponse = z.infer<typeof runtimeTaskPrTrackingResumeResponseSchema>;
+
+/**
+ * Revision-checked task tracking-state diagnostics: the single server source
+ * for the UI's active/disabled checkbox state, blockers, owner, reservation,
+ * snapshot freshness, and installed-consumer/capability signals.
+ */
+export const runtimeTaskTrackingStateRequestSchema = z.object({
+	taskId: z.string().min(1),
+	/** Diagnostic staleness check: mismatch does not fail, it is reported. */
+	expectedSettingsRevision: z.number().int().nonnegative().optional(),
+});
+export type RuntimeTaskTrackingStateRequest = z.infer<typeof runtimeTaskTrackingStateRequestSchema>;
+
+export const runtimePrTaskOwnerSchema = z.object({
+	workspaceId: z.string(),
+	taskId: z.string(),
+	ownerRevision: z.number().int().nonnegative(),
+	/** Workspace/task label for the "Repairs owned by …" display. */
+	label: z.string().nullable(),
+	/** "active" | "disabled" (owner no longer eligible, work stopped, no handoff) | "deleted". */
+	state: z.enum(["active", "disabled", "deleted"]),
+});
+export type RuntimePrTaskOwner = z.infer<typeof runtimePrTaskOwnerSchema>;
+
+export const runtimePrReservationStateSchema = z.object({
+	state: z.enum(["none", "reserved"]),
+	reservedBy: githubPrTaskIdentitySchema.nullable(),
+	reservedOperation: z.string().nullable(),
+	fencingGeneration: z.number().int().nonnegative(),
+});
+export type RuntimePrReservationState = z.infer<typeof runtimePrReservationStateSchema>;
+
+export const runtimeTaskTrackingStateResponseSchema = z.object({
+	ok: z.boolean(),
+	taskId: z.string(),
+	settingsRevision: z.number().int().nonnegative(),
+	/** True when the caller's expectedSettingsRevision is stale. */
+	staleRevision: z.boolean(),
+	autoAddressComments: z.boolean(),
+	autoFinishOnMerge: z.boolean(),
+	selectedAutomationPrKey: z.string().nullable(),
+	/** Eligible for live PR tracking (active card + selected/sole link + installed enabled consumer). */
+	eligible: z.boolean(),
+	/**
+	 * Legacy clean-tree/PR-delivery completion must not run (browser, CLI,
+	 * deterministic delivery): an installed enabled consumer owns this task's
+	 * linked PR workflow.
+	 */
+	legacyCompletionGated: z.boolean(),
+	/**
+	 * autoFinishOnMerge persisted true + merge consumer installed: delivery
+	 * with a clean worktree leaves the task In Review, never Done.
+	 */
+	mergeFinishesInReview: z.boolean(),
+	blockers: z.array(
+		z.object({
+			kind: z.enum([
+				"auth",
+				"unsupported_host",
+				"ambiguous_selection",
+				"waiting_for_linked_pr",
+				"feature_unavailable",
+				"comments_unsupported",
+				"choose_repair_owner",
+				"owner_deleted",
+				"owner_invalidated",
+				"needs_human",
+				"scheduler",
+			]),
+			/** Concise user-facing reason. */
+			message: z.string(),
+		}),
+	),
+	installedConsumers: z.array(runtimePrInstalledConsumerSchema),
+	/** Per-task agent support: comments are native-Cline only; merge is provider-independent. */
+	commentsSupportedForTask: z.boolean(),
+	owner: runtimePrTaskOwnerSchema.nullable(),
+	/** "Repairs owned by <workspace/task>" label for non-owner tasks. */
+	ownerLabel: z.string().nullable(),
+	/** Candidate tasks when the repair-owner selection is ambiguous. */
+	ownerCandidates: z.array(githubPrTaskIdentitySchema),
+	reservation: runtimePrReservationStateSchema,
+	snapshot: z
+		.object({
+			checkedAt: z.number().nullable(),
+			isStale: z.boolean(),
+			prState: z.enum(["open", "closed", "draft", "merged"]).nullable(),
+		})
+		.nullable(),
+	/** True when a terminal stop marker is set on this task's binding. */
+	terminalStop: z
+		.object({
+			reason: githubPrTerminalStopReasonSchema,
+			observedAt: z.number(),
+		})
+		.nullable(),
+	error: z.string().nullable(),
+});
+export type RuntimeTaskTrackingStateResponse = z.infer<typeof runtimeTaskTrackingStateResponseSchema>;
+
+// ── Authorized snapshots ────────────────────────────────────────────────────
+
+export const runtimePrAuthorizedSnapshotRequestSchema = z.object({
+	taskId: z.string().min(1),
+});
+export type RuntimePrAuthorizedSnapshotRequest = z.infer<typeof runtimePrAuthorizedSnapshotRequestSchema>;
+
+export const runtimePrAuthorizedSnapshotResponseSchema = z.object({
+	ok: z.boolean(),
+	taskId: z.string(),
+	/** Versioned: the record revision and snapshot checkedAt the data was read from. */
+	version: z.number().int().nonnegative(),
+	snapshot: githubPrNormalizedSnapshotSchema.nullable(),
+	/** True when no fresh read has completed for this task yet. */
+	isStale: z.boolean(),
+	checkedAt: z.number().nullable(),
+	error: z.string().nullable(),
+});
+export type RuntimePrAuthorizedSnapshotResponse = z.infer<typeof runtimePrAuthorizedSnapshotResponseSchema>;
+
+export const runtimePrSnapshotRefreshRequestSchema = z.object({
+	taskId: z.string().min(1),
+});
+export type RuntimePrSnapshotRefreshRequest = z.infer<typeof runtimePrSnapshotRefreshRequestSchema>;
+
+export const runtimePrSnapshotRefreshResponseSchema = z.object({
+	ok: z.boolean(),
+	/** True when this call joined an identical in-flight read (no duplicate request). */
+	coalesced: z.boolean(),
+	checkedAt: z.number().nullable(),
+	error: z.string().nullable(),
+});
+export type RuntimePrSnapshotRefreshResponse = z.infer<typeof runtimePrSnapshotRefreshResponseSchema>;
+
+// ── PR record mutators (revision-checked, inside the PR record) ─────────────
+
+export const runtimePrCommentDispatchUpdateRequestSchema = z.object({
+	taskId: z.string().min(1),
+	/** Expected PR-record revision — caller-side CAS (required). */
+	expectedRecordRevision: z.number().int().nonnegative(),
+	/**
+	 * Expected ownerRevision of the caller's owner tenure (absent = any).
+	 * A handoff between read and write is a conflict even when the record
+	 * revision is unchanged.
+	 */
+	expectedOwnerRevision: z.number().int().nonnegative().optional(),
+	dispatch: githubPrCommentDispatchSchema.nullable(),
+});
+export type RuntimePrCommentDispatchUpdateRequest = z.infer<typeof runtimePrCommentDispatchUpdateRequestSchema>;
+
+export const runtimePrRecordMutationResponseSchema = z.object({
+	ok: z.boolean(),
+	/** Current PR-record revision after a successful write. */
+	recordRevision: z.number().int().nonnegative().nullable(),
+	/** "conflict" (stale record revision) | "not_owner" (caller is not the repair owner) | "missing_task" | "no_record" | "ambiguous_selection". */
+	reason: z.enum(["conflict", "not_owner", "missing_task", "no_record", "ambiguous_selection"]).nullable(),
+	error: z.string().nullable(),
+});
+export type RuntimePrRecordMutationResponse = z.infer<typeof runtimePrRecordMutationResponseSchema>;
+
+export const runtimeTaskMergeBindingUpdateRequestSchema = z.object({
+	taskId: z.string().min(1),
+	/** Expected PR-record revision — caller-side CAS (required). */
+	expectedRecordRevision: z.number().int().nonnegative(),
+	mergeCompletion: githubPrMergeCompletionSchema.nullable(),
+});
+export type RuntimeTaskMergeBindingUpdateRequest = z.infer<typeof runtimeTaskMergeBindingUpdateRequestSchema>;
+
+// ── Repair owner selection / transfer ───────────────────────────────────────
+
+export const runtimePrRepairOwnerSelectRequestSchema = z.object({
+	/** The task to assign as repair owner (explicit selection). */
+	taskId: z.string().min(1),
+	/** Defaults to the caller's workspace (cross-workspace candidate selection). */
+	workspaceId: z.string().min(1).optional(),
+	/** Expected ownerRevision (absent = any) — revision-checked explicit assignment. */
+	expectedOwnerRevision: z.number().int().nonnegative().optional(),
+});
+export type RuntimePrRepairOwnerSelectRequest = z.infer<typeof runtimePrRepairOwnerSelectRequestSchema>;
+
+export const runtimePrRepairOwnerTransferRequestSchema = z.object({
+	fromTaskId: z.string().min(1),
+	/** null = explicit release (same drain/invalidate/reconcile preconditions). */
+	toTaskId: z.string().nullable(),
+	/** Target workspace for cross-workspace transfers (defaults to the caller's). */
+	toWorkspaceId: z.string().min(1).optional(),
+	/** Expected ownerRevision (absent reads as 0) — revision-checked handoff. */
+	expectedOwnerRevision: z.number().int().nonnegative().optional(),
+});
+export type RuntimePrRepairOwnerTransferRequest = z.infer<typeof runtimePrRepairOwnerTransferRequestSchema>;
+
+export const runtimePrRepairOwnerResponseSchema = z.object({
+	ok: z.boolean(),
+	owner: runtimePrTaskOwnerSchema.nullable(),
+	/**
+	 * "ambiguous" (multiple candidates, none selected) | "no_candidates" |
+	 * "conflict" (stale expectedOwnerRevision) | "not_owner" (caller is not
+	 * the current owner) | "drain_required" (writer actions / in-flight
+	 * dispatch not drained) | "missing_task" | "no_record" |
+	 * "not_valid_candidate" (target not a valid owner candidate).
+	 */
+	reason: z
+		.enum([
+			"ambiguous",
+			"no_candidates",
+			"conflict",
+			"not_owner",
+			"drain_required",
+			"missing_task",
+			"no_record",
+			"not_valid_candidate",
+		])
+		.nullable(),
+	/** Candidates for the explicit selector (linked tasks with labels). */
+	candidates: z.array(runtimePrTaskOwnerSchema),
+	error: z.string().nullable(),
+});
+export type RuntimePrRepairOwnerResponse = z.infer<typeof runtimePrRepairOwnerResponseSchema>;
+
+// ── Fenced operation reservations ────────────────────────────────────────────
+
+export const runtimePrOperationKindSchema = z.enum(["comment_followup", "merge_completion"]);
+export type RuntimePrOperationKind = z.infer<typeof runtimePrOperationKindSchema>;
+
+export const runtimePrOperationReservationRequestSchema = z.object({
+	taskId: z.string().min(1),
+	operation: runtimePrOperationKindSchema,
+	/**
+	 * Expected fencing generation of the caller's owner tenure (stale
+	 * detection). The head-ref write gate is keyed by the record's verified
+	 * head mapping (never caller-supplied).
+	 */
+	expectedFencingGeneration: z.number().int().nonnegative().optional(),
+	/**
+	 * Head-ref validation hints (informational): the authoritative head
+	 * mapping is the one persisted on the record. A mismatch with a
+	 * verified mapping rejects the reservation.
+	 */
+	headRepository: z.string().min(1).optional(),
+	headRef: z.string().min(1).optional(),
+});
+export type RuntimePrOperationReservationRequest = z.infer<typeof runtimePrOperationReservationRequestSchema>;
+
+export const runtimePrOperationReservationResponseSchema = z.object({
+	ok: z.boolean(),
+	/**
+	 * "reserved" | "busy" (another task holds the PR gate or the head-ref
+	 * gate) | "blocked" (caller not the repair owner / owner invalidated /
+	 * terminal) | "stale" (fencing generation mismatch — a newer owner tenure
+	 * exists; the old generation must not act).
+	 */
+	status: z.enum(["reserved", "busy", "blocked", "stale"]).nullable(),
+	reservation: runtimePrReservationStateSchema,
+	error: z.string().nullable(),
+});
+export type RuntimePrOperationReservationResponse = z.infer<typeof runtimePrOperationReservationResponseSchema>;
+
+export const runtimePrOperationValidateRequestSchema = z.object({
+	taskId: z.string().min(1),
+	operation: runtimePrOperationKindSchema,
+});
+export type RuntimePrOperationValidateRequest = z.infer<typeof runtimePrOperationValidateRequestSchema>;
+
+export const runtimePrOperationReleaseRequestSchema = z.object({
+	taskId: z.string().min(1),
+	operation: runtimePrOperationKindSchema,
+	/**
+	 * Operator path: clear a reservation held by a crashed holder. Audited on
+	 * the server (warning log with holder + operation); never implicit.
+	 * Requires `expectedHolder` + `expectedFencingGeneration` (the
+	 * reservation the operator actually observed), and is refused while the
+	 * holder's writer is still active.
+	 */
+	force: z.boolean().optional(),
+	/** The reservation holder the operator observed (required with `force`). */
+	expectedHolder: githubPrTaskIdentitySchema.optional(),
+	/** The fencing generation the operator observed (required with `force`). */
+	expectedFencingGeneration: z.number().int().nonnegative().optional(),
+});
+export type RuntimePrOperationReleaseRequest = z.infer<typeof runtimePrOperationReleaseRequestSchema>;
+
+// ── Versioned subscriptions with durable replay cursors ──────────────────────
+
+export const runtimePrSubscriptionRequestSchema = z.object({
+	taskId: z.string().min(1),
+	/** Consumer kind owning the durable replay cursor on the task binding. */
+	consumer: z.enum(["comments", "mergeCompletion"]).default("comments"),
+	/**
+	 * Durable replay cursor (per consumer kind, persisted on the task
+	 * binding). Events with seq > fromCursor are returned; the cursor
+	 * advances to the latest returned seq. Absent = 0 (full replay of the
+	 * retained events for this session).
+	 */
+	fromCursor: z.number().int().nonnegative().optional(),
+});
+export type RuntimePrSubscriptionRequest = z.infer<typeof runtimePrSubscriptionRequestSchema>;
+
+export const runtimePrSnapshotEventSchema = z.object({
+	seq: z.number().int().positive(),
+	kind: z.enum(["snapshot", "terminal_invalidation"]),
+	/** Snapshot events: the version the snapshot advanced to. */
+	version: z.number().int().nonnegative().nullable(),
+	checkedAt: z.number().nullable(),
+	prState: z.enum(["open", "closed", "draft", "merged"]).nullable(),
+	/** Terminal events: the stop reason that invalidated the workflow. */
+	terminalReason: githubPrTerminalStopReasonSchema.nullable(),
+});
+export type RuntimePrSnapshotEvent = z.infer<typeof runtimePrSnapshotEventSchema>;
+
+export const runtimePrSubscriptionResponseSchema = z.object({
+	ok: z.boolean(),
+	/**
+	 * Events are HINTS: consumers must reconcile authoritative state on
+	 * startup (and after any hint), never trust hints as complete state.
+	 */
+	events: z.array(runtimePrSnapshotEventSchema),
+	/** Advanced durable replay cursor (persisted on the task binding). */
+	nextCursor: z.number().int().nonnegative(),
+	error: z.string().nullable(),
+});
+export type RuntimePrSubscriptionResponse = z.infer<typeof runtimePrSubscriptionResponseSchema>;
