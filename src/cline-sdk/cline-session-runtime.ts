@@ -12,6 +12,7 @@ import {
 	calibrateClineCompactionConfig,
 } from "./cline-compaction-config";
 import type { ContextLimitSource } from "./cline-context-policy";
+import { createClineEditorLimitHooks } from "./cline-editor-limit";
 import { createClineEditorTraceHooks } from "./cline-editor-trace";
 import { extractClineSessionId } from "./cline-event-adapter";
 import { createClineInterruptedToolCallRepairHook } from "./cline-interrupted-tool-call-repair";
@@ -421,6 +422,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		const repairInterruptedToolCallsHook = createClineInterruptedToolCallRepairHook({ logger: sessionLogger });
 		const recoveryHooks = createClineToolFailureRecoveryHooks();
 		const editorTraceHooks = createClineEditorTraceHooks(request.taskId, requestedSessionId);
+		const editorLimitHooks = createClineEditorLimitHooks(request.cwd);
 		const compactionHook =
 			request.compaction &&
 			typeof request.compaction.contextWindowTokens === "number" &&
@@ -448,16 +450,20 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			afterModel: editorTraceHooks.afterModel,
 			beforeTool: async (context) => {
 				await editorTraceHooks.beforeTool?.(context);
+				await editorLimitHooks.beforeTool?.(context);
 				return recoveryHooks.beforeTool?.(context);
 			},
 			beforeModel: async (context) => {
+				const editorTools = await editorLimitHooks.beforeModel?.(context);
 				const repaired = await repairInterruptedToolCallsHook(context);
 				const recovered = await recoveryHooks.beforeModel?.({
 					...context,
 					request: { ...context.request, messages: repaired?.messages ?? context.request.messages },
 				});
 				const messages = recovered?.messages ?? repaired?.messages ?? context.request.messages;
-				return (await compactionHook?.({ ...context, request: { ...context.request, messages } })) ?? { messages };
+				const tools = editorTools?.tools ?? context.request.tools;
+				const compacted = await compactionHook?.({ ...context, request: { ...context.request, messages, tools } });
+				return { ...compacted, messages: compacted?.messages ?? messages, tools };
 			},
 			afterTool: async (context) => {
 				await editorTraceHooks.afterTool?.(context);
