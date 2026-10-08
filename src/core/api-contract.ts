@@ -3152,8 +3152,15 @@ export const runtimePrOperationReleaseRequestSchema = z.object({
 	/**
 	 * Operator path: clear a reservation held by a crashed holder. Audited on
 	 * the server (warning log with holder + operation); never implicit.
+	 * Requires `expectedHolder` + `expectedFencingGeneration` (the
+	 * reservation the operator actually observed), and is refused while the
+	 * holder's writer is still active.
 	 */
 	force: z.boolean().optional(),
+	/** The reservation holder the operator observed (required with `force`). */
+	expectedHolder: githubPrTaskIdentitySchema.optional(),
+	/** The fencing generation the operator observed (required with `force`). */
+	expectedFencingGeneration: z.number().int().nonnegative().optional(),
 });
 export type RuntimePrOperationReleaseRequest = z.infer<typeof runtimePrOperationReleaseRequestSchema>;
 

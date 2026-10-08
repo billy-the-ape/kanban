@@ -32,7 +32,7 @@ import {
 import { PrConsumerRegistry } from "../pr-tracking/pr-consumer-registry";
 import { findTaskCard, resolveCardAutomationPrKey } from "../pr-tracking/pr-owner-selection";
 import { PrRecordStore } from "../pr-tracking/pr-record-store";
-import { reconcileTaskSubscriptions } from "../pr-tracking/pr-task-subscriptions";
+import { createReconcilePass, type PrTaskReconcileOptions } from "../pr-tracking/pr-task-subscriptions";
 import { createPrTrackingCoordinator } from "../pr-tracking/pr-tracking-coordinator";
 import {
 	checkRateLimit,
@@ -176,7 +176,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				// PRLINK-1: open UIs pick up server-side card writes (Cline PR
 				// recording) without a reload; only fired when the card changed.
 				broadcastWorkspaceStateUpdated: (workspacePath) =>
-					void deps.runtimeStateHub.broadcastRuntimeWorkspaceStateUpdated(scope.workspaceId, workspacePath),
+					void broadcastRuntimeWorkspaceStateUpdatedWithReconcile(scope.workspaceId, workspacePath),
 			});
 			clineTaskSessionServiceByWorkspaceId.set(scope.workspaceId, service);
 			deps.runtimeStateHub.trackClineTaskSessionService(scope.workspaceId, scope.workspacePath, service);
@@ -277,27 +277,72 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		registry: PrConsumerRegistry;
 	} | null = null;
 	/**
-	 * Shared single-flight reconcile pass: the startup pass, board-save
-	 * triggers, the poll-time backstop, and API triggers all go through this,
-	 * so passes never interleave (a second caller joins the in-flight pass).
+	 * PRTRACK-1: every reconcile trigger (startup, board save, PR-link
+	 * add/remove from ANY writer, workspace removal, consumer registration,
+	 * the poll-time backstop) queues a pass AFTER the in-flight one, so a
+	 * coalesced trigger never runs on a board view older than the trigger.
+	 * A dirty flag coalesces bursts: at most one follow-up pass runs after
+	 * the current one, re-reading demand fresh.
 	 */
-	let prTrackingReconcileInFlight: Promise<void> | null = null;
-	const runPrTrackingReconcilePassShared = (): Promise<void> => {
-		if (!prTrackingReconcileInFlight) {
-			prTrackingReconcileInFlight = (async () => {
-				const state = getPrTrackingState();
-				await reconcileTaskSubscriptions(state.coordinator, {
+	let prTrackingReconcileRunning = false;
+	let prTrackingReconcileDirty = false;
+	let prTrackingReconcilePass: ((options?: PrTaskReconcileOptions) => Promise<void>) | null = null;
+	const getPrTrackingReconcilePass = () => {
+		if (!prTrackingReconcilePass) {
+			const state = getPrTrackingState();
+			prTrackingReconcilePass = createReconcilePass(
+				state.coordinator,
+				{
 					listBoards: listManagedWorkspaceBoards,
+					// Poll-time backstop reads each task's own board instead of
+					// enumerating every workspace.
+					listBoard: (workspaceId) =>
+						loadWorkspaceBoardById(workspaceId).then((board) => ({ workspaceId, board })),
 					installedConsumers: () => ({
 						comments: state.registry.isInstalled("comments"),
 						mergeCompletion: state.registry.isInstalled("mergeCompletion"),
 					}),
-				});
-			})().finally(() => {
-				prTrackingReconcileInFlight = null;
-			});
+				},
+				(error) =>
+					deps.warn(
+						`[pr-tracking] Reconcile pass failed: ${error instanceof Error ? error.message : String(error)}`,
+					),
+			);
 		}
-		return prTrackingReconcileInFlight;
+		return prTrackingReconcilePass;
+	};
+	const runPrTrackingReconcilePassShared = (options: PrTaskReconcileOptions = {}): Promise<void> => {
+		if (prTrackingReconcileRunning) {
+			// Coalesce: one follow-up FULL pass (which subsumes any per-PR
+			// revalidation) after the current one completes.
+			prTrackingReconcileDirty = true;
+			return Promise.resolve();
+		}
+		prTrackingReconcileRunning = true;
+		return getPrTrackingReconcilePass()(options).finally(() => {
+			prTrackingReconcileRunning = false;
+			if (prTrackingReconcileDirty) {
+				prTrackingReconcileDirty = false;
+				void runPrTrackingReconcilePassShared().catch((error) => {
+					deps.warn(
+						`[pr-tracking] Follow-up reconcile pass failed: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				});
+			}
+		});
+	};
+	/**
+	 * PRTRACK-1: any board-change broadcast (save, PR-link add/remove from
+	 * manual/hook/agent-tool/delivery/review-lookup writers) re-derives
+	 * task-derived subscription demand. Coalesced through the shared pass.
+	 */
+	const broadcastRuntimeWorkspaceStateUpdatedWithReconcile = (workspaceId: string, workspacePath: string) => {
+		void runPrTrackingReconcilePassShared().catch((error) => {
+			deps.warn(
+				`[pr-tracking] Reconcile pass after workspace broadcast failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		});
+		return deps.runtimeStateHub.broadcastRuntimeWorkspaceStateUpdated(workspaceId, workspacePath);
 	};
 	const getPrTrackingState = () => {
 		if (!prTrackingState) {
@@ -308,9 +353,10 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 					// durable record store: reads written by the API must be
 					// visible to the coordinator (and vice versa).
 					store,
-					// Poll-time backstop: re-derive task-derived demand from
-					// the live board view before every poll cycle.
-					revalidateSubscriptions: () => runPrTrackingReconcilePassShared(),
+					// Poll-time backstop: re-derive task-derived demand for the
+					// PR being polled before each poll (single-board reads only).
+					revalidateSubscriptions: (canonicalPrKey) =>
+						runPrTrackingReconcilePassShared(canonicalPrKey ? { onlyPr: canonicalPrKey } : {}),
 					warn: (message) => deps.warn(`[pr-tracking] ${message}`),
 					logError: (message) => deps.warn(`[pr-tracking] ${message}`),
 				}),
@@ -352,7 +398,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			prepareForStateReset,
 			getUpdateStatus: deps.getUpdateStatus,
 			runUpdateNow: deps.runUpdateNow,
-			broadcastRuntimeWorkspaceStateUpdated: deps.runtimeStateHub.broadcastRuntimeWorkspaceStateUpdated,
+			broadcastRuntimeWorkspaceStateUpdated: broadcastRuntimeWorkspaceStateUpdatedWithReconcile,
 			warnTaskDispatchError: (error) => {
 				deps.warn(`[task-dispatch] Queue pass failed: ${error instanceof Error ? error.message : String(error)}`);
 			},
@@ -408,7 +454,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			workspaceApi: createWorkspaceApi({
 				ensureTerminalManagerForWorkspace: deps.ensureTerminalManagerForWorkspace,
 				getScopedClineTaskSessionService,
-				broadcastRuntimeWorkspaceStateUpdated: deps.runtimeStateHub.broadcastRuntimeWorkspaceStateUpdated,
+				broadcastRuntimeWorkspaceStateUpdated: broadcastRuntimeWorkspaceStateUpdatedWithReconcile,
 				broadcastRuntimeProjectsUpdated: deps.runtimeStateHub.broadcastRuntimeProjectsUpdated,
 				buildWorkspaceStateSnapshot: deps.workspaceRegistry.buildWorkspaceStateSnapshot,
 				// B-9.2: a board save may complete prerequisites — fire a queue pass.
@@ -464,7 +510,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			hooksApi: createHooksApi({
 				getWorkspacePathById: deps.workspaceRegistry.getWorkspacePathById,
 				ensureTerminalManagerForWorkspace: deps.ensureTerminalManagerForWorkspace,
-				broadcastRuntimeWorkspaceStateUpdated: deps.runtimeStateHub.broadcastRuntimeWorkspaceStateUpdated,
+				broadcastRuntimeWorkspaceStateUpdated: broadcastRuntimeWorkspaceStateUpdatedWithReconcile,
 				broadcastTaskReadyForReview: deps.runtimeStateHub.broadcastTaskReadyForReview,
 			}),
 			prTrackingApi: createPrTrackingApi({
@@ -473,7 +519,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				getPrConsumerRegistry: () => getPrTrackingState().registry,
 				listManagedWorkspaceBoards,
 				broadcastRuntimeWorkspaceStateUpdated: (scope) =>
-					deps.runtimeStateHub.broadcastRuntimeWorkspaceStateUpdated(scope.workspaceId, scope.workspacePath),
+					broadcastRuntimeWorkspaceStateUpdatedWithReconcile(scope.workspaceId, scope.workspacePath),
 				// PRTRACK-1: all subscription reconciliation goes through the
 				// shared single-flight pass (never interleaves with the poll-time
 				// backstop or board-save triggers).
@@ -761,18 +807,12 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 	// PRTRACK-0/1: one runtime-wide PR tracking coordinator (created lazily
 	// with the durable record store and consumer registry). Starts idle;
 	// task-derived subscriptions are reconciled at startup in the background.
-	const { coordinator: prTrackingCoordinator, registry: prTrackingRegistry } = getPrTrackingState();
+	const { coordinator: prTrackingCoordinator } = getPrTrackingState();
 	await prTrackingCoordinator.start();
 	// PRTRACK-1: reconcile task-derived subscriptions at startup (background,
 	// fire-and-forget; never blocks startup).
-	void reconcileTaskSubscriptions(prTrackingCoordinator, {
-		listBoards: listManagedWorkspaceBoards,
-		installedConsumers: () => ({
-			comments: prTrackingRegistry.isInstalled("comments"),
-			mergeCompletion: prTrackingRegistry.isInstalled("mergeCompletion"),
-		}),
-	}).catch((error) => {
-		deps.warn(`[pr-tracking] Startup reconcile failed: ${error}`);
+	void runPrTrackingReconcilePassShared().catch((error) => {
+		deps.warn(`[pr-tracking] Startup reconcile failed: ${error instanceof Error ? error.message : String(error)}`);
 	});
 	const activeWorkspaceId = deps.workspaceRegistry.getActiveWorkspaceId();
 	const url = activeWorkspaceId

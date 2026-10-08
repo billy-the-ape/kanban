@@ -453,7 +453,7 @@ describe("pr-track1 automation PR resolution", () => {
 
 import { getPullRequestIdentityKey } from "../../../src/core/pull-request-links";
 import { removeTaskPullRequest } from "../../../src/core/task-board-mutations";
-import { assignRepairOwner, validateAutoAssignedOwner } from "../../../src/pr-tracking/pr-owner-selection";
+import { assignRepairOwner } from "../../../src/pr-tracking/pr-owner-selection";
 import { releasePrOperation, reservePrOperation } from "../../../src/pr-tracking/pr-reservations";
 
 async function seedRecordWithHead(store: InMemoryPrRecordStore, headRepository: string | null, headRef: string | null) {
@@ -533,8 +533,14 @@ describe("pr-track1 explicit repair-owner assignment", () => {
 	});
 });
 
-describe("pr-track1 cross-repository auto-owner guard", () => {
-	it("invalidates an auto-assignment when the verified head mapping is another repository", async () => {
+describe("pr-track1 cross-repository owner semantics (point-of-use decision)", () => {
+	it("keeps the owner for a fork→upstream PR (head repository differs from the record's repository)", async () => {
+		// Documented decision: a fork→upstream PR's head repository differing
+		// from the record/base repository is the normal shape and is NOT a
+		// cross-repository reference. Owner assignment is card-link based;
+		// the cross-repository-reference protection lives at the point of use
+		// (the record's verified head mapping keys the head-ref write gate,
+		// and the repair turn validates the task's delivery branch).
 		const store = new InMemoryPrRecordStore();
 		await seedRecordWithHead(store, "cline/fork", "fix");
 		const boards = [
@@ -544,31 +550,6 @@ describe("pr-track1 cross-repository auto-owner guard", () => {
 		];
 		const assigned = await assignRepairOwner(store, PR_KEY, boards, { workspaceId: "ws-1", taskId: "t-a" });
 		expect(assigned.ok).toBe(true);
-
-		const warnings: string[] = [];
-		const result = await validateAutoAssignedOwner(store, PR_KEY, { warn: (message) => warnings.push(message) });
-		expect(result).toEqual({ invalidated: true, headRepository: "cline/fork", recordRepository: "cline/kanban" });
-		expect(warnings.length).toBe(1);
-
-		const after = await store.loadRecord(PR_KEY);
-		expect(after.ok).toBe(true);
-		if (after.ok) {
-			expect(after.record.commentAutomation.repairOwner).toBeNull();
-		}
-	});
-
-	it("keeps the owner when the verified head mapping matches the record's repository", async () => {
-		const store = new InMemoryPrRecordStore();
-		await seedRecordWithHead(store, "cline/kanban", "fix");
-		const boards = [
-			makeBoard("ws-1", [
-				{ columnId: "in_progress", card: makeCard({ id: "t-a", autoAddressComments: true, pullRequests: [LINK] }) },
-			]),
-		];
-		await assignRepairOwner(store, PR_KEY, boards, { workspaceId: "ws-1", taskId: "t-a" });
-
-		const result = await validateAutoAssignedOwner(store, PR_KEY);
-		expect(result).toEqual({ invalidated: false, headRepository: "cline/kanban", recordRepository: "cline/kanban" });
 
 		const after = await store.loadRecord(PR_KEY);
 		expect(after.ok).toBe(true);

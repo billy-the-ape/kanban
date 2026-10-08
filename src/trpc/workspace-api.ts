@@ -459,7 +459,6 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 					workspaceId: workspaceScope.workspaceId,
 					workspacePath: workspaceScope.workspacePath,
 				});
-				// PRLINK-5: a card entering Review without PRs gets a best-effort
 				// PRTRACK-1: a board change may start or drop task-derived PR tracking
 				// subscriptions. Fire-and-forget: the save response is never delayed.
 				deps.runPrTrackingReconcilePass?.({

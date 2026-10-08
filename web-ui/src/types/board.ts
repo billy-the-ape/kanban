@@ -55,6 +55,8 @@ export interface BoardCard {
 	autoFinishOnMerge?: boolean;
 	/** PRTRACK-1: the selected Automation PR canonical key (server-owned). */
 	selectedAutomationPrKey?: string;
+	/** PRTRACK-1: optimistic-concurrency revision shared by the server-owned settings block. */
+	settingsRevision?: number;
 	baseRef: string;
 	/** UPD-0: missing values normalize to true; an explicit false disables the pre-start base refresh. */
 	updateBaseRefBeforeStart?: boolean;

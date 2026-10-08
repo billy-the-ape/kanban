@@ -20,9 +20,8 @@ import type {
 	RuntimeBoardData,
 } from "../core/api-contract";
 import { parsePullRequestUrl } from "../core/pull-request-links";
-import { parseCanonicalPrKey, toCanonicalPrKey } from "./pr-identity";
+import { toCanonicalPrKey } from "./pr-identity";
 import type { PrRecordStoreBase } from "./pr-record-store";
-import { getRecordHeadMapping } from "./pr-reservations";
 
 /** Columns in which a task can act as (or take over) repair owner. */
 export const PR_OWNER_ACTIVE_COLUMNS: ReadonlySet<string> = new Set(["in_progress", "review"]);
@@ -400,46 +399,13 @@ export async function transferRepairOwner(
 }
 
 /**
- * Cross-repository guard for auto-assigned owners: the record's verified
- * head mapping (the repository actually being tracked) must match the
- * canonical PR's repository. A candidate whose link is a cross-repository
- * reference (e.g. a fork PR linked as the upstream repo's PR) must never
- * produce a silent auto-owner; a just-made auto-assignment is cleared
- * (revision-checked). An explicit user assignment is never touched here.
+ * PRTRACK-1: repair-owner selection is card-link based (an explicit
+ * selection when linked, otherwise the sole resolvable link). The
+ * plan's "cross-repository reference" protection is enforced at the point
+ * of use, not at assignment: the record's verified head mapping keys the
+ * head-ref write gate in `reservePrOperation`/`validatePrOperation`, and
+ * the repair turn (COMMENT-0) validates the task's delivery branch against
+ * that mapping before any remote write. Fork workflows are intentionally
+ * supported: a fork→upstream PR's head repository differing from the
+ * record/base repository is the normal shape and is not a blocker.
  */
-export async function validateAutoAssignedOwner(
-	store: PrRecordStoreBase,
-	canonicalPrKey: string,
-	options: { warn?: (message: string) => void; now?: () => number } = {},
-): Promise<{ invalidated: boolean; headRepository: string | null; recordRepository: string }> {
-	const parsed = parseCanonicalPrKey(canonicalPrKey);
-	if (!parsed) {
-		throw new Error(`Invalid canonical PR key: ${canonicalPrKey}`);
-	}
-	const loaded = await store.loadRecord(canonicalPrKey);
-	if (!loaded.ok) {
-		return { invalidated: false, headRepository: null, recordRepository: parsed.repository };
-	}
-	const record = loaded.record;
-	const owner = record.commentAutomation.repairOwner;
-	const head = getRecordHeadMapping(record);
-	if (!owner || !head || head.headRepository.trim().toLowerCase() === parsed.repository) {
-		return { invalidated: false, headRepository: head?.headRepository ?? null, recordRepository: parsed.repository };
-	}
-	const result = await store.updateRecord(canonicalPrKey, record.revision, (current) =>
-		current.commentAutomation.repairOwner !== null && current.commentAutomation.repairOwner.taskId === owner.taskId
-			? {
-					...current,
-					revision: current.revision + 1,
-					updatedAt: options.now?.() ?? Date.now(),
-					commentAutomation: { ...current.commentAutomation, repairOwner: null },
-				}
-			: current,
-	);
-	if (result.ok) {
-		options.warn?.(
-			`PR tracking: auto-owner for ${canonicalPrKey} invalidated (head ${head.headRepository} does not match ${parsed.repository})`,
-		);
-	}
-	return { invalidated: result.ok, headRepository: head.headRepository, recordRepository: parsed.repository };
-}

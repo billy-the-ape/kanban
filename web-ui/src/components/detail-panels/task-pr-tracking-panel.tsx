@@ -79,15 +79,20 @@ export function TaskPrTrackingPanel({
 	installedConsumers: RuntimePrInstalledConsumer[];
 }): React.ReactElement | null {
 	const client = getRuntimeTrpcClient(workspaceId);
+	const commentsInstalled = installedConsumers.some((consumer) => consumer.kind === "comments");
+	const mergeInstalled = installedConsumers.some((consumer) => consumer.kind === "mergeCompletion");
+	const consumersInstalled = commentsInstalled || mergeInstalled;
+	// With zero installed consumers there is no tracking state to read or
+	// poll: the panel degrades to the (disabled) checkbox pair.
 	const { data: tracking, refetch } = useTrpcQuery<RuntimeTaskTrackingStateResponse>({
-		enabled: workspaceId !== null,
+		enabled: workspaceId !== null && consumersInstalled,
 		queryFn: () => client.workspace.prTracking.getTaskTrackingState.query({ taskId }),
 	});
 	const [acting, setActing] = useState(false);
 	const pollTimerRef = useRef<number | null>(null);
 
 	useEffect(() => {
-		if (workspaceId === null) {
+		if (workspaceId === null || !consumersInstalled) {
 			return;
 		}
 		pollTimerRef.current = window.setInterval(() => {
@@ -99,7 +104,7 @@ export function TaskPrTrackingPanel({
 				pollTimerRef.current = null;
 			}
 		};
-	}, [workspaceId, refetch]);
+	}, [workspaceId, refetch, consumersInstalled]);
 
 	const links = card.pullRequests ?? [];
 	const selectionCandidates = useMemo(
@@ -109,10 +114,37 @@ export function TaskPrTrackingPanel({
 				.filter((candidate) => candidate.prKey !== null),
 		[links],
 	);
-	const commentsInstalled = installedConsumers.some((consumer) => consumer.kind === "comments");
-	const mergeInstalled = installedConsumers.some((consumer) => consumer.kind === "mergeCompletion");
 
 	if (tracking === null) {
+		// Zero installed consumers: no tracking state to read; show only the
+		// disabled checkbox pair (card values, no polling).
+		if (!consumersInstalled) {
+			return (
+				<div className="border-b border-divider px-3 py-2">
+					<div className="mb-1.5">
+						<span className="text-xs font-medium text-text-primary">PR tracking</span>
+					</div>
+					<div className="flex flex-col gap-1.5">
+						<PrTrackingCheckbox
+							label="Auto address PR review comments"
+							hint="Feature unavailable"
+							checked={card.autoAddressComments === true}
+							disabled
+							acting={false}
+							onChange={() => undefined}
+						/>
+						<PrTrackingCheckbox
+							label="Auto complete when the PR merges"
+							hint="Feature unavailable"
+							checked={card.autoFinishOnMerge === true}
+							disabled
+							acting={false}
+							onChange={() => undefined}
+						/>
+					</div>
+				</div>
+			);
+		}
 		return null;
 	}
 
@@ -158,9 +190,15 @@ export function TaskPrTrackingPanel({
 			<div className="flex flex-col gap-1.5">
 				<PrTrackingCheckbox
 					label="Auto address PR review comments"
-					hint={commentsInstalled ? null : "Feature unavailable"}
+					hint={
+						!commentsInstalled
+							? "Feature unavailable"
+							: !tracking.commentsSupportedForTask
+								? "Comment follow-up requires a native Cline task"
+								: null
+					}
 					checked={tracking.autoAddressComments}
-					disabled={!commentsInstalled}
+					disabled={!commentsInstalled || !tracking.commentsSupportedForTask}
 					acting={acting}
 					onChange={(next) =>
 						void runMutation(() =>

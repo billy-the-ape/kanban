@@ -62,6 +62,8 @@ interface HookSnapshot {
 	setEditTaskAutoReviewMode: (value: TaskAutoReviewMode) => void;
 	setNewTaskAgentId: (value: RuntimeAgentId | undefined) => void;
 	setNewTaskClineSettings: (value: RuntimeTaskClineSettings | undefined) => void;
+	setEditTaskPrAutoAddressComments: (value: boolean) => void;
+	setEditTaskPrAutoFinishOnMerge: (value: boolean) => void;
 }
 
 function requireSnapshot(snapshot: HookSnapshot | null): HookSnapshot {
@@ -76,11 +78,16 @@ function HookHarness({
 	onSnapshot,
 	queueTaskStartAfterEdit,
 	getTaskInitialStartStatus = async () => null,
+	setTaskPrSettingsForTask,
 }: {
 	initialBoard: BoardData;
 	onSnapshot: (snapshot: HookSnapshot) => void;
 	queueTaskStartAfterEdit?: (taskId: string) => void;
 	getTaskInitialStartStatus?: (taskId: string) => Promise<RuntimeTaskInitialStartStatusResponse | null>;
+	setTaskPrSettingsForTask?: (
+		taskId: string,
+		settings: { autoAddressComments: boolean; autoFinishOnMerge: boolean; expectedSettingsRevision: number },
+	) => Promise<{ ok: boolean; reason?: string | null }>;
 }): null {
 	const [board, setBoard] = useState<BoardData>(initialBoard);
 	const [, setSelectedTaskId] = useState<string | null>(null);
@@ -94,6 +101,7 @@ function HookHarness({
 		setSelectedTaskId,
 		queueTaskStartAfterEdit,
 		getTaskInitialStartStatus,
+		setTaskPrSettingsForTask,
 	});
 
 	useEffect(() => {
@@ -126,6 +134,8 @@ function HookHarness({
 			setEditTaskAutoReviewMode: editor.setEditTaskAutoReviewMode,
 			setNewTaskAgentId: editor.setNewTaskAgentId,
 			setNewTaskClineSettings: editor.setNewTaskClineSettings,
+			setEditTaskPrAutoAddressComments: editor.setEditTaskPrAutoAddressComments,
+			setEditTaskPrAutoFinishOnMerge: editor.setEditTaskPrAutoFinishOnMerge,
 		});
 	}, [
 		board,
@@ -601,5 +611,89 @@ describe("useTaskEditor", () => {
 			.board.columns.find((column) => column.id === "backlog")
 			?.cards.find((card) => card.id === "task-fixed");
 		expect(savedCard?.updateBaseRefBeforeStart).toBe(true);
+	});
+
+	it("saves changed PR automation settings through the revision-checked write, not the board draft", async () => {
+		const setTaskPrSettingsForTask = vi.fn(async () => ({ ok: true, reason: null }));
+		let latestSnapshot: HookSnapshot | null = null;
+		const initialBoard = createBoard([
+			createTask("task-1", "Initial prompt", 1, {
+				autoAddressComments: false,
+				autoFinishOnMerge: true,
+				settingsRevision: 5,
+			}),
+		]);
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					initialBoard={initialBoard}
+					onSnapshot={(snapshot) => {
+						latestSnapshot = snapshot;
+					}}
+					setTaskPrSettingsForTask={setTaskPrSettingsForTask}
+				/>,
+			);
+		});
+
+		const task = requireSnapshot(latestSnapshot).board.columns[0]?.cards[0];
+		if (!task) {
+			throw new Error("Expected a backlog task.");
+		}
+
+		await act(async () => {
+			requireSnapshot(latestSnapshot).handleOpenEditTask(task);
+			requireSnapshot(latestSnapshot).setEditTaskPrAutoAddressComments(true);
+		});
+
+		await act(async () => {
+			requireSnapshot(latestSnapshot).handleSaveEditedTask();
+		});
+
+		expect(setTaskPrSettingsForTask).toHaveBeenCalledTimes(1);
+		expect(setTaskPrSettingsForTask).toHaveBeenCalledWith("task-1", {
+			autoAddressComments: true,
+			autoFinishOnMerge: true,
+			expectedSettingsRevision: 5,
+		});
+	});
+
+	it("does not call the settings write when the PR automation settings are unchanged", async () => {
+		const setTaskPrSettingsForTask = vi.fn(async () => ({ ok: true, reason: null }));
+		let latestSnapshot: HookSnapshot | null = null;
+		const initialBoard = createBoard([
+			createTask("task-1", "Initial prompt", 1, {
+				autoAddressComments: true,
+				autoFinishOnMerge: false,
+				settingsRevision: 7,
+			}),
+		]);
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					initialBoard={initialBoard}
+					onSnapshot={(snapshot) => {
+						latestSnapshot = snapshot;
+					}}
+					setTaskPrSettingsForTask={setTaskPrSettingsForTask}
+				/>,
+			);
+		});
+
+		const task = requireSnapshot(latestSnapshot).board.columns[0]?.cards[0];
+		if (!task) {
+			throw new Error("Expected a backlog task.");
+		}
+
+		await act(async () => {
+			requireSnapshot(latestSnapshot).handleOpenEditTask(task);
+		});
+
+		await act(async () => {
+			requireSnapshot(latestSnapshot).handleSaveEditedTask();
+		});
+
+		expect(setTaskPrSettingsForTask).not.toHaveBeenCalled();
 	});
 });

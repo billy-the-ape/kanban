@@ -195,6 +195,7 @@ function normalizeCard(rawCard: unknown): BoardCard | null {
 		autoAddressComments?: unknown;
 		autoFinishOnMerge?: unknown;
 		selectedAutomationPrKey?: unknown;
+		settingsRevision?: unknown;
 		createdAt?: unknown;
 		updatedAt?: unknown;
 	};
@@ -241,6 +242,7 @@ function normalizeCard(rawCard: unknown): BoardCard | null {
 		...(typeof card.selectedAutomationPrKey === "string" && card.selectedAutomationPrKey
 			? { selectedAutomationPrKey: card.selectedAutomationPrKey }
 			: {}),
+		...(typeof card.settingsRevision === "number" ? { settingsRevision: card.settingsRevision } : {}),
 		...(typeof card.updateBaseRefBeforeStart === "boolean"
 			? { updateBaseRefBeforeStart: card.updateBaseRefBeforeStart }
 			: {}),

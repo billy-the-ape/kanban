@@ -176,8 +176,11 @@ export interface CreatePrTrackingCoordinatorDependencies {
 	 * Poll-time backstop: re-derive task-derived subscription demand from the
 	 * live board view before each poll cycle, so a board change that bypassed
 	 * the mutation triggers still drops/updates demand here. Best-effort.
+	 * Called with the canonical PR key being polled so the implementation can
+	 * revalidate only that PR's subscriptions (cheap single-board reads)
+	 * instead of enumerating every workspace.
 	 */
-	revalidateSubscriptions?: () => Promise<void>;
+	revalidateSubscriptions?: (canonicalPrKey?: string) => Promise<void>;
 	warn?: (message: string) => void;
 	/** Visible stderr line for scheduler-lock failures (second process). */
 	logError?: (message: string) => void;
@@ -197,7 +200,7 @@ export class PrTrackingCoordinator {
 	private readonly logError: (message: string) => void;
 	private readonly now: () => number;
 	private readonly random: () => number;
-	private readonly revalidateSubscriptions: (() => Promise<void>) | null;
+	private readonly revalidateSubscriptions: ((canonicalPrKey?: string) => Promise<void>) | null;
 
 	private readonly subscriptions = new Map<string, TrackedSubscription>();
 	private readonly polls = new Map<string, PrPollState>();
@@ -1039,7 +1042,7 @@ export class PrTrackingCoordinator {
 		// revalidation failure never cancels this read.
 		if (this.revalidateSubscriptions) {
 			try {
-				await this.revalidateSubscriptions();
+				await this.revalidateSubscriptions(state.prKey);
 			} catch (error: unknown) {
 				this.warn(`PR tracking revalidation failed: ${String(error)}`);
 			}

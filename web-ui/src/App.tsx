@@ -65,6 +65,7 @@ import {
 	selectLatestTaskChatMessageForTask,
 	selectTaskChatMessagesForTask,
 } from "@/runtime/native-agent";
+import { getRuntimeTrpcClient } from "@/runtime/trpc-client";
 import type { RuntimeClineReasoningEffort, RuntimeTaskSessionSummary } from "@/runtime/types";
 import { useRuntimeProjectConfig } from "@/runtime/use-runtime-project-config";
 import { useTerminalConnectionReady } from "@/runtime/use-terminal-connection-ready";
@@ -361,6 +362,15 @@ export default function App(): ReactElement {
 		setSelectedTaskId,
 		queueTaskStartAfterEdit,
 		getTaskInitialStartStatus,
+		setTaskPrSettingsForTask: (taskId, settings) =>
+			getRuntimeTrpcClient(currentProjectId)
+				.workspace.prTracking.setTaskPrSettings.mutate({
+					taskId,
+					autoAddressComments: settings.autoAddressComments,
+					autoFinishOnMerge: settings.autoFinishOnMerge,
+					expectedSettingsRevision: settings.expectedSettingsRevision,
+				})
+				.then((result) => ({ ok: result.ok, reason: result.reason })),
 	});
 
 	useEffect(() => {

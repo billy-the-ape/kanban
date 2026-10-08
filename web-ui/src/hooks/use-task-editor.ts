@@ -2,6 +2,7 @@ import { deriveTaskTitleFromPrompt } from "@runtime-task-title";
 import type { Dispatch, SetStateAction } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { showAppToast } from "@/components/app-toaster";
 import {
 	normalizeStoredTaskAutoReviewMode,
 	TASK_AUTO_REVIEW_ENABLED_STORAGE_KEY,
@@ -32,6 +33,19 @@ interface UseTaskEditorInput {
 	queueTaskStartAfterEdit?: (taskId: string) => void;
 	/** UPD-1: server-derived initial-start status (baseline-fixed signal gates the edit checkbox). */
 	getTaskInitialStartStatus: (taskId: string) => Promise<RuntimeTaskInitialStartStatusResponse | null>;
+	/**
+	 * PRTRACK-1: server-owned PR automation settings. The edit dialog takes a
+	 * diff and saves ONLY changed fields through this revision-checked write
+	 * (never through the whole-board draft), surfacing conflicts as a toast.
+	 */
+	setTaskPrSettingsForTask?: (
+		taskId: string,
+		settings: {
+			autoAddressComments: boolean;
+			autoFinishOnMerge: boolean;
+			expectedSettingsRevision: number;
+		},
+	) => Promise<{ ok: boolean; reason?: string | null }>;
 }
 
 interface OpenEditTaskOptions {
@@ -119,6 +133,7 @@ export function useTaskEditor({
 	setSelectedTaskId,
 	queueTaskStartAfterEdit,
 	getTaskInitialStartStatus,
+	setTaskPrSettingsForTask,
 }: UseTaskEditorInput): UseTaskEditorResult {
 	const [isInlineTaskCreateOpen, setIsInlineTaskCreateOpen] = useState(false);
 	const [newTaskPrompt, setNewTaskPrompt] = useState("");
@@ -340,9 +355,19 @@ export function useTaskEditor({
 		const baseRef = editTaskBranchRef || resolvedDefaultTaskBranchRef;
 		const savedTaskId = editingTaskId;
 
+		// PRTRACK-1: the PR automation checkboxes are server-owned settings,
+		// not part of the whole-board draft. Diff against the current card and
+		// save only changed fields through the revision-checked settings
+		// write (conflicts are surfaced, never silently overwritten).
+		const currentCard = board.columns.flatMap((column) => column.cards).find((card) => card.id === savedTaskId);
+		const prSettingsChanged =
+			currentCard !== undefined &&
+			(editTaskPrAutoAddressComments !== (currentCard.autoAddressComments === true) ||
+				editTaskPrAutoFinishOnMerge !== (currentCard.autoFinishOnMerge === true));
+
 		setBoard((currentBoard) => {
-			const currentCard = currentBoard.columns.flatMap((c) => c.cards).find((c) => c.id === savedTaskId);
-			const title = currentCard?.title ?? "";
+			const boardCard = currentBoard.columns.flatMap((c) => c.cards).find((c) => c.id === savedTaskId);
+			const title = boardCard?.title ?? "";
 			const updated = updateTask(currentBoard, savedTaskId, {
 				title,
 				prompt,
@@ -350,9 +375,6 @@ export function useTaskEditor({
 				autoReviewEnabled: editTaskAutoReviewEnabled,
 				autoReviewMode: editTaskAutoReviewMode,
 				images: editTaskImages,
-				// PRTRACK-1: server-owned PR automation preferences (explicit booleans win on save).
-				autoAddressComments: editTaskPrAutoAddressComments,
-				autoFinishOnMerge: editTaskPrAutoFinishOnMerge,
 				agentId: editTaskAgentId,
 				clineSettings: editTaskClineSettings,
 				baseRef,
@@ -364,6 +386,23 @@ export function useTaskEditor({
 		});
 		setEditingTaskId(null);
 		editInitialStartStatusTaskIdRef.current = null;
+
+		if (prSettingsChanged && currentCard !== undefined && setTaskPrSettingsForTask) {
+			const expectedSettingsRevision = currentCard.settingsRevision ?? 0;
+			void setTaskPrSettingsForTask(savedTaskId, {
+				autoAddressComments: editTaskPrAutoAddressComments,
+				autoFinishOnMerge: editTaskPrAutoFinishOnMerge,
+				expectedSettingsRevision,
+			}).then((result) => {
+				if (!result.ok && result.reason === "conflict") {
+					showAppToast({
+						intent: "warning",
+						message:
+							"The task's PR tracking settings changed while you were editing; open the edit dialog again to review them.",
+					});
+				}
+			});
+		}
 
 		setEditTaskPrompt("");
 		setEditTaskStartInPlanMode(false);
@@ -391,7 +430,9 @@ export function useTaskEditor({
 		editTaskUpdateBaseRefBeforeStart,
 		editingTaskId,
 		resolvedDefaultTaskBranchRef,
+		board,
 		setBoard,
+		setTaskPrSettingsForTask,
 	]);
 
 	const handleSaveAndStartEditedTask = useCallback(() => {

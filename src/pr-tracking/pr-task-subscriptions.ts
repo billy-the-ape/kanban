@@ -16,6 +16,11 @@ export type { PrBoardSnapshot };
 export interface PrTaskSubscriptionSource {
 	/** Boards of ALL currently managed workspaces. */
 	listBoards(): Promise<PrBoardSnapshot[]>;
+	/**
+	 * Optional single-workspace board read for the poll-time backstop, so a
+	 * per-PR revalidation never enumerates every workspace.
+	 */
+	listBoard?: (workspaceId: string) => Promise<PrBoardSnapshot | null>;
 	installedConsumers(): PrInstalledConsumers;
 }
 
@@ -97,11 +102,48 @@ export function computeTaskSubscriptionDemand(
  * demand, so the pass never reads any board from disk — it only drains the
  * in-memory subscription set (e.g. after a consumer unregisters).
  */
+export interface PrTaskReconcileOptions {
+	/**
+	 * Poll-time backstop: revalidate ONLY the subscriptions already held for
+	 * this canonical PR, reading each task's own board (no full workspace
+	 * enumeration). New demand for the PR is picked up by the full pass.
+	 */
+	onlyPr?: string;
+}
+
 export async function reconcileTaskSubscriptions(
 	controller: PrSubscriptionController,
 	source: PrTaskSubscriptionSource,
+	options: PrTaskReconcileOptions = {},
 ): Promise<{ added: string[]; removed: string[]; updated: string[] }> {
 	const installed = source.installedConsumers();
+	if (options.onlyPr) {
+		const added: string[] = [];
+		const removed: string[] = [];
+		const updated: string[] = [];
+		const subs = controller.listSubscriptions().filter((sub) => sub.canonicalPrKey === options.onlyPr);
+		for (const sub of subs) {
+			const snapshot = source.listBoard ? await source.listBoard(sub.workspaceId) : null;
+			const demand = snapshot
+				? computeTaskSubscriptionDemand([snapshot], installed).find((d) => d.taskId === sub.taskId)
+				: undefined;
+			if (!demand || demand.canonicalPrKey !== sub.canonicalPrKey) {
+				await controller.removeSubscription(sub.workspaceId, sub.taskId);
+				removed.push(subscriptionKey(sub.workspaceId, sub.taskId));
+			} else if (demand.column !== sub.column || !sameConsumers(demand.consumers, sub.consumers)) {
+				await controller.removeSubscription(sub.workspaceId, sub.taskId);
+				await controller.addSubscription({
+					workspaceId: demand.workspaceId,
+					taskId: demand.taskId,
+					canonicalPrKey: demand.canonicalPrKey,
+					column: demand.column,
+					consumers: demand.consumers,
+				});
+				updated.push(subscriptionKey(sub.workspaceId, sub.taskId));
+			}
+		}
+		return { added, removed, updated };
+	}
 	let demands: PrTaskSubscriptionDemand[];
 	if (!installed.comments && !installed.mergeCompletion) {
 		demands = [];
@@ -161,15 +203,15 @@ export function createReconcilePass(
 	controller: PrSubscriptionController,
 	source: PrTaskSubscriptionSource,
 	onError?: (error: unknown) => void,
-): () => Promise<void> {
+): (options?: PrTaskReconcileOptions) => Promise<void> {
 	let chain: Promise<void> = Promise.resolve();
-	return () => {
-		// Every trigger queues a full pass after the in-flight one: the
+	return (options) => {
+		// Every trigger queues a pass after the in-flight one: the
 		// queued pass re-reads demand fresh, so a coalesced trigger never
 		// runs on a board view older than the trigger that queued it.
 		chain = chain
 			.then(async () => {
-				await reconcileTaskSubscriptions(controller, source);
+				await reconcileTaskSubscriptions(controller, source, options);
 			})
 			.catch((error: unknown) => {
 				onError?.(error);

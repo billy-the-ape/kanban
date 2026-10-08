@@ -43,7 +43,7 @@ import type {
 	RuntimeTaskTrackingStateRequest,
 	RuntimeTaskTrackingStateResponse,
 } from "../core/api-contract";
-import { updateTaskPrSettings } from "../core/task-board-mutations";
+import { setTaskSelectedAutomationPr, updateTaskPrSettings } from "../core/task-board-mutations";
 import type { PrConsumerRegistry, PrInstalledConsumers } from "../pr-tracking/pr-consumer-registry";
 import { evaluatePrLifecycleGate } from "../pr-tracking/pr-lifecycle-gate";
 import {
@@ -54,7 +54,6 @@ import {
 	resolveCardAutomationPrKey,
 	selectRepairOwner,
 	transferRepairOwner,
-	validateAutoAssignedOwner,
 } from "../pr-tracking/pr-owner-selection";
 import type { PrRecordStoreBase } from "../pr-tracking/pr-record-store";
 import { releasePrOperation, reservePrOperation, validatePrOperation } from "../pr-tracking/pr-reservations";
@@ -94,6 +93,19 @@ function toInstalledConsumerFlags(registry: PrConsumerRegistry): PrInstalledCons
 		mergeCompletion: registry.isInstalled("mergeCompletion"),
 	};
 }
+
+/** Human-facing mapping for coordinator subscription blockers. */
+const SUBSCRIPTION_BLOCKER_MESSAGES: Record<
+	string,
+	{ kind: RuntimeTaskTrackingStateResponse["blockers"][number]["kind"]; message: string }
+> = {
+	malformed_key: { kind: "auth", message: "The recorded PR link cannot be parsed." },
+	unsupported_host: { kind: "unsupported_host", message: "This PR host is not supported by tracking automation." },
+	auth: { kind: "auth", message: "GitHub authentication is unavailable for this PR." },
+	scope: { kind: "auth", message: "No access scope is available for this task's PR." },
+	scheduler: { kind: "scheduler", message: "The PR tracking scheduler is blocked; reads are paused." },
+	record_malformed: { kind: "needs_human", message: "The PR tracking record is malformed." },
+};
 
 /**
  * The repair owner's current state against the live boards: deleted when the
@@ -174,19 +186,15 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 	/**
 	 * Best-effort auto owner-selection for one canonical PR: exactly one
 	 * eligible candidate is assigned atomically; multiple candidates report
-	 * ambiguity (no assignment). The PRTRACK-1 gate (inside
-	 * validateAutoAssignedOwner): a just-made auto-assignment is invalidated
-	 * when the record's verified head mapping does not match the record's
-	 * repository (a cross-repository link never produces a silent
-	 * auto-owner).
+	 * ambiguity (no assignment). Selection is card-link based; the
+	 * cross-repository-reference protection lives at the point of use
+	 * (the record's verified head mapping keys the write gate, and the
+	 * repair turn validates the task's delivery branch — see
+	 * pr-owner-selection).
 	 */
 	async function autoSelectOwnerFor(canonicalPrKey: string, boards: PrBoardSnapshot[]): Promise<void> {
 		const store = deps.getPrTrackingStore();
-		const result = await selectRepairOwner(store, canonicalPrKey, boards);
-		if (!result.assigned) {
-			return;
-		}
-		await validateAutoAssignedOwner(store, canonicalPrKey, { warn: deps.warn });
+		await selectRepairOwner(store, canonicalPrKey, boards);
 	}
 
 	async function loadScopedCard(
@@ -224,15 +232,33 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 				};
 			}
 			if (!result.updated) {
+				if (result.task === null) {
+					return {
+						value: {
+							ok: false,
+							taskId: input.taskId,
+							autoAddressComments: result.autoAddressComments,
+							autoFinishOnMerge: result.autoFinishOnMerge,
+							selectedAutomationPrKey: result.selectedAutomationPrKey,
+							settingsRevision: result.settingsRevision,
+							reason: "missing_task",
+							error: null,
+						},
+						board: state.board,
+						save: false,
+					};
+				}
+				// No-op write: both fields absent and nothing changed; the
+				// revision is untouched and this reports success.
 				return {
 					value: {
-						ok: false,
+						ok: true,
 						taskId: input.taskId,
 						autoAddressComments: result.autoAddressComments,
 						autoFinishOnMerge: result.autoFinishOnMerge,
 						selectedAutomationPrKey: result.selectedAutomationPrKey,
 						settingsRevision: result.settingsRevision,
-						reason: "missing_task",
+						reason: null,
 						error: null,
 					},
 					board: state.board,
@@ -333,37 +359,19 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			};
 		}
 		// The selection write happens INSIDE the workspace-state mutation:
-		// the revision check is re-run against the just-read card, so a
-		// concurrent settings write between the pre-read and this write is a
-		// conflict, never silently overwritten.
+		// setTaskSelectedAutomationPr re-checks the revision against the
+		// just-read card, so a concurrent settings write between the pre-read
+		// and this write is a conflict, never silently overwritten.
 		let written = false;
 		let writtenRevision = 0;
 		await mutateWorkspaceState<null>(scope.workspacePath, (state) => {
-			const foundInBoard = findTaskCard(state.board, input.taskId);
-			if (!foundInBoard || (foundInBoard.card.settingsRevision ?? 0) !== currentRevision) {
+			const result = setTaskSelectedAutomationPr(state.board, input.taskId, selected, currentRevision);
+			if (result.conflict || !result.changed) {
 				return { value: null, board: state.board, save: false };
 			}
-			const nextCard: RuntimeBoardCard = {
-				...foundInBoard.card,
-				selectedAutomationPrKey: selected ?? undefined,
-				settingsRevision: currentRevision + 1,
-			};
-			if (nextCard.selectedAutomationPrKey === undefined) {
-				delete nextCard.selectedAutomationPrKey;
-			}
 			written = true;
-			writtenRevision = currentRevision + 1;
-			return {
-				value: null,
-				board: {
-					...state.board,
-					columns: state.board.columns.map((column) => ({
-						...column,
-						cards: column.cards.map((c) => (c.id === input.taskId ? nextCard : c)),
-					})),
-				},
-				save: true,
-			};
+			writtenRevision = result.settingsRevision;
+			return { value: null, board: result.board, save: true };
 		});
 		if (!written) {
 			return {
@@ -434,9 +442,16 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		// Zero-consumer short-circuit: no consumer installed means no demand
 		// can ever exist, so no board enumeration (or owner scan) is needed.
 		const noConsumers = !installedFlags.comments && !installedFlags.mergeCompletion;
+		// Per-task agent support: comment follow-up is native-Cline only;
+		// merge completion is provider-independent.
+		const nativeClineTask = card.agentId === undefined || card.agentId === "cline";
+		const commentsSupportedForTask = installedFlags.comments && nativeClineTask;
 		const coordinatorState = coordinator ? coordinator.getState() : null;
 		if (coordinatorState?.authBlocker) {
 			blockers.push({ kind: "auth", message: coordinatorState.authBlocker });
+		}
+		if (coordinatorState?.schedulerBlocked) {
+			blockers.push({ kind: "scheduler", message: "The PR tracking scheduler is blocked; reads are paused." });
 		}
 		// Per-task access blocker from the live subscription (e.g. an
 		// unsupported host or scope failure for this task's PR).
@@ -446,9 +461,10 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 					.find((entry) => entry.workspaceId === scope.workspaceId && entry.taskId === input.taskId)
 			: undefined;
 		if (subscriptionState?.blocker) {
+			const mapping = SUBSCRIPTION_BLOCKER_MESSAGES[subscriptionState.blocker];
 			blockers.push({
-				kind: subscriptionState.blocker === "unsupported_host" ? "unsupported_host" : "auth",
-				message: subscriptionState.blocker,
+				kind: mapping.kind,
+				message: mapping.message,
 			});
 		}
 		const active = found.columnId === "in_progress" || found.columnId === "review";
@@ -462,9 +478,16 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			blockers.push({ kind: "waiting_for_linked_pr", message: "No PR link is recorded for this task yet." });
 		}
 		if (card.autoAddressComments === true && !installedFlags.comments) {
+			// Consumer not installed: "Feature unavailable" (distinct from the
+			// per-task agent-support blocker below).
+			blockers.push({
+				kind: "feature_unavailable",
+				message: "Comment follow-up automation is not installed in this runtime.",
+			});
+		} else if (card.autoAddressComments === true && !nativeClineTask) {
 			blockers.push({
 				kind: "comments_unsupported",
-				message: "Comment follow-up automation is not installed in this runtime.",
+				message: "Comment follow-up automation requires a native Cline task.",
 			});
 		}
 		if (card.autoFinishOnMerge === true && !installedFlags.mergeCompletion) {
@@ -489,7 +512,13 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		const boards = noConsumers ? [] : await deps.listManagedWorkspaceBoards();
 		const candidates = resolved.key && !noConsumers ? listRepairOwnerCandidates(resolved.key, boards) : [];
 		const owner = resolved.key && record ? record.commentAutomation.repairOwner : null;
-		const ownerView = toOwnerView(owner, candidates, boards);
+		// With zero consumers no board scan happened, so "not found on a
+		// board" is indeterminate here and must not surface as a deletion.
+		const rawOwnerView = toOwnerView(owner, candidates, boards);
+		const ownerView =
+			noConsumers && rawOwnerView?.state === "deleted"
+				? { ...rawOwnerView, state: "active" as const }
+				: rawOwnerView;
 		if (owner && ownerView?.state === "deleted") {
 			blockers.push({ kind: "owner_deleted", message: "The repair owner task was deleted; reassign to continue." });
 		}
@@ -523,7 +552,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			mergeFinishesInReview: gate.mergeFinishesInReview,
 			blockers,
 			installedConsumers: installedConsumersOf(registry),
-			commentsSupportedForTask: installedFlags.comments,
+			commentsSupportedForTask,
 			owner: ownerView,
 			ownerLabel: owner && owner.workspaceId !== scope.workspaceId ? (ownerView?.label ?? null) : null,
 			ownerCandidates: candidates.map((candidate) => ({
@@ -901,6 +930,68 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			return { ok: false, status: "blocked", reservation: toReservationView(null), error: context.reason };
 		}
 		const force = input.force === true;
+		if (force) {
+			const reservation = context.record.reservation;
+			const held =
+				reservation.state === "reserved" && reservation.reservedBy !== null
+					? {
+							operation: reservation.reservedOperation,
+							holder: reservation.reservedBy,
+							generation: reservation.fencingGeneration,
+						}
+					: null;
+			if (
+				!input.expectedHolder ||
+				typeof input.expectedFencingGeneration !== "number" ||
+				!held ||
+				held.operation !== input.operation ||
+				held.holder.workspaceId !== input.expectedHolder.workspaceId ||
+				held.holder.taskId !== input.expectedHolder.taskId ||
+				held.generation !== input.expectedFencingGeneration
+			) {
+				// The reservation changed since the operator observed it (or the
+				// observation was incomplete): a stale operator click must not
+				// clear a newer reservation. Audited even when refused.
+				deps.warn?.(
+					`PR tracking operator force release refused on ${context.prKey} (${input.operation}) by ${scope.workspaceId}/${input.taskId}: observed holder/generation does not match the record`,
+				);
+				return {
+					ok: false,
+					status: "stale",
+					reservation: toReservationView(context.record),
+					error: "Force release requires the holder and fencing generation the operator actually observed.",
+				};
+			}
+			// A live holder can finish its write: verify prior process/session
+			// exit before taking over. An uncertain (or unavailable) probe refuses.
+			let holderActive: boolean;
+			if (!deps.isTaskWriterActive) {
+				holderActive = true;
+				deps.warn?.(
+					`PR tracking operator force release refused on ${context.prKey} (${input.operation}): holder-exit probe unavailable`,
+				);
+			} else {
+				try {
+					holderActive = await deps.isTaskWriterActive(held.holder.workspaceId, held.holder.taskId);
+				} catch (error: unknown) {
+					holderActive = true;
+					deps.warn?.(
+						`PR tracking operator force release refused on ${context.prKey} (${input.operation}): holder-exit probe failed (${String(error)})`,
+					);
+				}
+			}
+			if (holderActive) {
+				deps.warn?.(
+					`PR tracking operator force release refused on ${context.prKey} (${input.operation}) by ${scope.workspaceId}/${input.taskId}: holder ${held.holder.workspaceId}/${held.holder.taskId} is still active`,
+				);
+				return {
+					ok: false,
+					status: "busy",
+					reservation: toReservationView(context.record),
+					error: "The reservation holder's writer is still active; it can finish or must be stopped first.",
+				};
+			}
+		}
 		const result = await releasePrOperation(
 			deps.getPrTrackingStore(),
 			context.prKey,
@@ -912,11 +1003,11 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			undefined,
 			{ force },
 		);
-		if (force && result.status !== "stale") {
+		if (force) {
 			// Audited operator action: an explicit release of a reservation
-			// held by another (possibly crashed) holder.
+			// held by another (verified-dead) holder.
 			deps.warn?.(
-				`PR tracking operator force-release of ${input.operation} reservation on ${context.prKey} by ${scope.workspaceId}/${input.taskId}`,
+				`PR tracking operator force-release of ${input.operation} reservation on ${context.prKey} by ${scope.workspaceId}/${input.taskId} (cleared holder ${input.expectedHolder?.workspaceId}/${input.expectedHolder?.taskId} gen ${input.expectedFencingGeneration}, status ${result.status})`,
 			);
 		}
 		const record = await deps.getPrTrackingStore().loadRecord(context.prKey);

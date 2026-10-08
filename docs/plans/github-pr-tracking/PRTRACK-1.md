@@ -461,6 +461,42 @@ Implemented in this worktree (PR targets `feat/pr-tracking-base`). Record:
   `npm run web:typecheck` clean; `npm run web:test` (586 tests pass); Biome clean.
 - **Baseline drift.** None beyond PRTRACK-0; no storage-format changes beyond
   PRTRACK-0's record schema (reservation/owner blocks already present).
+- **Review-hardened semantics (revision 4, #66 follow-up).**
+  - Diagnostics are split so the UI can distinguish capability from agent
+    support: `feature_unavailable` (consumer not installed, message
+    "Comment follow-up automation is not installed in this runtime.") vs
+    `comments_unsupported` (installed but the task is not native Cline,
+    message "Comment follow-up automation requires a native Cline task.").
+    `getTaskTrackingState` also returns `commentsSupportedForTask`
+    (consumer installed AND native-Cline task), and the zero-consumer
+    short-circuit skips board enumeration entirely, so a repair owner is
+    reported `active` (never `deleted`) when no consumers are installed.
+  - The task edit dialog saves changed PR settings through the
+    revision-checked `setTaskPrSettings` (`expectedSettingsRevision` from the
+    board card, diff-detected: only changed values are sent, unchanged
+    settings never write). `updateTask` no longer carries PR fields (stale
+    whole-board saves cannot clobber server-owned settings); conflicts surface
+    a toast instead of silently losing the change. `settingsRevision`
+    hydrates through `normalizeCard`/`BoardCard`.
+  - `releasePrOperation` operator path is authorized: `force` requires the
+    reservation the operator observed (`expectedHolder` +
+    `expectedFencingGeneration`); a mismatch is `stale`, and the release is
+    refused (`busy`) while the holder's writer is still active
+    (`isTaskWriterActive` wired through `app-router` →
+    `runtime-server` → PR API). All force outcomes are audited through the
+    server warning log.
+  - No-op settings writes (no field present) report `ok` without touching the
+    revision; `selectTaskAutomationPr` reuses `setTaskSelectedAutomationPr`
+    (no duplicated inline mutation).
+  - New API-level suite: `test/runtime/pr-tracking/pr-tracking-api.test.ts`
+    (diagnostics, no-op/conflict settings, force-release authorization).
+- **Test commands and results (revision 4).** `npx vitest run
+  test/runtime/pr-tracking` (104 tests pass); `npx vitest run
+  test/runtime/trpc test/integration/workspace-state.integration.test.ts
+  test/runtime/task-board-mutations.test.ts` (246 pass); `npx tsc --noEmit`
+  and web-ui typecheck clean; `npx vitest run` (web-ui) passes incl.
+  `use-task-editor.test.tsx` (12 tests, 2 new revision-checked settings
+  tests); Biome clean for all changed files.
 
 COMMENT-0 and MERGE-1 can now start in parallel; each adds consumer modules and
 targeted existing API integrations only.
