@@ -488,6 +488,21 @@ Implemented in this worktree (PR targets `feat/pr-tracking-base`). Record:
   - No-op settings writes (no field present) report `ok` without touching the
     revision; `selectTaskAutomationPr` reuses `setTaskSelectedAutomationPr`
     (no duplicated inline mutation).
+  - Reconcile triggers queue a follow-up FULL pass after the in-flight one
+    (dirty-flag coalescing in `runtime-server`), so a coalesced trigger never
+    runs on a board view older than the trigger; `createReconcilePass`
+    (pr-task-subscriptions) is the single implementation (no dead duplicate).
+    Every board-change broadcast (save, PR-link add/remove from any writer,
+    including auto-discovered links) re-derives subscription demand.
+  - Fork-PR decision (review comment "needs a decision"): the
+    cross-repository auto-owner guard is NOT enforced at assignment. Fork→
+    upstream PRs have a head repository that differs from the base/record
+    repository by construction, so treating that as "cross-repository
+    reference" would block the normal fork workflow. Protection is enforced
+    at the point of use instead: the record's verified head mapping keys the
+    head-ref write gate (`reservePrOperation`/`validatePrOperation`), and the
+    repair turn (COMMENT-0) validates the task's delivery branch against that
+    mapping before any remote write.
   - New API-level suite: `test/runtime/pr-tracking/pr-tracking-api.test.ts`
     (diagnostics, no-op/conflict settings, force-release authorization).
 - **Test commands and results (revision 4).** `npx vitest run
