@@ -3,14 +3,14 @@
 Status: implementation-ready plan; no runtime behavior changes in this PR.
 Target: billy-the-ape/kanban main. Source baseline: `7a64060`.
 
-Implemented as four numbered briefs, each one PR / one squash commit, in this order. Every push to `main` auto-deploys (`docs/deployment/ai-monster.md`), so each brief must leave `main` in a deployable state:
+Implemented as four numbered briefs, each one PR / one squash commit, in this order. Deploys are manual (`.github/workflows/deploy-ai-monster.yml` is `workflow_dispatch`-only since `a7c026a`; `docs/deployment/ai-monster.md` still describes the old auto-deploy and is stale on this), but any `main` commit can be picked for a manual deploy, so each brief must leave `main` coherent and deployable:
 
 - **DIAG-0** — Expanded tool I/O visibility in the chat panel. Independent of the other briefs; immediately closes the `0e05l` editor-input visibility gap.
-- **DIAG-GATE** — Extract the runtime auth gate and workspace-scope resolution into a tested shared function. Behaviour-neutral; ships before DIAG-2.
-- **DIAG-1** — Additive export snapshot, schemaVersion 3 builder, streaming serializer, and the artifact sidecar index. Unwired. The schemaVersion 2 host-disk export is untouched.
-- **DIAG-2** — HTTP download route after the extracted gate, browser download, CLI repoint, old contract/consumer removal, and docs.
+- **DIAG-1** — Extract the runtime auth gate and workspace-scope resolution into a tested shared function. Behaviour-neutral; independent of DIAG-2.
+- **DIAG-2** — Additive export snapshot, schemaVersion 3 builder, streaming serializer, and the artifact sidecar index. Unwired. The schemaVersion 2 host-disk export is untouched. Independent of DIAG-1.
+- **DIAG-3** — HTTP download route after the extracted gate, browser download, CLI repoint, old contract/consumer removal, and docs. Depends on DIAG-1 and DIAG-2.
 
-The briefs stay in this one `PLAN.md` rather than `UPD-0.md`-style per-brief files because the decisions section is the load-bearing part and every brief cross-references it; if the DIAG-1 diff grows beyond one reviewable PR, its 1a/1b/1c sub-steps are independent and additive and can be split into separate briefs (and files) at that point.
+The briefs stay in this one `PLAN.md` rather than `UPD-0.md`-style per-brief files because the decisions section is the load-bearing part and every brief cross-references it; if the DIAG-2 diff grows beyond one reviewable PR, its 2a/2b/2c sub-steps are independent and additive and can be split into separate briefs (and files) at that point.
 
 All open decisions (artifact metadata mechanism, session eligibility, overlap/inheritance labeling, route placement, CLI fate, test layers) are resolved in this plan; the implementer makes no product or operator decisions.
 
@@ -74,11 +74,15 @@ In the expanded tool block, retain the existing readable `run_commands` renderin
 
 Tests (ship with DIAG-0): expanded editor block shows actual input with `old_text` present/absent; outputs and errors; `run_commands` readability unchanged; hostile markup displays as text; a raw output line that is exactly `Error:` is handled per the noted limitation.
 
-### DIAG-1: Export snapshot, builder, and streaming serializer (1 PR, additive and unwired)
+### DIAG-1: Extract the runtime auth gate (1 PR, behaviour-neutral)
 
-All DIAG-1 code is additive: no route, no UI, no contract change, and no user-visible behavior change — the only runtime change is the sidecar-index write in 1b. The schemaVersion 2 host-disk export and its mutation stay untouched until DIAG-2.
+No test boots `createRuntimeServer`, and the passcode/session/bearer gate plus workspace-scope resolution is inline in `requestHandler` (`runtime-server.ts:376-477`); `ws-upgrade-passcode.test.ts` re-implements the logic instead. Extract the gate (and workspace-scope resolution) into a shared function that the production `requestHandler` and the tests all call — behaviour-preserving by intent, and landed/reviewed on its own so that a security-sensitive refactor is never bundled with a new streaming route, a CLI repoint, and a contract removal. Independent of DIAG-2; DIAG-3 lands after it. Tests prove the gate decision is unchanged for: passcode off, passcode on + valid cookie, valid bearer token, no auth, `/api/passcode/*` paths, and static asset requests.
 
-#### 1a. Export-specific transcript snapshot
+### DIAG-2: Export snapshot, builder, and streaming serializer (1 PR, additive and unwired)
+
+All DIAG-2 code is additive: no route, no UI, no contract change, and no user-visible behavior change — the only runtime change is the sidecar-index write in 2b. The schemaVersion 2 host-disk export and its mutation stay untouched until DIAG-3.
+
+#### 2a. Export-specific transcript snapshot
 
 Add a typed read-only export snapshot method to the session runtime and task-session service. Keep existing context/UI methods unchanged. Read SDK session records and messages through the boundary, deriving transcript types from SDK types; do not scan guessed SDK paths or export raw credential-bearing session config.
 
@@ -88,13 +92,13 @@ Use durable messages as the main source, merging any not-yet-persisted live tail
 
 A task with no native Cline transcript still downloads operational diagnostics with a clear transcript availability status. A failed read of an expected existing transcript is a failure/gap, not an empty successful transcript. Terminal agents are handled per decision 9.
 
-Tests (ship with DIAG-1): durable-only task after runtime restart; live tail while running (including the review live tail via `getSessionExportSnapshot` while a review is running); empty/no session; multiple restarted segments; seeded/compacted/native labelling (`origin: "seeded-or-compacted"` / `native` / `unknown`); workspace mismatch rejected; corrupt transcript recorded as a gap/error; a snapshot test with >200 fake records where the task's oldest segment sits past the default 200 window and yields `partial` with reason "session listing may be truncated". Use SDK-host fakes; do not boot real hosts in unit tests.
+Tests (ship with DIAG-2): durable-only task after runtime restart; live tail while running (including the review live tail via `getSessionExportSnapshot` while a review is running); empty/no session; multiple restarted segments; seeded/compacted/native labelling (`origin: "seeded-or-compacted"` / `native` / `unknown`); workspace mismatch rejected; corrupt transcript recorded as a gap/error; a snapshot test with >200 fake records where the task's oldest segment sits past the default 200 window and yields `partial` with reason "session listing may be truncated". Use SDK-host fakes; do not boot real hosts in unit tests.
 
-#### 1b. Recover full tool output alongside its original transcript position
+#### 2b. Recover full tool output alongside its original transcript position
 
 For every tool-result part, retain the persisted result exactly and locate any associated full-output artifact:
 
-- Primary: an append-only sidecar index in the task's `context-artifacts/` directory, written by `writeTaskContextArtifact`, mapping `toolCallId` → artifact file name. This is resolved now, not deferred: the SDK's persisted `ToolResultContent` and runtime `AgentToolResultPart` carry no result-metadata field, and message-level `MessageWithMetadata.metadata` is not settable from tool hooks, so a Kanban-owned mechanism is required. Write discipline: parallel tool calls can fire the hook concurrently, so take `withLock` on the index file with a `path` distinct from the artifact files'/directory's lock (per AGENTS.md, `proper-lockfile` keys its in-process map by `path`, not `lockfilePath`), then read-append-`writeTextFileAtomic`. An index write failure is treated like the existing artifact-write failure: log it, still return the excerpt, and let the export fall back to filename lookup.
+- Primary: an append-only sidecar index in the task's `context-artifacts/` directory, written by `writeTaskContextArtifact`, mapping `toolCallId` → artifact file name. This is resolved now, not deferred: the SDK's persisted `ToolResultContent` and runtime `AgentToolResultPart` carry no result-metadata field, and message-level `MessageWithMetadata.metadata` is not settable from tool hooks, so a Kanban-owned mechanism is required. Write discipline: parallel tool calls can fire the hook concurrently, so take `withLock` on the index file with a `path` distinct from the artifact files'/directory's lock (per AGENTS.md, `proper-lockfile` keys its in-process map by `path`, not `lockfilePath`), then read-append and write with `writeTextFileAtomic(indexPath, content, { lock: null })` — the `lock: null` option exists for exactly this nesting case (`locked-file-system.ts:118-123`), because the default would take a second lock on the same path and self-deadlock with `ELOCKED` after the retry window. An index write failure is treated like the existing artifact-write failure: log it, still return the excerpt, and let the export fall back to filename lookup.
 - Fallback: deterministic file-name lookup — artifacts are named `<sanitized toolCallId>-<ts>-<rand>.txt` (`task-artifacts.ts:40`) — but sanitisation plus the 80-char cap can collide, so a multi-match becomes an explicit "ambiguous" gap.
 - Legacy: parse the prose paths emitted by `buildBoundedToolResultExcerpt` and `buildCommandOutputExcerpt` (both `Full content:` and `full output:` forms), for pre-existing sessions only.
 
@@ -104,43 +108,39 @@ Each tool-result export entry includes the original persisted result plus linked
 
 Missing, unreadable or ambiguous artifacts produce explicit per-result gaps and top-level completeness warnings while the rest remains downloadable. A bounded excerpt with no surviving artifact must be labelled incomplete. Do not change model context limits or stop bounding oversized model-facing results.
 
-Tests (ship with DIAG-1): index-based references, both legacy reference styles, full output larger than 50,000 characters recovered beside its call, raw non-JSON content, missing artifact, invalid path, sibling-task reference, escaping symlink rejection, ambiguous multi-match gap. Isolate HOME/USERPROFILE using repository test helpers.
+Tests (ship with DIAG-2): index-based references, both legacy reference styles, full output larger than 50,000 characters recovered beside its call, raw non-JSON content, missing artifact, invalid path, sibling-task reference, escaping symlink rejection, ambiguous multi-match gap, and two concurrent `writeTaskContextArtifact` calls where both entries land in the index and complete well under the lock-retry window (no self-deadlock). Isolate HOME/USERPROFILE using repository test helpers.
 
-#### 1c. SchemaVersion 3 bundle and streaming serializer
+#### 2c. SchemaVersion 3 bundle and streaming serializer
 
-Add typed export structures and assembly helpers for the schemaVersion 3 bundle (the schemaVersion 2 redaction builder stays in place until DIAG-2 removes it). Keep the operational fields from `RuntimeTaskDiagnosticsResponse`, including task title, review details, warning/activity text, dispatch data, workspace paths and diagnostics errors. Add capture metadata, chronological session segments, live tails, tool evidence, completeness status and gap reasons (decision 5).
+Add typed export structures and assembly helpers for the schemaVersion 3 bundle (the schemaVersion 2 redaction builder stays in place until DIAG-3 removes it). Keep the operational fields from `RuntimeTaskDiagnosticsResponse`, including task title, review details, warning/activity text, dispatch data, workspace paths and diagnostics errors. Add capture metadata, chronological session segments, live tails, tool evidence, completeness status and gap reasons (decision 5).
 
 Keep native messages/parts intact under each segment; add evidence using message/part references or enclosing export entries without rewriting the original messages. Tool calls retain exact parsed arguments including absent/null/empty distinctions; tool results retain error flags and all recorded errors/recovery envelopes. An interrupted call remains unmatched with an explicit annotation; do not run the model-history repair hook merely to make the export look paired.
 
 Use a JSON streaming writer based on Node streams that emits top-level fields, segments/messages, and artifacts incrementally; honor `drain` and abort on client disconnect. Serialize artifacts one at a time under decision 8's memory rule (exact raw text as a string, no parse-then-reserialise). Stream strings safely with JSON escaping (including quotes, backslashes, control characters, Unicode); do not build JSON by interpolating unescaped content. Do not include optional arbitrary file contents or global settings objects.
 
-Tests (ship with DIAG-1): JSON round-trip equality for original transcript values with control characters/Unicode/embedded quotes; large transcript plus multiple artifacts streamed one at a time; backpressure and client disconnect; no truncated successful response; no host export or temp files created.
+Tests (ship with DIAG-2): JSON round-trip equality for original transcript values with control characters/Unicode/embedded quotes; large transcript plus multiple artifacts streamed one at a time; backpressure and client disconnect; no truncated successful response; no host export or temp files created.
 
-### DIAG-GATE: Extract the runtime auth gate (1 PR, behaviour-neutral, ships before DIAG-2)
+### DIAG-3: Download route, browser download, CLI, old-contract removal, and docs (1 PR)
 
-No test boots `createRuntimeServer`, and the passcode/session/bearer gate plus workspace-scope resolution is inline in `requestHandler` (`runtime-server.ts:376-477`); `ws-upgrade-passcode.test.ts` re-implements the logic instead. Extract the gate (and workspace-scope resolution) into a shared function that the production `requestHandler` and the tests all call — behaviour-preserving by intent, and landed/reviewed on its own so that a security-sensitive refactor is never bundled with a new streaming route, a CLI repoint, and a contract removal. Tests prove the gate decision is unchanged for: passcode off, passcode on + valid cookie, valid bearer token, no auth, `/api/passcode/*` paths, and static asset requests.
+#### 3a. GET download route
 
-### DIAG-2: Download route, browser download, CLI, old-contract removal, and docs (1 PR)
-
-#### 2b. GET download route
-
-Add the GET handler as a small server module wired into `runtime-server.ts`, dispatched **after** the DIAG-GATE gate function and **before** the unmatched-`/api/` 404 (decision 7). Resolve the existing workspace scope, apply the task-membership rule (decision 7), and invoke export assembly. Set `Content-Type: application/json; charset=utf-8`, `Content-Disposition: attachment; filename="..."`, and `Cache-Control: no-store`. Sanitize only the download filename; preserve the task ID in the bundle.
+Add the GET handler as a small server module wired into `runtime-server.ts`, dispatched **after** the DIAG-1 gate function and **before** the unmatched-`/api/` 404 (decision 7). Resolve the existing workspace scope, apply the task-membership rule (decision 7), and invoke export assembly. Set `Content-Type: application/json; charset=utf-8`, `Content-Disposition: attachment; filename="..."`, and `Cache-Control: no-store`. Sanitize only the download filename; preserve the task ID in the bundle.
 
 Validate/read the initial snapshot before starting the response so auth, missing-task, and initial read errors return a clear non-2xx JSON error. If streaming fails after headers, terminate the response; the browser must report failure instead of downloading an apparently complete success. Missing historical artifacts are represented as gaps rather than transport failures. Respect backpressure and disconnects; no background export continues after cancellation.
 
-#### 2c. Browser download
+#### 3b. Browser download
 
-Replace the host-path export wrapper with a browser fetch helper: `fetch("/api/task-diagnostics/download?workspaceId=…&taskId=…", { credentials: "same-origin" })`. There is no "runtime base URL" helper in web-ui (the tRPC client uses the relative `/api/trpc`), and the `SameSite=Strict; HttpOnly` session cookie is sent automatically for same-origin requests; this path authenticates via the cookie only — the internal bearer token is a CLI concern (2d).
+Replace the host-path export wrapper with a browser fetch helper: `fetch("/api/task-diagnostics/download?workspaceId=…&taskId=…", { credentials: "same-origin" })`. There is no "runtime base URL" helper in web-ui (the tRPC client uses the relative `/api/trpc`), and the `SameSite=Strict; HttpOnly` session cookie is sent automatically for same-origin requests; this path authenticates via the cookie only — the internal bearer token is a CLI concern (3c).
 
 Check status, await Blob creation, create an object URL, click a temporary anchor with the client-built filename, then remove it and revoke the URL after download initiation. Preserve an exporting state and reject duplicate export starts. Surface actionable errors; do not show a host-path or redaction toast. Success text: "Diagnostics download started."
 
-#### 2d. CLI
+#### 3c. CLI
 
 `kanban task export-diag` (`task.ts:1339`, registered at `:1800`) is repointed at the new GET route — not removed — because it is the CLI/JSON equivalent of the button (B-10.5). Authenticate with the existing `getRuntimeFetch()` (`src/core/runtime-endpoint.ts:136`), which already attaches the internal bearer token and handles HTTPS, combined with `buildKanbanRuntimeUrl("/api/task-diagnostics/download?…")` — the same pair `createRuntimeTrpcClient` uses (`task.ts:250`). Do not invent a second auth mechanism.
 
 The command **requires** `--output <file>`: `runTaskCommand` prints a `printJson` result record (or `{ ok: false, error }`) on every success/failure (`task.ts:1470-1480`), so streaming the bundle to stdout would corrupt that scripting surface. Stream to the file, then return the normal record `{ ok, outputPath, bytes, completeness }`; on non-2xx or a truncated stream delete the partial file and return `ok: false` with a non-zero exit. Never write to `~/.cline/kanban/diagnostics`. Update the command description text (`task.ts:1801`).
 
-#### 2e. Remove the write-to-host export in the same commit
+#### 3d. Remove the write-to-host export in the same commit
 
 - `runtimeDiagnosticsExportRequestSchema` / response schemas in `src/core/api-contract.ts:2353-2366`
 - `exportTaskDiagnostics` type at `src/trpc/app-router.ts:310` and the `workspaceProcedure` at `:629`
@@ -148,29 +148,29 @@ The command **requires** `--output <file>`: `runTaskCommand` prints a `printJson
 - `exportTaskDiagnostics` mutation in `src/trpc/runtime-api.ts` (including the `lockedFileSystem.writeTextFileAtomic` write)
 - `buildTaskDiagnosticsExportBundle` (the schemaVersion 2 redaction builder) in `src/core/task-diagnostics-export.ts`
 - The old wrapper in `web-ui/src/hooks/use-task-diagnostics.ts` / `runtime/task-diagnostics.ts`
-- Delete `test/runtime/core/task-diagnostics-export.test.ts` (it asserts v2 redaction behaviour, e.g. `redactions` and `[redacted]` titles); replaced by the DIAG-1 builder tests — this gives the "no test references the removed contract" check an explicit owner
+- Delete `test/runtime/core/task-diagnostics-export.test.ts` (it asserts v2 redaction behaviour, e.g. `redactions` and `[redacted]` titles); replaced by the DIAG-2 builder tests — this gives the "no test references the removed contract" check an explicit owner
 
 Do not leave a hidden disk-writing fallback. Existing manually created diagnostic files need not be deleted or migrated.
 
-Tests (ship with DIAG-2, against the extracted gate and the route handler — no booted server): authenticated download with passcode enabled; unauthenticated rejection; origin rejection; missing/foreign workspace or task rejection; filename headers and no-store; initial error and stream failure behavior (fake export assembler → read the full response → `JSON.parse`); no test references the removed contract/procedure. Never bypass auth in the production route.
+Tests (ship with DIAG-3): the HTTP test composes `handleHttpRequest` → extracted gate → route handler the way `requestHandler` does (a small `http.createServer` wrapper in the test is fine; no full server boot), covering authenticated download with passcode enabled, unauthenticated rejection, origin/host rejection (unit coverage for those decisions stays in `middleware.test.ts` — `handleHttpRequest` at `middleware.ts:111` runs before the passcode gate, so the gate alone cannot observe it), missing/foreign workspace or task rejection, filename headers and no-store, initial error and stream failure behavior (fake export assembler → read the full response → `JSON.parse`), and no test references the removed contract/procedure. Never bypass auth in the production route.
 
 Browser test layer: jsdom with mocked `fetch` / `URL.createObjectURL` / anchor click covers one download per click with the correct filename, duplicate-click blocking, loading reset on success/failure, bad HTTP/download failure error, and object-URL cleanup. There is no Playwright assertion: `web-ui/playwright.config.ts` starts only the Vite dev server (no runtime boot) and no CI workflow runs e2e, so the "real download with parseable JSON" property is covered by the Node-level HTTP integration test above, with the true end-to-end download left to the manual ai-monster acceptance.
 
-#### 2f. Docs
+#### 3e. Docs
 
 - New `docs/runtime/diagnostics-export.md` documents the browser-download behavior, content caption, and completeness/gap semantics, linked from `docs/README.md`. No existing user-facing diagnostics documentation exists to update.
 - Update B-10.7's old redacted-host-file requirement in all three places: `docs/plans/B-10.md:191` (the requirement "Exclude API keys, prompts, private code, and raw environment by default"), `docs/plans/B-10.md:201` (acceptance: "Tests cover … redaction"), and `docs/plans/B_IMPLEMENTATION_PLAN.md:528` (the unchecked copy). Keep the wording explicit that provider credentials and raw environment dumps remain excluded while prompts and code are now included, so the history does not read as a silent policy flip.
-- CLI help text updated per 2d.
+- CLI help text updated per 3c.
 
-Manual acceptance (DIAG-2): in a remote browser connected to ai-monster, export a stopped task with failed editor calls and a task with archived oversized command output. A browser file download must start without SSH or a host export path. Parse the downloaded JSON, find the failure in its conversation segment, and inspect the exact recorded input plus error. Verify an archived output is fully present beyond the model excerpt. Test with passcode authentication and after a Kanban restart. Confirm no new file appeared under `~/.cline/kanban/diagnostics` from either export, and that `kanban task export-diag` writes to the requested file, not `~/.cline/kanban/diagnostics`.
+Manual acceptance (DIAG-3): in a remote browser connected to ai-monster, export a stopped task with failed editor calls and a task with archived oversized command output. A browser file download must start without SSH or a host export path. Parse the downloaded JSON, find the failure in its conversation segment, and inspect the exact recorded input plus error. Verify an archived output is fully present beyond the model excerpt. Test with passcode authentication and after a Kanban restart. Confirm no new file appeared under `~/.cline/kanban/diagnostics` from either export, and that `kanban task export-diag` writes to the requested file, not `~/.cline/kanban/diagnostics`.
 
 Every brief runs repository Biome formatting/checks on changed files, backend and web typechecks, its focused suites, and applicable CI checks before committing. Do not run Prettier.
 
 ## Completion and deployment
 
-No new environment variables, account setup, services, storage directories or database migration. Each brief is independently deployable: DIAG-0 is UI-only; DIAG-GATE is behaviour-neutral; DIAG-1 is additive with no user-visible behavior change (only the sidecar-index write); DIAG-2 wires the new route after the already-tested gate and removes the old host-disk export contract in one commit, so its backend and frontend deploy together.
+No new environment variables, account setup, services, storage directories or database migration. Each brief is independently deployable: DIAG-0 is UI-only; DIAG-1 is behaviour-neutral; DIAG-2 is additive with no user-visible behavior change (only the sidecar-index write); DIAG-3 wires the new route after the already-tested gate and removes the old host-disk export contract in one commit, so its backend and frontend deploy together.
 
-Deployment note for DIAG-2: because the host-path export contract is removed, an already-open browser tab running the old UI will see a "runtime request error" on Export until it is reloaded.
+Deployment note for DIAG-3: because the host-path export contract is removed, an already-open browser tab running the old UI will see a "runtime request error" on Export until it is reloaded.
 
 Historical exports and missing historical evidence stay unchanged.
 
