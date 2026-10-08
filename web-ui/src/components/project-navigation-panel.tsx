@@ -589,16 +589,15 @@ function ProjectSupportFooter({
 const MOD = isMacPlatform ? "⌘" : modifierKeyLabel;
 const ALT = isMacPlatform ? "⌥" : "Alt";
 
-const ESSENTIAL_SHORTCUTS = [
+const ESSENTIAL_SHORTCUTS: { keys: string[]; label: string }[] = [];
+
+const MORE_SHORTCUTS = [
 	{ keys: ["C"], label: "New task" },
 	{ keys: [MOD, "B"], label: "Start backlog tasks" },
 	{ keys: [MOD, "Shift", "S"], label: "Settings" },
 	{ keys: ["Click", MOD], label: "Hold to link tasks" },
 	{ keys: [MOD, "G"], label: "Toggle git view" },
 	{ keys: [MOD, "J"], label: "Toggle terminal" },
-];
-
-const MORE_SHORTCUTS = [
 	{ keys: [MOD, "Shift", "A"], label: "Toggle plan / act" },
 	{ keys: [ALT, "Shift", "Enter"], label: "Start and open task" },
 	{ keys: [MOD, "M"], label: "Expand terminal" },
@@ -643,7 +642,7 @@ function ShortcutsCard(): React.ReactElement {
 							className="flex items-center gap-1 mt-1.5 text-xs text-text-tertiary hover:text-text-secondary cursor-pointer bg-transparent border-none p-0"
 						>
 							{expanded ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
-							{expanded ? "Less" : "All shortcuts"}
+							{expanded ? "Hide shortcuts" : "Show shortcuts"}
 						</button>
 					</Collapsible.Trigger>
 				</Collapsible.Root>
