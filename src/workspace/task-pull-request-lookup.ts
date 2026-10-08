@@ -287,9 +287,16 @@ export async function lookupTaskPullRequests(input: TaskPullRequestLookupInput):
 
 /**
  * Fire-and-forget wrapper for review transitions: fires the branch lookup
- * only when the card exists and has no recorded PRs. Never awaited.
+ * only when the card exists and has no recorded PRs. Never awaited. When the
+ * lookup RECORDS new links, `onChanged` is invoked so the caller can
+ * broadcast the board change and re-derive PR tracking demand.
  */
-export function fireReviewPullRequestLookup(input: { workspacePath: string; taskId: string }): void {
+export function fireReviewPullRequestLookup(input: {
+	workspacePath: string;
+	taskId: string;
+	onChanged?: (recorded: number) => void;
+	gh?: TaskPullRequestGhRunner;
+}): void {
 	void (async () => {
 		try {
 			const state = await loadWorkspaceState(input.workspacePath);
@@ -297,10 +304,14 @@ export function fireReviewPullRequestLookup(input: { workspacePath: string; task
 			if (!card || (card.pullRequests ?? []).length > 0) {
 				return;
 			}
-			await lookupTaskPullRequests({
+			const result = await lookupTaskPullRequests({
 				workspacePath: input.workspacePath,
 				taskId: input.taskId,
+				gh: input.gh,
 			});
+			if (result.recorded > 0) {
+				input.onChanged?.(result.recorded);
+			}
 		} catch (error) {
 			// lookupTaskPullRequests swallows its own failures; this only
 			// guards the pre-check board read.

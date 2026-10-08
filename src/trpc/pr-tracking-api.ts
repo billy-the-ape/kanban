@@ -14,6 +14,7 @@ import type {
 	GitHubPrTaskBinding,
 	GitHubPrTaskIdentity,
 	GitHubPrTrackingRecord,
+	RuntimeAgentId,
 	RuntimeBoardCard,
 	RuntimePrAuthorizedSnapshotRequest,
 	RuntimePrAuthorizedSnapshotResponse,
@@ -76,6 +77,16 @@ export interface CreatePrTrackingApiDependencies {
 	 * it so passes never interleave; the fallback reconciles directly.
 	 */
 	runPrTrackingReconcilePass?: () => Promise<void>;
+	/**
+	 * PRTRACK-1: resolves the task's effective agent — a live session's
+	 * agent when one exists, else the workspace's selected agent. A card
+	 * with `agentId` unset does NOT default to Cline; it inherits the
+	 * workspace's selected agent (same precedence as task start).
+	 */
+	getEffectiveTaskAgentId?: (
+		scope: RuntimeTrpcWorkspaceScope,
+		taskId: string,
+	) => Promise<RuntimeAgentId | null> | (RuntimeAgentId | null);
 	/** Audited operator actions (force releases) are reported here. */
 	warn?: (message: string) => void;
 }
@@ -443,8 +454,22 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		// can ever exist, so no board enumeration (or owner scan) is needed.
 		const noConsumers = !installedFlags.comments && !installedFlags.mergeCompletion;
 		// Per-task agent support: comment follow-up is native-Cline only;
-		// merge completion is provider-independent.
-		const nativeClineTask = card.agentId === undefined || card.agentId === "cline";
+		// merge completion is provider-independent. An UNSET card agentId
+		// means "use the workspace's selected agent", not Cline — resolve
+		// the effective agent the same way task start does.
+		let effectiveAgentId: RuntimeAgentId | null = null;
+		if (deps.getEffectiveTaskAgentId) {
+			try {
+				effectiveAgentId = await deps.getEffectiveTaskAgentId(scope, input.taskId);
+			} catch {
+				effectiveAgentId = null;
+			}
+		}
+		if (effectiveAgentId === null && card.agentId === "cline") {
+			// Resolver unavailable: only an explicit per-card Cline counts.
+			effectiveAgentId = "cline";
+		}
+		const nativeClineTask = effectiveAgentId === "cline";
 		const commentsSupportedForTask = installedFlags.comments && nativeClineTask;
 		const coordinatorState = coordinator ? coordinator.getState() : null;
 		if (coordinatorState?.authBlocker) {
@@ -1001,7 +1026,17 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 				taskId: input.taskId,
 			},
 			undefined,
-			{ force },
+			// Re-validate the operator's observed reservation INSIDE the
+			// registry transaction: the holder-exit probe above is async, so a
+			// re-reservation can land between the record read and this call.
+			// A stale observation must return `stale`, never clear a newer
+			// reservation.
+			{
+				force,
+				...(force
+					? { expectedHolder: input.expectedHolder, expectedFencingGeneration: input.expectedFencingGeneration }
+					: {}),
+			},
 		);
 		if (force) {
 			// Audited operator action: an explicit release of a reservation

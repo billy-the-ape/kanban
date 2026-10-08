@@ -472,19 +472,25 @@ Implemented in this worktree (PR targets `feat/pr-tracking-base`). Record:
     short-circuit skips board enumeration entirely, so a repair owner is
     reported `active` (never `deleted`) when no consumers are installed.
   - The task edit dialog saves changed PR settings through the
-    revision-checked `setTaskPrSettings` (`expectedSettingsRevision` from the
-    board card, diff-detected: only changed values are sent, unchanged
-    settings never write). `updateTask` no longer carries PR fields (stale
-    whole-board saves cannot clobber server-owned settings); conflicts surface
-    a toast instead of silently losing the change. `settingsRevision`
-    hydrates through `normalizeCard`/`BoardCard`.
+    revision-checked `setTaskPrSettings` diffing against the values captured
+    WHEN THE DIALOG OPENED (`editTaskPrSettingsOpenRef` in `use-task-editor`):
+    only fields changed relative to the snapshot are sent (absent fields are
+    "keep"), and `expectedSettingsRevision` is the opening revision — a
+    concurrent change while the dialog is open surfaces a conflict toast
+    (never silently accepted on the new revision, never silently reverted).
+    `updateTask` no longer carries PR fields (stale whole-board saves cannot
+    clobber server-owned settings). `settingsRevision` hydrates through
+    `normalizeCard`/`BoardCard`.
   - `releasePrOperation` operator path is authorized: `force` requires the
     reservation the operator observed (`expectedHolder` +
     `expectedFencingGeneration`); a mismatch is `stale`, and the release is
     refused (`busy`) while the holder's writer is still active
     (`isTaskWriterActive` wired through `app-router` →
-    `runtime-server` → PR API). All force outcomes are audited through the
-    server warning log.
+    `runtime-server` → PR API). The observation is re-validated INSIDE the
+    registry transaction (revision 5): a reservation that changed after the
+    read (e.g. the holder released and another task reserved) is stale and
+    the newer reservation is preserved. All force outcomes are audited through
+    the server warning log.
   - No-op settings writes (no field present) report `ok` without touching the
     revision; `selectTaskAutomationPr` reuses `setTaskSelectedAutomationPr`
     (no duplicated inline mutation).
@@ -492,8 +498,17 @@ Implemented in this worktree (PR targets `feat/pr-tracking-base`). Record:
     (dirty-flag coalescing in `runtime-server`), so a coalesced trigger never
     runs on a board view older than the trigger; `createReconcilePass`
     (pr-task-subscriptions) is the single implementation (no dead duplicate).
-    Every board-change broadcast (save, PR-link add/remove from any writer,
-    including auto-discovered links) re-derives subscription demand.
+    Every board-change broadcast (save, PR-link add/remove from any writer)
+    re-derives subscription demand.
+  - Auto-discovered links (`source: "branch_lookup"`) are treated identically
+    for demand purposes: the reconcile pass derives demand from the full
+    `pullRequests` array, and `fireReviewPullRequestLookup` now invokes an
+    `onChanged` callback whenever it RECORDS new links — the board-save call
+    site wires it to broadcast the workspace state update (which also runs
+    the reconcile pass through the server's broadcast wiring), so recorded
+    lookups both refresh open UIs and re-derive demand. Demand for any other
+    board write (manual link, agent-tool link, hook refresh) is covered by
+    the board-save broadcast trigger.
   - Fork-PR decision (review comment "needs a decision"): the
     cross-repository auto-owner guard is NOT enforced at assignment. Fork→
     upstream PRs have a head repository that differs from the base/record
@@ -512,6 +527,51 @@ Implemented in this worktree (PR targets `feat/pr-tracking-base`). Record:
   and web-ui typecheck clean; `npx vitest run` (web-ui) passes incl.
   `use-task-editor.test.tsx` (12 tests, 2 new revision-checked settings
   tests); Biome clean for all changed files.
+
+### Revision 5 — re-review comments (PR #66)
+
+1. **Edit-dialog concurrent settings changes.** The diff and
+   `expectedSettingsRevision` now use the values captured when the dialog
+   opened (`editTaskPrSettingsOpenRef`), not the live board card; only fields
+   changed relative to the snapshot are sent. Concurrent changes while the
+   dialog is open surface a `conflict` toast; no silent overwrite, no silent
+   revert.
+2. **Effective agent for comment follow-up.** `getTaskTrackingState` resolves
+   the task's effective agent through a new optional `getEffectiveTaskAgentId`
+   dependency (wired in `runtime-server`: live session's `agentId` → scoped
+   runtime config `selectedAgentId`, mirroring task-start precedence). An
+   unset `card.agentId` no longer defaults to Cline — it inherits the
+   workspace's selected agent, which may be non-Cline.
+3. **Force-release race closed.** `releasePrOperation` re-validates the
+   operator's observed holder + fencing generation inside the registry
+   transaction; a superseded observation returns `stale` and preserves the
+   newer reservation.
+4. **Lookup demand + open UI.** `fireReviewPullRequestLookup` accepts
+   `onChanged`, invoked only when the lookup records new links; the board-save
+   call site passes it to broadcast the workspace state update (open UIs
+   refresh and demand re-derives). See the "Auto-discovered links" bullet above.
+
+**Tests (revision 5).** `test/runtime/pr-tracking/pr-tracking-api.test.ts`:
+three effective-agent cases (explicit `cline`, explicit non-Cline, unset
+agentId with a non-Cline selected agent), plus the superseded-generation
+force-release race. `web-ui/src/hooks/use-task-editor.test.tsx`: changed-field
+write now asserts only-changed-fields, plus a concurrent-change conflict case.
+`test/workspace/task-pull-request-lookup.test.ts`: recorded lookup fires
+`onChanged` (skipped cards do not; the fixture seeds an empty commit so the
+fixture repo has a named branch). `test/runtime/trpc/workspace-api.test.ts`:
+the board-save lookup passes `onChanged`, which broadcasts the workspace
+state. The pre-existing force-release test in
+`pr-track1-foundation.test.ts` now passes the observed holder + generation
+(force no longer clears an unobserved reservation).
+
+**Test commands and results (revision 5).** `npx vitest run
+test/runtime/pr-tracking` (107 pass); `npx vitest run
+test/runtime/trpc test/runtime/task-board-mutations.test.ts
+test/runtime/pr-tracking test/workspace` (307 pass); `npx vitest run
+test/integration/workspace-state.integration.test.ts` (9 pass);
+`npx tsc --noEmit` (root) and web-ui typecheck clean; `npx vitest run
+src/hooks/use-task-editor.test.tsx` (web-ui, 13 pass); Biome clean for all
+changed files.
 
 COMMENT-0 and MERGE-1 can now start in parallel; each adds consumer modules and
 targeted existing API integrations only.

@@ -471,6 +471,16 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 					fireReviewPullRequestLookup({
 						workspacePath: workspaceScope.workspacePath,
 						taskId,
+						onChanged: () => {
+							// PRTRACK-1: recorded branch_lookup links mutate the
+							// board with no other broadcast, so the lookup must
+							// refresh open UIs and re-derive PR tracking demand
+							// itself.
+							void deps.broadcastRuntimeWorkspaceStateUpdated(
+								workspaceScope.workspaceId,
+								workspaceScope.workspacePath,
+							);
+						},
 					});
 				}
 

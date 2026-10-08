@@ -16,6 +16,7 @@ import {
 } from "../cline-sdk/cline-task-session-service";
 import { createClineWatcherRegistry } from "../cline-sdk/cline-watcher-registry";
 import type {
+	RuntimeAgentId,
 	RuntimeCommandRunResponse,
 	RuntimeRunUpdateResponse,
 	RuntimeUpdateStatusResponse,
@@ -46,7 +47,12 @@ import {
 	validatePasscode,
 	validateSession,
 } from "../security/passcode-manager";
-import { listWorkspaceIndexEntries, loadWorkspaceBoardById, loadWorkspaceContextById } from "../state/workspace-state";
+import {
+	listWorkspaceIndexEntries,
+	loadWorkspaceBoardById,
+	loadWorkspaceContextById,
+	loadWorkspaceState,
+} from "../state/workspace-state";
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { createTerminalWebSocketBridge } from "../terminal/ws-server";
 import { type RuntimeTrpcContext, type RuntimeTrpcWorkspaceScope, runtimeAppRouter } from "../trpc/app-router";
@@ -535,6 +541,27 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 						clineTaskSessionService: await getScopedClineTaskSessionService(scope),
 						terminalManager: await getScopedTerminalManager(scope),
 					});
+				},
+				// PRTRACK-1: effective agent for a card — a live session's agent when
+				// one exists, else the workspace's selected agent (same precedence as
+				// task start). An unset per-card agentId inherits the workspace
+				// agent, which may be non-Cline.
+				getEffectiveTaskAgentId: async (scope, taskId): Promise<RuntimeAgentId | null> => {
+					const workspacePath = deps.workspaceRegistry.getWorkspacePathById(scope.workspaceId);
+					if (workspacePath) {
+						try {
+							const state = await loadWorkspaceState(workspacePath);
+							const sessionAgent = state.sessions[taskId]?.agentId;
+							if (sessionAgent) {
+								return sessionAgent;
+							}
+						} catch {
+							// No readable session state: fall through to the
+							// workspace's selected agent below.
+						}
+					}
+					const config = await deps.workspaceRegistry.loadScopedRuntimeConfig(scope);
+					return config.selectedAgentId;
 				},
 			}),
 		};

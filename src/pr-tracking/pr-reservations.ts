@@ -324,7 +324,18 @@ export async function releasePrOperation(
 	operation: RuntimePrOperationKind,
 	task: PrOperationTask,
 	now?: () => number,
-	options: { force?: boolean } = {},
+	options: {
+		force?: boolean;
+		/**
+		 * Operator force path: the reservation the operator actually observed
+		 * (holder + fencing generation). Re-validated INSIDE the registry
+		 * transaction: a reservation that changed after the observation (e.g.
+		 * the holder released and another task reserved in between) is stale
+		 * and the newer reservation is left intact.
+		 */
+		expectedHolder?: PrOperationTask;
+		expectedFencingGeneration?: number;
+	} = {},
 ): Promise<PrOperationReservationResult> {
 	const nowValue = (now ?? Date.now)();
 	return await store.withRegistryTransaction(async (registry) => {
@@ -342,7 +353,17 @@ export async function releasePrOperation(
 			record.reservation.state === "reserved" &&
 			sameTask(record.reservation.reservedBy, task) &&
 			record.reservation.reservedOperation === operation;
-		if (heldByCaller || (options.force === true && record.reservation.state === "reserved")) {
+		// Force is only honored against the reservation the operator
+		// observed: a re-reservation in the meantime must not be cleared.
+		const forceMatch =
+			record.reservation.state === "reserved" &&
+			record.reservation.reservedBy !== null &&
+			record.reservation.reservedOperation === operation &&
+			options.expectedHolder !== undefined &&
+			sameTask(record.reservation.reservedBy, options.expectedHolder) &&
+			typeof options.expectedFencingGeneration === "number" &&
+			record.reservation.fencingGeneration === options.expectedFencingGeneration;
+		if (heldByCaller || (options.force === true && forceMatch)) {
 			const next: GitHubPrTrackingRecord = {
 				...record,
 				revision: record.revision + 1,
@@ -361,9 +382,11 @@ export async function releasePrOperation(
 		return {
 			status: "stale" as const,
 			detail:
-				record.reservation.state === "reserved"
-					? `The reservation is held by ${record.reservation.reservedBy?.workspaceId ?? "unknown"}/${record.reservation.reservedBy?.taskId ?? "unknown"} (operator release requires force).`
-					: "No reservation is held for this PR.",
+				options.force === true && record.reservation.state === "reserved" && !forceMatch
+					? "The reservation changed after the operator observed it; the newer reservation is preserved."
+					: record.reservation.state === "reserved"
+						? `The reservation is held by ${record.reservation.reservedBy?.workspaceId ?? "unknown"}/${record.reservation.reservedBy?.taskId ?? "unknown"} (operator release requires force).`
+						: "No reservation is held for this PR.",
 			recordRevision: record.revision,
 			reservation: toView(record),
 		};

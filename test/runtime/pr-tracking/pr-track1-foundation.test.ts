@@ -573,12 +573,15 @@ describe("pr-track1 fenced operation reservations", () => {
 		expect(mergeReserved.status).toBe("reserved");
 		expect(mergeReserved.reservation.reservedBy).toMatchObject(task);
 
-		// A non-holder release without force is stale; with force it clears.
+		// A non-holder release without force is stale; with force (referencing
+		// the observed holder + generation) it clears.
 		const otherTask = { workspaceId: "ws-2", taskId: "t-other" };
 		const softRelease = await releasePrOperation(store, PR_KEY, "merge_completion", otherTask);
 		expect(softRelease.status).toBe("stale");
 		const forcedRelease = await releasePrOperation(store, PR_KEY, "merge_completion", otherTask, undefined, {
 			force: true,
+			expectedHolder: task,
+			expectedFencingGeneration: mergeReserved.reservation.fencingGeneration,
 		});
 		expect(forcedRelease.status).toBe("reserved");
 		expect(forcedRelease.reservation.state).toBe("none");

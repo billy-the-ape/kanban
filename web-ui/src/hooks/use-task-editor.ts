@@ -34,15 +34,17 @@ interface UseTaskEditorInput {
 	/** UPD-1: server-derived initial-start status (baseline-fixed signal gates the edit checkbox). */
 	getTaskInitialStartStatus: (taskId: string) => Promise<RuntimeTaskInitialStartStatusResponse | null>;
 	/**
-	 * PRTRACK-1: server-owned PR automation settings. The edit dialog takes a
-	 * diff and saves ONLY changed fields through this revision-checked write
-	 * (never through the whole-board draft), surfacing conflicts as a toast.
+	 * PRTRACK-1: server-owned PR automation settings. The edit dialog diffs
+	 * against the values captured WHEN THE DIALOG OPENED (not the live board
+	 * card) and saves ONLY changed fields through this revision-checked
+	 * write (never through the whole-board draft), using the opening
+	 * revision so concurrent changes surface as a conflict toast.
 	 */
 	setTaskPrSettingsForTask?: (
 		taskId: string,
 		settings: {
-			autoAddressComments: boolean;
-			autoFinishOnMerge: boolean;
+			autoAddressComments?: boolean;
+			autoFinishOnMerge?: boolean;
 			expectedSettingsRevision: number;
 		},
 	) => Promise<{ ok: boolean; reason?: string | null }>;
@@ -177,6 +179,18 @@ export function useTaskEditor({
 	// still gates the actual refresh on its own signal.
 	const [editTaskInitialBaselineFixed, setEditTaskInitialBaselineFixed] = useState(false);
 	const editInitialStartStatusTaskIdRef = useRef<string | null>(null);
+	/**
+	 * PRTRACK-1: the PR automation settings (plus the settings revision) as
+	 * captured WHEN THE EDIT DIALOG OPENED. The save diff and the
+	 * expectedSettingsRevision use this snapshot — never the live board card —
+	 * so a concurrent change while the dialog is open surfaces as a conflict
+	 * instead of being accepted on the new revision or silently reverted.
+	 */
+	const editTaskPrSettingsOpenRef = useRef<{
+		autoAddressComments: boolean;
+		autoFinishOnMerge: boolean;
+		settingsRevision: number;
+	} | null>(null);
 
 	const [newTaskAgentId, setNewTaskAgentId] = useState<RuntimeAgentId | undefined>(undefined);
 	const [newTaskClineSettings, setNewTaskClineSettings] = useState<RuntimeTaskClineSettings | undefined>(undefined);
@@ -250,6 +264,7 @@ export function useTaskEditor({
 		if (selection?.column.id !== "backlog") {
 			setEditingTaskId(null);
 			editInitialStartStatusTaskIdRef.current = null;
+			editTaskPrSettingsOpenRef.current = null;
 
 			setEditTaskPrompt("");
 			setEditTaskStartInPlanMode(false);
@@ -304,6 +319,14 @@ export function useTaskEditor({
 			setEditTaskAutoReviewMode(resolveTaskAutoReviewMode(task.autoReviewMode));
 			setEditTaskPrAutoAddressComments(task.autoAddressComments === true);
 			setEditTaskPrAutoFinishOnMerge(task.autoFinishOnMerge === true);
+			// Snapshot the opening values + revision: the save diff and the
+			// expectedSettingsRevision are computed against THIS, not the live
+			// board card, so concurrent edits conflict instead of clobbering.
+			editTaskPrSettingsOpenRef.current = {
+				autoAddressComments: task.autoAddressComments === true,
+				autoFinishOnMerge: task.autoFinishOnMerge === true,
+				settingsRevision: task.settingsRevision ?? 0,
+			};
 			const fallbackBranch = task.baseRef || resolvedDefaultTaskBranchRef;
 			setEditTaskBranchRef(fallbackBranch);
 			setEditTaskAgentId(task.agentId);
@@ -327,6 +350,7 @@ export function useTaskEditor({
 	const handleCancelEditTask = useCallback(() => {
 		setEditingTaskId(null);
 		editInitialStartStatusTaskIdRef.current = null;
+		editTaskPrSettingsOpenRef.current = null;
 
 		setEditTaskPrompt("");
 		setEditTaskStartInPlanMode(false);
@@ -356,14 +380,17 @@ export function useTaskEditor({
 		const savedTaskId = editingTaskId;
 
 		// PRTRACK-1: the PR automation checkboxes are server-owned settings,
-		// not part of the whole-board draft. Diff against the current card and
-		// save only changed fields through the revision-checked settings
-		// write (conflicts are surfaced, never silently overwritten).
-		const currentCard = board.columns.flatMap((column) => column.cards).find((card) => card.id === savedTaskId);
+		// not part of the whole-board draft. The diff is taken against the
+		// values captured WHEN THE DIALOG OPENED (see
+		// editTaskPrSettingsOpenRef), only changed fields are sent, and the
+		// opening revision is used as expectedSettingsRevision — a concurrent
+		// change while the dialog is open surfaces as a conflict, never
+		// accepted on the new revision or silently reverted.
+		const openedPrSettings = editTaskPrSettingsOpenRef.current;
 		const prSettingsChanged =
-			currentCard !== undefined &&
-			(editTaskPrAutoAddressComments !== (currentCard.autoAddressComments === true) ||
-				editTaskPrAutoFinishOnMerge !== (currentCard.autoFinishOnMerge === true));
+			openedPrSettings !== null &&
+			(editTaskPrAutoAddressComments !== openedPrSettings.autoAddressComments ||
+				editTaskPrAutoFinishOnMerge !== openedPrSettings.autoFinishOnMerge);
 
 		setBoard((currentBoard) => {
 			const boardCard = currentBoard.columns.flatMap((c) => c.cards).find((c) => c.id === savedTaskId);
@@ -387,12 +414,17 @@ export function useTaskEditor({
 		setEditingTaskId(null);
 		editInitialStartStatusTaskIdRef.current = null;
 
-		if (prSettingsChanged && currentCard !== undefined && setTaskPrSettingsForTask) {
-			const expectedSettingsRevision = currentCard.settingsRevision ?? 0;
+		if (prSettingsChanged && openedPrSettings !== null && setTaskPrSettingsForTask) {
 			void setTaskPrSettingsForTask(savedTaskId, {
-				autoAddressComments: editTaskPrAutoAddressComments,
-				autoFinishOnMerge: editTaskPrAutoFinishOnMerge,
-				expectedSettingsRevision,
+				// Only fields that differ from the opening snapshot; the server
+				// treats absent fields as "keep".
+				...(editTaskPrAutoAddressComments !== openedPrSettings.autoAddressComments
+					? { autoAddressComments: editTaskPrAutoAddressComments }
+					: {}),
+				...(editTaskPrAutoFinishOnMerge !== openedPrSettings.autoFinishOnMerge
+					? { autoFinishOnMerge: editTaskPrAutoFinishOnMerge }
+					: {}),
+				expectedSettingsRevision: openedPrSettings.settingsRevision,
 			}).then((result) => {
 				if (!result.ok && result.reason === "conflict") {
 					showAppToast({
@@ -403,6 +435,7 @@ export function useTaskEditor({
 				}
 			});
 		}
+		editTaskPrSettingsOpenRef.current = null;
 
 		setEditTaskPrompt("");
 		setEditTaskStartInPlanMode(false);
