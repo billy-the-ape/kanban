@@ -7,7 +7,7 @@ represents a single PR.
 
 | Field | Value |
 | --- | --- |
-| Document revision | 3 |
+| Document revision | 6 |
 | Prepared | 2026-10-06 |
 | Status | implemented in this worktree (branch targets `feat/pr-tracking-base`) |
 | Source baseline | 49a2ca05c6c2927da2194aaec8bd1e45e6fa2928 (main) |
@@ -220,7 +220,7 @@ Explicit non-goals:
       boards must not hold a workspace lock across any network call. A fetched result is
       applied only after rereading task settings, linkage, and current revision; in-flight
       responses revalidate each consumer before applying state or scheduling effects.
-- [~] PRTRACK-1.4 **Owner selection, transfer, and reservations (partial — see "Deferred to the consumer PRs" in Handoff). ** Durable repair-owner
+- [~] PRTRACK-1.4 **Owner selection, transfer, and reservations** *(partial — see "Deferred to the consumer PRs" in Handoff).* Durable repair-owner
       selection: exactly-one-candidate atomic assignment; multi-candidate "Choose repair owner"
       ambiguity block; revision-checked **Repair owner** selector listing linked tasks with
       workspace labels; owner validity requires the task selects this PR and has a verified
@@ -256,7 +256,7 @@ Explicit non-goals:
       requests safe cancellation of live tracked operations, preserving unpublished work.
       External tools outside Kanban cannot be locked: compare remote/local state and stop on
       drift.
-- [~] PRTRACK-1.5 **Task lifecycle gates (partial — see "Deferred to the consumer PRs" in Handoff). ** Shared arbitration: when either installed enabled
+- [~] PRTRACK-1.5 **Task lifecycle gates** *(partial — see "Deferred to the consumer PRs" in Handoff).* Shared arbitration: when either installed enabled
       consumer owns a linked PR workflow, legacy automatic clean-tree/PR-delivery completion
       cannot run (browser auto-actions, CLI, and deterministic delivery all gated); manual
       completion retains existing safeguards including preserved Done → Review movement.
@@ -285,7 +285,7 @@ Explicit non-goals:
       on confirmed open/draft + eligibility); snapshots labelled as of a time; all blockers in
       the existing detail warning/status surfaces with concise reasons. Tailwind tokens,
       `@/components/ui` primitives, `lucide-react` icons; conditional state via `cn()`.
-- [~] PRTRACK-1.7 **Fake-consumer and task lifecycle integration tests (partial — see "Deferred to the consumer PRs" in Handoff). ** Cover the acceptance
+- [~] PRTRACK-1.7 **Fake-consumer and task lifecycle integration tests** *(partial — see "Deferred to the consumer PRs" in Handoff).* Cover the acceptance
       rows below with independently registered fake consumers (merge-only, comment-only,
       both, neither) and real task/board changes driving subscription demand.
 
@@ -452,7 +452,7 @@ Implemented in this worktree (PR targets `feat/pr-tracking-base`). Record:
     only; enforcing it is MERGE-1.
   - Dispatch worker policy/readiness for owner transfer (draining
     running/queued writer actions) — consumer PRs.
-  - `src/task-dispatch/verification-service.ts` reservation integration —
+  - `src/verification/verification-service.ts` reservation integration —
     MERGE-1.
   - `src/cline-sdk/cline-task-session-service.ts` turn-liveness references —
     COMMENT-0.
@@ -633,7 +633,6 @@ targeted existing API integrations only.
 test/runtime/pr-tracking` (111 pass); `npx vitest run
 test/integration/workspace-state.integration.test.ts` (10 pass); `npx tsc
 --noEmit` (root) and web-ui typecheck clean; Biome clean for all changed files.
-
 
 ## Stop conditions
 
