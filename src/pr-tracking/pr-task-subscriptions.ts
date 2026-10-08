@@ -92,14 +92,23 @@ export function computeTaskSubscriptionDemand(
  * Reconcile the coordinator's subscriptions with the task-derived demand:
  * add missing, update changed (remove + add so eligibility re-evaluates),
  * and remove orphaned demand.
+ *
+ * Zero-consumer short-circuit: when no consumer is installed there can be no
+ * demand, so the pass never reads any board from disk — it only drains the
+ * in-memory subscription set (e.g. after a consumer unregisters).
  */
 export async function reconcileTaskSubscriptions(
 	controller: PrSubscriptionController,
 	source: PrTaskSubscriptionSource,
 ): Promise<{ added: string[]; removed: string[]; updated: string[] }> {
 	const installed = source.installedConsumers();
-	const boards = await source.listBoards();
-	const demands = computeTaskSubscriptionDemand(boards, installed);
+	let demands: PrTaskSubscriptionDemand[];
+	if (!installed.comments && !installed.mergeCompletion) {
+		demands = [];
+	} else {
+		const boards = await source.listBoards();
+		demands = computeTaskSubscriptionDemand(boards, installed);
+	}
 	const desiredByTask = new Map(demands.map((d) => [subscriptionKey(d.workspaceId, d.taskId), d]));
 	const current = controller.listSubscriptions();
 	const added: string[] = [];
@@ -139,4 +148,32 @@ export async function reconcileTaskSubscriptions(
 		}
 	}
 	return { added, removed, updated };
+}
+
+/**
+ * A single-flight reconcile pass: concurrent triggers (startup, board save,
+ * PR link add/remove, poll-time backstop, consumer registration) queue on
+ * ONE chain, so listBoards/add/remove sequences never interleave. Returns a
+ * pass function; the chain always ends resolved (failures are reported to
+ * `onError`, never propagated to the trigger).
+ */
+export function createReconcilePass(
+	controller: PrSubscriptionController,
+	source: PrTaskSubscriptionSource,
+	onError?: (error: unknown) => void,
+): () => Promise<void> {
+	let chain: Promise<void> = Promise.resolve();
+	return () => {
+		// Every trigger queues a full pass after the in-flight one: the
+		// queued pass re-reads demand fresh, so a coalesced trigger never
+		// runs on a board view older than the trigger that queued it.
+		chain = chain
+			.then(async () => {
+				await reconcileTaskSubscriptions(controller, source);
+			})
+			.catch((error: unknown) => {
+				onError?.(error);
+			});
+		return chain;
+	};
 }

@@ -7,7 +7,7 @@ represents a single PR.
 
 | Field | Value |
 | --- | --- |
-| Document revision | 2 |
+| Document revision | 3 |
 | Prepared | 2026-10-06 |
 | Status | implemented in this worktree (branch targets `feat/pr-tracking-base`) |
 | Source baseline | 49a2ca05c6c2927da2194aaec8bd1e45e6fa2928 (main) |
@@ -379,7 +379,7 @@ Implemented in this worktree (PR targets `feat/pr-tracking-base`). Record:
   `web-ui/src/utils/pr-tracking.ts`. Modified: `src/core/api-contract.ts`,
   `src/core/task-board-mutations.ts`, `src/state/workspace-state.ts`,
   `src/pr-tracking/{in-memory-pr-record-store,pr-record-store,pr-tracking-coordinator}.ts`,
-  `src/trpc/{app-router,runtime-api,workspace-api}.ts`, `src/server/runtime-server.ts`,
+  `src/trpc/{app-router,runtime-api,workspace-api,projects-api}.ts`, `src/server/runtime-server.ts`,
   `src/commands/task.ts`, `web-ui/src/App.tsx`, `web-ui/src/components/{card-detail-view,task-create-dialog,task-inline-create-card}.tsx`,
   `web-ui/src/hooks/{use-board-interactions,use-review-auto-actions,use-task-editor}.ts`,
   `web-ui/src/state/board-state.ts`, `web-ui/src/types/board.ts`.
@@ -396,6 +396,41 @@ Implemented in this worktree (PR targets `feat/pr-tracking-base`). Record:
   `validatePrOperation`, `releasePrOperation`, `readPrSnapshotEvents`. The
   installed-consumer list is also exposed on `RuntimeConfigResponse.installedPrConsumers`
   (empty until COMMENT-0 / MERGE-1 register).
+- **Review-hardened semantics (revision 3).**
+  - Reservation authorization is per operation: `comment_followup` requires the
+    caller to be the repair owner; `merge_completion` is claimable by any task
+    whose own binding selects the PR (the two consumers are independent, and a
+    merge-only task is never a repair owner). `releasePrOperation` supports an
+    audited operator `force` flag (server warning log); without it, a
+    non-holder release is `stale`.
+  - The head-ref write gate is keyed by the RECORD's verified head mapping
+    (`getRecordHeadMapping`, latest snapshot wins); caller-supplied
+    `headRepository`/`headRef` are validation hints that reject on mismatch,
+    and a record with no verified mapping is blocked (no writes before
+    verification).
+  - Cross-repository auto-owner guard: `validateAutoAssignedOwner`
+    (`src/pr-tracking/pr-owner-selection.ts`) clears a just-made
+    auto-assignment (revision-checked) when the verified head mapping does not
+    match the record's repository; explicit assignments are never touched.
+  - `removeTaskPullRequest` clears `selectedAutomationPrKey` (and bumps
+    `settingsRevision`) when the removed link was the selection, so a dangling
+    selection can never keep demand/gates alive.
+  - `updateTaskCommentDispatch` checks `expectedOwnerRevision` in addition to
+    the record-revision CAS (a handoff between read and write is a conflict);
+    `updateTaskMergeBinding` does not require ownership (merge consumers are
+    not repair owners).
+  - `readPrSnapshotEvents` omits `fromCursor` to resume from the persisted
+    per-consumer cursor (no zero-cursor reset for re-opened panels).
+  - `getTaskTrackingState` reports coordinator auth blockers plus the
+    per-task subscription blocker; `refreshTaskPrSnapshot` reports whether it
+    joined an in-flight read (`coalesced`).
+- **Shared reconcile pass.** All subscription reconciliation goes through one
+  single-flight pass (`runPrTrackingReconcilePassShared` in
+  `src/server/runtime-server.ts`): startup, board saves (save + PR-link
+  add/remove in `workspace-api`), workspace removal (`projects-api` hook),
+  the poll-time backstop (coordinator `revalidateSubscriptions`), and API
+  triggers join the in-flight pass instead of interleaving. The coordinator
+  and every PR API consumer share ONE durable `PrRecordStore`.
 - **Lock order and gate keys.** Fixed acquisition order task ownership → PR gate
   (canonical PR key) → head-ref gate (canonical head repository + ref), each
   gate acquisition a short CAS under the single tracking-registry mutex
@@ -419,8 +454,8 @@ Implemented in this worktree (PR targets `feat/pr-tracking-base`). Record:
   with Automation PR selector, "Repairs owned by <workspace/task>", Resume PR
   tracking, auth/unsupported blocker surfaces.
 - **Test commands and results.** `npx vitest run test/runtime/pr-tracking`
-  (87 tests pass, incl. 13 new PRTRACK-1 foundation tests); `npm run test:fast`
-  (1052/1053 — the one failure, `test/runtime/server/middleware.test.ts`
+  (96 tests pass, incl. 22 PRTRACK-1 foundation tests); `npm run test:fast`
+  (1061/1062 — the one failure, `test/runtime/server/middleware.test.ts`
   socket-upgrade case, fails identically on the clean base branch:
   environment-dependent, not a regression); `npm run typecheck` and
   `npm run web:typecheck` clean; `npm run web:test` (586 tests pass); Biome clean.

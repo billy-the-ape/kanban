@@ -865,7 +865,23 @@ export function removeTaskPullRequest(
 	if (nextPullRequests.length === existing.length) {
 		return { board, task, removed: false };
 	}
-	const nextTask: RuntimeBoardCard = { ...task, pullRequests: nextPullRequests, updatedAt: now };
+	// PRTRACK-1: if the removed link was the card's selected automation PR,
+	// the selection is dangling — clear it (and bump the settings revision)
+	// so the card reads as unselected instead of keeping demand/gates alive
+	// through a selection that no longer matches any link.
+	const selection = task.selectedAutomationPrKey;
+	const selectionRemoved = selection === identityKey;
+	const nextTask: RuntimeBoardCard = {
+		...task,
+		pullRequests: nextPullRequests,
+		...(selectionRemoved
+			? { selectedAutomationPrKey: undefined, settingsRevision: (task.settingsRevision ?? 0) + 1 }
+			: {}),
+		updatedAt: now,
+	};
+	if (selectionRemoved) {
+		delete nextTask.selectedAutomationPrKey;
+	}
 	return {
 		board: replaceTaskCard(board, normalizedTaskId, nextTask),
 		task: nextTask,

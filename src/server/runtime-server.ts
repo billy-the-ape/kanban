@@ -276,14 +276,45 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		store: PrRecordStore;
 		registry: PrConsumerRegistry;
 	} | null = null;
+	/**
+	 * Shared single-flight reconcile pass: the startup pass, board-save
+	 * triggers, the poll-time backstop, and API triggers all go through this,
+	 * so passes never interleave (a second caller joins the in-flight pass).
+	 */
+	let prTrackingReconcileInFlight: Promise<void> | null = null;
+	const runPrTrackingReconcilePassShared = (): Promise<void> => {
+		if (!prTrackingReconcileInFlight) {
+			prTrackingReconcileInFlight = (async () => {
+				const state = getPrTrackingState();
+				await reconcileTaskSubscriptions(state.coordinator, {
+					listBoards: listManagedWorkspaceBoards,
+					installedConsumers: () => ({
+						comments: state.registry.isInstalled("comments"),
+						mergeCompletion: state.registry.isInstalled("mergeCompletion"),
+					}),
+				});
+			})().finally(() => {
+				prTrackingReconcileInFlight = null;
+			});
+		}
+		return prTrackingReconcileInFlight;
+	};
 	const getPrTrackingState = () => {
 		if (!prTrackingState) {
+			const store = new PrRecordStore();
 			prTrackingState = {
 				coordinator: createPrTrackingCoordinator({
+					// The coordinator and every PR API consumer share ONE
+					// durable record store: reads written by the API must be
+					// visible to the coordinator (and vice versa).
+					store,
+					// Poll-time backstop: re-derive task-derived demand from
+					// the live board view before every poll cycle.
+					revalidateSubscriptions: () => runPrTrackingReconcilePassShared(),
 					warn: (message) => deps.warn(`[pr-tracking] ${message}`),
 					logError: (message) => deps.warn(`[pr-tracking] ${message}`),
 				}),
-				store: new PrRecordStore(),
+				store,
 				registry: new PrConsumerRegistry(),
 			};
 		}
@@ -393,13 +424,9 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				// PRTRACK-1: reconcile task-derived PR tracking subscriptions after
 				// a board change (card created/moved/checkboxes changed).
 				runPrTrackingReconcilePass: (scope) => {
-					void reconcileTaskSubscriptions(getPrTrackingState().coordinator, {
-						listBoards: listManagedWorkspaceBoards,
-						installedConsumers: () => ({
-							comments: getPrTrackingState().registry.isInstalled("comments"),
-							mergeCompletion: getPrTrackingState().registry.isInstalled("mergeCompletion"),
-						}),
-					}).catch((error) => {
+					// Shared single-flight pass (also used by the poll-time backstop
+					// and the PR tracking API), so passes never interleave.
+					void runPrTrackingReconcilePassShared().catch((error) => {
 						deps.warn(`[pr-tracking] Reconcile pass failed for ${scope.workspaceId}: ${error}`);
 					});
 				},
@@ -423,6 +450,12 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 					return deps.disposeWorkspace(workspaceId, options);
 				},
 				collectProjectWorktreeTaskIdsForRemoval: deps.collectProjectWorktreeTaskIdsForRemoval,
+				// PRTRACK-1: workspace removal drops task-derived PR tracking demand.
+				runPrTrackingReconcilePass: () => {
+					void runPrTrackingReconcilePassShared().catch((error) => {
+						deps.warn(`[pr-tracking] Reconcile pass after workspace removal failed: ${error}`);
+					});
+				},
 				warn: deps.warn,
 				buildProjectsPayload: deps.workspaceRegistry.buildProjectsPayload,
 				pickDirectoryPathFromSystemDialog: deps.pickDirectoryPathFromSystemDialog,
@@ -441,6 +474,11 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				listManagedWorkspaceBoards,
 				broadcastRuntimeWorkspaceStateUpdated: (scope) =>
 					deps.runtimeStateHub.broadcastRuntimeWorkspaceStateUpdated(scope.workspaceId, scope.workspacePath),
+				// PRTRACK-1: all subscription reconciliation goes through the
+				// shared single-flight pass (never interleaves with the poll-time
+				// backstop or board-save triggers).
+				runPrTrackingReconcilePass: () => runPrTrackingReconcilePassShared(),
+				warn: (message) => deps.warn(`[pr-tracking] ${message}`),
 				isTaskWriterActive: async (workspaceId, taskId) => {
 					const workspacePath = deps.workspaceRegistry.getWorkspacePathById(workspaceId);
 					if (!workspacePath) {

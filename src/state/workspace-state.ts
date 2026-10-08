@@ -729,10 +729,13 @@ function mergeServerOwnedPullRequests(
  * exception as `pullRequests`. `selectedAutomationPrKey` and
  * `settingsRevision` are written only through the dedicated PR mutations
  * under the workspace lock, so a stale whole board save restores the
- * persisted values. The two preference booleans are additionally settable by
- * the task create/edit dialogs: an explicit client boolean wins, an absent
- * value falls back to the persisted server-owned value (new cards with no
- * explicit value keep no PR settings).
+ * persisted values. The preference booleans follow the same rule for cards
+ * that ALREADY exist in the persisted board: the server-owned values always
+ * survive a board save (a stale client board save can neither reset a
+ * checkbox nor roll the settings revision back — the dialog's authoritative
+ * write is the dedicated setTaskPrSettings mutation). Only completely new
+ * cards take the client-supplied values (explicit booleans persist; omitted
+ * reads as false).
  */
 function mergeServerOwnedPrSettings(clientBoard: RuntimeBoardData, persistedBoard: RuntimeBoardData): RuntimeBoardData {
 	const persistedByTaskId = new Map<string, RuntimeBoardCard>();
@@ -749,14 +752,7 @@ function mergeServerOwnedPrSettings(clientBoard: RuntimeBoardData, persistedBoar
 				const persisted = persistedByTaskId.get(card.id);
 				const mergedCard: RuntimeBoardCard = {
 					...card,
-					autoAddressComments:
-						typeof card.autoAddressComments === "boolean"
-							? card.autoAddressComments
-							: persisted?.autoAddressComments,
-					autoFinishOnMerge:
-						typeof card.autoFinishOnMerge === "boolean" ? card.autoFinishOnMerge : persisted?.autoFinishOnMerge,
-					selectedAutomationPrKey: persisted?.selectedAutomationPrKey,
-					settingsRevision: persisted?.settingsRevision,
+					...mergeServerOwnedPrCardFields(card, persisted),
 				};
 				if (mergedCard.autoAddressComments === undefined) {
 					delete mergedCard.autoAddressComments;
@@ -773,6 +769,35 @@ function mergeServerOwnedPrSettings(clientBoard: RuntimeBoardData, persistedBoar
 				return mergedCard;
 			}),
 		})),
+	};
+}
+
+/**
+ * Per-card merge for server-owned PR settings. Existing cards keep the
+ * persisted values unconditionally; new cards take the client's explicit
+ * booleans (omitted reads as false, no revision).
+ */
+function mergeServerOwnedPrCardFields(
+	clientCard: RuntimeBoardCard,
+	persisted: RuntimeBoardCard | undefined,
+): Pick<
+	RuntimeBoardCard,
+	"autoAddressComments" | "autoFinishOnMerge" | "selectedAutomationPrKey" | "settingsRevision"
+> {
+	if (persisted) {
+		return {
+			autoAddressComments: persisted.autoAddressComments,
+			autoFinishOnMerge: persisted.autoFinishOnMerge,
+			selectedAutomationPrKey: persisted.selectedAutomationPrKey,
+			settingsRevision: persisted.settingsRevision,
+		};
+	}
+	return {
+		autoAddressComments:
+			typeof clientCard.autoAddressComments === "boolean" ? clientCard.autoAddressComments : undefined,
+		autoFinishOnMerge: typeof clientCard.autoFinishOnMerge === "boolean" ? clientCard.autoFinishOnMerge : undefined,
+		selectedAutomationPrKey: undefined,
+		settingsRevision: undefined,
 	};
 }
 

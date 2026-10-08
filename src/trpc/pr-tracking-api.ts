@@ -43,15 +43,18 @@ import type {
 	RuntimeTaskTrackingStateRequest,
 	RuntimeTaskTrackingStateResponse,
 } from "../core/api-contract";
+import { updateTaskPrSettings } from "../core/task-board-mutations";
 import type { PrConsumerRegistry, PrInstalledConsumers } from "../pr-tracking/pr-consumer-registry";
 import { evaluatePrLifecycleGate } from "../pr-tracking/pr-lifecycle-gate";
 import {
+	assignRepairOwner,
 	findTaskCard,
 	listRepairOwnerCandidates,
 	type PrBoardSnapshot,
 	resolveCardAutomationPrKey,
 	selectRepairOwner,
 	transferRepairOwner,
+	validateAutoAssignedOwner,
 } from "../pr-tracking/pr-owner-selection";
 import type { PrRecordStoreBase } from "../pr-tracking/pr-record-store";
 import { releasePrOperation, reservePrOperation, validatePrOperation } from "../pr-tracking/pr-reservations";
@@ -68,6 +71,14 @@ export interface CreatePrTrackingApiDependencies {
 	broadcastRuntimeWorkspaceStateUpdated: (scope: RuntimeTrpcWorkspaceScope) => void | Promise<void>;
 	/** B-5.5-style writer liveness probe (drain precondition for repair-owner transfer). */
 	isTaskWriterActive?: (workspaceId: string, taskId: string) => Promise<boolean> | boolean;
+	/**
+	 * PRTRACK-1: the shared single-flight reconcile pass (server wiring).
+	 * When present, ALL subscription reconciliation in this API goes through
+	 * it so passes never interleave; the fallback reconciles directly.
+	 */
+	runPrTrackingReconcilePass?: () => Promise<void>;
+	/** Audited operator actions (force releases) are reported here. */
+	warn?: (message: string) => void;
 }
 
 function installedConsumersOf(registry: PrConsumerRegistry): RuntimePrInstalledConsumer[] {
@@ -147,6 +158,12 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 
 	/** Reconcile live task-derived subscriptions after a board change. */
 	async function reconcileDemand(): Promise<void> {
+		if (deps.runPrTrackingReconcilePass) {
+			// The shared single-flight pass: coalesced with the startup pass,
+			// board-save triggers, poll-time backstop, and other API triggers.
+			await deps.runPrTrackingReconcilePass();
+			return;
+		}
 		const coordinator = deps.getPrTrackingCoordinator();
 		if (!coordinator) {
 			return;
@@ -157,10 +174,19 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 	/**
 	 * Best-effort auto owner-selection for one canonical PR: exactly one
 	 * eligible candidate is assigned atomically; multiple candidates report
-	 * ambiguity (no assignment).
+	 * ambiguity (no assignment). The PRTRACK-1 gate (inside
+	 * validateAutoAssignedOwner): a just-made auto-assignment is invalidated
+	 * when the record's verified head mapping does not match the record's
+	 * repository (a cross-repository link never produces a silent
+	 * auto-owner).
 	 */
 	async function autoSelectOwnerFor(canonicalPrKey: string, boards: PrBoardSnapshot[]): Promise<void> {
-		await selectRepairOwner(deps.getPrTrackingStore(), canonicalPrKey, boards);
+		const store = deps.getPrTrackingStore();
+		const result = await selectRepairOwner(store, canonicalPrKey, boards);
+		if (!result.assigned) {
+			return;
+		}
+		await validateAutoAssignedOwner(store, canonicalPrKey, { warn: deps.warn });
 	}
 
 	async function loadScopedCard(
@@ -176,34 +202,20 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		input: RuntimeTaskPrSettingsRequest,
 	): Promise<RuntimeTaskPrSettingsResponse> => {
 		const response = await mutateWorkspaceState<RuntimeTaskPrSettingsResponse>(scope.workspacePath, (state) => {
-			const found = findTaskCard(state.board, input.taskId);
-			if (!found) {
+			const result = updateTaskPrSettings(state.board, input.taskId, {
+				autoAddressComments: input.autoAddressComments,
+				autoFinishOnMerge: input.autoFinishOnMerge,
+				expectedSettingsRevision: input.expectedSettingsRevision,
+			});
+			if (result.conflict) {
 				return {
 					value: {
 						ok: false,
 						taskId: input.taskId,
-						autoAddressComments: false,
-						autoFinishOnMerge: false,
-						selectedAutomationPrKey: null,
-						settingsRevision: 0,
-						reason: "missing_task",
-						error: null,
-					},
-					board: state.board,
-					save: false,
-				};
-			}
-			const card = found.card;
-			const currentRevision = card.settingsRevision ?? 0;
-			if (typeof input.expectedSettingsRevision === "number" && input.expectedSettingsRevision !== currentRevision) {
-				return {
-					value: {
-						ok: false,
-						taskId: input.taskId,
-						autoAddressComments: card.autoAddressComments === true,
-						autoFinishOnMerge: card.autoFinishOnMerge === true,
-						selectedAutomationPrKey: card.selectedAutomationPrKey ?? null,
-						settingsRevision: currentRevision,
+						autoAddressComments: result.autoAddressComments,
+						autoFinishOnMerge: result.autoFinishOnMerge,
+						selectedAutomationPrKey: result.selectedAutomationPrKey,
+						settingsRevision: result.settingsRevision,
 						reason: "conflict",
 						error: null,
 					},
@@ -211,32 +223,35 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 					save: false,
 				};
 			}
-			const nextCard: RuntimeBoardCard = {
-				...card,
-				autoAddressComments:
-					input.autoAddressComments === undefined ? card.autoAddressComments === true : input.autoAddressComments,
-				autoFinishOnMerge:
-					input.autoFinishOnMerge === undefined ? card.autoFinishOnMerge === true : input.autoFinishOnMerge,
-				settingsRevision: currentRevision + 1,
-			};
+			if (!result.updated) {
+				return {
+					value: {
+						ok: false,
+						taskId: input.taskId,
+						autoAddressComments: result.autoAddressComments,
+						autoFinishOnMerge: result.autoFinishOnMerge,
+						selectedAutomationPrKey: result.selectedAutomationPrKey,
+						settingsRevision: result.settingsRevision,
+						reason: "missing_task",
+						error: null,
+					},
+					board: state.board,
+					save: false,
+				};
+			}
 			return {
 				value: {
 					ok: true,
 					taskId: input.taskId,
-					autoAddressComments: nextCard.autoAddressComments === true,
-					autoFinishOnMerge: nextCard.autoFinishOnMerge === true,
-					selectedAutomationPrKey: nextCard.selectedAutomationPrKey ?? null,
-					settingsRevision: currentRevision + 1,
+					autoAddressComments: result.autoAddressComments,
+					autoFinishOnMerge: result.autoFinishOnMerge,
+					selectedAutomationPrKey: result.selectedAutomationPrKey,
+					settingsRevision: result.settingsRevision,
 					reason: null,
 					error: null,
 				},
-				board: {
-					...state.board,
-					columns: state.board.columns.map((column) => ({
-						...column,
-						cards: column.cards.map((c) => (c.id === input.taskId ? nextCard : c)),
-					})),
-				},
+				board: result.board,
+				save: true,
 			};
 		});
 		if (response.value.ok) {
@@ -317,21 +332,50 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 				error: null,
 			};
 		}
-		const nextCard: RuntimeBoardCard = {
-			...card,
-			selectedAutomationPrKey: selected ?? undefined,
-			settingsRevision: currentRevision + 1,
-		};
-		await mutateWorkspaceState<null>(scope.workspacePath, (state) => ({
-			value: null,
-			board: {
-				...state.board,
-				columns: state.board.columns.map((column) => ({
-					...column,
-					cards: column.cards.map((c) => (c.id === input.taskId ? nextCard : c)),
-				})),
-			},
-		}));
+		// The selection write happens INSIDE the workspace-state mutation:
+		// the revision check is re-run against the just-read card, so a
+		// concurrent settings write between the pre-read and this write is a
+		// conflict, never silently overwritten.
+		let written = false;
+		let writtenRevision = 0;
+		await mutateWorkspaceState<null>(scope.workspacePath, (state) => {
+			const foundInBoard = findTaskCard(state.board, input.taskId);
+			if (!foundInBoard || (foundInBoard.card.settingsRevision ?? 0) !== currentRevision) {
+				return { value: null, board: state.board, save: false };
+			}
+			const nextCard: RuntimeBoardCard = {
+				...foundInBoard.card,
+				selectedAutomationPrKey: selected ?? undefined,
+				settingsRevision: currentRevision + 1,
+			};
+			if (nextCard.selectedAutomationPrKey === undefined) {
+				delete nextCard.selectedAutomationPrKey;
+			}
+			written = true;
+			writtenRevision = currentRevision + 1;
+			return {
+				value: null,
+				board: {
+					...state.board,
+					columns: state.board.columns.map((column) => ({
+						...column,
+						cards: column.cards.map((c) => (c.id === input.taskId ? nextCard : c)),
+					})),
+				},
+				save: true,
+			};
+		});
+		if (!written) {
+			return {
+				ok: false,
+				taskId: input.taskId,
+				selectedAutomationPrKey: card.selectedAutomationPrKey ?? null,
+				settingsRevision: currentRevision,
+				candidates,
+				blocker: "conflict",
+				error: null,
+			};
+		}
 		await reconcileDemand();
 		const boards = await deps.listManagedWorkspaceBoards();
 		if (selected) {
@@ -342,7 +386,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			ok: true,
 			taskId: input.taskId,
 			selectedAutomationPrKey: selected,
-			settingsRevision: currentRevision + 1,
+			settingsRevision: writtenRevision,
 			candidates,
 			blocker: null,
 			error: null,
@@ -387,9 +431,25 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		const gate = evaluatePrLifecycleGate({ card, installed: installedFlags });
 		const blockers: Array<{ kind: RuntimeTaskTrackingStateResponse["blockers"][number]["kind"]; message: string }> =
 			[];
+		// Zero-consumer short-circuit: no consumer installed means no demand
+		// can ever exist, so no board enumeration (or owner scan) is needed.
+		const noConsumers = !installedFlags.comments && !installedFlags.mergeCompletion;
 		const coordinatorState = coordinator ? coordinator.getState() : null;
 		if (coordinatorState?.authBlocker) {
 			blockers.push({ kind: "auth", message: coordinatorState.authBlocker });
+		}
+		// Per-task access blocker from the live subscription (e.g. an
+		// unsupported host or scope failure for this task's PR).
+		const subscriptionState = coordinator
+			? coordinator
+					.listSubscriptions()
+					.find((entry) => entry.workspaceId === scope.workspaceId && entry.taskId === input.taskId)
+			: undefined;
+		if (subscriptionState?.blocker) {
+			blockers.push({
+				kind: subscriptionState.blocker === "unsupported_host" ? "unsupported_host" : "auth",
+				message: subscriptionState.blocker,
+			});
 		}
 		const active = found.columnId === "in_progress" || found.columnId === "review";
 		if (resolved.ambiguous) {
@@ -403,7 +463,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		}
 		if (card.autoAddressComments === true && !installedFlags.comments) {
 			blockers.push({
-				kind: "feature_unavailable",
+				kind: "comments_unsupported",
 				message: "Comment follow-up automation is not installed in this runtime.",
 			});
 		}
@@ -413,7 +473,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 				message: "Merge completion automation is not installed in this runtime.",
 			});
 		}
-		const eligible = active && resolved.key !== null && gate.legacyCompletionGated;
+		const eligible = !noConsumers && active && resolved.key !== null && gate.legacyCompletionGated;
 		let record: GitHubPrTrackingRecord | null = null;
 		let binding: GitHubPrTaskBinding | null = null;
 		if (resolved.key) {
@@ -426,8 +486,8 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 					) ?? null;
 			}
 		}
-		const boards = await deps.listManagedWorkspaceBoards();
-		const candidates = resolved.key ? listRepairOwnerCandidates(resolved.key, boards) : [];
+		const boards = noConsumers ? [] : await deps.listManagedWorkspaceBoards();
+		const candidates = resolved.key && !noConsumers ? listRepairOwnerCandidates(resolved.key, boards) : [];
 		const owner = resolved.key && record ? record.commentAutomation.repairOwner : null;
 		const ownerView = toOwnerView(owner, candidates, boards);
 		if (owner && ownerView?.state === "deleted") {
@@ -463,7 +523,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			mergeFinishesInReview: gate.mergeFinishesInReview,
 			blockers,
 			installedConsumers: installedConsumersOf(registry),
-			commentsSupportedForTask: true,
+			commentsSupportedForTask: installedFlags.comments,
 			owner: ownerView,
 			ownerLabel: owner && owner.workspaceId !== scope.workspaceId ? (ownerView?.label ?? null) : null,
 			ownerCandidates: candidates.map((candidate) => ({
@@ -532,9 +592,9 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		if (!resolved?.key) {
 			return { ok: false, coalesced: false, checkedAt: null, error: "No resolvable Automation PR for this task" };
 		}
-		await coordinator.refresh(sub.canonicalPrKey, sub.accessScopeId);
+		const refreshed = await coordinator.refresh(sub.canonicalPrKey, sub.accessScopeId);
 		const after = coordinator.getTaskAuthorizedSnapshot(scope.workspaceId, input.taskId);
-		return { ok: true, coalesced: false, checkedAt: after.checkedAt, error: null };
+		return { ok: true, coalesced: refreshed.coalesced, checkedAt: after.checkedAt, error: null };
 	};
 
 	/**
@@ -586,8 +646,22 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 				error: "Only the repair owner may dispatch comment follow-ups.",
 			};
 		}
+		// Consumer-side CAS: the caller must hold the same owner tenure it
+		// observed (a handoff between read and write is a conflict, even
+		// though the record CAS already covers the revision bump).
+		if (
+			typeof input.expectedOwnerRevision === "number" &&
+			context.record.commentAutomation.repairOwner?.ownerRevision !== input.expectedOwnerRevision
+		) {
+			return {
+				ok: false,
+				recordRevision: context.record.revision,
+				reason: "conflict",
+				error: "Owner revision mismatch: a repair-owner handoff occurred.",
+			};
+		}
 		const store = deps.getPrTrackingStore();
-		const expected = input.expectedRecordRevision ?? context.record.revision;
+		const expected = input.expectedRecordRevision;
 		const result = await store.updateRecord(context.prKey, expected, (record) => ({
 			...record,
 			commentAutomation: {
@@ -654,16 +728,12 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		if (!context.ok) {
 			return { ok: false, recordRevision: context.recordRevision, reason: context.reason, error: null };
 		}
-		if (!context.isOwner) {
-			return {
-				ok: false,
-				recordRevision: context.record.revision,
-				reason: "not_owner",
-				error: "Only the repair owner may consume merge completion for this PR.",
-			};
-		}
+		// The merge binding is per TASK, not per owner: any task whose own
+		// binding selects this PR consumes its own merge completion. The
+		// revision-checked record CAS (required expectedRecordRevision) is
+		// the only concurrency guard.
 		const store = deps.getPrTrackingStore();
-		const expected = input.expectedRecordRevision ?? context.record.revision;
+		const expected = input.expectedRecordRevision;
 		const result = await store.updateRecord(context.prKey, expected, (record) => ({
 			...record,
 			taskBindings: record.taskBindings.map((item) =>
@@ -682,6 +752,9 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		scope: RuntimeTrpcWorkspaceScope,
 		input: RuntimePrRepairOwnerSelectRequest,
 	): Promise<RuntimePrRepairOwnerResponse> => {
+		// Explicit owner assignment (the ambiguity-resolution path): the
+		// caller names the task to assign; validation against the live
+		// candidate list happens inside assignRepairOwner.
 		const found = await loadScopedCard(scope, input.taskId);
 		if (!found) {
 			return { ok: false, owner: null, reason: "missing_task", candidates: [], error: null };
@@ -697,12 +770,18 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			};
 		}
 		const boards = await deps.listManagedWorkspaceBoards();
-		const result = await selectRepairOwner(deps.getPrTrackingStore(), resolved.key, boards);
+		const result = await assignRepairOwner(
+			deps.getPrTrackingStore(),
+			resolved.key,
+			boards,
+			{ workspaceId: scope.workspaceId, taskId: input.taskId },
+			{ expectedOwnerRevision: input.expectedOwnerRevision },
+		);
 		return {
 			ok: result.ok,
 			owner: result.owner ? toOwnerView(result.owner, result.candidates, boards) : null,
 			reason: result.reason,
-			candidates: toOwnerList(result.candidates),
+			candidates: toOwnerList(result.candidates, result.owner),
 			error: null,
 		};
 	};
@@ -726,16 +805,13 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			};
 		}
 		// Drain precondition: no live writer session on source or target.
+		const toWorkspaceId = input.toWorkspaceId ?? scope.workspaceId;
 		let drained = true;
 		try {
 			if (await deps.isTaskWriterActive?.(scope.workspaceId, input.fromTaskId)) {
 				drained = false;
 			}
-			if (
-				drained &&
-				input.toTaskId &&
-				(await deps.isTaskWriterActive?.(scope.workspaceId, input.toTaskId)) === true
-			) {
+			if (drained && input.toTaskId && (await deps.isTaskWriterActive?.(toWorkspaceId, input.toTaskId)) === true) {
 				drained = false;
 			}
 		} catch {
@@ -746,7 +822,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			deps.getPrTrackingStore(),
 			resolved.key,
 			{ workspaceId: scope.workspaceId, taskId: input.fromTaskId },
-			input.toTaskId ? { workspaceId: scope.workspaceId, taskId: input.toTaskId } : null,
+			input.toTaskId ? { workspaceId: toWorkspaceId, taskId: input.toTaskId } : null,
 			boards,
 			{ writerActionsDrained: drained, expectedOwnerRevision: input.expectedOwnerRevision },
 		);
@@ -754,7 +830,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			ok: result.ok,
 			owner: result.owner ? toOwnerView(result.owner, result.candidates, boards) : null,
 			reason: result.reason,
-			candidates: toOwnerList(result.candidates),
+			candidates: toOwnerList(result.candidates, result.owner),
 			error: null,
 		};
 	};
@@ -776,6 +852,11 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 				taskId: input.taskId,
 			},
 			{
+				// Per-operation authorization: comment follow-ups are
+				// owner-gated; merge completion is claimable by the task
+				// whose own binding selects this PR (already verified by
+				// resolveRecordContext from the caller's card).
+				requireOwner: input.operation === "comment_followup",
 				headRepository: input.headRepository ?? null,
 				headRef: input.headRef ?? null,
 				expectedFencingGeneration: input.expectedFencingGeneration,
@@ -819,10 +900,25 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		if (!context.ok) {
 			return { ok: false, status: "blocked", reservation: toReservationView(null), error: context.reason };
 		}
-		const result = await releasePrOperation(deps.getPrTrackingStore(), context.prKey, input.operation, {
-			workspaceId: scope.workspaceId,
-			taskId: input.taskId,
-		});
+		const force = input.force === true;
+		const result = await releasePrOperation(
+			deps.getPrTrackingStore(),
+			context.prKey,
+			input.operation,
+			{
+				workspaceId: scope.workspaceId,
+				taskId: input.taskId,
+			},
+			undefined,
+			{ force },
+		);
+		if (force && result.status !== "stale") {
+			// Audited operator action: an explicit release of a reservation
+			// held by another (possibly crashed) holder.
+			deps.warn?.(
+				`PR tracking operator force-release of ${input.operation} reservation on ${context.prKey} by ${scope.workspaceId}/${input.taskId}`,
+			);
+		}
 		const record = await deps.getPrTrackingStore().loadRecord(context.prKey);
 		return {
 			ok: result.status === "reserved",
@@ -844,7 +940,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			scope.workspaceId,
 			input.taskId,
 			input.consumer,
-			input.fromCursor ?? 0,
+			input.fromCursor,
 		);
 		return { ok: true, events: result.events, nextCursor: result.nextCursor, error: null };
 	};
@@ -867,11 +963,19 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 	};
 }
 
-function toOwnerList(candidates: Array<{ workspaceId: string; taskId: string; label: string }>): RuntimePrTaskOwner[] {
+function toOwnerList(
+	candidates: Array<{ workspaceId: string; taskId: string; label: string }>,
+	currentOwner: (GitHubPrTaskIdentity & { ownerRevision: number }) | null,
+): RuntimePrTaskOwner[] {
 	return candidates.map((candidate) => ({
 		workspaceId: candidate.workspaceId,
 		taskId: candidate.taskId,
-		ownerRevision: 0,
+		// Only the current owner holds a fencing generation; candidates are
+		// reported at generation 0 (the value a fresh assignment would start from).
+		ownerRevision:
+			currentOwner && candidate.workspaceId === currentOwner.workspaceId && candidate.taskId === currentOwner.taskId
+				? currentOwner.ownerRevision
+				: 0,
 		label: candidate.label,
 		state: "active" as const,
 	}));

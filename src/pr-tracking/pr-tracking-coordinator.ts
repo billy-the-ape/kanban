@@ -172,6 +172,12 @@ export interface CreatePrTrackingCoordinatorDependencies {
 	store?: PrRecordStorePort;
 	schedulerLockRequest?: LockRequest;
 	listManagedWorkspaceBoards?: () => Promise<Array<{ workspaceId: string; board: RuntimeBoardData }>>;
+	/**
+	 * Poll-time backstop: re-derive task-derived subscription demand from the
+	 * live board view before each poll cycle, so a board change that bypassed
+	 * the mutation triggers still drops/updates demand here. Best-effort.
+	 */
+	revalidateSubscriptions?: () => Promise<void>;
 	warn?: (message: string) => void;
 	/** Visible stderr line for scheduler-lock failures (second process). */
 	logError?: (message: string) => void;
@@ -191,6 +197,7 @@ export class PrTrackingCoordinator {
 	private readonly logError: (message: string) => void;
 	private readonly now: () => number;
 	private readonly random: () => number;
+	private readonly revalidateSubscriptions: (() => Promise<void>) | null;
 
 	private readonly subscriptions = new Map<string, TrackedSubscription>();
 	private readonly polls = new Map<string, PrPollState>();
@@ -236,6 +243,7 @@ export class PrTrackingCoordinator {
 		this.logError = deps.logError ?? (() => {});
 		this.now = deps.now ?? Date.now;
 		this.random = deps.random ?? Math.random;
+		this.revalidateSubscriptions = deps.revalidateSubscriptions ?? null;
 	}
 
 	/**
@@ -325,6 +333,34 @@ export class PrTrackingCoordinator {
 		}));
 	}
 
+	/**
+	 * Seed the in-memory event sequence from the binding's durable replay
+	 * cursors so a fresh session resumes above the last consumed seq
+	 * (already-replayed hints below the persisted cursor are never re-emitted).
+	 */
+	private async seedSnapshotSeq(descriptor: PrTrackingSubscriptionDescriptor): Promise<void> {
+		const key = this.subscriptionKey(descriptor.workspaceId, descriptor.taskId);
+		if (this.snapshotSeq.has(key)) {
+			return;
+		}
+		const loaded = await this.store.loadRecord(descriptor.canonicalPrKey);
+		if (!loaded.ok) {
+			return;
+		}
+		const binding = loaded.record.taskBindings.find(
+			(item) => item.workspaceId === descriptor.workspaceId && item.taskId === descriptor.taskId,
+		);
+		if (!binding) {
+			return;
+		}
+		const persisted = [binding.replayCursors.comments, binding.replayCursors.mergeCompletion].filter(
+			(cursor): cursor is number => typeof cursor === "number",
+		);
+		if (persisted.length > 0) {
+			this.snapshotSeq.set(key, Math.max(...persisted));
+		}
+	}
+
 	private emitSnapshotEvent(sub: TrackedSubscription, event: Omit<RuntimePrSnapshotEvent, "seq">): void {
 		const key = this.subscriptionKey(sub.workspaceId, sub.taskId);
 		const seq = (this.snapshotSeq.get(key) ?? 0) + 1;
@@ -379,23 +415,35 @@ export class PrTrackingCoordinator {
 	 * Versioned subscription: replay events with seq > fromCursor and advance
 	 * the durable per-consumer replay cursor on the task binding. Events are
 	 * HINTS — consumers must reconcile authoritative state on startup and
-	 * after any hint.
+	 * after any hint. An omitted fromCursor resumes from the binding's
+	 * persisted cursor for this consumer (never restarts at 0).
 	 */
 	async readTaskSnapshotEvents(
 		workspaceId: string,
 		taskId: string,
-		consumer: "comments" | "merge",
-		fromCursor: number = 0,
+		consumer: "comments" | "mergeCompletion",
+		fromCursor?: number,
 	): Promise<{ events: RuntimePrSnapshotEvent[]; nextCursor: number }> {
 		const sub = this.subscriptions.get(this.subscriptionKey(workspaceId, taskId));
 		if (!sub) {
-			return { events: [], nextCursor: fromCursor };
+			return { events: [], nextCursor: fromCursor ?? 0 };
 		}
 		const key = this.subscriptionKey(workspaceId, taskId);
+		let cursor = fromCursor;
+		if (typeof cursor !== "number") {
+			// Resume from the durable per-consumer cursor persisted on the
+			// binding: a fresh session never replays already-consumed hints.
+			const loaded = await this.store.loadRecord(sub.canonicalPrKey);
+			const persisted = loaded.ok
+				? loaded.record.taskBindings.find((item) => item.workspaceId === workspaceId && item.taskId === taskId)
+						?.replayCursors[consumer]
+				: undefined;
+			cursor = typeof persisted === "number" ? persisted : 0;
+		}
 		const log = this.snapshotEvents.get(key) ?? [];
-		const events = log.filter((event) => event.seq > fromCursor).map((event) => ({ ...event }));
-		const nextCursor = events.length > 0 ? events[events.length - 1].seq : fromCursor;
-		if (nextCursor > fromCursor) {
+		const events = log.filter((event) => event.seq > cursor).map((event) => ({ ...event }));
+		const nextCursor = events.length > 0 ? events[events.length - 1].seq : cursor;
+		if (nextCursor > cursor) {
 			// Best-effort durable cursor: a failed write only means the same
 			// hints replay again next session (authoritative reconciliation
 			// on startup is the safety net).
@@ -655,6 +703,7 @@ export class PrTrackingCoordinator {
 		if (!bindingResult.ok) {
 			return this.blockedSubscription(descriptor, scope, "record_malformed");
 		}
+		await this.seedSnapshotSeq(descriptor);
 		this.trackSubscription({
 			workspaceId: descriptor.workspaceId,
 			taskId: descriptor.taskId,
@@ -709,6 +758,11 @@ export class PrTrackingCoordinator {
 			return;
 		}
 		this.subscriptions.delete(this.subscriptionKey(workspaceId, taskId));
+		// The transient event log is per-task: with the last (only)
+		// subscription gone, nothing may replay from it.
+		const subKey = this.subscriptionKey(workspaceId, taskId);
+		this.snapshotEvents.delete(subKey);
+		this.snapshotSeq.delete(subKey);
 		if (this.subscriptionCountForPr(sub.canonicalPrKey) === 0) {
 			for (const state of this.polls.values()) {
 				if (state.prKey === sub.canonicalPrKey) {
@@ -979,6 +1033,17 @@ export class PrTrackingCoordinator {
 	}
 
 	private async performPollCycle(state: PrPollState): Promise<void> {
+		// Poll-time backstop: re-derive task-derived demand from the live board
+		// view so eligibility is re-read before every poll (a board change that
+		// bypassed the mutation triggers is picked up here). Best-effort: a
+		// revalidation failure never cancels this read.
+		if (this.revalidateSubscriptions) {
+			try {
+				await this.revalidateSubscriptions();
+			} catch (error: unknown) {
+				this.warn(`PR tracking revalidation failed: ${String(error)}`);
+			}
+		}
 		const { prKey, accessScopeId } = state;
 		const parsed = parseCanonicalPrKey(prKey);
 		// Use the requested scope exactly; never fall back to the cached
@@ -1357,17 +1422,18 @@ export class PrTrackingCoordinator {
 	 * An explicit refresh re-probes the API when an access/auth blocker is
 	 * set (permission changes do not require a new auth context).
 	 */
-	async refresh(prKey: string, accessScopeId: string): Promise<void> {
+	async refresh(prKey: string, accessScopeId: string): Promise<{ coalesced: boolean }> {
 		const state = this.polls.get(this.pollKey(prKey, accessScopeId));
 		if (!state) {
-			return;
+			return { coalesced: false };
 		}
 		if (state.pollInFlight) {
+			// Joined an identical in-flight read: no duplicate request.
 			await state.pollInFlight;
-			return;
+			return { coalesced: true };
 		}
 		if (this.stopping) {
-			return;
+			return { coalesced: false };
 		}
 		// Re-probe: a prior access/auth blocker must not suppress an
 		// explicit refresh. Clearing scopeFailure lets ensureScope re-resolve
@@ -1381,7 +1447,7 @@ export class PrTrackingCoordinator {
 		if (!scopeResult.ok) {
 			// The re-probe failed: the blocker is re-set by ensureScope and
 			// polling stays cancelled until the next explicit refresh/resume.
-			return;
+			return { coalesced: false };
 		}
 		if (wasBlocked && this.authBlocker === null) {
 			// A blocker cleared: re-arm the polls it cancelled, not just the
@@ -1391,7 +1457,7 @@ export class PrTrackingCoordinator {
 		if (state.pollInFlight) {
 			// Another refresh started its cycle while we re-probed: coalesce.
 			await state.pollInFlight;
-			return;
+			return { coalesced: true };
 		}
 		const job = this.performPollCycle(state);
 		state.pollInFlight = job;
@@ -1400,6 +1466,7 @@ export class PrTrackingCoordinator {
 		} finally {
 			state.pollInFlight = null;
 		}
+		return { coalesced: false };
 	}
 
 	/**

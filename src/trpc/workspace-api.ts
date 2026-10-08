@@ -521,6 +521,12 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 						workspaceScope.workspaceId,
 						workspaceScope.workspacePath,
 					);
+					// PRTRACK-1: a new PR link changes task-derived subscription
+					// demand. Fire-and-forget: the response is never delayed.
+					deps.runPrTrackingReconcilePass?.({
+						workspaceId: workspaceScope.workspaceId,
+						workspacePath: workspaceScope.workspacePath,
+					});
 				}
 				// Re-read from the board: the recorded entry, or the existing
 				// identical one on a duplicate add (no revision bump).
@@ -583,6 +589,13 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 						workspaceScope.workspaceId,
 						workspaceScope.workspacePath,
 					);
+					// PRTRACK-1: a removed PR link may clear a card's selected
+					// automation PR or its last link — re-derive demand.
+					// Fire-and-forget: the response is never delayed.
+					deps.runPrTrackingReconcilePass?.({
+						workspaceId: workspaceScope.workspaceId,
+						workspacePath: workspaceScope.workspacePath,
+					});
 				}
 				return response.value
 					? ({ ok: true, pullRequest: null } satisfies RuntimeTaskPullRequestLinkResponse)

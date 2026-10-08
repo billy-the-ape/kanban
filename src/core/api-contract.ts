@@ -2655,7 +2655,7 @@ export type GitHubPrOperationReservation = z.infer<typeof githubPrOperationReser
 export const githubPrReplayCursorsSchema = z
 	.object({
 		comments: z.number().int().nonnegative().optional(),
-		merge: z.number().int().nonnegative().optional(),
+		mergeCompletion: z.number().int().nonnegative().optional(),
 	})
 	.passthrough();
 export type GitHubPrReplayCursors = z.infer<typeof githubPrReplayCursorsSchema>;
@@ -3021,8 +3021,14 @@ export type RuntimePrSnapshotRefreshResponse = z.infer<typeof runtimePrSnapshotR
 
 export const runtimePrCommentDispatchUpdateRequestSchema = z.object({
 	taskId: z.string().min(1),
-	/** Expected PR-record revision (undefined = latest). */
-	expectedRecordRevision: z.number().int().nonnegative().optional(),
+	/** Expected PR-record revision — caller-side CAS (required). */
+	expectedRecordRevision: z.number().int().nonnegative(),
+	/**
+	 * Expected ownerRevision of the caller's owner tenure (absent = any).
+	 * A handoff between read and write is a conflict even when the record
+	 * revision is unchanged.
+	 */
+	expectedOwnerRevision: z.number().int().nonnegative().optional(),
 	dispatch: githubPrCommentDispatchSchema.nullable(),
 });
 export type RuntimePrCommentDispatchUpdateRequest = z.infer<typeof runtimePrCommentDispatchUpdateRequestSchema>;
@@ -3039,7 +3045,8 @@ export type RuntimePrRecordMutationResponse = z.infer<typeof runtimePrRecordMuta
 
 export const runtimeTaskMergeBindingUpdateRequestSchema = z.object({
 	taskId: z.string().min(1),
-	expectedRecordRevision: z.number().int().nonnegative().optional(),
+	/** Expected PR-record revision — caller-side CAS (required). */
+	expectedRecordRevision: z.number().int().nonnegative(),
 	mergeCompletion: githubPrMergeCompletionSchema.nullable(),
 });
 export type RuntimeTaskMergeBindingUpdateRequest = z.infer<typeof runtimeTaskMergeBindingUpdateRequestSchema>;
@@ -3047,7 +3054,12 @@ export type RuntimeTaskMergeBindingUpdateRequest = z.infer<typeof runtimeTaskMer
 // ── Repair owner selection / transfer ───────────────────────────────────────
 
 export const runtimePrRepairOwnerSelectRequestSchema = z.object({
+	/** The task to assign as repair owner (explicit selection). */
 	taskId: z.string().min(1),
+	/** Defaults to the caller's workspace (cross-workspace candidate selection). */
+	workspaceId: z.string().min(1).optional(),
+	/** Expected ownerRevision (absent = any) — revision-checked explicit assignment. */
+	expectedOwnerRevision: z.number().int().nonnegative().optional(),
 });
 export type RuntimePrRepairOwnerSelectRequest = z.infer<typeof runtimePrRepairOwnerSelectRequestSchema>;
 
@@ -3055,6 +3067,8 @@ export const runtimePrRepairOwnerTransferRequestSchema = z.object({
 	fromTaskId: z.string().min(1),
 	/** null = explicit release (same drain/invalidate/reconcile preconditions). */
 	toTaskId: z.string().nullable(),
+	/** Target workspace for cross-workspace transfers (defaults to the caller's). */
+	toWorkspaceId: z.string().min(1).optional(),
 	/** Expected ownerRevision (absent reads as 0) — revision-checked handoff. */
 	expectedOwnerRevision: z.number().int().nonnegative().optional(),
 });
@@ -3097,14 +3111,18 @@ export const runtimePrOperationReservationRequestSchema = z.object({
 	taskId: z.string().min(1),
 	operation: runtimePrOperationKindSchema,
 	/**
-	 * Canonical head repository + ref of the write target. Present when the
-	 * operation writes a remote branch: the remote write gate then serializes
-	 * distinct PRs pushing to the same head branch.
+	 * Expected fencing generation of the caller's owner tenure (stale
+	 * detection). The head-ref write gate is keyed by the record's verified
+	 * head mapping (never caller-supplied).
 	 */
-	headRepository: z.string().nullable().optional(),
-	headRef: z.string().nullable().optional(),
-	/** Expected fencing generation of the caller's owner tenure (stale detection). */
 	expectedFencingGeneration: z.number().int().nonnegative().optional(),
+	/**
+	 * Head-ref validation hints (informational): the authoritative head
+	 * mapping is the one persisted on the record. A mismatch with a
+	 * verified mapping rejects the reservation.
+	 */
+	headRepository: z.string().min(1).optional(),
+	headRef: z.string().min(1).optional(),
 });
 export type RuntimePrOperationReservationRequest = z.infer<typeof runtimePrOperationReservationRequestSchema>;
 
@@ -3131,6 +3149,11 @@ export type RuntimePrOperationValidateRequest = z.infer<typeof runtimePrOperatio
 export const runtimePrOperationReleaseRequestSchema = z.object({
 	taskId: z.string().min(1),
 	operation: runtimePrOperationKindSchema,
+	/**
+	 * Operator path: clear a reservation held by a crashed holder. Audited on
+	 * the server (warning log with holder + operation); never implicit.
+	 */
+	force: z.boolean().optional(),
 });
 export type RuntimePrOperationReleaseRequest = z.infer<typeof runtimePrOperationReleaseRequestSchema>;
 
@@ -3139,7 +3162,7 @@ export type RuntimePrOperationReleaseRequest = z.infer<typeof runtimePrOperation
 export const runtimePrSubscriptionRequestSchema = z.object({
 	taskId: z.string().min(1),
 	/** Consumer kind owning the durable replay cursor on the task binding. */
-	consumer: z.enum(["comments", "merge"]).default("comments"),
+	consumer: z.enum(["comments", "mergeCompletion"]).default("comments"),
 	/**
 	 * Durable replay cursor (per consumer kind, persisted on the task
 	 * binding). Events with seq > fromCursor are returned; the cursor

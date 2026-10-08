@@ -450,3 +450,227 @@ describe("pr-track1 automation PR resolution", () => {
 		expect(candidates.map((candidate) => candidate.taskId)).toEqual(["t-a", "t-b"]);
 	});
 });
+
+import { getPullRequestIdentityKey } from "../../../src/core/pull-request-links";
+import { removeTaskPullRequest } from "../../../src/core/task-board-mutations";
+import { assignRepairOwner, validateAutoAssignedOwner } from "../../../src/pr-tracking/pr-owner-selection";
+import { releasePrOperation, reservePrOperation } from "../../../src/pr-tracking/pr-reservations";
+
+async function seedRecordWithHead(store: InMemoryPrRecordStore, headRepository: string | null, headRef: string | null) {
+	await store.createRecord(RECORD_IDENTITY);
+	const loaded = await store.loadRecord(PR_KEY);
+	if (!loaded.ok) {
+		throw new Error("record missing after create");
+	}
+	await store.updateRecord(PR_KEY, loaded.record.revision, (record) => ({
+		...record,
+		revision: record.revision + 1,
+		updatedAt: 1,
+		snapshots:
+			headRepository === null || headRef === null
+				? record.snapshots
+				: {
+						"scope-1": {
+							accessScopeId: "scope-1",
+							checkedAt: 1,
+							state: "open" as const,
+							headRepository,
+							headRef,
+							baseRepository: "cline/kanban",
+							baseRef: "main",
+							headSha: null,
+							mergedAt: null,
+							mergeCommitSha: null,
+						},
+					},
+	}));
+}
+
+describe("pr-track1 explicit repair-owner assignment", () => {
+	it("assigns a valid candidate among multiple candidates and rejects stale revisions", async () => {
+		const store = new InMemoryPrRecordStore();
+		await store.createRecord(RECORD_IDENTITY);
+		const boards = [
+			makeBoard("ws-1", [
+				{ columnId: "in_progress", card: makeCard({ id: "t-a", autoAddressComments: true, pullRequests: [LINK] }) },
+				{ columnId: "review", card: makeCard({ id: "t-b", autoAddressComments: true, pullRequests: [LINK] }) },
+			]),
+		];
+
+		const assigned = await assignRepairOwner(store, PR_KEY, boards, { workspaceId: "ws-1", taskId: "t-b" });
+		expect(assigned.ok).toBe(true);
+		expect(assigned.assigned).toBe(true);
+		expect(assigned.owner).toMatchObject({ workspaceId: "ws-1", taskId: "t-b", ownerRevision: 1 });
+
+		// Re-assigning the same task keeps the same tenure (no revision bump).
+		const again = await assignRepairOwner(store, PR_KEY, boards, { workspaceId: "ws-1", taskId: "t-b" });
+		expect(again.ok).toBe(true);
+		expect(again.assigned).toBe(false);
+		expect(again.owner?.ownerRevision).toBe(1);
+
+		// Stale expectedOwnerRevision on a different target: conflict.
+		const stale = await assignRepairOwner(
+			store,
+			PR_KEY,
+			boards,
+			{ workspaceId: "ws-1", taskId: "t-a" },
+			{ expectedOwnerRevision: 99 },
+		);
+		expect(stale).toMatchObject({ ok: false, reason: "conflict" });
+		expect(stale.owner).toMatchObject({ taskId: "t-b" });
+	});
+
+	it("rejects a target that is not a valid candidate", async () => {
+		const store = new InMemoryPrRecordStore();
+		await store.createRecord(RECORD_IDENTITY);
+		const boards = [
+			makeBoard("ws-1", [
+				{ columnId: "in_progress", card: makeCard({ id: "t-a", autoAddressComments: true, pullRequests: [LINK] }) },
+			]),
+		];
+		const invalid = await assignRepairOwner(store, PR_KEY, boards, { workspaceId: "ws-9", taskId: "t-x" });
+		expect(invalid).toMatchObject({ ok: false, reason: "not_valid_candidate", assigned: false });
+	});
+});
+
+describe("pr-track1 cross-repository auto-owner guard", () => {
+	it("invalidates an auto-assignment when the verified head mapping is another repository", async () => {
+		const store = new InMemoryPrRecordStore();
+		await seedRecordWithHead(store, "cline/fork", "fix");
+		const boards = [
+			makeBoard("ws-1", [
+				{ columnId: "in_progress", card: makeCard({ id: "t-a", autoAddressComments: true, pullRequests: [LINK] }) },
+			]),
+		];
+		const assigned = await assignRepairOwner(store, PR_KEY, boards, { workspaceId: "ws-1", taskId: "t-a" });
+		expect(assigned.ok).toBe(true);
+
+		const warnings: string[] = [];
+		const result = await validateAutoAssignedOwner(store, PR_KEY, { warn: (message) => warnings.push(message) });
+		expect(result).toEqual({ invalidated: true, headRepository: "cline/fork", recordRepository: "cline/kanban" });
+		expect(warnings.length).toBe(1);
+
+		const after = await store.loadRecord(PR_KEY);
+		expect(after.ok).toBe(true);
+		if (after.ok) {
+			expect(after.record.commentAutomation.repairOwner).toBeNull();
+		}
+	});
+
+	it("keeps the owner when the verified head mapping matches the record's repository", async () => {
+		const store = new InMemoryPrRecordStore();
+		await seedRecordWithHead(store, "cline/kanban", "fix");
+		const boards = [
+			makeBoard("ws-1", [
+				{ columnId: "in_progress", card: makeCard({ id: "t-a", autoAddressComments: true, pullRequests: [LINK] }) },
+			]),
+		];
+		await assignRepairOwner(store, PR_KEY, boards, { workspaceId: "ws-1", taskId: "t-a" });
+
+		const result = await validateAutoAssignedOwner(store, PR_KEY);
+		expect(result).toEqual({ invalidated: false, headRepository: "cline/kanban", recordRepository: "cline/kanban" });
+
+		const after = await store.loadRecord(PR_KEY);
+		expect(after.ok).toBe(true);
+		if (after.ok) {
+			expect(after.record.commentAutomation.repairOwner).toMatchObject({ taskId: "t-a" });
+		}
+	});
+});
+
+describe("pr-track1 fenced operation reservations", () => {
+	const task = { workspaceId: "ws-1", taskId: "t-merge" };
+
+	it("requires the repair owner for comments but not for merge completion", async () => {
+		const store = new InMemoryPrRecordStore();
+		await seedRecordWithHead(store, "cline/kanban", "fix");
+
+		const commentBlocked = await reservePrOperation(store, PR_KEY, "comment_followup", task, { requireOwner: true });
+		expect(commentBlocked.status).toBe("blocked");
+
+		const mergeReserved = await reservePrOperation(store, PR_KEY, "merge_completion", task, { requireOwner: false });
+		expect(mergeReserved.status).toBe("reserved");
+		expect(mergeReserved.reservation.reservedBy).toMatchObject(task);
+
+		// A non-holder release without force is stale; with force it clears.
+		const otherTask = { workspaceId: "ws-2", taskId: "t-other" };
+		const softRelease = await releasePrOperation(store, PR_KEY, "merge_completion", otherTask);
+		expect(softRelease.status).toBe("stale");
+		const forcedRelease = await releasePrOperation(store, PR_KEY, "merge_completion", otherTask, undefined, {
+			force: true,
+		});
+		expect(forcedRelease.status).toBe("reserved");
+		expect(forcedRelease.reservation.state).toBe("none");
+	});
+
+	it("rejects a caller head hint that disagrees with the record's verified mapping", async () => {
+		const store = new InMemoryPrRecordStore();
+		await seedRecordWithHead(store, "cline/kanban", "fix");
+
+		const mismatch = await reservePrOperation(store, PR_KEY, "merge_completion", task, {
+			requireOwner: false,
+			headRepository: "cline/other",
+			headRef: "fix",
+		});
+		expect(mismatch.status).toBe("blocked");
+
+		const matching = await reservePrOperation(store, PR_KEY, "merge_completion", task, {
+			requireOwner: false,
+			headRepository: "cline/kanban",
+			headRef: "fix",
+		});
+		expect(matching.status).toBe("reserved");
+	});
+
+	it("blocks when the record has no verified head mapping", async () => {
+		const store = new InMemoryPrRecordStore();
+		await seedRecordWithHead(store, null, null);
+
+		const blocked = await reservePrOperation(store, PR_KEY, "merge_completion", task, { requireOwner: false });
+		expect(blocked.status).toBe("blocked");
+	});
+});
+
+describe("pr-track1 PR link removal and automation selection", () => {
+	it("clears the selected automation PR when the removed link is the selection", () => {
+		const other = { ...LINK, repository: "cline/other", number: 7, url: "https://github.com/cline/other/pull/7" };
+		const board = makeBoard("ws-1", [
+			{
+				columnId: "in_progress",
+				card: makeCard({
+					id: "t-1",
+					autoAddressComments: true,
+					selectedAutomationPrKey: PR_KEY,
+					pullRequests: [LINK, other],
+				}),
+			},
+		]).board;
+
+		const result = removeTaskPullRequest(board, "t-1", getPullRequestIdentityKey(LINK), 123);
+		expect(result.removed).toBe(true);
+		expect(result.task?.selectedAutomationPrKey).toBeUndefined();
+		expect(result.task?.settingsRevision).toBe(1);
+		// The remaining link is untouched.
+		expect(result.task?.pullRequests).toHaveLength(1);
+	});
+
+	it("keeps the selection when removing an unselected link", () => {
+		const other = { ...LINK, repository: "cline/other", number: 7, url: "https://github.com/cline/other/pull/7" };
+		const board = makeBoard("ws-1", [
+			{
+				columnId: "in_progress",
+				card: makeCard({
+					id: "t-1",
+					autoAddressComments: true,
+					selectedAutomationPrKey: PR_KEY,
+					pullRequests: [LINK, other],
+				}),
+			},
+		]).board;
+
+		const result = removeTaskPullRequest(board, "t-1", getPullRequestIdentityKey(other), 123);
+		expect(result.removed).toBe(true);
+		expect(result.task?.selectedAutomationPrKey).toBe(PR_KEY);
+		expect(result.task?.settingsRevision).toBeUndefined();
+	});
+});
