@@ -220,7 +220,7 @@ Explicit non-goals:
       boards must not hold a workspace lock across any network call. A fetched result is
       applied only after rereading task settings, linkage, and current revision; in-flight
       responses revalidate each consumer before applying state or scheduling effects.
-- [x] PRTRACK-1.4 **Owner selection, transfer, and reservations.** Durable repair-owner
+- [~] PRTRACK-1.4 **Owner selection, transfer, and reservations (partial — see "Deferred to the consumer PRs" in Handoff). ** Durable repair-owner
       selection: exactly-one-candidate atomic assignment; multi-candidate "Choose repair owner"
       ambiguity block; revision-checked **Repair owner** selector listing linked tasks with
       workspace labels; owner validity requires the task selects this PR and has a verified
@@ -256,7 +256,7 @@ Explicit non-goals:
       requests safe cancellation of live tracked operations, preserving unpublished work.
       External tools outside Kanban cannot be locked: compare remote/local state and stop on
       drift.
-- [x] PRTRACK-1.5 **Task lifecycle gates.** Shared arbitration: when either installed enabled
+- [~] PRTRACK-1.5 **Task lifecycle gates (partial — see "Deferred to the consumer PRs" in Handoff). ** Shared arbitration: when either installed enabled
       consumer owns a linked PR workflow, legacy automatic clean-tree/PR-delivery completion
       cannot run (browser auto-actions, CLI, and deterministic delivery all gated); manual
       completion retains existing safeguards including preserved Done → Review movement.
@@ -285,7 +285,7 @@ Explicit non-goals:
       on confirmed open/draft + eligibility); snapshots labelled as of a time; all blockers in
       the existing detail warning/status surfaces with concise reasons. Tailwind tokens,
       `@/components/ui` primitives, `lucide-react` icons; conditional state via `cn()`.
-- [x] PRTRACK-1.7 **Fake-consumer and task lifecycle integration tests.** Cover the acceptance
+- [~] PRTRACK-1.7 **Fake-consumer and task lifecycle integration tests (partial — see "Deferred to the consumer PRs" in Handoff). ** Cover the acceptance
       rows below with independently registered fake consumers (merge-only, comment-only,
       both, neither) and real task/board changes driving subscription demand.
 
@@ -437,13 +437,35 @@ Implemented in this worktree (PR targets `feat/pr-tracking-base`). Record:
   (`PrRecordStoreBase.withRegistryTransaction`); the registry mutex is never held
   while acquiring task/Git locks or awaiting model/network work. Sibling records
   sharing a head ref serialize on the gate under the global registry mutex.
-- **Lifecycle-gate hook points.** Browser: `web-ui/src/hooks/use-review-auto-actions.ts`
-  (`computePrLifecycleGatedTaskIds`). CLI: `src/commands/task.ts`
-  (`completeTaskById`). Deterministic delivery: `src/workspace/git-delivery.ts` +
-  `src/task-dispatch/task-dispatch-service.ts` (`checkPrDeliveryReservation`).
-  All read the installed-consumer registry through
-  `evaluatePrLifecycleGate` / `isPrLifecycleGated`; with zero consumers installed
-  every gate is a no-op (legacy behavior unchanged).
+- **Lifecycle-gate hook points (shipped).** Browser:
+  `web-ui/src/utils/pr-tracking.ts` (`computePrLifecycleGatedTaskIds`, used by
+  `web-ui/src/hooks/use-board-interactions.ts`). CLI: `src/commands/task.ts`
+  (`completeTaskById`, reads `installedPrConsumers` from the runtime config).
+  Deterministic delivery: only a reservation-busy check
+  (`checkPrDeliveryReservation` in `src/server/runtime-server.ts`, consulted by
+  `startTaskDelivery` in `src/trpc/runtime-api.ts`); `git-delivery.ts` and
+  `task-dispatch-service.ts` are **unchanged**. All read the installed-consumer
+  registry through `evaluatePrLifecycleGate` / `isPrLifecycleGated`; with zero
+  consumers installed every gate is a no-op (legacy behavior unchanged).
+- **Deferred to the consumer PRs (NOT landed here).**
+  - `mergeFinishesInReview` (In-Review-on-clean-push) is computed/diagnostic
+    only; enforcing it is MERGE-1.
+  - Dispatch worker policy/readiness for owner transfer (draining
+    running/queued writer actions) — consumer PRs.
+  - `src/task-dispatch/verification-service.ts` reservation integration —
+    MERGE-1.
+  - `src/cline-sdk/cline-task-session-service.ts` turn-liveness references —
+    COMMENT-0.
+  - `src/server/workspace-registry.ts` hooks — consumer PRs.
+  - Repository/delivery-branch matching for the Automation PR — COMMENT-0 (per
+    the fork-PR decision).
+- **Frozen-name → shipped-route mapping (COMMENT-0 / MERGE-1 must use the
+  shipped names).** `updateTaskPrSettings` → `setTaskPrSettings`;
+  `selectAutomationPr` → `selectTaskAutomationPr`; `getAuthorizedSnapshot` /
+  `refreshSnapshot` → `getTaskPrSnapshot` / `refreshTaskPrSnapshot`;
+  `subscribeTaskSnapshot` / `subscribeTerminalInvalidation` → polling
+  `readPrSnapshotEvents` (versioned replay with a durable per-consumer cursor);
+  `validateReservation` → `validatePrOperation`.
 - **Installed-consumer signal source.** `getTaskTrackingState` per consumer kind
   plus per-task agent support; `RuntimeConfigResponse.installedPrConsumers`
   drives the create/edit dialog checkbox availability ("Feature unavailable").
@@ -575,6 +597,43 @@ changed files.
 
 COMMENT-0 and MERGE-1 can now start in parallel; each adds consumer modules and
 targeted existing API integrations only.
+
+### Revision 6 — re-review #4 (PR #66): Handoff accuracy + headline-claim tests
+
+1. **Handoff made accurate.** The lifecycle-gate bullet now names only what
+   this PR changed: browser `web-ui/src/utils/pr-tracking.ts`
+   (`computePrLifecycleGatedTaskIds` via `use-board-interactions.ts`), CLI
+   `src/commands/task.ts` (`completeTaskById`), and deterministic delivery's
+   reservation-busy check (`checkPrDeliveryReservation` in
+   `runtime-server.ts`, consulted by `startTaskDelivery` in
+   `runtime-api.ts`); `git-delivery.ts` and `task-dispatch-service.ts` are
+   explicitly marked unchanged. A "Deferred to the consumer PRs" list records
+   what did NOT land, with owners (`mergeFinishesInReview` enforcement →
+   MERGE-1; dispatch-worker drain policy → consumer PRs;
+   `verification-service.ts` reservations → MERGE-1;
+   `cline-task-session-service.ts` turn-liveness → COMMENT-0;
+   `workspace-registry.ts` hooks → consumer PRs; repo/delivery-branch matching
+   → COMMENT-0). Acceptance boxes 1.4/1.5/1.7 are now `[~]` (partial) with a
+   pointer to that list, and a frozen-name → shipped-route mapping line was
+   added so COMMENT-0/MERGE-1 don't call routes that don't exist.
+2. **Headline-claim tests added.** `test/integration/workspace-state.integration.test.ts`:
+   stale whole-board saves cannot clobber persisted `autoAddressComments` /
+   `autoFinishOnMerge` / `settingsRevision`, and a brand-new card in the same
+   save takes the client's booleans. `pr-track1-foundation.test.ts`: owner at
+   generation N → release → re-assign → a `reservePrOperation` call carrying
+   the previous tenure's generation is `stale` (fencing high-water mark);
+   two records on one canonical head `repo@ref` with owners → the second
+   `reservePrOperation` is `busy` (head-ref gate); a trigger queued mid-pass
+   runs a follow-up `createReconcilePass` pass on the newer board (no lost
+   update). `pr-tracking-coordinator.test.ts`: after a restart the event
+   sequence resumes above the persisted cursor (`seedSnapshotSeq`), and
+   `readTaskSnapshotEvents` without `fromCursor` resumes from the binding.
+
+**Test commands and results (revision 6).** `npx vitest run
+test/runtime/pr-tracking` (111 pass); `npx vitest run
+test/integration/workspace-state.integration.test.ts` (10 pass); `npx tsc
+--noEmit` (root) and web-ui typecheck clean; Biome clean for all changed files.
+
 
 ## Stop conditions
 

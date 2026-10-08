@@ -17,12 +17,14 @@ import {
 } from "../../../src/pr-tracking/pr-owner-selection";
 import {
 	computeTaskSubscriptionDemand,
+	createReconcilePass,
 	type PrSubscriptionController,
 	type PrTaskSubscriptionSource,
 	reconcileTaskSubscriptions,
 } from "../../../src/pr-tracking/pr-task-subscriptions";
 
 const PR_KEY = "github|github.com|cline/kanban|49";
+const PR50_KEY = "github|github.com|cline/kanban|50";
 const LINK = {
 	provider: "github" as const,
 	host: "github.com",
@@ -234,6 +236,78 @@ describe("pr-track1 task-derived subscription demand", () => {
 			removed: ["ws-1:t-1"],
 			updated: [],
 		});
+	});
+
+	it("a trigger queued mid-pass runs a follow-up pass on the newer board (no lost update)", async () => {
+		const withDemand = [
+			makeBoard("ws-1", [
+				{ columnId: "in_progress", card: makeCard({ id: "t-1", autoAddressComments: true, pullRequests: [LINK] }) },
+			]),
+		];
+		const withoutDemand: PrBoardSnapshot[] = [makeBoard("ws-1", [])];
+		// The first board read is gated until the test flips the board, so the
+		// second trigger arrives while pass 1 is still in flight.
+		const gate: { resolve: ((boards: PrBoardSnapshot[]) => void) | null } = { resolve: null };
+		const firstRead = new Promise<PrBoardSnapshot[]>((resolve) => {
+			gate.resolve = resolve;
+		});
+		const views: Array<Promise<PrBoardSnapshot[]> | PrBoardSnapshot[]> = [firstRead, withoutDemand];
+		const added: string[] = [];
+		const removed: string[] = [];
+		const current: Array<{
+			workspaceId: string;
+			taskId: string;
+			canonicalPrKey: string;
+			column: string;
+			consumers: { comments: boolean; mergeCompletion: boolean };
+		}> = [];
+		const controller: PrSubscriptionController = {
+			async addSubscription(descriptor) {
+				added.push(descriptor.taskId);
+				current.push({
+					workspaceId: descriptor.workspaceId,
+					taskId: descriptor.taskId,
+					canonicalPrKey: descriptor.canonicalPrKey,
+					column: descriptor.column,
+					consumers: descriptor.consumers,
+				});
+				return { status: "active" as const };
+			},
+			async removeSubscription(workspaceId, taskId) {
+				removed.push(`${workspaceId}:${taskId}`);
+				const index = current.findIndex((entry) => entry.workspaceId === workspaceId && entry.taskId === taskId);
+				if (index !== -1) {
+					current.splice(index, 1);
+				}
+			},
+			listSubscriptions() {
+				return current;
+			},
+		};
+		const source: PrTaskSubscriptionSource = {
+			async listBoards() {
+				const next = views.shift();
+				return next === undefined ? [] : Array.isArray(next) ? next : await next;
+			},
+			installedConsumers: () => bothInstalled,
+		};
+		const pass = createReconcilePass(controller, source);
+
+		const first = pass();
+		// Yield so pass 1 reaches the gated board read.
+		for (let i = 0; i < 4; i += 1) {
+			await Promise.resolve();
+		}
+		// The board changed while pass 1 is in flight: the second trigger must
+		// queue a fresh pass, not coalesce into pass 1's stale view.
+		const second = pass();
+		gate.resolve?.(withDemand);
+		await first;
+		await second;
+
+		expect(added).toEqual(["t-1"]);
+		expect(removed).toEqual(["ws-1:t-1"]);
+		expect(current).toEqual([]);
 	});
 
 	it("updates a subscription when the card changes column or PR", async () => {
@@ -456,13 +530,18 @@ import { removeTaskPullRequest } from "../../../src/core/task-board-mutations";
 import { assignRepairOwner } from "../../../src/pr-tracking/pr-owner-selection";
 import { releasePrOperation, reservePrOperation } from "../../../src/pr-tracking/pr-reservations";
 
-async function seedRecordWithHead(store: InMemoryPrRecordStore, headRepository: string | null, headRef: string | null) {
-	await store.createRecord(RECORD_IDENTITY);
-	const loaded = await store.loadRecord(PR_KEY);
+async function seedRecordWithHead(
+	store: InMemoryPrRecordStore,
+	headRepository: string | null,
+	headRef: string | null,
+	identity: typeof RECORD_IDENTITY = RECORD_IDENTITY,
+) {
+	await store.createRecord(identity);
+	const loaded = await store.loadRecord(identity.canonicalPrKey);
 	if (!loaded.ok) {
 		throw new Error("record missing after create");
 	}
-	await store.updateRecord(PR_KEY, loaded.record.revision, (record) => ({
+	await store.updateRecord(identity.canonicalPrKey, loaded.record.revision, (record) => ({
 		...record,
 		revision: record.revision + 1,
 		updatedAt: 1,
@@ -613,6 +692,69 @@ describe("pr-track1 fenced operation reservations", () => {
 		const blocked = await reservePrOperation(store, PR_KEY, "merge_completion", task, { requireOwner: false });
 		expect(blocked.status).toBe("blocked");
 	});
+	it("a release then re-assignment makes the previous tenure's fencing generation permanently stale", async () => {
+		const store = new InMemoryPrRecordStore();
+		await seedRecordWithHead(store, "cline/kanban", "fix");
+		const boards = [
+			makeBoard("ws-1", [
+				{ columnId: "in_progress", card: makeCard({ id: "t-a", autoAddressComments: true, pullRequests: [LINK] }) },
+				{ columnId: "review", card: makeCard({ id: "t-b", autoAddressComments: true, pullRequests: [LINK] }) },
+			]),
+		];
+		const ownerA = { workspaceId: "ws-1", taskId: "t-a" };
+		const ownerB = { workspaceId: "ws-1", taskId: "t-b" };
+
+		const assigned = await assignRepairOwner(store, PR_KEY, boards, ownerA);
+		expect(assigned.ok).toBe(true);
+		const first = await store.loadRecord(PR_KEY);
+		if (!first.ok) {
+			throw new Error("record missing");
+		}
+		const firstGeneration = first.record.reservation.fencingGeneration;
+		expect(firstGeneration).toBeGreaterThan(0);
+
+		// Release keeps the high-water mark; the next assignment starts above it.
+		const released = await transferRepairOwner(store, PR_KEY, ownerA, null, boards, { writerActionsDrained: true });
+		expect(released.ok).toBe(true);
+		const reassigned = await assignRepairOwner(store, PR_KEY, boards, ownerB);
+		expect(reassigned.ok).toBe(true);
+		const second = await store.loadRecord(PR_KEY);
+		if (!second.ok) {
+			throw new Error("record missing");
+		}
+		expect(second.record.reservation.fencingGeneration).toBeGreaterThan(firstGeneration);
+
+		// A reservation call still carrying the first tenure's generation is stale.
+		const stale = await reservePrOperation(store, PR_KEY, "comment_followup", ownerB, {
+			requireOwner: false,
+			expectedFencingGeneration: firstGeneration,
+		});
+		expect(stale.status).toBe("stale");
+	});
+});
+it("blocks a reservation when a sibling record holding the same head ref is reserved", async () => {
+	const store = new InMemoryPrRecordStore();
+	await seedRecordWithHead(store, "cline/kanban", "fix");
+	// A second PR on the same base repository, verified to push to the
+	// SAME canonical head repository + ref.
+	await seedRecordWithHead(store, "cline/kanban", "fix", { ...RECORD_IDENTITY, number: 50, canonicalPrKey: PR50_KEY });
+	const link50 = { ...LINK, number: 50, url: "https://github.com/cline/kanban/pull/50" };
+	const boards = [
+		makeBoard("ws-1", [
+			{ columnId: "in_progress", card: makeCard({ id: "t-a", autoAddressComments: true, pullRequests: [LINK] }) },
+			{ columnId: "in_progress", card: makeCard({ id: "t-b", autoAddressComments: true, pullRequests: [link50] }) },
+		]),
+	];
+	// Both records carry an owner (the head-ref gate spans distinct PRs).
+	const ownerA = { workspaceId: "ws-1", taskId: "t-a" };
+	const ownerB = { workspaceId: "ws-1", taskId: "t-b" };
+	expect((await assignRepairOwner(store, PR_KEY, boards, ownerA)).ok).toBe(true);
+	expect((await assignRepairOwner(store, PR50_KEY, boards, ownerB)).ok).toBe(true);
+
+	const first = await reservePrOperation(store, PR_KEY, "comment_followup", ownerA, { requireOwner: true });
+	expect(first.status).toBe("reserved");
+	const busy = await reservePrOperation(store, PR50_KEY, "comment_followup", ownerB, { requireOwner: true });
+	expect(busy.status).toBe("busy");
 });
 
 describe("pr-track1 PR link removal and automation selection", () => {
