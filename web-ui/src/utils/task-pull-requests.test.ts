@@ -1,9 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import type { RuntimeBoardCard, RuntimeTaskPullRequest } from "@/runtime/types";
+import type { RuntimeTaskPullRequest } from "@/runtime/types";
 import {
 	formatPullRequestLabel,
-	getLatestPullRequest,
 	getPullRequestKey,
 	getPullRequestRefreshMessage,
 	getPullRequestTooltipLines,
@@ -26,32 +25,6 @@ function createPullRequest(overrides?: Partial<RuntimeTaskPullRequest>): Runtime
 		...overrides,
 	};
 }
-
-function createCard(pullRequests?: RuntimeTaskPullRequest[]): RuntimeBoardCard {
-	return {
-		id: "task-1",
-		title: "Task",
-		prompt: "Task",
-		startInPlanMode: false,
-		baseRef: "main",
-		createdAt: 1,
-		updatedAt: 1,
-		...(pullRequests !== undefined ? { pullRequests } : {}),
-	};
-}
-
-describe("getLatestPullRequest", () => {
-	it("returns the last recorded PR", () => {
-		const first = createPullRequest({ number: 1 });
-		const latest = createPullRequest({ number: 2 });
-		expect(getLatestPullRequest(createCard([first, latest]))).toBe(latest);
-	});
-
-	it("returns null for undefined or empty pullRequests", () => {
-		expect(getLatestPullRequest(createCard(undefined))).toBeNull();
-		expect(getLatestPullRequest(createCard([]))).toBeNull();
-	});
-});
 
 describe("formatPullRequestLabel", () => {
 	it("uses # and PR for GitHub", () => {
@@ -126,16 +99,30 @@ describe("getPullRequestRefreshMessage", () => {
 });
 
 describe("getPullRequestTooltipLines", () => {
-	it("shows repository, number, title, and approximate state age when available", () => {
+	it("shows repository, title, observation lines, and state line when available", () => {
 		const now = Date.now();
 		const lines = getPullRequestTooltipLines(
-			createPullRequest({ title: "Fix the bug", state: "merged", stateCheckedAt: now - 2 * HOUR_MS }),
+			createPullRequest({
+				createdAt: now - 2 * DAY_MS,
+				lastSeenAt: now - 2 * HOUR_MS,
+				title: "Fix the bug",
+				state: "merged",
+				stateCheckedAt: now - 2 * HOUR_MS,
+			}),
 		);
 		expect(lines).toEqual([
 			"cline/kanban#123",
 			"Fix the bug",
-			`merged as of ${Math.floor((now - (now - 2 * HOUR_MS)) / HOUR_MS)}h ago`,
+			"First recorded 2d ago",
+			"Last observed (approximate) 2h ago",
+			"State checked 2h ago (merged)",
 		]);
+	});
+
+	it("falls back to createdAt for the last-observed line when lastSeenAt is missing", () => {
+		const now = Date.now();
+		const lines = getPullRequestTooltipLines(createPullRequest({ createdAt: now - 5 * MINUTE_MS }));
+		expect(lines).toEqual(["cline/kanban#123", "First recorded 5m ago", "Last observed (approximate) 5m ago"]);
 	});
 
 	it("uses the ! prefix for GitLab repositories", () => {
@@ -150,25 +137,18 @@ describe("getPullRequestTooltipLines", () => {
 		expect(lines[0]).toBe("cline/kanban!45");
 	});
 
-	it("omits the title when absent", () => {
-		const lines = getPullRequestTooltipLines(createPullRequest());
-		expect(lines).toEqual(["cline/kanban#123"]);
-	});
-
 	it("omits the state line when state or stateCheckedAt is missing", () => {
-		expect(getPullRequestTooltipLines(createPullRequest({ state: "open" }))).toEqual(["cline/kanban#123"]);
-		expect(getPullRequestTooltipLines(createPullRequest({ stateCheckedAt: Date.now() }))).toEqual([
-			"cline/kanban#123",
-		]);
-	});
-
-	it("labels very recent and older snapshots with approximate ages", () => {
 		const now = Date.now();
-		const lines = getPullRequestTooltipLines(createPullRequest({ state: "open", stateCheckedAt: now - 90 * 1000 }));
-		expect(lines[1]).toBe("open as of 1m ago");
-		const daysAgo = getPullRequestTooltipLines(
-			createPullRequest({ state: "closed", stateCheckedAt: now - 3 * DAY_MS }),
-		);
-		expect(daysAgo[1]).toBe("closed as of 3d ago");
+		const created = now - 5 * MINUTE_MS;
+		expect(getPullRequestTooltipLines(createPullRequest({ createdAt: created, state: "open" }))).toEqual([
+			"cline/kanban#123",
+			"First recorded 5m ago",
+			"Last observed (approximate) 5m ago",
+		]);
+		expect(getPullRequestTooltipLines(createPullRequest({ createdAt: created, stateCheckedAt: created }))).toEqual([
+			"cline/kanban#123",
+			"First recorded 5m ago",
+			"Last observed (approximate) 5m ago",
+		]);
 	});
 });

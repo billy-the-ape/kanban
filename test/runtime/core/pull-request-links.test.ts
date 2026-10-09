@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
-
+import type { RuntimeTaskPullRequest } from "../../../src/core/api-contract";
 import type { ParsedPullRequestLink } from "../../../src/core/pull-request-links";
 import {
 	extractPullRequestLinks,
+	getOrderedTaskPullRequests,
+	getPrimaryPullRequest,
 	getPullRequestIdentityKey,
 	parsePullRequestUrl,
 } from "../../../src/core/pull-request-links";
@@ -156,5 +158,102 @@ describe("getPullRequestIdentityKey", () => {
 		expect(getPullRequestIdentityKey({ ...base, provider: "github", number: 2 })).not.toBe(
 			getPullRequestIdentityKey({ ...base, provider: "github" }),
 		);
+	});
+});
+
+function createPullRequest(overrides?: Partial<RuntimeTaskPullRequest>): RuntimeTaskPullRequest {
+	return {
+		provider: "github",
+		host: "github.com",
+		repository: "owner/repo",
+		number: 1,
+		url: "https://github.com/owner/repo/pull/1",
+		source: "manual",
+		createdAt: 1000,
+		...overrides,
+	};
+}
+
+describe("getPrimaryPullRequest", () => {
+	it("returns null for an empty list", () => {
+		expect(getPrimaryPullRequest([])).toBeNull();
+	});
+
+	it("picks the newest first-recorded open entry over older ones", () => {
+		const older = createPullRequest({ number: 1, state: "open", createdAt: 1000 });
+		const newest = createPullRequest({ number: 2, state: "open", createdAt: 3000 });
+		const oldest = createPullRequest({ number: 3, state: "open", createdAt: 2000 });
+		expect(getPrimaryPullRequest([older, newest, oldest])).toBe(newest);
+	});
+
+	it("treats draft and open as the same priority tier", () => {
+		const open = createPullRequest({ number: 1, state: "open", createdAt: 1000 });
+		const draft = createPullRequest({ number: 2, state: "draft", createdAt: 2000 });
+		expect(getPrimaryPullRequest([open, draft])).toBe(draft);
+	});
+
+	it("falls back to unknown-state entries when none are open or draft", () => {
+		const merged = createPullRequest({ number: 1, state: "merged", createdAt: 5000 });
+		const unknown = createPullRequest({ number: 2, createdAt: 1000 });
+		expect(getPrimaryPullRequest([merged, unknown])).toBe(unknown);
+	});
+
+	it("falls back to merged/closed only when no open, draft, or unknown entries exist", () => {
+		const closed = createPullRequest({ number: 1, state: "closed", createdAt: 1000 });
+		const merged = createPullRequest({ number: 2, state: "merged", createdAt: 2000 });
+		expect(getPrimaryPullRequest([closed, merged])).toBe(merged);
+	});
+
+	it("lets an explicit isPrimary win even for a merged or closed entry", () => {
+		const open = createPullRequest({ number: 1, state: "open", createdAt: 9000 });
+		const mergedPrimary = createPullRequest({ number: 2, state: "merged", createdAt: 1000, isPrimary: true });
+		expect(getPrimaryPullRequest([open, mergedPrimary])).toBe(mergedPrimary);
+	});
+
+	it("resolves duplicate explicit flags to the newest first-recorded, latest index on ties", () => {
+		const first = createPullRequest({ number: 1, createdAt: 2000, isPrimary: true });
+		const second = createPullRequest({ number: 2, createdAt: 2000, isPrimary: true });
+		const newest = createPullRequest({ number: 3, createdAt: 3000, isPrimary: true });
+		expect(getPrimaryPullRequest([first, second, newest])).toBe(newest);
+		const tied = [
+			createPullRequest({ number: 4, createdAt: 1000, isPrimary: true }),
+			createPullRequest({ number: 5, createdAt: 1000, isPrimary: true }),
+		];
+		expect(getPrimaryPullRequest(tied)).toBe(tied[1]);
+	});
+
+	it("breaks equal createdAt ties to the later original array index", () => {
+		const earlier = createPullRequest({ number: 1, state: "open", createdAt: 1000 });
+		const later = createPullRequest({ number: 2, state: "open", createdAt: 1000 });
+		expect(getPrimaryPullRequest([earlier, later])).toBe(later);
+	});
+
+	it("never mutates the stored list", () => {
+		const list = [
+			createPullRequest({ number: 1, state: "merged", createdAt: 1000 }),
+			createPullRequest({ number: 2, state: "open", createdAt: 2000 }),
+		];
+		const copy = [...list];
+		getPrimaryPullRequest(list);
+		getOrderedTaskPullRequests(list);
+		expect(list).toEqual(copy);
+	});
+});
+
+describe("getOrderedTaskPullRequests", () => {
+	it("returns an empty array for an empty list", () => {
+		expect(getOrderedTaskPullRequests([])).toEqual([]);
+	});
+
+	it("returns the winner first and the rest in original recorded order", () => {
+		const first = createPullRequest({ number: 1, state: "merged", createdAt: 1000 });
+		const winner = createPullRequest({ number: 2, state: "open", createdAt: 3000 });
+		const third = createPullRequest({ number: 3, state: "open", createdAt: 2000 });
+		expect(getOrderedTaskPullRequests([first, winner, third])).toEqual([winner, first, third]);
+	});
+
+	it("keeps a single-entry list unchanged in order", () => {
+		const only = createPullRequest();
+		expect(getOrderedTaskPullRequests([only])).toEqual([only]);
 	});
 });

@@ -157,6 +157,22 @@ export const runtimeTaskPullRequestSchema = z.object({
 	title: z.string().optional(),
 	state: z.enum(["open", "closed", "merged", "draft"]).optional(),
 	stateCheckedAt: z.number().optional(),
+	/**
+	 * PRLINK-6: last time Kanban successfully observed this PR (capture,
+	 * delivery, branch lookup, manual re-add, or a successful provider
+	 * metadata read). Throttled to at most one advance per 10 minutes; it is
+	 * an observation timestamp, not proof of state freshness. Missing on old
+	 * cards (display falls back to `createdAt`).
+	 */
+	lastSeenAt: z.number().nonnegative().optional(),
+	/**
+	 * PRLINK-6: explicit display-only primary. Never authorizes automation
+	 * (the Automation PR is `selectedAutomationPrKey`, selected separately).
+	 * At most one entry should carry this flag; malformed older data with
+	 * several is resolved deterministically and the next primary mutation
+	 * clears the extras.
+	 */
+	isPrimary: z.boolean().optional(),
 });
 export type RuntimeTaskPullRequest = z.infer<typeof runtimeTaskPullRequestSchema>;
 
@@ -175,6 +191,15 @@ export const runtimeTaskPullRequestLinkResponseSchema = z.object({
 	pullRequest: runtimeTaskPullRequestSchema.nullable(),
 });
 export type RuntimeTaskPullRequestLinkResponse = z.infer<typeof runtimeTaskPullRequestLinkResponseSchema>;
+
+// PRLINK-6: explicit display-only primary. `url: null` clears all explicit
+// primary flags; the response reuses the link-response shape (the selected
+// entry re-read from the board, or null when cleared).
+export const runtimeTaskPullRequestPrimaryRequestSchema = z.object({
+	taskId: z.string(),
+	url: z.string().min(1).max(2048).nullable(),
+});
+export type RuntimeTaskPullRequestPrimaryRequest = z.infer<typeof runtimeTaskPullRequestPrimaryRequestSchema>;
 
 export const runtimeTaskPullRequestsRefreshRequestSchema = z.object({
 	taskId: z.string(),
