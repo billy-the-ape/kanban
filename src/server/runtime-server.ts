@@ -395,7 +395,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				isTaskWriterActive: probeTaskWriterActive,
 				// Resolve the task worktree and probe its relationship to the
 				// task's base branch directly (no remote, no model work).
-				inspectWorktree: async ({ task, baseRef, mergeCommitSha }) => {
+				inspectWorktree: async ({ task, baseRef, baseRepository, mergeCommitSha, finalHeadSha }) => {
 					const workspacePath = deps.workspaceRegistry.getWorkspacePathById(task.workspaceId);
 					if (!workspacePath) {
 						return null;
@@ -408,25 +408,35 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 							baseRef,
 							ensure: false,
 						});
-					} catch {
-						return null;
+					} catch (error) {
+						// Only the specific "no worktree" case means nothing to
+						// reconcile; any other failure is transient and must
+						// retry (pending), never silently skip the
+						// base-branch verification.
+						if (error instanceof Error && error.message.startsWith("Task worktree not found")) {
+							return null;
+						}
+						throw error;
 					}
-					const inspection = await defaultInspectWorktree({
+					return await defaultInspectWorktree({
 						workspacePath,
 						worktreePath,
 						baseRef,
+						baseRepository,
 						mergeCommitSha,
+						finalHeadSha,
 					});
-					return { ...inspection, worktreePath };
 				},
-				// Persist the completion: move the task to Done through the
-				// server-owned board mutation, broadcast + reconcile, then
-				// fire the dispatch pass exactly once so children waiting on
-				// this task release with their retained valid evidence.
+				// Move the task to Done through the server-owned board
+				// mutation (idempotent), broadcast + reconcile, then fire the
+				// dispatch pass exactly once so children waiting on this task
+				// release with their retained valid evidence. Called BEFORE
+				// the completion is persisted, so a failure leaves the binding
+				// untouched and the bounded reconciliation reads retry.
 				completeTask: async (workspaceId, taskId) => {
 					const workspacePath = deps.workspaceRegistry.getWorkspacePathById(workspaceId);
 					if (!workspacePath) {
-						return;
+						throw new Error(`Workspace ${workspaceId} not found; cannot move task ${taskId} to Done.`);
 					}
 					await mutateWorkspaceState<void>(workspacePath, (state) => {
 						const result = completeTaskAndGetReadyLinkedTaskIds(state.board, taskId);

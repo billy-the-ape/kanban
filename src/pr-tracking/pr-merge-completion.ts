@@ -7,22 +7,29 @@
 //   - complete only when the PR is merged on the remote, the task's base
 //     branch contains the merge commit, and the worktree carries no local
 //     commits ahead of that base branch (discarding uncommitted/unpushed
-//     work);
+//     work); the ahead-of-base count excludes the merged PR head so squash
+//     and rebase merges do not read as "local commits";
 //   - block (needs human) when the base branch does not contain the merge
-//     commit or the worktree has clean local commits;
+//     commit or the worktree has clean local commits; states that cannot be
+//     verified yet (unfetched merge commit, unfetched base) stay pending
+//     and retry until the coordinator's bounded reconciliation budget
+//     turns them into "needs human" — never a guessed block;
 //   - stay pending (retry on the next read, bounded by the coordinator's
 //     reconciliation read budget) while a writer session is active or the
 //     merge_completion reservation is held by another task;
 //   - never rearm once a completion or a block is persisted (the binding's
-//     mergeCompletion + terminalStop markers survive restarts);
-//   - a task that was manually reopened from Done after a merge is not sent
-//     back to Done by the SAME merge commit — only a later merge (a
-//     different merge commit) completes it again.
+//     mergeCompletion + terminalStop markers survive restarts); a crash that
+//     persisted the completion but never moved the board is recovered on the
+//     next observation (the move is idempotent);
+//   - a task that was manually reopened from Done after a merge (server-
+//     derived manualReopenAt marker) is not sent back to Done by the SAME
+//     merge commit — only a later merge (a different merge commit) completes
+//     it again.
 //
 // The observation flow per merged PR read:
-//   idempotency checks -> card eligibility -> manual-reopen guard ->
-//   writer check -> reservation -> worktree checks -> persist completion ->
-//   complete the task (which fires the dispatch pass for waiting children).
+//   idempotency checks -> card eligibility -> writer check -> reservation ->
+//   worktree checks -> complete the task (board move + dispatch pass) ->
+//   persist completion (binding + terminal stop).
 import type { GitHubPrMergeCompletion, RuntimeBoardCard, RuntimeBoardColumnId } from "../core/api-contract";
 import { GITHUB_PR_TRACKING_RECORD_SCHEMA_VERSION } from "../core/api-contract";
 import { runGit } from "../workspace/git-utils";
@@ -51,7 +58,11 @@ export interface PrMergeWorktreeInspection {
 	baseContainsMerge: boolean;
 	/** Whether the worktree has uncommitted changes. */
 	dirty: boolean;
-	/** Commits reachable from the worktree HEAD but not from the base branch. */
+	/**
+	 * Commits reachable from the worktree HEAD but neither from the base
+	 * branch nor from the merged PR head (the merged work itself, so squash
+	 * and rebase merges do not read as local commits).
+	 */
 	aheadOfBase: number;
 }
 
@@ -66,58 +77,160 @@ export interface PrMergeCompletionDeps {
 	isTaskWriterActive: (workspaceId: string, taskId: string) => Promise<boolean>;
 	/**
 	 * Persistently move the task to Done and fire the dispatch pass for
-	 * waiting children. Must be idempotent; called AFTER the completion is
-	 * persisted on the binding.
+	 * waiting children. Must be idempotent (a card already in Done is a
+	 * no-op); called BEFORE the completion is persisted on the binding, so
+	 * a failed move leaves the binding untouched and the bounded
+	 * reconciliation reads retry from scratch.
 	 */
 	completeTask: (workspaceId: string, taskId: string) => Promise<void>;
 	/**
 	 * Inspect the task worktree's relationship to its base branch. Null when
-	 * the task has no worktree (nothing to reconcile). Injectable so tests
-	 * avoid real git repositories.
+	 * the task has no worktree (nothing to reconcile; the base-branch
+	 * verification still runs). Injectable so tests avoid real git
+	 * repositories.
 	 */
 	inspectWorktree?: (input: {
 		task: { workspaceId: string; taskId: string };
 		baseRef: string;
+		baseRepository: string | null;
 		mergeCommitSha: string;
+		finalHeadSha: string | null;
 	}) => Promise<PrMergeWorktreeInspection | null>;
 	warn?: (message: string) => void;
 	now?: () => number;
 }
 
 /**
- * Default worktree inspection: resolves the worktree and probes the git
- * repository directly (no remote, no model work).
+ * Default worktree inspection: probes the git repository directly (no
+ * model work). Best-effort fetches the landed merge commit, the PR head and
+ * the base branch from the matching remote so a just-merged PR is
+ * verifiable before the user pulls it. States that cannot be verified
+ * (missing objects, unfetchable remote) throw — the caller turns that into
+ * a retryable pending, never a guessed block.
  */
+const WORKTREE_SYNC_TIMEOUT_MS = 15_000;
+
+async function pickRemoteForBase(workspacePath: string, baseRepository: string | null): Promise<string | null> {
+	const remotes = await runGit(workspacePath, ["remote", "-v"]);
+	if (!remotes.ok || !remotes.stdout) {
+		return null;
+	}
+	const entries: Array<{ name: string; url: string }> = [];
+	for (const line of remotes.stdout.split("\n")) {
+		const [name, url] = line.split("\t");
+		if (name && url) {
+			entries.push({ name, url });
+		}
+	}
+	if (entries.length === 0) {
+		return null;
+	}
+	const wanted = (baseRepository ?? "").trim().toLowerCase();
+	if (wanted) {
+		const match = entries.find((entry) => entry.url.toLowerCase().includes(wanted));
+		if (match) {
+			return match.name;
+		}
+	}
+	const fallback = entries.find((entry) => entry.name === "origin") ?? entries[0];
+	return fallback?.name ?? null;
+}
+
 export async function defaultInspectWorktree(input: {
 	workspacePath: string;
-	worktreePath: string;
+	/** The task worktree to reconcile; null when the task has no worktree. */
+	worktreePath: string | null;
 	baseRef: string;
+	baseRepository: string | null;
 	mergeCommitSha: string;
+	/** The merged PR head commit (used to exclude the merged work from the ahead-of-base count). */
+	finalHeadSha: string | null;
 }): Promise<PrMergeWorktreeInspection> {
-	const baseRefSpec = `${input.baseRef}^{commit}`;
-	const [baseResult, ancestorResult, statusResult, headResult] = await Promise.all([
-		runGit(input.workspacePath, ["rev-parse", baseRefSpec]),
-		runGit(input.workspacePath, ["merge-base", "--is-ancestor", input.mergeCommitSha, baseRefSpec]),
-		runGit(input.worktreePath, ["status", "--porcelain"]),
-		runGit(input.worktreePath, ["rev-parse", "HEAD"]),
-	]);
-	if (!baseResult.ok || !baseResult.stdout) {
-		throw new Error(`Cannot resolve base branch "${input.baseRef}": ${baseResult.error ?? "unknown git error"}`);
+	const { workspacePath, worktreePath, baseRef, mergeCommitSha, finalHeadSha } = input;
+	const localBase = await runGit(workspacePath, ["rev-parse", `${baseRef}^{commit}`]);
+	if (!localBase.ok || !localBase.stdout) {
+		throw new Error(`Cannot resolve base branch "${baseRef}": ${localBase.error ?? "unknown git error"}`);
 	}
-	const baseSha = baseResult.stdout;
-	const aheadResult = await runGit(input.worktreePath, ["rev-list", "--count", `${baseSha}..HEAD`]);
-	if (!aheadResult.ok || !aheadResult.stdout) {
-		throw new Error(`Cannot count worktree commits ahead of base: ${aheadResult.error ?? "unknown git error"}`);
+	// Best-effort sync before verifying: fetch the landed merge commit and
+	// the PR head (objects only), then the base branch (updates the
+	// remote-tracking ref). A missing remote or a failed fetch falls back to
+	// whatever is local; the availability checks below decide whether the
+	// result is verifiable or a retryable pending.
+	let baseSha = localBase.stdout;
+	const remote = await pickRemoteForBase(workspacePath, input.baseRepository);
+	if (remote) {
+		const wantedObjects: string[] = [mergeCommitSha];
+		if (finalHeadSha && finalHeadSha !== mergeCommitSha) {
+			wantedObjects.push(finalHeadSha);
+		}
+		const objectFetch = await runGit(workspacePath, ["fetch", remote, ...wantedObjects], {
+			timeoutMs: WORKTREE_SYNC_TIMEOUT_MS,
+		});
+		const baseFetch = await runGit(workspacePath, ["fetch", remote, baseRef], {
+			timeoutMs: WORKTREE_SYNC_TIMEOUT_MS,
+		});
+		if (objectFetch.ok || baseFetch.ok) {
+			const remoteTracking = await runGit(workspacePath, [
+				"rev-parse",
+				"--verify",
+				`refs/remotes/${remote}/${baseRef}^{commit}`,
+			]);
+			if (remoteTracking.ok && remoteTracking.stdout) {
+				baseSha = remoteTracking.stdout;
+			}
+		}
+	}
+	// Object-existence probes use `cat-file -e`: `rev-parse --verify` accepts a
+	// well-formed 40-hex string even when the object does not exist locally.
+	const mergeCommitLocal = await runGit(workspacePath, ["cat-file", "-e", mergeCommitSha]);
+	if (!mergeCommitLocal.ok) {
+		throw new Error(
+			`Merge commit ${mergeCommitSha} is not available locally; retry once it has been fetched or pulled.`,
+		);
+	}
+	const ancestorResult = await runGit(workspacePath, ["merge-base", "--is-ancestor", mergeCommitSha, baseSha]);
+	const baseContainsMerge = ancestorResult.ok;
+	let worktreeHead: string | null = null;
+	let dirty = false;
+	let aheadOfBase = 0;
+	if (worktreePath) {
+		const [statusResult, headResult] = await Promise.all([
+			runGit(worktreePath, ["status", "--porcelain"]),
+			runGit(worktreePath, ["rev-parse", "HEAD"]),
+		]);
+		worktreeHead = headResult.ok ? headResult.stdout || null : null;
+		dirty = statusResult.ok ? statusResult.stdout.length > 0 : false;
+		// Exclude the merged PR head: after a squash or rebase merge the
+		// task's own commits are NOT ancestors of the landed commit, so a
+		// plain base..HEAD count would flag every squash/rebase merge as
+		// local work. The exclusion needs the head commit locally; without
+		// it the count is unverifiable (retryable pending), not a guess.
+		if (!finalHeadSha) {
+			throw new Error("The merged PR head commit is unavailable; the local-ahead count cannot be verified.");
+		}
+		const headLocal = await runGit(workspacePath, ["cat-file", "-e", finalHeadSha]);
+		if (!headLocal.ok) {
+			throw new Error(`PR head ${finalHeadSha} is not available locally; retry once it has been fetched or pulled.`);
+		}
+		const aheadResult = await runGit(worktreePath, [
+			"rev-list",
+			"--count",
+			`${baseSha}..HEAD`,
+			"--not",
+			finalHeadSha,
+		]);
+		if (!aheadResult.ok || !aheadResult.stdout) {
+			throw new Error(`Cannot count worktree commits ahead of base: ${aheadResult.error ?? "unknown git error"}`);
+		}
+		aheadOfBase = Number(aheadResult.stdout) || 0;
 	}
 	return {
-		worktreePath: input.worktreePath,
-		worktreeHead: headResult.ok ? headResult.stdout || null : null,
+		worktreePath,
+		worktreeHead,
 		baseSha,
-		// A missing/unknown merge commit reports exit 1 exactly like
-		// "not an ancestor"; both mean the base does not contain it.
-		baseContainsMerge: ancestorResult.ok,
-		dirty: statusResult.ok ? statusResult.stdout.length > 0 : false,
-		aheadOfBase: Number(aheadResult.stdout) || 0,
+		baseContainsMerge,
+		dirty,
+		aheadOfBase,
 	};
 }
 
@@ -178,19 +291,6 @@ export async function reconcileMergeCompletion(
 		return { action: "skipped", reason: "not_merged" };
 	}
 	const mergeCommitSha = metadata.mergeCommitSha;
-	// Idempotency + manual-reopen guard: the SAME merge commit was already
-	// consumed for this binding. A task manually reopened from Done is not
-	// sent back to Done by the same merged PR; a later merge (a different
-	// merge commit) completes it again.
-	const prior = binding.mergeCompletion;
-	if (
-		prior !== null &&
-		prior.status === "completed" &&
-		mergeCommitSha !== null &&
-		prior.mergeCommitSha === mergeCommitSha
-	) {
-		return { action: "skipped", reason: "merge_already_consumed" };
-	}
 	const found = await deps.getTaskCard(task.workspaceId, task.taskId);
 	if (!found) {
 		return { action: "skipped", reason: "task_missing" };
@@ -208,6 +308,23 @@ export async function reconcileMergeCompletion(
 		// turns a persistent gap into "needs human").
 		return { action: "pending", reason: "merge_commit_unavailable" };
 	}
+	// Idempotency + manual-reopen guard, with crash recovery. The SAME merge
+	// commit was already consumed for this binding and the card is in an
+	// active column (Done/Trash skip above). The server-derived manualReopenAt
+	// marker means a human reopened it from Done — do not send it back.
+	// Without the marker the board move never landed (crash after the
+	// completion persisted): fall through and re-run the idempotent
+	// completion so the straggler reaches Done.
+	const prior = binding.mergeCompletion;
+	if (
+		prior !== null &&
+		prior.status === "completed" &&
+		prior.mergeCommitSha !== null &&
+		prior.mergeCommitSha === mergeCommitSha &&
+		card.manualReopenAt !== undefined
+	) {
+		return { action: "skipped", reason: "merge_already_consumed" };
+	}
 	const writerActive = await deps.isTaskWriterActive(task.workspaceId, task.taskId).catch(() => true);
 	if (writerActive) {
 		return { action: "pending", reason: "writer_active" };
@@ -223,10 +340,17 @@ export async function reconcileMergeCompletion(
 	}
 	const releaseHeld = true;
 	try {
-		// Worktree checks (a missing worktree means nothing to reconcile).
+		// Worktree checks (a missing worktree still verifies the base branch).
 		let inspection: PrMergeWorktreeInspection | null = null;
 		try {
-			inspection = (await deps.inspectWorktree?.({ task, baseRef: card.baseRef, mergeCommitSha })) ?? null;
+			inspection =
+				(await deps.inspectWorktree?.({
+					task,
+					baseRef: card.baseRef,
+					baseRepository: metadata.baseRepository ?? null,
+					mergeCommitSha,
+					finalHeadSha: metadata.headSha ?? null,
+				})) ?? null;
 		} catch (error) {
 			warn(`PR merge completion worktree inspection failed for ${task.taskId}: ${String(error)}`);
 			return { action: "pending", reason: "worktree_inspection_failed" };
@@ -285,9 +409,18 @@ export async function reconcileMergeCompletion(
 				}
 			}
 		}
-		// Persist the completion BEFORE completing the task: a crash in
-		// between the two still never double-completes (the binding is the
-		// idempotency source of truth).
+		// Board move FIRST, then persist: the move is idempotent (a Done card
+		// is a no-op), so a failed move leaves the binding untouched and the
+		// coordinator's bounded reconciliation reads retry from scratch — no
+		// stranded card. A crash after the persist is recovered by the
+		// manual-reopen guard (active column without manualReopenAt re-runs
+		// this idempotent completion).
+		try {
+			await deps.completeTask(task.workspaceId, task.taskId);
+		} catch (error) {
+			warn(`PR merge completion move failed for ${task.taskId}: ${String(error)}`);
+			return { action: "pending", reason: "complete_move_failed" };
+		}
 		const write = await deps.store.updateTaskBinding(prKey, task, undefined, (item) => ({
 			...item,
 			mergeCompletion: buildMergeCompletion({
@@ -306,7 +439,6 @@ export async function reconcileMergeCompletion(
 			observedAt: now,
 			reconciliationReads: binding.terminalStop?.reconciliationReads ?? 0,
 		});
-		await deps.completeTask(task.workspaceId, task.taskId);
 		return { action: "completed" };
 	} finally {
 		if (releaseHeld) {

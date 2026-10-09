@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { GitHubPrMetadataSnapshot, RuntimeBoardCard } from "../../../src/core/api-contract";
+import type { GitHubPrMetadataSnapshot, RuntimeBoardCard, RuntimeBoardColumnId } from "../../../src/core/api-contract";
+import { GITHUB_PR_TRACKING_RECORD_SCHEMA_VERSION } from "../../../src/core/api-contract";
 import type {
 	AccessScope,
 	AccessScopeResult,
@@ -101,20 +102,35 @@ function makeObservation(
 	};
 }
 
+interface TestBoardState {
+	columnId: RuntimeBoardColumnId;
+	manualReopenAt?: number;
+}
+
 interface TestDeps extends PrMergeCompletionDeps {
 	completeCalls: Array<{ workspaceId: string; taskId: string }>;
 	warnings: string[];
+	/** Simulate server-side board transitions (manual reopen, moves). */
+	setBoard: (state: TestBoardState) => void;
 }
 
 function makeDeps(store: InMemoryPrRecordStore, overrides: Partial<PrMergeCompletionDeps> = {}): TestDeps {
 	const completeCalls: Array<{ workspaceId: string; taskId: string }> = [];
 	const warnings: string[] = [];
-	return {
+	// Server board mirror: completeTask moves the card to Done (idempotently)
+	// and clears the manual-reopen marker, as moveTaskToColumn does.
+	const board: TestBoardState = { columnId: "review" };
+	const deps: TestDeps = {
 		store,
-		getTaskCard: async () => ({ card: makeCard(), columnId: "review" }),
+		getTaskCard: async () => ({
+			card: makeCard({ manualReopenAt: board.manualReopenAt }),
+			columnId: board.columnId,
+		}),
 		isTaskWriterActive: async () => false,
 		completeTask: async (workspaceId, taskId) => {
 			completeCalls.push({ workspaceId, taskId });
+			board.columnId = "done";
+			delete board.manualReopenAt;
 		},
 		warn: (message) => {
 			warnings.push(message);
@@ -122,8 +138,17 @@ function makeDeps(store: InMemoryPrRecordStore, overrides: Partial<PrMergeComple
 		now: () => NOW,
 		completeCalls,
 		warnings,
+		setBoard: (state) => {
+			board.columnId = state.columnId;
+			if (state.manualReopenAt !== undefined) {
+				board.manualReopenAt = state.manualReopenAt;
+			} else {
+				delete board.manualReopenAt;
+			}
+		},
 		...overrides,
 	};
+	return deps;
 }
 
 async function loadRecord(store: InMemoryPrRecordStore) {
@@ -159,22 +184,97 @@ describe("pr-merge-completion consumer", () => {
 	it("completes again only for a LATER merge (a different merge commit)", async () => {
 		const store = await makeStore();
 		const deps = makeDeps(store);
-		await reconcileMergeCompletion(makeObservation(await loadRecord(store)), deps);
+		await expect(reconcileMergeCompletion(makeObservation(await loadRecord(store)), deps)).resolves.toEqual({
+			action: "completed",
+		});
 		expect(deps.completeCalls.length).toBe(1);
 
-		// The same merge commit again (e.g. a redelivered read after restart)
-		// never re-completes.
+		// The same merge commit again (e.g. a redelivered read after restart):
+		// the card is already Done (the move lands before the persist), so
+		// there is nothing to do.
 		const second = makeObservation(await loadRecord(store));
 		await expect(reconcileMergeCompletion(second, deps)).resolves.toEqual({
+			action: "skipped",
+			reason: "inactive_column",
+		});
+		expect(deps.completeCalls.length).toBe(1);
+
+		// A manual reopen from Done (server-derived manualReopenAt marker):
+		// the SAME merge commit must not send it back to Done.
+		deps.setBoard({ columnId: "review", manualReopenAt: NOW });
+		await expect(reconcileMergeCompletion(makeObservation(await loadRecord(store)), deps)).resolves.toEqual({
 			action: "skipped",
 			reason: "merge_already_consumed",
 		});
 		expect(deps.completeCalls.length).toBe(1);
 
-		// A later merge (new merge commit) completes the task again.
+		// A later merge (a new merge commit) completes the task again.
 		const later = makeObservation(await loadRecord(store), makeMergedMetadata({ mergeCommitSha: "mergesha2" }));
 		await expect(reconcileMergeCompletion(later, deps)).resolves.toEqual({ action: "completed" });
 		expect(deps.completeCalls.length).toBe(2);
+	});
+
+	it("a failed board move stays pending and leaves the binding untouched (retry from scratch)", async () => {
+		const store = await makeStore();
+		const deps = makeDeps(store, {
+			completeTask: async () => {
+				throw new Error("board save failed");
+			},
+		});
+		await expect(reconcileMergeCompletion(makeObservation(await loadRecord(store)), deps)).resolves.toEqual({
+			action: "pending",
+			reason: "complete_move_failed",
+		});
+		const record = await loadRecord(store);
+		expect(record.taskBindings[0].mergeCompletion).toBeNull();
+		expect(record.taskBindings[0].terminalStop).toBeNull();
+		expect(record.reservation.state).toBe("none");
+		expect(deps.completeCalls.length).toBe(0);
+		// The next read retries the whole flow from scratch.
+		const deps2 = makeDeps(store);
+		await expect(reconcileMergeCompletion(makeObservation(await loadRecord(store)), deps2)).resolves.toEqual({
+			action: "completed",
+		});
+	});
+
+	it("recovers a crash straggler: completion persisted but the board move never landed", async () => {
+		const store = await makeStore();
+		// Simulate a crash after the completion + terminal stop persisted but
+		// before the board move landed: the binding records the consumed
+		// merge commit, the card is still In Review, and no manual-reopen
+		// marker exists.
+		await store.updateTaskBinding(PR_KEY, TASK, undefined, (item) => ({
+			...item,
+			mergeCompletion: {
+				schemaVersion: GITHUB_PR_TRACKING_RECORD_SCHEMA_VERSION,
+				workspaceId: TASK.workspaceId,
+				taskId: TASK.taskId,
+				linkGeneration: item.linkGeneration,
+				prKey: PR_KEY,
+				finalHeadSha: "headsha1",
+				baseRepository: "cline/kanban",
+				baseRef: "main",
+				mergeCommitSha: "mergesha1",
+				mergedAt: NOW - 1000,
+				observedAt: NOW,
+				status: "completed",
+				completedAt: NOW,
+				error: null,
+			},
+		}));
+		await store.setTaskTerminalStop(PR_KEY, TASK, {
+			reason: "merged_completed",
+			observedAt: NOW,
+			reconciliationReads: 0,
+		});
+
+		const deps = makeDeps(store);
+		await expect(reconcileMergeCompletion(makeObservation(await loadRecord(store)), deps)).resolves.toEqual({
+			action: "completed",
+		});
+		expect(deps.completeCalls).toEqual([TASK]);
+		const record = await loadRecord(store);
+		expect(record.taskBindings[0].mergeCompletion?.mergeCommitSha).toBe("mergesha1");
 	});
 
 	it("skips when the preference is off, the task is missing, or the task is in an inactive column", async () => {

@@ -226,17 +226,23 @@ Implemented in `feat/merge-tracking` (single PR, per the boundary above):
 - **Consumer module** `src/pr-tracking/pr-merge-completion.ts`:
   `reconcileMergeCompletion` runs the observation flow (idempotency/manual-reopen
   guard on the persisted binding's `mergeCompletion` — the same merge commit is
-  consumed at most once; a later merge commit completes again), card eligibility
+  consumed at most once; a later merge commit completes again; a card in an
+  active column without the server-derived `manualReopenAt` marker is a crash
+  straggler and re-runs the idempotent completion), card eligibility
   (`autoFinishOnMerge` + In Progress/In Review only), writer quiescence probe,
   fenced `merge_completion` reservation (released in `finally` on every outcome),
   worktree inspection (base branch must contain the merge commit; no clean local
-  commits ahead of base), hard reset of a dirty worktree to the base branch,
-  then persists `mergeCompletion: completed` + terminal stop `merged_completed`
-  BEFORE completing the task. Blocks persist `blocked` + `merged_unresolved`
-  (needs human); busy writer/reservation or failed writes stay pending and retry
-  on the next read (bounded by the coordinator's reconciliation read budget).
-  `registerMergeCompletionConsumer` installs the single consumer with
-  `requiredReadSources = [metadata]`.
+  commits ahead of base — the ahead count excludes the merged PR head so
+  squash/rebase merges do not read as local work), hard reset of a dirty worktree
+  to the base branch, then moves the task to Done BEFORE persisting
+  `mergeCompletion: completed` + terminal stop `merged_completed` (the move is
+  idempotent, so a failed move leaves the binding untouched and the bounded
+  reconciliation reads retry from scratch — no stranded card). Blocks persist
+  `blocked` + `merged_unresolved` (needs human); busy writer/reservation or
+  unverifiable states (unfetched merge commit / PR head, unfetchable base,
+  failing writes) stay pending and retry on the next read, bounded by the
+  coordinator's reconciliation read budget. `registerMergeCompletionConsumer`
+  installs the single consumer with `requiredReadSources = [metadata]`.
 - **Observation delivery** `src/pr-tracking/pr-consumer-registry.ts` +
   `src/pr-tracking/pr-tracking-coordinator.ts`: the coordinator accepts an
   optional `consumerRegistry` and delivers one observation per active task
@@ -250,9 +256,12 @@ Implemented in `feat/merge-tracking` (single PR, per the boundary above):
   broadcasts the updated workspace state, then fires the dispatch pass exactly
   once so waiting children release with their retained valid evidence. The
   worktree seam resolves `resolveTaskCwd` (no ensure) + `defaultInspectWorktree`
-  (direct git probes: `rev-parse`, `merge-base --is-ancestor`,
-  `status --porcelain`, `rev-list --count`); a missing worktree means nothing to
-  reconcile.
+  (direct git probes: best-effort remote fetch of the merge commit, PR head and
+  base branch; `cat-file -e` object-existence checks; `rev-parse`,
+  `merge-base --is-ancestor`, `status --porcelain`, `rev-list --count` excluding
+  the merged PR head); only the specific "no worktree" case means nothing to
+  reconcile — any other resolution failure retries (pending), and a missing
+  workspace path makes the board move throw so the episode retries.
 - **Manual-reopen marker**: server-owned `manualReopenAt` on the card
   (`src/core/task-board-mutations.ts` sets it on Done → In Review and clears it on
   Done/Trash; `src/state/workspace-state.ts` re-derives it server-side at save so
@@ -266,9 +275,16 @@ Implemented in `feat/merge-tracking` (single PR, per the boundary above):
 - **Tests** `test/runtime/pr-tracking/pr-merge-completion.test.ts`: completion,
   idempotency + later-merge re-completion, preference/column/task-missing skips,
   writer-active pending, reservation contention + release, both block reasons,
-  failing inspection pending, dirty-worktree reset failure pending, plus
+  failing inspection pending, failed board move pending (binding untouched),
+  crash-straggler recovery, dirty-worktree reset failure pending, plus
   coordinator delivery (observation delivered to the installed consumer during a
   real poll cycle; no completion when no consumer is installed).
+  `test/runtime/pr-tracking/pr-merge-worktree-inspection.test.ts` exercises
+  `defaultInspectWorktree` against real local git repositories: merge-commit,
+  squash and rebase landed merges (the PR work is never counted as local
+  commits), genuine local commits ahead, a base lacking the merge commit,
+  unverifiable states (missing objects, missing PR head) throwing retryable,
+  and a stale local base verified through a best-effort remote fetch.
 
 Remaining verification items (require a live environment, not covered by the
 committed tests): the real-Git-repository dispatch matrix (merge/squash/rebase
