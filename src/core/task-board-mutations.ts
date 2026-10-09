@@ -26,6 +26,10 @@ export interface RuntimeCreateTaskInput {
 	baseRef: string;
 	/** UPD-0: missing values normalize to true; an explicit false is persisted as false. */
 	updateBaseRefBeforeStart?: boolean;
+	/** PRTRACK-1: "Auto address comments"; default false, not persisted when omitted. */
+	autoAddressComments?: boolean;
+	/** PRTRACK-1: "Auto complete task when PR is merged"; default false, not persisted when omitted. */
+	autoFinishOnMerge?: boolean;
 }
 
 export interface RuntimeUpdateTaskInput {
@@ -335,6 +339,9 @@ export function addTaskToColumn(
 		baseRef,
 		// UPD-0: missing normalizes to true; explicit false survives.
 		updateBaseRefBeforeStart: input.updateBaseRefBeforeStart !== false,
+		// PRTRACK-1: persist explicit preferences only; omitted reads as false.
+		...(input.autoAddressComments !== undefined ? { autoAddressComments: input.autoAddressComments } : {}),
+		...(input.autoFinishOnMerge !== undefined ? { autoFinishOnMerge: input.autoFinishOnMerge } : {}),
 		createdAt: now,
 		updatedAt: now,
 	};
@@ -583,6 +590,15 @@ export function moveTaskToColumn(
 		...task,
 		updatedAt: now,
 	};
+	// MERGE-1: persist the manual-reopen marker before the task is exposed
+	// in In Review, so the same merged PR does not immediately send it back
+	// to Done (a later merge still completes it). The marker clears when
+	// the task settles in Done or Trash.
+	if (found.columnId === "done" && targetColumnId === "review") {
+		movedTask.manualReopenAt = now;
+	} else if (targetColumnId === "done" || targetColumnId === "trash") {
+		delete movedTask.manualReopenAt;
+	}
 	const targetCards =
 		targetColumnId === "trash" || targetColumnId === "done"
 			? [movedTask, ...targetColumn.cards]
@@ -858,7 +874,23 @@ export function removeTaskPullRequest(
 	if (nextPullRequests.length === existing.length) {
 		return { board, task, removed: false };
 	}
-	const nextTask: RuntimeBoardCard = { ...task, pullRequests: nextPullRequests, updatedAt: now };
+	// PRTRACK-1: if the removed link was the card's selected automation PR,
+	// the selection is dangling — clear it (and bump the settings revision)
+	// so the card reads as unselected instead of keeping demand/gates alive
+	// through a selection that no longer matches any link.
+	const selection = task.selectedAutomationPrKey;
+	const selectionRemoved = selection === identityKey;
+	const nextTask: RuntimeBoardCard = {
+		...task,
+		pullRequests: nextPullRequests,
+		...(selectionRemoved
+			? { selectedAutomationPrKey: undefined, settingsRevision: (task.settingsRevision ?? 0) + 1 }
+			: {}),
+		updatedAt: now,
+	};
+	if (selectionRemoved) {
+		delete nextTask.selectedAutomationPrKey;
+	}
 	return {
 		board: replaceTaskCard(board, normalizedTaskId, nextTask),
 		task: nextTask,
@@ -922,38 +954,170 @@ export function updateTaskPullRequestSnapshot(
 	};
 }
 
-// --- COMMENT-0: auto address comments preference ------------------------------
+// --- PRTRACK-1: server-owned PR automation settings -------------------------
 
-export interface RuntimeSetTaskAutoAddressCommentsResult {
+export interface RuntimeTaskPrSettingsInput {
+	/** undefined = keep current; explicit boolean overwrites. */
+	autoAddressComments?: boolean;
+	/** undefined = keep current; explicit boolean overwrites. */
+	autoFinishOnMerge?: boolean;
+	/** Must equal the card's current settingsRevision (absent reads as 0). */
+	expectedSettingsRevision?: number;
+}
+
+export interface RuntimeUpdateTaskPrSettingsResult {
 	board: RuntimeBoardData;
 	task: RuntimeBoardCard | null;
-	changed: boolean;
+	updated: boolean;
+	/** True when expectedSettingsRevision did not match the stored revision. */
+	conflict: boolean;
+	settingsRevision: number;
+	autoAddressComments: boolean;
+	autoFinishOnMerge: boolean;
+	selectedAutomationPrKey: string | null;
 }
 
 /**
- * Sets the server-owned `autoAddressComments` preference on a card. Missing
- * values normalize to false; an unchanged preference is a no-op so repeated
- * saves do not bump the workspace revision.
+ * The dedicated revision-checked settings mutation. Never called from the
+ * whole-board save path: `saveWorkspaceState` carries the stored values over,
+ * and this mutation is the only writer of the settings block.
  */
+export function updateTaskPrSettings(
+	board: RuntimeBoardData,
+	taskId: string,
+	input: RuntimeTaskPrSettingsInput,
+	now: number = Date.now(),
+): RuntimeUpdateTaskPrSettingsResult {
+	const normalizedTaskId = taskId.trim();
+	const found = normalizedTaskId ? findTaskLocation(board, normalizedTaskId) : null;
+	const base = (task: RuntimeBoardCard): RuntimeUpdateTaskPrSettingsResult => ({
+		board,
+		task,
+		updated: false,
+		conflict: false,
+		settingsRevision: task.settingsRevision ?? 0,
+		autoAddressComments: task.autoAddressComments === true,
+		autoFinishOnMerge: task.autoFinishOnMerge === true,
+		selectedAutomationPrKey: task.selectedAutomationPrKey ?? null,
+	});
+	if (!found) {
+		return {
+			board,
+			task: null,
+			updated: false,
+			conflict: false,
+			settingsRevision: 0,
+			autoAddressComments: false,
+			autoFinishOnMerge: false,
+			selectedAutomationPrKey: null,
+		};
+	}
+	const task = found.task;
+	const currentRevision = task.settingsRevision ?? 0;
+	if (typeof input.expectedSettingsRevision === "number" && input.expectedSettingsRevision !== currentRevision) {
+		return { ...base(task), conflict: true };
+	}
+	if (input.autoAddressComments === undefined && input.autoFinishOnMerge === undefined) {
+		return base(task);
+	}
+	const nextTask: RuntimeBoardCard = {
+		...task,
+		autoAddressComments:
+			input.autoAddressComments === undefined ? task.autoAddressComments === true : input.autoAddressComments,
+		autoFinishOnMerge:
+			input.autoFinishOnMerge === undefined ? task.autoFinishOnMerge === true : input.autoFinishOnMerge,
+		settingsRevision: currentRevision + 1,
+		updatedAt: now,
+	};
+	return {
+		board: replaceTaskCard(board, normalizedTaskId, nextTask),
+		task: nextTask,
+		updated: true,
+		conflict: false,
+		settingsRevision: nextTask.settingsRevision ?? currentRevision + 1,
+		autoAddressComments: nextTask.autoAddressComments === true,
+		autoFinishOnMerge: nextTask.autoFinishOnMerge === true,
+		selectedAutomationPrKey: nextTask.selectedAutomationPrKey ?? null,
+	};
+}
+
+export interface RuntimeSetTaskSelectedAutomationPrResult {
+	board: RuntimeBoardData;
+	task: RuntimeBoardCard | null;
+	changed: boolean;
+	conflict: boolean;
+	settingsRevision: number;
+	selectedAutomationPrKey: string | null;
+}
+
+/**
+ * Sets (or clears, with null) the one selected Automation PR. The selection
+ * is part of the settings block, so it shares its revision.
+ */
+export function setTaskSelectedAutomationPr(
+	board: RuntimeBoardData,
+	taskId: string,
+	prKey: string | null,
+	expectedSettingsRevision?: number,
+	now: number = Date.now(),
+): RuntimeSetTaskSelectedAutomationPrResult {
+	const normalizedTaskId = taskId.trim();
+	const found = normalizedTaskId ? findTaskLocation(board, normalizedTaskId) : null;
+	if (!found) {
+		return { board, task: null, changed: false, conflict: false, settingsRevision: 0, selectedAutomationPrKey: null };
+	}
+	const task = found.task;
+	const currentRevision = task.settingsRevision ?? 0;
+	if (typeof expectedSettingsRevision === "number" && expectedSettingsRevision !== currentRevision) {
+		return {
+			board,
+			task,
+			changed: false,
+			conflict: true,
+			settingsRevision: currentRevision,
+			selectedAutomationPrKey: task.selectedAutomationPrKey ?? null,
+		};
+	}
+	const currentKey = task.selectedAutomationPrKey ?? null;
+	if (currentKey === prKey) {
+		return {
+			board,
+			task,
+			changed: false,
+			conflict: false,
+			settingsRevision: currentRevision,
+			selectedAutomationPrKey: currentKey,
+		};
+	}
+	const nextTask: RuntimeBoardCard = { ...task };
+	if (prKey === null) {
+		delete nextTask.selectedAutomationPrKey;
+	} else {
+		nextTask.selectedAutomationPrKey = prKey;
+	}
+	nextTask.settingsRevision = currentRevision + 1;
+	nextTask.updatedAt = now;
+	return {
+		board: replaceTaskCard(board, normalizedTaskId, nextTask),
+		task: nextTask,
+		changed: true,
+		conflict: false,
+		settingsRevision: nextTask.settingsRevision ?? currentRevision + 1,
+		selectedAutomationPrKey: nextTask.selectedAutomationPrKey ?? null,
+	};
+}
+
+/** COMMENT-0 compatibility endpoint uses the shared PR settings revision. */
 export function setTaskAutoAddressComments(
 	board: RuntimeBoardData,
 	taskId: string,
 	enabled: boolean,
 	now: number = Date.now(),
-): RuntimeSetTaskAutoAddressCommentsResult {
-	const normalizedTaskId = taskId.trim();
-	const found = normalizedTaskId ? findTaskLocation(board, normalizedTaskId) : null;
-	if (!found) {
-		return { board, task: null, changed: false };
+): { board: RuntimeBoardData; task: RuntimeBoardCard | null; changed: boolean } {
+	const task = findTaskLocation(board, taskId.trim())?.task;
+	if (!task || (task.autoAddressComments === true) === enabled) {
+		return { board, task: task ?? null, changed: false };
 	}
-	const task = found.task;
-	if ((task.autoAddressComments === true) === enabled) {
-		return { board, task, changed: false };
-	}
-	const nextTask: RuntimeBoardCard = { ...task, autoAddressComments: enabled, updatedAt: now };
-	return {
-		board: replaceTaskCard(board, normalizedTaskId, nextTask),
-		task: nextTask,
-		changed: true,
-	};
+	const result = updateTaskPrSettings(board, taskId, { autoAddressComments: enabled }, now);
+	return { board: result.board, task: result.task, changed: result.updated };
 }

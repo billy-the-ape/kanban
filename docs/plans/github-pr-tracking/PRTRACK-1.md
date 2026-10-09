@@ -7,9 +7,9 @@ represents a single PR.
 
 | Field | Value |
 | --- | --- |
-| Document revision | 1 |
+| Document revision | 6 |
 | Prepared | 2026-10-06 |
-| Status | planned; no milestone started |
+| Status | implemented in this worktree (branch targets `feat/pr-tracking-base`) |
 | Source baseline | 49a2ca05c6c2927da2194aaec8bd1e45e6fa2928 (main) |
 | Fork | https://github.com/billy-the-ape/kanban |
 | Prerequisites | PRTRACK-0 (FOUNDATION-0) landed: record store, gh adapter, read-only coordinator; PR #49 PR-linking contracts landed (through PRTRACK-0's prerequisite) |
@@ -174,7 +174,7 @@ Explicit non-goals:
 
 ## Implementation tasks (in this order)
 
-- [ ] PRTRACK-1.1 **Revision-checked preference and selection APIs.** Add
+- [x] PRTRACK-1.1 **Revision-checked preference and selection APIs.** Add
       `autoAddressComments`, `autoFinishOnMerge`, `selectedAutomationPrKey`, and
       `settingsRevision` to the board card contract (all optional; absent reads as false /
       unset). Implement a dedicated revision-checked task-settings mutation through
@@ -192,7 +192,7 @@ Explicit non-goals:
       read). If the installed-consumer list is carried in `RuntimeConfigResponse`, remember
       the `as unknown as` mock trap (uncast test mocks bypass tsc and crash at render time).
       No selected-PR tracking state in browser localStorage.
-- [ ] PRTRACK-1.2 **Consumer registry and frozen API surface.** Implement
+- [x] PRTRACK-1.2 **Consumer registry and frozen API surface.** Implement
       `registerConsumer(kind, capabilities)` / `unregisterConsumer` with per-consumer required
       read sources — demand rule: both consumers request metadata; only the comment consumer
       requests feedback/review/thread reads; a comment-only task needs no further recurring
@@ -205,7 +205,7 @@ Explicit non-goals:
       on each task binding in the PR record; events are hints and consumers reconcile
       authoritative state on startup. This registry is the "installed consumers" input for
       1.3 and must land before it.
-- [ ] PRTRACK-1.3 **Live task-derived subscriptions.** Replace PRTRACK-0's fake subscriptions
+- [x] PRTRACK-1.3 **Live task-derived subscriptions.** Replace PRTRACK-0's fake subscriptions
       as the production demand source (they remain the test seam for the coordinator suites —
       do not delete the PRTRACK-0 tests): on startup enumerate current managed workspaces/cards,
       validate links/preferences, join
@@ -220,7 +220,7 @@ Explicit non-goals:
       boards must not hold a workspace lock across any network call. A fetched result is
       applied only after rereading task settings, linkage, and current revision; in-flight
       responses revalidate each consumer before applying state or scheduling effects.
-- [ ] PRTRACK-1.4 **Owner selection, transfer, and reservations.** Durable repair-owner
+- [~] PRTRACK-1.4 **Owner selection, transfer, and reservations** *(partial — see "Deferred to the consumer PRs" in Handoff).* Durable repair-owner
       selection: exactly-one-candidate atomic assignment; multi-candidate "Choose repair owner"
       ambiguity block; revision-checked **Repair owner** selector listing linked tasks with
       workspace labels; owner validity requires the task selects this PR and has a verified
@@ -256,7 +256,7 @@ Explicit non-goals:
       requests safe cancellation of live tracked operations, preserving unpublished work.
       External tools outside Kanban cannot be locked: compare remote/local state and stop on
       drift.
-- [ ] PRTRACK-1.5 **Task lifecycle gates.** Shared arbitration: when either installed enabled
+- [~] PRTRACK-1.5 **Task lifecycle gates** *(partial — see "Deferred to the consumer PRs" in Handoff).* Shared arbitration: when either installed enabled
       consumer owns a linked PR workflow, legacy automatic clean-tree/PR-delivery completion
       cannot run (browser auto-actions, CLI, and deterministic delivery all gated); manual
       completion retains existing safeguards including preserved Done → Review movement.
@@ -270,7 +270,7 @@ Explicit non-goals:
       quiescence using `subscribeTerminalInvalidation` plus an exclusive
       `reservePrOperation` — they never call a comment-service API. The gate must work with
       zero real consumers installed (fake consumers in tests).
-- [ ] PRTRACK-1.6 **UI.** Both checkboxes in task create/edit and detail settings, independent,
+- [x] PRTRACK-1.6 **UI.** Both checkboxes in task create/edit and detail settings, independent,
       default false, editable throughout In Progress and In Review including queued tasks,
       subject to the consumer being installed; enabled choice with no PR shows "Waiting for
       linked PR"; the installed-consumer/capability signal comes from `getTaskTrackingState`
@@ -285,7 +285,7 @@ Explicit non-goals:
       on confirmed open/draft + eligibility); snapshots labelled as of a time; all blockers in
       the existing detail warning/status surfaces with concise reasons. Tailwind tokens,
       `@/components/ui` primitives, `lucide-react` icons; conditional state via `cn()`.
-- [ ] PRTRACK-1.7 **Fake-consumer and task lifecycle integration tests.** Cover the acceptance
+- [~] PRTRACK-1.7 **Fake-consumer and task lifecycle integration tests** *(partial — see "Deferred to the consumer PRs" in Handoff).* Cover the acceptance
       rows below with independently registered fake consumers (merge-only, comment-only,
       both, neither) and real task/board changes driving subscription demand.
 
@@ -369,12 +369,270 @@ with actual storage/config/auth references, concurrency behavior, and rollback.
 
 ## Handoff
 
-Record: changed files, the new card fields and their server-owned merge point, every consumer
-API route and its frozen schema, the fixed lock order and gate keys (and the registry-mutex
-CAS scoping), the lifecycle-gate hook points (browser/CLI/delivery), the installed-consumer
-signal source, the UI surface inventory, test commands and results, and any baseline drift
-discovered against 49a2ca05c6c2927da2194aaec8bd1e45e6fa2928. COMMENT-0 and MERGE-1 can
-then start in parallel; each adds consumer modules and targeted existing API integrations only.
+Implemented in this worktree (PR targets `feat/pr-tracking-base`). Record:
+
+- **Changed files.** New: `src/pr-tracking/pr-consumer-registry.ts`,
+  `pr-lifecycle-gate.ts`, `pr-owner-selection.ts`, `pr-reservations.ts`,
+  `pr-task-subscriptions.ts`, `src/trpc/pr-tracking-api.ts`,
+  `test/runtime/pr-tracking/pr-track1-foundation.test.ts`,
+  `web-ui/src/components/detail-panels/task-pr-tracking-panel.tsx`,
+  `web-ui/src/utils/pr-tracking.ts`. Modified: `src/core/api-contract.ts`,
+  `src/core/task-board-mutations.ts`, `src/state/workspace-state.ts`,
+  `src/pr-tracking/{in-memory-pr-record-store,pr-record-store,pr-tracking-coordinator}.ts`,
+  `src/trpc/{app-router,runtime-api,workspace-api,projects-api}.ts`, `src/server/runtime-server.ts`,
+  `src/commands/task.ts`, `web-ui/src/App.tsx`, `web-ui/src/components/{card-detail-view,task-create-dialog,task-inline-create-card}.tsx`,
+  `web-ui/src/hooks/{use-board-interactions,use-review-auto-actions,use-task-editor}.ts`,
+  `web-ui/src/state/board-state.ts`, `web-ui/src/types/board.ts`.
+- **New card fields and merge point.** `autoAddressComments`, `autoFinishOnMerge`,
+  `selectedAutomationPrKey`, `settingsRevision` (all optional on
+  `runtimeBoardCardSchema`; absent reads false / unselected / 0). Server-owned
+  carry-forward in `saveWorkspaceState` (`mergeServerOwnedPrSettings`) restores the
+  persisted values over stale whole-board saves, same pattern as `pullRequests`.
+- **Consumer API routes (frozen schemas).** Under `runtimeAppRouter` →
+  `workspace.prTracking`: `setTaskPrSettings`, `selectTaskAutomationPr`,
+  `resumeTaskPrTracking`, `getTaskTrackingState`, `getTaskPrSnapshot`,
+  `refreshTaskPrSnapshot`, `updateTaskCommentDispatch`, `updateTaskMergeBinding`,
+  `selectRepairOwner`, `transferRepairOwner`, `reservePrOperation`,
+  `validatePrOperation`, `releasePrOperation`, `readPrSnapshotEvents`. The
+  installed-consumer list is also exposed on `RuntimeConfigResponse.installedPrConsumers`
+  (empty until COMMENT-0 / MERGE-1 register).
+- **Review-hardened semantics (revision 3).**
+  - Reservation authorization is per operation: `comment_followup` requires the
+    caller to be the repair owner; `merge_completion` is claimable by any task
+    whose own binding selects the PR (the two consumers are independent, and a
+    merge-only task is never a repair owner). `releasePrOperation` supports an
+    audited operator `force` flag (server warning log); without it, a
+    non-holder release is `stale`.
+  - The head-ref write gate is keyed by the RECORD's verified head mapping
+    (`getRecordHeadMapping`, latest snapshot wins); caller-supplied
+    `headRepository`/`headRef` are validation hints that reject on mismatch,
+    and a record with no verified mapping is blocked (no writes before
+    verification).
+  - Cross-repository auto-owner guard: `validateAutoAssignedOwner`
+    (`src/pr-tracking/pr-owner-selection.ts`) clears a just-made
+    auto-assignment (revision-checked) when the verified head mapping does not
+    match the record's repository; explicit assignments are never touched.
+  - `removeTaskPullRequest` clears `selectedAutomationPrKey` (and bumps
+    `settingsRevision`) when the removed link was the selection, so a dangling
+    selection can never keep demand/gates alive.
+  - `updateTaskCommentDispatch` checks `expectedOwnerRevision` in addition to
+    the record-revision CAS (a handoff between read and write is a conflict);
+    `updateTaskMergeBinding` does not require ownership (merge consumers are
+    not repair owners).
+  - `readPrSnapshotEvents` omits `fromCursor` to resume from the persisted
+    per-consumer cursor (no zero-cursor reset for re-opened panels).
+  - `getTaskTrackingState` reports coordinator auth blockers plus the
+    per-task subscription blocker; `refreshTaskPrSnapshot` reports whether it
+    joined an in-flight read (`coalesced`).
+- **Shared reconcile pass.** All subscription reconciliation goes through one
+  single-flight pass (`runPrTrackingReconcilePassShared` in
+  `src/server/runtime-server.ts`): startup, board saves (save + PR-link
+  add/remove in `workspace-api`), workspace removal (`projects-api` hook),
+  the poll-time backstop (coordinator `revalidateSubscriptions`), and API
+  triggers join the in-flight pass instead of interleaving. The coordinator
+  and every PR API consumer share ONE durable `PrRecordStore`.
+- **Lock order and gate keys.** Fixed acquisition order task ownership → PR gate
+  (canonical PR key) → head-ref gate (canonical head repository + ref), each
+  gate acquisition a short CAS under the single tracking-registry mutex
+  (`PrRecordStoreBase.withRegistryTransaction`); the registry mutex is never held
+  while acquiring task/Git locks or awaiting model/network work. Sibling records
+  sharing a head ref serialize on the gate under the global registry mutex.
+- **Lifecycle-gate hook points (shipped).** Browser:
+  `web-ui/src/utils/pr-tracking.ts` (`computePrLifecycleGatedTaskIds`, used by
+  `web-ui/src/hooks/use-board-interactions.ts`). CLI: `src/commands/task.ts`
+  (`completeTaskById`, reads `installedPrConsumers` from the runtime config).
+  Deterministic delivery: only a reservation-busy check
+  (`checkPrDeliveryReservation` in `src/server/runtime-server.ts`, consulted by
+  `startTaskDelivery` in `src/trpc/runtime-api.ts`); `git-delivery.ts` and
+  `task-dispatch-service.ts` are **unchanged**. All read the installed-consumer
+  registry through `evaluatePrLifecycleGate` / `isPrLifecycleGated`; with zero
+  consumers installed every gate is a no-op (legacy behavior unchanged).
+- **Deferred to the consumer PRs (NOT landed here).**
+  - `mergeFinishesInReview` (In-Review-on-clean-push) is computed/diagnostic
+    only; enforcing it is MERGE-1.
+  - Dispatch worker policy/readiness for owner transfer (draining
+    running/queued writer actions) — consumer PRs.
+  - `src/verification/verification-service.ts` reservation integration —
+    MERGE-1.
+  - `src/cline-sdk/cline-task-session-service.ts` turn-liveness references —
+    COMMENT-0.
+  - `src/server/workspace-registry.ts` hooks — consumer PRs.
+  - Repository/delivery-branch matching for the Automation PR — COMMENT-0 (per
+    the fork-PR decision).
+- **Frozen-name → shipped-route mapping (COMMENT-0 / MERGE-1 must use the
+  shipped names).** `updateTaskPrSettings` → `setTaskPrSettings`;
+  `selectAutomationPr` → `selectTaskAutomationPr`; `getAuthorizedSnapshot` /
+  `refreshSnapshot` → `getTaskPrSnapshot` / `refreshTaskPrSnapshot`;
+  `subscribeTaskSnapshot` / `subscribeTerminalInvalidation` → polling
+  `readPrSnapshotEvents` (versioned replay with a durable per-consumer cursor);
+  `validateReservation` → `validatePrOperation`.
+- **Installed-consumer signal source.** `getTaskTrackingState` per consumer kind
+  plus per-task agent support; `RuntimeConfigResponse.installedPrConsumers`
+  drives the create/edit dialog checkbox availability ("Feature unavailable").
+- **UI surface inventory.** Task create dialog + inline edit card: both
+  checkboxes (disabled with "(feature unavailable)" when the consumer is not
+  installed). Detail view: `TaskPrTrackingPanel` — checkbox toggles, snapshot
+  as-of label with manual refresh, "Waiting for linked PR", ambiguity blocker
+  with Automation PR selector, "Repairs owned by <workspace/task>", Resume PR
+  tracking, auth/unsupported blocker surfaces.
+- **Test commands and results.** `npx vitest run test/runtime/pr-tracking`
+  (96 tests pass, incl. 22 PRTRACK-1 foundation tests); `npm run test:fast`
+  (1061/1062 — the one failure, `test/runtime/server/middleware.test.ts`
+  socket-upgrade case, fails identically on the clean base branch:
+  environment-dependent, not a regression); `npm run typecheck` and
+  `npm run web:typecheck` clean; `npm run web:test` (586 tests pass); Biome clean.
+- **Baseline drift.** None beyond PRTRACK-0; no storage-format changes beyond
+  PRTRACK-0's record schema (reservation/owner blocks already present).
+- **Review-hardened semantics (revision 4, #66 follow-up).**
+  - Diagnostics are split so the UI can distinguish capability from agent
+    support: `feature_unavailable` (consumer not installed, message
+    "Comment follow-up automation is not installed in this runtime.") vs
+    `comments_unsupported` (installed but the task is not native Cline,
+    message "Comment follow-up automation requires a native Cline task.").
+    `getTaskTrackingState` also returns `commentsSupportedForTask`
+    (consumer installed AND native-Cline task), and the zero-consumer
+    short-circuit skips board enumeration entirely, so a repair owner is
+    reported `active` (never `deleted`) when no consumers are installed.
+  - The task edit dialog saves changed PR settings through the
+    revision-checked `setTaskPrSettings` diffing against the values captured
+    WHEN THE DIALOG OPENED (`editTaskPrSettingsOpenRef` in `use-task-editor`):
+    only fields changed relative to the snapshot are sent (absent fields are
+    "keep"), and `expectedSettingsRevision` is the opening revision — a
+    concurrent change while the dialog is open surfaces a conflict toast
+    (never silently accepted on the new revision, never silently reverted).
+    `updateTask` no longer carries PR fields (stale whole-board saves cannot
+    clobber server-owned settings). `settingsRevision` hydrates through
+    `normalizeCard`/`BoardCard`.
+  - `releasePrOperation` operator path is authorized: `force` requires the
+    reservation the operator observed (`expectedHolder` +
+    `expectedFencingGeneration`); a mismatch is `stale`, and the release is
+    refused (`busy`) while the holder's writer is still active
+    (`isTaskWriterActive` wired through `app-router` →
+    `runtime-server` → PR API). The observation is re-validated INSIDE the
+    registry transaction (revision 5): a reservation that changed after the
+    read (e.g. the holder released and another task reserved) is stale and
+    the newer reservation is preserved. All force outcomes are audited through
+    the server warning log.
+  - No-op settings writes (no field present) report `ok` without touching the
+    revision; `selectTaskAutomationPr` reuses `setTaskSelectedAutomationPr`
+    (no duplicated inline mutation).
+  - Reconcile triggers queue a follow-up FULL pass after the in-flight one
+    (dirty-flag coalescing in `runtime-server`), so a coalesced trigger never
+    runs on a board view older than the trigger; `createReconcilePass`
+    (pr-task-subscriptions) is the single implementation (no dead duplicate).
+    Every board-change broadcast (save, PR-link add/remove from any writer)
+    re-derives subscription demand.
+  - Auto-discovered links (`source: "branch_lookup"`) are treated identically
+    for demand purposes: the reconcile pass derives demand from the full
+    `pullRequests` array, and `fireReviewPullRequestLookup` now invokes an
+    `onChanged` callback whenever it RECORDS new links — the board-save call
+    site wires it to broadcast the workspace state update (which also runs
+    the reconcile pass through the server's broadcast wiring), so recorded
+    lookups both refresh open UIs and re-derive demand. Demand for any other
+    board write (manual link, agent-tool link, hook refresh) is covered by
+    the board-save broadcast trigger.
+  - Fork-PR decision (review comment "needs a decision"): the
+    cross-repository auto-owner guard is NOT enforced at assignment. Fork→
+    upstream PRs have a head repository that differs from the base/record
+    repository by construction, so treating that as "cross-repository
+    reference" would block the normal fork workflow. Protection is enforced
+    at the point of use instead: the record's verified head mapping keys the
+    head-ref write gate (`reservePrOperation`/`validatePrOperation`), and the
+    repair turn (COMMENT-0) validates the task's delivery branch against that
+    mapping before any remote write.
+  - New API-level suite: `test/runtime/pr-tracking/pr-tracking-api.test.ts`
+    (diagnostics, no-op/conflict settings, force-release authorization).
+- **Test commands and results (revision 4).** `npx vitest run
+  test/runtime/pr-tracking` (104 tests pass); `npx vitest run
+  test/runtime/trpc test/integration/workspace-state.integration.test.ts
+  test/runtime/task-board-mutations.test.ts` (246 pass); `npx tsc --noEmit`
+  and web-ui typecheck clean; `npx vitest run` (web-ui) passes incl.
+  `use-task-editor.test.tsx` (12 tests, 2 new revision-checked settings
+  tests); Biome clean for all changed files.
+
+### Revision 5 — re-review comments (PR #66)
+
+1. **Edit-dialog concurrent settings changes.** The diff and
+   `expectedSettingsRevision` now use the values captured when the dialog
+   opened (`editTaskPrSettingsOpenRef`), not the live board card; only fields
+   changed relative to the snapshot are sent. Concurrent changes while the
+   dialog is open surface a `conflict` toast; no silent overwrite, no silent
+   revert.
+2. **Effective agent for comment follow-up.** `getTaskTrackingState` resolves
+   the task's effective agent through a new optional `getEffectiveTaskAgentId`
+   dependency (wired in `runtime-server`: live session's `agentId` → scoped
+   runtime config `selectedAgentId`, mirroring task-start precedence). An
+   unset `card.agentId` no longer defaults to Cline — it inherits the
+   workspace's selected agent, which may be non-Cline.
+3. **Force-release race closed.** `releasePrOperation` re-validates the
+   operator's observed holder + fencing generation inside the registry
+   transaction; a superseded observation returns `stale` and preserves the
+   newer reservation.
+4. **Lookup demand + open UI.** `fireReviewPullRequestLookup` accepts
+   `onChanged`, invoked only when the lookup records new links; the board-save
+   call site passes it to broadcast the workspace state update (open UIs
+   refresh and demand re-derives). See the "Auto-discovered links" bullet above.
+
+**Tests (revision 5).** `test/runtime/pr-tracking/pr-tracking-api.test.ts`:
+three effective-agent cases (explicit `cline`, explicit non-Cline, unset
+agentId with a non-Cline selected agent), plus the superseded-generation
+force-release race. `web-ui/src/hooks/use-task-editor.test.tsx`: changed-field
+write now asserts only-changed-fields, plus a concurrent-change conflict case.
+`test/workspace/task-pull-request-lookup.test.ts`: recorded lookup fires
+`onChanged` (skipped cards do not; the fixture seeds an empty commit so the
+fixture repo has a named branch). `test/runtime/trpc/workspace-api.test.ts`:
+the board-save lookup passes `onChanged`, which broadcasts the workspace
+state. The pre-existing force-release test in
+`pr-track1-foundation.test.ts` now passes the observed holder + generation
+(force no longer clears an unobserved reservation).
+
+**Test commands and results (revision 5).** `npx vitest run
+test/runtime/pr-tracking` (107 pass); `npx vitest run
+test/runtime/trpc test/runtime/task-board-mutations.test.ts
+test/runtime/pr-tracking test/workspace` (307 pass); `npx vitest run
+test/integration/workspace-state.integration.test.ts` (9 pass);
+`npx tsc --noEmit` (root) and web-ui typecheck clean; `npx vitest run
+src/hooks/use-task-editor.test.tsx` (web-ui, 13 pass); Biome clean for all
+changed files.
+
+COMMENT-0 and MERGE-1 can now start in parallel; each adds consumer modules and
+targeted existing API integrations only.
+
+### Revision 6 — re-review #4 (PR #66): Handoff accuracy + headline-claim tests
+
+1. **Handoff made accurate.** The lifecycle-gate bullet now names only what
+   this PR changed: browser `web-ui/src/utils/pr-tracking.ts`
+   (`computePrLifecycleGatedTaskIds` via `use-board-interactions.ts`), CLI
+   `src/commands/task.ts` (`completeTaskById`), and deterministic delivery's
+   reservation-busy check (`checkPrDeliveryReservation` in
+   `runtime-server.ts`, consulted by `startTaskDelivery` in
+   `runtime-api.ts`); `git-delivery.ts` and `task-dispatch-service.ts` are
+   explicitly marked unchanged. A "Deferred to the consumer PRs" list records
+   what did NOT land, with owners (`mergeFinishesInReview` enforcement →
+   MERGE-1; dispatch-worker drain policy → consumer PRs;
+   `verification-service.ts` reservations → MERGE-1;
+   `cline-task-session-service.ts` turn-liveness → COMMENT-0;
+   `workspace-registry.ts` hooks → consumer PRs; repo/delivery-branch matching
+   → COMMENT-0). Acceptance boxes 1.4/1.5/1.7 are now `[~]` (partial) with a
+   pointer to that list, and a frozen-name → shipped-route mapping line was
+   added so COMMENT-0/MERGE-1 don't call routes that don't exist.
+2. **Headline-claim tests added.** `test/integration/workspace-state.integration.test.ts`:
+   stale whole-board saves cannot clobber persisted `autoAddressComments` /
+   `autoFinishOnMerge` / `settingsRevision`, and a brand-new card in the same
+   save takes the client's booleans. `pr-track1-foundation.test.ts`: owner at
+   generation N → release → re-assign → a `reservePrOperation` call carrying
+   the previous tenure's generation is `stale` (fencing high-water mark);
+   two records on one canonical head `repo@ref` with owners → the second
+   `reservePrOperation` is `busy` (head-ref gate); a trigger queued mid-pass
+   runs a follow-up `createReconcilePass` pass on the newer board (no lost
+   update). `pr-tracking-coordinator.test.ts`: after a restart the event
+   sequence resumes above the persisted cursor (`seedSnapshotSeq`), and
+   `readTaskSnapshotEvents` without `fromCursor` resumes from the binding.
+
+**Test commands and results (revision 6).** `npx vitest run
+test/runtime/pr-tracking` (111 pass); `npx vitest run
+test/integration/workspace-state.integration.test.ts` (10 pass); `npx tsc
+--noEmit` (root) and web-ui typecheck clean; Biome clean for all changed files.
 
 ## Stop conditions
 

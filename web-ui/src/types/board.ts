@@ -49,6 +49,14 @@ export interface BoardCard {
 	clineSettings?: RuntimeTaskClineSettings;
 	/** PRLINK-0: pull requests linked to this task (server-owned; optional on cards). */
 	pullRequests?: RuntimeTaskPullRequest[];
+	/** PRTRACK-1: auto address PR review comments (server-owned; absent reads false). */
+	autoAddressComments?: boolean;
+	/** PRTRACK-1: auto complete the task when the selected PR merges (server-owned; absent reads false). */
+	autoFinishOnMerge?: boolean;
+	/** PRTRACK-1: the selected Automation PR canonical key (server-owned). */
+	selectedAutomationPrKey?: string;
+	/** PRTRACK-1: optimistic-concurrency revision shared by the server-owned settings block. */
+	settingsRevision?: number;
 	baseRef: string;
 	/** UPD-0: missing values normalize to true; an explicit false disables the pre-start base refresh. */
 	updateBaseRefBeforeStart?: boolean;
