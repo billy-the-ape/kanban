@@ -1,4 +1,5 @@
 import * as RadixPopover from "@radix-ui/react-popover";
+import { getOrderedTaskPullRequests } from "@runtime-pull-request-links";
 import {
 	ArrowDown,
 	ArrowLeft,
@@ -140,12 +141,12 @@ function GitBranchStatusControl({
 	taskId?: string | null;
 	workspaceId?: string | null;
 }): React.ReactElement {
-	const pullRequestList = pullRequests ?? [];
+	const pullRequestList = getOrderedTaskPullRequests(pullRequests ?? []);
 	const isPullRequestsOverflowing = pullRequestList.length > MAX_INLINE_PULL_REQUESTS;
 	const inlinePullRequests = isPullRequestsOverflowing
-		? pullRequestList.slice(-OVERFLOW_INLINE_PULL_REQUESTS)
+		? pullRequestList.slice(0, OVERFLOW_INLINE_PULL_REQUESTS)
 		: pullRequestList;
-	const hiddenPullRequests = isPullRequestsOverflowing ? pullRequestList.slice(0, -OVERFLOW_INLINE_PULL_REQUESTS) : [];
+	const hiddenPullRequests = isPullRequestsOverflowing ? pullRequestList.slice(OVERFLOW_INLINE_PULL_REQUESTS) : [];
 	const hiddenPullRequestCount = hiddenPullRequests.length;
 
 	if (onToggleGitHistory) {

@@ -1,21 +1,12 @@
 import { getPullRequestIdentityKey, parsePullRequestUrl } from "@runtime-pull-request-links";
 
-import type { RuntimeBoardCard, RuntimeTaskPullRequest, RuntimeTaskPullRequestRefreshReason } from "@/runtime/types";
+import type { RuntimeTaskPullRequest, RuntimeTaskPullRequestRefreshReason } from "@/runtime/types";
 
 const MINUTE_MS = 60 * 1000;
 const HOUR_MS = 60 * MINUTE_MS;
 const DAY_MS = 24 * HOUR_MS;
 const WEEK_MS = 7 * DAY_MS;
 const YEAR_MS = 365 * DAY_MS;
-
-/** The card's most recent PR (last recorded), or null. */
-export function getLatestPullRequest(card: RuntimeBoardCard): RuntimeTaskPullRequest | null {
-	const pullRequests = card.pullRequests;
-	if (!pullRequests || pullRequests.length === 0) {
-		return null;
-	}
-	return pullRequests[pullRequests.length - 1] ?? null;
-}
 
 /** Stable identity for a pull request link, used as React keys in the UI. */
 export function getPullRequestKey(pullRequest: RuntimeTaskPullRequest): string {
@@ -98,8 +89,12 @@ function formatApproximateAge(timestamp: number, now: number = Date.now()): stri
 }
 
 /**
- * Tooltip lines: "owner/repo#123", snapshot title (if any),
- * "state as of <age>" (only when both state and stateCheckedAt are present).
+ * Tooltip lines: "owner/repo#123", snapshot title (if any), then the
+ * observation metadata as separate lines: "First recorded <age>",
+ * "Last observed (approximate) <age>" (lastSeenAt, falling back to
+ * createdAt when missing), and "State checked <age>" (only when both state
+ * and stateCheckedAt are present). lastSeenAt is approximate and never
+ * proof of state freshness — stateCheckedAt stays separate.
  */
 export function getPullRequestTooltipLines(pullRequest: RuntimeTaskPullRequest): string[] {
 	const prefix = pullRequest.provider === "gitlab" ? "!" : "#";
@@ -107,8 +102,10 @@ export function getPullRequestTooltipLines(pullRequest: RuntimeTaskPullRequest):
 	if (pullRequest.title) {
 		lines.push(pullRequest.title);
 	}
+	lines.push(`First recorded ${formatApproximateAge(pullRequest.createdAt)}`);
+	lines.push(`Last observed (approximate) ${formatApproximateAge(pullRequest.lastSeenAt ?? pullRequest.createdAt)}`);
 	if (pullRequest.state && pullRequest.stateCheckedAt !== undefined) {
-		lines.push(`${pullRequest.state} as of ${formatApproximateAge(pullRequest.stateCheckedAt)}`);
+		lines.push(`State checked ${formatApproximateAge(pullRequest.stateCheckedAt)} (${pullRequest.state})`);
 	}
 	return lines;
 }

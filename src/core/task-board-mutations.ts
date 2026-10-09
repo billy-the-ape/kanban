@@ -724,10 +724,20 @@ export function updateTask(
 /** Hard cap on stored pull requests per task card. */
 const MAX_TASK_PULL_REQUESTS = 20;
 
+/**
+ * PRLINK-6: minimum spacing between `lastSeenAt` advances. Duplicate
+ * observations (repeated captures, polling, refreshes) coalesce: the stamp
+ * only moves when at least 10 minutes have passed, so polling can never
+ * produce a timestamp-only write every minute.
+ */
+export const LAST_SEEN_OBSERVATION_THROTTLE_MS = 600_000;
+
 export interface RuntimeTaskPullRequestSnapshotUpdate {
 	title?: string;
 	state?: RuntimeTaskPullRequest["state"];
 	stateCheckedAt?: number;
+	/** PRLINK-6: explicit observation time (caller already applied the throttle). */
+	lastSeenAt?: number;
 }
 
 export interface RuntimeAddTaskPullRequestsResult {
@@ -787,9 +797,20 @@ function backfillPullRequestSnapshot(
  * Records pull requests against a task. Deduped by identity key: an existing
  * entry keeps its position, `createdAt`, and `source` and only backfills
  * missing snapshot fields. New entries append (first-appearance order is
- * preserved across interleaved adds). When the cap is exceeded, the oldest
- * non-manual entry is dropped first; only an all-manual list evicts its
- * oldest manual entry. `added` is true only when the stored array changed.
+ * preserved across interleaved adds) with `lastSeenAt` seeded to their
+ * `createdAt`; an `isPrimary` flag on incoming entries is never honored
+ * (capture/manual-add inputs cannot set the display primary).
+ *
+ * PRLINK-6: a duplicate observation may advance the stored `lastSeenAt`, but
+ * only when at least `LAST_SEEN_OBSERVATION_THROTTLE_MS` have passed since
+ * the last observation, and it never moves backward on a clock regression.
+ * When other fields already force a save, the newer observation time rides
+ * along in the same write.
+ *
+ * When the cap is exceeded, eviction protects the explicit display primary
+ * and the selected Automation PR: the oldest unprotected non-manual entry
+ * is dropped first, otherwise the oldest unprotected manual entry.
+ * `added` is true only when the stored array changed.
  */
 export function addTaskPullRequests(
 	board: RuntimeBoardData,
@@ -819,22 +840,53 @@ export function addTaskPullRequests(
 		const existingIndex = positionByKey.get(key);
 		if (existingIndex === undefined) {
 			positionByKey.set(key, nextPullRequests.length);
-			nextPullRequests.push({ ...incoming });
+			const entry: RuntimeTaskPullRequest = {
+				...incoming,
+				// New record: last observed is the first recorded time.
+				lastSeenAt: incoming.lastSeenAt ?? incoming.createdAt,
+			};
+			// Incoming capture/manual-add inputs may not set the display primary.
+			delete entry.isPrimary;
+			nextPullRequests.push(entry);
 			changed = true;
 			continue;
 		}
 		const existing = nextPullRequests[existingIndex];
 		if (existing !== undefined) {
 			const backfilled = backfillPullRequestSnapshot(existing, incoming);
-			if (backfilled !== null) {
-				nextPullRequests[existingIndex] = backfilled;
+			let entry: RuntimeTaskPullRequest = backfilled ?? existing;
+			// Successful capture/delivery/manual re-add is an observation:
+			// coalesce it, include it in an already-dirty write, never regress.
+			const lastSeen = existing.lastSeenAt ?? existing.createdAt;
+			const otherFieldsChanged = backfilled !== null;
+			const observationOldEnough = now - lastSeen >= LAST_SEEN_OBSERVATION_THROTTLE_MS;
+			if (now >= lastSeen && (otherFieldsChanged || observationOldEnough)) {
+				entry = { ...entry, lastSeenAt: now };
+			}
+			if (entry !== existing) {
+				nextPullRequests[existingIndex] = entry;
 				changed = true;
 			}
 		}
 	}
 
+	const selectedAutomationPrKey = task.selectedAutomationPrKey;
+	const isEvictionProtected = (pullRequest: RuntimeTaskPullRequest): boolean =>
+		pullRequest.isPrimary === true ||
+		(selectedAutomationPrKey !== undefined && getPullRequestIdentityKey(pullRequest) === selectedAutomationPrKey);
+
 	while (nextPullRequests.length > MAX_TASK_PULL_REQUESTS) {
-		let dropIndex = nextPullRequests.findIndex((pullRequest) => pullRequest.source !== "manual");
+		let dropIndex = nextPullRequests.findIndex(
+			(pullRequest) => !isEvictionProtected(pullRequest) && pullRequest.source !== "manual",
+		);
+		if (dropIndex === -1) {
+			dropIndex = nextPullRequests.findIndex(
+				(pullRequest) => !isEvictionProtected(pullRequest) && pullRequest.source === "manual",
+			);
+		}
+		// Malformed data with several explicit primaries (plus a selected
+		// Automation PR) can leave nothing unprotected; drop the oldest
+		// entry anyway instead of looping forever.
 		if (dropIndex === -1) {
 			dropIndex = 0;
 		}
@@ -901,7 +953,10 @@ export function removeTaskPullRequest(
 /**
  * Updates the stored snapshot for one pull request. Only provided fields are
  * set; when `title` or `state` is provided without `stateCheckedAt`, the
- * stamp is set to `now`.
+ * stamp is set to `now`. PRLINK-6: a successful observation write also
+ * advances `lastSeenAt` — an explicit `snapshot.lastSeenAt` is applied as
+ * given, otherwise the write carries `now` along — and the observation
+ * time never moves backward.
  */
 export function updateTaskPullRequestSnapshot(
 	board: RuntimeBoardData,
@@ -919,10 +974,15 @@ export function updateTaskPullRequestSnapshot(
 	const existing = task.pullRequests;
 	if (
 		!existing ||
-		(snapshot.title === undefined && snapshot.state === undefined && snapshot.stateCheckedAt === undefined)
+		(snapshot.title === undefined &&
+			snapshot.state === undefined &&
+			snapshot.stateCheckedAt === undefined &&
+			snapshot.lastSeenAt === undefined)
 	) {
 		return { board, task, updated: false };
 	}
+	const observationWrite =
+		snapshot.title !== undefined || snapshot.state !== undefined || snapshot.stateCheckedAt !== undefined;
 	let foundMatch = false;
 	const nextPullRequests = existing.map((pullRequest) => {
 		if (getPullRequestIdentityKey(pullRequest) !== identityKey) {
@@ -941,11 +1001,105 @@ export function updateTaskPullRequestSnapshot(
 		} else if (snapshot.title !== undefined || snapshot.state !== undefined) {
 			next.stateCheckedAt = now;
 		}
+		const lastSeen = next.lastSeenAt ?? next.createdAt;
+		if (snapshot.lastSeenAt !== undefined) {
+			if (snapshot.lastSeenAt >= lastSeen) {
+				next.lastSeenAt = snapshot.lastSeenAt;
+			}
+		} else if (observationWrite && now >= lastSeen) {
+			next.lastSeenAt = now;
+		}
 		return next;
 	});
 	if (!foundMatch) {
 		return { board, task, updated: false };
 	}
+	const nextTask: RuntimeBoardCard = { ...task, pullRequests: nextPullRequests, updatedAt: now };
+	return {
+		board: replaceTaskCard(board, normalizedTaskId, nextTask),
+		task: nextTask,
+		updated: true,
+	};
+}
+
+// --- PRLINK-6: display-only primary ------------------------------------------
+
+export interface RuntimeSetPrimaryTaskPullRequestResult {
+	board: RuntimeBoardData;
+	task: RuntimeBoardCard | null;
+	updated: boolean;
+}
+
+/**
+ * Sets (or clears, with null) the display-only explicit primary. This is a
+ * display preference only: it never reads or writes `selectedAutomationPrKey`,
+ * the checkbox settings, tracking generations, repair ownership, or
+ * completion markers, and it never authorizes automation.
+ *
+ * - `null` clears every explicit flag; a task with no flags is a no-op.
+ * - An identity key sets exactly one flag and clears the rest (a malformed
+ *   list with several flags is normalized on the way).
+ * - Selecting the already-sole primary is a no-op (no revision/broadcast).
+ * - Unknown task or unknown identity key is a no-op.
+ */
+export function setPrimaryTaskPullRequest(
+	board: RuntimeBoardData,
+	taskId: string,
+	identityKey: string | null,
+	now: number = Date.now(),
+): RuntimeSetPrimaryTaskPullRequestResult {
+	const normalizedTaskId = taskId.trim();
+	const found = normalizedTaskId ? findTaskLocation(board, normalizedTaskId) : null;
+	if (!found) {
+		return { board, task: null, updated: false };
+	}
+	const task = found.task;
+	const existing = task.pullRequests;
+	if (!existing || existing.length === 0) {
+		return { board, task, updated: false };
+	}
+
+	const primaryCount = existing.filter((pullRequest) => pullRequest.isPrimary === true).length;
+
+	if (identityKey === null) {
+		if (primaryCount === 0) {
+			return { board, task, updated: false };
+		}
+		const nextPullRequests = existing.map((pullRequest) => {
+			if (pullRequest.isPrimary !== true) {
+				return pullRequest;
+			}
+			const next: RuntimeTaskPullRequest = { ...pullRequest };
+			delete next.isPrimary;
+			return next;
+		});
+		const nextTask: RuntimeBoardCard = { ...task, pullRequests: nextPullRequests, updatedAt: now };
+		return {
+			board: replaceTaskCard(board, normalizedTaskId, nextTask),
+			task: nextTask,
+			updated: true,
+		};
+	}
+
+	const target = existing.find((pullRequest) => getPullRequestIdentityKey(pullRequest) === identityKey);
+	if (!target) {
+		return { board, task, updated: false };
+	}
+	if (primaryCount === 1 && target.isPrimary === true) {
+		// Already the sole explicit primary: succeed without a revision bump.
+		return { board, task, updated: false };
+	}
+	const nextPullRequests = existing.map((pullRequest) => {
+		if (pullRequest === target) {
+			return { ...pullRequest, isPrimary: true };
+		}
+		if (pullRequest.isPrimary === true) {
+			const next: RuntimeTaskPullRequest = { ...pullRequest };
+			delete next.isPrimary;
+			return next;
+		}
+		return pullRequest;
+	});
 	const nextTask: RuntimeBoardCard = { ...task, pullRequests: nextPullRequests, updatedAt: now };
 	return {
 		board: replaceTaskCard(board, normalizedTaskId, nextTask),
