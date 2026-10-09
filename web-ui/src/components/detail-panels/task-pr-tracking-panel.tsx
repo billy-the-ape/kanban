@@ -163,6 +163,19 @@ export function TaskPrTrackingPanel({
 	const blockers = tracking.blockers;
 	const selectedKey = tracking.selectedAutomationPrKey;
 	const asOf = formatAsOf(tracking.snapshot?.checkedAt ?? null);
+	// MERGE-1: merge completion status line (the needs-human blocker above
+	// carries the reason; this line shows the episode state itself).
+	const terminalStopReason = tracking.terminalStop?.reason ?? null;
+	const mergeStatusLine =
+		terminalStopReason === "merged_completed"
+			? "PR merged — task completed automatically."
+			: terminalStopReason === "merged_reconciling"
+				? "Merge completion in progress."
+				: terminalStopReason === "merged_unresolved"
+					? "Merge completion needs a human decision."
+					: terminalStopReason === "closed_unmerged"
+						? "PR closed without merging."
+						: null;
 
 	return (
 		<div className="border-b border-divider px-3 py-2">
@@ -219,6 +232,8 @@ export function TaskPrTrackingPanel({
 					}
 				/>
 			</div>
+
+			{mergeStatusLine ? <div className="mt-2 text-xs text-text-secondary">{mergeStatusLine}</div> : null}
 
 			{selectionCandidates.length > 1 ? (
 				<div className="mt-2 flex items-center gap-2 text-xs text-text-secondary">

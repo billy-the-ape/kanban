@@ -259,6 +259,15 @@ export const runtimeBoardCardSchema = z
 		 * for the dedicated revision-checked settings mutation. Server-owned.
 		 */
 		settingsRevision: z.number().int().nonnegative().optional(),
+		/**
+		 * MERGE-1: server-owned marker set when a task is manually reopened
+		 * from Done into In Review. While set, the SAME merged PR (the same
+		 * merge commit already consumed for the task's binding) must not
+		 * immediately send the task back to Done; a later merge (a different
+		 * merge commit) completes it again. The marker is cleared when the
+		 * task reaches Done or Trash.
+		 */
+		manualReopenAt: z.number().optional(),
 		createdAt: z.number(),
 		updatedAt: z.number(),
 	})

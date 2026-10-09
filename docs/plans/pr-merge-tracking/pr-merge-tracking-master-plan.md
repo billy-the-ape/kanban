@@ -1,6 +1,6 @@
 # PR merge tracking — master plan
 
-Updated: 2026-10-06. Status: proposed; documentation only. Repository: `billy-the-ape/kanban`.
+Updated: 2026-10-09. Status: MERGE-1 implemented (branch `feat/merge-tracking`, pending review); documentation + implementation. Repository: `billy-the-ape/kanban`.
 
 ## Goal and independent feature boundary
 
@@ -218,6 +218,62 @@ The foundation supplies false-default settings, records, 60-second polling and r
 Merge implementation adds only its task merge binding schema and completion/handoff
 behavior. Document storage upgrades and deployment/rollback in
 implementation PRs. Merge tracking requires read access and no PR push permission.
+
+## MERGE-1 final implementation state
+
+Implemented in `feat/merge-tracking` (single PR, per the boundary above):
+
+- **Consumer module** `src/pr-tracking/pr-merge-completion.ts`:
+  `reconcileMergeCompletion` runs the observation flow (idempotency/manual-reopen
+  guard on the persisted binding's `mergeCompletion` — the same merge commit is
+  consumed at most once; a later merge commit completes again), card eligibility
+  (`autoFinishOnMerge` + In Progress/In Review only), writer quiescence probe,
+  fenced `merge_completion` reservation (released in `finally` on every outcome),
+  worktree inspection (base branch must contain the merge commit; no clean local
+  commits ahead of base), hard reset of a dirty worktree to the base branch,
+  then persists `mergeCompletion: completed` + terminal stop `merged_completed`
+  BEFORE completing the task. Blocks persist `blocked` + `merged_unresolved`
+  (needs human); busy writer/reservation or failed writes stay pending and retry
+  on the next read (bounded by the coordinator's reconciliation read budget).
+  `registerMergeCompletionConsumer` installs the single consumer with
+  `requiredReadSources = [metadata]`.
+- **Observation delivery** `src/pr-tracking/pr-consumer-registry.ts` +
+  `src/pr-tracking/pr-tracking-coordinator.ts`: the coordinator accepts an
+  optional `consumerRegistry` and delivers one observation per active task
+  subscription after every successful metadata read (after authoritative
+  terminal-state effects); observer failures are logged and never break the
+  poll cycle.
+- **Server wiring** `src/server/runtime-server.ts`: the merge completion consumer
+  is registered on the shared registry BEFORE the coordinator is created (every
+  read the coordinator performs already delivers observations). `completeTask`
+  moves the card to Done through `completeTaskAndGetReadyLinkedTaskIds`,
+  broadcasts the updated workspace state, then fires the dispatch pass exactly
+  once so waiting children release with their retained valid evidence. The
+  worktree seam resolves `resolveTaskCwd` (no ensure) + `defaultInspectWorktree`
+  (direct git probes: `rev-parse`, `merge-base --is-ancestor`,
+  `status --porcelain`, `rev-list --count`); a missing worktree means nothing to
+  reconcile.
+- **Manual-reopen marker**: server-owned `manualReopenAt` on the card
+  (`src/core/task-board-mutations.ts` sets it on Done → In Review and clears it on
+  Done/Trash; `src/state/workspace-state.ts` re-derives it server-side at save so
+  a stale client board can neither forge nor drop it). The binding's consumed
+  merge commit is the enforcement guard; the marker is the durable,
+  client-visible record of the manual reopen.
+- **UI**: `web-ui/src/components/detail-panels/task-pr-tracking-panel.tsx`
+  renders the merge-completion episode state (completed / in progress / needs a
+  human decision / closed without merging) alongside the existing "Auto complete
+  when the PR merges" checkbox and needs-human blockers.
+- **Tests** `test/runtime/pr-tracking/pr-merge-completion.test.ts`: completion,
+  idempotency + later-merge re-completion, preference/column/task-missing skips,
+  writer-active pending, reservation contention + release, both block reasons,
+  failing inspection pending, dirty-worktree reset failure pending, plus
+  coordinator delivery (observation delivered to the installed consumer during a
+  real poll cycle; no completion when no consumer is installed).
+
+Remaining verification items (require a live environment, not covered by the
+committed tests): the real-Git-repository dispatch matrix (merge/squash/rebase
+landed results, diamond dependencies, saturated caps) and the end-to-end
+disposable-PR exercise from the Verification section.
 
 Roll out collection without effects, then one merge-completion pilot, then successor queue tests.
 Disable either task checkbox independently; preserve records/work/history. Before binary rollback,

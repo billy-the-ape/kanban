@@ -30,7 +30,9 @@ import {
 	getKanbanRuntimeTls,
 	isKanbanRemoteHost,
 } from "../core/runtime-endpoint";
+import { completeTaskAndGetReadyLinkedTaskIds } from "../core/task-board-mutations";
 import { PrConsumerRegistry } from "../pr-tracking/pr-consumer-registry";
+import { defaultInspectWorktree, registerMergeCompletionConsumer } from "../pr-tracking/pr-merge-completion";
 import { findTaskCard, resolveCardAutomationPrKey } from "../pr-tracking/pr-owner-selection";
 import { PrRecordStore } from "../pr-tracking/pr-record-store";
 import { createReconcilePass, type PrTaskReconcileOptions } from "../pr-tracking/pr-task-subscriptions";
@@ -52,6 +54,7 @@ import {
 	loadWorkspaceBoardById,
 	loadWorkspaceContextById,
 	loadWorkspaceState,
+	mutateWorkspaceState,
 } from "../state/workspace-state";
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { createTerminalWebSocketBridge } from "../terminal/ws-server";
@@ -61,6 +64,7 @@ import { createPrTrackingApi } from "../trpc/pr-tracking-api";
 import { createProjectsApi } from "../trpc/projects-api";
 import { createRuntimeApi } from "../trpc/runtime-api";
 import { createWorkspaceApi } from "../trpc/workspace-api";
+import { resolveTaskCwd } from "../workspace/task-worktree";
 import { getWebUiDir, normalizeRequestPath, readAsset } from "./assets";
 import { handleHttpRequest, handleSocketUpgrade } from "./middleware";
 import type { RuntimeStateHub } from "./runtime-state-hub";
@@ -350,15 +354,105 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		});
 		return deps.runtimeStateHub.broadcastRuntimeWorkspaceStateUpdated(workspaceId, workspacePath);
 	};
+	// Shared writer-activity probe (PR tracking API + merge completion
+	// consumer): true when a live terminal process, Cline task session, or
+	// review session exists for the task.
+	const probeTaskWriterActive = async (workspaceId: string, taskId: string): Promise<boolean> => {
+		const workspacePath = deps.workspaceRegistry.getWorkspacePathById(workspaceId);
+		if (!workspacePath) {
+			return false;
+		}
+		const scope = { workspaceId, workspacePath };
+		return isTaskWriterActive(taskId, {
+			clineTaskSessionService: await getScopedClineTaskSessionService(scope),
+			terminalManager: await getScopedTerminalManager(scope),
+		});
+	};
+
 	const getPrTrackingState = () => {
 		if (!prTrackingState) {
 			const store = new PrRecordStore();
+			const registry = new PrConsumerRegistry();
+			// MERGE-1: register the merge completion consumer on the
+			// installed-consumer registry BEFORE the coordinator is created,
+			// so every read the coordinator performs already delivers
+			// observations to the consumer.
+			registerMergeCompletionConsumer(registry, {
+				store,
+				getTaskCard: async (workspaceId, taskId) => {
+					const board = await loadWorkspaceBoardById(workspaceId).catch(() => null);
+					if (!board) {
+						return null;
+					}
+					for (const column of board.columns) {
+						const card = column.cards.find((item) => item.id === taskId);
+						if (card) {
+							return { card, columnId: column.id };
+						}
+					}
+					return null;
+				},
+				isTaskWriterActive: probeTaskWriterActive,
+				// Resolve the task worktree and probe its relationship to the
+				// task's base branch directly (no remote, no model work).
+				inspectWorktree: async ({ task, baseRef, mergeCommitSha }) => {
+					const workspacePath = deps.workspaceRegistry.getWorkspacePathById(task.workspaceId);
+					if (!workspacePath) {
+						return null;
+					}
+					let worktreePath: string | null = null;
+					try {
+						worktreePath = await resolveTaskCwd({
+							cwd: workspacePath,
+							taskId: task.taskId,
+							baseRef,
+							ensure: false,
+						});
+					} catch {
+						return null;
+					}
+					const inspection = await defaultInspectWorktree({
+						workspacePath,
+						worktreePath,
+						baseRef,
+						mergeCommitSha,
+					});
+					return { ...inspection, worktreePath };
+				},
+				// Persist the completion: move the task to Done through the
+				// server-owned board mutation, broadcast + reconcile, then
+				// fire the dispatch pass exactly once so children waiting on
+				// this task release with their retained valid evidence.
+				completeTask: async (workspaceId, taskId) => {
+					const workspacePath = deps.workspaceRegistry.getWorkspacePathById(workspaceId);
+					if (!workspacePath) {
+						return;
+					}
+					await mutateWorkspaceState<void>(workspacePath, (state) => {
+						const result = completeTaskAndGetReadyLinkedTaskIds(state.board, taskId);
+						return { board: result.board, value: undefined, save: result.moved };
+					});
+					broadcastRuntimeWorkspaceStateUpdatedWithReconcile(workspaceId, workspacePath);
+					void buildRuntimeApi()
+						.dispatchReadyTasks({ workspaceId, workspacePath })
+						.catch((error) => {
+							deps.warn(
+								`[pr-tracking] Merge completion dispatch pass failed: ${
+									error instanceof Error ? error.message : String(error)
+								}`,
+							);
+						});
+				},
+				warn: (message) => deps.warn(`[pr-tracking] ${message}`),
+			});
 			prTrackingState = {
 				coordinator: createPrTrackingCoordinator({
 					// The coordinator and every PR API consumer share ONE
 					// durable record store: reads written by the API must be
 					// visible to the coordinator (and vice versa).
 					store,
+					// MERGE-1: deliver observations to installed consumers.
+					consumerRegistry: registry,
 					// Poll-time backstop: re-derive task-derived demand for the
 					// PR being polled before each poll (single-board reads only).
 					revalidateSubscriptions: (canonicalPrKey) =>
@@ -367,7 +461,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 					logError: (message) => deps.warn(`[pr-tracking] ${message}`),
 				}),
 				store,
-				registry: new PrConsumerRegistry(),
+				registry,
 			};
 		}
 		return prTrackingState;
@@ -531,17 +625,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				// backstop or board-save triggers).
 				runPrTrackingReconcilePass: () => runPrTrackingReconcilePassShared(),
 				warn: (message) => deps.warn(`[pr-tracking] ${message}`),
-				isTaskWriterActive: async (workspaceId, taskId) => {
-					const workspacePath = deps.workspaceRegistry.getWorkspacePathById(workspaceId);
-					if (!workspacePath) {
-						return false;
-					}
-					const scope = { workspaceId, workspacePath };
-					return isTaskWriterActive(taskId, {
-						clineTaskSessionService: await getScopedClineTaskSessionService(scope),
-						terminalManager: await getScopedTerminalManager(scope),
-					});
-				},
+				isTaskWriterActive: probeTaskWriterActive,
 				// PRTRACK-1: effective agent for a card — a live session's agent when
 				// one exists, else the workspace's selected agent (same precedence as
 				// task start). An unset per-card agentId inherits the workspace

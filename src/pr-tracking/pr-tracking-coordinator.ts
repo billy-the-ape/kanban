@@ -17,6 +17,7 @@ import type {
 	GitHubPrNormalizedSnapshot,
 	GitHubPrTaskBinding,
 	GitHubPrTerminalStopReason,
+	GitHubPrTrackingRecord,
 	RuntimeBoardColumnId,
 	RuntimeBoardData,
 	RuntimePrSnapshotEvent,
@@ -30,6 +31,7 @@ import {
 	type GhAdapterFailure,
 	type GitHubGhAdapter,
 } from "./github-gh-adapter";
+import { type PrConsumerRegistry, toInstalledConsumerFlags } from "./pr-consumer-registry";
 import { isTrackingSupportedPr, type ParsedCanonicalPrKey, parseCanonicalPrKey } from "./pr-identity";
 import { getPrTrackingSchedulerLockRequest, PrRecordStore, type PrRecordStorePort } from "./pr-record-store";
 import {
@@ -170,6 +172,13 @@ export interface CreatePrTrackingCoordinatorDependencies {
 	 * `PrRecordStore`; tests inject an in-memory store.
 	 */
 	store?: PrRecordStorePort;
+	/**
+	 * MERGE-1: the installed-consumer registry. When present, every
+	 * successful read delivers one observation to each registered consumer's
+	 * `onObservation` hook, per active task subscription (after the
+	 * authoritative terminal-state effects were applied).
+	 */
+	consumerRegistry?: PrConsumerRegistry;
 	schedulerLockRequest?: LockRequest;
 	listManagedWorkspaceBoards?: () => Promise<Array<{ workspaceId: string; board: RuntimeBoardData }>>;
 	/**
@@ -201,6 +210,7 @@ export class PrTrackingCoordinator {
 	private readonly now: () => number;
 	private readonly random: () => number;
 	private readonly revalidateSubscriptions: ((canonicalPrKey?: string) => Promise<void>) | null;
+	private readonly consumerRegistry: PrConsumerRegistry | null;
 
 	private readonly subscriptions = new Map<string, TrackedSubscription>();
 	private readonly polls = new Map<string, PrPollState>();
@@ -247,6 +257,7 @@ export class PrTrackingCoordinator {
 		this.now = deps.now ?? Date.now;
 		this.random = deps.random ?? Math.random;
 		this.revalidateSubscriptions = deps.revalidateSubscriptions ?? null;
+		this.consumerRegistry = deps.consumerRegistry ?? null;
 	}
 
 	/**
@@ -1165,6 +1176,9 @@ export class PrTrackingCoordinator {
 				prState,
 				terminalReason: null,
 			});
+			// MERGE-1: deliver one observation to each installed consumer's
+			// observer, after the authoritative terminal-state effects.
+			await this.deliverConsumerObservations(sub, recordAfter.record, state);
 		}
 		if (!this.stopping && feedbackOk) {
 			state.consecutiveFailures = 0;
@@ -1306,6 +1320,53 @@ export class PrTrackingCoordinator {
 				threadOutdated: info.outdated,
 			};
 		});
+	}
+
+	/**
+	 * MERGE-1: deliver one observation to each installed consumer's observer
+	 * for this active subscription. The snapshot is the same authorized data
+	 * every consumer sees (the coordinator's in-memory poll state); a
+	 * consumer that cannot act yet (busy writer, busy reservation) simply
+	 * returns and retries on the next read. Observer failures never break
+	 * the poll cycle.
+	 */
+	private async deliverConsumerObservations(
+		sub: TrackedSubscription,
+		record: GitHubPrTrackingRecord,
+		state: PrPollState,
+	): Promise<void> {
+		if (!this.consumerRegistry) {
+			return;
+		}
+		if (!state.metadata) {
+			return;
+		}
+		const snapshot: GitHubPrNormalizedSnapshot = {
+			canonicalPrKey: sub.canonicalPrKey,
+			accessScopeId: sub.accessScopeId,
+			checkedAt: state.snapshotCheckedAt ?? state.metadata.checkedAt,
+			metadata: state.metadata,
+			feedback: state.feedback,
+			feedbackCompleteness: state.feedbackCompleteness,
+		};
+		const installedConsumers = toInstalledConsumerFlags(this.consumerRegistry);
+		for (const registration of this.consumerRegistry.listInstalled()) {
+			const observe = registration.onObservation;
+			if (!observe) {
+				continue;
+			}
+			try {
+				await observe({
+					task: { workspaceId: sub.workspaceId, taskId: sub.taskId },
+					record,
+					snapshot,
+					installedConsumers,
+					now: this.now(),
+				});
+			} catch (error) {
+				this.warn(`PR tracking ${registration.kind} consumer observation failed: ${String(error)}`);
+			}
+		}
 	}
 
 	/**

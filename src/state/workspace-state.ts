@@ -801,6 +801,52 @@ function mergeServerOwnedPrCardFields(
 	};
 }
 
+/**
+ * MERGE-1: server-owned manual-reopen marker. The board is client-owned, but
+ * the marker is derived server-side from the persisted -> incoming column
+ * transition so a stale client board can neither forge nor drop it:
+ *   - persisted in Done, incoming in In Review  -> marker set (manual reopen);
+ *   - incoming in Done or Trash                 -> marker cleared;
+ *   - otherwise                                 -> the persisted marker
+ *     survives (it only guards "the same merged PR" against an immediate
+ *     re-completion and is consumed by the merge completion consumer).
+ */
+export function applyManualReopenMarkers(
+	board: RuntimeBoardData,
+	persistedBoard: RuntimeBoardData,
+	now: number,
+): RuntimeBoardData {
+	const persistedByTaskId = new Map<string, { columnId: RuntimeBoardColumnId; marker: number | undefined }>();
+	for (const column of persistedBoard.columns) {
+		for (const card of column.cards) {
+			persistedByTaskId.set(card.id, { columnId: column.id, marker: card.manualReopenAt });
+		}
+	}
+	return {
+		...board,
+		columns: board.columns.map((column) => ({
+			...column,
+			cards: column.cards.map((card) => {
+				const persisted = persistedByTaskId.get(card.id);
+				if (!persisted) {
+					// New card: no history to derive a marker from.
+					const next = { ...card };
+					delete next.manualReopenAt;
+					return next;
+				}
+				const next: RuntimeBoardCard = { ...card };
+				delete next.manualReopenAt;
+				if (persisted.columnId === "done" && column.id === "review") {
+					next.manualReopenAt = now;
+				} else if (persisted.marker !== undefined && column.id !== "done" && column.id !== "trash") {
+					next.manualReopenAt = persisted.marker;
+				}
+				return next;
+			}),
+		})),
+	};
+}
+
 export async function saveWorkspaceState(
 	cwd: string,
 	payload: RuntimeWorkspaceStateSaveRequest,
@@ -820,9 +866,10 @@ export async function saveWorkspaceState(
 			throw new WorkspaceStateConflictError(expectedRevision, currentMeta.revision);
 		}
 		const persistedBoard = await readWorkspaceBoard(context.workspaceId);
-		const board = mergeServerOwnedPrSettings(
-			mergeServerOwnedPullRequests(parsedPayload.board, persistedBoard),
+		const board = applyManualReopenMarkers(
+			mergeServerOwnedPrSettings(mergeServerOwnedPullRequests(parsedPayload.board, persistedBoard), persistedBoard),
 			persistedBoard,
+			Date.now(),
 		);
 		const sessions = parsedPayload.sessions;
 		const nextRevision = currentMeta.revision + 1;

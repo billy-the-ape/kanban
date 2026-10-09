@@ -590,6 +590,15 @@ export function moveTaskToColumn(
 		...task,
 		updatedAt: now,
 	};
+	// MERGE-1: persist the manual-reopen marker before the task is exposed
+	// in In Review, so the same merged PR does not immediately send it back
+	// to Done (a later merge still completes it). The marker clears when
+	// the task settles in Done or Trash.
+	if (found.columnId === "done" && targetColumnId === "review") {
+		movedTask.manualReopenAt = now;
+	} else if (targetColumnId === "done" || targetColumnId === "trash") {
+		delete movedTask.manualReopenAt;
+	}
 	const targetCards =
 		targetColumnId === "trash" || targetColumnId === "done"
 			? [movedTask, ...targetColumn.cards]
