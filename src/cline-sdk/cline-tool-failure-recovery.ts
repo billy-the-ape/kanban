@@ -65,11 +65,31 @@ function callKey(toolName: string, input: unknown): string {
 	return `${toolName}\n${JSON.stringify(input) ?? ""}`;
 }
 
+function editorRecovery(error: string): string | null {
+	if (error.startsWith("Editor operation failed: No replacement performed: multiple occurrences")) {
+		return "The replacement anchor matched more than once. Read the current file section and include enough surrounding text in old_text to identify exactly one occurrence. Do not repeat the ambiguous anchor.";
+	}
+	if (error.startsWith("Editor operation failed: No replacement performed: text not found")) {
+		return "Replacement text did not match. Read the current file section with read_files, then copy an exact, unique old_text anchor from that fresh read. Do not repeat unchanged arguments or guess whitespace. insert_line is only for a pure insertion, not a replacement.";
+	}
+	if (error.startsWith("Editor operation failed: Parameter `old_text` is required")) {
+		return "The editor received an existing-file edit without usable old_text. Read the current file section and include an explicit old_text string in the actual arguments. Use insert_line only for an intended insertion; do not assume the tool dropped a field.";
+	}
+	if (error.startsWith("Editor operation failed: Invalid insert_line:")) {
+		return "Read the current file to determine its line count and insertion boundary. insert_line is one-based; use line_count + 1 to append. Do not repeat the invalid line number.";
+	}
+	if (error.startsWith("Editor input too large:")) {
+		return "Split the edit into smaller sequential calls; keep old_text and new_text below 30000 characters each. Read the current file before anchoring the next edit. Do not retry the same oversized payload.";
+	}
+	return null;
+}
+
 /**
  * Local SDK hooks that bound *timeout* recovery only. A timed-out replay-safe tool is retried once inside tool
  * execution; any other timed-out tool goes back to the model with instructions to verify side effects before
  * retrying. A call (same tool and input) that times out again after that retry ends the run. All other tool
- * errors pass through untouched so the model can repair them itself; only the same call failing with the same
+ * editor input errors receive targeted instructions in their model-facing result; other errors pass through.
+ * Only the same call failing with the same
  * error repeatedly, with no successful tool call in between, ends the run. Reset only on a new user turn.
  */
 export function createClineToolFailureRecoveryHooks(): ClineSdkAgentHooks {
@@ -172,9 +192,17 @@ export function createClineToolFailureRecoveryHooks(): ClineSdkAgentHooks {
 				identicalFailures.clear();
 				return;
 			}
-			const recovery = isClineToolTimeout(error)
+			const boundedRecovery = isClineToolTimeout(error)
 				? timeoutFailure(toolCall.toolName, input, error, count, snapshot.iteration)
 				: repeatedFailure(toolCall.toolName, input, error, snapshot.iteration);
+			const editorGuidance = toolCall.toolName === "editor" ? editorRecovery(error) : null;
+			const key = `${callKey(toolCall.toolName, input)}\n${error}`;
+			const repeated = (identicalFailures.get(key)?.count ?? 0) > 1;
+			const recovery =
+				boundedRecovery ??
+				(editorGuidance
+					? `${repeated ? "This exact editor call already failed. Change your approach before another attempt. " : ""}${editorGuidance}`
+					: null);
 			if (!recovery) return;
 			return {
 				result: {
