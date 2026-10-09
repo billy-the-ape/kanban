@@ -518,7 +518,9 @@ export class PrCommentAutomationService {
 		if (sub.dispatchRetryAt !== null && nowMs < sub.dispatchRetryAt) {
 			return;
 		}
-		if (nowMs < (automation.debounceDeadline ?? 0)) {
+		// No scheduled deadline means the last successful poll saw no pending
+		// feedback: settle must not burn gh API calls to re-derive that.
+		if (automation.debounceDeadline === null || nowMs < automation.debounceDeadline) {
 			return;
 		}
 		if (!owner) {

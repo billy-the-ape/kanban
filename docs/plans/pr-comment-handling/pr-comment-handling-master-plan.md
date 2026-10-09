@@ -216,7 +216,9 @@ and Biome checks:
   `runTick` awaits polls before settles so settle always sees the freshest record, and
   per-subscription in-flight flags keep overlapping ticks from double-polling or
   double-sending; `settleDispatch` treats `null`/`completed` dispatches with a due
-  deadline as dispatchable in addition to queued intents.
+  deadline as dispatchable in addition to queued intents, and returns early when no
+  deadline is scheduled (no pending feedback) so idle subscriptions never trigger gh
+  API fetches from the settle path.
 - Contract and mutations: `autoAddressComments` (optional, default false) on
   `runtimeTaskCardSchema`; `runtimeTaskPullRequestSchema` with `lastSyncedAt`/`stateCheckedAt`;
   `RuntimePrTrackingRecord`, `RuntimePrCommentAutomation`, `RuntimePrCommentDispatch`,

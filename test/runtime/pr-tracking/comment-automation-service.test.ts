@@ -138,6 +138,7 @@ function makeService(
 	const workspaces = overrides.workspaces ?? [{ workspaceId: "w1", workspacePath: "/w1" }];
 	const workspaceStates = overrides.workspaceStates ?? new Map<string, RuntimeWorkspaceStateResponse>();
 	const sent: Array<{ scope: { workspaceId: string; workspacePath: string }; body: RuntimeTaskChatSendRequest }> = [];
+	const snapshotCalls: string[] = [];
 	const service = createPrCommentAutomationService({
 		listManagedWorkspaces: () => workspaces,
 		loadWorkspaceState: async (workspacePath) => {
@@ -157,12 +158,15 @@ function makeService(
 		},
 		getGitHubAccessScopeId: async () => "scope-1",
 		ghClient: {
-			fetchSnapshot: async (): Promise<GitHubPrSnapshot> => makeSnapshot(overrides.snapshot ?? {}),
+			fetchSnapshot: async (): Promise<GitHubPrSnapshot> => {
+				snapshotCalls.push("fetchSnapshot");
+				return makeSnapshot(overrides.snapshot ?? {});
+			},
 		},
 		now: () => NOW,
 		warn: () => undefined,
 	});
-	return { service, sent, workspaces, workspaceStates };
+	return { service, sent, workspaces, workspaceStates, snapshotCalls };
 }
 
 describe("applyPrPollOutcome", () => {
@@ -564,6 +568,25 @@ describe("PrCommentAutomationService", () => {
 		const second = harness.service.runTick();
 		await Promise.all([first, second]);
 		expect(harness.sent).toHaveLength(1);
+	});
+
+	it("does not call fetchSnapshot from settle when there is no pending feedback", async () => {
+		const harness = makeService({
+			workspaceStates: new Map([
+				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })])],
+			]),
+		});
+		await harness.service.refreshWorkspace(scope);
+		// The initial poll observes no feedback, so no deadline is scheduled
+		// and the next poll is deferred ~60s.
+		await harness.service.runTick();
+		expect(harness.snapshotCalls).toHaveLength(1);
+		// Later ticks: the poll is backed off and the idle settle must return
+		// before fetching a snapshot (no gh API calls to re-derive "nothing").
+		await harness.service.runTick();
+		await harness.service.runTick();
+		expect(harness.snapshotCalls).toHaveLength(1);
+		expect(harness.sent).toHaveLength(0);
 	});
 
 	it("resume sends exactly one instruction through the normal chat send and records the running dispatch", async () => {
