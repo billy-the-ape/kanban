@@ -53,6 +53,7 @@ interface PrSubscriptionState {
 	dispatchRetryAt: number | null;
 	consecutiveFailures: number;
 	pollInFlight: boolean;
+	settleInFlight: boolean;
 }
 
 const POLL_INTERVAL_MS = 60_000;
@@ -194,6 +195,19 @@ export function applyPrPollOutcome(
 					fingerprint.watermark + DEBOUNCE_MS,
 					firstPendingAt + MAX_PENDING_MS,
 				);
+				// Persist the queued intent up front so settle, restart
+				// reconciliation, and cancellation have a durable target.
+				if (dispatch === null || dispatch.status === "completed") {
+					nextAutomation.dispatch = {
+						dispatchId: randomUUID(),
+						attemptedAt: null,
+						fingerprint,
+						ownerRevision: owner?.revision ?? 0,
+						status: "queued",
+						turnRef: null,
+						error: null,
+					};
+				}
 			}
 		} else if (inFlight) {
 			// A batch is queued/running: new feedback waits for the next batch;
@@ -266,7 +280,7 @@ export class PrCommentAutomationService {
 			}
 		})();
 		this.timer = setInterval(() => {
-			void this.tick().catch((error: unknown) => {
+			void this.runTick().catch((error: unknown) => {
 				this.warn(`tick failed: ${error instanceof Error ? error.message : String(error)}`);
 			});
 		}, TICK_INTERVAL_MS);
@@ -326,6 +340,7 @@ export class PrCommentAutomationService {
 							dispatchRetryAt: null,
 							consecutiveFailures: 0,
 							pollInFlight: false,
+							settleInFlight: false,
 						} satisfies PrSubscriptionState);
 					if (!existing) {
 						this.subscriptions.set(key, sub);
@@ -360,26 +375,47 @@ export class PrCommentAutomationService {
 			}
 		}
 	}
-	private async tick(): Promise<void> {
+	/**
+	 * One poll/settle cycle. Polls are awaited before settles so the settle
+	 * always sees the freshest record; the per-subscription in-flight flags
+	 * keep overlapping ticks from double-polling or double-sending.
+	 */
+	async runTick(): Promise<void> {
 		const nowMs = this.nowMs();
+		const polls: Promise<void>[] = [];
 		for (const sub of [...this.subscriptions.values()]) {
 			if (sub.pollInFlight || nowMs < sub.nextPollAt) {
 				continue;
 			}
 			sub.pollInFlight = true;
-			void this.pollSubscription(sub)
-				.catch((error: unknown) => {
-					this.warn(`poll failed: ${error instanceof Error ? error.message : String(error)}`);
-				})
-				.finally(() => {
-					sub.pollInFlight = false;
-				});
+			polls.push(
+				this.pollSubscription(sub)
+					.catch((error: unknown) => {
+						this.warn(`poll failed: ${error instanceof Error ? error.message : String(error)}`);
+					})
+					.finally(() => {
+						sub.pollInFlight = false;
+					}),
+			);
 		}
+		await Promise.all(polls);
+		const settles: Promise<void>[] = [];
 		for (const sub of [...this.subscriptions.values()]) {
-			void this.settleDispatch(sub).catch((error: unknown) => {
-				this.warn(`settle failed: ${error instanceof Error ? error.message : String(error)}`);
-			});
+			if (sub.settleInFlight) {
+				continue;
+			}
+			sub.settleInFlight = true;
+			settles.push(
+				this.settleDispatch(sub)
+					.catch((error: unknown) => {
+						this.warn(`settle failed: ${error instanceof Error ? error.message : String(error)}`);
+					})
+					.finally(() => {
+						sub.settleInFlight = false;
+					}),
+			);
 		}
+		await Promise.all(settles);
 	}
 
 	private async pollSubscription(sub: PrSubscriptionState): Promise<void> {
@@ -473,7 +509,10 @@ export class PrCommentAutomationService {
 			return;
 		}
 
-		if (dispatch === null || dispatch.status !== "queued") {
+		// A failed dispatch is sticky: only an explicit Resume can retry it.
+		// dispatch === null or completed stays dispatchable so records that
+		// predate queued-intent creation (or lost it) still settle when due.
+		if (dispatch !== null && dispatch.status !== "queued" && dispatch.status !== "completed") {
 			return;
 		}
 		if (sub.dispatchRetryAt !== null && nowMs < sub.dispatchRetryAt) {

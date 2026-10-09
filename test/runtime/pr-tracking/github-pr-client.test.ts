@@ -133,6 +133,29 @@ describe("github pr client", () => {
 		);
 	});
 
+	it("sends the GraphQL PR number as a plain typed -F variable", async () => {
+		const graphqlCalls: string[][] = [];
+		const base = makeRunner(baseRoutes());
+		const runner: GitHubPrCommandRunner = (args, cwd) => {
+			if (args[1] === "graphql") {
+				graphqlCalls.push([...args]);
+			}
+			return base(args, cwd);
+		};
+		const snapshot = await clientWith(runner).fetchSnapshot(PR, "/repo", "scope");
+		expect(snapshot.complete).toBe(true);
+		expect(graphqlCalls.length).toBeGreaterThan(0);
+		const call = graphqlCalls[0];
+		if (call === undefined) {
+			throw new Error("expected a graphql call");
+		}
+		const fIndex = call.indexOf("-F");
+		expect(fIndex).toBeGreaterThan(-1);
+		// `-F` does not accept a `name:Type=value` form; the value is typed
+		// automatically, so `$number` must be supplied as `number=42`.
+		expect(call[fIndex + 1]).toBe("number=42");
+	});
+
 	it("marks the snapshot incomplete when any source page fails", async () => {
 		const runner = makeRunner([
 			{

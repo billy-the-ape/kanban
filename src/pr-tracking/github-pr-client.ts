@@ -190,7 +190,7 @@ async function fetchResolvedInlineCommentIds(
 			"-f",
 			`name=${name}`,
 			"-F",
-			`number:Integer=${pr.number}`,
+			`number=${pr.number}`,
 		];
 		if (cursor) {
 			args.push("-f", `cursor=${cursor}`);

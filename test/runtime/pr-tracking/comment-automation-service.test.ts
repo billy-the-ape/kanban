@@ -182,6 +182,17 @@ describe("applyPrPollOutcome", () => {
 		expect(next.commentAutomation.pendingCount).toBe(1);
 		expect(next.commentAutomation.firstPendingAt).toBe(NOW);
 		expect(next.commentAutomation.debounceDeadline).toBe(NOW + 120_000);
+		// The first pending observation persists the queued intent so settle,
+		// restart reconciliation, and cancellation have a durable target.
+		expect(next.commentAutomation.dispatch).toMatchObject({
+			attemptedAt: null,
+			fingerprint: fingerprintOf([event]),
+			ownerRevision: 1,
+			status: "queued",
+			turnRef: null,
+			error: null,
+		});
+		expect(typeof next.commentAutomation.dispatch?.dispatchId).toBe("string");
 		expect(next.taskBindings).toEqual([{ workspaceId: "w1", taskId: "t1", terminal: false }]);
 	});
 
@@ -478,6 +489,81 @@ describe("PrCommentAutomationService", () => {
 		const result = await harness.service.getTaskPrTrackingState(scope, "t1");
 		expect(result.ok).toBe(true);
 		expect(result.state.blocker).toContain("Choose one repair owner");
+	});
+
+	it("settles a due pending observation from a tick and sends exactly one instruction", async () => {
+		// Seeded so the recomputed deadline stays in the past:
+		// watermark NOW-471s + 120s = NOW-351s; firstPendingAt NOW-590s + 600s = NOW+10s.
+		const event = makeEvent({ providerId: "conversation-1", updatedAt: NOW - 471_000 });
+		const fingerprint = fingerprintOf([event]);
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			taskBindings: [{ workspaceId: "w1", taskId: "t1", terminal: false }],
+			commentAutomation: {
+				...record.commentAutomation,
+				repairOwner: { workspaceId: "w1", taskId: "t1", revision: 1 },
+				pendingFeedbackFingerprint: fingerprint,
+				pendingCount: 1,
+				firstPendingAt: NOW - 590_000,
+				debounceDeadline: NOW - 351_000,
+			},
+		}));
+		const harness = makeService({
+			workspaceStates: new Map([
+				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })])],
+			]),
+			snapshot: { events: [event] },
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(1);
+		expect(harness.sent[0]?.scope).toMatchObject(scope);
+		expect(harness.sent[0]?.body.taskId).toBe("t1");
+		expect(harness.sent[0]?.body.mode).toBe("act");
+		expect(harness.sent[0]?.body.text).toBe(buildCommentHandlingInstruction(PR.url));
+
+		const loaded = await loadPrTrackingRecord(KEY);
+		expect(loaded.status).toBe("ok");
+		if (loaded.status !== "ok") {
+			throw new Error("unreachable");
+		}
+		const automation = loaded.record.commentAutomation;
+		expect(automation.dispatch?.status).toBe("running");
+		expect(automation.dispatch?.turnRef).toBe("msg-1");
+		expect(automation.dispatch?.attemptedAt).not.toBeNull();
+		expect(automation.pendingFeedbackFingerprint).toBeNull();
+		expect(automation.pendingCount).toBeNull();
+		expect(automation.lastDispatchedFeedbackFingerprint).toEqual(fingerprint);
+	});
+
+	it("does not send twice when ticks overlap", async () => {
+		const event = makeEvent({ providerId: "conversation-1", updatedAt: NOW - 471_000 });
+		const fingerprint = fingerprintOf([event]);
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			taskBindings: [{ workspaceId: "w1", taskId: "t1", terminal: false }],
+			commentAutomation: {
+				...record.commentAutomation,
+				repairOwner: { workspaceId: "w1", taskId: "t1", revision: 1 },
+				pendingFeedbackFingerprint: fingerprint,
+				pendingCount: 1,
+				firstPendingAt: NOW - 590_000,
+				debounceDeadline: NOW - 351_000,
+			},
+		}));
+		const harness = makeService({
+			workspaceStates: new Map([
+				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })])],
+			]),
+			snapshot: { events: [event] },
+		});
+		await harness.service.refreshWorkspace(scope);
+		const first = harness.service.runTick();
+		const second = harness.service.runTick();
+		await Promise.all([first, second]);
+		expect(harness.sent).toHaveLength(1);
 	});
 
 	it("resume sends exactly one instruction through the normal chat send and records the running dispatch", async () => {

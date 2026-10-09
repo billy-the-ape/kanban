@@ -204,14 +204,19 @@ and Biome checks:
   identity validation, exactly-one revision advancement per accepted update and no-op writes
   that never touch the file.
 - `src/pr-tracking/comment-automation-service.ts` — `applyPrPollOutcome` (task bindings,
-  owner selection/blocking, 120s quiet deadline capped at 600s, pending tracking, sticky failed
-  dispatch, queued-intent cancellation on disable/terminal observation while in-flight and
+  owner selection/blocking, 120s quiet deadline capped at 600s, pending tracking,
+  queued-intent creation on the first pending observation, sticky failed dispatch,
+  queued-intent cancellation on disable/terminal observation while in-flight and
   failed dispatches survive), `getTaskPrTrackingState` (neutral / enabled / blocked /
   unsupported), `resumeCommentHandling` (one-shot resume of a failed dispatch; clears the
   failure without sending when no eligible feedback remains), and dispatch through the normal
   backend `sendTaskChatMessage` in `act` mode with the exact fixed instruction.
   `reconcileRestartedDispatches` runs at service startup and resolves recorded in-flight
   dispatches from their normal turn reference without re-running the prompt.
+  `runTick` awaits polls before settles so settle always sees the freshest record, and
+  per-subscription in-flight flags keep overlapping ticks from double-polling or
+  double-sending; `settleDispatch` treats `null`/`completed` dispatches with a due
+  deadline as dispatchable in addition to queued intents.
 - Contract and mutations: `autoAddressComments` (optional, default false) on
   `runtimeTaskCardSchema`; `runtimeTaskPullRequestSchema` with `lastSyncedAt`/`stateCheckedAt`;
   `RuntimePrTrackingRecord`, `RuntimePrCommentAutomation`, `RuntimePrCommentDispatch`,
