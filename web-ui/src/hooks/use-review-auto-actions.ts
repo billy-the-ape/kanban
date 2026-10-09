@@ -64,6 +64,12 @@ interface UseReviewAutoActionsOptions {
 	 * worktree after the agent runs the git prompt.
 	 */
 	completeOnGitActionSuccess?: boolean;
+	/**
+	 * PRTRACK-1: task ids whose linked PR workflow is owned by an installed
+	 * enabled consumer — legacy automatic completion must not run for them
+	 * (the consumer owns completion).
+	 */
+	prCompletionGatedTaskIds?: ReadonlySet<string>;
 	resetKey?: string | null;
 }
 
@@ -73,6 +79,7 @@ export function useReviewAutoActions({
 	runAutoReviewGitAction,
 	requestCompleteTask,
 	completeOnGitActionSuccess = false,
+	prCompletionGatedTaskIds,
 	resetKey,
 }: UseReviewAutoActionsOptions): void {
 	const boardRef = useRef<BoardData>(board);
@@ -100,6 +107,11 @@ export function useReviewAutoActions({
 	useEffect(() => {
 		completeOnGitActionSuccessRef.current = completeOnGitActionSuccess;
 	}, [completeOnGitActionSuccess]);
+
+	const prCompletionGatedTaskIdsRef = useRef<ReadonlySet<string> | undefined>(prCompletionGatedTaskIds);
+	useEffect(() => {
+		prCompletionGatedTaskIdsRef.current = prCompletionGatedTaskIds;
+	}, [prCompletionGatedTaskIds]);
 
 	const clearAutoReviewTimer = useCallback((taskId: string) => {
 		const timer = timerByTaskIdRef.current[taskId];
@@ -190,6 +202,15 @@ export function useReviewAutoActions({
 			}
 
 			for (const reviewTask of reviewCardsForAutomation) {
+				// PRTRACK-1: an installed enabled consumer owns this task's linked
+				// PR workflow — legacy automatic completion must not run for it.
+				if (prCompletionGatedTaskIdsRef.current?.has(reviewTask.id)) {
+					delete awaitingCleanActionByTaskIdRef.current[reviewTask.id];
+					clearAutoReviewTimer(reviewTask.id);
+					completeTaskInFlightTaskIdsRef.current.delete(reviewTask.id);
+					continue;
+				}
+
 				const autoReviewEnabled = isTaskAutoReviewEnabled(reviewTask);
 				if (!autoReviewEnabled) {
 					delete awaitingCleanActionByTaskIdRef.current[reviewTask.id];

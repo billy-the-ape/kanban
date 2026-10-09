@@ -740,14 +740,24 @@ describe("createWorkspaceApi PR linking (PRLINK-5)", () => {
 			sessions: {},
 			revision: 2,
 		});
-		const { api } = createApi();
+		const broadcast = vi.fn();
+		const { api } = createApi(broadcast);
 
 		await api.saveState(scope, { board, sessions: {}, expectedRevision: 1 });
 
-		expect(prLinkMocks.fireReviewPullRequestLookup).toHaveBeenCalledWith({
-			workspacePath: "/tmp/repo",
-			taskId: "task-1",
-		});
+		expect(prLinkMocks.fireReviewPullRequestLookup).toHaveBeenCalledTimes(1);
+		const fireInput = prLinkMocks.fireReviewPullRequestLookup.mock.calls[0][0] as {
+			workspacePath: string;
+			taskId: string;
+			onChanged?: () => void;
+		};
+		expect(fireInput).toMatchObject({ workspacePath: "/tmp/repo", taskId: "task-1" });
+		// PRTRACK-1: a recorded lookup must re-broadcast the workspace state
+		// so open UIs refresh and demand re-derives (via the server's
+		// broadcast wiring).
+		expect(typeof fireInput.onChanged).toBe("function");
+		fireInput.onChanged?.();
+		expect(broadcast).toHaveBeenCalledWith(scope.workspaceId, "/tmp/repo");
 	});
 
 	it("saveState does not fire the branch lookup when no task enters review", async () => {

@@ -429,4 +429,56 @@ describe("fireReviewPullRequestLookup", () => {
 			fixture.cleanup();
 		}
 	});
+	it("invokes onChanged when the lookup records new links (and not when skipped)", async () => {
+		const fixture = createWorkspaceFixture("kanban-lookup-fire3-");
+		try {
+			const workspacePath = fixture.workspacePath;
+			// The lookup resolves the branch from the worktree (mocked below to
+			// the fixture repo); an unborn HEAD has no branch name, so seed a
+			// commit first.
+			const seed = spawnSync("git", ["commit", "--allow-empty", "-m", "seed"], {
+				cwd: workspacePath,
+				stdio: "ignore",
+				env: {
+					...createGitTestEnv(),
+					GIT_AUTHOR_NAME: "Test",
+					GIT_AUTHOR_EMAIL: "test@example.com",
+					GIT_COMMITTER_NAME: "Test",
+					GIT_COMMITTER_EMAIL: "test@example.com",
+				},
+			});
+			if (seed.status !== 0) {
+				throw new Error("Failed to seed an empty commit in the fixture repo");
+			}
+			const initial = await loadWorkspaceState(workspacePath);
+			await saveWorkspaceState(workspacePath, {
+				board: createBoard({ id: "task-1" }),
+				sessions: {},
+				expectedRevision: initial.revision,
+			});
+			// The lookup resolves the branch from the worktree; point the
+			// (mocked) worktree at the fixture repo itself.
+			taskWorktreeMocks.resolveTaskCwd.mockReset();
+			taskWorktreeMocks.resolveTaskCwd.mockResolvedValue(workspacePath);
+			const gh = createGhRunner([{ url: "https://github.com/owner/repo/pull/21", title: "Found", state: "OPEN" }]);
+			const onChanged = vi.fn();
+
+			fireReviewPullRequestLookup({ workspacePath, taskId: "task-1", gh, onChanged });
+			await vi.waitFor(
+				() => {
+					expect(onChanged).toHaveBeenCalledTimes(1);
+				},
+				{ timeout: 10_000 },
+			);
+			expect(onChanged).toHaveBeenCalledWith(1);
+
+			// The card now has recorded PRs: a second fire is skipped by the
+			// pre-check and must not fire the callback again.
+			fireReviewPullRequestLookup({ workspacePath, taskId: "task-1", gh, onChanged });
+			await flushFireAndForget();
+			expect(onChanged).toHaveBeenCalledTimes(1);
+		} finally {
+			fixture.cleanup();
+		}
+	});
 });

@@ -113,6 +113,8 @@ export function TaskCreateDialog({
 	onAutoReviewEnabledChange,
 	autoReviewMode,
 	onAutoReviewModeChange,
+	prAutoAddressComments,
+	prAutoFinishOnMerge,
 	startInPlanModeDisabled = false,
 	workspaceId,
 	branchRef,
@@ -147,6 +149,12 @@ export function TaskCreateDialog({
 	onAutoReviewEnabledChange: (value: boolean) => void;
 	autoReviewMode: TaskAutoReviewMode;
 	onAutoReviewModeChange: (value: TaskAutoReviewMode) => void;
+	/**
+	 * PRTRACK-1: PR automation preferences. The checkbox renders disabled with
+	 * "feature unavailable" when no consumer of that kind is installed.
+	 */
+	prAutoAddressComments?: { checked: boolean; onChange: (value: boolean) => void; featureAvailable: boolean };
+	prAutoFinishOnMerge?: { checked: boolean; onChange: (value: boolean) => void; featureAvailable: boolean };
 	startInPlanModeDisabled?: boolean;
 	workspaceId: string | null;
 	branchRef: string;
@@ -176,6 +184,8 @@ export function TaskCreateDialog({
 	const startInPlanModeId = useId();
 	const autoReviewEnabledId = useId();
 	const updateBaseRefBeforeStartId = useId();
+	const prAutoAddressCommentsId = useId();
+	const prAutoFinishOnMergeId = useId();
 	const createMoreId = useId();
 	const [primaryStartAction, setPrimaryStartAction] = useRawLocalStorageValue<TaskCreateStartAction>(
 		LocalStorageKey.TaskCreatePrimaryStartAction,
@@ -602,6 +612,63 @@ export function TaskCreateDialog({
 							))}
 						</NativeSelect>
 					</div>
+
+					{prAutoAddressComments || prAutoFinishOnMerge ? (
+						<div className="flex items-center gap-4 flex-wrap">
+							{prAutoAddressComments ? (
+								<label
+									htmlFor={prAutoAddressCommentsId}
+									className={`flex items-center gap-2 text-[12px] select-none ${
+										prAutoAddressComments.featureAvailable
+											? "text-text-primary cursor-pointer"
+											: "text-text-tertiary cursor-not-allowed"
+									}`}
+								>
+									<RadixCheckbox.Root
+										id={prAutoAddressCommentsId}
+										aria-label="Auto address PR review comments"
+										checked={prAutoAddressComments.checked}
+										disabled={!prAutoAddressComments.featureAvailable}
+										onCheckedChange={(checked) => prAutoAddressComments.onChange(checked === true)}
+										className="flex h-3.5 w-3.5 items-center justify-center rounded-sm border border-border-bright bg-surface-3 data-[state=checked]:bg-accent data-[state=checked]:border-accent data-[disabled]:cursor-not-allowed data-[disabled]:opacity-50"
+									>
+										<RadixCheckbox.Indicator>
+											<Check size={10} className="text-white" />
+										</RadixCheckbox.Indicator>
+									</RadixCheckbox.Root>
+									{prAutoAddressComments.featureAvailable
+										? "Auto address PR review comments"
+										: "Auto address PR review comments (feature unavailable)"}
+								</label>
+							) : null}
+							{prAutoFinishOnMerge ? (
+								<label
+									htmlFor={prAutoFinishOnMergeId}
+									className={`flex items-center gap-2 text-[12px] select-none ${
+										prAutoFinishOnMerge.featureAvailable
+											? "text-text-primary cursor-pointer"
+											: "text-text-tertiary cursor-not-allowed"
+									}`}
+								>
+									<RadixCheckbox.Root
+										id={prAutoFinishOnMergeId}
+										aria-label="Auto complete when the PR merges"
+										checked={prAutoFinishOnMerge.checked}
+										disabled={!prAutoFinishOnMerge.featureAvailable}
+										onCheckedChange={(checked) => prAutoFinishOnMerge.onChange(checked === true)}
+										className="flex h-3.5 w-3.5 items-center justify-center rounded-sm border border-border-bright bg-surface-3 data-[state=checked]:bg-accent data-[state=checked]:border-accent data-[disabled]:cursor-not-allowed data-[disabled]:opacity-50"
+									>
+										<RadixCheckbox.Indicator>
+											<Check size={10} className="text-white" />
+										</RadixCheckbox.Indicator>
+									</RadixCheckbox.Root>
+									{prAutoFinishOnMerge.featureAvailable
+										? "Auto complete when the PR merges"
+										: "Auto complete on merge (feature unavailable)"}
+								</label>
+							) : null}
+						</div>
+					) : null}
 
 					{onAgentIdChange && onClineSettingsChange ? (
 						<TaskAgentModelPicker
