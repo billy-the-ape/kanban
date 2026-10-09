@@ -1,77 +1,87 @@
-# PRLINK-6 — PR metadata: first/last seen and a "primary" PR
+# PRLINK-6 — Observation timestamps and a primary display PR
 
-**Status: PROPOSED (draft for refinement; execute only after PR-linking v1 has merged).**
+**Status: READY FOR IMPLEMENTATION; depends on landed PR-linking v1.**
+Master plan: [v1](../complete/pr-linking/PR_LINKING_PLAN.md). Shared context: [follow-ups](PRLINK-FOLLOWUPS.md).
+Deliver as one implementation PR. No higher-level product decisions remain open.
 
-Master plan: `PR_LINKING_PLAN.md`. Index of follow-ups: `PRLINK-FOLLOWUPS.md`.
-Depends on: **PRLINK-0** (data model), **PRLINK-4** (card and top-bar display), **PRLINK-5** (manual management UI).
-Unblocks: **PRLINK-7** (mobile link) and **PRLINK-10** (PRs tab) both want a stable "primary" PR.
+## Fixed behavior
 
-## Purpose
+Primary means **display preference**, never automation authority. Do not read or write
+`selectedAutomationPrKey`, checkbox settings, tracking generations, repair ownership or completion
+markers when choosing/clearing a primary. Label the action **Make primary for display**; explain
+that Automation PR is selected separately. Preserve the foundation's validated selection rules.
 
-v1 has no notion of a "main" PR. The card shows the **last element** of `pullRequests` (the most recently *first-recorded* PR), and the top bar shows all of them in recorded order. That is wrong when a task opens PR A, then a follow-up PR B, and A is the live one. This milestone:
+Keep `createdAt` as first recorded time; show it as **First recorded**. Do not add `firstSeenAt`.
+Add only optional `lastSeenAt: number` and `isPrimary: boolean` fields to
+`runtimeTaskPullRequestSchema`. Timestamps are server epoch milliseconds, finite and nonnegative.
+Missing `lastSeenAt` displays `createdAt`; old cards require no bulk migration.
 
-1. Adds `firstSeenAt` / `lastSeenAt` timestamps to each stored PR.
-2. Adds a user-settable **primary** flag so one PR is the one shown first in the board card and the task detail.
-3. Defines a deterministic fallback when the user has not chosen one.
+A new record sets lastSeenAt = createdAt = now. Successful capture, delivery, branch discovery,
+manual re-add and successful provider metadata observation may advance lastSeenAt. Merely rendering,
+loading a board, choosing primary, or a failed provider read never advances it.
+Coalesce duplicate observations: advance only when now - (lastSeenAt ?? createdAt) >= 600,000 ms;
+never move backward if the clock regresses. If other fields already require a save, include the
+newer observation time in that same write. Throttled duplicate observations remain save:false.
+This is an observation timestamp, **not** proof of state freshness; stateCheckedAt remains separate.
+Polling must not add a timestamp-only write every minute.
 
-## Data model
+Use one pure shared getPrimaryPullRequest(list) helper in `src/core/pull-request-links.ts`.
+Resolve by these rules, with no sorting/mutation of stored order:
 
-Each PR is already one object: `runtimeTaskPullRequestSchema` in `src/core/api-contract.ts` (provider, host, repository, number, url, source, `createdAt`, optional title/state/stateCheckedAt). Add, all **optional** so existing `board.json` files and uncast web-ui mocks keep working (AGENTS.md "required field" trap):
+1. Explicit isPrimary:true wins, even if closed, merged or unknown.
+2. Otherwise pick the newest first-recorded open or draft entry (same priority).
+3. Otherwise pick the newest first-recorded unknown-state entry.
+4. Otherwise pick the newest first-recorded merged or closed entry.
+5. Empty list returns null.
 
-```ts
-firstSeenAt: z.number().optional(), // first time Kanban observed this PR
-lastSeenAt: z.number().optional(),  // last time a capture/lookup path observed it again
-isPrimary: z.boolean().optional(),  // user-chosen; at most one true per task
-```
+Newest compares createdAt descending, then later original array index for equal timestamps.
+For malformed older data with several true flags, select the same newest winner deterministically;
+the next successful primary mutation clears the other flags. Add ordered display helper returning
+the winner first and all other entries in original order, without mutating the input.
 
-Rules:
+## Mutation and integration
 
-- `createdAt` already means "first time Kanban recorded it". Do not rename it. Treat `firstSeenAt` as an alias populated from `createdAt` on read when missing (migration is read-time only; do not rewrite every card on load). Decide during implementation whether to keep both or fold `firstSeenAt` into `createdAt`; prefer **not** adding a duplicate field if `createdAt` is enough, and only add `lastSeenAt`.
-- **`lastSeenAt` semantics**: updated when a capture path (Cline tool call, hook, delivery, branch lookup/refresh, manual re-add of an existing link) observes an already-stored PR. v1 deliberately does `save: false` on duplicate detections to avoid revision churn, so this needs a **throttle** (for example only write when the stored value is older than 10 minutes, or only on refresh and delivery). Pick one and document it; never bump the revision on every tool call.
-- **`isPrimary` invariants**: at most one entry per task has `isPrimary: true`. Enforced in the mutation, not by the client. Removing the primary PR clears the flag (no automatic promotion of another entry to `isPrimary`; the fallback below handles display).
-- Stays **server-owned**: `mergeServerOwnedPullRequests` in `src/state/workspace-state.ts` already restores the persisted array wholesale, so the new fields are protected for free. Do not add client-writable paths.
+Add setPrimaryTaskPullRequest(board, taskId, identityKey | null, now), returning board/task/updated.
+Expose workspace.setPrimaryTaskPullRequest({ taskId, url: string | null }) using the existing
+link-response style: strict server URL parse, missing task/unknown link gives ok:false and no save;
+null clears all flags; selecting the same sole primary or clearing an already clear task succeeds
+without revision/broadcast. The response returns the selected link, or null when cleared.
+Set/clear under mutateWorkspaceState, preserving concurrent links and unrelated card fields.
+Incoming capture/manual-add inputs may not set primary. Keep the server-owned board merge protection.
 
-## Selection logic (single shared helper)
+Removal leaves no explicit primary; fallback handles display. Cap remains 20, but implicit eviction
+must protect both explicit primary and the selected Automation PR. Evict the oldest unprotected
+non-manual entry first, otherwise oldest unprotected manual entry. Keep retained entries ordered.
+With at most one display primary and one selected Automation PR there is always an eviction candidate.
+Do not alter automation selection to make room; test both protected identities.
+Explicit unlink still uses the foundation's existing invalidation/reconciliation behavior.
 
-Add `getPrimaryPullRequest(pullRequests)` next to the identity helpers in `src/core/pull-request-links.ts` and expose it to web-ui through the same alias used for the shared identity key (see the PRLINK-4/5 review follow-up about replacing the duplicated `getPullRequestKey`). Resolution order:
-
-1. The entry with `isPrimary === true`.
-2. Otherwise the most relevant by state: prefer `open` (or `draft`), then the most recently first-recorded among the rest. State comes from the snapshot; entries without a snapshot sort as unknown, after `open`.
-3. Otherwise the last element (today's v1 behavior).
-
-`getLatestPullRequest` in `web-ui/src/utils/task-pull-requests.ts` becomes a thin caller of this helper (or is replaced by it). The card must **not** reimplement the order.
-
-## API
-
-- New board mutation in `src/core/task-board-mutations.ts`: `setPrimaryTaskPullRequest(board, taskId, identityKey | null, now)` returning `{ board, task, updated }`. `null` clears the flag. Unknown identity key returns `updated: false`.
-- New tRPC route `workspace.setPrimaryTaskPullRequest` mirroring `addTaskPullRequest` / `removeTaskPullRequest` (request: `{ taskId, url }` re-parsed with `parsePullRequestUrl`, or `null` to clear; response: the existing link response schema). Broadcast only when the board changed.
-- `addTaskPullRequests` gains no flag parameter; a manual add does not become primary automatically (see open question 2).
+Update recordTaskPullRequests and lookup snapshot writes in one transaction per observation batch;
+the current recorder returns changed:false for both duplicate and failure, so do not infer successful
+recording from that boolean alone. Snapshot updates preserve all display/observation fields.
+Successful metadata reads from tracking may project these display fields through the existing board
+mutation path; an authorized read updates stateCheckedAt even when title/state are unchanged.
+No capture/delivery event may overwrite a newer authoritative state snapshot.
 
 ## UI
 
-- **Board card** (`web-ui/src/components/board-card.tsx`): the compact `#123` link shows `getPrimaryPullRequest(card)`. Optionally show a tiny "+N" suffix when the task has more than one PR so the card hints there are others (tooltip lists them).
-- **Task detail top bar** (`top-bar.tsx`): render the primary PR first, then the rest in recorded order. The overflow rule (3 inline, then "+N" popover) keeps the primary visible by always pulling it into the inline set.
-- **Manager popover** (`task-pull-request-manager.tsx`): each row gets a "Make primary" action (Lucide `Star`, filled when primary) and the row for the primary is visually marked. Clearing returns to the fallback.
-- Tooltip gains "first seen / last seen <relative time>" lines using the existing `formatApproximateAge` helper, labelled as approximate.
+Board compact link uses the shared winner. Desktop top bar shows winner first, then remaining links
+in recorded order; keep the winner inline under the existing overflow limit. Manager rows use that
+order, distinguish explicit **Primary for display** from **Shown by default**, and offer **Use automatic
+display order** to clear. Use pending/error states and authoritative broadcasts, not optimistic flags.
+Show First recorded, Last observed (approximate), and State checked as distinct tooltip lines.
+No extra board-card count badge in this milestone.
 
-## Tests
+## Verification and acceptance
 
-- Contract: new optional fields round-trip; old cards without them still parse.
-- `task-board-mutations.test.ts`: set/clear primary, single-primary invariant when setting a second, removing the primary clears it, unknown key is a no-op.
-- `lastSeenAt` throttle: repeated detection inside the window does not bump the revision; outside the window it does.
-- `getPrimaryPullRequest`: explicit primary wins; open beats merged/closed; unknown state falls back to last recorded; empty list returns null.
-- `workspace-state.integration.test.ts`: a stale client save cannot flip `isPrimary` (server-owned).
-- web-ui: card shows the primary, not the last; top bar orders primary first and keeps it inline when overflowing; manager action calls the route.
-- Tests that touch workspace state redirect `HOME`/`USERPROFILE` (AGENTS.md).
+- Contract: old cards parse; new fields round-trip; stale client saves cannot forge/drop flags.
+- Pure selection: all four state groups, equal timestamps, explicit terminal primary, duplicate flags,
+  empty array, stable remaining order, no mutation.
+- Mutation: set second/clear/remove/no-op/unknown task and key; primary and Automation PR cap protection.
+- Observation: 599,999 ms no save, 600,000 ms save once, clock regression, snapshot change inside window,
+  failed lookup, unchanged successful metadata refresh, batch one revision; preserve primary/source.
+- Integration: primary A with Automation PR B changes display only; no settings/generation/polling/
+  completion/repair effect. Removing A leaves B selected.
+- UI: card/top bar/manager agree after restart, moves and overflow; mutation failure leaves old choice.
 
-## Acceptance
-
-- A user can mark any PR as primary and the board card and task detail both show it first, after a reload and across column moves.
-- With no explicit choice, a task with an open PR and an older merged PR shows the open one.
-- Repeated tool calls do not churn the workspace revision.
-
-## Open questions (refine before starting)
-
-1. One field (`createdAt`) or two (`firstSeenAt` + `createdAt`)? Leaning one.
-2. Should a newly detected PR from a **PR-creating tool call** auto-become primary when the task has no explicit primary, or only via the fallback ordering? Leaning fallback-only, so the user's explicit choice is never overridden.
-3. Should merged/closed PRs ever be preferred over open ones when the user has not chosen? Leaning no.
+Follow the shared verification/deployment rules in PRLINK-FOLLOWUPS.md.

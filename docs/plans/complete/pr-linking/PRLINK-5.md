@@ -1,6 +1,6 @@
 # PRLINK-5 — Manual add/remove and optional refresh
 
-Master plan: `PR_LINKING_PLAN.md` (this is milestone **PL-6**).
+Master plan: `PR_LINKING_PLAN.md`.
 Depends on: **PRLINK-4** (top-bar PR link UI to hang the affordance on) and **PRLINK-1** (`recordTaskPullRequests`).
 
 ## Purpose

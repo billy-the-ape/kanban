@@ -7,6 +7,7 @@ import type { RuntimeBoardData, RuntimeTaskSessionSummary } from "../../../src/c
 import { loadWorkspaceState, saveWorkspaceState } from "../../../src/state/workspace-state";
 import type { TerminalSessionManager } from "../../../src/terminal/session-manager";
 import { createHooksApi } from "../../../src/trpc/hooks-api";
+import { type RecordHookPullRequestsInput, recordHookPullRequests } from "../../../src/workspace/task-pull-requests";
 import { createGitTestEnv } from "../../utilities/git-env";
 import { createTempDir } from "../../utilities/temp-dir";
 
@@ -236,20 +237,29 @@ describe("createHooksApi pull-request recording", () => {
 			transitionToRunning: vi.fn(),
 			applyHookActivity: vi.fn(),
 		} as unknown as TerminalSessionManager;
+		// The API fires recording off the hot path (never awaits it), so the
+		// spy delegates to the real recorder and lets tests await completion
+		// deterministically instead of racing the board file.
+		let recordPromise: Promise<void> | null = null;
 		return {
 			manager,
+			flushRecording: () => recordPromise ?? Promise.resolve(),
 			api: createHooksApi({
 				getWorkspacePathById: vi.fn(() => workspacePath),
 				ensureTerminalManagerForWorkspace: vi.fn(async () => manager),
 				broadcastRuntimeWorkspaceStateUpdated: broadcast,
 				broadcastTaskReadyForReview: vi.fn(),
+				recordHookPullRequests: vi.fn((input: RecordHookPullRequestsInput) => {
+					recordPromise = recordHookPullRequests(input);
+					return recordPromise;
+				}),
 			}),
 		};
 	}
 
 	it("records PR URLs onto the card with source agent_tool and broadcasts on change", async () => {
 		const broadcast = vi.fn();
-		const { manager, api } = createApi(broadcast);
+		const { manager, api, flushRecording } = createApi(broadcast);
 
 		// A running task receiving to_in_progress does not transition, so any
 		// broadcast here must come from the PR recording itself.
@@ -262,6 +272,7 @@ describe("createHooksApi pull-request recording", () => {
 
 		expect(response).toEqual({ ok: true });
 		expect(manager.transitionToRunning).not.toHaveBeenCalled();
+		await flushRecording();
 		expect(broadcast).toHaveBeenCalledWith("workspace-1", workspacePath);
 
 		const recorded = await loadWorkspaceState(workspacePath);
@@ -278,7 +289,7 @@ describe("createHooksApi pull-request recording", () => {
 	});
 
 	it("drops unparseable URLs without recording and still succeeds", async () => {
-		const { api } = createApi(vi.fn());
+		const { api, flushRecording } = createApi(vi.fn());
 
 		const response = await api.ingest({
 			taskId: "task-1",
@@ -292,13 +303,14 @@ describe("createHooksApi pull-request recording", () => {
 		});
 
 		expect(response).toEqual({ ok: true });
+		await flushRecording();
 		const recorded = await loadWorkspaceState(workspacePath);
 		expect(findCardPullRequests(recorded.board, "task-1")).toBeUndefined();
 	});
 
 	it("records PRs on non-transition events (asserts the board file, not the transition)", async () => {
 		const broadcast = vi.fn();
-		const { manager, api } = createApi(broadcast);
+		const { manager, api, flushRecording } = createApi(broadcast);
 
 		const response = await api.ingest({
 			taskId: "task-1",
@@ -310,7 +322,7 @@ describe("createHooksApi pull-request recording", () => {
 		expect(response).toEqual({ ok: true });
 		expect(manager.transitionToRunning).not.toHaveBeenCalled();
 		expect(manager.transitionToReview).not.toHaveBeenCalled();
-
+		await flushRecording();
 		const recorded = await loadWorkspaceState(workspacePath);
 		const pullRequests = findCardPullRequests(recorded.board, "task-1");
 		expect(pullRequests?.map((pullRequest) => pullRequest.url)).toEqual([
@@ -320,7 +332,7 @@ describe("createHooksApi pull-request recording", () => {
 	});
 
 	it("does not bump the revision for duplicate URLs already recorded", async () => {
-		const { api: firstApi } = createApi(vi.fn());
+		const { api: firstApi, flushRecording: flushFirst } = createApi(vi.fn());
 
 		const first = await firstApi.ingest({
 			taskId: "task-1",
@@ -329,10 +341,11 @@ describe("createHooksApi pull-request recording", () => {
 			pullRequestUrls: ["https://github.com/owner/repo/pull/7"],
 		});
 		expect(first).toEqual({ ok: true });
+		await flushFirst();
 		const revisionAfterFirst = (await loadWorkspaceState(workspacePath)).revision;
 
 		const broadcast = vi.fn();
-		const { api: secondApi } = createApi(broadcast);
+		const { api: secondApi, flushRecording: flushSecond } = createApi(broadcast);
 		const second = await secondApi.ingest({
 			taskId: "task-1",
 			workspaceId: "workspace-1",
@@ -341,6 +354,7 @@ describe("createHooksApi pull-request recording", () => {
 		});
 
 		expect(second).toEqual({ ok: true });
+		await flushSecond();
 		expect(broadcast).not.toHaveBeenCalled();
 		const recorded = await loadWorkspaceState(workspacePath);
 		expect(recorded.revision).toBe(revisionAfterFirst);

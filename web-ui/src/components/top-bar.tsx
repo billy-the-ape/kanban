@@ -165,7 +165,7 @@ function GitBranchStatusControl({
 					<span className="truncate w-full text-left">{branchLabel}</span>
 				</Button>
 				{pullRequestList.length > 0 || (taskId && workspaceId) ? (
-					<div className="ml-1.5 flex items-center gap-1.5 shrink-0">
+					<div className="ml-1.5 flex min-w-0 items-center gap-1.5">
 						{inlinePullRequests.map((pullRequest) => (
 							<TaskPullRequestLink
 								key={getPullRequestKey(pullRequest)}

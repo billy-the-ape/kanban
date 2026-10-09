@@ -49,6 +49,11 @@ export interface CreateProjectsApiDependencies {
 		options?: DisposeWorkspaceOptions,
 	) => { terminalManager: TerminalSessionManager | null; workspacePath: string | null };
 	collectProjectWorktreeTaskIdsForRemoval: (board: RuntimeBoardData) => Set<string>;
+	/**
+	 * PRTRACK-1: reconcile task-derived PR tracking subscriptions after a
+	 * workspace removal (its cards can no longer generate demand).
+	 */
+	runPrTrackingReconcilePass?: () => void;
 	warn: (message: string) => void;
 	buildProjectsPayload: (preferredCurrentProjectId: string | null) => Promise<{
 		currentProjectId: string | null;
@@ -190,6 +195,10 @@ export function createProjectsApi(deps: CreateProjectsApiDependencies): RuntimeT
 				deps.disposeWorkspace(body.projectId, {
 					stopTerminalSessions: false,
 				});
+				// PRTRACK-1: removing the workspace drops all task-derived PR
+				// tracking demand from it. Fire-and-forget: the removal response
+				// is never delayed.
+				deps.runPrTrackingReconcilePass?.();
 
 				if (deps.getActiveWorkspaceId() === body.projectId) {
 					const remaining = await listWorkspaceIndexEntries();

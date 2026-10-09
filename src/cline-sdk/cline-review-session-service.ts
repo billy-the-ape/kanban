@@ -598,7 +598,7 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 		const messages = this.sessionService.listMessages(sessionId);
 		for (let index = messages.length - 1; index >= 0; index -= 1) {
 			const message = messages[index];
-			if (message?.role !== "assistant") {
+			if (!message || message.role !== "assistant") {
 				continue;
 			}
 			const block = extractReviewResultBlock(message.content);

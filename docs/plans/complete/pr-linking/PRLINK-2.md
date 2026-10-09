@@ -1,6 +1,6 @@
 # PRLINK-2 — Hook capture for terminal agents
 
-Master plan: `PR_LINKING_PLAN.md` (this is milestone **PL-3**).
+Master plan: `PR_LINKING_PLAN.md`.
 Depends on: **PRLINK-1** (`recordTaskPullRequests` write path; detection/parser from PRLINK-0).
 
 Status: **implemented** — detection runs in the hook CLI, `pullRequestUrls` is on
@@ -151,7 +151,7 @@ payloads).
   not evident from anything in this repo (the installed binary is a compiled
   Bun bundle), and no `tool_response`-shaped field is read today. **Gap:** if
   the payload carries no output, PR capture cannot fire — falls back to
-  delivery / branch lookup (PL-6) / manual add.
+  delivery / branch lookup (PRLINK-5) / manual add.
 - Codex: **gap — no tool output reaches detection.** Two paths exist:
   (1) the session-log watcher (`codex-hook-events.ts`) maps
   `exec_command_begin`/`exec_command_end` to metadata-only background

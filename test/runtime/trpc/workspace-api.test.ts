@@ -694,17 +694,28 @@ describe("createWorkspaceApi PR linking (PRLINK-5)", () => {
 
 	it("refreshTaskPullRequests runs the branch lookup and reports changes", async () => {
 		prLinkMocks.loadWorkspaceBoardById.mockResolvedValue(createBoard("task-1"));
-		prLinkMocks.lookupTaskPullRequests.mockResolvedValue({ recorded: 2 });
+		prLinkMocks.lookupTaskPullRequests.mockResolvedValue({ recorded: 2, reason: "updated" });
 		const { api, broadcast } = createApi();
 
 		const response = await api.refreshTaskPullRequests(scope, { taskId: "task-1" });
 
-		expect(response).toEqual({ ok: true, updated: 2 });
+		expect(response).toEqual({ ok: true, updated: 2, reason: "updated" });
 		expect(prLinkMocks.lookupTaskPullRequests).toHaveBeenCalledWith({
 			workspacePath: "/tmp/repo",
 			taskId: "task-1",
 		});
 		expect(broadcast).toHaveBeenCalledWith("workspace-1", "/tmp/repo");
+	});
+
+	it("passes the lookup reason through so the explicit Refresh can toast it", async () => {
+		prLinkMocks.loadWorkspaceBoardById.mockResolvedValue(createBoard("task-1"));
+		prLinkMocks.lookupTaskPullRequests.mockResolvedValue({ recorded: 0, reason: "none_found" });
+		const { api, broadcast } = createApi();
+
+		const response = await api.refreshTaskPullRequests(scope, { taskId: "task-1" });
+
+		expect(response).toEqual({ ok: true, updated: 0, reason: "none_found" });
+		expect(broadcast).not.toHaveBeenCalled();
 	});
 
 	it("refreshTaskPullRequests rejects unknown tasks", async () => {
@@ -729,14 +740,24 @@ describe("createWorkspaceApi PR linking (PRLINK-5)", () => {
 			sessions: {},
 			revision: 2,
 		});
-		const { api } = createApi();
+		const broadcast = vi.fn();
+		const { api } = createApi(broadcast);
 
 		await api.saveState(scope, { board, sessions: {}, expectedRevision: 1 });
 
-		expect(prLinkMocks.fireReviewPullRequestLookup).toHaveBeenCalledWith({
-			workspacePath: "/tmp/repo",
-			taskId: "task-1",
-		});
+		expect(prLinkMocks.fireReviewPullRequestLookup).toHaveBeenCalledTimes(1);
+		const fireInput = prLinkMocks.fireReviewPullRequestLookup.mock.calls[0][0] as {
+			workspacePath: string;
+			taskId: string;
+			onChanged?: () => void;
+		};
+		expect(fireInput).toMatchObject({ workspacePath: "/tmp/repo", taskId: "task-1" });
+		// PRTRACK-1: a recorded lookup must re-broadcast the workspace state
+		// so open UIs refresh and demand re-derives (via the server's
+		// broadcast wiring).
+		expect(typeof fireInput.onChanged).toBe("function");
+		fireInput.onChanged?.();
+		expect(broadcast).toHaveBeenCalledWith(scope.workspaceId, "/tmp/repo");
 	});
 
 	it("saveState does not fire the branch lookup when no task enters review", async () => {

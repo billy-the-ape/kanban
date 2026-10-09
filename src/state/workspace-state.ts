@@ -6,6 +6,7 @@ import { basename, join, resolve } from "node:path";
 import { z } from "zod";
 
 import {
+	type RuntimeBoardCard,
 	type RuntimeBoardColumnId,
 	type RuntimeBoardData,
 	type RuntimeGitRepositoryInfo,
@@ -723,6 +724,129 @@ function mergeServerOwnedPullRequests(
 	};
 }
 
+/**
+ * PRTRACK-1: server-owned PR automation settings — the same documented
+ * exception as `pullRequests`. `selectedAutomationPrKey` and
+ * `settingsRevision` are written only through the dedicated PR mutations
+ * under the workspace lock, so a stale whole board save restores the
+ * persisted values. The preference booleans follow the same rule for cards
+ * that ALREADY exist in the persisted board: the server-owned values always
+ * survive a board save (a stale client board save can neither reset a
+ * checkbox nor roll the settings revision back — the dialog's authoritative
+ * write is the dedicated setTaskPrSettings mutation). Only completely new
+ * cards take the client-supplied values (explicit booleans persist; omitted
+ * reads as false).
+ */
+function mergeServerOwnedPrSettings(clientBoard: RuntimeBoardData, persistedBoard: RuntimeBoardData): RuntimeBoardData {
+	const persistedByTaskId = new Map<string, RuntimeBoardCard>();
+	for (const column of persistedBoard.columns) {
+		for (const card of column.cards) {
+			persistedByTaskId.set(card.id, card);
+		}
+	}
+	return {
+		...clientBoard,
+		columns: clientBoard.columns.map((column) => ({
+			...column,
+			cards: column.cards.map((card) => {
+				const persisted = persistedByTaskId.get(card.id);
+				const mergedCard: RuntimeBoardCard = {
+					...card,
+					...mergeServerOwnedPrCardFields(card, persisted),
+				};
+				if (mergedCard.autoAddressComments === undefined) {
+					delete mergedCard.autoAddressComments;
+				}
+				if (mergedCard.autoFinishOnMerge === undefined) {
+					delete mergedCard.autoFinishOnMerge;
+				}
+				if (mergedCard.selectedAutomationPrKey === undefined) {
+					delete mergedCard.selectedAutomationPrKey;
+				}
+				if (mergedCard.settingsRevision === undefined) {
+					delete mergedCard.settingsRevision;
+				}
+				return mergedCard;
+			}),
+		})),
+	};
+}
+
+/**
+ * Per-card merge for server-owned PR settings. Existing cards keep the
+ * persisted values unconditionally; new cards take the client's explicit
+ * booleans (omitted reads as false, no revision).
+ */
+function mergeServerOwnedPrCardFields(
+	clientCard: RuntimeBoardCard,
+	persisted: RuntimeBoardCard | undefined,
+): Pick<
+	RuntimeBoardCard,
+	"autoAddressComments" | "autoFinishOnMerge" | "selectedAutomationPrKey" | "settingsRevision"
+> {
+	if (persisted) {
+		return {
+			autoAddressComments: persisted.autoAddressComments,
+			autoFinishOnMerge: persisted.autoFinishOnMerge,
+			selectedAutomationPrKey: persisted.selectedAutomationPrKey,
+			settingsRevision: persisted.settingsRevision,
+		};
+	}
+	return {
+		autoAddressComments:
+			typeof clientCard.autoAddressComments === "boolean" ? clientCard.autoAddressComments : undefined,
+		autoFinishOnMerge: typeof clientCard.autoFinishOnMerge === "boolean" ? clientCard.autoFinishOnMerge : undefined,
+		selectedAutomationPrKey: undefined,
+		settingsRevision: undefined,
+	};
+}
+
+/**
+ * MERGE-1: server-owned manual-reopen marker. The board is client-owned, but
+ * the marker is derived server-side from the persisted -> incoming column
+ * transition so a stale client board can neither forge nor drop it:
+ *   - persisted in Done, incoming in In Review  -> marker set (manual reopen);
+ *   - incoming in Done or Trash                 -> marker cleared;
+ *   - otherwise                                 -> the persisted marker
+ *     survives (it only guards "the same merged PR" against an immediate
+ *     re-completion and is consumed by the merge completion consumer).
+ */
+export function applyManualReopenMarkers(
+	board: RuntimeBoardData,
+	persistedBoard: RuntimeBoardData,
+	now: number,
+): RuntimeBoardData {
+	const persistedByTaskId = new Map<string, { columnId: RuntimeBoardColumnId; marker: number | undefined }>();
+	for (const column of persistedBoard.columns) {
+		for (const card of column.cards) {
+			persistedByTaskId.set(card.id, { columnId: column.id, marker: card.manualReopenAt });
+		}
+	}
+	return {
+		...board,
+		columns: board.columns.map((column) => ({
+			...column,
+			cards: column.cards.map((card) => {
+				const persisted = persistedByTaskId.get(card.id);
+				if (!persisted) {
+					// New card: no history to derive a marker from.
+					const next = { ...card };
+					delete next.manualReopenAt;
+					return next;
+				}
+				const next: RuntimeBoardCard = { ...card };
+				delete next.manualReopenAt;
+				if (persisted.columnId === "done" && column.id === "review") {
+					next.manualReopenAt = now;
+				} else if (persisted.marker !== undefined && column.id !== "done" && column.id !== "trash") {
+					next.manualReopenAt = persisted.marker;
+				}
+				return next;
+			}),
+		})),
+	};
+}
+
 export async function saveWorkspaceState(
 	cwd: string,
 	payload: RuntimeWorkspaceStateSaveRequest,
@@ -741,7 +865,12 @@ export async function saveWorkspaceState(
 		) {
 			throw new WorkspaceStateConflictError(expectedRevision, currentMeta.revision);
 		}
-		const board = mergeServerOwnedPullRequests(parsedPayload.board, await readWorkspaceBoard(context.workspaceId));
+		const persistedBoard = await readWorkspaceBoard(context.workspaceId);
+		const board = applyManualReopenMarkers(
+			mergeServerOwnedPrSettings(mergeServerOwnedPullRequests(parsedPayload.board, persistedBoard), persistedBoard),
+			persistedBoard,
+			Date.now(),
+		);
 		const sessions = parsedPayload.sessions;
 		const nextRevision = currentMeta.revision + 1;
 		const nextMeta: WorkspaceStateMeta = {

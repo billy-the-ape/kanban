@@ -1,26 +1,80 @@
-# PR linking — follow-up milestones (post v1)
+# PR linking — settled post-v1 implementation tasks
 
-These are **proposed** follow-ups to PR linking v1 (`PRLINK-0` … `PRLINK-5`, master plan `PR_LINKING_PLAN.md`). They are drafts to refine; none is scheduled and none should be started until v1 has merged. They are written to be executed independently, so an agent only needs its own file plus the master plan.
+Updated: 2026-10-09. **Planning only; no follow-up implementation is delivered by this PR.**
+These five documents are implementation-ready specifications, one PR each. Preserve their IDs.
+The landed v1 plans now live in [complete/pr-linking](../complete/pr-linking/PR_LINKING_PLAN.md);
+the old PL numbering in that historical master plan does not create another card series.
 
-| Doc | Milestone | One line | Depends on |
-| --- | --- | --- | --- |
-| `PRLINK-6.md` | PR metadata and "primary" PR | `lastSeenAt` (and first-seen), a user-settable primary flag, deterministic fallback, shown first on the card and task detail | v1 |
-| `PRLINK-7.md` | Mobile task detail | Primary PR link and manage popover reachable on mobile (the top-bar git section is desktop-only today) | v1 (better with 6) |
-| `PRLINK-8.md` | Paste a PR URL into the chat | Link a PR to the task from the chat, auto-link only when the message is a lone URL, otherwise a one-click suggestion; GitHub first, provider-neutral | v1 (parser, manual route) |
-| `PRLINK-9.md` | Provider abstraction | Move `gh` code behind a provider interface; GitLab (`glab`) and Bitbucket parsing next; self-hosted URL fixes | v1 |
-| `PRLINK-10.md` | PRs tab (exploratory) | A "Pull requests" tab beside All Changes / Last Turn with state, source, seen dates and per-PR actions | 6, 7, ideally 9 |
+## Execution order
 
-## Suggested order
+| Task | Deliverable | Requires |
+| --- | --- | --- |
+| [PRLINK-6](PRLINK-6.md) | Observation timestamps and primary display preference | Landed v1 |
+| [PRLINK-7](PRLINK-7.md) | Mobile primary anchor and shared manager | v1 + 6 |
+| [PRLINK-8](PRLINK-8.md) | Native chat bare-URL shortcut and explicit prose suggestions | v1 |
+| [PRLINK-9](PRLINK-9.md) | Pure provider boundaries and identity-based explicit refresh | v1 + 6 + existing tracking foundation |
+| [PRLINK-10](PRLINK-10.md) | PR view in changes panel with shared management | 6 + 7 + 9 |
 
-`PRLINK-6` → `PRLINK-7` → `PRLINK-8` (GitHub) → `PRLINK-9` → `PRLINK-10`. 6 comes first because 7 and 10 both want the primary PR; 8 can move earlier since it only needs v1; 9 can run in parallel with 6 and 7 because it touches the lookup/delivery layer rather than the card UI.
+Recommended sequence: 6 → 7 → 8 → 9 → 10. Each task includes decisions, integration points,
+error/concurrency behavior and acceptance. Do not add a preliminary planning PR or expand into
+extra implementation PRs by default. Each agent reads its task, this index, relevant existing code
+and the dependency contracts.
 
-## Confirmed facts about v1 that these docs rely on
+## Review findings resolved
 
-- Each PR is one object (`runtimeTaskPullRequestSchema`): provider, host, repository, number, canonical url, source, `createdAt`, optional title/state/`stateCheckedAt`.
-- v1 has no primary flag; the board card shows the **last element** of the list and the top bar shows all of them (3 inline, then "+N").
-- The board card link renders in every column and on every viewport. The top-bar links, "Link PR" popover and Refresh render **only on desktop** (`!isMobile` branch in `top-bar.tsx`).
-- `pullRequests` is a server-owned card field; any new PR fields stay server-owned.
+The original drafts left timestamp duplication/throttling, fallback ordering, mobile placement,
+terminal input handling, provider delivery scope, tab state and refresh semantics undecided.
+They also predated the tracking foundation now present on main. These documents settle those choices:
 
-## Not covered here
+- createdAt is first recorded; lastSeenAt is throttled observation, not snapshot freshness.
+- Primary for display and Automation PR are separate. Display selection never authorizes automation.
+- Mobile uses a direct primary anchor plus a consistent manager button beside Chat/Diff.
+- Native chat supports the lone-URL shortcut; prose needs a click. Raw terminal input is excluded.
+- GitHub.com explicit metadata reads share the existing tracking coordinator. Other providers retain
+  parsing/manual links; no new GitLab/Bitbucket networking or delivery.
+- PRs occupy a UI view, not a git-diff API mode. External anchors retain their external behavior.
+- Find PRs for branch and Refresh linked PRs are distinct operations.
 
-Live PR status sync, webhooks, creating PRs from the UI and auto-moving cards on merge remain the master plan's non-goals. The v1 review items (Refresh feedback toast, web-ui duplication of the shared identity key, stale plan status) belong on the v1 PR, not in these milestones.
+## Integration ownership and baseline
+
+PR #63 originally targeted feat/task-pr-links at 0e4f3ec. V1 is now landed and archived.
+These revised plans are based on main 292e12cbbcfdcfca04a7c9a6a6cc79602a9bc72d and preserve current
+source. Reinspect the current implementation before each task; historical line numbers and status
+labels in older master plans are not proof of current behavior.
+
+Read the [tracking foundation](../github-pr-tracking/github-pr-tracking-master-plan.md),
+[merge tracking](../pr-merge-tracking/pr-merge-tracking-master-plan.md) and
+[comment handling](../pr-comment-handling/pr-comment-handling-master-plan.md) contracts.
+They own settings, Automation PR validation, auth scopes, subscriptions, polling, repair ownership,
+operation gates, terminal/reopen markers and completion. Reuse them; these follow-ups add no second
+automation selection, poller or task lifecycle. A linked reference PR is not a completion signal.
+The foundation's checkboxes remain opt-in; confirmed merge acceptance stays unchanged.
+
+Known source anchors: src/core/api-contract.ts; pull-request-links.ts/pull-request-detection.ts;
+task-board-mutations.ts; src/state/workspace-state.ts; src/workspace/task-pull-requests.ts and
+task-pull-request-lookup.ts; src/trpc/workspace-api.ts/runtime-api.ts/pr-tracking-api.ts;
+src/pr-tracking/; web-ui task-pull-request-manager, card-detail-view, top-bar, board-card and
+detail-panels/task-pr-tracking-panel. The current recorder conflates duplicates/failures and current
+branch lookup cannot refresh all stored links; task 8/9 must explicitly address those limitations.
+
+## Shared implementation verification and rollout
+
+Follow root AGENTS.md. Keep server-owned fields protected from stale board saves, use optional
+contract additions and update mocks. Execute network/model work outside board locks; revalidate
+task/link/scope before committing a result. Share identity and parser logic with web-ui.
+Use sanitized timestamped logs for new operational errors; never log tokens or full chat text.
+
+Run focused backend/UI tests, backend/web typechecks where touched, Biome on supported changed
+files, and required CI. Markdown is outside biome.json's configured includes: preserve ordinary
+Markdown layout/trailing newlines; do not run Prettier over the repository.
+Isolate HOME/USERPROFILE in persistence tests and use createGitTestEnv for fixture subprocesses.
+Each implementation PR prominently lists deployment/settings/migrations/rollback and an easy
+manual test for every added behavior; do not claim fixture tests prove production rollout.
+
+This planning PR adds **no environment variables, dependencies, migrations or deployment steps**.
+Tasks 6/7/8/10 need no new service configuration; task 9 reuses runtime service gh authentication,
+which is separate from the chat author's existing GitHub OAuth connection. Optional metadata fields
+must remain backward-compatible; preserve them and tracking records during rollback.
+Do not enable automation, request login or modify devices as part of these documentation changes.
+After any later real service/device update, append a final operational task to update
+billy-the-ape/homelab-documentation through the established Ready for Review PR workflow.

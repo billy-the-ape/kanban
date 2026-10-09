@@ -1,66 +1,100 @@
-# PRLINK-9 — Provider abstraction (GitHub first, GitLab/Bitbucket next)
+# PRLINK-9 — Provider boundaries and explicit linked-PR refresh
 
-**Status: PROPOSED (draft for refinement; execute only after PR-linking v1 has merged).**
+**Status: READY FOR IMPLEMENTATION. Depends on v1 and PRLINK-6.**
+Master plan: [v1](../complete/pr-linking/PR_LINKING_PLAN.md). Shared context: [follow-ups](PRLINK-FOLLOWUPS.md).
+Deliver as one provider/read-path PR. This replaces the draft's unbounded multi-provider rollout.
 
-Master plan: `PR_LINKING_PLAN.md`. Index: `PRLINK-FOLLOWUPS.md`.
-Depends on: PR-linking v1. Enables full multi-platform behavior for **PRLINK-8** and the lookups in **PRLINK-5**.
+## Fixed scope
 
-## Purpose
+Separate pure URL/detection policy from workspace I/O and reuse the existing GitHub tracking adapter,
+coordinator, access scope and read limiter in `src/pr-tracking/`. Do not introduce another GitHub
+client, timer, token database, automation provider registry or credential UI.
 
-The v1 *stored shape* and *URL parser* are provider-neutral (`provider: "github" | "gitlab" | "bitbucket"`, host, repository, number; GHE and self-hosted GitLab classified by URL shape). The v1 *behavior* is GitHub-only in several places. This milestone puts those behind a small provider interface so adding a platform is one new module, not edits across the runtime.
+GitHub.com: branch discovery and explicit metadata refresh.
+GitHub Enterprise: parsing/manual links and existing branch-discovery compatibility only.
+GitLab (including self-hosted): parsing/manual links and existing creation detection only.
+Bitbucket Cloud: parsing/manual links only.
+No new glab dependency, GitLab/Bitbucket remote lookup, provider delivery path or automation support.
+Those are separately planned future features; an interface is not a claim of provider support.
+GitHub delivery creation/dedupe remains in git-delivery.ts with unchanged behavior.
 
-## Where v1 is GitHub-specific (verified)
+## Provider architecture
 
-- `src/workspace/task-pull-request-lookup.ts`: branch lookup shells out to `gh pr list --head <branch> --state all --json number,url,title,state` and maps gh's `OPEN/MERGED/CLOSED` states.
-- `src/workspace/git-delivery.ts`: PR open/dedupe uses `gh pr list` and `gh pr create`; the receipt and `GhCommandResult` are gh-shaped.
-- `src/core/pull-request-detection.ts`: the creation gate already knows `glab mr create` and `hub pull-request`, but MCP detection and output parsing are only exercised against GitHub and GitLab shapes.
-- UI: label formatting handles `MR !123` for GitLab; state tinting and `validatePullRequestUrlShape` are tuned to the three URL shapes.
-- `http://` hosts are canonicalized to `https://`, and hosts with ports do not match, which matters for self-hosted instances.
+Keep pure policies in `src/core/pull-request-providers/` with provider id, URL parser and existing
+creation-command gate rules. Expose them through the shared pull-request-links/detection entry points.
+No execFile, Node-only imports, environment or tokens in code imported by web-ui.
+Workspace provider capabilities declare branch discovery and metadata refresh separately.
+Resolve provider from the parsed URL identity; resolve branch-discovery context from origin remote
+(HTTPS or SSH, including scp form), never from title or from an arbitrary first linked PR.
+Missing/unrecognized remotes yield unsupported/no discovery, not a guessed GitHub repository.
 
-## Proposed design
+Branch discovery retains the existing limit five, bounded direct command execution and best-effort
+Review-with-no-links trigger. Do not turn it into live tracking. Normalized draft state must use the
+provider draft bit, and merged/closed wins over draft. Existing delivery tests must remain valid;
+lookup tests may change to assert the intentionally improved draft/freshness behavior.
 
-```ts
-interface PullRequestProvider {
-	id: RuntimeTaskPullRequestProvider;
-	/** Classify a URL for this provider (replaces the per-provider regexes in the parser). */
-	parseUrl(raw: string): ParsedPullRequestLink | null;
-	/** Command gate patterns for creation detection (gh pr create, glab mr create, ...). */
-	isCreationCommand(tokens: string[]): boolean;
-	/** Optional, best-effort, never required for linking. */
-	lookupByBranch?(input: { cwd: string; branch: string }): Promise<ProviderPullRequestSnapshot[]>;
-	fetchSnapshot?(link: ParsedPullRequestLink, cwd: string): Promise<ProviderPullRequestSnapshot | null>;
-}
-```
+## URL policy (settled)
 
-- Providers live in `src/core/pull-request-providers/` (parsing and detection, pure) and `src/workspace/pull-request-providers/` (CLI execution, I/O). The pure half stays importable by web-ui through the alias, as the shared parser is today.
-- A registry resolves a provider from a parsed link or a remote URL. `ParsedPullRequestLink` and the stored schema do **not** change.
-- **GitHub provider**: move the existing `gh` code behind the interface with no behavior change. This is the milestone's regression anchor; the existing lookup and delivery tests must pass unchanged.
-- **GitLab provider** (`glab`): `glab mr list --source-branch`, state mapping `opened/merged/closed/locked`, `!<n>` labels already present in the UI. Delivery integration is **out of scope** unless delivery itself gains a GitLab path.
-- **Bitbucket**: URL parsing and manual link only (no stable first-party CLI). Snapshot lookup via API is a later decision.
-- All CLI calls keep the existing rules: direct `execFile`, no interactive shell, bounded timeouts, silent degrade on missing binary or auth failure.
-- Self-hosted fixes folded in: preserve the original scheme when it was `http://` and the host explicitly carried a port; allow `host:port` in the host matcher; add tests.
+Use URL parsing plus provider path validation. Reject credentials/userinfo, unsafe schemes, missing/
+unsafe-positive numbers, invalid ports and malformed repository segments. Known provider hosts cannot
+accept another provider's path shape. Unknown hosts use the existing GitHub/GitLab shape rules;
+Bitbucket Server and installations under a URL path prefix remain unsupported.
+Support DNS/localhost and IPv4 authorities with optional valid port; IPv6 is deferred and rejected.
 
-## Out of scope
+Lowercase host; `host` includes a nondefault port. Preserve existing case-insensitive repository
+identity; remove trailing PR path/query/fragment. Known public hosts retain HTTPS canonicalization;
+self-hosted HTTP is accepted only with an explicit nondefault port and then preserves HTTP.
+Other portless HTTP links retain v1 HTTPS canonicalization. URL's default-port normalization applies;
+http://host:80 is portless for this policy. Scheme is not part of identity: same host/port/repo/number
+deduplicates, HTTPS wins if both forms are observed. Different nondefault ports remain distinct.
+Existing portless identities do not change and require no migration. Never rewrite a stored HTTP
+self-hosted URL merely by rendering it.
 
-- Live PR status sync, webhooks, or creating PRs from the UI (unchanged from the master plan non-goals).
-- Authentication handling beyond what the CLI already has.
+This is URL/manual-link support, not authorization to send credentials to an unknown host.
+No provider query is made for arbitrary self-hosted pasted links in this milestone.
 
-## Tests
+## Refresh semantics and API
 
-- Table-driven parser tests per provider, including GHE, self-hosted GitLab with subgroups, Bitbucket, ports and `http://`.
-- Provider contract tests: each provider's `lookupByBranch` with a fake runner (missing binary, unauthenticated, empty, malformed JSON).
-- GitHub provider parity: existing `task-pull-request-lookup.test.ts` and `git-delivery.test.ts` pass without edits.
-- web-ui: label, tint and URL-shape validation per provider driven from one shared table.
-- `HOME`/`USERPROFILE` isolation and `createGitTestEnv()` for any test that touches workspace state or Git.
+Current workspace.refreshTaskPullRequests only lists current branch PRs; it misses manual links.
+Keep that route as **Find PRs for branch** (including Review fallback). Add
+workspace.refreshTaskPullRequest({ taskId, url }) for one already-linked PR and
+workspace.refreshLinkedTaskPullRequests({ taskId }) for all existing links, capped at 20.
+Single-link refresh never adds a link or performs branch discovery. Both are explicit actions,
+not reads caused by mounting a view.
 
-## Acceptance
+For github.com, use a one-shot metadata operation in the shared tracking coordinator. Extend the
+foundation read contract here so it works without an active task subscription; the current
+prTracking.refreshTaskPrSnapshot requires a subscription and is insufficient for historical links.
+Resolve the runtime service's active access scope, coalesce with that PR's existing in-flight read
+and obey existing auth/backoff/rate limits. Do not create a subscription, resume stopped tracking,
+clear terminal markers or invoke automation consumers from a display-only request. Scheduled
+eligible observations still follow their existing lifecycle independently.
 
-- Adding a platform requires a new provider module and a registry entry only.
-- GitHub behavior is byte-for-byte unchanged.
-- Pasting a GitLab MR URL (PRLINK-8) links it correctly even without `glab` installed.
+Return per-identity outcomes: refreshed | unsupported | failed | unlinked, plus checkedAt/error
+where applicable, and an updated count. Aggregate partial success is visible; unsupported or failed
+entries preserve their last snapshot/time. A successful unchanged/304 read advances stateCheckedAt
+using validated cached data, without inventing a snapshot if none exists. Observation timestamp
+follows 6's throttle. Project title/state into card display fields; title needs an optional addition
+to the authorized metadata contract/normalizer, not a second fetch/client. Maintain accessScopeId
+authorization checks; do not display a previous credential scope's tracked snapshot as current.
 
-## Open questions
+Fetch outside workspace locks, then reread/revalidate task and canonical link inside the mutation;
+a removed/replaced link is never resurrected. Ignore results older than the currently stored
+stateCheckedAt. Do not update primary/source/createdAt/Automation PR selection.
+Batch at most four reads concurrently through the shared runtime limiter; each request has the
+existing 30-second/8-MiB bound and all-link refresh has a 60-second overall deadline, no retry loop.
+Apply completed valid results and report remaining timeouts; task disappearance applies nothing.
+Coalesce duplicate refresh clicks, disable pending actions and show concise sanitized outcomes.
 
-1. Is Bitbucket worth a provider at all beyond URL parsing?
-2. Should provider selection be inferred from the repository's `origin` remote when the URL host is unknown (for example a GHE host the parser guessed)?
-3. Does delivery (B-8) grow a provider interface too, or stay GitHub-only for now?
+## Verification and acceptance
+
+- Parser matrix: public providers, GHE/GitLab nesting, SSH remote resolution, scheme/port policy,
+  credentials, unsafe numbers, foreign host/path, unsupported IPv6/path prefixes/Bitbucket Server.
+- Missing binary/auth/remote, malformed output, empty discovery, correct draft mapping.
+- Metadata: stored manual PR from another branch/repo and Done task refresh by identity; no worktree
+  needed for identity refresh; no subscription/consumer effect with tracking disabled/stopped.
+- Same PR on two tasks: shared access-scoped read and limiter; scope switch, partial failure, 304,
+  deadlines, stale response and unlink/task-delete races; no revision for failed/unsupported reads.
+- GitHub delivery regression, creation detection gates and web-ui shared parsing/labels remain valid.
+
+Follow the shared verification/deployment rules in PRLINK-FOLLOWUPS.md.

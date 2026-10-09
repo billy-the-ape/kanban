@@ -2,11 +2,11 @@
 
 Document revision: 1  
 Prepared: 2026-10-03  
-Status: planned; no milestone started.  
+Status: implemented (PRLINK-0 through PRLINK-5); open as PR #49.  
 Source baseline: ba3b715 (main, after billy-the-ape/kanban#28).  
 Fork: https://github.com/billy-the-ape/kanban
 
-This is the master plan. It will be split into one file per milestone (`PL-1.md`, `PL-2.md`, …) in this directory so a coding agent only needs to load the milestone it is executing plus the shared context it carries. Do not renumber milestones once work starts; record later additions under a new PL number.
+This is the master plan. It is split into one file per milestone (`PRLINK-1.md`, `PRLINK-2.md`, …) in this directory so a coding agent only needs to load the milestone it is executing plus the shared context it carries. Do not renumber milestones once work starts; record later additions under a new PRLINK number.
 
 ## Purpose
 
@@ -62,7 +62,7 @@ export const runtimeTaskPullRequestSourceSchema = z.enum([
 	"agent_tool",   // detected from a PR-creating tool call (Cline run_commands, hook PostToolUse, MCP tool)
 	"delivery",     // recorded by B-8 deterministic delivery
 	"manual",       // added by the user in the UI
-	"branch_lookup" // found by querying the provider for the task branch (PL-6)
+	"branch_lookup" // found by querying the provider for the task branch (PRLINK-5)
 ]);
 
 export const runtimeTaskPullRequestSchema = z.object({
@@ -91,7 +91,7 @@ Rules:
 - **Server-owned field.** `saveWorkspaceState` ignores the client's `pullRequests` for a card that already exists on disk and carries the persisted value forward. All writes go through dedicated mutations:
   - `addTaskPullRequests` (runtime detection, delivery, manual add)
   - `removeTaskPullRequest` (manual remove)
-  - `updateTaskPullRequestSnapshot` (PL-6)
+  - `updateTaskPullRequestSnapshot` (PRLINK-5)
 
   This is the one exception to "the client owns the board". Document it next to the merge code.
 - New cards never accept `pullRequests` from create input.
@@ -121,7 +121,7 @@ Rules:
 | MCP tool | Tool name ends in `create_pull_request` or `create_merge_request`. Parse `html_url` / `web_url` from structured output, or fall back to `extractPullRequestLinks` over the serialized output. |
 | Anything else | Return `[]`. In particular `gh pr view`, `gh pr list`, `gh pr comment`, and plain `git push` do not attach PRs. A review task that reads PR #205 must not adopt it. |
 
-The gate is deliberately narrow. A PR the gate misses can still be found by delivery, by branch lookup (PL-6), or by manual add.
+The gate is deliberately narrow. A PR the gate misses can still be found by delivery, by branch lookup (PRLINK-5), or by manual add.
 
 ## Recording flow
 
@@ -138,7 +138,7 @@ manual add (tRPC) ───┘                                     │  (no-op +
 - **Cline** (`cline-event-adapter.ts`): the adapter is protocol translation. It should not do I/O. Have it surface `{ toolName, toolInput, output }` for finished tools through an injected callback, such as `onToolFinished`, on `ApplyClineSessionEventInput`. The task-session service wires that callback to detection and recording. This keeps the adapter pure and testable.
 - **Hooks** (`src/commands/hooks.ts` → `hooks-api.ts`): run detection **in the hook CLI process**, which already has the full payload including `tool_response`, and send only the resulting `pullRequestUrls: string[]` (max 10) on the ingest request. This avoids shipping large tool output to the runtime. `hooks-api.ts` re-parses those URLs with the strict parser, so the hook is not trusted to send canonical data, and then records them. Recording happens whether or not the hook event causes a column transition.
 - **Delivery** (`git-delivery.ts`): after `openPullRequest` returns `created` or `existing` with a URL, call `recordTaskPullRequests` with `source: "delivery"`, and add the gh `title` to the snapshot where it is available.
-- **Agent coverage matrix.** PL-3 fills in the real payload shapes per agent and records them in its milestone file. Expected coverage: Claude Code `PostToolUse` has `tool_input.command` and `tool_response`. Cline CLI has a PostToolUse script. Codex, Droid, and Kiro must be verified. Where an agent's hook carries no tool output, document the gap and rely on PL-6 branch lookup.
+- **Agent coverage matrix.** PRLINK-2 fills in the real payload shapes per agent and records them in its milestone file. Expected coverage: Claude Code `PostToolUse` has `tool_input.command` and `tool_response`. Cline CLI has a PostToolUse script. Codex, Droid, and Kiro must be verified. Where an agent's hook carries no tool output, document the gap and rely on PRLINK-5 branch lookup.
 
 ## UI
 
@@ -174,14 +174,14 @@ Each milestone is one PR against `main`, independently reviewable, with tests. L
 
 | ID | Title | Depends on | Scope |
 | --- | --- | --- | --- |
-| PL-1 | Contract, parser, and board mutations | — | `runtimeTaskPullRequestSchema` and the optional `pullRequests` card field. `pull-request-links.ts` and `pull-request-detection.ts` with exhaustive unit tests. `addTaskPullRequests`, `removeTaskPullRequest`, and `updateTaskPullRequestSnapshot` in `task-board-mutations.ts`. The server-owned merge in `saveWorkspaceState`. Swap `git-delivery.ts` to the shared parser. No behavior visible to users. |
-| PL-2 | Cline capture | PL-1 | `recordTaskPullRequests` write path and broadcast. `onToolFinished` callback from `cline-event-adapter.ts`, wired in the Cline task-session service. Tests: `run_commands` with `gh pr create` records a PR. `gh pr view` does not. Repeated detection does not bump the revision. |
-| PL-3 | Hook capture for terminal agents | PL-2 | Detection in `src/commands/hooks.ts`, `pullRequestUrls` on `runtimeHookIngestRequestSchema`, and recording in `hooks-api.ts`. Verify and document the per-agent payload matrix (Claude Code first). Wire `PostToolUse` for agents that have it but do not yet send it. |
-| PL-4 | Delivery capture | PL-2 | Record `receipt.pr` from B-8 with `source: "delivery"` and the title snapshot. |
-| PL-5 | UI: links in top bar and board card | PL-1 | `TaskPullRequestLink`, helpers, top-bar placement with overflow popover, and board-card compact link. Component tests: placement, `target="_blank"` with `rel`, propagation stopped, latest-only on the card, all on the detail view. Can land in parallel with PL-2 through PL-4, because data can be seeded in tests. |
-| PL-6 | Manual add/remove and optional refresh | PL-5 | tRPC add/remove plus the popover UI. Optional "Refresh" action and a best-effort branch lookup on transition to Review when the card has no PR: `gh pr list --head <branch> --state all --json number,url,title,state --limit 5`, run in the task worktree with a short timeout. It never runs on a hot path, never runs through an interactive shell (AGENTS.md), and is skipped silently when `gh` is missing or unauthenticated. Writes the snapshot (`title`, `state`, `stateCheckedAt`). |
+| PRLINK-0 | Contract, parser, and board mutations | — | `runtimeTaskPullRequestSchema` and the optional `pullRequests` card field. `pull-request-links.ts` and `pull-request-detection.ts` with exhaustive unit tests. `addTaskPullRequests`, `removeTaskPullRequest`, and `updateTaskPullRequestSnapshot` in `task-board-mutations.ts`. The server-owned merge in `saveWorkspaceState`. Swap `git-delivery.ts` to the shared parser. No behavior visible to users. |
+| PRLINK-1 | Cline capture | PRLINK-0 | `recordTaskPullRequests` write path and broadcast. `onToolFinished` callback from `cline-event-adapter.ts`, wired in the Cline task-session service. Tests: `run_commands` with `gh pr create` records a PR. `gh pr view` does not. Repeated detection does not bump the revision. |
+| PRLINK-2 | Hook capture for terminal agents | PRLINK-1 | Detection in `src/commands/hooks.ts`, `pullRequestUrls` on `runtimeHookIngestRequestSchema`, and recording in `hooks-api.ts`. Verify and document the per-agent payload matrix (Claude Code first). Wire `PostToolUse` for agents that have it but do not yet send it. |
+| PRLINK-3 | Delivery capture | PRLINK-1 | Record `receipt.pr` from B-8 with `source: "delivery"` and the title snapshot. |
+| PRLINK-4 | UI: links in top bar and board card | PRLINK-0 | `TaskPullRequestLink`, helpers, top-bar placement with overflow popover, and board-card compact link. Component tests: placement, `target="_blank"` with `rel`, propagation stopped, latest-only on the card, all on the detail view. Can land in parallel with PRLINK-1 through PRLINK-3, because data can be seeded in tests. |
+| PRLINK-5 | Manual add/remove and optional refresh | PRLINK-4 | tRPC add/remove plus the popover UI. Optional "Refresh" action and a best-effort branch lookup on transition to Review when the card has no PR: `gh pr list --head <branch> --state all --json number,url,title,state --limit 5`, run in the task worktree with a short timeout. It never runs on a hot path, never runs through an interactive shell (AGENTS.md), and is skipped silently when `gh` is missing or unauthenticated. Writes the snapshot (`title`, `state`, `stateCheckedAt`). |
 
-PL-1 through PL-5 meet the user-visible goal for GitHub. PL-6 adds the safety nets and an opt-in way to refresh staleness.
+PRLINK-0 through PRLINK-4 meet the user-visible goal for GitHub. PRLINK-5 adds the safety nets and an opt-in way to refresh staleness.
 
 ## Testing strategy
 
@@ -194,9 +194,9 @@ PL-1 through PL-5 meet the user-visible goal for GitHub. PL-6 adds the safety ne
 
 ## Risks and open questions
 
-1. **Client overwrite race.** This is mitigated by the server-owned merge in PL-1. It must land before any runtime writer (PL-2 through PL-4).
-2. **Hook payload size and shape.** Some agents may truncate or omit tool output. Coverage gaps fall back to PL-6. Do not grow the ingest payload with raw output.
+1. **Client overwrite race.** This is mitigated by the server-owned merge in PRLINK-0. It must land before any runtime writer (PRLINK-1 through PRLINK-3).
+2. **Hook payload size and shape.** Some agents may truncate or omit tool output. Coverage gaps fall back to PRLINK-5. Do not grow the ingest payload with raw output.
 3. **Cross-repo PRs.** An agent in task A could legitimately open a PR in another repo. That is accepted and recorded, because the detection gate is "this task's agent created it", not "it matches the worktree remote". Revisit only if it causes noise.
 4. **Snapshot staleness.** Title and state are labelled as of `stateCheckedAt`. No background polling in this plan.
-5. **Upstream suitability.** PL-1, PL-2, PL-3, and PL-5 are generic and upstreamable to cline/kanban. PL-4 depends on fork-only B-8 delivery.
-6. **Open question for the owner:** should a merged PR state, once PL-6 refresh exists, offer moving the card to Done? This plan leaves it out. Decide before it is split into a follow-up PL.
+5. **Upstream suitability.** PRLINK-0, PRLINK-1, PRLINK-2, and PRLINK-4 are generic and upstreamable to cline/kanban. PRLINK-3 depends on fork-only B-8 delivery.
+6. **Open question for the owner:** should a merged PR state, once PRLINK-5 refresh exists, offer moving the card to Done? This plan leaves it out. Decide before it is split into a follow-up PRLINK.

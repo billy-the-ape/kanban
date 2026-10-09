@@ -20,6 +20,7 @@ import {
 	type CoreCompactionStrategy,
 	type CoreCompactionSummarizerConfig,
 	type CoreSessionEvent,
+	createDefaultExecutors,
 	createUserInstructionConfigService,
 	formatRulesForSystemPrompt,
 	getClineDefaultSystemPrompt,
@@ -36,6 +37,12 @@ import { CLINE_BUILTIN_SLASH_COMMANDS } from "./cline-slash-commands";
 import { getCliTelemetryService } from "./cline-telemetry-service";
 
 export { TelemetryLoggerSink, TelemetryService } from "@clinebot/core";
+/** Use the SDK's filesystem semantics when adapting its hard-coded editor wrapper limit. */
+export function createClineSdkEditorExecutor(): NonNullable<ReturnType<typeof createDefaultExecutors>["editor"]> {
+	const editor = createDefaultExecutors().editor;
+	if (!editor) throw new Error("SDK default editor executor unavailable");
+	return editor;
+}
 /**
  * Mirrors DEFAULT_CONTEXT_WINDOW_TOKENS from @clinebot/core 0.0.38
  * (dist/extensions/context/compaction-shared.d.ts). The constant is not part
@@ -200,6 +207,21 @@ export function loadClineSdkRulesForSystemPrompt(service: ClineSdkUserInstructio
 	return formatRulesForSystemPrompt(rules);
 }
 
+/**
+ * Local-mode editor adapter raises the SDK wrapper's 6000-character cap to 32000.
+ * Keep guidance comfortably below that cap because models undercount characters.
+ */
+export const CLINE_EDITOR_SIZE_GUIDANCE = [
+	"Editor tool usage and limits:",
+	"- To replace text in an existing file, include `path`, `old_text`, and `new_text` in the actual editor tool arguments. `old_text` must be the exact existing text to replace and match exactly once; read the file first if needed.",
+	"- Mentioning `old_text` in reasoning or prose does not supply it to the tool. Before sending an editor call, verify that its JSON arguments contain `old_text` for a replacement edit.",
+	"- Omit `old_text` only when creating a file that does not exist, or when inserting text using `insert_line`. `path` plus `new_text` alone cannot edit an existing file.",
+	"- If the tool reports missing `old_text`, rebuild the arguments with an explicit `old_text` string, or use `insert_line` for an intended insertion. Do not repeat the same incomplete call or assume the tool removed a parameter; JSON property order does not matter.",
+	"- In local Kanban sessions, keep `new_text` and `old_text` under 30000 characters each; the hard limit is 32000. Split larger additions into sequential edits or a separate file.",
+	"- After a replacement mismatch, read the current file section and copy a fresh unique anchor before retrying. Never repeat unchanged arguments that failed to match.",
+	"- Prefer a new, separate file for large additions instead of growing an already large file.",
+].join("\n");
+
 export async function resolveClineSdkSystemPrompt(input: {
 	cwd: string;
 	providerId: string;
@@ -210,11 +232,12 @@ export async function resolveClineSdkSystemPrompt(input: {
 	// its repo-aware behavior in the same way the official CLI does.
 	const shouldAppendWorkspaceMetadata = input.providerId === "cline";
 	const workspaceMetadata = shouldAppendWorkspaceMetadata ? await buildWorkspaceMetadata(input.cwd) : "";
-	return getClineDefaultSystemPrompt({
+	const defaultPrompt = getClineDefaultSystemPrompt({
 		ide: "Kanban",
 		rootPath: input.cwd,
 		providerId: input.providerId,
 		metadata: workspaceMetadata,
 		rules: input.rules ?? "",
 	});
+	return `${defaultPrompt}\n\n${CLINE_EDITOR_SIZE_GUIDANCE}`;
 }

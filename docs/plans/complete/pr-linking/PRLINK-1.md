@@ -10,7 +10,7 @@
 > `test/integration` verified (the only failures are two pre-existing,
 > unrelated ones that also fail on the base branch).
 
-Master plan: `PR_LINKING_PLAN.md` (this is milestone **PL-2**).
+Master plan: `PR_LINKING_PLAN.md`.
 Depends on: **PRLINK-0** (contract, parser, detection, board mutations).
 
 ## Purpose

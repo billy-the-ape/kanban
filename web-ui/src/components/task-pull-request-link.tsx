@@ -44,13 +44,13 @@ export function TaskPullRequestLink({
 				onMouseDown={handleStopPropagation}
 				onClick={handleStopPropagation}
 				className={cn(
-					"inline-flex shrink-0 items-center gap-1 font-mono text-xs hover:text-accent-hover hover:underline",
+					"inline-flex min-w-0 items-center gap-1 font-mono text-xs hover:text-accent-hover hover:underline",
 					stateTint,
 					className,
 				)}
 			>
 				{variant === "full" ? <GitPullRequest size={12} className="shrink-0" /> : null}
-				<span>{formatPullRequestLabel(pullRequest, variant)}</span>
+				<span className="truncate">{formatPullRequestLabel(pullRequest, variant)}</span>
 			</a>
 		</Tooltip>
 	);

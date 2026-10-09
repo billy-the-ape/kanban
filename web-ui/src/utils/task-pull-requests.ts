@@ -1,4 +1,6 @@
-import type { RuntimeBoardCard, RuntimeTaskPullRequest } from "@/runtime/types";
+import { getPullRequestIdentityKey, parsePullRequestUrl } from "@runtime-pull-request-links";
+
+import type { RuntimeBoardCard, RuntimeTaskPullRequest, RuntimeTaskPullRequestRefreshReason } from "@/runtime/types";
 
 const MINUTE_MS = 60 * 1000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -17,26 +19,47 @@ export function getLatestPullRequest(card: RuntimeBoardCard): RuntimeTaskPullReq
 
 /** Stable identity for a pull request link, used as React keys in the UI. */
 export function getPullRequestKey(pullRequest: RuntimeTaskPullRequest): string {
-	return `${pullRequest.provider}|${pullRequest.host.toLowerCase()}|${pullRequest.repository.toLowerCase()}|${pullRequest.number}`;
+	return getPullRequestIdentityKey(pullRequest);
 }
 
 /**
- * Lightweight client-side shape check for the "link a PR" input (PRLINK-5):
- * http(s) URL that looks like a GitHub/GitLab/Bitbucket PR or MR link.
- * The server re-parses with the strict parser and is authoritative.
+ * Lightweight client-side shape check for the "link a PR" input (PRLINK-5).
+ * Reuses the shared strict parser as a hint; the server re-parses and is
+ * authoritative.
  */
 export function validatePullRequestUrlShape(url: string): string | null {
 	const trimmed = url.trim();
 	if (!trimmed) {
 		return "Enter a pull request URL.";
 	}
-	if (!/^https?:\/\//i.test(trimmed)) {
-		return "URL must start with http:// or https://.";
+	if (parsePullRequestUrl(trimmed)) {
+		return null;
 	}
-	if (!/(\/pull\/|\/pull-requests\/|\/-\/merge_requests\/)/.test(trimmed)) {
-		return "URL does not look like a pull request or merge request link.";
+	return "URL does not look like a pull request or merge request link.";
+}
+
+/**
+ * Info message for an explicit Refresh outcome (PRLINK-5). Null when the board
+ * already reflects the result (updated/unchanged) or the reason needs no
+ * user-facing explanation.
+ */
+export function getPullRequestRefreshMessage(reason: RuntimeTaskPullRequestRefreshReason | undefined): string | null {
+	switch (reason) {
+		case "none_found":
+			return "No pull requests found for this branch";
+		case "no_gh":
+			return "GitHub CLI (gh) not found";
+		case "gh_failed":
+			return "Could not query GitHub";
+		case "no_worktree":
+			return "Task worktree no longer exists";
+		case "no_branch":
+			return "Could not determine the current branch";
+		case "no_task":
+			return "Task not found";
+		default:
+			return null;
 	}
-	return null;
 }
 
 /**

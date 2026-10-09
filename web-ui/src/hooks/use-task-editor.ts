@@ -2,6 +2,7 @@ import { deriveTaskTitleFromPrompt } from "@runtime-task-title";
 import type { Dispatch, SetStateAction } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { showAppToast } from "@/components/app-toaster";
 import {
 	normalizeStoredTaskAutoReviewMode,
 	TASK_AUTO_REVIEW_ENABLED_STORAGE_KEY,
@@ -32,6 +33,21 @@ interface UseTaskEditorInput {
 	queueTaskStartAfterEdit?: (taskId: string) => void;
 	/** UPD-1: server-derived initial-start status (baseline-fixed signal gates the edit checkbox). */
 	getTaskInitialStartStatus: (taskId: string) => Promise<RuntimeTaskInitialStartStatusResponse | null>;
+	/**
+	 * PRTRACK-1: server-owned PR automation settings. The edit dialog diffs
+	 * against the values captured WHEN THE DIALOG OPENED (not the live board
+	 * card) and saves ONLY changed fields through this revision-checked
+	 * write (never through the whole-board draft), using the opening
+	 * revision so concurrent changes surface as a conflict toast.
+	 */
+	setTaskPrSettingsForTask?: (
+		taskId: string,
+		settings: {
+			autoAddressComments?: boolean;
+			autoFinishOnMerge?: boolean;
+			expectedSettingsRevision: number;
+		},
+	) => Promise<{ ok: boolean; reason?: string | null }>;
 }
 
 interface OpenEditTaskOptions {
@@ -54,6 +70,11 @@ export interface UseTaskEditorResult {
 	setNewTaskAutoReviewEnabled: Dispatch<SetStateAction<boolean>>;
 	newTaskAutoReviewMode: TaskAutoReviewMode;
 	setNewTaskAutoReviewMode: Dispatch<SetStateAction<TaskAutoReviewMode>>;
+	/** PRTRACK-1: PR automation preferences for new tasks (server-owned; default off). */
+	newTaskPrAutoAddressComments: boolean;
+	setNewTaskPrAutoAddressComments: Dispatch<SetStateAction<boolean>>;
+	newTaskPrAutoFinishOnMerge: boolean;
+	setNewTaskPrAutoFinishOnMerge: Dispatch<SetStateAction<boolean>>;
 	isNewTaskStartInPlanModeDisabled: boolean;
 	newTaskBranchRef: string;
 	setNewTaskBranchRef: Dispatch<SetStateAction<string>>;
@@ -75,6 +96,11 @@ export interface UseTaskEditorResult {
 	setEditTaskAutoReviewEnabled: Dispatch<SetStateAction<boolean>>;
 	editTaskAutoReviewMode: TaskAutoReviewMode;
 	setEditTaskAutoReviewMode: Dispatch<SetStateAction<TaskAutoReviewMode>>;
+	/** PRTRACK-1: PR automation preferences for the edited task. */
+	editTaskPrAutoAddressComments: boolean;
+	setEditTaskPrAutoAddressComments: Dispatch<SetStateAction<boolean>>;
+	editTaskPrAutoFinishOnMerge: boolean;
+	setEditTaskPrAutoFinishOnMerge: Dispatch<SetStateAction<boolean>>;
 	isEditTaskStartInPlanModeDisabled: boolean;
 	editTaskBranchRef: string;
 	setEditTaskBranchRef: Dispatch<SetStateAction<string>>;
@@ -109,6 +135,7 @@ export function useTaskEditor({
 	setSelectedTaskId,
 	queueTaskStartAfterEdit,
 	getTaskInitialStartStatus,
+	setTaskPrSettingsForTask,
 }: UseTaskEditorInput): UseTaskEditorResult {
 	const [isInlineTaskCreateOpen, setIsInlineTaskCreateOpen] = useState(false);
 	const [newTaskPrompt, setNewTaskPrompt] = useState("");
@@ -126,6 +153,8 @@ export function useTaskEditor({
 		"commit",
 		normalizeStoredTaskAutoReviewMode,
 	);
+	const [newTaskPrAutoAddressComments, setNewTaskPrAutoAddressComments] = useState(false);
+	const [newTaskPrAutoFinishOnMerge, setNewTaskPrAutoFinishOnMerge] = useState(false);
 	const isNewTaskStartInPlanModeDisabled = false;
 	const [newTaskBranchRef, setNewTaskBranchRef] = useState("");
 	const [lastCreatedTaskBranchByProjectId, setLastCreatedTaskBranchByProjectId] = useState<Record<string, string>>({});
@@ -135,6 +164,8 @@ export function useTaskEditor({
 	const [editTaskStartInPlanMode, setEditTaskStartInPlanMode] = useState(false);
 	const [editTaskAutoReviewEnabled, setEditTaskAutoReviewEnabled] = useState(false);
 	const [editTaskAutoReviewMode, setEditTaskAutoReviewMode] = useState<TaskAutoReviewMode>("commit");
+	const [editTaskPrAutoAddressComments, setEditTaskPrAutoAddressComments] = useState(false);
+	const [editTaskPrAutoFinishOnMerge, setEditTaskPrAutoFinishOnMerge] = useState(false);
 	const isEditTaskStartInPlanModeDisabled = false;
 	const [editTaskBranchRef, setEditTaskBranchRef] = useState("");
 	const [newTaskUpdateBaseRefBeforeStart, setNewTaskUpdateBaseRefBeforeStart] = useState(
@@ -148,6 +179,18 @@ export function useTaskEditor({
 	// still gates the actual refresh on its own signal.
 	const [editTaskInitialBaselineFixed, setEditTaskInitialBaselineFixed] = useState(false);
 	const editInitialStartStatusTaskIdRef = useRef<string | null>(null);
+	/**
+	 * PRTRACK-1: the PR automation settings (plus the settings revision) as
+	 * captured WHEN THE EDIT DIALOG OPENED. The save diff and the
+	 * expectedSettingsRevision use this snapshot — never the live board card —
+	 * so a concurrent change while the dialog is open surfaces as a conflict
+	 * instead of being accepted on the new revision or silently reverted.
+	 */
+	const editTaskPrSettingsOpenRef = useRef<{
+		autoAddressComments: boolean;
+		autoFinishOnMerge: boolean;
+		settingsRevision: number;
+	} | null>(null);
 
 	const [newTaskAgentId, setNewTaskAgentId] = useState<RuntimeAgentId | undefined>(undefined);
 	const [newTaskClineSettings, setNewTaskClineSettings] = useState<RuntimeTaskClineSettings | undefined>(undefined);
@@ -221,6 +264,7 @@ export function useTaskEditor({
 		if (selection?.column.id !== "backlog") {
 			setEditingTaskId(null);
 			editInitialStartStatusTaskIdRef.current = null;
+			editTaskPrSettingsOpenRef.current = null;
 
 			setEditTaskPrompt("");
 			setEditTaskStartInPlanMode(false);
@@ -273,6 +317,16 @@ export function useTaskEditor({
 			setEditTaskStartInPlanMode(task.startInPlanMode);
 			setEditTaskAutoReviewEnabled(task.autoReviewEnabled === true);
 			setEditTaskAutoReviewMode(resolveTaskAutoReviewMode(task.autoReviewMode));
+			setEditTaskPrAutoAddressComments(task.autoAddressComments === true);
+			setEditTaskPrAutoFinishOnMerge(task.autoFinishOnMerge === true);
+			// Snapshot the opening values + revision: the save diff and the
+			// expectedSettingsRevision are computed against THIS, not the live
+			// board card, so concurrent edits conflict instead of clobbering.
+			editTaskPrSettingsOpenRef.current = {
+				autoAddressComments: task.autoAddressComments === true,
+				autoFinishOnMerge: task.autoFinishOnMerge === true,
+				settingsRevision: task.settingsRevision ?? 0,
+			};
 			const fallbackBranch = task.baseRef || resolvedDefaultTaskBranchRef;
 			setEditTaskBranchRef(fallbackBranch);
 			setEditTaskAgentId(task.agentId);
@@ -296,11 +350,14 @@ export function useTaskEditor({
 	const handleCancelEditTask = useCallback(() => {
 		setEditingTaskId(null);
 		editInitialStartStatusTaskIdRef.current = null;
+		editTaskPrSettingsOpenRef.current = null;
 
 		setEditTaskPrompt("");
 		setEditTaskStartInPlanMode(false);
 		setEditTaskAutoReviewEnabled(false);
 		setEditTaskAutoReviewMode("commit");
+		setEditTaskPrAutoAddressComments(false);
+		setEditTaskPrAutoFinishOnMerge(false);
 		setEditTaskImages([]);
 		setEditTaskBranchRef("");
 		setEditTaskUpdateBaseRefBeforeStart(DEFAULT_NEW_TASK_UPDATE_BASE_REF_BEFORE_START);
@@ -322,9 +379,22 @@ export function useTaskEditor({
 		const baseRef = editTaskBranchRef || resolvedDefaultTaskBranchRef;
 		const savedTaskId = editingTaskId;
 
+		// PRTRACK-1: the PR automation checkboxes are server-owned settings,
+		// not part of the whole-board draft. The diff is taken against the
+		// values captured WHEN THE DIALOG OPENED (see
+		// editTaskPrSettingsOpenRef), only changed fields are sent, and the
+		// opening revision is used as expectedSettingsRevision — a concurrent
+		// change while the dialog is open surfaces as a conflict, never
+		// accepted on the new revision or silently reverted.
+		const openedPrSettings = editTaskPrSettingsOpenRef.current;
+		const prSettingsChanged =
+			openedPrSettings !== null &&
+			(editTaskPrAutoAddressComments !== openedPrSettings.autoAddressComments ||
+				editTaskPrAutoFinishOnMerge !== openedPrSettings.autoFinishOnMerge);
+
 		setBoard((currentBoard) => {
-			const currentCard = currentBoard.columns.flatMap((c) => c.cards).find((c) => c.id === savedTaskId);
-			const title = currentCard?.title ?? "";
+			const boardCard = currentBoard.columns.flatMap((c) => c.cards).find((c) => c.id === savedTaskId);
+			const title = boardCard?.title ?? "";
 			const updated = updateTask(currentBoard, savedTaskId, {
 				title,
 				prompt,
@@ -344,6 +414,29 @@ export function useTaskEditor({
 		setEditingTaskId(null);
 		editInitialStartStatusTaskIdRef.current = null;
 
+		if (prSettingsChanged && openedPrSettings !== null && setTaskPrSettingsForTask) {
+			void setTaskPrSettingsForTask(savedTaskId, {
+				// Only fields that differ from the opening snapshot; the server
+				// treats absent fields as "keep".
+				...(editTaskPrAutoAddressComments !== openedPrSettings.autoAddressComments
+					? { autoAddressComments: editTaskPrAutoAddressComments }
+					: {}),
+				...(editTaskPrAutoFinishOnMerge !== openedPrSettings.autoFinishOnMerge
+					? { autoFinishOnMerge: editTaskPrAutoFinishOnMerge }
+					: {}),
+				expectedSettingsRevision: openedPrSettings.settingsRevision,
+			}).then((result) => {
+				if (!result.ok && result.reason === "conflict") {
+					showAppToast({
+						intent: "warning",
+						message:
+							"The task's PR tracking settings changed while you were editing; open the edit dialog again to review them.",
+					});
+				}
+			});
+		}
+		editTaskPrSettingsOpenRef.current = null;
+
 		setEditTaskPrompt("");
 		setEditTaskStartInPlanMode(false);
 		setEditTaskAutoReviewEnabled(false);
@@ -359,6 +452,8 @@ export function useTaskEditor({
 		editTaskAgentId,
 		editTaskAutoReviewEnabled,
 		editTaskAutoReviewMode,
+		editTaskPrAutoAddressComments,
+		editTaskPrAutoFinishOnMerge,
 		editTaskBranchRef,
 		editTaskClineSettings,
 		editTaskInitialBaselineFixed,
@@ -368,7 +463,9 @@ export function useTaskEditor({
 		editTaskUpdateBaseRefBeforeStart,
 		editingTaskId,
 		resolvedDefaultTaskBranchRef,
+		board,
 		setBoard,
+		setTaskPrSettingsForTask,
 	]);
 
 	const handleSaveAndStartEditedTask = useCallback(() => {
@@ -412,6 +509,9 @@ export function useTaskEditor({
 				baseRef,
 				// UPD-1: persist an explicit policy (unchecked must survive as false).
 				updateBaseRefBeforeStart: newTaskUpdateBaseRefBeforeStart,
+				// PRTRACK-1: server-owned PR automation preferences.
+				autoAddressComments: newTaskPrAutoAddressComments,
+				autoFinishOnMerge: newTaskPrAutoFinishOnMerge,
 			});
 			setBoard(created.board);
 			trackTaskCreated({
@@ -443,6 +543,8 @@ export function useTaskEditor({
 			newTaskAgentId,
 			newTaskAutoReviewEnabled,
 			newTaskAutoReviewMode,
+			newTaskPrAutoAddressComments,
+			newTaskPrAutoFinishOnMerge,
 			newTaskBranchRef,
 			newTaskClineSettings,
 			newTaskImages,
@@ -481,6 +583,9 @@ export function useTaskEditor({
 					baseRef,
 					// UPD-1: persist an explicit policy (unchecked must survive as false).
 					updateBaseRefBeforeStart: newTaskUpdateBaseRefBeforeStart,
+					// PRTRACK-1: server-owned PR automation preferences.
+					autoAddressComments: newTaskPrAutoAddressComments,
+					autoFinishOnMerge: newTaskPrAutoFinishOnMerge,
 				});
 				updatedBoard = created.board;
 				createdTaskIds.push(created.task.id);
@@ -517,6 +622,8 @@ export function useTaskEditor({
 			newTaskAgentId,
 			newTaskAutoReviewEnabled,
 			newTaskAutoReviewMode,
+			newTaskPrAutoAddressComments,
+			newTaskPrAutoFinishOnMerge,
 			newTaskBranchRef,
 			newTaskClineSettings,
 			newTaskImages,
@@ -565,6 +672,10 @@ export function useTaskEditor({
 		setNewTaskAutoReviewEnabled,
 		newTaskAutoReviewMode,
 		setNewTaskAutoReviewMode,
+		newTaskPrAutoAddressComments,
+		setNewTaskPrAutoAddressComments,
+		newTaskPrAutoFinishOnMerge,
+		setNewTaskPrAutoFinishOnMerge,
 		isNewTaskStartInPlanModeDisabled,
 		newTaskBranchRef,
 		setNewTaskBranchRef,
@@ -585,6 +696,10 @@ export function useTaskEditor({
 		setEditTaskAutoReviewEnabled,
 		editTaskAutoReviewMode,
 		setEditTaskAutoReviewMode,
+		editTaskPrAutoAddressComments,
+		setEditTaskPrAutoAddressComments,
+		editTaskPrAutoFinishOnMerge,
+		setEditTaskPrAutoFinishOnMerge,
 		isEditTaskStartInPlanModeDisabled,
 		editTaskBranchRef,
 		setEditTaskBranchRef,

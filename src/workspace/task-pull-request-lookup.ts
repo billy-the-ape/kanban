@@ -6,7 +6,8 @@
 // current branch and record them with a snapshot (title, state,
 // stateCheckedAt). Every failure mode degrades silently: missing gh,
 // unauthenticated gh, no worktree, detached HEAD, or a git error all yield
-// `{ recorded: 0 }` without surfacing an error.
+// `{ recorded: 0 }` with a reason and never surface an error. The explicit
+// refresh toasts the reason; the automatic review-entry lookup ignores it.
 //
 // Writes are a documented exception to the single-write-path rule in
 // task-pull-requests.ts: new links go through addTaskPullRequests (same
@@ -48,12 +49,30 @@ export interface TaskPullRequestLookupInput {
 	gh?: TaskPullRequestGhRunner;
 }
 
+export type TaskPullRequestLookupReason =
+	| "no_task"
+	| "no_worktree"
+	| "no_branch"
+	| "no_gh"
+	| "gh_failed"
+	| "none_found"
+	| "unchanged"
+	| "updated"
+	| "failed";
+
 export interface TaskPullRequestLookupResult {
 	/** Number of PR entries that changed (newly recorded or snapshot-updated). */
 	recorded: number;
+	/**
+	 * Why the lookup produced that result. Consumed by the explicit refresh
+	 * (which toasts it); the automatic review-entry lookup ignores it.
+	 */
+	reason: TaskPullRequestLookupReason;
 }
 
-const NO_OP_RESULT: TaskPullRequestLookupResult = { recorded: 0 };
+function noOpResult(reason: TaskPullRequestLookupReason): TaskPullRequestLookupResult {
+	return { recorded: 0, reason };
+}
 
 function logLookupFailure(taskId: string, reason: string): void {
 	// Debug-level only: lookup failures are expected on machines without gh.
@@ -153,13 +172,14 @@ function parseGhPullRequestEntries(stdout: string): GhPullRequestEntry[] {
 
 /**
  * Looks up the PRs for the task's current branch and records them. Returns
- * how many entries changed; never throws. `branch` defaults to the worktree's
- * current branch (resolved inside this fire-and-forget work, direct git call).
+ * how many entries changed plus a reason; never throws. `branch` defaults to
+ * the worktree's current branch (resolved inside this fire-and-forget work,
+ * direct git call).
  */
 export async function lookupTaskPullRequests(input: TaskPullRequestLookupInput): Promise<TaskPullRequestLookupResult> {
 	const taskId = input.taskId.trim();
 	if (!taskId) {
-		return NO_OP_RESULT;
+		return noOpResult("no_task");
 	}
 	const gh = input.gh ?? ((args: string[], cwd: string) => runGhCommand(args, cwd, TASK_PULL_REQUEST_GH_TIMEOUT_MS));
 	try {
@@ -167,18 +187,25 @@ export async function lookupTaskPullRequests(input: TaskPullRequestLookupInput):
 		const card = findCard(state.board, taskId);
 		if (!card) {
 			logLookupFailure(taskId, "task not found on the board");
-			return NO_OP_RESULT;
+			return noOpResult("no_task");
 		}
-		const worktreePath = await resolveTaskCwd({
-			cwd: input.workspacePath,
-			taskId,
-			baseRef: card.baseRef,
-			ensure: false,
-		});
+		let worktreePath: string;
+		try {
+			worktreePath = await resolveTaskCwd({
+				cwd: input.workspacePath,
+				taskId,
+				baseRef: card.baseRef,
+				ensure: false,
+			});
+		} catch (error) {
+			// resolveTaskCwd throws when the worktree is gone (cleaned up).
+			logLookupFailure(taskId, `task worktree no longer exists: ${String(error)}`);
+			return noOpResult("no_worktree");
+		}
 		const branch = input.branch?.trim() || (await resolveCurrentBranch(worktreePath));
 		if (!branch) {
 			logLookupFailure(taskId, "no resolvable branch (detached HEAD or git error)");
-			return NO_OP_RESULT;
+			return noOpResult("no_branch");
 		}
 		const ghResult = await gh(
 			["pr", "list", "--head", branch, "--state", "all", "--json", "number,url,title,state", "--limit", "5"],
@@ -186,16 +213,16 @@ export async function lookupTaskPullRequests(input: TaskPullRequestLookupInput):
 		);
 		if (ghResult.missingBinary) {
 			logLookupFailure(taskId, "gh CLI is not installed");
-			return NO_OP_RESULT;
+			return noOpResult("no_gh");
 		}
 		if (!ghResult.ok) {
 			// Unauthenticated, no remote, or a transient failure: degrade silently.
 			logLookupFailure(taskId, `gh pr list failed (exit ${ghResult.exitCode}): ${ghResult.stderr || "no stderr"}`);
-			return NO_OP_RESULT;
+			return noOpResult("gh_failed");
 		}
 		const entries = parseGhPullRequestEntries(ghResult.stdout);
 		if (entries.length === 0) {
-			return NO_OP_RESULT;
+			return noOpResult("none_found");
 		}
 		const now = Date.now();
 		const response = await mutateWorkspaceState<number>(input.workspacePath, (current) => {
@@ -208,8 +235,11 @@ export async function lookupTaskPullRequests(input: TaskPullRequestLookupInput):
 				const existing = taskPullRequests.find((pullRequest) => getPullRequestIdentityKey(pullRequest) === key);
 				if (existing) {
 					// Refresh only when the stored snapshot is actually stale;
-					// repeated lookups must not churn the revision.
-					if (existing.title !== entry.title || existing.state !== entry.state) {
+					// repeated lookups must not churn the revision. Only compare
+					// the title when gh returned one: gh can omit it while the
+					// stored entry keeps it, which must not count as a change.
+					const titleChanged = entry.title !== undefined && existing.title !== entry.title;
+					if (titleChanged || existing.state !== entry.state) {
 						const result = updateTaskPullRequestSnapshot(board, taskId, key, {
 							...(entry.title !== undefined ? { title: entry.title } : {}),
 							state: entry.state,
@@ -244,20 +274,29 @@ export async function lookupTaskPullRequests(input: TaskPullRequestLookupInput):
 			// revision or trigger a broadcast.
 			return { board, value: changed, save: changed > 0 };
 		});
-		return { recorded: response.value };
+		return response.value > 0
+			? { recorded: response.value, reason: "updated" }
+			: { recorded: response.value, reason: "unchanged" };
 	} catch (error) {
 		// Best-effort by contract: a lookup must never fail the surrounding
 		// transition, board save, or refresh call.
 		logLookupFailure(taskId, String(error));
-		return NO_OP_RESULT;
+		return noOpResult("failed");
 	}
 }
 
 /**
  * Fire-and-forget wrapper for review transitions: fires the branch lookup
- * only when the card exists and has no recorded PRs. Never awaited.
+ * only when the card exists and has no recorded PRs. Never awaited. When the
+ * lookup RECORDS new links, `onChanged` is invoked so the caller can
+ * broadcast the board change and re-derive PR tracking demand.
  */
-export function fireReviewPullRequestLookup(input: { workspacePath: string; taskId: string }): void {
+export function fireReviewPullRequestLookup(input: {
+	workspacePath: string;
+	taskId: string;
+	onChanged?: (recorded: number) => void;
+	gh?: TaskPullRequestGhRunner;
+}): void {
 	void (async () => {
 		try {
 			const state = await loadWorkspaceState(input.workspacePath);
@@ -265,10 +304,14 @@ export function fireReviewPullRequestLookup(input: { workspacePath: string; task
 			if (!card || (card.pullRequests ?? []).length > 0) {
 				return;
 			}
-			await lookupTaskPullRequests({
+			const result = await lookupTaskPullRequests({
 				workspacePath: input.workspacePath,
 				taskId: input.taskId,
+				gh: input.gh,
 			});
+			if (result.recorded > 0) {
+				input.onChanged?.(result.recorded);
+			}
 		} catch (error) {
 			// lookupTaskPullRequests swallows its own failures; this only
 			// guards the pre-check board read.

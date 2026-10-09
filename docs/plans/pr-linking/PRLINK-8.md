@@ -1,60 +1,84 @@
-# PRLINK-8 — Link a PR by pasting its URL into the task chat
+# PRLINK-8 — Link from a URL sent in native task chat
 
-**Status: PROPOSED (draft for refinement; execute only after PR-linking v1 has merged).**
+**Status: READY FOR IMPLEMENTATION. Depends on v1; independent of 6/7/9.**
+Master plan: [v1](../complete/pr-linking/PR_LINKING_PLAN.md). Shared context: [follow-ups](PRLINK-FOLLOWUPS.md).
+Deliver as one native-Cline chat PR. Terminal input support is explicitly deferred.
 
-Master plan: `PR_LINKING_PLAN.md`. Index: `PRLINK-FOLLOWUPS.md`.
-Depends on: **PRLINK-1** (`recordTaskPullRequests`), **PRLINK-5** (manual link route and `source: "manual"`).
-Related: **PRLINK-9** (provider abstraction) so the same flow works for GitLab/Bitbucket.
+## Fixed user behavior
 
-## Purpose
+Only the native `sendTaskChatMessage` route participates. Never scan `sendTaskSessionInput`:
+it also transports terminal keystrokes/control input and does not guarantee complete messages.
+Do not scan assistant messages, tool output, initial task prompts, history replay, home-agent
+sessions, slash commands or messages rejected by the send operation.
 
-Today a user links a PR by opening the top-bar popover and pasting the URL. They would rather just paste the PR link into the chat with the agent, since that is where they already are. GitHub first, but the flow must not hard-code GitHub.
+A trimmed message that is **exactly one valid bare HTTP(S) PR URL**, with no attached images,
+automatically links it as source:manual after successful send acceptance. A suffix such as /files
+or a fragment is permitted and canonicalized by the shared parser. Markdown links, angle-bracket
+wrappers, code fences, trailing prose punctuation, multiple URLs, attached images and accompanying
+text use the suggestion path, never auto-link. No broader-auto-link setting is added.
 
-## Why this needs care
+Use the shared extractPullRequestLinks/parsePullRequestUrl helpers for suggestions; deduplicate by
+canonical identity in appearance order and return at most three. Skip consumed slash commands.
+An already linked identity renders **Already linked**, with no clickable duplicate suggestion.
+Keep the user's original text/images and normal agent turn behavior unchanged.
 
-Master plan Requirement 1 says PRs are captured from the *act of creating a PR*, never by scanning prose. A **user** pasting a URL is a different signal, but still ambiguous: a user may paste a PR URL for the agent to *review*, to *compare against*, or because it is *this task's* PR. Auto-attaching every pasted PR would reproduce exactly the false positives the plan was designed to avoid (a review task adopting PR #205 because the user mentioned it).
+A lone URL is an explicit shortcut, **not proof that the PR was created by this task**.
+A user can still send a lone reference URL in a review task; acknowledge that limitation with a
+visible **Linked <repository>#<number> · Remove link** confirmation. Prose mentions never attach
+automatically. Do not claim URL-only classification solves every review-task false positive.
 
-## Proposed behavior
+Closed/merged PRs and cross-repository PRs are allowed with manual semantics and repository labels.
+No network lookup is needed before linking. Linking does not mark primary or select an Automation PR
+explicitly; the existing foundation may reconcile eligibility under its own validated rules.
+Do not bypass branch mapping, settings, generation or ownership checks.
 
-Detect on the **user's outgoing message** and decide by confidence:
+## Server contract and write ordering
 
-1. **High confidence, auto-link**: the whole trimmed message is a single PR URL (nothing else). Record it with `source: "manual"` and show a short confirmation line in the chat ("Linked PR #123 to this task"). The message is still forwarded to the agent unchanged.
-2. **Ambiguous, ask**: the message contains one or more PR URLs among other text. Do not link automatically. Show a non-blocking inline action under the sent message: **"Link PR #123 to this task"** (one chip per distinct PR, max 3). One click records it as `manual`.
-3. **No PR URL**: nothing happens; no extra work on the hot path beyond a cheap regex test.
+Classify before send using a pure helper, but apply a link only after the actual send succeeds,
+including the successful rebind/retry path. Slash-command handling returns before classification.
+Use workspace scope plus the durable task card, not session cwd, and recheck that card exists.
+Call the existing recorder/manual-link mutation; broadcast only if changed. Preserve the existing
+20-entry cap and protections from PRLINK-6 if installed.
 
-A message that the existing slash-command handling consumes (for example the Cline `clear` command) is never scanned.
+Add an optional `pullRequestLinking` field to the native chat-send response only:
+- status: linked | already_linked | suggestions | failed;
+- links: canonical parsed identifiers/URLs (up to three);
+- error?: concise sanitized message for failed linkage.
 
-## Implementation notes
+Leave the field absent when there are no candidates or the send is unsuccessful/excluded.
+The current recorder conflates duplicate/no-task/write-failure: extend its internal result or
+re-read authoritative persisted entries before reporting linked/already_linked. A false changed
+value alone is never success. A failed record returns failed while retaining send ok:true;
+the UI explains **Message sent; PR link could not be saved** and offers the normal Add action.
+Never resend the user's message to retry linking.
 
-- **Where to detect.** Server-side in the two message entry points in `src/trpc/runtime-api.ts`: `sendTaskChatMessage` (~line 1597, native Cline chat) and `sendTaskSessionInput` (~line 1354, terminal agents). Both already receive the raw text. Use the existing strict parser (`extractPullRequestLinks` / `parsePullRequestUrl` in `src/core/pull-request-links.ts`); do not add a second URL matcher. Do detection after the message has been accepted so a failed send does not link anything.
-- **Single write path.** Call `recordTaskPullRequests({ source: "manual", ... })` from `src/workspace/task-pull-requests.ts`, then broadcast only if `changed`. Best-effort: a failed record never fails the message send.
-- **Return the outcome to the UI.** Extend the send response with an optional `linkedPullRequests` / `pullRequestSuggestions` field (optional, so uncast mocks and older clients are unaffected) so the chat can render the confirmation line or the "Link PR" chips without a second round trip. The chips call the existing `workspace.addTaskPullRequest` route; no new write route is needed.
-- **Task scoping.** Home-agent sessions (`isHomeAgentSession`) have no card; skip detection for them.
-- **Provider neutrality.** Detection goes through the shared parser, which already classifies GitHub, GitLab and Bitbucket URLs. Nothing here should mention `gh`. Any provider-specific enrichment (title/state lookup) belongs behind the provider interface from PRLINK-9 and is optional for this milestone: the link is recorded from the URL alone, as manual adds are today.
-- **UI.** The chat composer area is under `web-ui/src/components/detail-panels/` (`cline-chat-composer.tsx` and the message list). Render the confirmation / chips as a lightweight system-style row, not as part of the user's message text. For terminal agents (xterm-based, no message list) there is no chat surface: either skip the chips and only auto-link the pure-URL case with a toast, or defer terminal agents. State the choice in the implementation notes.
+Keep durable truth only in card.pullRequests. Confirmation/suggestion UI is local to the active
+chat, keyed by originating send/task, not injected into the model transcript or persisted as a new
+message type. On reload it may disappear; do not retrospectively auto-link or recreate chips from
+history. PR links already saved remain. No persistent per-message suggestion ledger.
 
-## Edge cases
+## UI and concurrent requests
 
-- Same URL pasted twice: no-op (identity dedupe), confirmation says "already linked".
-- URL for a different repository than the task's workspace: still allowed (manual semantics), but the chip text includes `owner/repo#123` so the user sees it.
-- `/pull/new/<branch>`, `/compare`, `/issues/<n>`: rejected by the parser, no chip.
-- More than the 20-entry cap: existing eviction rules apply (manual entries are evicted last).
-- Pasted into a review session (a Cline review session reading someone else's PR): the ambiguous path asks rather than links, which is the point.
+Render a lightweight notice under the composer for the latest completed send, with distinct
+repository labels and up to three **Link <repository>#<number> to this task** buttons. A chip calls
+workspace.addTaskPullRequest and uses pending/error states; success reads as Linked. Remove link
+uses the existing unlink API and its automation invalidation rules. Never hide pending/failed
+notices behind another send; serialize composer submission until the send response is handled.
+Clear notices on task/workspace change and guard late callbacks against the captured scope.
+The board broadcast remains authoritative. Do not attach notices to listMessages().at(-1), which
+may already be an assistant/tool message when the send finishes.
 
-## Tests
+## Verification and acceptance
 
-- Unit: message classification (pure URL, URL with text, multiple URLs, no URL, slash command, `pull/new`), including GitLab and Bitbucket URLs.
-- `runtime-api` tests with `HOME`/`USERPROFILE` isolation: pure-URL message records a `manual` PR and still reaches the agent; mixed text records nothing and returns suggestions; home-agent sessions record nothing; a record failure does not fail the send.
-- web-ui: confirmation row and chip rendering, chip click calls `addTaskPullRequest`.
+- Pure classifier: bare URL/whitespace/suffixes, images, prose, wrappers, multiple/duplicate URLs,
+  slash commands, rejected shapes (/pull/new, /compare, /issues), supported providers.
+- Runtime: successful normal/rebound send links once; failed send/clear/home-agent do nothing;
+  duplicate vs write failure distinguished; failure preserves message send; removed task race.
+- UI: confirmation, suggestions, duplicate notice, Add/Remove errors and pending clicks;
+  overlapping send guard and task-switch response isolation; no notice enters model input.
+- A GitHub/GitLab/Bitbucket URL supported by the installed shared parser works without provider CLI.
+  Self-hosted scheme/port additions arrive in 9; no parser fork here.
 
-## Acceptance
-
-- Pasting a lone GitHub PR URL into the task chat links it to the task and the card/top bar update without a reload.
-- A PR URL inside a longer message offers a one-click link and never links by itself.
-- A review task that merely discusses another PR does not adopt it.
-
-## Open questions
-
-1. Is "pure URL only" the right auto-link threshold, or should the user opt in to broader auto-linking in settings?
-2. Terminal agents have no chat surface: toast only, or defer?
-3. Should a pasted URL for a **closed or merged** PR be auto-linked (it could be the user pointing at an old reference)? Needs the snapshot, which needs the provider lookup from PRLINK-9; until then, treat all the same.
+Acceptance: bare-URL shortcut works without reload; prose references require a user click;
+link-save errors do not fail or repeat the agent turn.
+Follow the shared verification/deployment rules in PRLINK-FOLLOWUPS.md.

@@ -58,16 +58,33 @@ import type {
 	RuntimeHookIngestResponse,
 	RuntimeOpenFileRequest,
 	RuntimeOpenFileResponse,
+	RuntimePrAuthorizedSnapshotRequest,
+	RuntimePrAuthorizedSnapshotResponse,
+	RuntimePrCommentDispatchUpdateRequest,
+	RuntimePrOperationReleaseRequest,
+	RuntimePrOperationReservationRequest,
+	RuntimePrOperationReservationResponse,
+	RuntimePrOperationValidateRequest,
 	RuntimeProjectAddRequest,
 	RuntimeProjectAddResponse,
 	RuntimeProjectDirectoryPickerResponse,
 	RuntimeProjectRemoveRequest,
 	RuntimeProjectRemoveResponse,
 	RuntimeProjectsResponse,
+	RuntimePrRecordMutationResponse,
+	RuntimePrRepairOwnerResponse,
+	RuntimePrRepairOwnerSelectRequest,
+	RuntimePrRepairOwnerTransferRequest,
+	RuntimePrSnapshotRefreshRequest,
+	RuntimePrSnapshotRefreshResponse,
+	RuntimePrSubscriptionRequest,
+	RuntimePrSubscriptionResponse,
 	RuntimeRunUpdateResponse,
 	RuntimeShellSessionStartRequest,
 	RuntimeShellSessionStartResponse,
 	RuntimeSlashCommandsResponse,
+	RuntimeTaskAutomationPrSelectRequest,
+	RuntimeTaskAutomationPrSelectResponse,
 	RuntimeTaskChatAbortRequest,
 	RuntimeTaskChatAbortResponse,
 	RuntimeTaskChatCancelRequest,
@@ -91,10 +108,15 @@ import type {
 	RuntimeTaskDispatchStatusResponse,
 	RuntimeTaskInitialStartStatusRequest,
 	RuntimeTaskInitialStartStatusResponse,
+	RuntimeTaskMergeBindingUpdateRequest,
 	RuntimeTaskPhasesRequest,
 	RuntimeTaskPhasesResponse,
 	RuntimeTaskPreservationInfoResponse,
 	RuntimeTaskPreservationRequest,
+	RuntimeTaskPrSettingsRequest,
+	RuntimeTaskPrSettingsResponse,
+	RuntimeTaskPrTrackingResumeRequest,
+	RuntimeTaskPrTrackingResumeResponse,
 	RuntimeTaskPullRequestLinkRequest,
 	RuntimeTaskPullRequestLinkResponse,
 	RuntimeTaskPullRequestsRefreshRequest,
@@ -109,6 +131,8 @@ import type {
 	RuntimeTaskSessionStartResponse,
 	RuntimeTaskSessionStopRequest,
 	RuntimeTaskSessionStopResponse,
+	RuntimeTaskTrackingStateRequest,
+	RuntimeTaskTrackingStateResponse,
 	RuntimeTaskWorkspaceInfoRequest,
 	RuntimeTaskWorkspaceInfoResponse,
 	RuntimeTaskWorkspaceMaintenanceReport,
@@ -179,16 +203,33 @@ import {
 	runtimeHookIngestResponseSchema,
 	runtimeOpenFileRequestSchema,
 	runtimeOpenFileResponseSchema,
+	runtimePrAuthorizedSnapshotRequestSchema,
+	runtimePrAuthorizedSnapshotResponseSchema,
+	runtimePrCommentDispatchUpdateRequestSchema,
+	runtimePrOperationReleaseRequestSchema,
+	runtimePrOperationReservationRequestSchema,
+	runtimePrOperationReservationResponseSchema,
+	runtimePrOperationValidateRequestSchema,
 	runtimeProjectAddRequestSchema,
 	runtimeProjectAddResponseSchema,
 	runtimeProjectDirectoryPickerResponseSchema,
 	runtimeProjectRemoveRequestSchema,
 	runtimeProjectRemoveResponseSchema,
 	runtimeProjectsResponseSchema,
+	runtimePrRecordMutationResponseSchema,
+	runtimePrRepairOwnerResponseSchema,
+	runtimePrRepairOwnerSelectRequestSchema,
+	runtimePrRepairOwnerTransferRequestSchema,
+	runtimePrSnapshotRefreshRequestSchema,
+	runtimePrSnapshotRefreshResponseSchema,
+	runtimePrSubscriptionRequestSchema,
+	runtimePrSubscriptionResponseSchema,
 	runtimeRunUpdateResponseSchema,
 	runtimeShellSessionStartRequestSchema,
 	runtimeShellSessionStartResponseSchema,
 	runtimeSlashCommandsResponseSchema,
+	runtimeTaskAutomationPrSelectRequestSchema,
+	runtimeTaskAutomationPrSelectResponseSchema,
 	runtimeTaskChatAbortRequestSchema,
 	runtimeTaskChatAbortResponseSchema,
 	runtimeTaskChatCancelRequestSchema,
@@ -212,10 +253,15 @@ import {
 	runtimeTaskDispatchStatusResponseSchema,
 	runtimeTaskInitialStartStatusRequestSchema,
 	runtimeTaskInitialStartStatusResponseSchema,
+	runtimeTaskMergeBindingUpdateRequestSchema,
 	runtimeTaskPhasesRequestSchema,
 	runtimeTaskPhasesResponseSchema,
 	runtimeTaskPreservationInfoResponseSchema,
 	runtimeTaskPreservationRequestSchema,
+	runtimeTaskPrSettingsRequestSchema,
+	runtimeTaskPrSettingsResponseSchema,
+	runtimeTaskPrTrackingResumeRequestSchema,
+	runtimeTaskPrTrackingResumeResponseSchema,
 	runtimeTaskPullRequestLinkRequestSchema,
 	runtimeTaskPullRequestLinkResponseSchema,
 	runtimeTaskPullRequestsRefreshRequestSchema,
@@ -230,6 +276,8 @@ import {
 	runtimeTaskSessionStartResponseSchema,
 	runtimeTaskSessionStopRequestSchema,
 	runtimeTaskSessionStopResponseSchema,
+	runtimeTaskTrackingStateRequestSchema,
+	runtimeTaskTrackingStateResponseSchema,
 	runtimeTaskWorkspaceInfoRequestSchema,
 	runtimeTaskWorkspaceInfoResponseSchema,
 	runtimeTaskWorkspaceMaintenanceReportSchema,
@@ -505,6 +553,64 @@ export interface RuntimeTrpcContext {
 	};
 	hooksApi: {
 		ingest: (input: RuntimeHookIngestRequest) => Promise<RuntimeHookIngestResponse>;
+	};
+	prTrackingApi: {
+		setTaskPrSettings: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskPrSettingsRequest,
+		) => Promise<RuntimeTaskPrSettingsResponse>;
+		selectTaskAutomationPr: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskAutomationPrSelectRequest,
+		) => Promise<RuntimeTaskAutomationPrSelectResponse>;
+		resumeTaskPrTracking: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskPrTrackingResumeRequest,
+		) => Promise<RuntimeTaskPrTrackingResumeResponse>;
+		getTaskTrackingState: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskTrackingStateRequest,
+		) => Promise<RuntimeTaskTrackingStateResponse>;
+		getTaskPrSnapshot: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimePrAuthorizedSnapshotRequest,
+		) => Promise<RuntimePrAuthorizedSnapshotResponse>;
+		refreshTaskPrSnapshot: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimePrSnapshotRefreshRequest,
+		) => Promise<RuntimePrSnapshotRefreshResponse>;
+		updateTaskCommentDispatch: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimePrCommentDispatchUpdateRequest,
+		) => Promise<RuntimePrRecordMutationResponse>;
+		updateTaskMergeBinding: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskMergeBindingUpdateRequest,
+		) => Promise<RuntimePrRecordMutationResponse>;
+		selectRepairOwner: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimePrRepairOwnerSelectRequest,
+		) => Promise<RuntimePrRepairOwnerResponse>;
+		transferRepairOwner: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimePrRepairOwnerTransferRequest,
+		) => Promise<RuntimePrRepairOwnerResponse>;
+		reservePrOperation: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimePrOperationReservationRequest,
+		) => Promise<RuntimePrOperationReservationResponse>;
+		validatePrOperation: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimePrOperationValidateRequest,
+		) => Promise<RuntimePrOperationReservationResponse>;
+		releasePrOperation: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimePrOperationReleaseRequest,
+		) => Promise<RuntimePrOperationReservationResponse>;
+		readPrSnapshotEvents: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimePrSubscriptionRequest,
+		) => Promise<RuntimePrSubscriptionResponse>;
 	};
 }
 
@@ -942,6 +1048,93 @@ export const runtimeAppRouter = t.router({
 			.query(async ({ ctx, input }) => {
 				return await ctx.workspaceApi.loadCommitDiff(ctx.workspaceScope, input);
 			}),
+		// PRTRACK-1: the frozen consumer API for PR-driven task workflows.
+		prTracking: t.router({
+			setTaskPrSettings: workspaceProcedure
+				.input(runtimeTaskPrSettingsRequestSchema)
+				.output(runtimeTaskPrSettingsResponseSchema)
+				.mutation(async ({ ctx, input }) => {
+					return await ctx.prTrackingApi.setTaskPrSettings(ctx.workspaceScope, input);
+				}),
+			selectTaskAutomationPr: workspaceProcedure
+				.input(runtimeTaskAutomationPrSelectRequestSchema)
+				.output(runtimeTaskAutomationPrSelectResponseSchema)
+				.mutation(async ({ ctx, input }) => {
+					return await ctx.prTrackingApi.selectTaskAutomationPr(ctx.workspaceScope, input);
+				}),
+			resumeTaskPrTracking: workspaceProcedure
+				.input(runtimeTaskPrTrackingResumeRequestSchema)
+				.output(runtimeTaskPrTrackingResumeResponseSchema)
+				.mutation(async ({ ctx, input }) => {
+					return await ctx.prTrackingApi.resumeTaskPrTracking(ctx.workspaceScope, input);
+				}),
+			getTaskTrackingState: workspaceProcedure
+				.input(runtimeTaskTrackingStateRequestSchema)
+				.output(runtimeTaskTrackingStateResponseSchema)
+				.query(async ({ ctx, input }) => {
+					return await ctx.prTrackingApi.getTaskTrackingState(ctx.workspaceScope, input);
+				}),
+			getTaskPrSnapshot: workspaceProcedure
+				.input(runtimePrAuthorizedSnapshotRequestSchema)
+				.output(runtimePrAuthorizedSnapshotResponseSchema)
+				.query(async ({ ctx, input }) => {
+					return await ctx.prTrackingApi.getTaskPrSnapshot(ctx.workspaceScope, input);
+				}),
+			refreshTaskPrSnapshot: workspaceProcedure
+				.input(runtimePrSnapshotRefreshRequestSchema)
+				.output(runtimePrSnapshotRefreshResponseSchema)
+				.mutation(async ({ ctx, input }) => {
+					return await ctx.prTrackingApi.refreshTaskPrSnapshot(ctx.workspaceScope, input);
+				}),
+			updateTaskCommentDispatch: workspaceProcedure
+				.input(runtimePrCommentDispatchUpdateRequestSchema)
+				.output(runtimePrRecordMutationResponseSchema)
+				.mutation(async ({ ctx, input }) => {
+					return await ctx.prTrackingApi.updateTaskCommentDispatch(ctx.workspaceScope, input);
+				}),
+			updateTaskMergeBinding: workspaceProcedure
+				.input(runtimeTaskMergeBindingUpdateRequestSchema)
+				.output(runtimePrRecordMutationResponseSchema)
+				.mutation(async ({ ctx, input }) => {
+					return await ctx.prTrackingApi.updateTaskMergeBinding(ctx.workspaceScope, input);
+				}),
+			selectRepairOwner: workspaceProcedure
+				.input(runtimePrRepairOwnerSelectRequestSchema)
+				.output(runtimePrRepairOwnerResponseSchema)
+				.mutation(async ({ ctx, input }) => {
+					return await ctx.prTrackingApi.selectRepairOwner(ctx.workspaceScope, input);
+				}),
+			transferRepairOwner: workspaceProcedure
+				.input(runtimePrRepairOwnerTransferRequestSchema)
+				.output(runtimePrRepairOwnerResponseSchema)
+				.mutation(async ({ ctx, input }) => {
+					return await ctx.prTrackingApi.transferRepairOwner(ctx.workspaceScope, input);
+				}),
+			reservePrOperation: workspaceProcedure
+				.input(runtimePrOperationReservationRequestSchema)
+				.output(runtimePrOperationReservationResponseSchema)
+				.mutation(async ({ ctx, input }) => {
+					return await ctx.prTrackingApi.reservePrOperation(ctx.workspaceScope, input);
+				}),
+			validatePrOperation: workspaceProcedure
+				.input(runtimePrOperationValidateRequestSchema)
+				.output(runtimePrOperationReservationResponseSchema)
+				.mutation(async ({ ctx, input }) => {
+					return await ctx.prTrackingApi.validatePrOperation(ctx.workspaceScope, input);
+				}),
+			releasePrOperation: workspaceProcedure
+				.input(runtimePrOperationReleaseRequestSchema)
+				.output(runtimePrOperationReservationResponseSchema)
+				.mutation(async ({ ctx, input }) => {
+					return await ctx.prTrackingApi.releasePrOperation(ctx.workspaceScope, input);
+				}),
+			readPrSnapshotEvents: workspaceProcedure
+				.input(runtimePrSubscriptionRequestSchema)
+				.output(runtimePrSubscriptionResponseSchema)
+				.query(async ({ ctx, input }) => {
+					return await ctx.prTrackingApi.readPrSnapshotEvents(ctx.workspaceScope, input);
+				}),
+		}),
 	}),
 	projects: t.router({
 		list: t.procedure.output(runtimeProjectsResponseSchema).query(async ({ ctx }) => {

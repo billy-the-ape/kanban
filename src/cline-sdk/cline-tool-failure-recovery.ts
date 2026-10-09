@@ -2,6 +2,23 @@ import type { ClineSdkAgentAfterToolContext, ClineSdkAgentHooks } from "./sdk-ru
 
 type Tool = ClineSdkAgentAfterToolContext["tool"];
 const REPLAY_SAFE_TOOLS = new Set(["read_files", "search_codebase", "fetch_web_content"]);
+/** A call that has timed out this many times (the original plus one retry) ends the run. */
+const MAX_TIMEOUTS_PER_CALL = 2;
+/** The same call failing with the same error this many times in a row, with no successful tool call between, ends the run. */
+const MAX_IDENTICAL_FAILURES = 3;
+/**
+ * Timeouts are recognised by the exact shapes the SDK and Kanban's MCP layer emit, one error line at a time.
+ * A free-text search is wrong here: stderr, file paths, regexes, and echoed model input routinely contain
+ * "timeout" / "timed out" (`Test timed out in 5000ms`, `src/utils/timeout.ts`, `--timeout=5`) and are the
+ * model's to fix, not transient failures. Optional leading `Prefix: ` covers the SDK's `Command failed: ...`
+ * style wrappers and Kanban's `MCP server "x" failed: ...`.
+ */
+const TIMEOUT_LINE_PATTERNS = [
+	/^(?:[A-Za-z_ ]{1,40}: )?(?:Command|File read|Search|Web fetch|Editor operation|apply_patch|Skills operation|submit_and_exit|Request) timed out after \d+ ?ms\b/,
+	/^(?:MCP server "[^"\n]*" failed: )?MCP error -32001: Request timed out\b/,
+	/^(?:MCP server "[^"\n]*" failed: )?MCP request timed out for "[^"\n]*"/,
+	/^(?:Error fetching web content: )?HTTP (?:408|504|524)\b/,
+];
 
 function record(value: unknown): Record<string, unknown> | null {
 	return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -23,32 +40,103 @@ export function readClineToolFailure(output: unknown): string | null {
 	return null;
 }
 
+/**
+ * Only timeouts are transient. Every other failure (bad input, oversized edit, missing file, unknown tool)
+ * is the model's to fix: it sees the error in the ordinary tool result and adapts, so it is never retried
+ * and only the repeated-failure guard counts it.
+ */
+export function isClineToolTimeout(error: string | null): error is string {
+	return (
+		error?.split("\n").some((line) => TIMEOUT_LINE_PATTERNS.some((pattern) => pattern.test(line.trim()))) ?? false
+	);
+}
+
 function summarize(value: unknown): string {
 	const text = value instanceof Error ? value.message : typeof value === "string" ? value : JSON.stringify(value);
 	return (text ?? "Unknown tool error").slice(0, 4000);
 }
 
-/** Local SDK hooks: one safe replay, one model repair, then a failed run. Reset only on a new user turn. */
+function errorText(error: unknown): string {
+	return summarize(error);
+}
+
+/** Strike key. Unlike `summarize`, never truncated, so distinct long inputs do not share a strike. */
+function callKey(toolName: string, input: unknown): string {
+	return `${toolName}\n${JSON.stringify(input) ?? ""}`;
+}
+
+function editorRecovery(error: string): string | null {
+	if (error.startsWith("Editor operation failed: No replacement performed: multiple occurrences")) {
+		return "The replacement anchor matched more than once. Read the current file section and include enough surrounding text in old_text to identify exactly one occurrence. Do not repeat the ambiguous anchor.";
+	}
+	if (error.startsWith("Editor operation failed: No replacement performed: text not found")) {
+		return "Replacement text did not match. Read the current file section with read_files, then copy an exact, unique old_text anchor from that fresh read. Do not repeat unchanged arguments or guess whitespace. insert_line is only for a pure insertion, not a replacement.";
+	}
+	if (error.startsWith("Editor operation failed: Parameter `old_text` is required")) {
+		return "The editor received an existing-file edit without usable old_text. Read the current file section and include an explicit old_text string in the actual arguments. Use insert_line only for an intended insertion; do not assume the tool dropped a field.";
+	}
+	if (error.startsWith("Editor operation failed: Invalid insert_line:")) {
+		return "Read the current file to determine its line count and insertion boundary. insert_line is one-based; use line_count + 1 to append. Do not repeat the invalid line number.";
+	}
+	if (error.startsWith("Editor input too large:")) {
+		return "Split the edit into smaller sequential calls; keep old_text and new_text below 30000 characters each. Read the current file before anchoring the next edit. Do not retry the same oversized payload.";
+	}
+	return null;
+}
+
+/**
+ * Local SDK hooks that bound *timeout* recovery only. A timed-out replay-safe tool is retried once inside tool
+ * execution; any other timed-out tool goes back to the model with instructions to verify side effects before
+ * retrying. A call (same tool and input) that times out again after that retry ends the run. All other tool
+ * editor input errors receive targeted instructions in their model-facing result; other errors pass through.
+ * Only the same call failing with the same
+ * error repeatedly, with no successful tool call in between, ends the run. Reset only on a new user turn.
+ */
 export function createClineToolFailureRecoveryHooks(): ClineSdkAgentHooks {
 	const wrapped = new WeakSet<Tool>();
 	const attempts = new Map<string, number>();
-	const seen = new Set<string>();
-	let repairIteration: number | null = null;
+	const timeouts = new Map<string, { count: number; iteration: number }>();
+	// Keyed by call + error text. Cleared entirely by any successful tool call.
+	const identicalFailures = new Map<string, { count: number; iteration: number }>();
 	let terminalError: string | null = null;
 
-	function failure(toolName: string, input: unknown, error: string, count: number, iteration: number): string {
+	function repeatedFailure(toolName: string, input: unknown, error: string, iteration: number): string | null {
+		const key = `${callKey(toolName, input)}\n${error}`;
+		const previous = identicalFailures.get(key);
+		// Identical calls in one batch share a single strike.
+		const count = previous && previous.iteration === iteration ? previous.count : (previous?.count ?? 0) + 1;
+		identicalFailures.set(key, { count, iteration });
+		if (count < MAX_IDENTICAL_FAILURES) return null;
+		terminalError = [
+			`Tool call failed ${MAX_IDENTICAL_FAILURES} times in a row with the same error and no successful tool call in between.`,
+			`Tool: ${toolName}\nInput: ${summarize(input)}\nError: ${summarize(error)}`,
+		].join("\n");
+		return terminalError;
+	}
+
+	function timeoutFailure(
+		toolName: string,
+		input: unknown,
+		error: string,
+		attemptCount: number,
+		iteration: number,
+	): string {
+		const key = callKey(toolName, input);
+		const previous = timeouts.get(key);
+		// Identical calls in one batch share a single strike.
+		const count = previous && previous.iteration === iteration ? previous.count : (previous?.count ?? 0) + 1;
+		timeouts.set(key, { count, iteration });
 		const details = `Tool: ${toolName}\nInput: ${summarize(input)}\nError: ${summarize(error)}`;
-		if (repairIteration !== null && iteration > repairIteration) {
-			terminalError = `Tool recovery exhausted after the model repair attempt.\n${details}`;
+		if (count >= MAX_TIMEOUTS_PER_CALL) {
+			terminalError = `Tool timed out again after one retry.\n${details}`;
 			return terminalError;
 		}
-		repairIteration ??= iteration;
 		return [
-			count === 2
-				? "The last tool call failed twice."
-				: "The last tool call failed. Automatic replay was skipped because its outcome may include side effects.",
+			attemptCount === 2
+				? "The last tool call timed out twice."
+				: "The last tool call timed out. Automatic replay was skipped because its outcome may include side effects.",
 			details,
-			"Try reformatting the call or using a different tool. You have one repair opportunity; another tool failure will stop this task.",
+			"You may retry this call once, ideally narrowed or split into smaller steps, or use a different tool. If it times out again the task will stop.",
 			"Before repeating a command or write, check whether it already succeeded (especially PR creation, commits, and pushes). A timeout does not prove it failed remotely.",
 		].join("\n");
 	}
@@ -56,8 +144,7 @@ export function createClineToolFailureRecoveryHooks(): ClineSdkAgentHooks {
 	return {
 		beforeRun: () => {
 			attempts.clear();
-			seen.clear();
-			repairIteration = null;
+			timeouts.clear();
 			terminalError = null;
 			return undefined;
 		},
@@ -68,25 +155,26 @@ export function createClineToolFailureRecoveryHooks(): ClineSdkAgentHooks {
 			tool.execute = async (input, context) => {
 				context.signal?.throwIfAborted();
 				if (terminalError) throw new Error(terminalError);
-				const maxAttempts =
-					(repairIteration === null || context.iteration <= repairIteration) && REPLAY_SAFE_TOOLS.has(tool.name)
-						? 2
-						: 1;
+				// A call the model is retrying after a timeout already had its automatic retry; same-batch twins have not.
+				const priorTimeout = timeouts.get(callKey(tool.name, input));
+				const replaySafe =
+					REPLAY_SAFE_TOOLS.has(tool.name) && !(priorTimeout && priorTimeout.iteration < context.iteration);
+				const maxAttempts = replaySafe ? 2 : 1;
 				for (let attempt = 1; ; attempt++) {
 					context.signal?.throwIfAborted();
 					if (context.toolCallId) attempts.set(context.toolCallId, attempt);
 					try {
 						const output = await execute(input, context);
 						context.signal?.throwIfAborted();
-						if (!readClineToolFailure(output) || attempt >= maxAttempts) return output;
+						if (attempt >= maxAttempts || !isClineToolTimeout(readClineToolFailure(output))) return output;
 					} catch (error) {
 						context.signal?.throwIfAborted();
-						if (attempt >= maxAttempts) throw error;
+						if (attempt >= maxAttempts || !isClineToolTimeout(errorText(error))) throw error;
 					}
 					context.emitUpdate?.({
 						status: "retrying",
 						attempt: 2,
-						message: "Tool failed; retrying once without a model call.",
+						message: "Tool timed out; retrying once without a model call.",
 					});
 				}
 			};
@@ -96,64 +184,39 @@ export function createClineToolFailureRecoveryHooks(): ClineSdkAgentHooks {
 			const error = readClineToolFailure(result.output) ?? (result.isError ? summarize(result.output) : null);
 			const count = attempts.get(toolCall.toolCallId) ?? 1;
 			attempts.delete(toolCall.toolCallId);
-			seen.add(toolCall.toolCallId);
-			if (!error) return;
+			// A call blocked by the terminal error was never executed; leave its result alone.
+			if (terminalError) return;
+			if (!error) {
+				// Progress: this call is off its timeout strike and every failure streak starts over.
+				timeouts.delete(callKey(toolCall.toolName, input));
+				identicalFailures.clear();
+				return;
+			}
+			const boundedRecovery = isClineToolTimeout(error)
+				? timeoutFailure(toolCall.toolName, input, error, count, snapshot.iteration)
+				: repeatedFailure(toolCall.toolName, input, error, snapshot.iteration);
+			const editorGuidance = toolCall.toolName === "editor" ? editorRecovery(error) : null;
+			const key = `${callKey(toolCall.toolName, input)}\n${error}`;
+			const repeated = (identicalFailures.get(key)?.count ?? 0) > 1;
+			const recovery =
+				boundedRecovery ??
+				(editorGuidance
+					? `${repeated ? "This exact editor call already failed. Change your approach before another attempt. " : ""}${editorGuidance}`
+					: null);
+			if (!recovery) return;
 			return {
 				result: {
 					...result,
 					isError: true,
-					output: {
-						recovery: failure(toolCall.toolName, input, error, count, snapshot.iteration),
-						output: result.output,
-					},
+					output: { recovery, output: result.output },
 				},
 			};
 		},
-		beforeModel: ({ snapshot, request }) => {
-			// Unknown tools / malformed call JSON bypass beforeTool and afterTool in the SDK.
-			// Inspect only the latest batch, so historical failures do not consume a new turn's budget.
-			const latest: (typeof request.messages)[number][] = [];
-			for (let index = request.messages.length - 1; index >= 0; index--) {
-				const message = request.messages[index];
-				if (message.role !== "tool") break;
-				latest.unshift(message);
-			}
-			const latestAssistant = request.messages.at(request.messages.length - latest.length - 1);
-			const calls = new Map(
-				latestAssistant?.role === "assistant"
-					? latestAssistant.content.flatMap((part) =>
-							part.type === "tool-call" ? [[part.toolCallId, part.input] as const] : [],
-						)
-					: [],
-			);
-			const messages = request.messages.map((message) => {
-				if (!latest.includes(message)) return message;
-				return {
-					...message,
-					content: message.content.map((part) => {
-						if (part.type !== "tool-result" || seen.has(part.toolCallId)) return part;
-						seen.add(part.toolCallId);
-						const error = readClineToolFailure(part.output) ?? (part.isError ? summarize(part.output) : null);
-						if (!error) return part;
-						return {
-							...part,
-							isError: true,
-							output: failure(
-								part.toolName,
-								calls.get(part.toolCallId) ?? "Unavailable (invalid or unknown tool call)",
-								error,
-								1,
-								snapshot.iteration,
-							),
-						};
-					}),
-				};
-			});
-			seen.clear();
+		beforeModel: () => {
 			// Throw here, after the SDK has persisted the failed tool result, rather than stopping
 			// in afterTool (which reports an interruption and loses the tool-result pairing).
 			if (terminalError) throw new Error(terminalError);
-			return { messages };
+			return undefined;
 		},
 	};
 }

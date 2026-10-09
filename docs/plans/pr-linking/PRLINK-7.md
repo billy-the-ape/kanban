@@ -1,51 +1,55 @@
-# PRLINK-7 — Primary PR link in the mobile task detail
+# PRLINK-7 — Mobile PR access and management
 
-**Status: PROPOSED (draft for refinement; execute only after PR-linking v1 has merged).**
+**Status: READY FOR IMPLEMENTATION. Depends on v1 and PRLINK-6.**
+Master plan: [v1](../complete/pr-linking/PR_LINKING_PLAN.md). Shared context: [follow-ups](PRLINK-FOLLOWUPS.md).
+Deliver as one UI PR; no new server route or mobile navigation architecture.
 
-Master plan: `PR_LINKING_PLAN.md`. Index: `PRLINK-FOLLOWUPS.md`.
-Depends on: **PRLINK-4**. Benefits from **PRLINK-6** (primary PR) but can ship first using the v1 "latest" PR.
+## Fixed layout and interaction
 
-## Purpose
+Use the trailing area of MobileDetailTabBar in `web-ui/src/components/card-detail-view.tsx`.
+Keep Chat/Diff as the two top-level tabs and leave the narrow title bar unchanged.
+For a task with links, show a compact anchor for the primary display PR and a separate
+GitPullRequest management button. The anchor opens the provider URL in one tap. The management
+button always opens the same manager, irrespective of link count; never switch its meaning from
+external navigation to popover when a second PR arrives.
 
-Make the task's main PR reachable from the task detail on mobile.
+For zero links and a workspaceId, show **Link PR** as the management trigger. With no workspaceId,
+existing links remain readable/openable; omit management actions. Use the selected card's
+pullRequests as the source. Reset pending/form/popover state on workspace/task change so a late
+response from task A cannot update task B.
 
-## Current state (verified against `feat/task-pr-links` at `0e4f3ec`)
+Reuse TaskPullRequestLink and TaskPullRequestManager, including primary order/actions from 6.
+Make the manager's trigger/presentation configurable rather than duplicating mutation logic.
+Include Add, Remove, Make primary for display, clear primary and the existing task-wide Refresh.
+Until PRLINK-9, that Refresh retains its current branch-discovery behavior; do not claim it updates
+every manually linked PR. Primary remains separate from Automation PR.
 
-- **Board card: yes, on all viewports.** `board-card.tsx` renders `TaskPullRequestLink variant="compact"` for `getLatestPullRequest(card)` in the card header, in every column including Done and Trash. Nothing in that path is desktop-only. (It is only visible on mobile while the board is showing; once a task is opened in detail, the card is not on screen.)
-- **Task detail top bar: no, not on mobile.** The PR links, the "Link PR" / manage popover and the refresh action all live inside `TopBarGitStatusSection`, which `TopBar` renders only in the `!isMobile` branch ("Desktop-only: open-workspace button, hints, git status", `top-bar.tsx` around line 551). On mobile the task detail therefore has no PR link at all.
-- Mobile task detail is `card-detail-view.tsx` with `MobileDetailTabBar` and `chat` / `diff` panels (`isMobile` branch around line 734). The top bar on mobile is a compact title area (`max-w-[180px]`).
+## Accessibility and layout
 
-## Proposed behavior
+All mobile interactive hit areas, including each PR anchor and row action, are at least 44 x 44 px.
+Use a Radix Portal, collision-aware placement, viewport-bounded width and scrollable content.
+At 320/360 px, long titles/repositories and all 20 links must wrap/truncate without horizontal
+overflow. Do not rely on a hover tooltip for names or state; provide accessible labels and visible
+repository information in manager rows. Focus returns to trigger on close; Escape/dismiss works.
+Links retain target="_blank" and rel="noopener noreferrer". Anchor touch/click must not switch tabs,
+open task selection or begin dragging. Desktop remains unchanged.
 
-Surface the primary PR (or latest, until PRLINK-6) as a compact, tappable affordance in the mobile task detail. Candidate placements, pick one during refinement:
+## Implementation order
 
-1. **Next to the title in the mobile top bar**: a compact `#123` link after the task title, reusing `TaskPullRequestLink variant="compact"`. Cheapest; competes for the narrow title space.
-2. **In `MobileDetailTabBar`**: a trailing icon button (`GitPullRequest`, 44px touch target via `MOBILE_TOUCH_TARGET`) that opens the PR in a new tab when there is one PR, or a small popover listing all PRs when there are several. Same popover can host the "Link PR" and Refresh actions so mobile gets the PRLINK-5 manual management too.
-3. **A header strip above the chat panel** when the task has PRs: one line with the primary PR and a "+N" for the rest. Most discoverable; uses vertical space in a chat-first layout.
+1. Adapt existing manager trigger/mobile sizing and primary anchor hit area.
+2. Render the trailing controls in MobileDetailTabBar using current task/workspace scope.
+3. Add pending/error feedback and task-change reset without creating a second PR state cache.
+4. Verify the phone layouts and desktop regressions.
 
-Recommendation: option 2 for the link and management popover, so the title area is untouched and the touch target is correct.
+## Verification and acceptance
 
-## Implementation notes
+- Mobile tests: zero/one/multiple PRs, primary link, no workspaceId, Add/Remove/set/clear/Refresh.
+- Anchor is an external link; management remains a button for every count; touch/click does not
+  trigger navigation/drag/tab changes.
+- Pending mutation double-tap prevention, error feedback, task switch during an in-flight request.
+- Keyboard/focus and phone-width checks at 320/360/390 px with long names and 20 entries.
+- Desktop top bar/manager still render and behave normally.
 
-- Reuse `TaskPullRequestLink` and `TaskPullRequestManager`; do not fork them. The manager's popover must be checked at phone width (it is `w-72`) and in a Radix Portal so it is not clipped by the tab bar.
-- Touch targets: follow `MOBILE_TOUCH_TARGET` (`min-w-[44px] min-h-[44px]`) from `top-bar.tsx`. Links need adequate hit areas, since the desktop link is a 12px text link.
-- The anchor already stops `mousedown`/`click` propagation; confirm that touch events (`onTouchStart`) do not trigger card drag or a tab switch.
-- `workspaceId` and `selectedTaskPullRequests` are already threaded from `App.tsx` into `TopBar`; the mobile placement needs the same two values in `CardDetailView`. Prefer passing the `RuntimeBoardCard`'s `pullRequests` rather than adding another prop chain.
-- No server change.
-
-## Tests
-
-- `card-detail-view.test.tsx` (mobile via the existing `useIsMobile` mock): PR affordance renders when the card has PRs; absent when it has none and no `workspaceId`; link opens with `target="_blank" rel="noopener noreferrer"`.
-- Popover lists all PRs with the primary first once PRLINK-6 lands.
-- Manual add from the mobile popover calls `addTaskPullRequest`.
-- Desktop rendering is unchanged (regression assertion in `top-bar.test.tsx`).
-
-## Acceptance
-
-- On a phone-width viewport, opening a task with a recorded PR shows a one-tap path to the PR, and a task with none shows a way to link one.
-- No horizontal overflow at 360px wide.
-
-## Open questions
-
-1. Placement (1, 2 or 3 above)?
-2. Should the mobile popover include Refresh, or is manual add/remove enough on mobile?
+A user can open the displayed PR directly and manage all links from either mobile panel,
+without changing the title layout or losing Chat/Diff access.
+Follow the shared verification/deployment rules in PRLINK-FOLLOWUPS.md.
