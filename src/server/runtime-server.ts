@@ -29,6 +29,8 @@ import {
 	getKanbanRuntimeTls,
 	isKanbanRemoteHost,
 } from "../core/runtime-endpoint";
+import { createPrCommentAutomationService } from "../pr-tracking/comment-automation-service";
+import { createGitHubPrClient, resolveGitHubAccessScopeId } from "../pr-tracking/github-pr-client";
 import {
 	checkRateLimit,
 	clearRateLimit,
@@ -41,13 +43,13 @@ import {
 	validatePasscode,
 	validateSession,
 } from "../security/passcode-manager";
-import { loadWorkspaceContextById } from "../state/workspace-state";
+import { loadWorkspaceContextById, loadWorkspaceState } from "../state/workspace-state";
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { createTerminalWebSocketBridge } from "../terminal/ws-server";
 import { type RuntimeTrpcContext, type RuntimeTrpcWorkspaceScope, runtimeAppRouter } from "../trpc/app-router";
 import { createHooksApi } from "../trpc/hooks-api";
 import { createProjectsApi } from "../trpc/projects-api";
-import { createRuntimeApi } from "../trpc/runtime-api";
+import { createRuntimeApi, createTaskChatMessageSender } from "../trpc/runtime-api";
 import { createWorkspaceApi } from "../trpc/workspace-api";
 import { getWebUiDir, normalizeRequestPath, readAsset } from "./assets";
 import { handleHttpRequest, handleSocketUpgrade } from "./middleware";
@@ -262,6 +264,47 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		deps.workspaceRegistry.clearActiveWorkspace();
 	};
 
+	// COMMENT-0: the runtime-wide PR comment-handling observer. Reconciles
+	// durable tracking records on startup and polls subscribed PRs on a
+	// jittered ~60s cadence; it never blocks startup or dispatch.
+	let accessScopePromise: Promise<string> | null = null;
+	const resolveAccessScopeId = (): Promise<string> => {
+		if (!accessScopePromise) {
+			accessScopePromise = resolveGitHubAccessScopeId().catch((error: unknown) => {
+				accessScopePromise = null;
+				throw error;
+			});
+		}
+		return accessScopePromise;
+	};
+	const prCommentAutomationService = createPrCommentAutomationService({
+		listManagedWorkspaces: () =>
+			deps.workspaceRegistry
+				.listManagedWorkspaces()
+				.filter(
+					(
+						workspace,
+					): workspace is {
+						workspaceId: string;
+						workspacePath: string;
+						terminalManager: TerminalSessionManager;
+					} => workspace.workspacePath !== null,
+				)
+				.map((workspace) => ({ workspaceId: workspace.workspaceId, workspacePath: workspace.workspacePath })),
+		loadWorkspaceState: (workspacePath) => loadWorkspaceState(workspacePath),
+		getClineTaskSessionService: getScopedClineTaskSessionService,
+		getTerminalManager: getScopedTerminalManager,
+		sendTaskChatMessage: createTaskChatMessageSender({
+			getScopedClineTaskSessionService,
+			broadcastTaskChatCleared: deps.runtimeStateHub.broadcastTaskChatCleared,
+			resolveClineLaunchConfig: () => clineProviderService.resolveLaunchConfig(),
+		}),
+		getGitHubAccessScopeId: resolveAccessScopeId,
+		ghClient: createGitHubPrClient(),
+		warn: (message) => deps.warn(`[pr-comment-automation] ${message}`),
+	});
+	prCommentAutomationService.start();
+
 	// B-9: shared by per-request contexts and the post-startup reconciliation pass.
 	const buildRuntimeApi = () =>
 		createRuntimeApi({
@@ -281,6 +324,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			getUpdateStatus: deps.getUpdateStatus,
 			runUpdateNow: deps.runUpdateNow,
 			broadcastRuntimeWorkspaceStateUpdated: deps.runtimeStateHub.broadcastRuntimeWorkspaceStateUpdated,
+			getPrCommentAutomationService: () => prCommentAutomationService,
 			warnTaskDispatchError: (error) => {
 				deps.warn(`[task-dispatch] Queue pass failed: ${error instanceof Error ? error.message : String(error)}`);
 			},
@@ -307,6 +351,15 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 							`[task-dispatch] Queue pass after board save failed for ${dispatchScope.workspaceId}: ${
 								error instanceof Error ? error.message : String(error)
 							}`,
+						);
+					});
+				},
+				// COMMENT-0: board saves can add/remove/enable PR comment
+				// subscriptions; refresh immediately (fire-and-forget).
+				refreshPrCommentTracking: (refreshScope) => {
+					void prCommentAutomationService.refreshWorkspace(refreshScope).catch((error) => {
+						deps.warn(
+							`[pr-comment-automation] Refresh failed for ${refreshScope.workspaceId}: ${error instanceof Error ? error.message : String(error)}`,
 						);
 					});
 				},
@@ -617,6 +670,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		url,
 		close: async () => {
 			await startupMaintenance;
+			prCommentAutomationService.dispose();
 			await Promise.all(
 				Array.from(clineTaskSessionServiceByWorkspaceId.values()).map(async (service) => {
 					await service.dispose();

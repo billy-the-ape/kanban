@@ -3,6 +3,7 @@ import { Link, Plus, RefreshCw, X } from "lucide-react";
 import { useState } from "react";
 
 import { showAppToast } from "@/components/app-toaster";
+import { TaskPrCommentHandlingPanel } from "@/components/task-pr-comment-handling-panel";
 import { TaskPullRequestLink } from "@/components/task-pull-request-link";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
@@ -232,6 +233,8 @@ export function TaskPullRequestManager({ workspaceId, taskId, pullRequests }: Ta
 					>
 						{refreshing ? "Refreshing" : "Refresh"}
 					</Button>
+					<div className="h-px bg-border" />
+					<TaskPrCommentHandlingPanel workspaceId={workspaceId} taskId={taskId} pullRequests={pullRequests} />
 				</RadixPopover.Content>
 			</RadixPopover.Portal>
 		</RadixPopover.Root>

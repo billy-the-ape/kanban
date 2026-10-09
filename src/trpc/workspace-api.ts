@@ -70,6 +70,8 @@ export interface CreateWorkspaceApiDependencies {
 	buildWorkspaceStateSnapshot: (workspaceId: string, workspacePath: string) => Promise<RuntimeWorkspaceStateResponse>;
 	/** B-9.2: fire-and-forget queue pass after a board save (a card may have just reached Done). */
 	runTaskDispatchPass?: (scope: { workspaceId: string; workspacePath: string }) => void;
+	/** COMMENT-0: fire-and-forget PR comment-tracking subscription refresh after a board save. */
+	refreshPrCommentTracking?: (scope: { workspaceId: string; workspacePath: string }) => void;
 }
 
 function normalizeOptionalTaskWorkspaceScopeInput(
@@ -454,6 +456,12 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 				// B-9.2: a board save is the trigger that moves a card to Done;
 				// the pass itself is locked and a no-op unless dispatch is enabled.
 				deps.runTaskDispatchPass?.({
+					workspaceId: workspaceScope.workspaceId,
+					workspacePath: workspaceScope.workspacePath,
+				});
+				// COMMENT-0: board edits can add/remove/enable PR comment
+				// subscriptions; refresh immediately (fire-and-forget).
+				deps.refreshPrCommentTracking?.({
 					workspaceId: workspaceScope.workspaceId,
 					workspacePath: workspaceScope.workspacePath,
 				});

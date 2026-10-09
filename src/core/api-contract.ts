@@ -209,6 +209,156 @@ export const runtimeTaskPullRequestsRefreshResponseSchema = z.object({
 });
 export type RuntimeTaskPullRequestsRefreshResponse = z.infer<typeof runtimeTaskPullRequestsRefreshResponseSchema>;
 
+// --- PR comment automation (COMMENT-0) ----------------------------------------
+
+/**
+ * Structured dedupe descriptor for an aggregate of eligible PR feedback
+ * events. Not a bare string: SHA-256 digest of the sorted event-version
+ * tokens, the latest `updatedAt` watermark, and the sorted version tokens at
+ * exactly that watermark timestamp. This is compact transport dedupe data,
+ * not per-comment fix state (see docs/plans/pr-comment-handling).
+ */
+export const runtimePrFeedbackFingerprintSchema = z.object({
+	digest: z.string(),
+	watermark: z.number().int().nonnegative(),
+	watermarkTokens: z.array(z.string()),
+});
+export type RuntimePrFeedbackFingerprint = z.infer<typeof runtimePrFeedbackFingerprintSchema>;
+
+export const runtimePrCommentDispatchStatusSchema = z.enum(["queued", "running", "completed", "failed"]);
+export type RuntimePrCommentDispatchStatus = z.infer<typeof runtimePrCommentDispatchStatusSchema>;
+
+/**
+ * One automatic comment follow-up instruction. Describes instruction
+ * execution, not proof that every comment was fixed; GitHub and the task
+ * transcript hold the substantive outcome.
+ */
+export const runtimePrCommentDispatchSchema = z.object({
+	dispatchId: z.string(),
+	/** Epoch ms when the send was provably attempted; null while unsent. */
+	attemptedAt: z.number().nullable(),
+	/** Eligible feedback aggregate captured at instruction submission. */
+	fingerprint: runtimePrFeedbackFingerprintSchema,
+	/** Ownership revision the instruction was dispatched under. */
+	ownerRevision: z.number().int().nonnegative(),
+	status: runtimePrCommentDispatchStatusSchema,
+	/** Normal session/turn reference (the accepted chat message id). */
+	turnRef: z.string().nullable(),
+	error: z.string().nullable(),
+});
+export type RuntimePrCommentDispatch = z.infer<typeof runtimePrCommentDispatchSchema>;
+
+export const runtimePrCommentOwnerSchema = z.object({
+	workspaceId: z.string(),
+	taskId: z.string(),
+	/** Ownership revision; advanced on assignment/transfer, never reset. */
+	revision: z.number().int().nonnegative(),
+});
+export type RuntimePrCommentOwner = z.infer<typeof runtimePrCommentOwnerSchema>;
+
+/**
+ * Minimal comment automation block in the PR tracking record. No comment
+ * bodies, per-item dispositions, batch ledgers, or repair-budget counters
+ * are durable fields.
+ */
+export const runtimePrCommentAutomationSchema = z.object({
+	repairOwner: runtimePrCommentOwnerSchema.nullable(),
+	pendingFeedbackFingerprint: runtimePrFeedbackFingerprintSchema.nullable(),
+	pendingCount: z.number().int().nonnegative().nullable(),
+	/** Dispatch due time: 120s after the last feedback change, capped at 600s from firstPendingAt. */
+	debounceDeadline: z.number().nullable(),
+	firstPendingAt: z.number().nullable(),
+	/** Watermark preserved when previously dispatched feedback disappears. */
+	lastDispatchedFeedbackFingerprint: runtimePrFeedbackFingerprintSchema.nullable(),
+	dispatch: runtimePrCommentDispatchSchema.nullable(),
+});
+export type RuntimePrCommentAutomation = z.infer<typeof runtimePrCommentAutomationSchema>;
+
+export const runtimePrTaskBindingSchema = z.object({
+	workspaceId: z.string(),
+	taskId: z.string(),
+	/** Terminal PR observation marker (merged/closed); no further follow-ups. */
+	terminal: z.boolean(),
+});
+export type RuntimePrTaskBinding = z.infer<typeof runtimePrTaskBindingSchema>;
+
+/**
+ * Foundation GitHub PR tracking record (schema version 1), keyed by the
+ * canonical PR identity. Stored under `<runtimeHome>/pr-tracking/prs/<sha256(key)>.json`
+ * and mutated only through revision-checked atomic updates serialized by the
+ * single tracking-registry mutex.
+ */
+export const runtimeGitHubPrTrackingRecordSchema = z.object({
+	schemaVersion: z.literal(1),
+	revision: z.number().int().nonnegative(),
+	canonicalPrKey: z.string(),
+	/** Opaque, nonsecret identifier of the active github.com credential context. */
+	accessScopeId: z.string(),
+	pr: runtimeTaskPullRequestSchema,
+	taskBindings: z.array(runtimePrTaskBindingSchema),
+	commentAutomation: runtimePrCommentAutomationSchema,
+});
+export type RuntimeGitHubPrTrackingRecord = z.infer<typeof runtimeGitHubPrTrackingRecordSchema>;
+
+// --- PR comment automation API -------------------------------------------------
+
+export const runtimeTaskPrAutomationSettingsRequestSchema = z.object({
+	taskId: z.string(),
+	autoAddressComments: z.boolean(),
+});
+export type RuntimeTaskPrAutomationSettingsRequest = z.infer<typeof runtimeTaskPrAutomationSettingsRequestSchema>;
+
+export const runtimeTaskPrAutomationSettingsResponseSchema = z.object({
+	ok: z.boolean(),
+	error: z.string().optional(),
+	autoAddressComments: z.boolean().optional(),
+});
+export type RuntimeTaskPrAutomationSettingsResponse = z.infer<typeof runtimeTaskPrAutomationSettingsResponseSchema>;
+
+export const runtimeTaskPrTrackingStateRequestSchema = z.object({
+	taskId: z.string(),
+});
+export type RuntimeTaskPrTrackingStateRequest = z.infer<typeof runtimeTaskPrTrackingStateRequestSchema>;
+
+/**
+ * Read-only view of the comment automation state for a task's linked PR:
+ * pending count/deadline from the last GitHub snapshot, dispatch status, and
+ * any visible blocker. No comment bodies are exposed.
+ */
+export const runtimeTaskPrTrackingStateSchema = z.object({
+	enabled: z.boolean(),
+	/** v1: comment automation is native Cline only. */
+	supported: z.boolean(),
+	pr: runtimeTaskPullRequestSchema.nullable(),
+	pendingCount: z.number().int().nonnegative(),
+	pendingDeadline: z.number().nullable(),
+	dispatch: runtimePrCommentDispatchSchema.nullable(),
+	blocker: z.string().nullable(),
+	/** A failed dispatch that can be resumed via "Resume comment handling". */
+	resumable: z.boolean(),
+});
+export type RuntimeTaskPrTrackingState = z.infer<typeof runtimeTaskPrTrackingStateSchema>;
+
+export const runtimeTaskPrTrackingStateResponseSchema = z.object({
+	ok: z.boolean(),
+	error: z.string().optional(),
+	state: runtimeTaskPrTrackingStateSchema,
+});
+export type RuntimeTaskPrTrackingStateResponse = z.infer<typeof runtimeTaskPrTrackingStateResponseSchema>;
+
+export const runtimeTaskPrCommentResumeRequestSchema = z.object({
+	taskId: z.string(),
+});
+export type RuntimeTaskPrCommentResumeRequest = z.infer<typeof runtimeTaskPrCommentResumeRequestSchema>;
+
+export const runtimeTaskPrCommentResumeResponseSchema = z.object({
+	ok: z.boolean(),
+	error: z.string().optional(),
+	/** True when a fresh follow-up instruction was accepted. */
+	dispatched: z.boolean(),
+});
+export type RuntimeTaskPrCommentResumeResponse = z.infer<typeof runtimeTaskPrCommentResumeResponseSchema>;
+
 export const runtimeBoardCardSchema = z
 	.object({
 		id: z.string(),
@@ -216,6 +366,13 @@ export const runtimeBoardCardSchema = z
 		prompt: z.string(),
 		startInPlanMode: z.boolean(),
 		autoReviewEnabled: z.boolean().optional(),
+		/**
+		 * Auto address PR comments (COMMENT-0): when true and a github.com PR
+		 * is linked, settled PR feedback triggers one debounced follow-up
+		 * through the task's normal agent workflow. Server-owned; missing
+		 * values normalize to false.
+		 */
+		autoAddressComments: z.boolean().optional(),
 		autoReviewMode: runtimeTaskAutoReviewModeSchema.optional(),
 		images: z.array(runtimeTaskImageSchema).optional(),
 		agentId: runtimeAgentIdSchema.optional(),

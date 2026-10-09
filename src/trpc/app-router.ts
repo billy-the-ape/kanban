@@ -93,8 +93,14 @@ import type {
 	RuntimeTaskInitialStartStatusResponse,
 	RuntimeTaskPhasesRequest,
 	RuntimeTaskPhasesResponse,
+	RuntimeTaskPrAutomationSettingsRequest,
+	RuntimeTaskPrAutomationSettingsResponse,
+	RuntimeTaskPrCommentResumeRequest,
+	RuntimeTaskPrCommentResumeResponse,
 	RuntimeTaskPreservationInfoResponse,
 	RuntimeTaskPreservationRequest,
+	RuntimeTaskPrTrackingStateRequest,
+	RuntimeTaskPrTrackingStateResponse,
 	RuntimeTaskPullRequestLinkRequest,
 	RuntimeTaskPullRequestLinkResponse,
 	RuntimeTaskPullRequestsRefreshRequest,
@@ -214,8 +220,14 @@ import {
 	runtimeTaskInitialStartStatusResponseSchema,
 	runtimeTaskPhasesRequestSchema,
 	runtimeTaskPhasesResponseSchema,
+	runtimeTaskPrAutomationSettingsRequestSchema,
+	runtimeTaskPrAutomationSettingsResponseSchema,
+	runtimeTaskPrCommentResumeRequestSchema,
+	runtimeTaskPrCommentResumeResponseSchema,
 	runtimeTaskPreservationInfoResponseSchema,
 	runtimeTaskPreservationRequestSchema,
+	runtimeTaskPrTrackingStateRequestSchema,
+	runtimeTaskPrTrackingStateResponseSchema,
 	runtimeTaskPullRequestLinkRequestSchema,
 	runtimeTaskPullRequestLinkResponseSchema,
 	runtimeTaskPullRequestsRefreshRequestSchema,
@@ -346,6 +358,19 @@ export interface RuntimeTrpcContext {
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskChatSendRequest,
 		) => Promise<RuntimeTaskChatSendResponse>;
+		// COMMENT-0: PR comment automation settings and tracking state.
+		setTaskPrAutomationSettings: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskPrAutomationSettingsRequest,
+		) => Promise<RuntimeTaskPrAutomationSettingsResponse>;
+		getTaskPrTrackingState: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskPrTrackingStateRequest,
+		) => Promise<RuntimeTaskPrTrackingStateResponse>;
+		resumeTaskPrCommentHandling: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskPrCommentResumeRequest,
+		) => Promise<RuntimeTaskPrCommentResumeResponse>;
 		reloadTaskChatSession: (
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskChatReloadRequest,
@@ -703,6 +728,25 @@ export const runtimeAppRouter = t.router({
 			.output(runtimeTaskChatSendResponseSchema)
 			.mutation(async ({ ctx, input }) => {
 				return await ctx.runtimeApi.sendTaskChatMessage(ctx.workspaceScope, input);
+			}),
+		// COMMENT-0: PR comment automation settings and tracking state.
+		setTaskPrAutomationSettings: workspaceProcedure
+			.input(runtimeTaskPrAutomationSettingsRequestSchema)
+			.output(runtimeTaskPrAutomationSettingsResponseSchema)
+			.mutation(async ({ ctx, input }) => {
+				return await ctx.runtimeApi.setTaskPrAutomationSettings(ctx.workspaceScope, input);
+			}),
+		getTaskPrTrackingState: workspaceProcedure
+			.input(runtimeTaskPrTrackingStateRequestSchema)
+			.output(runtimeTaskPrTrackingStateResponseSchema)
+			.query(async ({ ctx, input }) => {
+				return await ctx.runtimeApi.getTaskPrTrackingState(ctx.workspaceScope, input);
+			}),
+		resumeTaskPrCommentHandling: workspaceProcedure
+			.input(runtimeTaskPrCommentResumeRequestSchema)
+			.output(runtimeTaskPrCommentResumeResponseSchema)
+			.mutation(async ({ ctx, input }) => {
+				return await ctx.runtimeApi.resumeTaskPrCommentHandling(ctx.workspaceScope, input);
 			}),
 		abortTaskChatTurn: workspaceProcedure
 			.input(runtimeTaskChatAbortRequestSchema)

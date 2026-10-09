@@ -14,6 +14,7 @@ import {
 import { buildTaskContextUsage } from "../cline-sdk/cline-context-usage";
 import { createClineMcpRuntimeService } from "../cline-sdk/cline-mcp-runtime-service";
 import { createClineMcpSettingsService } from "../cline-sdk/cline-mcp-settings-service";
+import type { ResolvedClineLaunchConfig } from "../cline-sdk/cline-provider-service";
 import { createClineProviderService } from "../cline-sdk/cline-provider-service";
 import type { ClineReviewSessionService } from "../cline-sdk/cline-review-session-service";
 import { isClineClearSlashCommand } from "../cline-sdk/cline-slash-commands";
@@ -25,6 +26,8 @@ import type {
 	RuntimeEffectiveContextWindow,
 	RuntimeGitDeliveryReceipt,
 	RuntimeRunUpdateResponse,
+	RuntimeTaskChatSendRequest,
+	RuntimeTaskChatSendResponse,
 	RuntimeTaskDeliveryInfoResponse,
 	RuntimeTaskDeliveryStartResponse,
 	RuntimeTaskDiagnosticsActionResponse,
@@ -65,6 +68,9 @@ import {
 	parseTaskDiagnosticsActionRequest,
 	parseTaskDiagnosticsRequest,
 	parseTaskPhasesRequest,
+	parseTaskPrAutomationSettingsRequest,
+	parseTaskPrCommentResumeRequest,
+	parseTaskPrTrackingStateRequest,
 	parseTaskReviewInfoRequest,
 	parseTaskReviewStartRequest,
 	parseTaskSessionInputRequest,
@@ -72,11 +78,12 @@ import {
 	parseTaskSessionStopRequest,
 } from "../core/api-validation";
 import { isHomeAgentSessionId } from "../core/home-agent-session";
-import { getTaskColumnId, moveTaskToColumn } from "../core/task-board-mutations";
+import { getTaskColumnId, moveTaskToColumn, setTaskAutoAddressComments } from "../core/task-board-mutations";
 import { computeTaskPhase, isDeliveryResumable, type TaskPhaseInput } from "../core/task-diagnostics";
 import { buildTaskDiagnosticsExportBundle } from "../core/task-diagnostics-export";
 import { resolveTaskTitle } from "../core/task-title.js";
 import { lockedFileSystem } from "../fs/locked-file-system";
+import type { PrCommentAutomationService } from "../pr-tracking/comment-automation-service";
 import { openInBrowser } from "../server/browser";
 import { getRuntimeHomePath, loadWorkspaceBoardById, mutateWorkspaceState } from "../state/workspace-state";
 import { readTaskDispatchRecord, writeTaskDispatchRecord } from "../task-dispatch/dispatch-records";
@@ -129,6 +136,92 @@ export interface CreateRuntimeApiDependencies {
 	broadcastRuntimeWorkspaceStateUpdated?: (workspaceId: string, workspacePath: string) => void;
 	/** B-9: surface fire-and-forget dispatch pass failures (a missed pass is retried by the next trigger). */
 	warnTaskDispatchError?: (error: unknown) => void;
+	/** COMMENT-0: the runtime-wide comment-handling observer (optional in partial harnesses). */
+	getPrCommentAutomationService?: () => PrCommentAutomationService | null;
+}
+
+/**
+ * The reusable backend task-chat sender — the same path the browser's
+ * `sendTaskChatMessage` procedure and the COMMENT-0 automation service use.
+ */
+export function createTaskChatMessageSender(deps: {
+	getScopedClineTaskSessionService: (scope: RuntimeTrpcWorkspaceScope) => Promise<ClineTaskSessionService>;
+	broadcastTaskChatCleared?: (workspaceId: string, taskId: string) => void;
+	resolveClineLaunchConfig: () => Promise<ResolvedClineLaunchConfig>;
+}): (scope: RuntimeTrpcWorkspaceScope, body: RuntimeTaskChatSendRequest) => Promise<RuntimeTaskChatSendResponse> {
+	return async (workspaceScope, body) => {
+		try {
+			const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
+			if (isClineClearSlashCommand(body.text)) {
+				const summary = await clineTaskSessionService.clearTaskSession(body.taskId);
+				deps.broadcastTaskChatCleared?.(workspaceScope.workspaceId, body.taskId);
+				return {
+					ok: true,
+					summary,
+					message: null,
+				};
+			}
+			const requestedMode = body.mode;
+			let summary = await clineTaskSessionService.sendTaskSessionInput(
+				body.taskId,
+				body.text,
+				requestedMode,
+				body.images,
+			);
+			if (!summary) {
+				if (!isHomeAgentSessionId(body.taskId)) {
+					const reboundSummary = await clineTaskSessionService.rebindPersistedTaskSession(body.taskId);
+					if (reboundSummary) {
+						summary = await clineTaskSessionService.sendTaskSessionInput(
+							body.taskId,
+							body.text,
+							requestedMode,
+							body.images,
+						);
+					}
+					if (!summary) {
+						return {
+							ok: false,
+							summary: null,
+							error: "Task chat session is not running.",
+						};
+					}
+				} else {
+					const clineLaunchConfig = await deps.resolveClineLaunchConfig();
+					summary = await clineTaskSessionService.startTaskSession({
+						taskId: body.taskId,
+						cwd: workspaceScope.workspacePath,
+						prompt: body.text,
+						images: body.images,
+						resumeFromPersistence: true,
+						providerId: clineLaunchConfig.providerId,
+						modelId: clineLaunchConfig.modelId,
+						mode: requestedMode,
+						apiKey: clineLaunchConfig.apiKey,
+						baseUrl: clineLaunchConfig.baseUrl,
+						reasoningEffort: clineLaunchConfig.reasoningEffort,
+						contextWindowTokens: clineLaunchConfig.contextWindowTokens,
+						contextWindowSource: clineLaunchConfig.contextWindowSource,
+						compaction: buildClineCompactionConfig({ launchConfig: clineLaunchConfig }),
+						compactionSafetyMarginTokens: clineLaunchConfig.compactionSettings?.safetyMarginTokens,
+					});
+				}
+			}
+			const latestMessage = clineTaskSessionService.listMessages(body.taskId).at(-1) ?? null;
+			return {
+				ok: true,
+				summary,
+				message: latestMessage,
+			};
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			return {
+				ok: false,
+				summary: null,
+				error: message,
+			};
+		}
+	};
 }
 
 async function resolveExistingTaskCwdOrEnsure(options: {
@@ -166,6 +259,11 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		join(homedir(), ".cline", "kanban"),
 		join(homedir(), ".cline", "worktrees"),
 	] as const;
+	const sendTaskChatMessageCore = createTaskChatMessageSender({
+		getScopedClineTaskSessionService: deps.getScopedClineTaskSessionService,
+		broadcastTaskChatCleared: deps.broadcastTaskChatCleared,
+		resolveClineLaunchConfig: () => clineProviderService.resolveLaunchConfig(),
+	});
 
 	// B-2.9: the effective context window (budget override → provider-settings
 	// override → provider metadata → fallback) is diagnostic input for the
@@ -1595,78 +1693,63 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			return response;
 		},
 		sendTaskChatMessage: async (workspaceScope, input) => {
-			try {
-				const body = parseTaskChatSendRequest(input);
-				const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
-				if (isClineClearSlashCommand(body.text)) {
-					const summary = await clineTaskSessionService.clearTaskSession(body.taskId);
-					deps.broadcastTaskChatCleared?.(workspaceScope.workspaceId, body.taskId);
-					return {
-						ok: true,
-						summary,
-						message: null,
-					};
-				}
-				const requestedMode = body.mode;
-				let summary = await clineTaskSessionService.sendTaskSessionInput(
-					body.taskId,
-					body.text,
-					requestedMode,
-					body.images,
-				);
-				if (!summary) {
-					if (!isHomeAgentSessionId(body.taskId)) {
-						const reboundSummary = await clineTaskSessionService.rebindPersistedTaskSession(body.taskId);
-						if (reboundSummary) {
-							summary = await clineTaskSessionService.sendTaskSessionInput(
-								body.taskId,
-								body.text,
-								requestedMode,
-								body.images,
-							);
-						}
-						if (!summary) {
-							return {
-								ok: false,
-								summary: null,
-								error: "Task chat session is not running.",
-							};
-						}
-					} else {
-						const clineLaunchConfig = await clineProviderService.resolveLaunchConfig();
-						summary = await clineTaskSessionService.startTaskSession({
-							taskId: body.taskId,
-							cwd: workspaceScope.workspacePath,
-							prompt: body.text,
-							images: body.images,
-							resumeFromPersistence: true,
-							providerId: clineLaunchConfig.providerId,
-							modelId: clineLaunchConfig.modelId,
-							mode: requestedMode,
-							apiKey: clineLaunchConfig.apiKey,
-							baseUrl: clineLaunchConfig.baseUrl,
-							reasoningEffort: clineLaunchConfig.reasoningEffort,
-							contextWindowTokens: clineLaunchConfig.contextWindowTokens,
-							contextWindowSource: clineLaunchConfig.contextWindowSource,
-							compaction: buildClineCompactionConfig({ launchConfig: clineLaunchConfig }),
-							compactionSafetyMarginTokens: clineLaunchConfig.compactionSettings?.safetyMarginTokens,
-						});
-					}
-				}
-				const latestMessage = clineTaskSessionService.listMessages(body.taskId).at(-1) ?? null;
-				return {
-					ok: true,
-					summary,
-					message: latestMessage,
-				};
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
+			const body = parseTaskChatSendRequest(input);
+			return await sendTaskChatMessageCore(workspaceScope, body);
+		},
+		// --- COMMENT-0: PR comment automation --------------------------------
+		setTaskPrAutomationSettings: async (workspaceScope, input) => {
+			const body = parseTaskPrAutomationSettingsRequest(input);
+			const board = await loadWorkspaceBoardById(workspaceScope.workspaceId).catch(() => null);
+			if (!board || !board.columns.flatMap((column) => column.cards).some((card) => card.id === body.taskId)) {
+				return { ok: false, error: `Task "${body.taskId}" not found.` };
+			}
+			await mutateWorkspaceState(workspaceScope.workspacePath, (state) => {
+				const mutation = setTaskAutoAddressComments(state.board, body.taskId, body.autoAddressComments);
+				return { board: mutation.board, value: mutation };
+			});
+			deps.broadcastRuntimeWorkspaceStateUpdated?.(workspaceScope.workspaceId, workspaceScope.workspacePath);
+			const automationService = deps.getPrCommentAutomationService?.() ?? null;
+			if (automationService) {
+				// Subscription changes are reflected immediately (no 60s wait).
+				await automationService.refreshWorkspace(workspaceScope).catch(() => null);
+			}
+			return {
+				ok: true,
+				autoAddressComments: body.autoAddressComments,
+			};
+		},
+		getTaskPrTrackingState: async (workspaceScope, input) => {
+			const body = parseTaskPrTrackingStateRequest(input);
+			const automationService = deps.getPrCommentAutomationService?.() ?? null;
+			if (!automationService) {
 				return {
 					ok: false,
-					summary: null,
-					error: message,
+					error: "Comment tracking is not available in this runtime.",
+					state: {
+						enabled: false,
+						supported: true,
+						pr: null,
+						pendingCount: 0,
+						pendingDeadline: null,
+						dispatch: null,
+						blocker: null,
+						resumable: false,
+					},
 				};
 			}
+			return await automationService.getTaskPrTrackingState(workspaceScope, body.taskId);
+		},
+		resumeTaskPrCommentHandling: async (workspaceScope, input) => {
+			const body = parseTaskPrCommentResumeRequest(input);
+			const automationService = deps.getPrCommentAutomationService?.() ?? null;
+			if (!automationService) {
+				return {
+					ok: false,
+					error: "Comment tracking is not available in this runtime.",
+					dispatched: false,
+				};
+			}
+			return await automationService.resumeCommentHandling(workspaceScope, body.taskId);
 		},
 		startShellSession: async (workspaceScope, input) => {
 			try {

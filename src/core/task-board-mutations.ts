@@ -921,3 +921,39 @@ export function updateTaskPullRequestSnapshot(
 		updated: true,
 	};
 }
+
+// --- COMMENT-0: auto address comments preference ------------------------------
+
+export interface RuntimeSetTaskAutoAddressCommentsResult {
+	board: RuntimeBoardData;
+	task: RuntimeBoardCard | null;
+	changed: boolean;
+}
+
+/**
+ * Sets the server-owned `autoAddressComments` preference on a card. Missing
+ * values normalize to false; an unchanged preference is a no-op so repeated
+ * saves do not bump the workspace revision.
+ */
+export function setTaskAutoAddressComments(
+	board: RuntimeBoardData,
+	taskId: string,
+	enabled: boolean,
+	now: number = Date.now(),
+): RuntimeSetTaskAutoAddressCommentsResult {
+	const normalizedTaskId = taskId.trim();
+	const found = normalizedTaskId ? findTaskLocation(board, normalizedTaskId) : null;
+	if (!found) {
+		return { board, task: null, changed: false };
+	}
+	const task = found.task;
+	if ((task.autoAddressComments === true) === enabled) {
+		return { board, task, changed: false };
+	}
+	const nextTask: RuntimeBoardCard = { ...task, autoAddressComments: enabled, updatedAt: now };
+	return {
+		board: replaceTaskCard(board, normalizedTaskId, nextTask),
+		task: nextTask,
+		changed: true,
+	};
+}

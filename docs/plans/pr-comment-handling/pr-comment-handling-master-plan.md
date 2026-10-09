@@ -1,6 +1,6 @@
 # PR comment handling — master plan
 
-Updated: 2026-10-06. Status: proposed; documentation only. Repository: `billy-the-ape/kanban`.
+Updated: 2026-10-09. Status: COMMENT-0 implemented (see "Implementation status" below). Repository: `billy-the-ape/kanban`.
 
 ## Goal and dependencies
 
@@ -183,6 +183,64 @@ Implement in this order: consume foundation snapshots → compute aggregate/dead
 queued intent → dispatch through normal chat continuation → record turn acceptance/outcome →
 wire task detail diagnostics/resume → run the tests below. No task breakout documents are
 created here; the user's agent will create them using this boundary.
+
+## Implementation status (COMMENT-0)
+
+Implemented in this repository, all green under `vitest run`, `tsc --noEmit` (root and web-ui)
+and Biome checks:
+
+- `src/pr-tracking/feedback-fingerprint.ts` — normalizes eligible feedback events and computes
+  the deterministic aggregate (SHA-256 digest, newest-watermark ms, sorted provider-id token
+  set). A dispatch watermark removes its own token set from later aggregates, so deletion or
+  resolution of already-dispatched feedback never requeues it.
+- `src/pr-tracking/github-pr-client.ts` — read-only `gh` client: PR metadata plus complete
+  pagination (`per_page=100`, capped at 20 pages per source) of reviews, inline review comments
+  and PR conversation comments, plus GraphQL resolved-thread filtering. Eligibility applies the
+  fixed policy: published, non-empty, unresolved, non-bot conversation chatter. Per-source
+  pagination failure marks the snapshot incomplete (dispatch waits); non-`github.com` hosts and
+  missing/failed credential resolution surface visible errors without partial dispatch.
+- `src/pr-tracking/pr-record-store.ts` — durable PR tracking records under
+  `~/.cline/kanban/pr-tracking/prs/<sha256(canonicalKey)>.json` with atomic writes, load-time
+  identity validation, exactly-one revision advancement per accepted update and no-op writes
+  that never touch the file.
+- `src/pr-tracking/comment-automation-service.ts` — `applyPrPollOutcome` (task bindings,
+  owner selection/blocking, 120s quiet deadline capped at 600s, pending tracking, sticky failed
+  dispatch, queued-intent cancellation on disable/terminal observation while in-flight and
+  failed dispatches survive), `getTaskPrTrackingState` (neutral / enabled / blocked /
+  unsupported), `resumeCommentHandling` (one-shot resume of a failed dispatch; clears the
+  failure without sending when no eligible feedback remains), and dispatch through the normal
+  backend `sendTaskChatMessage` in `act` mode with the exact fixed instruction.
+  `reconcileRestartedDispatches` runs at service startup and resolves recorded in-flight
+  dispatches from their normal turn reference without re-running the prompt.
+- Contract and mutations: `autoAddressComments` (optional, default false) on
+  `runtimeTaskCardSchema`; `runtimeTaskPullRequestSchema` with `lastSyncedAt`/`stateCheckedAt`;
+  `RuntimePrTrackingRecord`, `RuntimePrCommentAutomation`, `RuntimePrCommentDispatch`,
+  `RuntimePrFeedbackFingerprint`, `RuntimeTaskPrTrackingState` and
+  `RuntimePrCommentDispatchResult`. `validateTaskCardMutation` and
+  `applyTaskBoardMutation` preserve the flag and PR links.
+- Server: `workspaceStateCache.getTaskPrTrackingState`,
+  `workspaceStateMutations.setTaskAutoAddressComments` (triggers a 30s post-commit PR poll),
+  `workspaceStateMutations.resumePrCommentHandling`; runtime TRPC endpoints
+  `getTaskPrTrackingState`, `setTaskAutoAddressComments`, `resumePrCommentHandling`; the
+  runtime server injects the service with an `updateTaskRecord` hook that persists card
+  changes, syncs the board and refreshes the PR record after every accepted poll outcome.
+- UI: `web-ui/src/hooks/use-task-pr-tracking-state.ts` (polls state, exposes toggle/resume
+  actions) and `web-ui/src/components/task-pr-comment-handling-panel.tsx` (toggle with
+  enabled/neutral/blocked/unsupported state, pending count and quiet-time countdown, dispatch
+  status, failed state with the concise error, Resume button, incomplete-snapshot and auth
+  blockers), wired into the task detail's PR manager.
+- Tests: `test/runtime/pr-tracking/` — `feedback-fingerprint.test.ts`,
+  `pr-record-store.test.ts`, `comment-automation-service.test.ts`
+  (`applyPrPollOutcome` semantics plus service state/resume/dispatch behavior with injected
+  dependencies) and `github-pr-client.test.ts` (eligibility, completeness, pagination and
+  access-scope errors via an injected command runner).
+
+Documented v1 deviations: a terminal PR observation cancels queued dispatch but keeps the owner
+held until its candidate is no longer enabled; dispatch waits for conflicting writers before
+sending (the normal send path provides model-queue admission) but does not yet gate on
+repository-wide merge quiescence (merge consumer is a separate plan); restart reconciliation
+covers recorded running dispatches via their turn reference, and unknown outcomes stay failed
+with the visible Resume requirement.
 
 ## Verification and rollout
 

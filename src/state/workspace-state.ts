@@ -6,10 +6,10 @@ import { basename, join, resolve } from "node:path";
 import { z } from "zod";
 
 import {
+	type RuntimeBoardCard,
 	type RuntimeBoardColumnId,
 	type RuntimeBoardData,
 	type RuntimeGitRepositoryInfo,
-	type RuntimeTaskPullRequest,
 	type RuntimeTaskSessionSummary,
 	type RuntimeWorkspaceStateResponse,
 	type RuntimeWorkspaceStateSaveRequest,
@@ -685,22 +685,20 @@ export async function loadWorkspaceState(cwd: string): Promise<RuntimeWorkspaceS
 }
 
 /**
- * Server-owned card field — the one documented exception to "the client
- * owns the board": `pullRequests` are recorded by the runtime (tool-call
- * detection, deterministic delivery, branch lookup, manual add). A client
- * save built from a stale board must never erase or forge them, so the
- * persisted list replaces any client-supplied value for existing cards,
- * and new cards never accept `pullRequests` from create input. All PR
- * link writes go through `mutateWorkspaceState` + the PR board mutations.
+ * Server-owned card fields — documented exceptions to "the client owns the
+ * board": `pullRequests` are recorded by the runtime (tool-call detection,
+ * deterministic delivery, branch lookup, manual add), and
+ * `autoAddressComments` (COMMENT-0) is set through the dedicated
+ * revision-checked mutation. A client save built from a stale board must
+ * never erase or forge either, so the persisted values replace any
+ * client-supplied value for existing cards, and new cards never accept them
+ * from create input.
  */
-function mergeServerOwnedPullRequests(
-	clientBoard: RuntimeBoardData,
-	persistedBoard: RuntimeBoardData,
-): RuntimeBoardData {
-	const persistedByTaskId = new Map<string, RuntimeTaskPullRequest[] | undefined>();
+function mergeServerOwnedCardFields(clientBoard: RuntimeBoardData, persistedBoard: RuntimeBoardData): RuntimeBoardData {
+	const persistedByTaskId = new Map<string, RuntimeBoardCard>();
 	for (const column of persistedBoard.columns) {
 		for (const card of column.cards) {
-			persistedByTaskId.set(card.id, card.pullRequests);
+			persistedByTaskId.set(card.id, card);
 		}
 	}
 	return {
@@ -709,14 +707,19 @@ function mergeServerOwnedPullRequests(
 			...column,
 			cards: column.cards.map((card) => {
 				const persisted = persistedByTaskId.get(card.id);
-				if (persisted !== undefined) {
-					return { ...card, pullRequests: persisted.map((pullRequest) => ({ ...pullRequest })) };
-				}
-				if (card.pullRequests === undefined) {
-					return card;
+				if (persisted) {
+					return {
+						...card,
+						pullRequests:
+							persisted.pullRequests === undefined
+								? undefined
+								: persisted.pullRequests.map((pullRequest) => ({ ...pullRequest })),
+						autoAddressComments: persisted.autoAddressComments,
+					};
 				}
 				const mergedCard = { ...card };
 				delete mergedCard.pullRequests;
+				delete mergedCard.autoAddressComments;
 				return mergedCard;
 			}),
 		})),
@@ -741,7 +744,7 @@ export async function saveWorkspaceState(
 		) {
 			throw new WorkspaceStateConflictError(expectedRevision, currentMeta.revision);
 		}
-		const board = mergeServerOwnedPullRequests(parsedPayload.board, await readWorkspaceBoard(context.workspaceId));
+		const board = mergeServerOwnedCardFields(parsedPayload.board, await readWorkspaceBoard(context.workspaceId));
 		const sessions = parsedPayload.sessions;
 		const nextRevision = currentMeta.revision + 1;
 		const nextMeta: WorkspaceStateMeta = {
