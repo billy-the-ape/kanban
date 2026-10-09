@@ -1,6 +1,6 @@
 # PR comment handling — master plan
 
-Updated: 2026-10-06. Status: proposed; documentation only. Repository: `billy-the-ape/kanban`.
+Updated: 2026-10-09. Status: COMMENT-0 implemented (see "Implementation status" below). Repository: `billy-the-ape/kanban`.
 
 ## Goal and dependencies
 
@@ -184,6 +184,71 @@ queued intent → dispatch through normal chat continuation → record turn acce
 wire task detail diagnostics/resume → run the tests below. No task breakout documents are
 created here; the user's agent will create them using this boundary.
 
+## Implementation status (COMMENT-0)
+
+Implemented in this repository, all green under `vitest run`, `tsc --noEmit` (root and web-ui)
+and Biome checks:
+
+- `src/pr-tracking/feedback-fingerprint.ts` — normalizes eligible feedback events and computes
+  the deterministic aggregate (SHA-256 digest, newest-watermark ms, sorted provider-id token
+  set). A dispatch watermark removes its own token set from later aggregates, so deletion or
+  resolution of already-dispatched feedback never requeues it.
+- `src/pr-tracking/github-pr-client.ts` — read-only `gh` client: PR metadata plus complete
+  pagination (`per_page=100`, capped at 20 pages per source) of reviews, inline review comments
+  and PR conversation comments, plus GraphQL resolved-thread filtering. Eligibility applies the
+  fixed policy: published, non-empty, unresolved, non-bot conversation chatter. Per-source
+  pagination failure marks the snapshot incomplete (dispatch waits); non-`github.com` hosts and
+  missing/failed credential resolution surface visible errors without partial dispatch.
+- `src/pr-tracking/pr-record-store.ts` — durable PR tracking records under
+  `~/.cline/kanban/pr-tracking/prs/<sha256(canonicalKey)>.json` with atomic writes, load-time
+  identity validation, exactly-one revision advancement per accepted update and no-op writes
+  that never touch the file.
+- `src/pr-tracking/comment-automation-service.ts` — `applyPrPollOutcome` (task bindings,
+  owner selection/blocking, 120s quiet deadline capped at 600s, pending tracking,
+  queued-intent creation on the first pending observation, sticky failed dispatch,
+  queued-intent cancellation on disable/terminal observation while in-flight and
+  failed dispatches survive), `getTaskPrTrackingState` (neutral / enabled / blocked /
+  unsupported), `resumeCommentHandling` (one-shot resume of a failed dispatch; clears the
+  failure without sending when no eligible feedback remains), and dispatch through the normal
+  backend `sendTaskChatMessage` in `act` mode with the exact fixed instruction.
+  `reconcileRestartedDispatches` runs at service startup and resolves recorded in-flight
+  dispatches from their normal turn reference without re-running the prompt.
+  `runTick` awaits polls before settles so settle always sees the freshest record, and
+  per-subscription in-flight flags keep overlapping ticks from double-polling or
+  double-sending; `settleDispatch` treats `null`/`completed` dispatches with a due
+  deadline as dispatchable in addition to queued intents, and returns early when no
+  deadline is scheduled (no pending feedback) so idle subscriptions never trigger gh
+  API fetches from the settle path.
+- Contract and mutations: `autoAddressComments` (optional, default false) on
+  `runtimeTaskCardSchema`; `runtimeTaskPullRequestSchema` with `lastSyncedAt`/`stateCheckedAt`;
+  `RuntimePrTrackingRecord`, `RuntimePrCommentAutomation`, `RuntimePrCommentDispatch`,
+  `RuntimePrFeedbackFingerprint`, `RuntimeTaskPrTrackingState` and
+  `RuntimePrCommentDispatchResult`. `validateTaskCardMutation` and
+  `applyTaskBoardMutation` preserve the flag and PR links.
+- Server: `workspaceStateCache.getTaskPrTrackingState`,
+  `workspaceStateMutations.setTaskAutoAddressComments` (triggers a 30s post-commit PR poll),
+  `workspaceStateMutations.resumePrCommentHandling`; runtime TRPC endpoints
+  `getTaskPrTrackingState`, `setTaskAutoAddressComments`, `resumePrCommentHandling`; the
+  runtime server injects the service with an `updateTaskRecord` hook that persists card
+  changes, syncs the board and refreshes the PR record after every accepted poll outcome.
+- UI: `web-ui/src/hooks/use-task-pr-tracking-state.ts` (polls state, exposes toggle/resume
+  actions) and `web-ui/src/components/task-pr-comment-handling-panel.tsx` (toggle with
+  enabled/neutral/blocked/unsupported state, pending count and quiet-time countdown, dispatch
+  status, failed state with the concise error, Resume button, incomplete-snapshot and auth
+  blockers), wired into the task detail's PR manager.
+- Tests: `test/runtime/pr-tracking/` — `feedback-fingerprint.test.ts`,
+  `pr-record-store.test.ts`, `comment-automation-service.test.ts`
+  (`applyPrPollOutcome` semantics plus service state/resume/dispatch behavior with injected
+  dependencies) and `github-pr-client.test.ts` (eligibility, completeness, pagination and
+  access-scope errors via an injected command runner).
+
+Documented v1 deviations: a terminal PR observation cancels queued dispatch but keeps the owner
+held until its candidate is no longer enabled; dispatch waits for conflicting writers before
+sending (the normal send path provides model-queue admission) but does not yet gate on
+repository-wide merge quiescence (merge consumer is a separate plan); restart reconciliation
+covers recorded running dispatches via their turn reference, and unknown outcomes stay failed
+with the visible Resume requirement.
+
 ## Verification and rollout
 
 - Multiple new/edited comments reset quiet time; duplicate polls do not; max wait and partial
@@ -208,3 +273,20 @@ permissions in implementation PRs; pilot one task before expanding.
 
 After actual service/device changes, update `billy-the-ape/homelab-documentation` through a
 Ready for Review PR with deployed configuration, storage, permissions and rollback.
+
+
+## PR 71 conflict reconciliation
+
+PR 71 originally branched before PRTRACK-0, PRTRACK-1, and MERGE-1 reached
+`main`. Its independently implemented COMMENT-0 record schema is incompatible
+with the shared tracking foundation record. This conflict resolution preserves
+both implementations: shared records remain in `pr-tracking/prs`, while COMMENT-0
+records use `pr-tracking/comments` through `pr-comment-record-store.ts`. Neither
+consumer may overwrite the other's record for the same canonical PR identity.
+The COMMENT-0 settings endpoint delegates to the shared PR settings mutation,
+including its revision; board-change broadcasts refresh both subscription paths.
+
+This is coexistence, not migration to a single coordinator: COMMENT-0 retains its
+existing observer and detail panel. Integrating that observer with the shared
+consumer registry, record schema, and reservation lifecycle remains separate work.
+No new environment variables or manual data migration are required for this PR.

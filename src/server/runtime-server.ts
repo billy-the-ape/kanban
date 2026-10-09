@@ -31,6 +31,8 @@ import {
 	isKanbanRemoteHost,
 } from "../core/runtime-endpoint";
 import { completeTaskAndGetReadyLinkedTaskIds } from "../core/task-board-mutations";
+import { createPrCommentAutomationService } from "../pr-tracking/comment-automation-service";
+import { createGitHubPrClient, resolveGitHubAccessScopeId } from "../pr-tracking/github-pr-client";
 import { PrConsumerRegistry } from "../pr-tracking/pr-consumer-registry";
 import { defaultInspectWorktree, registerMergeCompletionConsumer } from "../pr-tracking/pr-merge-completion";
 import { findTaskCard, resolveCardAutomationPrKey } from "../pr-tracking/pr-owner-selection";
@@ -62,7 +64,7 @@ import { type RuntimeTrpcContext, type RuntimeTrpcWorkspaceScope, runtimeAppRout
 import { createHooksApi } from "../trpc/hooks-api";
 import { createPrTrackingApi } from "../trpc/pr-tracking-api";
 import { createProjectsApi } from "../trpc/projects-api";
-import { createRuntimeApi } from "../trpc/runtime-api";
+import { createRuntimeApi, createTaskChatMessageSender } from "../trpc/runtime-api";
 import { createWorkspaceApi } from "../trpc/workspace-api";
 import { resolveTaskCwd } from "../workspace/task-worktree";
 import { getWebUiDir, normalizeRequestPath, readAsset } from "./assets";
@@ -278,6 +280,46 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		deps.workspaceRegistry.clearActiveWorkspace();
 	};
 
+	// COMMENT-0: the runtime-wide PR comment-handling observer. Reconciles
+	// durable tracking records on startup and polls subscribed PRs on a
+	// jittered ~60s cadence; it never blocks startup or dispatch.
+	let accessScopePromise: Promise<string> | null = null;
+	const resolveAccessScopeId = (): Promise<string> => {
+		if (!accessScopePromise) {
+			accessScopePromise = resolveGitHubAccessScopeId().catch((error: unknown) => {
+				accessScopePromise = null;
+				throw error;
+			});
+		}
+		return accessScopePromise;
+	};
+	const prCommentAutomationService = createPrCommentAutomationService({
+		listManagedWorkspaces: () =>
+			deps.workspaceRegistry
+				.listManagedWorkspaces()
+				.filter(
+					(
+						workspace,
+					): workspace is {
+						workspaceId: string;
+						workspacePath: string;
+						terminalManager: TerminalSessionManager;
+					} => workspace.workspacePath !== null,
+				)
+				.map((workspace) => ({ workspaceId: workspace.workspaceId, workspacePath: workspace.workspacePath })),
+		loadWorkspaceState: (workspacePath) => loadWorkspaceState(workspacePath),
+		getClineTaskSessionService: getScopedClineTaskSessionService,
+		getTerminalManager: getScopedTerminalManager,
+		sendTaskChatMessage: createTaskChatMessageSender({
+			getScopedClineTaskSessionService,
+			broadcastTaskChatCleared: deps.runtimeStateHub.broadcastTaskChatCleared,
+			resolveClineLaunchConfig: () => clineProviderService.resolveLaunchConfig(),
+		}),
+		getGitHubAccessScopeId: resolveAccessScopeId,
+		ghClient: createGitHubPrClient(),
+		warn: (message) => deps.warn(`[pr-comment-automation] ${message}`),
+	});
+	prCommentAutomationService.start();
 	// PRTRACK-1: runtime-wide PR tracking state (coordinator + durable record
 	// store + consumer registry). One coordinator serves every workspace; the
 	// trpc API and board-save reconciliation share these singletons.
@@ -347,6 +389,9 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 	 * task-derived subscription demand. Coalesced through the shared pass.
 	 */
 	const broadcastRuntimeWorkspaceStateUpdatedWithReconcile = (workspaceId: string, workspacePath: string) => {
+		void prCommentAutomationService.refreshWorkspace({ workspaceId, workspacePath }).catch((error) => {
+			deps.warn(`[pr-comment-automation] Refresh after board broadcast failed: ${String(error)}`);
+		});
 		void runPrTrackingReconcilePassShared().catch((error) => {
 			deps.warn(
 				`[pr-tracking] Reconcile pass after workspace broadcast failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -509,6 +554,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			getUpdateStatus: deps.getUpdateStatus,
 			runUpdateNow: deps.runUpdateNow,
 			broadcastRuntimeWorkspaceStateUpdated: broadcastRuntimeWorkspaceStateUpdatedWithReconcile,
+			getPrCommentAutomationService: () => prCommentAutomationService,
 			warnTaskDispatchError: (error) => {
 				deps.warn(`[task-dispatch] Queue pass failed: ${error instanceof Error ? error.message : String(error)}`);
 			},
@@ -574,6 +620,15 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 							`[task-dispatch] Queue pass after board save failed for ${dispatchScope.workspaceId}: ${
 								error instanceof Error ? error.message : String(error)
 							}`,
+						);
+					});
+				},
+				// COMMENT-0: board saves can add/remove/enable PR comment
+				// subscriptions; refresh immediately (fire-and-forget).
+				refreshPrCommentTracking: (refreshScope) => {
+					void prCommentAutomationService.refreshWorkspace(refreshScope).catch((error) => {
+						deps.warn(
+							`[pr-comment-automation] Refresh failed for ${refreshScope.workspaceId}: ${error instanceof Error ? error.message : String(error)}`,
 						);
 					});
 				},
@@ -944,6 +999,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		url,
 		close: async () => {
 			await startupMaintenance;
+			prCommentAutomationService.dispose();
 			await Promise.all(
 				Array.from(clineTaskSessionServiceByWorkspaceId.values()).map(async (service) => {
 					await service.dispose();

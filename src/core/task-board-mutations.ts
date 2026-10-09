@@ -1106,3 +1106,18 @@ export function setTaskSelectedAutomationPr(
 		selectedAutomationPrKey: nextTask.selectedAutomationPrKey ?? null,
 	};
 }
+
+/** COMMENT-0 compatibility endpoint uses the shared PR settings revision. */
+export function setTaskAutoAddressComments(
+	board: RuntimeBoardData,
+	taskId: string,
+	enabled: boolean,
+	now: number = Date.now(),
+): { board: RuntimeBoardData; task: RuntimeBoardCard | null; changed: boolean } {
+	const task = findTaskLocation(board, taskId.trim())?.task;
+	if (!task || (task.autoAddressComments === true) === enabled) {
+		return { board, task: task ?? null, changed: false };
+	}
+	const result = updateTaskPrSettings(board, taskId, { autoAddressComments: enabled }, now);
+	return { board: result.board, task: result.task, changed: result.updated };
+}
