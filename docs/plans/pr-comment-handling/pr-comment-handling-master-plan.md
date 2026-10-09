@@ -271,3 +271,20 @@ permissions in implementation PRs; pilot one task before expanding.
 
 After actual service/device changes, update `billy-the-ape/homelab-documentation` through a
 Ready for Review PR with deployed configuration, storage, permissions and rollback.
+
+
+## PR 71 conflict reconciliation
+
+PR 71 originally branched before PRTRACK-0, PRTRACK-1, and MERGE-1 reached
+`main`. Its independently implemented COMMENT-0 record schema is incompatible
+with the shared tracking foundation record. This conflict resolution preserves
+both implementations: shared records remain in `pr-tracking/prs`, while COMMENT-0
+records use `pr-tracking/comments` through `pr-comment-record-store.ts`. Neither
+consumer may overwrite the other's record for the same canonical PR identity.
+The COMMENT-0 settings endpoint delegates to the shared PR settings mutation,
+including its revision; board-change broadcasts refresh both subscription paths.
+
+This is coexistence, not migration to a single coordinator: COMMENT-0 retains its
+existing observer and detail panel. Integrating that observer with the shared
+consumer registry, record schema, and reservation lifecycle remains separate work.
+No new environment variables or manual data migration are required for this PR.

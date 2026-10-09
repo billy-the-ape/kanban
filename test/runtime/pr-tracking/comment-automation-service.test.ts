@@ -22,7 +22,7 @@ import {
 	createInitialPrTrackingRecord,
 	loadPrTrackingRecord,
 	upsertPrTrackingRecord,
-} from "../../../src/pr-tracking/pr-record-store";
+} from "../../../src/pr-tracking/pr-comment-record-store";
 import type { TerminalSessionManager } from "../../../src/terminal/session-manager";
 import { isolateTestEnvironment } from "../../utilities/test-environment";
 

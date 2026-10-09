@@ -7,6 +7,7 @@ import type {
 	RuntimeBoardColumnId,
 	RuntimeBoardDependency,
 	RuntimeClineReasoningEffort,
+	RuntimePrInstalledConsumer,
 	RuntimeTaskClineSettings,
 	RuntimeTaskDispatchRunResponse,
 	RuntimeWorkspaceStateResponse,
@@ -25,6 +26,8 @@ import {
 	trashTaskAndGetReadyLinkedTaskIds,
 	updateTask,
 } from "../core/task-board-mutations";
+import type { PrInstalledConsumers } from "../pr-tracking/pr-consumer-registry";
+import { evaluatePrLifecycleGate } from "../pr-tracking/pr-lifecycle-gate";
 import { resolveProjectInputPath } from "../projects/project-path";
 import { loadWorkspaceContext, mutateWorkspaceState } from "../state/workspace-state";
 import type { RuntimeAppRouter } from "../trpc/app-router";
@@ -821,6 +824,18 @@ async function completeTaskById(input: {
 	workspaceRepoPath: string;
 	runtimeClient: ReturnType<typeof createRuntimeTrpcClient>;
 }): Promise<CompleteTaskExecutionResult> {
+	// PRTRACK-1: shared lifecycle gate — legacy CLI completion must not
+	// complete a task whose linked PR workflow is owned by an installed
+	// enabled consumer. The installed-consumer list comes from the runtime
+	// server (with zero consumers installed the gate never activates).
+	const installedPrConsumers = await input.runtimeClient.runtime.getConfig
+		.query()
+		.then((config) => config.installedPrConsumers ?? [])
+		.catch((): RuntimePrInstalledConsumer[] => []);
+	const prGateInstalled: PrInstalledConsumers = {
+		comments: installedPrConsumers.some((consumer) => consumer.kind === "comments"),
+		mergeCompletion: installedPrConsumers.some((consumer) => consumer.kind === "mergeCompletion"),
+	};
 	const mutation = await mutateWorkspaceState<CompleteTaskMutationValue>(input.workspaceRepoPath, (latestState) => {
 		const latestRecord = findTaskRecord(latestState, input.taskId);
 		if (!latestRecord) {
@@ -837,6 +852,13 @@ async function completeTaskById(input: {
 				},
 				save: false,
 			};
+		}
+
+		const prLifecycleGate = evaluatePrLifecycleGate({ card: latestRecord.task, installed: prGateInstalled });
+		if (prLifecycleGate.legacyCompletionGated) {
+			throw new Error(
+				`Task "${input.taskId}" has a linked PR workflow owned by an installed PR tracking consumer; legacy completion is gated. Disable the task's PR automation settings or let the consumer complete it.`,
+			);
 		}
 
 		const completed = completeTaskAndGetReadyLinkedTaskIds(latestState.board, input.taskId);

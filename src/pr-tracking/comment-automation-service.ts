@@ -32,7 +32,7 @@ import type { TerminalSessionManager } from "../terminal/session-manager";
 import type { PrFeedbackEvent } from "./feedback-fingerprint";
 import { computePrFeedbackFingerprint, findPrFeedbackPendingEvents } from "./feedback-fingerprint";
 import type { GitHubPrClient, GitHubPrSnapshot } from "./github-pr-client";
-import { listPrTrackingRecords, loadPrTrackingRecord, upsertPrTrackingRecord } from "./pr-record-store";
+import { listPrTrackingRecords, loadPrTrackingRecord, upsertPrTrackingRecord } from "./pr-comment-record-store";
 
 export interface PrCommentAutomationWorkspaceScope {
 	workspaceId: string;

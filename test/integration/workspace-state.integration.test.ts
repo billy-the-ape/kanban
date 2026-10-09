@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import type { RuntimeBoardData, RuntimeTaskPullRequest, RuntimeTaskSessionSummary } from "../../src/core/api-contract";
-import { addTaskPullRequests } from "../../src/core/task-board-mutations";
+import { addTaskPullRequests, updateTaskPrSettings } from "../../src/core/task-board-mutations";
 import type { WorkspaceStateConflictError } from "../../src/state/workspace-state";
 import {
 	getWorkspacesRootPath,
@@ -125,6 +125,10 @@ function boardWithTaskPullRequests(
 	};
 }
 
+function findCard(board: RuntimeBoardData, taskId: string) {
+	return board.columns.flatMap((column) => column.cards).find((card) => card.id === taskId);
+}
+
 describe.sequential("workspace-state integration", () => {
 	it("persists revision numbers and rejects stale writes", async () => {
 		await withTemporaryHome(async () => {
@@ -167,6 +171,109 @@ describe.sequential("workspace-state integration", () => {
 				const loadedAfterConflict = await loadWorkspaceState(workspacePath);
 				expect(loadedAfterConflict.revision).toBe(2);
 				expect(loadedAfterConflict.board.columns[0]?.cards[0]?.prompt).toBe("Task Two");
+			} finally {
+				cleanup();
+			}
+		});
+	});
+
+	it("a stale whole-board save cannot clobber server-owned PR settings; new cards take client values", async () => {
+		await withTemporaryHome(async () => {
+			const { path: sandboxRoot, cleanup } = createTempDir("kanban-workspace-");
+			try {
+				const workspacePath = join(sandboxRoot, "project-a");
+				mkdirSync(workspacePath, { recursive: true });
+				initGitRepository(workspacePath);
+
+				const initial = await loadWorkspaceState(workspacePath);
+				// First save: a brand-new card takes the client's explicit booleans.
+				const firstBoard = createBoard("Task One");
+				const newCard = findCard(firstBoard, "task-1");
+				if (newCard === undefined) {
+					throw new Error("task-1 missing");
+				}
+				newCard.autoAddressComments = true;
+				newCard.autoFinishOnMerge = true;
+				await saveWorkspaceState(workspacePath, {
+					board: firstBoard,
+					sessions: {},
+					expectedRevision: initial.revision,
+				});
+				let loaded = await loadWorkspaceState(workspacePath);
+				let task1 = findCard(loaded.board, "task-1");
+				if (task1 === undefined) {
+					throw new Error("task-1 missing");
+				}
+				expect(task1.autoAddressComments).toBe(true);
+				expect(task1.autoFinishOnMerge).toBe(true);
+				expect(task1.settingsRevision).toBeUndefined();
+
+				// The dedicated mutation (the only settings writer) flips the
+				// checkbox and bumps the settings revision.
+				await mutateWorkspaceState<null>(workspacePath, (state) => {
+					const result = updateTaskPrSettings(state.board, "task-1", {
+						autoAddressComments: false,
+						expectedSettingsRevision: 0,
+					});
+					return { value: null, board: result.board, save: result.updated };
+				});
+				loaded = await loadWorkspaceState(workspacePath);
+				task1 = findCard(loaded.board, "task-1");
+				if (task1 === undefined) {
+					throw new Error("task-1 missing");
+				}
+				expect(task1.autoAddressComments).toBe(false);
+				expect(task1.autoFinishOnMerge).toBe(true);
+				expect(task1.settingsRevision).toBe(1);
+
+				// A stale whole-board save (client values disagree, no revision)
+				// saves board content but must not touch the settings block.
+				const staleBoard = createBoard("Stale title");
+				const staleTask1 = findCard(staleBoard, "task-1");
+				if (staleTask1 === undefined) {
+					throw new Error("task-1 missing");
+				}
+				staleTask1.autoAddressComments = true;
+				staleTask1.autoFinishOnMerge = false;
+				// A brand-new card in the same save still takes its client booleans.
+				const staleBacklog = staleBoard.columns[0];
+				if (staleBacklog === undefined) {
+					throw new Error("backlog column missing");
+				}
+				staleBacklog.cards.push({
+					id: "task-2",
+					title: "Task Two",
+					prompt: "Task Two",
+					startInPlanMode: false,
+					autoReviewEnabled: false,
+					baseRef: "main",
+					createdAt: Date.now(),
+					updatedAt: Date.now(),
+					autoAddressComments: true,
+					autoFinishOnMerge: false,
+				});
+				await saveWorkspaceState(workspacePath, {
+					board: staleBoard,
+					sessions: {},
+					expectedRevision: loaded.revision,
+				});
+
+				const afterStale = await loadWorkspaceState(workspacePath);
+				const staleTask1Loaded = findCard(afterStale.board, "task-1");
+				if (staleTask1Loaded === undefined) {
+					throw new Error("task-1 missing");
+				}
+				expect(staleTask1Loaded.title).toBe("Stale title");
+				expect(staleTask1Loaded.autoAddressComments).toBe(false);
+				expect(staleTask1Loaded.autoFinishOnMerge).toBe(true);
+				expect(staleTask1Loaded.settingsRevision).toBe(1);
+				const staleTask2 = findCard(afterStale.board, "task-2");
+				if (staleTask2 === undefined) {
+					throw new Error("task-2 missing");
+				}
+				expect(staleTask2.autoAddressComments).toBe(true);
+				expect(staleTask2.autoFinishOnMerge).toBe(false);
+				expect(staleTask2.settingsRevision).toBeUndefined();
 			} finally {
 				cleanup();
 			}

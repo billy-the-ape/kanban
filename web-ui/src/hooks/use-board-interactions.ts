@@ -11,6 +11,7 @@ import type { UseTaskSessionsResult } from "@/hooks/use-task-sessions";
 import { fetchTaskDependentsUnlock, requestTaskWorkspaceMaintenance } from "@/runtime/task-delivery";
 import { returnQueuedTaskToBacklog } from "@/runtime/task-queue";
 import type {
+	RuntimePrInstalledConsumer,
 	RuntimeTaskDependentsUnlock,
 	RuntimeTaskInitialStartStage,
 	RuntimeTaskSessionSummary,
@@ -36,6 +37,7 @@ import {
 	hasPromptedForBrowserNotificationPermission,
 	requestBrowserNotificationPermission,
 } from "@/utils/notification-permission";
+import { computePrLifecycleGatedTaskIds } from "@/utils/pr-tracking";
 
 // Clearing the Done column fires stopTaskSession + cleanupTaskWorkspace per task.
 // The tRPC client batches same-tick calls into one request, so an unbounded
@@ -94,6 +96,12 @@ interface UseBoardInteractionsInput {
 	deterministicDeliveryEnabled?: boolean;
 	/** B-9.5: backend task dispatch is enabled, so completed tasks queue their dependents for the backend queue. */
 	backendTaskDispatchEnabled?: boolean;
+	/**
+	 * PRTRACK-1: installed PR tracking consumers (from the runtime config).
+	 * Drives the lifecycle gate: tasks whose linked PR workflow is owned by an
+	 * installed enabled consumer skip legacy automatic completion.
+	 */
+	installedPrConsumers?: RuntimePrInstalledConsumer[];
 }
 
 export interface UseBoardInteractionsResult {
@@ -146,6 +154,7 @@ export function useBoardInteractions({
 	runAutoReviewGitAction,
 	deterministicDeliveryEnabled = false,
 	backendTaskDispatchEnabled = false,
+	installedPrConsumers,
 }: UseBoardInteractionsInput): UseBoardInteractionsResult {
 	const previousSessionsRef = useRef<Record<string, RuntimeTaskSessionSummary>>({});
 	const notificationPermissionPromptInFlightRef = useRef(false);
@@ -675,12 +684,25 @@ export function useBoardInteractions({
 		setRequestCompleteTaskHandler(requestCompleteTask);
 	}, [requestCompleteTask, setRequestCompleteTaskHandler]);
 
+	// PRTRACK-1: the shared lifecycle gate — legacy automatic completion is
+	// skipped for tasks whose linked PR workflow is owned by an installed
+	// enabled consumer.
+	const prCompletionGatedTaskIds = useMemo(
+		() =>
+			computePrLifecycleGatedTaskIds(board, {
+				comments: (installedPrConsumers ?? []).some((consumer) => consumer.kind === "comments"),
+				mergeCompletion: (installedPrConsumers ?? []).some((consumer) => consumer.kind === "mergeCompletion"),
+			}),
+		[board, installedPrConsumers],
+	);
+
 	useReviewAutoActions({
 		board,
 		taskGitActionLoadingByTaskId,
 		runAutoReviewGitAction,
 		requestCompleteTask: requestCompleteTaskWithAnimation,
 		completeOnGitActionSuccess: deterministicDeliveryEnabled,
+		prCompletionGatedTaskIds,
 		resetKey: currentProjectId,
 	});
 

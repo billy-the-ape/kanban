@@ -25,6 +25,7 @@ import type {
 	RuntimeCommandRunResponse,
 	RuntimeEffectiveContextWindow,
 	RuntimeGitDeliveryReceipt,
+	RuntimePrInstalledConsumer,
 	RuntimeRunUpdateResponse,
 	RuntimeTaskChatSendRequest,
 	RuntimeTaskChatSendResponse,
@@ -137,7 +138,22 @@ export interface CreateRuntimeApiDependencies {
 	/** B-9: surface fire-and-forget dispatch pass failures (a missed pass is retried by the next trigger). */
 	warnTaskDispatchError?: (error: unknown) => void;
 	/** COMMENT-0: the runtime-wide comment-handling observer (optional in partial harnesses). */
-	getPrCommentAutomationService?: () => PrCommentAutomationService | null;
+	getPrCommentAutomationService?: () => PrCommentAutomationService | null /**
+	 * PRTRACK-1: the installed PR tracking consumers. Surfaced in the runtime
+	 * config response as the browser's installed-consumer signal (checkbox
+	 * availability, lifecycle-gate display). Optional so test harnesses that
+	 * never register consumers keep working.
+	 */;
+	getInstalledPrConsumers?: () => RuntimePrInstalledConsumer[];
+	/**
+	 * PRTRACK-1: shared lifecycle gate for deterministic delivery — reports
+	 * whether another task's PR operation currently holds a reservation on the
+	 * task's automation PR (busy → delivery must not race it).
+	 */
+	checkPrDeliveryReservation?: (
+		scope: RuntimeTrpcWorkspaceScope,
+		taskId: string,
+	) => Promise<{ busy: boolean; reason: string | null }>;
 }
 
 /**
@@ -943,7 +959,12 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			} else {
 				throw new Error("No active runtime config provider is available.");
 			}
-			return buildConfigResponse(scopedRuntimeConfig);
+			const configResponse = buildConfigResponse(scopedRuntimeConfig);
+			return {
+				...configResponse,
+				// PRTRACK-1: the installed-consumer signal for the browser.
+				installedPrConsumers: deps.getInstalledPrConsumers?.() ?? [],
+			};
 		},
 		saveConfig: async (workspaceScope, input) => {
 			const parsed = parseRuntimeConfigSaveRequest(input);
@@ -1092,6 +1113,21 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 						receipt: null,
 						error: "Git delivery is not enabled; enable gitDeliveryPolicy in the runtime settings first.",
 					};
+				}
+				// PRTRACK-1: the shared lifecycle gate — if another task's PR
+				// operation holds a reservation on this task's PR write target,
+				// deterministic delivery must not race it (busy result).
+				if (deps.checkPrDeliveryReservation) {
+					const reservationCheck = await deps.checkPrDeliveryReservation(workspaceScope, body.taskId);
+					if (reservationCheck.busy) {
+						return {
+							ok: false,
+							receipt: null,
+							error:
+								reservationCheck.reason ??
+								"The task's PR write target is reserved by another operation; retry after it drains.",
+						};
+					}
 				}
 				const baseRef = await findTaskBaseRef(workspaceScope.workspaceId, body.taskId);
 				if (!baseRef) {

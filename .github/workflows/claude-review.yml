@@ -138,8 +138,8 @@ jobs:
             suite yourself, with `gh run view <run id> --log-failed`. CI is
             context, not a substitute for the review: still read, at minimum,
             every changed file in the pull request diff, and do not stop at
-            the CI result. 
-            Read unchanged but related files as needed, sparingly, when more 
+            the CI result.
+            Read unchanged but related files as needed, sparingly, when more
             context demands.
             State in the summary exactly which files you read, flagging unedited but
             related files as (related).

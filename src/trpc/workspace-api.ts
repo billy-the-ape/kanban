@@ -72,6 +72,8 @@ export interface CreateWorkspaceApiDependencies {
 	runTaskDispatchPass?: (scope: { workspaceId: string; workspacePath: string }) => void;
 	/** COMMENT-0: fire-and-forget PR comment-tracking subscription refresh after a board save. */
 	refreshPrCommentTracking?: (scope: { workspaceId: string; workspacePath: string }) => void;
+	/** PRTRACK-1: reconcile task-derived PR tracking subscriptions after a board change. */
+	runPrTrackingReconcilePass?: (scope: { workspaceId: string; workspacePath: string }) => void;
 }
 
 function normalizeOptionalTaskWorkspaceScopeInput(
@@ -465,12 +467,28 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 					workspaceId: workspaceScope.workspaceId,
 					workspacePath: workspaceScope.workspacePath,
 				});
+				// PRTRACK-1: a board change may start or drop task-derived PR tracking
+				// subscriptions. Fire-and-forget: the save response is never delayed.
+				deps.runPrTrackingReconcilePass?.({
+					workspaceId: workspaceScope.workspaceId,
+					workspacePath: workspaceScope.workspacePath,
+				});
 				// PRLINK-5: a card entering Review without PRs gets a best-effort
 				// branch lookup. Fire-and-forget: the save response is never delayed.
 				for (const taskId of findTasksEnteringReviewWithoutPullRequests(previousBoard, response.board)) {
 					fireReviewPullRequestLookup({
 						workspacePath: workspaceScope.workspacePath,
 						taskId,
+						onChanged: () => {
+							// PRTRACK-1: recorded branch_lookup links mutate the
+							// board with no other broadcast, so the lookup must
+							// refresh open UIs and re-derive PR tracking demand
+							// itself.
+							void deps.broadcastRuntimeWorkspaceStateUpdated(
+								workspaceScope.workspaceId,
+								workspaceScope.workspacePath,
+							);
+						},
 					});
 				}
 
@@ -520,6 +538,12 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 						workspaceScope.workspaceId,
 						workspaceScope.workspacePath,
 					);
+					// PRTRACK-1: a new PR link changes task-derived subscription
+					// demand. Fire-and-forget: the response is never delayed.
+					deps.runPrTrackingReconcilePass?.({
+						workspaceId: workspaceScope.workspaceId,
+						workspacePath: workspaceScope.workspacePath,
+					});
 				}
 				// Re-read from the board: the recorded entry, or the existing
 				// identical one on a duplicate add (no revision bump).
@@ -582,6 +606,13 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 						workspaceScope.workspaceId,
 						workspaceScope.workspacePath,
 					);
+					// PRTRACK-1: a removed PR link may clear a card's selected
+					// automation PR or its last link — re-derive demand.
+					// Fire-and-forget: the response is never delayed.
+					deps.runPrTrackingReconcilePass?.({
+						workspaceId: workspaceScope.workspaceId,
+						workspacePath: workspaceScope.workspacePath,
+					});
 				}
 				return response.value
 					? ({ ok: true, pullRequest: null } satisfies RuntimeTaskPullRequestLinkResponse)
