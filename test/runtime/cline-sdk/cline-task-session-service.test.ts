@@ -1298,6 +1298,10 @@ describe("InMemoryClineTaskSessionService", () => {
 
 		expect(service.getSummary("task-1")?.state).toBe("idle");
 		expect(service.getSummary("task-1")?.reviewReason).toBeNull();
+		const abortCount = runtime.abortTaskSessionMock.mock.calls.length;
+		const repeatedPause = await service.cancelTaskTurn("task-1");
+		expect(repeatedPause).toMatchObject({ ...canceled, updatedAt: expect.any(Number) });
+		expect(runtime.abortTaskSessionMock).toHaveBeenCalledTimes(abortCount);
 	});
 
 	it("uses agent_event text deltas for streaming and ignores serialized agent chunks", async () => {

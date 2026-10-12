@@ -25,6 +25,7 @@ import {
 } from "../core/api-validation";
 import { getPullRequestIdentityKey, parsePullRequestUrl } from "../core/pull-request-links";
 import { removeTaskPullRequest, setPrimaryTaskPullRequest } from "../core/task-board-mutations";
+import { resolveWorkspaceSessionSummaries } from "../core/workspace-session-summaries";
 import { isTaskWriterActive } from "../server/task-writer-activity";
 import {
 	loadWorkspaceBoardById,
@@ -117,32 +118,12 @@ function normalizeRequiredTaskWorkspaceScopeInput(input: {
 	};
 }
 
-function isActiveTaskSessionState(summary: RuntimeTaskSessionSummary | null): boolean {
-	return summary?.state === "running" || summary?.state === "awaiting_review";
-}
-
 function selectLastTurnSummary(
 	terminalSummary: RuntimeTaskSessionSummary | null,
 	clineSummary: RuntimeTaskSessionSummary | null,
+	terminalHasActiveProcess: boolean,
 ): RuntimeTaskSessionSummary | null {
-	if (!terminalSummary) {
-		return clineSummary;
-	}
-	if (!clineSummary) {
-		return terminalSummary;
-	}
-	const terminalIsActive = isActiveTaskSessionState(terminalSummary);
-	const clineIsActive = isActiveTaskSessionState(clineSummary);
-	if (terminalIsActive !== clineIsActive) {
-		return clineIsActive ? clineSummary : terminalSummary;
-	}
-	if (terminalSummary.updatedAt !== clineSummary.updatedAt) {
-		return terminalSummary.updatedAt > clineSummary.updatedAt ? terminalSummary : clineSummary;
-	}
-	if (clineSummary.agentId === "cline" && terminalSummary.agentId !== "cline") {
-		return clineSummary;
-	}
-	return terminalSummary;
+	return terminalHasActiveProcess ? terminalSummary : (clineSummary ?? terminalSummary);
 }
 
 function createEmptyGitSummaryErrorResponse(error: unknown): RuntimeGitSummaryResponse {
@@ -331,6 +312,7 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 				const summary = selectLastTurnSummary(
 					terminalManager.getSummary(normalizedInput.taskId),
 					clineTaskSessionService.getSummary(normalizedInput.taskId),
+					terminalManager.hasActiveProcess?.(normalizedInput.taskId) === true,
 				);
 				const fromCheckpoint = summary?.previousTurnCheckpoint;
 				const toCheckpoint = summary?.latestTurnCheckpoint;
@@ -445,9 +427,15 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 					workspaceScope.workspaceId,
 					workspaceScope.workspacePath,
 				);
-				for (const summary of terminalManager.listSummaries()) {
-					input.sessions[summary.taskId] = summary;
-				}
+				const clineService = await deps.getScopedClineTaskSessionService(workspaceScope);
+				input = {
+					...input,
+					sessions: resolveWorkspaceSessionSummaries(
+						input.sessions,
+						terminalManager,
+						clineService.listSummaries(),
+					),
+				};
 				// PRLINK-5: capture the pre-save board so we can detect cards that
 				// just moved into Review without PRs (best-effort lookup trigger).
 				const previousBoard = await loadWorkspaceBoardById(workspaceScope.workspaceId);

@@ -998,7 +998,11 @@ export function useBoardInteractions({
 	);
 
 	const handleCompleteTask = useCallback(() => {
-		if (selectedCard?.column.id !== "review") {
+		if (
+			!selectedCard ||
+			(selectedCard.column.id !== "review" &&
+				(selectedCard.column.id !== "in_progress" || isTaskSessionRunning(sessions[selectedCard.card.id])))
+		) {
 			return;
 		}
 		if (completeTaskLoadingByIdRef.current[selectedCard.card.id]) {
@@ -1008,7 +1012,7 @@ export function useBoardInteractions({
 		void requestCompleteTaskWithAnimation(selectedCard.card.id, selectedCard.column.id).finally(() => {
 			setTaskCompleteLoading(selectedCard.card.id, false);
 		});
-	}, [requestCompleteTaskWithAnimation, selectedCard, setTaskCompleteLoading]);
+	}, [requestCompleteTaskWithAnimation, selectedCard, sessions, setTaskCompleteLoading]);
 
 	const handleCompleteReviewCard = useCallback(
 		(taskId: string) => {

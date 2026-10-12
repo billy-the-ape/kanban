@@ -526,7 +526,9 @@ export function CardDetailView({
 	const detailDiffContentPanelPercent = `${((1 - detailDiffFileTreeRatio) * 100).toFixed(1)}%`;
 	const detailDiffFileTreePanelFlex = `0 0 ${detailDiffFileTreePanelPercent}`;
 	const showMoveToTrashActions = selection.column.id === "review" || selection.column.id === "in_progress";
-	const showCompleteActions = selection.column.id === "review";
+	const showCompleteActions =
+		selection.column.id === "review" ||
+		(selection.column.id === "in_progress" && sessionSummary?.state !== "running");
 	const reviewControl =
 		selection.column.id === "review" ? (
 			<TaskReviewControl
