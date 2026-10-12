@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { RuntimeConfigState } from "../../../src/config/runtime-config";
+import type { RuntimeTaskSessionSummary } from "../../../src/core/api-contract";
 import { createWorkspaceRegistry } from "../../../src/server/workspace-registry";
 
 const fixtures = vi.hoisted(() => {
@@ -12,7 +13,12 @@ const fixtures = vi.hoisted(() => {
 		state,
 		removeWorkspaceIndexEntry: vi.fn(),
 		removeWorkspaceStateFiles: vi.fn(),
-		manager: { hydrateFromRecord: vi.fn(), listSummaries: vi.fn(() => []), markInterruptedAndStopAll: vi.fn() },
+		manager: {
+			hydrateFromRecord: vi.fn(),
+			listSummaries: vi.fn<() => RuntimeTaskSessionSummary[]>(() => []),
+			hasActiveProcess: vi.fn(() => false),
+			markInterruptedAndStopAll: vi.fn(),
+		},
 	};
 });
 
@@ -31,12 +37,51 @@ vi.mock("../../../src/terminal/session-manager", () => ({
 	TerminalSessionManager: class {
 		hydrateFromRecord = fixtures.manager.hydrateFromRecord;
 		listSummaries = fixtures.manager.listSummaries;
+		hasActiveProcess = fixtures.manager.hasActiveProcess;
 		markInterruptedAndStopAll = fixtures.manager.markInterruptedAndStopAll;
 	},
 }));
 
 describe("workspace stream validation", () => {
-	beforeEach(() => vi.clearAllMocks());
+	beforeEach(() => {
+		vi.clearAllMocks();
+		fixtures.manager.listSummaries.mockReturnValue([]);
+	});
+
+	it("includes the resumed Cline owner in reload and websocket snapshots", async () => {
+		const old: RuntimeTaskSessionSummary = {
+			taskId: "7wp6m",
+			state: "running",
+			agentId: "cline",
+			workspacePath: "/worktrees/7wp6m",
+			pid: null,
+			startedAt: 100,
+			updatedAt: 110,
+			lastOutputAt: 110,
+			reviewReason: null,
+			exitCode: null,
+			lastHookAt: null,
+			latestHookActivity: null,
+			latestTurnCheckpoint: null,
+			previousTurnCheckpoint: null,
+		};
+		fixtures.manager.listSummaries.mockReturnValue([old]);
+		const config = {} as RuntimeConfigState;
+		const registry = await createWorkspaceRegistry({
+			cwd: "/launcher",
+			loadGlobalRuntimeConfig: async () => config,
+			loadRuntimeConfig: async () => config,
+			hasGitRepository: () => false,
+			pathIsDirectory: async () => true,
+		});
+		const first = await registry.buildWorkspaceStateSnapshot("project", "/repos/project");
+		expect(first.sessions[old.taskId]?.state).toBe("interrupted");
+		const completed = { ...old, startedAt: 200, updatedAt: 210, state: "awaiting_review" as const };
+		registry.setClineSessionSummaryProvider?.(() => [completed]);
+		expect((await registry.buildWorkspaceStateSnapshot("project", "/repos/project")).sessions[old.taskId]).toEqual(
+			completed,
+		);
+	});
 
 	it.each(["missing directory", "invalid Git configuration"])(
 		"retains project data after %s and recovers on retry",

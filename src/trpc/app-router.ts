@@ -125,6 +125,7 @@ import type {
 	RuntimeTaskPrTrackingStateResponse,
 	RuntimeTaskPullRequestLinkRequest,
 	RuntimeTaskPullRequestLinkResponse,
+	RuntimeTaskPullRequestPrimaryRequest,
 	RuntimeTaskPullRequestsRefreshRequest,
 	RuntimeTaskPullRequestsRefreshResponse,
 	RuntimeTaskReviewInfoRequest,
@@ -276,6 +277,7 @@ import {
 	runtimeTaskPrTrackingStateResponseSchema,
 	runtimeTaskPullRequestLinkRequestSchema,
 	runtimeTaskPullRequestLinkResponseSchema,
+	runtimeTaskPullRequestPrimaryRequestSchema,
 	runtimeTaskPullRequestsRefreshRequestSchema,
 	runtimeTaskPullRequestsRefreshResponseSchema,
 	runtimeTaskReviewInfoRequestSchema,
@@ -553,6 +555,11 @@ export interface RuntimeTrpcContext {
 		removeTaskPullRequest: (
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskPullRequestLinkRequest,
+		) => Promise<RuntimeTaskPullRequestLinkResponse>;
+		/** PRLINK-6: set (url) or clear (null) the display-only explicit primary. */
+		setPrimaryTaskPullRequest: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskPullRequestPrimaryRequest,
 		) => Promise<RuntimeTaskPullRequestLinkResponse>;
 		/** PRLINK-5: re-run the branch lookup for a task (opt-in refresh). */
 		refreshTaskPullRequests: (
@@ -1064,6 +1071,13 @@ export const runtimeAppRouter = t.router({
 			.output(runtimeTaskPullRequestLinkResponseSchema)
 			.mutation(async ({ ctx, input }) => {
 				return await ctx.workspaceApi.removeTaskPullRequest(ctx.workspaceScope, input);
+			}),
+		// PRLINK-6: explicit display-only primary (url: null clears it).
+		setPrimaryTaskPullRequest: workspaceProcedure
+			.input(runtimeTaskPullRequestPrimaryRequestSchema)
+			.output(runtimeTaskPullRequestLinkResponseSchema)
+			.mutation(async ({ ctx, input }) => {
+				return await ctx.workspaceApi.setPrimaryTaskPullRequest(ctx.workspaceScope, input);
 			}),
 		refreshTaskPullRequests: workspaceProcedure
 			.input(runtimeTaskPullRequestsRefreshRequestSchema)

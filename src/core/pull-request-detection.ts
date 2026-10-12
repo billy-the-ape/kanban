@@ -6,6 +6,8 @@
 // from the tool output only — never from the command text — so review
 // sessions reading PRs (`gh pr view`) adopt nothing. Misses are recoverable
 // via deterministic delivery, branch lookup (PRLINK-5), or manual add.
+
+import { parseCommandOutputEntries } from "../cline-sdk/cline-command-output-excerpt";
 import { extractCommandStrings } from "../cline-sdk/review-tool-policy";
 import type { ParsedPullRequestLink } from "./pull-request-links";
 import { extractPullRequestLinks, parsePullRequestUrl } from "./pull-request-links";
@@ -148,6 +150,23 @@ function detectMcpCreatedPullRequests(output: string | null): ParsedPullRequestL
 	return extractPullRequestLinks(text);
 }
 
+function createdPrCommandOutputText(output: string): string {
+	try {
+		const entries = parseCommandOutputEntries(JSON.parse(output));
+		if (entries) {
+			// SDK command results are structured. Scan decoded result/error bodies,
+			// never JSON escaping or query text (which can mention unrelated PRs).
+			return entries
+				.filter((entry) => commandHasPrCreatingSegment(entry.query))
+				.map((entry) => entry.body)
+				.join("\n");
+		}
+	} catch {
+		// Plain command output remains supported.
+	}
+	return output;
+}
+
 /**
  * Detects pull requests created by a single tool call. Returns `[]` for
  * everything that does not itself create a PR. Results are deduplicated by
@@ -160,7 +179,7 @@ export function detectCreatedPullRequests(input: PullRequestDetectionInput): Par
 	const outputText = input.output ?? "";
 	for (const command of extractCommandStrings(input.commands)) {
 		if (commandHasPrCreatingSegment(command)) {
-			return extractPullRequestLinks(outputText);
+			return extractPullRequestLinks(createdPrCommandOutputText(outputText));
 		}
 	}
 	return [];

@@ -34,6 +34,7 @@ import {
 	type RuntimeTaskPreservationRequest,
 	type RuntimeTaskPrTrackingStateRequest,
 	type RuntimeTaskPullRequestLinkRequest,
+	type RuntimeTaskPullRequestPrimaryRequest,
 	type RuntimeTaskPullRequestsRefreshRequest,
 	type RuntimeTaskReviewInfoRequest,
 	type RuntimeTaskReviewStartRequest,
@@ -80,6 +81,7 @@ import {
 	runtimeTaskPreservationRequestSchema,
 	runtimeTaskPrTrackingStateRequestSchema,
 	runtimeTaskPullRequestLinkRequestSchema,
+	runtimeTaskPullRequestPrimaryRequestSchema,
 	runtimeTaskPullRequestsRefreshRequestSchema,
 	runtimeTaskReviewInfoRequestSchema,
 	runtimeTaskReviewStartRequestSchema,
@@ -737,6 +739,21 @@ export function parseTaskPullRequestLinkRequest(value: unknown): RuntimeTaskPull
 	if (!url) {
 		throw new Error("Missing pull request URL");
 	}
+	return {
+		...parsed,
+		taskId,
+		url,
+	};
+}
+
+export function parseTaskPullRequestPrimaryRequest(value: unknown): RuntimeTaskPullRequestPrimaryRequest {
+	const parsed = parseWithSchema(runtimeTaskPullRequestPrimaryRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Missing taskId");
+	}
+	// A blank URL is treated as a clear (null), never as a URL to parse.
+	const url = parsed.url === null ? null : parsed.url.trim() === "" ? null : parsed.url.trim();
 	return {
 		...parsed,
 		taskId,

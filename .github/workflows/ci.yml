@@ -5,7 +5,8 @@ on:
 #  push:
 #    branches: [main]
   pull_request:
-    branches: [main]
+# Run on any PR
+#    branches: [main]
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}

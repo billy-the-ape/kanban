@@ -78,6 +78,8 @@ const TICK_INTERVAL_MS = 10_000;
 const DEBOUNCE_MS = 120_000;
 const MAX_PENDING_MS = 600_000;
 const DISPATCH_RETRY_MS = 30_000;
+/** How long dispose() waits for already-running work before giving up on it. */
+const DISPOSE_GRACE_MS = 3_000;
 const BACKOFF_SCHEDULE_MS = [60_000, 120_000, 240_000, 480_000, 900_000];
 /** Bounded automatic-turn backstop: at most N sends per PR per window. */
 const MAX_AUTO_SEND_PER_WINDOW = 5;
@@ -96,7 +98,7 @@ export function buildCommentHandlingInstruction(prUrl: string): string {
 		`Address comments on the linked PR: ${prUrl}.`,
 		"Check the feedback against the current code and original task requirements.",
 		"Fix valid issues, explain any disagreements, and update the same PR.",
-		"Explain changes and disagreements in task chat; do not post PR comments.",
+		"Explain changes and disagreements in PR comments and within task chat.",
 	].join(" ");
 }
 
@@ -313,6 +315,9 @@ export class PrCommentAutomationService {
 	private readonly captureBlocked = new Set<string>();
 	private timer: NodeJS.Timeout | null = null;
 	private started = false;
+	private disposed = false;
+	/** Fire-and-forget work that dispose() lets finish before the process exits. */
+	private readonly inFlight = new Set<Promise<unknown>>();
 
 	constructor(private readonly deps: PrCommentAutomationServiceDependencies) {}
 
@@ -326,10 +331,20 @@ export class PrCommentAutomationService {
 
 	/** Reconciles durable state from a restart, then starts the poll tick. */
 	async start(): Promise<void> {
-		if (this.started) {
+		if (this.started || this.disposed) {
 			return;
 		}
 		this.started = true;
+		this.timer = setInterval(() => {
+			void this.runTick().catch((error: unknown) => {
+				this.warn(`tick failed: ${error instanceof Error ? error.message : String(error)}`);
+			});
+		}, TICK_INTERVAL_MS);
+		this.timer.unref?.();
+		await this.track(this.reconcileOnStartup());
+	}
+
+	private async reconcileOnStartup(): Promise<void> {
 		try {
 			await this.reconcileRestartedDispatches();
 			await this.reconcilePublicationCaptures();
@@ -339,28 +354,70 @@ export class PrCommentAutomationService {
 		} catch (error) {
 			this.warn(`startup reconciliation failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
-		this.timer = setInterval(() => {
-			void this.runTick().catch((error: unknown) => {
-				this.warn(`tick failed: ${error instanceof Error ? error.message : String(error)}`);
-			});
-		}, TICK_INTERVAL_MS);
-		this.timer.unref?.();
 	}
 
-	dispose(): void {
+	/**
+	 * Stops scheduling and waits (bounded) for work that is already running;
+	 * work requested afterwards is dropped. Refreshes, ticks, and the startup
+	 * reconcile are fire-and-forget and each reads workspace state, which takes
+	 * the workspace-index lock. A process that exits while one holds it leaves
+	 * the lockfile behind, and the next start then fails with "Lock file is
+	 * already being held".
+	 */
+	async dispose(): Promise<void> {
+		this.disposed = true;
 		this.started = false;
 		if (this.timer) {
 			clearInterval(this.timer);
 			this.timer = null;
+		}
+		await this.waitForInFlight();
+	}
+
+	private track<T>(operation: Promise<T>): Promise<T> {
+		this.inFlight.add(operation);
+		const forget = () => {
+			this.inFlight.delete(operation);
+		};
+		void operation.then(forget, forget);
+		return operation;
+	}
+
+	private async waitForInFlight(): Promise<void> {
+		if (this.inFlight.size === 0) {
+			return;
+		}
+		let graceTimer: NodeJS.Timeout | undefined;
+		const graceElapsed = new Promise<void>((resolve) => {
+			graceTimer = setTimeout(resolve, DISPOSE_GRACE_MS);
+		});
+		try {
+			await Promise.race([this.settleInFlight(), graceElapsed]);
+		} finally {
+			clearTimeout(graceTimer);
+		}
+	}
+
+	private async settleInFlight(): Promise<void> {
+		while (this.inFlight.size > 0) {
+			await Promise.allSettled([...this.inFlight]);
 		}
 	}
 
 	/**
 	 * Rescans one workspace's board and updates PR subscriptions. Called on
 	 * startup and after every board save. Disabling, unlinking, or moving a
-	 * card to a terminal column cancels its queued intent.
+	 * card to a terminal column cancels its queued intent. A no-op once the
+	 * service is disposed.
 	 */
 	async refreshWorkspace(scope: PrCommentAutomationWorkspaceScope): Promise<void> {
+		if (this.disposed) {
+			return;
+		}
+		await this.track(this.syncWorkspaceSubscriptions(scope));
+	}
+
+	private async syncWorkspaceSubscriptions(scope: PrCommentAutomationWorkspaceScope): Promise<void> {
 		let state: RuntimeWorkspaceStateResponse;
 		try {
 			state = await this.deps.loadWorkspaceState(scope.workspacePath);
@@ -441,9 +498,17 @@ export class PrCommentAutomationService {
 	/**
 	 * One poll/settle cycle. Polls are awaited before settles so the settle
 	 * always sees the freshest record; the per-subscription in-flight flags
-	 * keep overlapping ticks from double-polling or double-sending.
+	 * keep overlapping ticks from double-polling or double-sending. A no-op
+	 * once the service is disposed.
 	 */
 	async runTick(): Promise<void> {
+		if (this.disposed) {
+			return;
+		}
+		await this.track(this.pollAndSettle());
+	}
+
+	private async pollAndSettle(): Promise<void> {
 		const nowMs = this.nowMs();
 		const polls: Promise<void>[] = [];
 		for (const sub of [...this.subscriptions.values()]) {
@@ -462,6 +527,10 @@ export class PrCommentAutomationService {
 			);
 		}
 		await Promise.all(polls);
+		if (this.disposed) {
+			// Shutting down: leave durable state untouched; settle resumes on the next start.
+			return;
+		}
 		const settles: Promise<void>[] = [];
 		for (const sub of [...this.subscriptions.values()]) {
 			if (sub.settleInFlight) {
@@ -1247,6 +1316,9 @@ export class PrCommentAutomationService {
 	private async reconcileRestartedDispatches(): Promise<void> {
 		const records = await listPrTrackingRecords();
 		for (const record of records) {
+			if (this.disposed) {
+				return;
+			}
 			const dispatch = record.commentAutomation.dispatch;
 			if (dispatch === null || (dispatch.status !== "queued" && dispatch.status !== "running")) {
 				continue;

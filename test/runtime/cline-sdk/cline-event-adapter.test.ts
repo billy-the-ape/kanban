@@ -1,11 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { applyClineSessionEvent, type ClineToolFinishedInfo } from "../../../src/cline-sdk/cline-event-adapter";
 import {
 	type ClineTaskMessage,
 	type ClineTaskSessionEntry,
 	createDefaultSummary,
 } from "../../../src/cline-sdk/cline-session-state";
+import { extractCommandStrings } from "../../../src/cline-sdk/review-tool-policy";
 import type { RuntimeTaskSessionSummary } from "../../../src/core/api-contract";
+import { detectCreatedPullRequests } from "../../../src/core/pull-request-detection";
 
 function createEntry(taskId: string): ClineTaskSessionEntry {
 	return {
@@ -72,6 +74,94 @@ function runtimeSnapshot(iteration = 1) {
 }
 
 describe("applyClineSessionEvent", () => {
+	it.each(["tool-finished", "content_end"] as const)("captures a structured PR creation from %s", (type) => {
+		const entry = createEntry("task-1");
+		const command = "cd repo && gh pr create --body-file /tmp/pr-body.md";
+		const url = "https://github.com/billy-the-ape/kanban/pull/72";
+		const output = [{ query: command, result: `${url}\n`, success: true }];
+		const finishedTools: ClineToolFinishedInfo[] = [];
+		applyEvent({
+			entry,
+			event: {
+				type: "agent_event",
+				payload: {
+					sessionId: "session-1",
+					event: {
+						type: "content_start",
+						contentType: "tool",
+						toolCallId: "pr-create",
+						toolName: "run_commands",
+						input: { commands: [command] },
+					},
+				},
+			},
+		});
+		const event =
+			type === "content_end"
+				? { type, contentType: "tool", toolName: "run_commands", toolCallId: "pr-create", output }
+				: {
+						type,
+						toolCall: { toolName: "run_commands", toolCallId: "pr-create" },
+						message: { content: [{ type: "tool-result", output }] },
+					};
+		applyEvent({
+			entry,
+			event: { type: "agent_event", payload: { sessionId: "session-1", event } },
+			onToolFinished: (tool) => finishedTools.push(tool),
+		});
+		expect(finishedTools).toHaveLength(1);
+		const tool = finishedTools[0];
+		if (!tool) throw new Error("Missing finished tool");
+		expect(
+			detectCreatedPullRequests({
+				toolName: tool.toolName,
+				commands: extractCommandStrings(tool.toolInput),
+				output: tool.output,
+			}).map((link) => link.url),
+		).toEqual([url]);
+	});
+
+	it("does not let a PR observer exception block turn completion", () => {
+		const entry = createEntry("task-1");
+		const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+		try {
+			applyEvent({
+				entry,
+				event: {
+					type: "agent_event",
+					payload: {
+						sessionId: "session-1",
+						event: {
+							type: "content_end",
+							contentType: "tool",
+							toolName: "run_commands",
+							output: "PR created",
+						},
+					},
+				},
+				onToolFinished: () => {
+					throw new Error("observer failed");
+				},
+			});
+			applyEvent({
+				entry,
+				event: {
+					type: "agent_event",
+					payload: {
+						sessionId: "session-1",
+						event: {
+							type: "done",
+							reason: "completed",
+						},
+					},
+				},
+			});
+			expect(entry.summary.state).toBe("awaiting_review");
+			expect(stderr).toHaveBeenCalled();
+		} finally {
+			stderr.mockRestore();
+		}
+	});
 	it("publishes queue positions and clears them on admission", () => {
 		const entry = createEntry("task-1");
 		for (const queuePosition of [2, 1]) {

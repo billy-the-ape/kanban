@@ -99,4 +99,11 @@ describe("drag rules", () => {
 		expect(isTaskSessionRunning({ state: "interrupted" } as RuntimeTaskSessionSummary)).toBe(false);
 		expect(isTaskSessionRunning({ state: "failed" } as RuntimeTaskSessionSummary)).toBe(false);
 	});
+
+	it("allows direct completion of stopped in-progress cards but blocks working or unknown states", () => {
+		expect(isAllowedCrossColumnCardMove("in_progress", "done", { isTaskSessionRunning: false })).toBe(true);
+		expect(isCardDropDisabled("done", "in_progress", { isActiveDragTaskSessionRunning: false })).toBe(false);
+		expect(isAllowedCrossColumnCardMove("in_progress", "done", { isTaskSessionRunning: true })).toBe(false);
+		expect(isAllowedCrossColumnCardMove("in_progress", "done")).toBe(false);
+	});
 });

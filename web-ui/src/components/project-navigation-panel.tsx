@@ -303,16 +303,14 @@ export function ProjectNavigationPanel({
 						<ClineIcon size={18} className="text-text-primary shrink-0 self-center" />
 						Cline <span className="text-text-secondary font-normal text-xs">v{__APP_VERSION__}</span>
 					</div>
-					{isMobile ? (
-						<Button
-							variant="ghost"
-							size="sm"
-							icon={<Plus size={16} className="rotate-45" />}
-							onClick={() => setCollapsed(true)}
-							aria-label="Close sidebar"
-							className="min-w-[44px] min-h-[44px] -mr-2"
-						/>
-					) : null}
+					<Button
+						variant="ghost"
+						size="sm"
+						icon={<Plus size={16} className="rotate-45" />}
+						onClick={() => setCollapsed(!isCollapsed)}
+						aria-label="Close sidebar"
+						className="min-w-[44px] min-h-[44px] -mr-2"
+					/>
 				</div>
 				<div className="mt-2 rounded-md bg-surface-2 border border-border p-1">
 					<div className="grid grid-cols-2 gap-1">
