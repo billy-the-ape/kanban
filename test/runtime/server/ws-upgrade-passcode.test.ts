@@ -5,33 +5,29 @@
  * with HTTP 401 when remote mode + passcode are active, and allow them through
  * when the session cookie is valid or when the gate is not active.
  *
- * We test the gate by exercising the passcode-manager helpers directly (the
- * same helpers the upgrade handler calls) rather than spinning up a full
- * runtime server, keeping the test fast and deterministic.
+ * We test the gate by exercising the shared `isRuntimeRequestAuthenticated`
+ * predicate (the same check the upgrade handler calls) rather than spinning up
+ * a full runtime server, keeping the test fast and deterministic.
  */
 
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	disablePasscode,
-	extractSessionTokenFromCookie,
 	generatePasscode,
 	isPasscodeEnabled,
 	issueSession,
 	validateSession,
 } from "../../../src/security/passcode-manager";
+import { isRuntimeRequestAuthenticated } from "../../../src/server/request-auth-gate";
 
 // ---------------------------------------------------------------------------
-// Helper: simulate the exact guard logic from the upgrade handler so we can
+// Helper: run the same guard logic the upgrade handler applies so we can
 // assert on all branch outcomes without a real HTTP server.
 // ---------------------------------------------------------------------------
 function runUpgradeGuard(input: { isRemoteMode: boolean; cookieHeader: string | undefined }): "allowed" | "rejected" {
 	const passcodeActive = input.isRemoteMode && isPasscodeEnabled();
-	if (passcodeActive) {
-		const token = extractSessionTokenFromCookie(input.cookieHeader);
-		const authenticated = token !== null && validateSession(token);
-		if (!authenticated) {
-			return "rejected";
-		}
+	if (passcodeActive && !isRuntimeRequestAuthenticated({ headers: { cookie: input.cookieHeader } })) {
+		return "rejected";
 	}
 	return "allowed";
 }
