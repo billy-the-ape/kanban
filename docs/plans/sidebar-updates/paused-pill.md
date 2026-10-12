@@ -40,16 +40,18 @@ The fix has two parts:
 
    | Column | Effective session summary | Display state |
    | --- | --- | --- |
-   | `in_progress` | none | `in_progress` (avoids a flash of Paused before a just-started session reports) |
+   | `in_progress` | none, or a placeholder (see below) | `in_progress` (avoids a flash of Paused before a just-started session reports) |
    | `in_progress` | `state === "running"`, including queued (`latestHookActivity.hookEventName === "concurrency_waiting"`) | `in_progress` |
    | `in_progress` | `state === "awaiting_review"` | `review` (keeps today's behavior for projects that are not open) |
    | `in_progress` | `state` is `"idle"`, `"interrupted"` or `"failed"` | `paused` |
    | any other column | any | the column id |
 
+   A **placeholder** summary is one with `state === "idle" && startedAt === null && agentId === null`. `TerminalSessionManager` creates one through `createDefaultSummary` (`src/terminal/session-manager.ts:109-127`, stamped `updatedAt: now()`) when a terminal is attached for a task with no entry (`:977`). It describes no session, so it never classifies a card as Paused.
+
    `idle` is what the composer's pause button produces (`cancelTaskTurn`, `src/cline-sdk/cline-task-session-service.ts:1004-1033`). `interrupted` comes from stop/abort and runtime shutdown. `failed` counts as Paused because the agent is not working.
 2. **Counts shape.** `RuntimeProjectTaskCounts` gains a required `paused: number`. `in_progress` now means display state `in_progress` only. Paused cards are **not** also counted in `in_progress`.
 3. **Pill.** Order `B, IP, P, R, D, T`. Paused pill: `id: "paused"`, `title: "Paused"`, `shortLabel: "P"`, `toneClassName: "bg-status-gold/20 text-status-gold"`. Like the other pills, it is hidden when its count is 0, and the selected project row uses its existing `bg-accent-fg/20 text-accent-fg` override.
-4. **Merge rule.** For one task, given two summaries, keep the one with the larger `updatedAt`. On a tie, keep the **later-listed source** in the merge order defined for that call site. This is one shared helper used everywhere summaries from two sources meet.
+4. **Merge rule.** For one task, given two summaries, keep the one with the larger `updatedAt`. On a tie, keep the **later-listed source** in the merge order defined for that call site. Exception: a placeholder candidate never replaces an existing non-placeholder summary, whatever its `updatedAt`, because its fresh timestamp would otherwise mask real session state. This is one shared helper used everywhere summaries from two sources meet.
 5. **Server effective sessions** for a workspace, merged in this order (later wins ties): persisted `sessions.json` → terminal manager `listSummaries()` (if a manager exists) → the hub's latest Cline summaries for that workspace (if tracked).
 6. **No board-card visual change.** The card's status marker (`web-ui/src/components/board-card.tsx:449-462`) is out of scope.
 
@@ -89,10 +91,12 @@ export function countTasksByDisplayState(
 	sessionsByTaskId: Readonly<Record<string, RuntimeTaskSessionSummary>>,
 ): RuntimeProjectTaskCounts;
 
+export function isPlaceholderSessionSummary(summary: RuntimeTaskSessionSummary): boolean; // decision 1 definition
+
 export function pickNewerSessionSummary(
 	current: RuntimeTaskSessionSummary | undefined,
 	candidate: RuntimeTaskSessionSummary,
-): RuntimeTaskSessionSummary; // candidate wins when candidate.updatedAt >= current.updatedAt
+): RuntimeTaskSessionSummary; // decision 4: candidate wins when candidate.updatedAt >= current.updatedAt, unless candidate is a placeholder and current is not
 
 export function mergeSessionSummaries(
 	...sources: ReadonlyArray<Iterable<RuntimeTaskSessionSummary>>
@@ -150,13 +154,15 @@ In `src/trpc/workspace-api.ts` `saveState`, replace the overwrite loop with `inp
 - `test/runtime/core/task-display-state.test.ts` (new):
   - The full decision 1 table, one case per row, including queued `running` → `in_progress`, and `failed`/`idle`/`interrupted` → `paused`.
   - `countTasksByDisplayState` over a mixed board: `in_progress + paused + review-from-in_progress` equals the In Progress column length.
-  - `pickNewerSessionSummary` tie and older/newer cases.
+  - `pickNewerSessionSummary` tie and older/newer cases, plus a newer placeholder losing to an older real summary and a placeholder kept when there is no current summary.
+  - An In Progress card whose only summary is a placeholder classifies as `in_progress`, not `paused`.
   - `mergeSessionSummaries` with three sources.
 - `test/runtime/server/workspace-registry.test.ts`:
   - Add `loadWorkspaceSessionsById` to the `workspace-state` mock.
   - **Regression test for the bug:** the terminal manager's `listSummaries` returns a Cline summary `{ taskId: "task", agentId: "cline", state: "awaiting_review", updatedAt: 100 }`, the board has `task` in `in_progress`, and `getClineTaskSessionSummaries` returns `{ state: "running", updatedAt: 200 }`. Expected counts: `in_progress: 1, review: 0`.
   - The same setup with the Cline summary `state: "idle"`: expected `paused: 1, in_progress: 0`.
   - A terminal-agent task whose terminal summary is newer than disk is classified from the terminal summary.
+  - A just-attached terminal placeholder (`createDefaultSummary` shape, newest `updatedAt`) over an older persisted `running` summary still counts as `in_progress`.
   - `buildWorkspaceStateSnapshot` keeps a newer disk summary over an older terminal-manager one.
 - `test/runtime/trpc/workspace-api.test.ts`: `saveState` with a browser summary (`running`, `updatedAt: 200`) and a terminal-manager summary for the same task (`awaiting_review`, `updatedAt: 100`) persists the browser's. With the timestamps reversed, it persists the terminal manager's.
 - `web-ui/src/hooks/use-project-ui-state.test.tsx`: the open project's counts reflect `paused` from local `sessions`. The other projects' server counts pass through unchanged.
