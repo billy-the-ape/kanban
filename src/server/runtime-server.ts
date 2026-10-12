@@ -999,7 +999,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		url,
 		close: async () => {
 			await startupMaintenance;
-			prCommentAutomationService.dispose();
+			await prCommentAutomationService.dispose();
 			await Promise.all(
 				Array.from(clineTaskSessionServiceByWorkspaceId.values()).map(async (service) => {
 					await service.dispose();

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClineTaskSessionService } from "../../../src/cline-sdk/cline-task-session-service";
 import type {
 	RuntimeBoardData,
@@ -128,6 +128,7 @@ function makeService(
 	overrides: {
 		workspaces?: Array<{ workspaceId: string; workspacePath: string }>;
 		workspaceStates?: Map<string, RuntimeWorkspaceStateResponse>;
+		loadWorkspaceState?: (workspacePath: string) => Promise<RuntimeWorkspaceStateResponse>;
 		snapshot?: Partial<GitHubPrSnapshot>;
 		send?: (
 			scope: { workspaceId: string; workspacePath: string },
@@ -141,13 +142,15 @@ function makeService(
 	const snapshotCalls: string[] = [];
 	const service = createPrCommentAutomationService({
 		listManagedWorkspaces: () => workspaces,
-		loadWorkspaceState: async (workspacePath) => {
-			const state = workspaceStates.get(workspacePath);
-			if (!state) {
-				throw new Error(`no state for ${workspacePath}`);
-			}
-			return state;
-		},
+		loadWorkspaceState:
+			overrides.loadWorkspaceState ??
+			(async (workspacePath) => {
+				const state = workspaceStates.get(workspacePath);
+				if (!state) {
+					throw new Error(`no state for ${workspacePath}`);
+				}
+				return state;
+			}),
 		getClineTaskSessionService: async () => idleCline,
 		getTerminalManager: async () => idleTerminal,
 		sendTaskChatMessage: async (scope, body) => {
@@ -813,5 +816,119 @@ describe("PrCommentAutomationService", () => {
 		}
 		expect(loaded.record.commentAutomation.dispatch?.status).toBe("failed");
 		expect(loaded.record.commentAutomation.dispatch?.error).toBe("model down");
+	});
+});
+
+// Regression: refreshes, ticks, and the startup reconcile are fire-and-forget
+// and each reads workspace state under the workspace-index lock. A process
+// that exits while one holds it leaves the lockfile behind and the next start
+// fails with "Lock file is already being held".
+describe("PrCommentAutomationService dispose", () => {
+	const scope = { workspaceId: "w1", workspacePath: "/w1" };
+
+	function deferredState() {
+		let resolve: (state: RuntimeWorkspaceStateResponse) => void = () => undefined;
+		const promise = new Promise<RuntimeWorkspaceStateResponse>((resolvePromise) => {
+			resolve = resolvePromise;
+		});
+		return { promise, resolve };
+	}
+
+	it("waits for an in-flight workspace read before resolving", async () => {
+		const read = deferredState();
+		const loads: string[] = [];
+		const harness = makeService({
+			loadWorkspaceState: (workspacePath) => {
+				loads.push(workspacePath);
+				return read.promise;
+			},
+		});
+		const refresh = harness.service.refreshWorkspace(scope);
+		expect(loads).toEqual(["/w1"]);
+
+		let disposed = false;
+		const disposing = harness.service.dispose().then(() => {
+			disposed = true;
+		});
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(disposed).toBe(false);
+
+		read.resolve(makeState([]));
+		await disposing;
+		await refresh;
+		expect(disposed).toBe(true);
+	});
+
+	it("drops refreshes and ticks requested after dispose", async () => {
+		const loads: string[] = [];
+		const state = makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })]);
+		const harness = makeService({
+			loadWorkspaceState: async (workspacePath) => {
+				loads.push(workspacePath);
+				return state;
+			},
+		});
+		await harness.service.refreshWorkspace(scope);
+		expect(loads).toEqual(["/w1"]);
+
+		await harness.service.dispose();
+		await harness.service.refreshWorkspace(scope);
+		// The new subscription is due immediately, so a live tick would poll it.
+		await harness.service.runTick();
+		expect(loads).toEqual(["/w1"]);
+		expect(harness.snapshotCalls).toEqual([]);
+	});
+
+	it("stops the startup reconcile from reading further workspaces once disposed", async () => {
+		const firstRead = deferredState();
+		const loads: string[] = [];
+		const harness = makeService({
+			workspaces: [
+				{ workspaceId: "w1", workspacePath: "/w1" },
+				{ workspaceId: "w2", workspacePath: "/w2" },
+			],
+			loadWorkspaceState: (workspacePath) => {
+				loads.push(workspacePath);
+				return workspacePath === "/w1" ? firstRead.promise : Promise.resolve(makeState([]));
+			},
+		});
+		harness.service.start();
+		await vi.waitFor(() => {
+			expect(loads).toEqual(["/w1"]);
+		});
+
+		const disposing = harness.service.dispose();
+		firstRead.resolve(makeState([]));
+		await disposing;
+		// Give a (buggy) reconcile that kept going time to reach /w2.
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(loads).toEqual(["/w1"]);
+	});
+
+	it("clears the tick timer", async () => {
+		vi.useFakeTimers();
+		try {
+			const harness = makeService();
+			harness.service.start();
+			expect(vi.getTimerCount()).toBeGreaterThan(0);
+			await harness.service.dispose();
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("stops waiting for stuck work after the grace period", async () => {
+		vi.useFakeTimers();
+		try {
+			const stuck = deferredState();
+			const harness = makeService({ loadWorkspaceState: () => stuck.promise });
+			void harness.service.refreshWorkspace(scope);
+			const disposing = harness.service.dispose();
+			await vi.advanceTimersByTimeAsync(60_000);
+			await disposing;
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });
