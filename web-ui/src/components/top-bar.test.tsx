@@ -229,7 +229,9 @@ describe("TopBar pull request links", () => {
 		});
 
 		const anchors = Array.from(container.querySelectorAll("a"));
-		expect(anchors.map((anchor) => anchor.textContent)).toEqual(["PR #1", "PR #2", "PR #3"]);
+		// PRLINK-6: the display winner leads; equal createdAt breaks ties to the
+		// later recorded entry, so #3 wins and #1/#2 keep recorded order.
+		expect(anchors.map((anchor) => anchor.textContent)).toEqual(["PR #3", "PR #1", "PR #2"]);
 		for (const anchor of anchors) {
 			expect(anchor.getAttribute("target")).toBe("_blank");
 			expect(anchor.getAttribute("rel")).toBe("noopener noreferrer");
@@ -254,7 +256,7 @@ describe("TopBar pull request links", () => {
 		).toBeTruthy();
 	});
 
-	it("collapses more than 3 PRs into the latest 2 links plus a +N popover", async () => {
+	it("collapses more than 3 PRs into the winner plus the next link and a +N popover", async () => {
 		const pullRequests = [1, 2, 3, 4, 5].map((number) => createTaskPullRequest(number));
 
 		await act(async () => {
@@ -267,7 +269,8 @@ describe("TopBar pull request links", () => {
 		});
 
 		const inlineAnchors = Array.from(container.querySelectorAll("a"));
-		expect(inlineAnchors.map((anchor) => anchor.textContent)).toEqual(["PR #4", "PR #5"]);
+		// PRLINK-6: winner (#5, latest recorded) stays inline with the next link.
+		expect(inlineAnchors.map((anchor) => anchor.textContent)).toEqual(["PR #5", "PR #1"]);
 
 		const overflowButton = Array.from(container.querySelectorAll("button")).find(
 			(button) => button.textContent?.trim() === "+3",
@@ -281,7 +284,7 @@ describe("TopBar pull request links", () => {
 		});
 
 		const allAnchors = Array.from(document.body.querySelectorAll("a"));
-		expect(allAnchors.map((anchor) => anchor.textContent)).toEqual(["PR #4", "PR #5", "PR #1", "PR #2", "PR #3"]);
+		expect(allAnchors.map((anchor) => anchor.textContent)).toEqual(["PR #5", "PR #1", "PR #2", "PR #3", "PR #4"]);
 	});
 
 	it("renders GitLab pull requests with the MR prefix", async () => {

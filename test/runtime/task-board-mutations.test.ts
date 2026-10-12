@@ -13,6 +13,7 @@ import {
 	deleteTasksFromBoard,
 	moveTaskToColumn,
 	removeTaskPullRequest,
+	setPrimaryTaskPullRequest,
 	trashTaskAndGetReadyLinkedTaskIds,
 	updateTask,
 	updateTaskPullRequestSnapshot,
@@ -414,6 +415,9 @@ describe("task pull request links (PRLINK-0)", () => {
 				url: "https://github.com/owner/repo/pull/12",
 				source: "delivery",
 				createdAt: 1000,
+				// New record seeded lastSeenAt to createdAt; the backfilled
+				// observation at now=3000 advanced it in the same write.
+				lastSeenAt: 3000,
 				title: "Fix bug",
 				state: "open",
 				stateCheckedAt: 2000,
@@ -424,10 +428,23 @@ describe("task pull request links (PRLINK-0)", () => {
 
 	it("is a no-op when the incoming links are already stored verbatim", () => {
 		const board = taskWithId(createBoard(), "task-1");
-		const first = addTaskPullRequests(board, "task-1", [createPullRequest()]);
-		const repeat = addTaskPullRequests(first.board, "task-1", [createPullRequest()]);
+		const first = addTaskPullRequests(board, "task-1", [createPullRequest()], 1000);
+		// PRLINK-6: a duplicate observation inside the coalescing window
+		// (less than 600s) is a no-op with no revision bump.
+		const repeat = addTaskPullRequests(first.board, "task-1", [createPullRequest()], 1100);
 		expect(repeat.added).toBe(false);
 		expect(repeat.board).toBe(first.board);
+
+		// Once the coalescing window has passed, the observation advances
+		// lastSeenAt and saves.
+		const advanced = addTaskPullRequests(first.board, "task-1", [createPullRequest()], 1000 + 600_000);
+		expect(advanced.added).toBe(true);
+		expect(advanced.task?.pullRequests?.[0]?.lastSeenAt).toBe(1000 + 600_000);
+
+		// A clock regression never moves lastSeenAt backward.
+		const regressed = addTaskPullRequests(advanced.board, "task-1", [createPullRequest()], 1000 + 600_001);
+		expect(regressed.added).toBe(false);
+		expect(regressed.board).toBe(advanced.board);
 	});
 
 	it("preserves first-appearance order across interleaved adds", () => {
@@ -489,6 +506,116 @@ describe("task pull request links (PRLINK-0)", () => {
 	});
 });
 
+describe("setPrimaryTaskPullRequest (PRLINK-6)", () => {
+	it("sets exactly one explicit primary and clears the rest", () => {
+		const first = createPullRequest({ number: 1, url: "https://github.com/owner/repo/pull/1" });
+		const second = createPullRequest({ number: 2, url: "https://github.com/owner/repo/pull/2" });
+		const board = boardWithTaskPullRequests(taskWithId(createBoard(), "task-1"), "task-1", [first, second]);
+
+		const result = setPrimaryTaskPullRequest(board, "task-1", getPullRequestIdentityKey(second), 4000);
+		expect(result.updated).toBe(true);
+		expect(result.task?.pullRequests).toEqual([first, { ...second, isPrimary: true }]);
+		expect(result.task?.updatedAt).toBe(4000);
+	});
+
+	it("normalizes malformed data with several explicit primaries to the selected one", () => {
+		const first = createPullRequest({ number: 1, url: "https://github.com/owner/repo/pull/1", isPrimary: true });
+		const second = createPullRequest({ number: 2, url: "https://github.com/owner/repo/pull/2", isPrimary: true });
+		const board = boardWithTaskPullRequests(taskWithId(createBoard(), "task-1"), "task-1", [first, second]);
+
+		const result = setPrimaryTaskPullRequest(board, "task-1", getPullRequestIdentityKey(first));
+		expect(result.updated).toBe(true);
+		expect(result.task?.pullRequests).toEqual([
+			{ ...first, isPrimary: true },
+			{ ...second, isPrimary: undefined },
+		]);
+	});
+
+	it("is a no-op when the chosen entry is already the sole explicit primary", () => {
+		const primary = createPullRequest({ isPrimary: true });
+		const board = boardWithTaskPullRequests(taskWithId(createBoard(), "task-1"), "task-1", [primary]);
+
+		const result = setPrimaryTaskPullRequest(board, "task-1", getPullRequestIdentityKey(primary));
+		expect(result.updated).toBe(false);
+		expect(result.board).toBe(board);
+	});
+
+	it("clears every explicit flag with a null identity key", () => {
+		const primary = createPullRequest({ number: 1, url: "https://github.com/owner/repo/pull/1", isPrimary: true });
+		const other = createPullRequest({ number: 2, url: "https://github.com/owner/repo/pull/2" });
+		const board = boardWithTaskPullRequests(taskWithId(createBoard(), "task-1"), "task-1", [primary, other]);
+
+		const result = setPrimaryTaskPullRequest(board, "task-1", null, 5000);
+		expect(result.updated).toBe(true);
+		expect(result.task?.pullRequests).toEqual([{ ...primary, isPrimary: undefined }, other]);
+	});
+
+	it("is a no-op when clearing a task without explicit primaries", () => {
+		const board = boardWithTaskPullRequests(taskWithId(createBoard(), "task-1"), "task-1", [createPullRequest()]);
+		const result = setPrimaryTaskPullRequest(board, "task-1", null);
+		expect(result.updated).toBe(false);
+		expect(result.board).toBe(board);
+	});
+
+	it("is a no-op for unknown tasks and unknown identity keys", () => {
+		const board = taskWithId(createBoard(), "task-1");
+		const unknownTask = setPrimaryTaskPullRequest(board, "nope", "github|github.com|owner/repo|12");
+		expect(unknownTask.updated).toBe(false);
+		expect(unknownTask.task).toBeNull();
+
+		const boardWithLinks = boardWithTaskPullRequests(board, "task-1", [createPullRequest()]);
+		const unknownKey = setPrimaryTaskPullRequest(boardWithLinks, "task-1", "github|github.com|other/repo|99");
+		expect(unknownKey.updated).toBe(false);
+		expect(unknownKey.board).toBe(boardWithLinks);
+	});
+});
+
+describe("pull request cap protection (PRLINK-6)", () => {
+	it("protects the explicit display primary and the selected Automation PR from eviction", () => {
+		const seed = Array.from({ length: 18 }, (_, index) =>
+			createPullRequest({
+				number: index + 1,
+				url: `https://github.com/owner/repo/pull/${index + 1}`,
+				createdAt: 1000 + index,
+			}),
+		);
+		// Entry 19 is the explicit display primary; entry 20 is the selected
+		// Automation PR. Both must survive eviction of entry 1 (oldest unprotected non-manual).
+		const primaryEntry = createPullRequest({
+			number: 19,
+			url: "https://github.com/owner/repo/pull/19",
+			isPrimary: true,
+		});
+		const automationEntry = createPullRequest({ number: 20, url: "https://github.com/owner/repo/pull/20" });
+		const board = boardWithTaskPullRequests(taskWithId(createBoard(), "task-1"), "task-1", [
+			...seed,
+			primaryEntry,
+			automationEntry,
+		]);
+		const protectedBoard: RuntimeBoardData = {
+			...board,
+			columns: board.columns.map((column) => ({
+				...column,
+				cards: column.cards.map((card) =>
+					card.id === "task-1"
+						? { ...card, selectedAutomationPrKey: getPullRequestIdentityKey(automationEntry) }
+						: card,
+				),
+			})),
+		};
+
+		const added = addTaskPullRequests(protectedBoard, "task-1", [
+			createPullRequest({ number: 21, url: "https://github.com/owner/repo/pull/21" }),
+		]);
+		const numbers = added.task?.pullRequests?.map((pr) => pr.number) ?? [];
+		expect(numbers).toHaveLength(20);
+		expect(numbers[0]).toBe(2); // oldest unprotected dropped; #1 protected? No: #1 unprotected -> dropped
+		expect(numbers).toContain(19); // explicit primary survived
+		expect(numbers).toContain(20); // selected Automation PR survived
+		expect(numbers).toContain(21);
+		expect(added.task?.selectedAutomationPrKey).toBe(getPullRequestIdentityKey(automationEntry));
+	});
+});
 describe("removeTaskPullRequest / updateTaskPullRequestSnapshot (PRLINK-0)", () => {
 	it("removes by identity key case-insensitively and is a no-op for unknown identities", () => {
 		const stored = createPullRequest({ host: "GITHUB.COM", repository: "Owner/Repo" });
@@ -519,17 +646,26 @@ describe("removeTaskPullRequest / updateTaskPullRequestSnapshot (PRLINK-0)", () 
 		const board = boardWithTaskPullRequests(taskWithId(createBoard(), "task-1"), "task-1", [stored]);
 		const identityKey = getPullRequestIdentityKey(stored);
 
+		// PRLINK-6: a successful observation write also advances lastSeenAt.
 		const updated = updateTaskPullRequestSnapshot(board, "task-1", identityKey, { title: "Fix bug" }, 7000);
 		expect(updated.updated).toBe(true);
-		expect(updated.task?.pullRequests).toEqual([{ ...stored, title: "Fix bug", stateCheckedAt: 7000 }]);
+		expect(updated.task?.pullRequests).toEqual([
+			{ ...stored, title: "Fix bug", stateCheckedAt: 7000, lastSeenAt: 7000 },
+		]);
 
-		const restamped = updateTaskPullRequestSnapshot(updated.board, "task-1", identityKey, {
-			state: "merged",
-			stateCheckedAt: 9000,
-		});
+		const restamped = updateTaskPullRequestSnapshot(
+			updated.board,
+			"task-1",
+			identityKey,
+			{
+				state: "merged",
+				stateCheckedAt: 9000,
+			},
+			9500,
+		);
 		expect(restamped.updated).toBe(true);
 		expect(restamped.task?.pullRequests).toEqual([
-			{ ...stored, title: "Fix bug", state: "merged", stateCheckedAt: 9000 },
+			{ ...stored, title: "Fix bug", state: "merged", stateCheckedAt: 9000, lastSeenAt: 9500 },
 		]);
 	});
 

@@ -5,7 +5,12 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import type { RuntimeBoardData, RuntimeTaskPullRequest, RuntimeTaskSessionSummary } from "../../src/core/api-contract";
-import { addTaskPullRequests, updateTaskPrSettings } from "../../src/core/task-board-mutations";
+import { getPullRequestIdentityKey } from "../../src/core/pull-request-links";
+import {
+	addTaskPullRequests,
+	setPrimaryTaskPullRequest,
+	updateTaskPrSettings,
+} from "../../src/core/task-board-mutations";
 import type { WorkspaceStateConflictError } from "../../src/state/workspace-state";
 import {
 	getWorkspacesRootPath,
@@ -544,8 +549,10 @@ describe.sequential("workspace-state integration", () => {
 					return { board: result.board, value: result };
 				});
 
+				// PRLINK-6: a new record seeds lastSeenAt to its createdAt.
+				const storedLink: RuntimeTaskPullRequest = { ...recordedLink, lastSeenAt: recordedLink.createdAt };
 				const seeded = await loadWorkspaceState(workspacePath);
-				expect(seeded.board.columns[0]?.cards[0]?.pullRequests).toEqual([recordedLink]);
+				expect(seeded.board.columns[0]?.cards[0]?.pullRequests).toEqual([storedLink]);
 
 				// (a) A client board that omits the field must not erase the link.
 				const omitSave = await saveWorkspaceState(workspacePath, {
@@ -553,7 +560,7 @@ describe.sequential("workspace-state integration", () => {
 					sessions: {},
 					expectedRevision: seeded.revision,
 				});
-				expect(omitSave.board.columns[0]?.cards[0]?.pullRequests).toEqual([recordedLink]);
+				expect(omitSave.board.columns[0]?.cards[0]?.pullRequests).toEqual([storedLink]);
 
 				// (b) A stale client list must not overwrite the recorded link.
 				const staleSave = await saveWorkspaceState(workspacePath, {
@@ -563,7 +570,7 @@ describe.sequential("workspace-state integration", () => {
 					sessions: {},
 					expectedRevision: omitSave.revision,
 				});
-				expect(staleSave.board.columns[0]?.cards[0]?.pullRequests).toEqual([recordedLink]);
+				expect(staleSave.board.columns[0]?.cards[0]?.pullRequests).toEqual([storedLink]);
 
 				// (c) A brand-new card must never accept client-supplied pullRequests.
 				const now = Date.now();
@@ -598,14 +605,36 @@ describe.sequential("workspace-state integration", () => {
 					expectedRevision: staleSave.revision,
 				});
 				const savedCards = newCardSave.board.columns.flatMap((column) => column.cards);
-				expect(savedCards.find((card) => card.id === "task-1")?.pullRequests).toEqual([recordedLink]);
+				expect(savedCards.find((card) => card.id === "task-1")?.pullRequests).toEqual([storedLink]);
 				expect(savedCards.find((card) => card.id === "task-2")?.pullRequests).toBeUndefined();
 
 				const loaded = await loadWorkspaceState(workspacePath);
 				expect(
 					loaded.board.columns.flatMap((column) => column.cards).find((card) => card.id === "task-1")
 						?.pullRequests,
-				).toEqual([recordedLink]);
+				).toEqual([storedLink]);
+
+				// (d) PRLINK-6: the display-only primary flag round-trips, and
+				// a stale client save cannot forge or drop it.
+				await mutateWorkspaceState(workspacePath, (state) => {
+					const result = setPrimaryTaskPullRequest(state.board, "task-1", getPullRequestIdentityKey(recordedLink));
+					if (!result.updated) {
+						throw new Error("Expected the display primary to be set.");
+					}
+					return { board: result.board, value: result };
+				});
+				const primaryLink: RuntimeTaskPullRequest = { ...storedLink, isPrimary: true };
+				const primaryLoad = await loadWorkspaceState(workspacePath);
+				expect(primaryLoad.board.columns[0]?.cards[0]?.pullRequests).toEqual([primaryLink]);
+
+				const forgedSave = await saveWorkspaceState(workspacePath, {
+					board: boardWithTaskPullRequests(primaryLoad.board, "task-1", [
+						{ ...storedLink, number: 7, url: "https://github.com/owner/repo/pull/7", isPrimary: true },
+					]),
+					sessions: {},
+					expectedRevision: primaryLoad.revision,
+				});
+				expect(forgedSave.board.columns[0]?.cards[0]?.pullRequests).toEqual([primaryLink]);
 			} finally {
 				cleanup();
 			}

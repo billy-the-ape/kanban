@@ -4,8 +4,10 @@ import type {
 	RuntimeBoardData,
 	RuntimeProjectSummary,
 	RuntimeProjectTaskCounts,
+	RuntimeTaskSessionSummary,
 	RuntimeWorkspaceStateResponse,
 } from "../core/api-contract";
+import { resolveWorkspaceSessionSummaries } from "../core/workspace-session-summaries";
 import {
 	listWorkspaceIndexEntries,
 	loadWorkspaceBoardById,
@@ -40,6 +42,7 @@ export interface ResolvedWorkspaceStreamTarget {
 }
 
 export interface WorkspaceRegistry {
+	setClineSessionSummaryProvider?: (provider: (workspaceId: string) => RuntimeTaskSessionSummary[]) => void;
 	getActiveWorkspaceId: () => string | null;
 	getActiveWorkspacePath: () => string | null;
 	getWorkspacePathById: (workspaceId: string) => string | null;
@@ -192,6 +195,7 @@ export async function createWorkspaceRegistry(deps: CreateWorkspaceRegistryDepen
 	const projectTaskCountsByWorkspaceId = new Map<string, RuntimeProjectTaskCounts>();
 	const terminalManagersByWorkspaceId = new Map<string, TerminalSessionManager>();
 	const terminalManagerLoadPromises = new Map<string, Promise<TerminalSessionManager>>();
+	let getClineSessionSummaries: (workspaceId: string) => RuntimeTaskSessionSummary[] = () => [];
 
 	const rememberWorkspace = (workspaceId: string, repoPath: string): void => {
 		workspacePathsById.set(workspaceId, repoPath);
@@ -288,10 +292,11 @@ export async function createWorkspaceRegistry(deps: CreateWorkspaceRegistryDepen
 				projectTaskCountsByWorkspaceId.set(workspaceId, persistedCounts);
 				return persistedCounts;
 			}
-			const liveSessionsByTaskId: RuntimeWorkspaceStateResponse["sessions"] = {};
-			for (const summary of terminalManager.listSummaries()) {
-				liveSessionsByTaskId[summary.taskId] = summary;
-			}
+			const liveSessionsByTaskId = resolveWorkspaceSessionSummaries(
+				{},
+				terminalManager,
+				getClineSessionSummaries(workspaceId),
+			);
 			const nextCounts = applyLiveSessionStateToProjectTaskCounts(persistedCounts, board, liveSessionsByTaskId);
 			projectTaskCountsByWorkspaceId.set(workspaceId, nextCounts);
 			return nextCounts;
@@ -306,9 +311,11 @@ export async function createWorkspaceRegistry(deps: CreateWorkspaceRegistryDepen
 	): Promise<RuntimeWorkspaceStateResponse> => {
 		const response = await loadWorkspaceState(workspacePath);
 		const terminalManager = await ensureTerminalManagerForWorkspace(workspaceId, workspacePath);
-		for (const summary of terminalManager.listSummaries()) {
-			response.sessions[summary.taskId] = summary;
-		}
+		response.sessions = resolveWorkspaceSessionSummaries(
+			response.sessions,
+			terminalManager,
+			getClineSessionSummaries(workspaceId),
+		);
 		return response;
 	};
 
@@ -444,6 +451,9 @@ export async function createWorkspaceRegistry(deps: CreateWorkspaceRegistryDepen
 		summarizeProjectTaskCounts,
 		createProjectSummary: toProjectSummary,
 		buildWorkspaceStateSnapshot,
+		setClineSessionSummaryProvider: (provider) => {
+			getClineSessionSummaries = provider;
+		},
 		buildProjectsPayload,
 		resolveWorkspaceForStream,
 		listManagedWorkspaces: () => {

@@ -6,6 +6,32 @@ const GH_PR_URL = "https://github.com/owner/repo/pull/12";
 const GLAB_MR_URL = "https://gitlab.com/group/project/-/merge_requests/7";
 
 describe("detectCreatedPullRequests", () => {
+	it("decodes the structured command result used by PRLINK-6", () => {
+		const command =
+			"cat > /tmp/pr-body.md << 'EOF'\nBody\nEOF\ncd repo && gh pr create --body-file /tmp/pr-body.md 2>&1";
+		const url = "https://github.com/billy-the-ape/kanban/pull/72";
+		expect(
+			detectCreatedPullRequests({
+				toolName: "run_commands",
+				commands: [command],
+				output: JSON.stringify([{ query: command, result: `${url}\n`, success: true }]),
+			}).map((link) => link.url),
+		).toEqual([url]);
+	});
+
+	it("reads structured stderr without adopting query URLs or other commands' results", () => {
+		const command = "gh pr create --body https://github.com/owner/repo/pull/99";
+		expect(
+			detectCreatedPullRequests({
+				toolName: "run_commands",
+				commands: [command, "gh pr view 88"],
+				output: JSON.stringify([
+					{ query: command, result: "", success: false, error: `Already exists:\n${GH_PR_URL}\n` },
+					{ query: "gh pr view 88", result: "https://github.com/owner/repo/pull/88\n", success: true },
+				]),
+			}).map((link) => link.url),
+		).toEqual([GH_PR_URL]);
+	});
 	it("extracts the PR URL from a successful gh pr create", () => {
 		const links = detectCreatedPullRequests({
 			toolName: "run_commands",

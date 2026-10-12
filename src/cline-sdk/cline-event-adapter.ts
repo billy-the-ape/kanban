@@ -655,7 +655,7 @@ export function applyClineSessionEvent(input: ApplyClineSessionEventInput): void
 		emitSummary(input, summaryPatch);
 		// PRLINK-1: surface the finished tool to observers (PR-creation
 		// detection). The adapter stays pure; the observer does the I/O.
-		input.onToolFinished?.({ toolName, toolInput, output: toToolOutputText(toolOutput), error: toolError });
+		notifyToolFinished(input, { toolName, toolInput, output: toToolOutputText(toolOutput), error: toolError });
 		return;
 	}
 
@@ -734,6 +734,7 @@ export function applyClineSessionEvent(input: ApplyClineSessionEventInput): void
 			summaryPatch.reviewReason = null;
 		}
 		emitSummary(input, summaryPatch);
+		notifyToolFinished(input, { toolName, toolInput, output: toToolOutputText(toolOutput), error: toolError });
 		return;
 	}
 
@@ -837,6 +838,14 @@ export function applyClineSessionEvent(input: ApplyClineSessionEventInput): void
 					: entry.summary.state,
 			lastOutputAt: now(),
 		});
+	}
+}
+
+function notifyToolFinished(input: ApplyClineSessionEventInput, tool: ClineToolFinishedInfo): void {
+	try {
+		input.onToolFinished?.(tool);
+	} catch (error) {
+		process.stderr.write(`[cline-tool-observer] task ${input.taskId}: ${String(error)}\n`);
 	}
 }
 

@@ -18,12 +18,14 @@ import {
 	parseGitCheckoutRequest,
 	parseTaskPreservationRequest,
 	parseTaskPullRequestLinkRequest,
+	parseTaskPullRequestPrimaryRequest,
 	parseTaskPullRequestsRefreshRequest,
 	parseWorktreeDeleteRequest,
 	parseWorktreeEnsureRequest,
 } from "../core/api-validation";
 import { getPullRequestIdentityKey, parsePullRequestUrl } from "../core/pull-request-links";
-import { removeTaskPullRequest } from "../core/task-board-mutations";
+import { removeTaskPullRequest, setPrimaryTaskPullRequest } from "../core/task-board-mutations";
+import { resolveWorkspaceSessionSummaries } from "../core/workspace-session-summaries";
 import { isTaskWriterActive } from "../server/task-writer-activity";
 import {
 	loadWorkspaceBoardById,
@@ -118,32 +120,12 @@ function normalizeRequiredTaskWorkspaceScopeInput(input: {
 	};
 }
 
-function isActiveTaskSessionState(summary: RuntimeTaskSessionSummary | null): boolean {
-	return summary?.state === "running" || summary?.state === "awaiting_review";
-}
-
 function selectLastTurnSummary(
 	terminalSummary: RuntimeTaskSessionSummary | null,
 	clineSummary: RuntimeTaskSessionSummary | null,
+	terminalHasActiveProcess: boolean,
 ): RuntimeTaskSessionSummary | null {
-	if (!terminalSummary) {
-		return clineSummary;
-	}
-	if (!clineSummary) {
-		return terminalSummary;
-	}
-	const terminalIsActive = isActiveTaskSessionState(terminalSummary);
-	const clineIsActive = isActiveTaskSessionState(clineSummary);
-	if (terminalIsActive !== clineIsActive) {
-		return clineIsActive ? clineSummary : terminalSummary;
-	}
-	if (terminalSummary.updatedAt !== clineSummary.updatedAt) {
-		return terminalSummary.updatedAt > clineSummary.updatedAt ? terminalSummary : clineSummary;
-	}
-	if (clineSummary.agentId === "cline" && terminalSummary.agentId !== "cline") {
-		return clineSummary;
-	}
-	return terminalSummary;
+	return terminalHasActiveProcess ? terminalSummary : (clineSummary ?? terminalSummary);
 }
 
 function createEmptyGitSummaryErrorResponse(error: unknown): RuntimeGitSummaryResponse {
@@ -332,6 +314,7 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 				const summary = selectLastTurnSummary(
 					terminalManager.getSummary(normalizedInput.taskId),
 					clineTaskSessionService.getSummary(normalizedInput.taskId),
+					terminalManager.hasActiveProcess?.(normalizedInput.taskId) === true,
 				);
 				const fromCheckpoint = summary?.previousTurnCheckpoint;
 				const toCheckpoint = summary?.latestTurnCheckpoint;
@@ -446,9 +429,15 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 					workspaceScope.workspaceId,
 					workspaceScope.workspacePath,
 				);
-				for (const summary of terminalManager.listSummaries()) {
-					input.sessions[summary.taskId] = summary;
-				}
+				const clineService = await deps.getScopedClineTaskSessionService(workspaceScope);
+				input = {
+					...input,
+					sessions: resolveWorkspaceSessionSummaries(
+						input.sessions,
+						terminalManager,
+						clineService.listSummaries(),
+					),
+				};
 				// PRLINK-5: capture the pre-save board so we can detect cards that
 				// just moved into Review without PRs (best-effort lookup trigger).
 				const previousBoard = await loadWorkspaceBoardById(workspaceScope.workspaceId);
@@ -621,6 +610,88 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 							error: "No matching pull request is recorded for this task.",
 							pullRequest: null,
 						} satisfies RuntimeTaskPullRequestLinkResponse);
+			} catch (error) {
+				return {
+					ok: false,
+					error: error instanceof Error ? error.message : String(error),
+					pullRequest: null,
+				} satisfies RuntimeTaskPullRequestLinkResponse;
+			}
+		},
+		// PRLINK-6: explicit display-only primary. Display preference only —
+		// never touches the Automation PR selection, settings, or tracking.
+		// `url: null` clears all explicit flags. The response reuses the
+		// link-response shape: the selected entry re-read from the board, or
+		// null when cleared.
+		setPrimaryTaskPullRequest: async (workspaceScope, input): Promise<RuntimeTaskPullRequestLinkResponse> => {
+			try {
+				const body = parseTaskPullRequestPrimaryRequest(input);
+				let identityKey: string | null;
+				if (body.url === null) {
+					identityKey = null;
+				} else {
+					const parsed = parsePullRequestUrl(body.url);
+					if (!parsed) {
+						return {
+							ok: false,
+							error: "Not a valid pull request URL.",
+							pullRequest: null,
+						} satisfies RuntimeTaskPullRequestLinkResponse;
+					}
+					identityKey = getPullRequestIdentityKey(parsed);
+				}
+				const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
+				if (!taskExistsOnBoard(board, body.taskId)) {
+					return {
+						ok: false,
+						error: `Task "${body.taskId}" not found`,
+						pullRequest: null,
+					} satisfies RuntimeTaskPullRequestLinkResponse;
+				}
+				const recorded =
+					board.columns.flatMap((column) => column.cards).find((card) => card.id === body.taskId)?.pullRequests ??
+					[];
+				if (identityKey !== null && !recorded.some((entry) => getPullRequestIdentityKey(entry) === identityKey)) {
+					return {
+						ok: false,
+						error: "That pull request is not linked to this task.",
+						pullRequest: null,
+					} satisfies RuntimeTaskPullRequestLinkResponse;
+				}
+				const response = await mutateWorkspaceState<boolean>(workspaceScope.workspacePath, (state) => {
+					const result = setPrimaryTaskPullRequest(state.board, body.taskId, identityKey);
+					// save: false on a no-op so a redundant choice does not bump
+					// the revision or trigger a broadcast.
+					return { board: result.board, value: result.updated, save: result.updated };
+				});
+				if (response.saved) {
+					void deps.broadcastRuntimeWorkspaceStateUpdated(
+						workspaceScope.workspaceId,
+						workspaceScope.workspacePath,
+					);
+				}
+				// Re-read the board so the response reflects the authoritative
+				// entry (or null when cleared), matching the add/remove style.
+				const authoritative =
+					(await loadWorkspaceBoardById(workspaceScope.workspaceId)).columns
+						.flatMap((column) => column.cards)
+						.find((card) => card.id === body.taskId)?.pullRequests ?? [];
+				const pullRequest =
+					identityKey === null
+						? null
+						: (authoritative.find((entry) => getPullRequestIdentityKey(entry) === identityKey) ?? null);
+				// A null result is the successful cleared state, not an error.
+				if (pullRequest === null && identityKey !== null) {
+					return {
+						ok: false,
+						error: "Could not update the display primary.",
+						pullRequest: null,
+					} satisfies RuntimeTaskPullRequestLinkResponse;
+				}
+				return {
+					ok: true,
+					pullRequest,
+				} satisfies RuntimeTaskPullRequestLinkResponse;
 			} catch (error) {
 				return {
 					ok: false,

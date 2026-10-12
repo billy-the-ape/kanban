@@ -22,7 +22,11 @@ import type { RuntimeBoardCard, RuntimeBoardData, RuntimeTaskPullRequest } from 
 import { createGitProcessEnv } from "../core/git-process-env";
 import type { ParsedPullRequestLink } from "../core/pull-request-links";
 import { getPullRequestIdentityKey, parsePullRequestUrl } from "../core/pull-request-links";
-import { addTaskPullRequests, updateTaskPullRequestSnapshot } from "../core/task-board-mutations";
+import {
+	addTaskPullRequests,
+	LAST_SEEN_OBSERVATION_THROTTLE_MS,
+	updateTaskPullRequestSnapshot,
+} from "../core/task-board-mutations";
 import { loadWorkspaceState, mutateWorkspaceState } from "../state/workspace-state";
 import { runGhCommand } from "./git-delivery";
 import { resolveTaskCwd } from "./task-worktree";
@@ -238,6 +242,8 @@ export async function lookupTaskPullRequests(input: TaskPullRequestLookupInput):
 					// repeated lookups must not churn the revision. Only compare
 					// the title when gh returned one: gh can omit it while the
 					// stored entry keeps it, which must not count as a change.
+					// A successful read also advances the throttled
+					// lastSeenAt observation timestamp in the same write.
 					const titleChanged = entry.title !== undefined && existing.title !== entry.title;
 					if (titleChanged || existing.state !== entry.state) {
 						const result = updateTaskPullRequestSnapshot(board, taskId, key, {
@@ -248,6 +254,21 @@ export async function lookupTaskPullRequests(input: TaskPullRequestLookupInput):
 						if (result.updated) {
 							board = result.board;
 							changed += 1;
+						}
+					} else {
+						// PRLINK-6: the gh read succeeded even though title and
+						// state match the stored snapshot. Coalesce duplicate
+						// observations: only write when the observation window
+						// has elapsed, never a timestamp-only write per poll.
+						const lastSeen = existing.lastSeenAt ?? existing.createdAt;
+						if (now - lastSeen >= LAST_SEEN_OBSERVATION_THROTTLE_MS) {
+							const result = updateTaskPullRequestSnapshot(board, taskId, key, {
+								lastSeenAt: now,
+							});
+							if (result.updated) {
+								board = result.board;
+								changed += 1;
+							}
 						}
 					}
 					continue;

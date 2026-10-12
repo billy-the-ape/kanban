@@ -78,6 +78,7 @@ const NOOP_RUN_AUTO_REVIEW = async (): Promise<boolean> => false;
 const NOOP_INITIAL_START_STATUS = async (): Promise<RuntimeTaskInitialStartStatusResponse | null> => null;
 
 interface HookSnapshot {
+	handleCompleteTask: () => void;
 	handleDragEnd: ReturnType<typeof useBoardInteractions>["handleDragEnd"];
 	handleRestoreTaskFromTrash: (taskId: string) => void;
 	handleStartTask: (taskId: string) => void;
@@ -155,6 +156,7 @@ function HookHarness({
 
 	useEffect(() => {
 		onSnapshot?.({
+			handleCompleteTask: actions.handleCompleteTask,
 			handleDragEnd: actions.handleDragEnd,
 			handleRestoreTaskFromTrash: actions.handleRestoreTaskFromTrash,
 			handleStartTask: actions.handleStartTask,
@@ -163,6 +165,7 @@ function HookHarness({
 			initialStartStageByTaskId: actions.initialStartStageByTaskId,
 		});
 	}, [
+		actions.handleCompleteTask,
 		actions.handleCardSelect,
 		actions.handleDragEnd,
 		actions.handleConfirmClearTrash,
@@ -218,6 +221,69 @@ describe("useBoardInteractions", () => {
 				previousActEnvironment;
 		}
 	});
+
+	it.each(["running", "idle", "interrupted"] as const)(
+		"only completes a stopped in-progress task (%s)",
+		async (state) => {
+			const complete = vi.fn(async () => {});
+			useProgrammaticCardMovesMock.mockReturnValue({
+				handleProgrammaticCardMoveReady: () => {},
+				setRequestMoveTaskToTrashHandler: () => {},
+				setRequestCompleteTaskHandler: () => {},
+				tryProgrammaticCardMove: () => "unavailable",
+				consumeProgrammaticCardMove: () => ({}),
+				resolvePendingProgrammaticTrashMove: () => {},
+				resolvePendingProgrammaticCompleteMove: () => {},
+				waitForProgrammaticCardMoveAvailability: async () => {},
+				resetProgrammaticCardMoves: () => {},
+				requestMoveTaskToTrashWithAnimation: async () => {},
+				requestCompleteTaskWithAnimation: complete,
+				programmaticCardMoveCycle: 0,
+			});
+			useLinkedBacklogTaskActionsMock.mockReturnValue({});
+			const task = createTask("7wp6m", "PRLINK-6", 1);
+			const board = createBoard();
+			board.columns = board.columns.map((column) => ({
+				...column,
+				cards: column.id === "in_progress" ? [task] : [],
+			}));
+			const summary: RuntimeTaskSessionSummary = {
+				taskId: task.id,
+				state,
+				agentId: "cline",
+				pid: null,
+				workspacePath: "/tmp/task",
+				startedAt: 1,
+				updatedAt: 2,
+				lastOutputAt: 2,
+				reviewReason: null,
+				exitCode: null,
+				lastHookAt: null,
+				latestHookActivity: null,
+			};
+			let actions: HookSnapshot | undefined;
+			await act(async () => {
+				root.render(
+					<HookHarness
+						board={board}
+						setBoard={vi.fn()}
+						ensureTaskWorkspace={vi.fn()}
+						startTaskSession={vi.fn()}
+						selectedCard={{ card: task, column: { id: "in_progress" } }}
+						initialSessions={{ [task.id]: summary }}
+						onSnapshot={(value) => {
+							actions = value;
+						}}
+					/>,
+				);
+			});
+			await act(async () => {
+				actions?.handleCompleteTask();
+			});
+			if (state === "running") expect(complete).not.toHaveBeenCalled();
+			else expect(complete).toHaveBeenCalledWith(task.id, "in_progress");
+		},
+	);
 
 	it("moves a running backlog task into In Progress when its session is hydrated", async () => {
 		useProgrammaticCardMovesMock.mockReturnValue({
