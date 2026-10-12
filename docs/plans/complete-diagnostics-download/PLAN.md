@@ -1,11 +1,11 @@
 # Complete task diagnostics as a browser download
 
-Status: implementation-ready plan; no runtime behavior changes in this PR.
+Status: DIAG-0 implemented (shipped in its own PR); DIAG-1 to DIAG-3 remain implementation-ready.
 Target: billy-the-ape/kanban main. Source baseline: `7a64060`.
 
 Implemented as four numbered briefs, each one PR / one squash commit, in this order. Deploys are manual (`.github/workflows/deploy-ai-monster.yml` is `workflow_dispatch`-only since `a7c026a`; `docs/deployment/ai-monster.md` still describes the old auto-deploy and is stale on this), but any `main` commit can be picked for a manual deploy, so each brief must leave `main` coherent and deployable:
 
-- **DIAG-0** — Expanded tool I/O visibility in the chat panel. Independent of the other briefs; immediately closes the `0e05l` editor-input visibility gap.
+- **DIAG-0** (implemented) — Expanded tool I/O visibility in the chat panel. Independent of the other briefs; immediately closes the `0e05l` editor-input visibility gap.
 - **DIAG-1** — Extract the runtime auth gate and workspace-scope resolution into a tested shared function. Behaviour-neutral; independent of DIAG-2.
 - **DIAG-2** — Additive export snapshot, schemaVersion 3 builder, streaming serializer, and the artifact sidecar index. Unwired. The schemaVersion 2 host-disk export is untouched. Independent of DIAG-1.
 - **DIAG-3** — HTTP download route after the extracted gate, browser download, CLI repoint, old contract/consumer removal, and docs. Depends on DIAG-1 and DIAG-2.
@@ -73,6 +73,15 @@ In the expanded tool block, retain the existing readable `run_commands` renderin
 - Archived full outputs need not be loaded into every chat block; the export includes them.
 
 Tests (ship with DIAG-0): expanded editor block shows actual input with `old_text` present/absent; outputs and errors; `run_commands` readability unchanged; hostile markup displays as text; a raw output line that is exactly `Error:` is handled per the noted limitation.
+
+Implementation state (as shipped):
+
+- `formatToolInputForDisplay` returns the exact recorded input for every non-`run_commands` tool: pretty-printed when it parses as a JSON object/array (strings stay escaped), otherwise the raw recorded text. The `run_commands` command-list rendering and its null cases (invalid JSON, empty `commands`) are unchanged.
+- The expanded input section is hard-labelled `Command` for `run_commands` and `Input` for every other tool (`getToolInputSectionLabel`).
+- Structured per-operation errors from a `ToolOperationResult` get their own `Error` label inside the result block, distinct from the tool-level (SDK-level) `Error:` section.
+- Output and error section labels gain an `(excerpt)` suffix when the persisted prose contains a bounding marker (`Full content:`, `full output:`, `[truncated` — `isExcerptedToolText`).
+- All recorded content renders as selectable text in scrollable `<pre>` blocks; nothing is HTML-parsed. Collapsed summaries are unchanged.
+- The `Error:`-line mis-sectioning limitation is documented on `parseToolMessageContent` and pinned by a test. Tests live in `web-ui/src/components/detail-panels/cline-chat-message-item.test.tsx` and the extended `cline-chat-message-utils.test.ts` (all scenarios above covered).
 
 ### DIAG-1: Extract the runtime auth gate (1 PR, behaviour-neutral)
 

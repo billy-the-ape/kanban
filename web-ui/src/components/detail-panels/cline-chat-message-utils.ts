@@ -28,9 +28,12 @@ export function getToolDisplay(toolName: string, input: string | null): ClineToo
 }
 
 /**
- * Formats the raw tool input into a human-readable string for the expanded view.
- * For tools like run_commands, this extracts the full command list so users can
- * see the complete commands that were executed.
+ * Formats the raw tool input into a string for the expanded view.
+ * For run_commands, this extracts the full command list so users can see the complete
+ * commands that were executed (readability preserved from the original behaviour).
+ * For every other tool, the exact recorded input is shown: pretty-printed when it parses
+ * as a JSON object/array, otherwise the raw recorded text. Recorded input must not
+ * disappear solely because the tool is not run_commands.
  * Returns null when the input adds no value beyond the collapsed summary.
  */
 export function formatToolInputForDisplay(toolName: string, input: string | null): string | null {
@@ -38,26 +41,52 @@ export function formatToolInputForDisplay(toolName: string, input: string | null
 		return null;
 	}
 
-	try {
-		const parsed: unknown = JSON.parse(input);
-		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-			return null;
-		}
-		const record = parsed as Record<string, unknown>;
-		const normalized = toolName.toLowerCase().replace(/[^a-z]/g, "");
+	const normalized = toolName.toLowerCase().replace(/[^a-z]/g, "");
 
-		if (normalized === "runcommands" && Array.isArray(record.commands)) {
-			const commands = record.commands.map((cmd) => String(cmd)).filter((cmd) => cmd.length > 0);
-			if (commands.length === 0) {
-				return null;
+	if (normalized === "runcommands") {
+		try {
+			const parsed: unknown = JSON.parse(input);
+			if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+				const record = parsed as Record<string, unknown>;
+				if (Array.isArray(record.commands)) {
+					const commands = record.commands.map((cmd) => String(cmd)).filter((cmd) => cmd.length > 0);
+					if (commands.length > 0) {
+						return commands.join("\n");
+					}
+				}
 			}
-			return commands.join("\n");
+		} catch {
+			// Invalid JSON: run_commands has no readable command view.
 		}
-	} catch {
 		return null;
 	}
 
-	return null;
+	try {
+		const parsed: unknown = JSON.parse(input);
+		if (typeof parsed === "object" && parsed !== null) {
+			return JSON.stringify(parsed, null, 2);
+		}
+	} catch {
+		// Raw (non-JSON) input: show the recorded text as-is.
+	}
+	return input;
+}
+
+/**
+ * Section label for the expanded tool input block: "Command" for run_commands
+ * (readable joined commands), "Input" for every other tool (recorded JSON).
+ */
+export function getToolInputSectionLabel(toolName: string): string {
+	return toolName.toLowerCase().replace(/[^a-z]/g, "") === "runcommands" ? "Command" : "Input";
+}
+
+/**
+ * Detects persisted excerpts in tool output/error prose: the `Full content:` reference,
+ * the `full output: <path>` reference, or a `...[truncated ...]` marker written by the
+ * tool-result bounding hook. Used only to label the UI section as an excerpt.
+ */
+export function isExcerptedToolText(text: string): boolean {
+	return text.includes("Full content:") || text.includes("full output:") || text.includes("[truncated");
 }
 
 export interface ToolOutputResult {
@@ -121,6 +150,16 @@ function normalizeSectionValue(lines: string[]): string | null {
 	return value.length > 0 ? value : null;
 }
 
+/**
+ * Parses the persisted line-oriented tool message format (Tool:/Input:/Output:/Error:/
+ * Duration: sections).
+ *
+ * Known limitation: section detection matches lines that are exactly `Input:`, `Output:`,
+ * `Error:`, or start with `Tool:` / `Duration:`. A raw (non-JSON) string output containing
+ * a line that is exactly `Error:` (or another section prefix) will be mis-sectioned.
+ * Pretty-printed JSON inputs/outputs are safe because JSON strings are escaped. The
+ * diagnostics export deliberately avoids this parsing.
+ */
 export function parseToolMessageContent(content: string): ParsedToolMessageContent {
 	const lines = content.split("\n");
 	let toolName = "unknown";

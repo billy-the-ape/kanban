@@ -4,7 +4,9 @@ import {
 	formatToolInputForDisplay,
 	getCompletedAssistantMessageId,
 	getToolDisplay,
+	getToolInputSectionLabel,
 	getToolSummary,
+	isExcerptedToolText,
 	parseToolMessageContent,
 } from "@/components/detail-panels/cline-chat-message-utils";
 import type { ClineChatMessage } from "@/hooks/use-cline-chat-session";
@@ -130,9 +132,36 @@ describe("formatToolInputForDisplay", () => {
 		);
 	});
 
-	it("returns null for non-run_commands tools", () => {
+	it("shows the pretty-printed recorded JSON input for non-run_commands tools", () => {
 		const input = JSON.stringify({ file_paths: ["/tmp/a.ts"] });
-		expect(formatToolInputForDisplay("read_files", input)).toBeNull();
+		expect(formatToolInputForDisplay("read_files", input)).toBe('{\n  "file_paths": [\n    "/tmp/a.ts"\n  ]\n}');
+	});
+
+	it("shows the recorded editor input with old_text present", () => {
+		const input = JSON.stringify({ path: "/tmp/app.ts", old_text: "foo", new_text: "bar" });
+		const formatted = formatToolInputForDisplay("editor", input);
+		expect(formatted).not.toBeNull();
+		expect(formatted).toContain('"old_text": "foo"');
+		expect(formatted).toContain('"new_text": "bar"');
+		expect(formatted).toContain('"path": "/tmp/app.ts"');
+	});
+
+	it("shows the recorded editor input without old_text when it is omitted", () => {
+		const input = JSON.stringify({ path: "/tmp/new.ts", new_text: "hello" });
+		const formatted = formatToolInputForDisplay("editor", input);
+		expect(formatted).not.toBeNull();
+		expect(formatted).toContain('"new_text": "hello"');
+		expect(formatted).not.toContain("old_text");
+	});
+
+	it("shows the recorded JSON array input for non-run_commands tools", () => {
+		expect(formatToolInputForDisplay("readfiles", JSON.stringify(["/tmp/a.ts", "/tmp/b.ts"]))).toBe(
+			'[\n  "/tmp/a.ts",\n  "/tmp/b.ts"\n]',
+		);
+	});
+
+	it("shows the raw input for non-JSON input of non-run_commands tools", () => {
+		expect(formatToolInputForDisplay("ask_question", "plain recorded text")).toBe("plain recorded text");
 	});
 
 	it("returns null for null input", () => {
@@ -146,6 +175,49 @@ describe("formatToolInputForDisplay", () => {
 	it("returns null for empty commands array", () => {
 		const input = JSON.stringify({ commands: [] });
 		expect(formatToolInputForDisplay("run_commands", input)).toBeNull();
+	});
+});
+
+describe("getToolInputSectionLabel", () => {
+	it("labels run_commands input as Command", () => {
+		expect(getToolInputSectionLabel("run_commands")).toBe("Command");
+	});
+
+	it("labels every other tool input as Input", () => {
+		expect(getToolInputSectionLabel("editor")).toBe("Input");
+		expect(getToolInputSectionLabel("Read")).toBe("Input");
+	});
+});
+
+describe("isExcerptedToolText", () => {
+	it("detects the Full content: artifact reference", () => {
+		expect(isExcerptedToolText("head of output\nFull content: /tmp/artifact.txt")).toBe(true);
+	});
+
+	it("detects the full output: artifact reference", () => {
+		expect(isExcerptedToolText("... [truncated 100 lines; full output: /tmp/artifact.txt]")).toBe(true);
+	});
+
+	it("detects the truncated marker without an artifact reference", () => {
+		expect(isExcerptedToolText("... [truncated 100 lines]")).toBe(true);
+	});
+
+	it("does not flag complete output", () => {
+		expect(isExcerptedToolText("all output here")).toBe(false);
+	});
+});
+
+describe("parseToolMessageContent known limitation", () => {
+	it("mis-sections a raw output line that is exactly Error: (documented limitation)", () => {
+		// A line that is exactly `Error:` switches the parser to the error section even
+		// when it is part of a raw (non-JSON) string output. Pretty-printed JSON inputs
+		// and outputs are unaffected because their strings are escaped.
+		const parsed = parseToolMessageContent(
+			["Tool: Bash", "Input:", "cmd", "Output:", "first output line", "Error:", "rest of raw output"].join("\n"),
+		);
+
+		expect(parsed.output).toBe("first output line");
+		expect(parsed.error).toBe("rest of raw output");
 	});
 });
 
