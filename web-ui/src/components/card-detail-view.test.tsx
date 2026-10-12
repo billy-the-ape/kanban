@@ -3,6 +3,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CardDetailView } from "@/components/card-detail-view";
+import type { RuntimeTaskSessionSummary } from "@/runtime/types";
 import { LocalStorageKey } from "@/storage/local-storage-store";
 import { TERMINAL_THEME_COLORS } from "@/terminal/theme-colors";
 import type { BoardCard, BoardColumn, CardSelection } from "@/types";
@@ -220,6 +221,50 @@ describe("CardDetailView", () => {
 				previousActEnvironment;
 		}
 	});
+
+	it.each(["running", "idle", "interrupted"] as const)(
+		"shows completion for stopped in-progress cards (%s)",
+		async (state) => {
+			const selection = createSelection();
+			selection.column = { ...selection.column, id: "in_progress" };
+			const summary: RuntimeTaskSessionSummary = {
+				taskId: selection.card.id,
+				state,
+				agentId: "cline",
+				pid: null,
+				workspacePath: "/tmp/task",
+				startedAt: 1,
+				updatedAt: 2,
+				lastOutputAt: 2,
+				reviewReason: null,
+				exitCode: null,
+				lastHookAt: null,
+				latestHookActivity: null,
+			};
+			await act(async () => {
+				root.render(
+					<CardDetailView
+						selection={selection}
+						currentProjectId="workspace-1"
+						sessionSummary={summary}
+						taskSessions={{ [summary.taskId]: summary }}
+						onSessionSummary={() => {}}
+						onCardSelect={() => {}}
+						onTaskDragEnd={() => {}}
+						onMoveToTrash={() => {}}
+						onComplete={() => {}}
+						bottomTerminalOpen={false}
+						bottomTerminalTaskId={null}
+						bottomTerminalSummary={null}
+						onBottomTerminalClose={() => {}}
+					/>,
+				);
+			});
+			expect(getLastMockFirstArg<{ showComplete: boolean }>(mockClineAgentChatPanel).showComplete).toBe(
+				state !== "running",
+			);
+		},
+	);
 
 	it("collapses the expanded diff on Escape without closing the detail view", async () => {
 		await act(async () => {

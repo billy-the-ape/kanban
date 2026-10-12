@@ -257,13 +257,13 @@ describe("createWorkspaceApi loadChanges", () => {
 		});
 	});
 
-	it("prefers the newer live cline summary over a stale terminal summary", async () => {
+	it("prefers current cline checkpoints over a stale running terminal summary", async () => {
 		const terminalManager = {
 			getSummary: vi.fn(() =>
 				createSummary({
-					state: "awaiting_review",
-					agentId: "claude",
-					updatedAt: 10,
+					state: "running",
+					agentId: "cline",
+					updatedAt: 1000,
 					latestTurnCheckpoint: {
 						turn: 2,
 						ref: "refs/kanban/checkpoints/task-1/turn/2",
@@ -527,7 +527,9 @@ describe("createWorkspaceApi PR linking (PRLINK-5)", () => {
 			broadcast,
 			api: createWorkspaceApi({
 				ensureTerminalManagerForWorkspace: vi.fn(async () => ({ listSummaries: vi.fn(() => []) }) as never),
-				getScopedClineTaskSessionService: vi.fn(async () => ({ getSummary: vi.fn(() => null) }) as never),
+				getScopedClineTaskSessionService: vi.fn(
+					async () => ({ getSummary: vi.fn(() => null), listSummaries: vi.fn(() => []) }) as never,
+				),
 				broadcastRuntimeWorkspaceStateUpdated: broadcast,
 				broadcastRuntimeProjectsUpdated: vi.fn(),
 				buildWorkspaceStateSnapshot: vi.fn(),
@@ -761,6 +763,31 @@ describe("createWorkspaceApi PR linking (PRLINK-5)", () => {
 		expect(typeof fireInput.onChanged).toBe("function");
 		fireInput.onChanged?.();
 		expect(broadcast).toHaveBeenCalledWith(scope.workspaceId, "/tmp/repo");
+	});
+
+	it("saves the current Cline owner rather than a hydrated pre-pause running summary", async () => {
+		const old = createSummary({ agentId: "cline", pid: null, updatedAt: 100 });
+		const completed = createSummary({ agentId: "cline", pid: null, state: "awaiting_review", updatedAt: 200 });
+		const board = createBoard("task-1");
+		prLinkMocks.loadWorkspaceBoardById.mockResolvedValue(board);
+		prLinkMocks.findTasksEnteringReviewWithoutPullRequests.mockReturnValue([]);
+		prLinkMocks.saveWorkspaceState.mockResolvedValue({ board, sessions: { "task-1": completed } });
+		const api = createWorkspaceApi({
+			ensureTerminalManagerForWorkspace: vi.fn(
+				async () => ({ listSummaries: () => [old], hasActiveProcess: () => false }) as never,
+			),
+			getScopedClineTaskSessionService: vi.fn(async () => ({ listSummaries: () => [completed] }) as never),
+			broadcastRuntimeWorkspaceStateUpdated: vi.fn(),
+			broadcastRuntimeProjectsUpdated: vi.fn(),
+			buildWorkspaceStateSnapshot: vi.fn(),
+		});
+		const input = { board, sessions: { "task-1": old }, expectedRevision: 1 };
+		await api.saveState(scope, input);
+		expect(prLinkMocks.saveWorkspaceState).toHaveBeenCalledWith(scope.workspacePath, {
+			...input,
+			sessions: { "task-1": completed },
+		});
+		expect(input.sessions["task-1"]).toBe(old);
 	});
 
 	it("saveState does not fire the branch lookup when no task enters review", async () => {

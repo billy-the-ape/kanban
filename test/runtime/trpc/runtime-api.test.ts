@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -138,6 +139,7 @@ import * as dispatchRecords from "../../../src/task-dispatch/dispatch-records";
 import type { RuntimeTrpcContext } from "../../../src/trpc/app-router";
 import { type CreateRuntimeApiDependencies, createRuntimeApi } from "../../../src/trpc/runtime-api";
 import * as queuedReset from "../../../src/workspace/task-queued-reset";
+import { createGitTestEnv } from "../../utilities/git-env";
 
 function createTestRuntimeApi(
 	deps: Omit<CreateRuntimeApiDependencies, "getUpdateStatus" | "runUpdateNow"> &
@@ -3083,6 +3085,70 @@ describe("createRuntimeApi update handlers", () => {
 			message: "Updated Kanban to 0.2.0.",
 		});
 		expect(runUpdateNow).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("Pause reconciles orphaned task sessions", () => {
+	let previousHome: string | undefined;
+	let previousUserProfile: string | undefined;
+	let tempHome: string;
+	beforeEach(() => {
+		previousHome = process.env.HOME;
+		previousUserProfile = process.env.USERPROFILE;
+		tempHome = mkdtempSync(join(tmpdir(), "kanban-pause-home-"));
+		process.env.HOME = tempHome;
+		process.env.USERPROFILE = tempHome;
+	});
+	afterEach(() => {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+		else process.env.USERPROFILE = previousUserProfile;
+		rmSync(tempHome, { recursive: true, force: true });
+	});
+
+	it.each([false, true])("repairs an orphan but never clears a real terminal process (active=%s)", async (active) => {
+		const cwd = join(tempHome, "repo");
+		mkdirSync(cwd);
+		execFileSync("git", ["init", "-b", "main"], { cwd, env: createGitTestEnv(), stdio: "ignore" });
+		const old = createSummary({ agentId: "cline", pid: null, startedAt: 100, updatedAt: 110 });
+		const initial = await workspaceState.loadWorkspaceState(cwd);
+		const context = await workspaceState.loadWorkspaceContext(cwd);
+		await workspaceState.saveWorkspaceState(cwd, {
+			board: initial.board,
+			sessions: { "task-1": old },
+			expectedRevision: initial.revision,
+		});
+		const terminal = { listSummaries: () => [old], hasActiveProcess: () => active };
+		const service = createClineTaskSessionServiceMock();
+		const broadcast = vi.fn();
+		const api = createTestRuntimeApi({
+			getActiveWorkspaceId: () => context.workspaceId,
+			loadScopedRuntimeConfig: async () => createRuntimeConfigState(),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: async () => terminal as never,
+			getScopedClineTaskSessionService: async () => service as never,
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+			broadcastRuntimeWorkspaceStateUpdated: broadcast,
+		});
+		const scope = { workspaceId: context.workspaceId, workspacePath: cwd };
+		const response = await api.cancelTaskChatTurn(scope, { taskId: "task-1" });
+		const saved = (await workspaceState.loadWorkspaceState(cwd)).sessions["task-1"];
+		if (active) {
+			expect(response.ok).toBe(false);
+			expect(saved).toEqual(old);
+			expect(broadcast).not.toHaveBeenCalled();
+		} else {
+			expect(response.ok).toBe(true);
+			expect(response.summary).toMatchObject({ state: "interrupted", reviewReason: "interrupted" });
+			expect(saved).toEqual(response.summary);
+			expect(saved?.workspacePath).toBe(old.workspacePath);
+			expect(broadcast).toHaveBeenCalledWith(scope.workspaceId, cwd);
+			const repeated = await api.cancelTaskChatTurn(scope, { taskId: "task-1" });
+			expect(repeated.ok).toBe(true);
+			expect(repeated.summary).toEqual(response.summary);
+		}
 	});
 });
 

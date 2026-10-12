@@ -58,7 +58,11 @@ export function isAllowedCrossColumnCardMove(
 	if ((fromColumnId === "trash" || fromColumnId === "done") && toColumnId === "review") {
 		return true;
 	}
-	if (fromColumnId === "in_progress" && toColumnId === "review" && options?.isTaskSessionRunning === false) {
+	if (
+		fromColumnId === "in_progress" &&
+		(toColumnId === "review" || toColumnId === "done") &&
+		options?.isTaskSessionRunning === false
+	) {
 		return true;
 	}
 	if (
