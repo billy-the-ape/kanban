@@ -1007,7 +1007,11 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			return null;
 		}
 		if (entry.summary.state !== "running") {
-			return null;
+			// Pause is idempotent: return the owner's stopped state so a stale
+			// client can reconcile without losing a completed turn or its history.
+			const summary = updateSummary(entry, {});
+			this.emitSummary(summary);
+			return summary;
 		}
 		this.invalidatePendingTaskTurns(taskId);
 		this.pendingTurnCancelTaskIds.add(taskId);

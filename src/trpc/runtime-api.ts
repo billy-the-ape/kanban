@@ -77,6 +77,7 @@ import { getTaskColumnId, moveTaskToColumn } from "../core/task-board-mutations"
 import { computeTaskPhase, isDeliveryResumable, type TaskPhaseInput } from "../core/task-diagnostics";
 import { buildTaskDiagnosticsExportBundle } from "../core/task-diagnostics-export";
 import { resolveTaskTitle } from "../core/task-title.js";
+import { reconcileOrphanedSessionSummary, resolveWorkspaceSessionSummaries } from "../core/workspace-session-summaries";
 import { lockedFileSystem } from "../fs/locked-file-system";
 import { openInBrowser } from "../server/browser";
 import { getRuntimeHomePath, loadWorkspaceBoardById, mutateWorkspaceState } from "../state/workspace-state";
@@ -544,9 +545,10 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			}
 			const terminalSummary = terminalManager?.getSummary(taskId) ?? null;
 			if (terminalSummary) {
+				const hasActiveProcess = terminalManager?.hasActiveProcess(taskId) === true;
 				return {
-					summary: terminalSummary,
-					active: isLiveSessionState(terminalSummary.state) && terminalManager?.hasActiveProcess(taskId) === true,
+					summary: reconcileOrphanedSessionSummary(terminalSummary, hasActiveProcess),
+					active: isLiveSessionState(terminalSummary.state) && hasActiveProcess,
 					source: "terminal",
 				};
 			}
@@ -1531,13 +1533,34 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			try {
 				const body = parseTaskChatCancelRequest(input);
 				const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
-				const summary = await clineTaskSessionService.cancelTaskTurn(body.taskId);
+				let summary = await clineTaskSessionService.cancelTaskTurn(body.taskId);
 				if (!summary) {
-					return {
-						ok: false,
-						summary: null,
-						error: "Task chat session turn is not running.",
-					};
+					const terminal = await deps.getScopedTerminalManager(workspaceScope);
+					const reconciled = await mutateWorkspaceState<RuntimeTaskSessionSummary>(
+						workspaceScope.workspacePath,
+						(state) => {
+							// Recheck ownership under the state lock: a newer turn may have
+							// started while this request was waiting. Never clear that turn.
+							const currentCline = clineTaskSessionService.getSummary(body.taskId);
+							if (currentCline) return { board: state.board, value: currentCline, save: false };
+							if (terminal.hasActiveProcess(body.taskId)) {
+								throw new Error("Task has an active terminal session; use the task's Stop control.");
+							}
+							const resolved = resolveWorkspaceSessionSummaries(state.sessions, terminal, []);
+							const stopped = resolved[body.taskId];
+							if (!stopped) throw new Error("Task chat session is not available.");
+							return {
+								board: state.board,
+								sessions: { ...state.sessions, [body.taskId]: stopped },
+								value: stopped,
+							};
+						},
+					);
+					summary = reconciled.value;
+					void deps.broadcastRuntimeWorkspaceStateUpdated?.(
+						workspaceScope.workspaceId,
+						workspaceScope.workspacePath,
+					);
 				}
 				return {
 					ok: true,
