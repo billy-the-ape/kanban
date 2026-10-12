@@ -4,6 +4,8 @@ import { type ReactElement, useEffect, useMemo, useRef, useState } from "react";
 import {
 	formatToolInputForDisplay,
 	getToolDisplay,
+	getToolInputSectionLabel,
+	isExcerptedToolText,
 	parseToolMessageContent,
 	parseToolOutput,
 } from "@/components/detail-panels/cline-chat-message-utils";
@@ -21,6 +23,9 @@ function ToolMessageBlock({ message }: { message: ClineChatMessage }): ReactElem
 
 	const toolDisplay = useMemo(() => getToolDisplay(parsed.toolName, parsed.input), [parsed.toolName, parsed.input]);
 	const toolOutput = useMemo(() => (parsed.output ? parseToolOutput(parsed.output) : null), [parsed.output]);
+	// Persisted bounded output is labelled as an excerpt so users know it is not the full result.
+	const outputExcerptSuffix = parsed.output && isExcerptedToolText(parsed.output) ? " (excerpt)" : "";
+	const errorExcerptSuffix = parsed.error && isExcerptedToolText(parsed.error) ? " (excerpt)" : "";
 	const fullInput = useMemo(
 		() => formatToolInputForDisplay(parsed.toolName, parsed.input),
 		[parsed.toolName, parsed.input],
@@ -74,10 +79,12 @@ function ToolMessageBlock({ message }: { message: ClineChatMessage }): ReactElem
 
 			{expanded ? (
 				<div className="mt-1 space-y-1.5 pr-1.5 pl-[24px] pb-1">
-					{/* Full tool input (e.g. complete run_commands commands) */}
+					{/* Full tool input: complete run_commands commands, or the exact recorded JSON input for other tools */}
 					{fullInput ? (
 						<div>
-							<div className="mb-0.5 text-xs text-text-tertiary">Command</div>
+							<div className="mb-0.5 text-xs text-text-tertiary">
+								{getToolInputSectionLabel(parsed.toolName)}
+							</div>
 							<pre className="max-h-60 overflow-auto rounded bg-surface-0 px-2 py-1.5 text-xs leading-relaxed whitespace-pre-wrap break-all text-text-primary">
 								{fullInput}
 							</pre>
@@ -92,9 +99,12 @@ function ToolMessageBlock({ message }: { message: ClineChatMessage }): ReactElem
 									<div className="mb-0.5 truncate text-xs text-text-tertiary">{result.query}</div>
 								) : null}
 								{result.error ? (
-									<pre className="max-h-60 overflow-auto rounded bg-status-red/5 px-2 py-1.5 text-xs leading-relaxed whitespace-pre-wrap break-all text-status-red">
-										{result.error}
-									</pre>
+									<div>
+										<div className="mb-0.5 text-xs text-status-red">Error</div>
+										<pre className="max-h-60 overflow-auto rounded bg-status-red/5 px-2 py-1.5 text-xs leading-relaxed whitespace-pre-wrap break-all text-status-red">
+											{result.error}
+										</pre>
+									</div>
 								) : null}
 								{result.content ? (
 									<pre className="max-h-60 overflow-auto rounded bg-surface-0 px-2 py-1.5 text-xs leading-relaxed whitespace-pre-wrap break-all text-text-primary">
@@ -106,17 +116,17 @@ function ToolMessageBlock({ message }: { message: ClineChatMessage }): ReactElem
 					) : parsed.output ? (
 						/* Fallback for non-ToolOperationResult output (skills, ask_question, MCP tools) */
 						<div>
-							<div className="mb-0.5 text-xs text-text-tertiary">Output</div>
+							<div className="mb-0.5 text-xs text-text-tertiary">Output{outputExcerptSuffix}</div>
 							<pre className="max-h-60 overflow-auto rounded bg-surface-0 px-2 py-1.5 text-xs leading-relaxed whitespace-pre-wrap break-all text-text-primary">
 								{parsed.output}
 							</pre>
 						</div>
 					) : null}
 
-					{/* Tool-level error (SDK crash/timeout, separate from per-result errors) */}
+					{/* Tool-level (SDK-level) error section, separate from structured per-operation result errors */}
 					{parsed.error ? (
 						<div>
-							<div className="mb-0.5 text-xs text-status-red">Error</div>
+							<div className="mb-0.5 text-xs text-status-red">Error{errorExcerptSuffix}</div>
 							<pre className="max-h-60 overflow-auto rounded bg-status-red/5 px-2 py-1.5 text-xs leading-relaxed whitespace-pre-wrap break-all text-status-red">
 								{parsed.error}
 							</pre>
