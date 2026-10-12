@@ -1,12 +1,12 @@
 # Complete task diagnostics as a browser download
 
-Status: DIAG-0 implemented (shipped in its own PR); DIAG-1 to DIAG-3 remain implementation-ready.
+Status: DIAG-0 and DIAG-1 implemented (each shipped in its own PR); DIAG-2 and DIAG-3 remain implementation-ready.
 Target: billy-the-ape/kanban main. Source baseline: `7a64060`.
 
 Implemented as four numbered briefs, each one PR / one squash commit, in this order. Deploys are manual (`.github/workflows/deploy-ai-monster.yml` is `workflow_dispatch`-only since `a7c026a`; `docs/deployment/ai-monster.md` still describes the old auto-deploy and is stale on this), but any `main` commit can be picked for a manual deploy, so each brief must leave `main` coherent and deployable:
 
 - **DIAG-0** (implemented) — Expanded tool I/O visibility in the chat panel. Independent of the other briefs; immediately closes the `0e05l` editor-input visibility gap.
-- **DIAG-1** — Extract the runtime auth gate and workspace-scope resolution into a tested shared function. Behaviour-neutral; independent of DIAG-2.
+- **DIAG-1** (implemented) — Extract the runtime auth gate and workspace-scope resolution into a tested shared function. Behaviour-neutral; independent of DIAG-2.
 - **DIAG-2** — Additive export snapshot, schemaVersion 3 builder, streaming serializer, and the artifact sidecar index. Unwired. The schemaVersion 2 host-disk export is untouched. Independent of DIAG-1.
 - **DIAG-3** — HTTP download route after the extracted gate, browser download, CLI repoint, old contract/consumer removal, and docs. Depends on DIAG-1 and DIAG-2.
 
@@ -86,6 +86,15 @@ Implementation state (as shipped):
 ### DIAG-1: Extract the runtime auth gate (1 PR, behaviour-neutral)
 
 No test boots `createRuntimeServer`, and the passcode/session/bearer gate plus workspace-scope resolution is inline in `requestHandler` (`runtime-server.ts:376-477`); `ws-upgrade-passcode.test.ts` re-implements the logic instead. Extract the gate (and workspace-scope resolution) into a shared function that the production `requestHandler` and the tests all call — behaviour-preserving by intent, and landed/reviewed on its own so that a security-sensitive refactor is never bundled with a new streaming route, a CLI repoint, and a contract removal. Independent of DIAG-2; DIAG-3 lands after it. Tests prove the gate decision is unchanged for: passcode off, passcode on + valid cookie, valid bearer token, no auth, `/api/passcode/*` paths, and static asset requests.
+
+Implementation state (as shipped):
+
+- New `src/server/request-auth-gate.ts` is the single source of truth:
+  - `handleRuntimeHttpAuthGate(req, res, pathname, { isRemoteMode, isTls })` — the full passcode gate moved verbatim from `requestHandler`: `/api/passcode/status` (any method, before any auth check), `/api/passcode/verify` (POST only, rate-limit lockout, body/JSON errors, session-cookie issuance with `Secure` flag when TLS), and the 401-for-unauthenticated-`/api/*` / static-asset fall-through decision. Returns `{ handled: true }` when it wrote a complete response.
+  - `isRuntimeRequestAuthenticated(request)` — the shared session-cookie-OR-internal-bearer check, used by the HTTP gate, the WebSocket upgrade gate, and the tests.
+  - `readWorkspaceIdFromRequest` / `resolveWorkspaceScopeFromRequest` — the workspace-scope resolution, moved verbatim from `runtime-server.ts`.
+- `runtime-server.ts` `requestHandler` calls the gate (before the OAuth callback and tRPC dispatch, exactly where the inline gate sat) and the WS upgrade path uses the shared predicate; the inline gate body, body reader, and scope-resolution helpers are removed from it.
+- Tests: `test/runtime/server/request-auth-gate.test.ts` drives the gate through a small `http.createServer` wrapper (same wiring as `requestHandler`, no full server boot) covering the plan matrix — passcode off, valid cookie, valid bearer, no auth (401 on `/api/*`), `/api/passcode/*` endpoints (status variants, verify success/invalid/invalid-JSON/rate-limit 429, TLS `Secure` flag, non-POST verify not handled), static asset fall-through, plus workspace-scope resolution (header precedence over query, trimming, unknown id, registered scope via an isolated-HOME git fixture). `ws-upgrade-passcode.test.ts` and `internal-auth-token.test.ts` now call the shared predicate instead of re-implementing the guard logic.
 
 ### DIAG-2: Export snapshot, builder, and streaming serializer (1 PR, additive and unwired)
 

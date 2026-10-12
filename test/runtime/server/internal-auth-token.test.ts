@@ -6,7 +6,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	disablePasscode,
 	extractBearerToken,
-	extractSessionTokenFromCookie,
 	generateInternalToken,
 	generatePasscode,
 	getInternalToken,
@@ -15,8 +14,8 @@ import {
 	issueSession,
 	validateInternalToken,
 	validatePasscode,
-	validateSession,
 } from "../../../src/security/passcode-manager";
+import { isRuntimeRequestAuthenticated } from "../../../src/server/request-auth-gate";
 
 function runHttpGate(input: {
 	isRemoteMode: boolean;
@@ -25,14 +24,14 @@ function runHttpGate(input: {
 	pathname: string;
 }): "allowed" | "rejected" {
 	const passcodeActive = input.isRemoteMode && isPasscodeEnabled();
-	if (passcodeActive) {
-		const sessionToken = extractSessionTokenFromCookie(input.cookieHeader);
-		const sessionAuth = sessionToken !== null && validateSession(sessionToken);
-		const bearerToken = extractBearerToken(input.authorizationHeader);
-		const internalAuth = bearerToken !== null && validateInternalToken(bearerToken);
-		if (!(sessionAuth || internalAuth) && input.pathname.startsWith("/api/")) {
-			return "rejected";
-		}
+	if (
+		passcodeActive &&
+		!isRuntimeRequestAuthenticated({
+			headers: { cookie: input.cookieHeader, authorization: input.authorizationHeader },
+		}) &&
+		input.pathname.startsWith("/api/")
+	) {
+		return "rejected";
 	}
 	return "allowed";
 }
@@ -43,12 +42,13 @@ function runWsUpgradeGate(input: {
 	authorizationHeader: string | undefined;
 }): "allowed" | "rejected" {
 	const passcodeActive = input.isRemoteMode && isPasscodeEnabled();
-	if (passcodeActive) {
-		const sessionToken = extractSessionTokenFromCookie(input.cookieHeader);
-		const sessionAuth = sessionToken !== null && validateSession(sessionToken);
-		const bearerToken = extractBearerToken(input.authorizationHeader);
-		const internalAuth = bearerToken !== null && validateInternalToken(bearerToken);
-		if (!sessionAuth && !internalAuth) return "rejected";
+	if (
+		passcodeActive &&
+		!isRuntimeRequestAuthenticated({
+			headers: { cookie: input.cookieHeader, authorization: input.authorizationHeader },
+		})
+	) {
+		return "rejected";
 	}
 	return "allowed";
 }

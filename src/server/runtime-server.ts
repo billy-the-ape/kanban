@@ -37,22 +37,10 @@ import { findTaskCard, resolveCardAutomationPrKey } from "../pr-tracking/pr-owne
 import { PrRecordStore } from "../pr-tracking/pr-record-store";
 import { createReconcilePass, type PrTaskReconcileOptions } from "../pr-tracking/pr-task-subscriptions";
 import { createPrTrackingCoordinator } from "../pr-tracking/pr-tracking-coordinator";
-import {
-	checkRateLimit,
-	clearRateLimit,
-	extractBearerToken,
-	extractSessionTokenFromCookie,
-	isPasscodeEnabled,
-	issueSession,
-	recordFailedAttempt,
-	validateInternalToken,
-	validatePasscode,
-	validateSession,
-} from "../security/passcode-manager";
+import { extractSessionTokenFromCookie, isPasscodeEnabled, validateSession } from "../security/passcode-manager";
 import {
 	listWorkspaceIndexEntries,
 	loadWorkspaceBoardById,
-	loadWorkspaceContextById,
 	loadWorkspaceState,
 	mutateWorkspaceState,
 } from "../state/workspace-state";
@@ -67,6 +55,11 @@ import { createWorkspaceApi } from "../trpc/workspace-api";
 import { resolveTaskCwd } from "../workspace/task-worktree";
 import { getWebUiDir, normalizeRequestPath, readAsset } from "./assets";
 import { handleHttpRequest, handleSocketUpgrade } from "./middleware";
+import {
+	handleRuntimeHttpAuthGate,
+	isRuntimeRequestAuthenticated,
+	resolveWorkspaceScopeFromRequest,
+} from "./request-auth-gate";
 import type { RuntimeStateHub } from "./runtime-state-hub";
 import { runStartupTaskWorkspaceMaintenance } from "./startup-maintenance";
 import { isTaskWriterActive } from "./task-writer-activity";
@@ -104,25 +97,6 @@ export interface RuntimeServer {
 	close: () => Promise<void>;
 }
 
-function readWorkspaceIdFromRequest(request: IncomingMessage, requestUrl: URL): string | null {
-	const headerValue = request.headers["x-kanban-workspace-id"];
-	const headerWorkspaceId = Array.isArray(headerValue) ? headerValue[0] : headerValue;
-	if (typeof headerWorkspaceId === "string") {
-		const normalized = headerWorkspaceId.trim();
-		if (normalized) {
-			return normalized;
-		}
-	}
-	const queryWorkspaceId = requestUrl.searchParams.get("workspaceId");
-	if (typeof queryWorkspaceId === "string") {
-		const normalized = queryWorkspaceId.trim();
-		if (normalized) {
-			return normalized;
-		}
-	}
-	return null;
-}
-
 export async function createRuntimeServer(deps: CreateRuntimeServerDependencies): Promise<RuntimeServer> {
 	const webUiDir = getWebUiDir();
 
@@ -131,36 +105,6 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 	} catch {
 		throw new Error("Could not find web UI assets. Run `npm run build` to generate and package the web UI.");
 	}
-
-	const resolveWorkspaceScopeFromRequest = async (
-		request: IncomingMessage,
-		requestUrl: URL,
-	): Promise<{
-		requestedWorkspaceId: string | null;
-		workspaceScope: RuntimeTrpcWorkspaceScope | null;
-	}> => {
-		const requestedWorkspaceId = readWorkspaceIdFromRequest(request, requestUrl);
-		if (!requestedWorkspaceId) {
-			return {
-				requestedWorkspaceId: null,
-				workspaceScope: null,
-			};
-		}
-		const requestedWorkspaceContext = await loadWorkspaceContextById(requestedWorkspaceId);
-		if (!requestedWorkspaceContext) {
-			return {
-				requestedWorkspaceId,
-				workspaceScope: null,
-			};
-		}
-		return {
-			requestedWorkspaceId,
-			workspaceScope: {
-				workspaceId: requestedWorkspaceContext.workspaceId,
-				workspacePath: requestedWorkspaceContext.repoPath,
-			},
-		};
-	};
 
 	const getScopedTerminalManager = async (scope: RuntimeTrpcWorkspaceScope): Promise<TerminalSessionManager> =>
 		await deps.ensureTerminalManagerForWorkspace(scope.workspaceId, scope.workspacePath);
@@ -672,24 +616,6 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 
 	const isRemoteMode = isKanbanRemoteHost();
 
-	const readRequestBody = (req: IncomingMessage, maxBytes = 4096): Promise<string> =>
-		new Promise((resolve, reject) => {
-			let body = "";
-			let size = 0;
-			req.on("data", (chunk: Buffer) => {
-				size += chunk.length;
-				if (size > maxBytes) {
-					reject(new Error("Request body too large"));
-					return;
-				}
-				body += chunk.toString("utf8");
-			});
-			req.on("end", () => resolve(body));
-			req.on("error", reject);
-		});
-
-	const getRemoteIp = (req: IncomingMessage): string => req.socket.remoteAddress ?? "unknown";
-
 	const tlsConfig = getKanbanRuntimeTls();
 	const requestHandler = async (req: IncomingMessage, res: import("node:http").ServerResponse) => {
 		try {
@@ -700,109 +626,16 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			const requestUrl = new URL(req.url ?? "/", "http://localhost");
 			const pathname = normalizeRequestPath(requestUrl.pathname);
 
-			// ── Passcode gate (remote mode only) ──────────────────────────────
-			const passcodeActive = isRemoteMode && isPasscodeEnabled();
-			if (pathname === "/api/passcode/status") {
-				if (passcodeActive) {
-					const token = extractSessionTokenFromCookie(req.headers.cookie);
-					const authenticated = token !== null && validateSession(token);
-					res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
-					res.end(JSON.stringify({ required: true, authenticated }));
-				} else {
-					res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
-					res.end(JSON.stringify({ required: false, authenticated: true }));
-				}
+			// Passcode gate (remote mode only). The gate writes a complete
+			// response for the /api/passcode/* endpoints and 401s unauthenticated
+			// /api/* requests; everything else continues through the gate.
+			const authGate = await handleRuntimeHttpAuthGate(req, res, pathname, {
+				isRemoteMode,
+				isTls: tlsConfig !== null,
+			});
+			if (authGate.handled) {
 				return;
 			}
-			if (passcodeActive && req.method === "POST" && pathname === "/api/passcode/verify") {
-				const ip = getRemoteIp(req);
-				const rateLimit = checkRateLimit(ip);
-				if (!rateLimit.allowed) {
-					const retryAfterSec = rateLimit.lockedUntilMs
-						? Math.ceil((rateLimit.lockedUntilMs - Date.now()) / 1000)
-						: 30;
-					res.writeHead(429, {
-						"Content-Type": "application/json; charset=utf-8",
-						"Cache-Control": "no-store",
-						"Retry-After": String(retryAfterSec),
-					});
-					res.end(JSON.stringify({ error: "Too many attempts. Please wait before trying again." }));
-					return;
-				}
-				let body: string;
-				try {
-					body = await readRequestBody(req);
-				} catch {
-					res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
-					res.end(JSON.stringify({ error: "Invalid request body." }));
-					return;
-				}
-				let parsed: unknown;
-				try {
-					parsed = JSON.parse(body);
-				} catch {
-					res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
-					res.end(JSON.stringify({ error: "Invalid JSON." }));
-					return;
-				}
-				const submitted =
-					parsed !== null &&
-					typeof parsed === "object" &&
-					"passcode" in parsed &&
-					typeof (parsed as Record<string, unknown>).passcode === "string"
-						? ((parsed as Record<string, unknown>).passcode as string)
-						: "";
-				if (!validatePasscode(submitted)) {
-					recordFailedAttempt(ip);
-					res.writeHead(401, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
-					res.end(JSON.stringify({ error: "Invalid passcode." }));
-					return;
-				}
-				clearRateLimit(ip);
-				const token = issueSession();
-				const cookieFlags = [
-					`kanban_session=${token}`,
-					"HttpOnly",
-					"SameSite=Strict",
-					"Path=/",
-					`Max-Age=${24 * 60 * 60}`,
-					...(tlsConfig !== null ? ["Secure"] : []),
-				].join("; ");
-				res.writeHead(200, {
-					"Content-Type": "application/json; charset=utf-8",
-					"Cache-Control": "no-store",
-					"Set-Cookie": cookieFlags,
-				});
-				res.end(JSON.stringify({ ok: true }));
-				return;
-			}
-			if (passcodeActive) {
-				// Check session cookie (browser flow) first, then internal bearer token (CLI flow).
-				const sessionToken = extractSessionTokenFromCookie(req.headers.cookie);
-				const sessionAuth = sessionToken !== null && validateSession(sessionToken);
-				const bearerToken = extractBearerToken(req.headers.authorization);
-				const internalAuth = bearerToken !== null && validateInternalToken(bearerToken);
-				const authenticated = sessionAuth || internalAuth;
-				if (!authenticated) {
-					// Static assets (JS, CSS, images, fonts, icons, manifest) are served
-					// freely even when unauthenticated. They contain no user data and are
-					// required for the React app to boot and render the passcode gate.
-					// Only API routes are hard-blocked; index.html is served normally so
-					// PasscodeGateProvider in React can intercept before any API calls.
-					if (pathname.startsWith("/api/")) {
-						res.writeHead(401, {
-							"Content-Type": "application/json; charset=utf-8",
-							"Cache-Control": "no-store",
-						});
-						res.end(JSON.stringify({ error: "Authentication required." }));
-						return;
-					}
-					// Fall through — let the normal asset/index.html serving below handle it.
-					// PasscodeGateProvider in main.tsx will render the gate before any
-					// authenticated API calls are made.
-				}
-			}
-			// ── End passcode gate ──────────────────────────────────────────────
 
 			const oauthCallbackResponse = await handleClineMcpOauthCallback(requestUrl);
 			if (oauthCallbackResponse) {
@@ -854,16 +687,10 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		}
 		// ── Passcode gate for WebSocket upgrades (remote mode only) ──────────
 		const passcodeActive = isRemoteMode && isPasscodeEnabled();
-		if (passcodeActive) {
-			const sessionToken = extractSessionTokenFromCookie(request.headers.cookie);
-			const sessionAuth = sessionToken !== null && validateSession(sessionToken);
-			const bearerToken = extractBearerToken(request.headers.authorization);
-			const internalAuth = bearerToken !== null && validateInternalToken(bearerToken);
-			if (!sessionAuth && !internalAuth) {
-				socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
-				socket.destroy();
-				return;
-			}
+		if (passcodeActive && !isRuntimeRequestAuthenticated(request)) {
+			socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+			socket.destroy();
+			return;
 		}
 		// ── End passcode gate ─────────────────────────────────────────────────
 		(request as IncomingMessage & { __kanbanUpgradeHandled?: boolean }).__kanbanUpgradeHandled = true;
