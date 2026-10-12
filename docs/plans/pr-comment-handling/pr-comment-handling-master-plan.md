@@ -106,7 +106,7 @@ Use this template, substituting the validated selected PR URL:
 
 > Address comments on the linked PR: {url}. Check the feedback against the current code and
 > original task requirements. Fix valid issues, explain any disagreements, and update the
-> same PR. Explain changes and disagreements in task chat; do not post PR comments.
+> same PR. Explain changes and disagreements in PR comments and within task chat.
 
 Send this as a normal task follow-up. Reuse the existing conversation/session, original task
 context, repository instructions, model/provider settings, tool permissions and compaction.

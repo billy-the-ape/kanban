@@ -389,7 +389,7 @@ describe("PrCommentAutomationService", () => {
 				`Address comments on the linked PR: ${PR.url}.`,
 				"Check the feedback against the current code and original task requirements.",
 				"Fix valid issues, explain any disagreements, and update the same PR.",
-				"Explain changes and disagreements in task chat; do not post PR comments.",
+				"Explain changes and disagreements in PR comments and within task chat.",
 			].join(" "),
 		);
 	});
