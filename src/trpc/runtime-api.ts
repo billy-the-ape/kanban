@@ -138,12 +138,13 @@ export interface CreateRuntimeApiDependencies {
 	/** B-9: surface fire-and-forget dispatch pass failures (a missed pass is retried by the next trigger). */
 	warnTaskDispatchError?: (error: unknown) => void;
 	/** COMMENT-0: the runtime-wide comment-handling observer (optional in partial harnesses). */
-	getPrCommentAutomationService?: () => PrCommentAutomationService | null /**
+	getPrCommentAutomationService?: () => PrCommentAutomationService | null;
+	/**
 	 * PRTRACK-1: the installed PR tracking consumers. Surfaced in the runtime
 	 * config response as the browser's installed-consumer signal (checkbox
 	 * availability, lifecycle-gate display). Optional so test harnesses that
 	 * never register consumers keep working.
-	 */;
+	 */
 	getInstalledPrConsumers?: () => RuntimePrInstalledConsumer[];
 	/**
 	 * PRTRACK-1: shared lifecycle gate for deterministic delivery — reports

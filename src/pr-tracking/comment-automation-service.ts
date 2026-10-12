@@ -307,7 +307,7 @@ export class PrCommentAutomationService {
 		} catch {
 			return;
 		}
-		const removedCandidates: Array<{ key: string; candidate: PrCommentCandidate }> = [];
+		const emptiedSubscriptions: PrSubscriptionState[] = [];
 		const activeCandidateIds = new Map<string, PrCommentCandidate>();
 		for (const column of state.board.columns) {
 			if (!ACTIVE_COLUMN_IDS.has(column.id)) {
@@ -360,16 +360,19 @@ export class PrCommentAutomationService {
 				}
 				if (!activeCandidateIds.has(`${key}/${candidateId}`)) {
 					sub.candidates.delete(candidateId);
-					removedCandidates.push({ key, candidate });
 				}
 			}
 			if (sub.candidates.size === 0) {
 				this.subscriptions.delete(key);
+				emptiedSubscriptions.push(sub);
 			}
 		}
-		for (const { key } of removedCandidates) {
+		// Only a PR with no remaining candidate loses its scheduling; while
+		// any candidate remains, the next applyPrPollOutcome re-derives the
+		// bindings and owner.
+		for (const sub of emptiedSubscriptions) {
 			try {
-				await this.cancelPendingForTask(key);
+				await this.cancelPendingRecord(sub);
 			} catch (error) {
 				this.warn(`cancel pending failed: ${error instanceof Error ? error.message : String(error)}`);
 			}
@@ -781,15 +784,6 @@ export class PrCommentAutomationService {
 				},
 			};
 		});
-	}
-
-	/** Cancels the queued intent when a candidate task stops qualifying. */
-	async cancelPendingForTask(key: string): Promise<void> {
-		const sub = this.subscriptions.get(key);
-		if (!sub) {
-			return;
-		}
-		await this.cancelPendingRecord(sub);
 	}
 
 	/**

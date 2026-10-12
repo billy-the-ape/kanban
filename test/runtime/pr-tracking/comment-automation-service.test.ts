@@ -589,6 +589,74 @@ describe("PrCommentAutomationService", () => {
 		expect(harness.sent).toHaveLength(0);
 	});
 
+	it("cancels the pending schedule and queued intent when the only enabled task is disabled", async () => {
+		const event = makeEvent({ providerId: "conversation-1" });
+		const harness = makeService({
+			workspaceStates: new Map([
+				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })])],
+			]),
+			snapshot: { events: [event] },
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		let loaded = await loadPrTrackingRecord(KEY);
+		expect(loaded.status).toBe("ok");
+		if (loaded.status !== "ok") {
+			throw new Error("unreachable");
+		}
+		// Sanity: the first poll scheduled the debounce and queued intent.
+		expect(loaded.record.commentAutomation.debounceDeadline).toBe(NOW + 120_000);
+		expect(loaded.record.commentAutomation.dispatch?.status).toBe("queued");
+
+		// Disable the only enabled task and rescan: the record must be cleared
+		// so a later re-enable starts a fresh quiet window.
+		harness.workspaceStates.set("/w1", makeState([makeCard({ id: "t1" })]));
+		await harness.service.refreshWorkspace(scope);
+		loaded = await loadPrTrackingRecord(KEY);
+		expect(loaded.status).toBe("ok");
+		if (loaded.status !== "ok") {
+			throw new Error("unreachable");
+		}
+		const automation = loaded.record.commentAutomation;
+		expect(automation.pendingFeedbackFingerprint).toBeNull();
+		expect(automation.pendingCount).toBeNull();
+		expect(automation.debounceDeadline).toBeNull();
+		expect(automation.firstPendingAt).toBeNull();
+		expect(automation.dispatch).toBeNull();
+	});
+
+	it("does not reset the pending schedule while another candidate remains", async () => {
+		const event = makeEvent({ providerId: "conversation-1" });
+		const harness = makeService({
+			workspaces: [
+				{ workspaceId: "w1", workspacePath: "/w1" },
+				{ workspaceId: "w2", workspacePath: "/w2" },
+			],
+			workspaceStates: new Map([
+				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })])],
+			]),
+			snapshot: { events: [event] },
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		// A second workspace enables the same PR: the first owner's schedule
+		// must survive the rescan; the next poll owns that decision.
+		harness.workspaceStates.set(
+			"/w2",
+			makeState([makeCard({ id: "t2", autoAddressComments: true, pullRequests: [PR] })]),
+		);
+		await harness.service.refreshWorkspace({ workspaceId: "w2", workspacePath: "/w2" });
+		const loaded = await loadPrTrackingRecord(KEY);
+		expect(loaded.status).toBe("ok");
+		if (loaded.status !== "ok") {
+			throw new Error("unreachable");
+		}
+		const automation = loaded.record.commentAutomation;
+		expect(automation.debounceDeadline).toBe(NOW + 120_000);
+		expect(automation.pendingCount).toBe(1);
+		expect(automation.dispatch?.status).toBe("queued");
+	});
+
 	it("resume sends exactly one instruction through the normal chat send and records the running dispatch", async () => {
 		const dispatched = makeEvent({ providerId: "conversation-1", updatedAt: NOW - 10_000 });
 		const dispatchedFp = fingerprintOf([dispatched]);

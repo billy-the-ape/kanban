@@ -218,7 +218,10 @@ and Biome checks:
   double-sending; `settleDispatch` treats `null`/`completed` dispatches with a due
   deadline as dispatchable in addition to queued intents, and returns early when no
   deadline is scheduled (no pending feedback) so idle subscriptions never trigger gh
-  API fetches from the settle path.
+  API fetches from the settle path. `refreshWorkspace` cancels the pending schedule
+  and provably-unsent queued intent only when a PR loses its last remaining
+  candidate; while any candidate remains, the next `applyPrPollOutcome` re-derives
+  bindings and ownership instead of resetting the quiet window.
 - Contract and mutations: `autoAddressComments` (optional, default false) on
   `runtimeTaskCardSchema`; `runtimeTaskPullRequestSchema` with `lastSyncedAt`/`stateCheckedAt`;
   `RuntimePrTrackingRecord`, `RuntimePrCommentAutomation`, `RuntimePrCommentDispatch`,
