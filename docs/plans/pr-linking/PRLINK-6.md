@@ -1,8 +1,44 @@
 # PRLINK-6 — Observation timestamps and a primary display PR
 
-**Status: READY FOR IMPLEMENTATION; depends on landed PR-linking v1.**
+**Status: IMPLEMENTED in this worktree.**
 Master plan: [v1](../complete/pr-linking/PR_LINKING_PLAN.md). Shared context: [follow-ups](PRLINK-FOLLOWUPS.md).
 Deliver as one implementation PR. No higher-level product decisions remain open.
+
+## Final-state implementation notes
+
+- `runtimeTaskPullRequestSchema` gained optional `lastSeenAt: number` and `isPrimary: boolean`
+  (finite, nonnegative server epoch ms); no `firstSeenAt`, no bulk migration.
+- `addTaskPullRequests` seeds `lastSeenAt = createdAt` on new records, strips any incoming
+  `isPrimary`, and coalesces duplicate observations: it advances `lastSeenAt` only when
+  `now - (lastSeenAt ?? createdAt) >= LAST_SEEN_OBSERVATION_THROTTLE_MS` (600,000 ms) or when
+  other fields already force a write; it never moves backward on clock regression.
+- `updateTaskPullRequestSnapshot` carries the newer `lastSeenAt` on any successful observation
+  write (`title`/`state`/`stateCheckedAt`), or applies an explicit `snapshot.lastSeenAt` when
+  given (never backward).
+- Eviction at the 20-link cap protects the explicit display primary and the card's
+  `selectedAutomationPrKey`: oldest unprotected non-manual first, then oldest unprotected
+  manual, with a bounded fallback for malformed all-protected data.
+- New pure helpers in `src/core/pull-request-links.ts`: `getPrimaryPullRequest` (explicit flag
+  wins; else newest `createdAt` among open/draft, then unknown-state, then merged/closed; ties
+  to later array index; empty list → null) and `getOrderedTaskPullRequests` (winner first, rest
+  in original order; no mutation).
+- `setPrimaryTaskPullRequest(board, taskId, identityKey | null, now)` in
+  `src/core/task-board-mutations.ts` sets exactly one flag, normalizes malformed multi-flag
+  data, clears all flags on `null`, and is a no-op (no revision/broadcast) for unknown
+  task/key or an already-sole primary. Exposed as
+  `workspace.setPrimaryTaskPullRequest({ taskId, url: string | null })` with strict server
+  URL parsing, `ok:false` for missing task/unlinked PR, and the selected entry (or null when
+  cleared) re-read from the authoritative board.
+- Branch lookup (`task-pull-request-lookup.ts`) refreshes snapshots in one
+  `mutateWorkspaceState` batch and writes a throttled `lastSeenAt`-only update when title and
+  state already match; no per-poll timestamp churn, one revision per changed batch.
+- UI: board card and desktop top bar use `getPrimaryPullRequest`/`getOrderedTaskPullRequests`
+  (winner first, overflow limit preserved); the manager shows the winner first with
+  **Primary for display** vs **Shown by default** labels and **Use automatic display order**
+  (clear); tooltips show First recorded, Last observed (approximate), and State checked as
+  distinct lines.
+- Server-owned board merge protection is unchanged and now also preserves `isPrimary`/
+  `lastSeenAt` (verified in the workspace-state integration test).
 
 ## Fixed behavior
 

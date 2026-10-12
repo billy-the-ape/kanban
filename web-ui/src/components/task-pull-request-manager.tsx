@@ -1,11 +1,13 @@
 import * as RadixPopover from "@radix-ui/react-popover";
-import { Link, Plus, RefreshCw, X } from "lucide-react";
+import { getOrderedTaskPullRequests } from "@runtime-pull-request-links";
+import { Link, Plus, RefreshCw, Star, StarOff, X } from "lucide-react";
 import { useState } from "react";
 
 import { showAppToast } from "@/components/app-toaster";
 import { TaskPullRequestLink } from "@/components/task-pull-request-link";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { Tooltip } from "@/components/ui/tooltip";
 import { getRuntimeTrpcClient } from "@/runtime/trpc-client";
 import type { RuntimeTaskPullRequest } from "@/runtime/types";
 import {
@@ -14,6 +16,12 @@ import {
 	getPullRequestRefreshMessage,
 	validatePullRequestUrlShape,
 } from "@/utils/task-pull-requests";
+
+// Sentinel pending key for the "use automatic display order" (clear) action.
+const CLEAR_PRIMARY_PENDING_KEY = "__clear-primary__";
+const MAKE_PRIMARY_TOOLTIP =
+	"Make primary for display. The Automation PR is selected separately in PR tracking settings.";
+const CLEAR_PRIMARY_TOOLTIP = "Use automatic display order";
 
 interface TaskPullRequestManagerProps {
 	workspaceId: string;
@@ -34,9 +42,14 @@ export function TaskPullRequestManager({ workspaceId, taskId, pullRequests }: Ta
 	const [submitting, setSubmitting] = useState(false);
 	const [formError, setFormError] = useState<string | null>(null);
 	const [removingKey, setRemovingKey] = useState<string | null>(null);
+	// PRLINK-6: pending display-primary actions (server response is authoritative).
+	const [primaryPendingKey, setPrimaryPendingKey] = useState<string | null>(null);
 	const [refreshing, setRefreshing] = useState(false);
 	const validationError = url.trim() ? validatePullRequestUrlShape(url) : null;
 	const canSubmit = validationError === null && !submitting;
+	// PRLINK-6: display order — the primary winner first, the rest in recorded order.
+	const orderedPullRequests = getOrderedTaskPullRequests(pullRequests);
+	const winnerPullRequest = orderedPullRequests[0];
 
 	const handleAdd = async (): Promise<void> => {
 		if (!canSubmit) {
@@ -89,6 +102,56 @@ export function TaskPullRequestManager({ workspaceId, taskId, pullRequests }: Ta
 			});
 		} finally {
 			setRemovingKey(null);
+		}
+	};
+
+	// PRLINK-6: make this link the display-only primary. The server response is
+	// authoritative; the board refreshes via the state broadcast.
+	const handleMakePrimary = async (pullRequest: RuntimeTaskPullRequest): Promise<void> => {
+		const key = getPullRequestKey(pullRequest);
+		setPrimaryPendingKey(key);
+		try {
+			const response = await getRuntimeTrpcClient(workspaceId).workspace.setPrimaryTaskPullRequest.mutate({
+				taskId,
+				url: pullRequest.url,
+			});
+			if (!response.ok) {
+				showAppToast({
+					intent: "danger",
+					message: response.error || "Could not update the display primary.",
+				});
+			}
+		} catch (error) {
+			showAppToast({
+				intent: "danger",
+				message: error instanceof Error ? error.message : "Could not update the display primary.",
+			});
+		} finally {
+			setPrimaryPendingKey(null);
+		}
+	};
+
+	// PRLINK-6: clear every explicit primary and fall back to the automatic order.
+	const handleClearPrimary = async (): Promise<void> => {
+		setPrimaryPendingKey(CLEAR_PRIMARY_PENDING_KEY);
+		try {
+			const response = await getRuntimeTrpcClient(workspaceId).workspace.setPrimaryTaskPullRequest.mutate({
+				taskId,
+				url: null,
+			});
+			if (!response.ok) {
+				showAppToast({
+					intent: "danger",
+					message: response.error || "Could not update the display primary.",
+				});
+			}
+		} catch (error) {
+			showAppToast({
+				intent: "danger",
+				message: error instanceof Error ? error.message : "Could not update the display primary.",
+			});
+		} finally {
+			setPrimaryPendingKey(null);
 		}
 	};
 
@@ -193,12 +256,16 @@ export function TaskPullRequestManager({ workspaceId, taskId, pullRequests }: Ta
 					</form>
 					<div className="h-px bg-border" />
 					<div className="flex min-h-0 flex-col gap-1" data-testid="task-pr-list">
-						{pullRequests.length === 0 ? (
+						{orderedPullRequests.length === 0 ? (
 							<p className="m-0 text-xs text-text-tertiary">No pull requests linked yet.</p>
 						) : (
-							pullRequests.map((pullRequest) => {
+							orderedPullRequests.map((pullRequest) => {
 								const key = getPullRequestKey(pullRequest);
 								const isRemoving = removingKey === key;
+								const isWinner = winnerPullRequest !== undefined && pullRequest === winnerPullRequest;
+								const isExplicitPrimary = isWinner && pullRequest.isPrimary === true;
+								const isPrimaryPending = primaryPendingKey === key;
+								const isClearPrimaryPending = primaryPendingKey === CLEAR_PRIMARY_PENDING_KEY;
 								return (
 									<div key={key} className="flex items-center gap-1.5">
 										<TaskPullRequestLink
@@ -206,6 +273,43 @@ export function TaskPullRequestManager({ workspaceId, taskId, pullRequests }: Ta
 											variant="full"
 											className="min-w-0 flex-1 truncate"
 										/>
+										{isWinner ? (
+											<span
+												className="shrink-0 text-[10px] text-text-tertiary"
+												data-testid={
+													isExplicitPrimary ? "task-pr-primary-label" : "task-pr-default-primary-label"
+												}
+											>
+												{isExplicitPrimary ? "Primary for display" : "Shown by default"}
+											</span>
+										) : null}
+										{isWinner && isExplicitPrimary ? (
+											<Tooltip content={CLEAR_PRIMARY_TOOLTIP}>
+												<Button
+													variant="ghost"
+													size="sm"
+													aria-label={CLEAR_PRIMARY_TOOLTIP}
+													icon={isClearPrimaryPending ? <Spinner size={10} /> : <StarOff size={12} />}
+													disabled={isClearPrimaryPending}
+													onClick={() => void handleClearPrimary()}
+													className="h-6 w-6 shrink-0 px-0"
+													data-testid="task-pr-use-automatic-order"
+												/>
+											</Tooltip>
+										) : (
+											<Tooltip content={MAKE_PRIMARY_TOOLTIP}>
+												<Button
+													variant="ghost"
+													size="sm"
+													aria-label="Make primary for display"
+													icon={isPrimaryPending ? <Spinner size={10} /> : <Star size={12} />}
+													disabled={isPrimaryPending}
+													onClick={() => void handleMakePrimary(pullRequest)}
+													className="h-6 w-6 shrink-0 px-0"
+													data-testid={`task-pr-make-primary-${pullRequest.number}`}
+												/>
+											</Tooltip>
+										)}
 										<Button
 											variant="ghost"
 											size="sm"

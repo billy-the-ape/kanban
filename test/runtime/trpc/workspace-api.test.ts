@@ -38,6 +38,7 @@ const prLinkMocks = vi.hoisted(() => ({
 	fireReviewPullRequestLookup: vi.fn(),
 	findTasksEnteringReviewWithoutPullRequests: vi.fn(),
 	removeTaskPullRequest: vi.fn(),
+	setPrimaryTaskPullRequest: vi.fn(),
 }));
 
 vi.mock("../../../src/state/workspace-state.js", () => ({
@@ -59,6 +60,7 @@ vi.mock("../../../src/workspace/task-pull-request-lookup.js", () => ({
 
 vi.mock("../../../src/core/task-board-mutations.js", () => ({
 	removeTaskPullRequest: prLinkMocks.removeTaskPullRequest,
+	setPrimaryTaskPullRequest: prLinkMocks.setPrimaryTaskPullRequest,
 }));
 
 import { createWorkspaceApi } from "../../../src/trpc/workspace-api";
@@ -542,6 +544,7 @@ describe("createWorkspaceApi PR linking (PRLINK-5)", () => {
 		prLinkMocks.fireReviewPullRequestLookup.mockReset();
 		prLinkMocks.findTasksEnteringReviewWithoutPullRequests.mockReset();
 		prLinkMocks.removeTaskPullRequest.mockReset();
+		prLinkMocks.setPrimaryTaskPullRequest.mockReset();
 	});
 
 	it("addTaskPullRequest rejects unknown tasks without writing", async () => {
@@ -777,5 +780,157 @@ describe("createWorkspaceApi PR linking (PRLINK-5)", () => {
 		await api.saveState(scope, { board, sessions: {}, expectedRevision: 1 });
 
 		expect(prLinkMocks.fireReviewPullRequestLookup).not.toHaveBeenCalled();
+	});
+
+	it("setPrimaryTaskPullRequest selects a recorded entry and broadcasts", async () => {
+		const first: TestPullRequest = {
+			provider: "github",
+			host: "github.com",
+			repository: "owner/repo",
+			number: 9,
+			url: "https://github.com/owner/repo/pull/9",
+			source: "manual",
+			createdAt: 1,
+		};
+		const second: TestPullRequest = {
+			...first,
+			number: 10,
+			url: "https://github.com/owner/repo/pull/10",
+		};
+		const boardBefore = createBoard("task-1", [first, second]);
+		const boardAfter = createBoard("task-1", [first, { ...second, isPrimary: true }]);
+		prLinkMocks.loadWorkspaceBoardById.mockResolvedValueOnce(boardBefore).mockResolvedValueOnce(boardAfter);
+		prLinkMocks.setPrimaryTaskPullRequest.mockImplementation((b: unknown, taskId: string) => ({
+			board: b,
+			taskId,
+			updated: true,
+		}));
+		prLinkMocks.mutateWorkspaceState.mockImplementation(
+			async (_cwd: string, mutator: (current: unknown) => unknown) => {
+				const result = mutator({ board: boardBefore }) as { board: unknown; value: boolean; save: boolean };
+				return { saved: result.save, value: result.value, board: result.board };
+			},
+		);
+		const { api, broadcast } = createApi();
+
+		const response = await api.setPrimaryTaskPullRequest(scope, {
+			taskId: "task-1",
+			url: "https://github.com/owner/repo/pull/10",
+		});
+
+		expect(response.ok).toBe(true);
+		if (!response.ok) {
+			throw new Error("Expected the display primary selection to succeed");
+		}
+		expect(response.pullRequest).toMatchObject({ number: 10, isPrimary: true });
+		expect(prLinkMocks.setPrimaryTaskPullRequest).toHaveBeenCalledWith(boardBefore, "task-1", expect.any(String));
+		expect(broadcast).toHaveBeenCalledWith("workspace-1", "/tmp/repo");
+	});
+
+	it("setPrimaryTaskPullRequest clears with a null url and reports a null pullRequest", async () => {
+		const primary: TestPullRequest = {
+			provider: "github",
+			host: "github.com",
+			repository: "owner/repo",
+			number: 9,
+			url: "https://github.com/owner/repo/pull/9",
+			source: "manual",
+			createdAt: 1,
+			isPrimary: true,
+		};
+		const boardBefore = createBoard("task-1", [primary]);
+		prLinkMocks.loadWorkspaceBoardById
+			.mockResolvedValueOnce(boardBefore)
+			.mockResolvedValueOnce(createBoard("task-1", [{ ...primary, isPrimary: undefined }]));
+		prLinkMocks.setPrimaryTaskPullRequest.mockImplementation((b: unknown) => ({ board: b, updated: true }));
+		prLinkMocks.mutateWorkspaceState.mockImplementation(
+			async (_cwd: string, mutator: (current: unknown) => unknown) => {
+				const result = mutator({ board: boardBefore }) as { board: unknown; value: boolean; save: boolean };
+				return { saved: result.save, value: result.value, board: result.board };
+			},
+		);
+		const { api, broadcast } = createApi();
+
+		const response = await api.setPrimaryTaskPullRequest(scope, { taskId: "task-1", url: null });
+
+		expect(response).toEqual({ ok: true, pullRequest: null });
+		expect(prLinkMocks.setPrimaryTaskPullRequest).toHaveBeenCalledWith(boardBefore, "task-1", null);
+		expect(broadcast).toHaveBeenCalledWith("workspace-1", "/tmp/repo");
+	});
+
+	it("setPrimaryTaskPullRequest rejects unknown tasks without writing", async () => {
+		prLinkMocks.loadWorkspaceBoardById.mockResolvedValue(createBoard("task-2"));
+		const { api } = createApi();
+
+		const response = await api.setPrimaryTaskPullRequest(scope, {
+			taskId: "task-1",
+			url: "https://github.com/owner/repo/pull/9",
+		});
+
+		expect(response).toEqual({ ok: false, error: 'Task "task-1" not found', pullRequest: null });
+		expect(prLinkMocks.mutateWorkspaceState).not.toHaveBeenCalled();
+	});
+
+	it("setPrimaryTaskPullRequest rejects a PR that is not linked to the task", async () => {
+		const board = createBoard("task-1", [
+			{
+				provider: "github",
+				host: "github.com",
+				repository: "owner/repo",
+				number: 9,
+				url: "https://github.com/owner/repo/pull/9",
+				source: "manual",
+				createdAt: 1,
+			},
+		]);
+		prLinkMocks.loadWorkspaceBoardById.mockResolvedValue(board);
+		const { api } = createApi();
+
+		const response = await api.setPrimaryTaskPullRequest(scope, {
+			taskId: "task-1",
+			url: "https://github.com/owner/repo/pull/7",
+		});
+
+		expect(response).toEqual({
+			ok: false,
+			error: "That pull request is not linked to this task.",
+			pullRequest: null,
+		});
+		expect(prLinkMocks.mutateWorkspaceState).not.toHaveBeenCalled();
+	});
+
+	it("setPrimaryTaskPullRequest succeeds without broadcasting when the entry is already the sole primary", async () => {
+		const primary: TestPullRequest = {
+			provider: "github",
+			host: "github.com",
+			repository: "owner/repo",
+			number: 9,
+			url: "https://github.com/owner/repo/pull/9",
+			source: "manual",
+			createdAt: 1,
+			isPrimary: true,
+		};
+		const board = createBoard("task-1", [primary]);
+		prLinkMocks.loadWorkspaceBoardById.mockResolvedValue(board);
+		prLinkMocks.setPrimaryTaskPullRequest.mockImplementation((b: unknown) => ({ board: b, updated: false }));
+		prLinkMocks.mutateWorkspaceState.mockImplementation(
+			async (_cwd: string, mutator: (current: unknown) => unknown) => {
+				const result = mutator({ board }) as { board: unknown; value: boolean; save: boolean };
+				return { saved: result.save, value: result.value, board: result.board };
+			},
+		);
+		const { api, broadcast } = createApi();
+
+		const response = await api.setPrimaryTaskPullRequest(scope, {
+			taskId: "task-1",
+			url: "https://github.com/owner/repo/pull/9",
+		});
+
+		expect(response.ok).toBe(true);
+		if (!response.ok) {
+			throw new Error("Expected the no-op selection to succeed");
+		}
+		expect(response.pullRequest).toMatchObject({ number: 9, isPrimary: true });
+		expect(broadcast).not.toHaveBeenCalled();
 	});
 });

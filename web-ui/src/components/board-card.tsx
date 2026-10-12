@@ -1,6 +1,7 @@
 import { Draggable } from "@hello-pangea/dnd";
 import { getRuntimeAgentCatalogEntry } from "@runtime-agent-catalog";
 import { formatClineToolCallLabel } from "@runtime-cline-tool-call-display";
+import { getPrimaryPullRequest } from "@runtime-pull-request-links";
 import { buildTaskWorktreeDisplayPath } from "@runtime-task-worktree-path";
 import {
 	AlertCircle,
@@ -40,7 +41,6 @@ import {
 	normalizePromptForDisplay,
 	truncateTaskPromptLabel,
 } from "@/utils/task-prompt";
-import { getLatestPullRequest } from "@/utils/task-pull-requests";
 import { DEFAULT_TEXT_MEASURE_FONT, measureTextWidth, readElementFontShorthand } from "@/utils/text-measure";
 
 interface CardSessionActivity {
@@ -313,8 +313,9 @@ export function BoardCard({
 	const [isDescriptionExpanded, setIsDescriptionExpanded] = useState(false);
 	const reviewWorkspaceSnapshot = useTaskWorkspaceSnapshotValue(card.id);
 	const isTrashCard = columnId === "trash";
-	// PRLINK-4: most recent recorded PR shown as a compact link in the card header.
-	const latestPullRequest = getLatestPullRequest(card);
+	// PRLINK-6: display-preferred PR (explicit primary or state-ordered
+	// winner) shown as a compact link in the card header.
+	const primaryPullRequest = getPrimaryPullRequest(card.pullRequests ?? []);
 	const isDoneCard = columnId === "done";
 	const isCardInteractive = !isTrashCard && !isDoneCard;
 	const isPreparingInitialStart =
@@ -654,9 +655,9 @@ export function BoardCard({
 										</p>
 									)}
 								</div>
-								{latestPullRequest ? (
+								{primaryPullRequest ? (
 									<TaskPullRequestLink
-										pullRequest={latestPullRequest}
+										pullRequest={primaryPullRequest}
 										variant="compact"
 										className="shrink-0"
 									/>
