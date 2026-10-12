@@ -22,7 +22,7 @@ const ENV_ASSIGNMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*=/;
 const MAX_STRUCTURED_OUTPUT_DEPTH = 4;
 
 /** Splits a command line at unquoted-ish shell operators and newlines. */
-function splitCommandFragments(command: string): string[] {
+export function splitCommandFragments(command: string): string[] {
 	return command
 		.split(COMMAND_FRAGMENT_SPLIT_PATTERN)
 		.map((fragment) => fragment.trim())
@@ -30,7 +30,7 @@ function splitCommandFragments(command: string): string[] {
 }
 
 /** Tokenizes a fragment, skipping leading env assignments (`FOO=bar cmd`). */
-function tokenizeCommandFragment(fragment: string): string[] {
+export function tokenizeCommandFragment(fragment: string): string[] {
 	const tokens = fragment.split(/\s+/).filter(Boolean);
 	let index = 0;
 	while (index < tokens.length && ENV_ASSIGNMENT_PATTERN.test(tokens[index] ?? "")) {

@@ -881,6 +881,7 @@ describe("applyClineSessionEvent", () => {
 		expect(finishedTools).toEqual([
 			{
 				toolName: "run_commands",
+				toolCallId: "tool-1",
 				toolInput: { commands: ["gh pr create --title 'Fix'"] },
 				output: "Created https://github.com/owner/repo/pull/12",
 				error: null,
@@ -924,7 +925,13 @@ describe("applyClineSessionEvent", () => {
 		});
 
 		expect(finishedTools).toEqual([
-			{ toolName: "run_commands", toolInput: undefined, output: "gh: auth failed", error: "gh: auth failed" },
+			{
+				toolName: "run_commands",
+				toolCallId: "tool-2",
+				toolInput: undefined,
+				output: "gh: auth failed",
+				error: "gh: auth failed",
+			},
 		]);
 	});
 

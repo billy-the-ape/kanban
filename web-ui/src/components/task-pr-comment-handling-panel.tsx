@@ -5,6 +5,13 @@ import { useState } from "react";
 
 import { showAppToast } from "@/components/app-toaster";
 import { Button } from "@/components/ui/button";
+import {
+	AlertDialog,
+	AlertDialogAction,
+	AlertDialogCancel,
+	AlertDialogDescription,
+	AlertDialogTitle,
+} from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
 import { useTaskPrTrackingState } from "@/hooks/use-task-pr-tracking-state";
 import { getRuntimeTrpcClient } from "@/runtime/trpc-client";
@@ -26,6 +33,7 @@ export function TaskPrCommentHandlingPanel({ workspaceId, taskId, pullRequests }
 	const { state } = useTaskPrTrackingState(workspaceId, taskId, true);
 	const [toggling, setToggling] = useState(false);
 	const [resuming, setResuming] = useState(false);
+	const [showAckDialog, setShowAckDialog] = useState(false);
 
 	const githubPrs = pullRequests.filter((pullRequest) => pullRequest.host === "github.com");
 	const hasEligiblePr = githubPrs.length === 1;
@@ -59,7 +67,7 @@ export function TaskPrCommentHandlingPanel({ workspaceId, taskId, pullRequests }
 		}
 	};
 
-	const handleResume = async (): Promise<void> => {
+	const handleResume = async (acknowledge: boolean): Promise<void> => {
 		if (resuming) {
 			return;
 		}
@@ -67,8 +75,9 @@ export function TaskPrCommentHandlingPanel({ workspaceId, taskId, pullRequests }
 		try {
 			const response = await getRuntimeTrpcClient(workspaceId).runtime.resumeTaskPrCommentHandling.mutate({
 				taskId,
+				...(acknowledge ? { acknowledgeCaptureUncertainty: true } : {}),
 			});
-			if (!response.ok || !response.dispatched) {
+			if (!response.ok) {
 				showAppToast({ intent: "warning", message: response.error || "Could not resume comment handling." });
 			}
 		} catch (error) {
@@ -80,6 +89,28 @@ export function TaskPrCommentHandlingPanel({ workspaceId, taskId, pullRequests }
 			setResuming(false);
 		}
 	};
+
+	const requiresAcknowledgment = state?.resumeRequiresAcknowledgment ?? false;
+	const requestResume = (): void => {
+		if (requiresAcknowledgment) {
+			setShowAckDialog(true);
+		} else {
+			void handleResume(false);
+		}
+	};
+	const resumeButton = state?.resumable ? (
+		<Button
+			variant="ghost"
+			size="sm"
+			icon={resuming ? <Spinner size={10} /> : <Play size={10} />}
+			disabled={resuming}
+			onClick={requestResume}
+			className="h-5 shrink-0 px-1.5 text-[11px]"
+			data-testid="task-pr-comment-resume-button"
+		>
+			Resume
+		</Button>
+	) : null;
 
 	let statusLine: ReactNode = null;
 	if (dispatch?.status === "running") {
@@ -99,19 +130,7 @@ export function TaskPrCommentHandlingPanel({ workspaceId, taskId, pullRequests }
 				data-testid="task-pr-comment-status-failed"
 			>
 				{dispatch.error ?? "Comment handling failed."}
-				{state?.resumable ? (
-					<Button
-						variant="ghost"
-						size="sm"
-						icon={resuming ? <Spinner size={10} /> : <Play size={10} />}
-						disabled={resuming}
-						onClick={() => void handleResume()}
-						className="h-5 shrink-0 px-1.5 text-[11px]"
-						data-testid="task-pr-comment-resume-button"
-					>
-						Resume
-					</Button>
-				) : null}
+				{resumeButton}
 			</span>
 		);
 	} else if (pendingCount > 0 && pendingDeadline !== null) {
@@ -125,8 +144,12 @@ export function TaskPrCommentHandlingPanel({ workspaceId, taskId, pullRequests }
 		);
 	} else if (blocker) {
 		statusLine = (
-			<span className="text-[11px] text-status-orange" data-testid="task-pr-comment-status-blocked">
-				{blocker}
+			<span
+				className="flex items-center gap-1.5 text-[11px] text-status-orange"
+				data-testid="task-pr-comment-status-blocked"
+			>
+				<span className="min-w-0">{blocker}</span>
+				{resumeButton}
 			</span>
 		);
 	} else if (enabled) {
@@ -170,6 +193,22 @@ export function TaskPrCommentHandlingPanel({ workspaceId, taskId, pullRequests }
 						: "Link a GitHub pull request to enable comment handling."}
 				</span>
 			) : null}
+			<AlertDialog open={showAckDialog} onOpenChange={setShowAckDialog}>
+				<AlertDialogTitle>Resume with unverified publication capture?</AlertDialogTitle>
+				<AlertDialogDescription>
+					A comment published by this task could not be identified from its tool output. If you resume, that
+					comment could retrigger comment handling later.
+				</AlertDialogDescription>
+				<AlertDialogCancel disabled={resuming}>Cancel</AlertDialogCancel>
+				<AlertDialogAction
+					disabled={resuming}
+					onClick={() => {
+						void handleResume(true);
+					}}
+				>
+					Resume anyway
+				</AlertDialogAction>
+			</AlertDialog>
 		</div>
 	);
 }

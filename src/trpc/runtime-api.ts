@@ -1771,6 +1771,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 						dispatch: null,
 						blocker: null,
 						resumable: false,
+						resumeRequiresAcknowledgment: false,
 					},
 				};
 			}
@@ -1786,7 +1787,9 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					dispatched: false,
 				};
 			}
-			return await automationService.resumeCommentHandling(workspaceScope, body.taskId);
+			return await automationService.resumeCommentHandling(workspaceScope, body.taskId, {
+				acknowledgeCaptureUncertainty: body.acknowledgeCaptureUncertainty,
+			});
 		},
 		startShellSession: async (workspaceScope, input) => {
 			try {

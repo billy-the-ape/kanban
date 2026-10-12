@@ -1,0 +1,565 @@
+// COMMENT-0: publication attribution for implementation-agent PR writes.
+//
+// Pure detection + identity extraction over implementation task tool calls.
+// Only recognized write operations are considered, and identities come
+// exclusively from attributable API responses or returned comment/review
+// URLs — never from command text, quoted reply bodies, read-only output, or
+// arbitrary URLs in a mixed tool result. The result is publication
+// attribution metadata (which exact identities the implementation session
+// published), not a ledger of feedback fixes, decisions, or repair outcomes.
+//
+// Known limitation (documented, not hidden): arbitrary opaque scripts or
+// deliberately suppressed output cannot be exhaustively attributed while
+// preserving unrestricted terminal access. Those cases surface as an
+// explicit capture uncertainty instead of silently registering (or missing)
+// identities.
+import { splitCommandFragments, tokenizeCommandFragment } from "../core/pull-request-detection";
+
+export type PrPublishedIdentityKind = "conversation" | "inline" | "review";
+
+/** One implementation-published GitHub feedback item (kind + database id). */
+export interface PrPublishedIdentity {
+	kind: PrPublishedIdentityKind;
+	id: number;
+}
+
+/** Namespaced identity string matching the feedback event provider ids. */
+export function prPublishedIdentityKey(identity: PrPublishedIdentity): string {
+	return `${identity.kind}-${identity.id}`;
+}
+
+/** A github.com PR selection target (matches RuntimeTaskPullRequest fields). */
+export interface PrPublicationTarget {
+	host: string;
+	/** "owner/repo". */
+	repository: string;
+	number: number;
+}
+
+/** A recognized PR-feedback write operation in one command fragment. */
+export interface PrPublicationOperation {
+	/** Minimal label for attribution: "gh pr comment" | "gh api" | "gh pr review". */
+	operation: string;
+	kind: PrPublishedIdentityKind;
+	explicitRepository: string | null;
+	explicitNumber: number | null;
+}
+
+export type PrPublicationStatus = "none" | "pending" | "published" | "failed" | "uncertain";
+
+export interface PrPublicationObservation {
+	/**
+	 * none: no recognized write operation; pending: recognized write before
+	 * execution (started phase, output not yet available); published:
+	 * identities captured; failed: the write clearly failed (nothing
+	 * published); uncertain: a write happened (or may have) and the exact
+	 * identity cannot be established from the available evidence.
+	 */
+	status: PrPublicationStatus;
+	/** The linked PR this operation resolved to, when determinable. */
+	target: PrPublicationTarget | null;
+	operation: string | null;
+	kind: PrPublishedIdentityKind | null;
+	identities: PrPublishedIdentity[];
+	/** Human-readable uncertainty reason (visible in the panel). */
+	reason: string | null;
+}
+
+const GH_API_WRITE_METHODS = new Set(["POST", "PUT", "PATCH"]);
+const GH_API_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
+/** Flags whose next token is a value (skipped when scanning for positionals). */
+const GH_VALUE_FLAGS = new Set([
+	"-b",
+	"--body",
+	"--body-file",
+	"-R",
+	"--repo",
+	"-l",
+	"--label",
+	"--reviewer",
+	"--milestone",
+	"--project",
+]);
+
+function isDigits(value: string): boolean {
+	return value.length > 0 && /^\d+$/.test(value);
+}
+
+/**
+ * Scans one fragment for a `-R/--repo <owner/repo>` or a positional PR
+ * number. A bare digits token is a PR number only when it directly follows
+ * the action (before any flag) or is the sole positional after value flags.
+ */
+function readPrSelection(tokens: string[], from: number): { repository: string | null; number: number | null } {
+	let repository: string | null = null;
+	let number: number | null = null;
+	for (let i = from; i < tokens.length; i += 1) {
+		const token = tokens[i] ?? "";
+		if (token === "-R" || token === "--repo") {
+			repository = tokens[i + 1] ?? repository;
+			i += 1;
+			continue;
+		}
+		if (GH_VALUE_FLAGS.has(token)) {
+			i += 1;
+			continue;
+		}
+		if (token.startsWith("-")) {
+			continue;
+		}
+		if (isDigits(token) && number === null) {
+			number = Number.parseInt(token, 10);
+		}
+	}
+	return { repository, number };
+}
+
+function parseApiWriteEndpoint(endpoint: string): { kind: PrPublishedIdentityKind } | null {
+	// REST write endpoints for PR feedback:
+	//   repos/O/R/issues/N/comments[?/C]   conversation comment create/edit
+	//   repos/O/R/pulls/N/comments[?/C]     inline (review) comment create/edit
+	//   repos/O/R/pulls/N/reviews           review submission (may carry inlines)
+	const match = /^repos\/([^/]+)\/([^/]+)\/(issues|pulls)\/(\d+)\/(comments)(?:\/\d+)?$/.exec(endpoint);
+	if (match) {
+		return { kind: match[3] === "issues" ? "conversation" : "inline" };
+	}
+	const reviews = /^repos\/([^/]+)\/([^/]+)\/(pulls)\/(\d+)\/(reviews)$/.exec(endpoint);
+	if (reviews) {
+		return { kind: "review" };
+	}
+	return null;
+}
+
+/**
+ * Detects recognized PR-feedback write operations in raw command strings.
+ * Pure string scan (cheap enough to run for every tool call); returns
+ * operations in first-appearance order, deduplicated by shape. `--web`
+ * variants open a browser instead of an API write and are not publications.
+ */
+export function detectPublicationOperations(commands: string[]): PrPublicationOperation[] {
+	const operations: PrPublicationOperation[] = [];
+	const seen = new Set<string>();
+	const push = (operation: PrPublicationOperation): void => {
+		const shape = `${operation.operation}|${operation.kind}|${operation.explicitRepository}|${operation.explicitNumber}`;
+		if (seen.has(shape)) {
+			return;
+		}
+		seen.add(shape);
+		operations.push(operation);
+	};
+	for (const command of commands) {
+		for (const fragment of splitCommandFragments(command)) {
+			const tokens = tokenizeCommandFragment(fragment);
+			const commandName = tokens[0] ?? "";
+			if (commandName !== "gh") {
+				continue;
+			}
+			const group = tokens[1] ?? "";
+			if (group === "pr") {
+				const action = tokens[2] ?? "";
+				if (action === "comment") {
+					if (tokens.slice(3).includes("--web")) {
+						continue;
+					}
+					const selection = readPrSelection(tokens, 3);
+					push({
+						operation: "gh pr comment",
+						kind: "conversation",
+						explicitRepository: selection.repository,
+						explicitNumber: selection.number,
+					});
+				} else if (action === "review" && tokens.slice(3).includes("--comment")) {
+					if (tokens.slice(3).includes("--web")) {
+						continue;
+					}
+					const selection = readPrSelection(tokens, 3);
+					push({
+						operation: "gh pr review",
+						kind: "review",
+						explicitRepository: selection.repository,
+						explicitNumber: selection.number,
+					});
+				}
+			} else if (group === "api") {
+				let i = 1;
+				let method: string | null = null;
+				if (i < tokens.length && GH_API_METHODS.has(tokens[i] ?? "")) {
+					method = tokens[i];
+					i += 1;
+				}
+				const endpoint = tokens[i] ?? null;
+				const rest = tokens.slice(i + 1);
+				const hasPayload = rest.some(
+					(token) => token === "-f" || token === "-F" || token === "--field" || token === "--raw-field",
+				);
+				const effective = method ?? (hasPayload ? "POST" : "GET");
+				if (!endpoint || !GH_API_WRITE_METHODS.has(effective)) {
+					continue;
+				}
+				const parsed = parseApiWriteEndpoint(endpoint);
+				if (!parsed) {
+					continue;
+				}
+				const repoMatch = /^repos\/([^/]+)\/([^/]+)/.exec(endpoint);
+				const numberMatch = /\/\d+/.exec(endpoint);
+				push({
+					operation: "gh api",
+					kind: parsed.kind,
+					explicitRepository: repoMatch ? `${repoMatch[1]}/${repoMatch[2]}` : null,
+					explicitNumber: numberMatch ? Number.parseInt(numberMatch[0].slice(1), 10) : null,
+				});
+			}
+		}
+	}
+	return operations;
+}
+
+function sameTarget(left: PrPublicationTarget | null, right: PrPublicationTarget | null): boolean {
+	return (
+		left !== null &&
+		right !== null &&
+		left.host === right.host &&
+		left.repository === right.repository &&
+		left.number === right.number
+	);
+}
+
+function matchLinked(
+	linked: PrPublicationTarget[],
+	repository: string | null,
+	number: number | null,
+): PrPublicationTarget | null {
+	if (repository !== null && number !== null) {
+		const match = linked.find((target) => target.repository === repository && target.number === number);
+		return match ?? null;
+	}
+	if (repository !== null) {
+		const onRepo = linked.filter((target) => target.repository === repository);
+		return onRepo.length === 1 ? onRepo[0] : null;
+	}
+	if (number !== null) {
+		const byNumber = linked.filter((target) => target.number === number);
+		return byNumber.length === 1 ? byNumber[0] : null;
+	}
+	// No explicit selector: only safe with exactly one linked PR (the
+	// command's implicit selector targets that PR's branch).
+	return linked.length === 1 ? linked[0] : null;
+}
+
+/**
+ * Resolves the single tracked PR a tool call's write operations target.
+ * Every operation must resolve to the same linked PR; otherwise the
+ * publication cannot be attributed to one tracking record.
+ */
+export function resolvePublicationTarget(
+	operations: PrPublicationOperation[],
+	linked: PrPublicationTarget[],
+): PrPublicationTarget | null {
+	if (operations.length === 0) {
+		return null;
+	}
+	const resolved = operations.map((operation) =>
+		matchLinked(linked, operation.explicitRepository, operation.explicitNumber),
+	);
+	if (resolved.some((target) => target === null)) {
+		return null;
+	}
+	return resolved.every((target) => sameTarget(target, resolved[0])) ? resolved[0] : null;
+}
+export interface PrPublicationOutputResult {
+	status: "published" | "failed" | "uncertain";
+	identities: PrPublishedIdentity[];
+	reason: string | null;
+}
+
+function findBalancedBrace(text: string, start: number): number {
+	let depth = 0;
+	let inString = false;
+	let escaped = false;
+	for (let i = start; i < text.length; i += 1) {
+		const char = text[i] ?? "";
+		if (inString) {
+			if (escaped) {
+				escaped = false;
+			} else if (char === "\\") {
+				escaped = true;
+			} else if (char === '"') {
+				inString = false;
+			}
+			continue;
+		}
+		if (char === '"') {
+			inString = true;
+		} else if (char === "{") {
+			depth += 1;
+		} else if (char === "}") {
+			depth -= 1;
+			if (depth === 0) {
+				return i;
+			}
+		}
+	}
+	return -1;
+}
+
+/** Top-level JSON objects embedded in tool output (parse failures skipped). */
+function extractJsonObjects(text: string): Array<Record<string, unknown>> {
+	const results: Array<Record<string, unknown>> = [];
+	for (let i = 0; i < text.length && results.length < 8; i += 1) {
+		if (text[i] !== "{") {
+			continue;
+		}
+		const end = findBalancedBrace(text, i);
+		if (end < 0) {
+			continue;
+		}
+		try {
+			const parsed: unknown = JSON.parse(text.slice(i, end + 1));
+			if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+				results.push(parsed as Record<string, unknown>);
+			}
+		} catch {
+			// Not a JSON document; keep scanning.
+		}
+		i = end;
+	}
+	return results;
+}
+
+function readString(record: Record<string, unknown>, key: string): string | null {
+	const value = record[key];
+	return typeof value === "string" ? value : null;
+}
+
+function readPositiveInt(record: Record<string, unknown>, key: string): number | null {
+	const value = record[key];
+	return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+/**
+ * Maps one attributable GitHub API response object to published identities.
+ * The object must carry the target repository/PR in its URL fields; error
+ * responses (`{"message": ...}` with no id) are recognized as failures.
+ */
+function mapApiResponseIdentity(
+	object: Record<string, unknown>,
+	target: PrPublicationTarget | null,
+): { kind: "identities" | "error"; identities: PrPublishedIdentity[] } {
+	if (target === null) {
+		return { kind: "identities", identities: [] };
+	}
+	const id = readPositiveInt(object, "id");
+	const url = readString(object, "url") ?? readString(object, "html_url");
+	const issueUrl = readString(object, "issue_url");
+	const pullRequestUrl = readString(object, "pull_request_url");
+	const path = object.path;
+	const diffHunk = object.diff_hunk;
+	const state = object.state;
+	const hasTarget = (value: string | null): boolean => {
+		if (!value) {
+			return false;
+		}
+		const repoMatch = /github\.com\/([^/\s?#]+)\/([^/\s?#]+)/.exec(value);
+		const repo = repoMatch ? `${repoMatch[1]}/${repoMatch[2]}` : null;
+		const numberMatch = /(?:\/pull|\/pulls|\/issues)\/(\d+)/.exec(value);
+		const number = numberMatch ? Number.parseInt(numberMatch[1], 10) : null;
+		return repo === target.repository && number === target.number;
+	};
+	if (id === null) {
+		// API error response (or something without an identity).
+		return { kind: typeof object.message === "string" ? "error" : "identities", identities: [] };
+	}
+	if (issueUrl !== null && hasTarget(issueUrl) && (url === null || hasTarget(url))) {
+		return { kind: "identities", identities: [{ kind: "conversation", id }] };
+	}
+	if (pullRequestUrl !== null && hasTarget(pullRequestUrl)) {
+		if (path !== undefined && diffHunk !== undefined) {
+			return { kind: "identities", identities: [{ kind: "inline", id }] };
+		}
+		if (typeof state === "string" && Array.isArray(object.comments)) {
+			// A submitted review response: the review itself plus every
+			// inline comment it returned.
+			const identities: PrPublishedIdentity[] = [{ kind: "review", id }];
+			for (const comment of object.comments) {
+				if (comment !== null && typeof comment === "object" && !Array.isArray(comment)) {
+					const commentId = readPositiveInt(comment as Record<string, unknown>, "id");
+					if (commentId !== null) {
+						identities.push({ kind: "inline", id: commentId });
+					}
+				}
+			}
+			return { kind: "identities", identities };
+		}
+	}
+	// A URL for the target PR but an unrecognized shape: do not guess.
+	return { kind: "identities", identities: [] };
+}
+
+/**
+ * Returns comment/review URLs printed by `gh pr comment` / `gh pr review`,
+ * validated against the target PR. The fragment anchors are the GitHub
+ * database ids (`#issuecomment-<issue comment id>`, `#discussion_r<review
+ * comment id>`, `#pullrequestreview-<review id>`), so each form is only
+ * accepted under its own kind — a reviewer's inline URL never registers as
+ * a conversation identity or vice versa.
+ */
+function extractUrlIdentities(
+	text: string,
+	operations: PrPublicationOperation[],
+	target: PrPublicationTarget | null,
+): PrPublishedIdentity[] {
+	if (target === null) {
+		return [];
+	}
+	const identities: PrPublishedIdentity[] = [];
+	const kinds = new Set(operations.map((operation) => operation.kind));
+	if (kinds.has("conversation")) {
+		const pattern = /https?:\/\/([^/]+)\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:\/discussions\/|#issuecomment-)(\d+)/g;
+		for (const match of text.matchAll(pattern)) {
+			if (
+				match[1] === target.host &&
+				`${match[2]}/${match[3]}` === target.repository &&
+				Number.parseInt(match[4], 10) === target.number
+			) {
+				identities.push({ kind: "conversation", id: Number.parseInt(match[5], 10) });
+			}
+		}
+	}
+	if (kinds.has("inline")) {
+		const pattern = /https?:\/\/([^/]+)\/([^/]+)\/([^/]+)\/pull\/(\d+)#discussion_r(\d+)/g;
+		for (const match of text.matchAll(pattern)) {
+			if (
+				match[1] === target.host &&
+				`${match[2]}/${match[3]}` === target.repository &&
+				Number.parseInt(match[4], 10) === target.number
+			) {
+				identities.push({ kind: "inline", id: Number.parseInt(match[5], 10) });
+			}
+		}
+	}
+	if (kinds.has("review")) {
+		const pattern = /https?:\/\/([^/]+)\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:#pullrequestreview-|\/reviews\/)(\d+)/g;
+		for (const match of text.matchAll(pattern)) {
+			if (
+				match[1] === target.host &&
+				`${match[2]}/${match[3]}` === target.repository &&
+				Number.parseInt(match[4], 10) === target.number
+			) {
+				identities.push({ kind: "review", id: Number.parseInt(match[5], 10) });
+			}
+		}
+	}
+	return identities;
+}
+
+function hasClearFailureEvidence(output: string | null, error: string | null): boolean {
+	const candidates = [output, error].filter((value): value is string => value !== null && value.trim().length > 0);
+	if (candidates.length === 0) {
+		return false;
+	}
+	const pattern = /^\s*gh: |^HTTP [45]\d\d|^\s*HTTP [45]\d\d|GraphQL/i;
+	return candidates.some((value) => pattern.test(value));
+}
+
+/**
+ * Resolves a recognized write's tool output to exact published identities.
+ * Identities come only from attributable API responses or returned URLs for
+ * the resolved target; a clear API/CLI failure means nothing was published;
+ * anything else is explicit uncertainty (never a guess).
+ */
+export function resolvePublicationOutput(input: {
+	operations: PrPublicationOperation[];
+	target: PrPublicationTarget | null;
+	output: string | null;
+	error: string | null;
+}): PrPublicationOutputResult {
+	const text = input.output ?? "";
+	const collected: PrPublishedIdentity[] = [];
+	let sawError = false;
+	for (const object of extractJsonObjects(text)) {
+		const mapped = mapApiResponseIdentity(object, input.target);
+		if (mapped.kind === "error") {
+			sawError = true;
+			continue;
+		}
+		collected.push(...mapped.identities);
+	}
+	if (collected.length === 0) {
+		collected.push(...extractUrlIdentities(text, input.operations, input.target));
+	}
+	const deduped: PrPublishedIdentity[] = [];
+	const seen = new Set<string>();
+	for (const identity of collected) {
+		const key = prPublishedIdentityKey(identity);
+		if (!seen.has(key)) {
+			seen.add(key);
+			deduped.push(identity);
+		}
+	}
+	if (deduped.length > 0) {
+		return { status: "published", identities: deduped, reason: null };
+	}
+	if (sawError || hasClearFailureEvidence(input.output, input.error)) {
+		return { status: "failed", identities: [], reason: null };
+	}
+	return {
+		status: "uncertain",
+		identities: [],
+		reason: "The publication output did not include the comment or review identity.",
+	};
+}
+
+/**
+ * Analyzes one implementation tool call for PR-feedback publications.
+ * `output` null = started phase (recognized write, execution not yet
+ * complete): establishes capture-pending without any identity claim.
+ */
+export function analyzePrPublication(input: {
+	toolName: string | null;
+	commands: string[];
+	output: string | null;
+	error: string | null;
+	linkedPullRequests: PrPublicationTarget[];
+}): PrPublicationObservation {
+	void input.toolName; // detection is command-based, like the PRLINK-0 gate
+	const operations = detectPublicationOperations(input.commands);
+	if (operations.length === 0) {
+		return { status: "none", target: null, operation: null, kind: null, identities: [], reason: null };
+	}
+	const target = resolvePublicationTarget(operations, input.linkedPullRequests);
+	const primary = operations[0];
+	if (target === null) {
+		return {
+			status: "uncertain",
+			target: null,
+			operation: primary.operation,
+			kind: primary.kind,
+			identities: [],
+			reason: "Could not resolve which linked pull request the publication targets.",
+		};
+	}
+	if (input.output === null) {
+		return {
+			status: "pending",
+			target,
+			operation: primary.operation,
+			kind: primary.kind,
+			identities: [],
+			reason: null,
+		};
+	}
+	const resolved = resolvePublicationOutput({
+		operations,
+		target,
+		output: input.output,
+		error: input.error,
+	});
+	return {
+		status: resolved.status,
+		target,
+		operation: primary.operation,
+		kind: primary.kind,
+		identities: resolved.identities,
+		reason: resolved.reason,
+	};
+}

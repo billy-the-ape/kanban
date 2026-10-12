@@ -133,6 +133,7 @@ function makeService(
 			scope: { workspaceId: string; workspacePath: string },
 			body: RuntimeTaskChatSendRequest,
 		) => Promise<RuntimeTaskChatSendResponse>;
+		now?: () => number;
 	} = {},
 ) {
 	const workspaces = overrides.workspaces ?? [{ workspaceId: "w1", workspacePath: "/w1" }];
@@ -163,7 +164,7 @@ function makeService(
 				return makeSnapshot(overrides.snapshot ?? {});
 			},
 		},
-		now: () => NOW,
+		now: overrides.now ?? (() => NOW),
 		warn: () => undefined,
 	});
 	return { service, sent, workspaces, workspaceStates, snapshotCalls };
@@ -773,7 +774,7 @@ describe("PrCommentAutomationService", () => {
 		}));
 		const result = await noFailure.service.resumeCommentHandling(scope, "t1");
 		expect(result.ok).toBe(false);
-		expect(result.error).toContain("no failed");
+		expect(result.error).toBe("There is nothing to resume.");
 	});
 
 	it("a failed send marks the dispatch failed with the concise error", async () => {
@@ -813,5 +814,435 @@ describe("PrCommentAutomationService", () => {
 		}
 		expect(loaded.record.commentAutomation.dispatch?.status).toBe("failed");
 		expect(loaded.record.commentAutomation.dispatch?.error).toBe("model down");
+	});
+});
+
+describe("COMMENT-0 publication capture", () => {
+	const scope = { workspaceId: "w1", workspacePath: "/w1" };
+	const cardState = () =>
+		new Map<string, RuntimeWorkspaceStateResponse>([
+			["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })])],
+		]);
+
+	const toolEvent = (
+		overrides: {
+			phase?: "started" | "finished";
+			commands?: string[];
+			output?: string | null;
+			error?: string | null;
+			toolCallId?: string | null;
+		} = {},
+	) => ({
+		workspaceId: "w1",
+		workspacePath: "/w1",
+		taskId: "t1",
+		phase: (overrides.phase ?? "finished") as "started" | "finished",
+		toolCallId: overrides.toolCallId ?? "call-1",
+		toolName: "run_command",
+		commands: overrides.commands ?? ["gh pr comment -b 'addressing review'"],
+		output: overrides.output ?? null,
+		error: overrides.error ?? null,
+	});
+
+	const load = async (): Promise<RuntimeGitHubPrTrackingRecord> => {
+		const loaded = await loadPrTrackingRecord(KEY);
+		if (loaded.status !== "ok") {
+			throw new Error(`record unavailable: ${loaded.status}`);
+		}
+		return loaded.record;
+	};
+
+	const seedOwner = () =>
+		upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			taskBindings: [{ workspaceId: "w1", taskId: "t1", terminal: false }],
+			commentAutomation: {
+				...record.commentAutomation,
+				repairOwner: { workspaceId: "w1", taskId: "t1", revision: 1 },
+			},
+		}));
+
+	it("excludes recorded implementation replies from pending feedback and sends once", async () => {
+		const reviewer = makeEvent({ providerId: "conversation-1", updatedAt: NOW - 471_000 });
+		const reply = makeEvent({ providerId: "conversation-9", updatedAt: NOW - 100_000 });
+		await seedOwner();
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			commentAutomation: {
+				...record.commentAutomation,
+				publication: { ...record.commentAutomation.publication, published: [{ kind: "conversation", id: 9 }] },
+			},
+		}));
+		const harness = makeService({ workspaceStates: cardState(), snapshot: { events: [reviewer, reply] } });
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		// One follow-up for the reviewer feedback: the recorded reply is
+		// excluded, so the sent batch is the reviewer event only.
+		expect(harness.sent).toHaveLength(1);
+		let record = await load();
+		expect(record.commentAutomation.pendingCount).toBeNull();
+		expect(record.commentAutomation.lastDispatchedFeedbackFingerprint).toEqual(fingerprintOf([reviewer]));
+		// A later poll with the same events creates no new scheduling and no
+		// second send: the recorded reply never re-triggers handling.
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(1);
+		record = await load();
+		expect(record.commentAutomation.pendingCount).toBeNull();
+	});
+
+	it("keeps another reviewer using the same account eligible", async () => {
+		const first = makeEvent({ providerId: "conversation-1", updatedAt: NOW });
+		const second = makeEvent({ providerId: "conversation-2", updatedAt: NOW });
+		await seedOwner();
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			commentAutomation: {
+				...record.commentAutomation,
+				publication: { ...record.commentAutomation.publication, published: [{ kind: "conversation", id: 1 }] },
+			},
+		}));
+		const harness = makeService({ workspaceStates: cardState(), snapshot: { events: [first, second] } });
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		const record = await load();
+		expect(record.commentAutomation.pendingCount).toBe(1);
+		expect(record.commentAutomation.pendingFeedbackFingerprint).toEqual(fingerprintOf([second]));
+	});
+
+	it("records published identities and drops scheduling caused solely by the reply", async () => {
+		const reply = makeEvent({ providerId: "conversation-9", updatedAt: NOW - 471_000 });
+		const replyFp = fingerprintOf([reply]);
+		// A due pending schedule caused solely by the implementation reply.
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			taskBindings: [{ workspaceId: "w1", taskId: "t1", terminal: false }],
+			commentAutomation: {
+				...record.commentAutomation,
+				repairOwner: { workspaceId: "w1", taskId: "t1", revision: 1 },
+				pendingFeedbackFingerprint: replyFp,
+				pendingCount: 1,
+				firstPendingAt: NOW - 590_000,
+				debounceDeadline: NOW - 351_000,
+			},
+		}));
+		let clock = NOW;
+		const harness = makeService({
+			workspaceStates: cardState(),
+			snapshot: { events: [reply] },
+			now: () => clock,
+		});
+		await harness.service.refreshWorkspace(scope);
+
+		await harness.service.recordPrPublicationToolEvent(toolEvent({ phase: "started" }));
+		expect((await load()).commentAutomation.publication.pending).toHaveLength(1);
+		// The due dispatch must wait while the capture is unresolved.
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(0);
+
+		await harness.service.recordPrPublicationToolEvent(
+			toolEvent({
+				phase: "finished",
+				output: JSON.stringify({
+					id: 9,
+					issue_url: "https://github.com/octo/repo/issues/42",
+					html_url: "https://github.com/octo/repo/pull/42#discussion_r9",
+				}),
+			}),
+		);
+		let record = await load();
+		expect(record.commentAutomation.publication.published).toEqual([{ kind: "conversation", id: 9 }]);
+		expect(record.commentAutomation.publication.pending).toEqual([]);
+		// The next settle re-derives with the exclusion: the only pending
+		// event was the implementation reply, so the schedule and queued
+		// intent clear instead of sending.
+		clock += 61_000;
+		await harness.service.runTick();
+		record = await load();
+		expect(record.commentAutomation.pendingCount).toBeNull();
+		expect(record.commentAutomation.debounceDeadline).toBeNull();
+		expect(record.commentAutomation.dispatch).toBeNull();
+		// A restarted service keeps the exclusion (durable record).
+		const restarted = makeService({ workspaceStates: cardState(), snapshot: { events: [reply] } });
+		await restarted.service.refreshWorkspace(scope);
+		await restarted.service.runTick();
+		expect((await load()).commentAutomation.pendingCount).toBeNull();
+	});
+
+	it("records a submitted review plus every inline comment it returned", async () => {
+		const commands = ["gh pr review --comment -b 'addresses the review'"];
+		const harness = makeService({ workspaceStates: cardState() });
+		await harness.service.recordPrPublicationToolEvent(toolEvent({ phase: "started", commands }));
+		await harness.service.recordPrPublicationToolEvent(
+			toolEvent({
+				phase: "finished",
+				commands,
+				output: JSON.stringify({
+					id: 500,
+					state: "COMMENTED",
+					pull_request_url: "https://github.com/octo/repo/pull/42",
+					comments: [{ id: 501 }, { id: 502 }],
+				}),
+			}),
+		);
+		const record = await load();
+		expect(record.commentAutomation.publication.published).toEqual([
+			{ kind: "review", id: 500 },
+			{ kind: "inline", id: 501 },
+			{ kind: "inline", id: 502 },
+		]);
+		expect(record.commentAutomation.publication.pending).toEqual([]);
+	});
+
+	it("never registers identities from read-only output or quoted URLs", async () => {
+		const harness = makeService({ workspaceStates: cardState() });
+		await harness.service.recordPrPublicationToolEvent(
+			toolEvent({
+				commands: ["gh pr view 42 --json comments"],
+				output: "https://github.com/octo/repo/pull/42#discussion_r7",
+			}),
+		);
+		await harness.service.recordPrPublicationToolEvent(
+			toolEvent({
+				toolCallId: "call-2",
+				commands: ["gh api GET repos/octo/repo/pulls/42/comments"],
+				output: JSON.stringify({ id: 7, body: "reviewer feedback" }),
+			}),
+		);
+		await harness.service.recordPrPublicationToolEvent(
+			toolEvent({
+				toolCallId: "call-3",
+				commands: ["gh pr comment -b 'see https://github.com/octo/repo/pull/42#discussion_r7'"],
+				output: "https://github.com/octo/repo/pull/42#issuecomment-8",
+			}),
+		);
+		const record = await load();
+		expect(record.commentAutomation.publication.published).toEqual([{ kind: "conversation", id: 8 }]);
+		expect(record.commentAutomation.publication.pending).toEqual([]);
+	});
+
+	it("does not record publications targeting an unlinked pull request", async () => {
+		await seedOwner();
+		const harness = makeService({ workspaceStates: cardState() });
+		await harness.service.recordPrPublicationToolEvent(
+			toolEvent({
+				commands: ["gh pr comment 43 -b 'for the other pull request'"],
+				output: "https://github.com/octo/repo/pull/43#discussion_r11",
+			}),
+		);
+		const record = await load();
+		expect(record.commentAutomation.publication.published).toEqual([]);
+		expect(record.commentAutomation.publication.pending).toEqual([]);
+	});
+
+	it("pauses with a visible reason when the identity is unknowable, until acknowledged", async () => {
+		const harness = makeService({ workspaceStates: cardState() });
+		await harness.service.recordPrPublicationToolEvent(toolEvent({ phase: "started" }));
+		await harness.service.recordPrPublicationToolEvent(toolEvent({ phase: "finished", output: "Done." }));
+		let record = await load();
+		expect(record.commentAutomation.publication.pending).toHaveLength(1);
+		expect(record.commentAutomation.publication.pending[0]?.uncertain).toBe(true);
+		// A duplicate finished event updates in place, never duplicates.
+		await harness.service.recordPrPublicationToolEvent(toolEvent({ phase: "finished", output: "Done." }));
+		record = await load();
+		expect(record.commentAutomation.publication.pending).toHaveLength(1);
+
+		let state = await harness.service.getTaskPrTrackingState(scope, "t1");
+		expect(state.ok).toBe(true);
+		if (!state.ok) {
+			throw new Error("unreachable");
+		}
+		expect(state.state.blocker).toContain("publication output did not include");
+		expect(state.state.resumable).toBe(true);
+		expect(state.state.resumeRequiresAcknowledgment).toBe(true);
+
+		// Resume without acknowledgment is rejected and keeps the uncertainty.
+		expect(await harness.service.resumeCommentHandling(scope, "t1")).toMatchObject({ ok: false, dispatched: false });
+		record = await load();
+		expect(record.commentAutomation.publication.pending).toHaveLength(1);
+
+		// Explicit acknowledgment clears it without dispatching.
+		expect(await harness.service.resumeCommentHandling(scope, "t1", { acknowledgeCaptureUncertainty: true })).toEqual(
+			{
+				ok: true,
+				dispatched: false,
+			},
+		);
+		record = await load();
+		expect(record.commentAutomation.publication.pending).toEqual([]);
+		expect(record.commentAutomation.autoSendAttempts).toEqual([]);
+		expect(record.commentAutomation.autoSendPaused).toBe(false);
+		state = await harness.service.getTaskPrTrackingState(scope, "t1");
+		if (!state.ok) {
+			throw new Error("unreachable");
+		}
+		expect(state.state.blocker).toBeNull();
+	});
+
+	it("keeps dispatch, binding, and PR fields intact while recording attribution", async () => {
+		const event = makeEvent({ providerId: "conversation-1", updatedAt: NOW });
+		const fp = fingerprintOf([event]);
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			taskBindings: [{ workspaceId: "w1", taskId: "t1", terminal: false }],
+			commentAutomation: {
+				...record.commentAutomation,
+				repairOwner: { workspaceId: "w1", taskId: "t1", revision: 1 },
+				pendingFeedbackFingerprint: fp,
+				pendingCount: 1,
+				firstPendingAt: NOW,
+				debounceDeadline: NOW + 120_000,
+				lastDispatchedFeedbackFingerprint: null,
+			},
+		}));
+		const harness = makeService({ workspaceStates: cardState() });
+		await harness.service.recordPrPublicationToolEvent(
+			toolEvent({ output: "https://github.com/octo/repo/pull/42#issuecomment-9" }),
+		);
+		const record = await load();
+		expect(record.commentAutomation.publication.published).toEqual([{ kind: "conversation", id: 9 }]);
+		expect(record.taskBindings).toEqual([{ workspaceId: "w1", taskId: "t1", terminal: false }]);
+		expect(record.pr).toEqual(PR);
+		expect(record.commentAutomation.pendingFeedbackFingerprint).toEqual(fp);
+		expect(record.commentAutomation.pendingCount).toBe(1);
+		expect(record.commentAutomation.debounceDeadline).toBe(NOW + 120_000);
+	});
+
+	it("allows five automatic sends per hour, pauses the sixth, and persists the pause", async () => {
+		for (let i = 1; i <= 5; i += 1) {
+			const event = makeEvent({ providerId: `conversation-${i}`, updatedAt: NOW - 471_000 });
+			await upsertSeed((record) => ({
+				...record,
+				revision: record.revision + 1,
+				taskBindings: [{ workspaceId: "w1", taskId: "t1", terminal: false }],
+				commentAutomation: {
+					...record.commentAutomation,
+					repairOwner: { workspaceId: "w1", taskId: "t1", revision: 1 },
+					dispatch:
+						record.commentAutomation.dispatch !== null
+							? { ...record.commentAutomation.dispatch, status: "completed" }
+							: null,
+				},
+			}));
+			const harness = makeService({ workspaceStates: cardState(), snapshot: { events: [event] } });
+			await harness.service.refreshWorkspace(scope);
+			await harness.service.runTick();
+			expect(harness.sent).toHaveLength(1);
+		}
+		let record = await load();
+		expect(record.commentAutomation.autoSendAttempts).toHaveLength(5);
+
+		// Complete the fifth dispatch before observing the sixth attempt.
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			commentAutomation: {
+				...record.commentAutomation,
+				dispatch:
+					record.commentAutomation.dispatch !== null
+						? { ...record.commentAutomation.dispatch, status: "completed" }
+						: null,
+			},
+		}));
+		const sixth = makeEvent({ providerId: "conversation-6", updatedAt: NOW - 471_000 });
+		const harness = makeService({ workspaceStates: cardState(), snapshot: { events: [sixth] } });
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(0);
+		record = await load();
+		expect(record.commentAutomation.autoSendPaused).toBe(true);
+
+		const state = await harness.service.getTaskPrTrackingState(scope, "t1");
+		expect(state.ok).toBe(true);
+		if (!state.ok) {
+			throw new Error("unreachable");
+		}
+		expect(state.state.blocker).toContain("paused after 5 attempts");
+		expect(state.state.resumable).toBe(true);
+		expect(state.state.resumeRequiresAcknowledgment).toBe(false);
+
+		// A restart sees the durable pause and never auto-resumes.
+		const restarted = makeService({ workspaceStates: cardState(), snapshot: { events: [sixth] } });
+		await restarted.service.refreshWorkspace(scope);
+		await restarted.service.runTick();
+		expect(restarted.sent).toHaveLength(0);
+
+		// Explicit Resume resets the rate-limit history without dispatching.
+		expect(await restarted.service.resumeCommentHandling(scope, "t1")).toEqual({ ok: true, dispatched: false });
+		record = await load();
+		expect(record.commentAutomation.autoSendAttempts).toEqual([]);
+		expect(record.commentAutomation.autoSendPaused).toBe(false);
+	});
+
+	it("does not resend a dispatch whose send was already attempted", async () => {
+		const event = makeEvent({ providerId: "conversation-1", updatedAt: NOW });
+		const fp = fingerprintOf([event]);
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			taskBindings: [{ workspaceId: "w1", taskId: "t1", terminal: false }],
+			commentAutomation: {
+				...record.commentAutomation,
+				repairOwner: { workspaceId: "w1", taskId: "t1", revision: 1 },
+				lastDispatchedFeedbackFingerprint: fp,
+				dispatch: {
+					dispatchId: "d-attempted",
+					attemptedAt: NOW - 5_000,
+					fingerprint: fp,
+					ownerRevision: 1,
+					status: "queued",
+					turnRef: null,
+					error: null,
+				},
+			},
+		}));
+		const harness = makeService({ workspaceStates: cardState(), snapshot: { events: [event] } });
+		await harness.service.start();
+		// Unknown-outcome semantics are preserved: no automatic re-send; the
+		// dispatch becomes a failed state that requires an explicit resume.
+		expect(harness.sent).toHaveLength(0);
+		const record = await load();
+		expect(record.commentAutomation.dispatch?.status).toBe("failed");
+		expect(record.commentAutomation.dispatch?.error).toContain("restart interrupted");
+	});
+
+	it("does not advance the dispatched watermark past an ignored implementation reply", async () => {
+		const reviewer = makeEvent({ providerId: "conversation-1", updatedAt: NOW - 471_000 });
+		const reply = makeEvent({ providerId: "conversation-9", updatedAt: NOW });
+		const reviewerFp = fingerprintOf([reviewer]);
+		await seedOwner();
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			commentAutomation: {
+				...record.commentAutomation,
+				publication: { ...record.commentAutomation.publication, published: [{ kind: "conversation", id: 9 }] },
+			},
+		}));
+		const harness = makeService({ workspaceStates: cardState(), snapshot: { events: [reviewer, reply] } });
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(1);
+		const record = await load();
+		expect(record.commentAutomation.lastDispatchedFeedbackFingerprint).toEqual(reviewerFp);
+		expect(record.commentAutomation.lastDispatchedFeedbackFingerprint?.watermark).toBe(NOW - 471_000);
+	});
+
+	it("captures publications even while auto-address is disabled", async () => {
+		const harness = makeService({
+			workspaceStates: new Map<string, RuntimeWorkspaceStateResponse>([
+				["/w1", makeState([makeCard({ id: "t1", pullRequests: [PR] })])],
+			]),
+		});
+		await harness.service.recordPrPublicationToolEvent(
+			toolEvent({ output: "https://github.com/octo/repo/pull/42#issuecomment-9" }),
+		);
+		const record = await load();
+		expect(record.commentAutomation.publication.published).toEqual([{ kind: "conversation", id: 9 }]);
 	});
 });

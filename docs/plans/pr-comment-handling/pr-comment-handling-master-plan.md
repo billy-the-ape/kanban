@@ -34,6 +34,8 @@ creates a task-sidecar comment ledger.
 | debounceDeadline / firstPendingAt | Two-minute quiet time and ten-minute maximum wait |
 | lastDispatchedFeedbackFingerprint | Suppress dispatch of the same feedback after polling, toggle or restart |
 | dispatch | queued/running/completed/failed status, dispatched fingerprint, existing session/turn reference, ownership revision and concise error |
+| publication | Deduplicated exact identities of comments/reviews published by implementation work (plus the minimal pending/uncertain capture state) |
+| autoSendAttempts / autoSendPaused | Bounded safety cap: five automatic send attempts per canonical PR in a rolling 60-minute window and its durable pause state |
 
 Record status describes instruction execution, not proof that every comment was fixed.
 GitHub and the existing task transcript/check/delivery history hold the substantive outcome.
@@ -222,6 +224,35 @@ and Biome checks:
   and provably-unsent queued intent only when a PR loses its last remaining
   candidate; while any candidate remains, the next `applyPrPollOutcome` re-derives
   bindings and ownership instead of resetting the quiet window.
+  `recordPrPublicationToolEvent` observes implementation-task tool events through
+  the same adapter path as PR-link capture (restricted to implementation task
+  sessions, never reviewer sessions) and persists captured publication
+  identities in the `commentAutomation.publication` block. Recorded identities
+  are excluded before every eligibility computation (fingerprint, counts, quiet
+  deadline, dispatched watermark), and recording a reply removes any pending
+  scheduling caused solely by that reply while a reviewer's existing quiet-time
+  deadline survives. Settle waits while a capture is unresolved and pauses with
+  a visible blocker when an identity is unknowable (resume requires explicit
+  acknowledgment); `reconcilePublicationCaptures` recovers interrupted captures
+  at startup from the exact existing tool result in the task transcript
+  (read-only, never a replayed publication). A bounded safety cap allows at
+  most five automatic send attempts per canonical PR in a rolling 60-minute
+  window: the sixth attempt durably pauses automation (no auto-resume when the
+  window expires), and an explicit Resume resets the attempt history without
+  bypassing an unresolved capture blocker. A dispatch whose `attemptedAt` was
+  recorded is never re-sent automatically after a later record-write failure.
+- `src/pr-tracking/pr-publication-attribution.ts` — pure publication-attribution
+  logic: recognizes terminal publication commands (`gh pr comment` including
+  `--edit-last --create-if-none`, `gh pr review --comment`, and `gh api` writes
+  for PR conversation comments, inline comment replies, and review
+  submissions), resolves the target against the task's linked PRs (explicit
+  repository/selector arguments respected; implicit selectors resolved only
+  when safe), and extracts exact identities — namespaced `conversation`,
+  `inline`, and `review` — from attributable API responses or returned
+  comment/review URLs (URL fragment anchors accepted only under their own
+  kind and always validated against the canonical PR). Command text, quoted
+  bodies, read-only output, and arbitrary URLs never contribute identities;
+  ambiguous output becomes explicit uncertainty, never a guess.
 - Contract and mutations: `autoAddressComments` (optional, default false) on
   `runtimeTaskCardSchema`; `runtimeTaskPullRequestSchema` with `lastSyncedAt`/`stateCheckedAt`;
   `RuntimePrTrackingRecord`, `RuntimePrCommentAutomation`, `RuntimePrCommentDispatch`,
@@ -250,7 +281,12 @@ held until its candidate is no longer enabled; dispatch waits for conflicting wr
 sending (the normal send path provides model-queue admission) but does not yet gate on
 repository-wide merge quiescence (merge consumer is a separate plan); restart reconciliation
 covers recorded running dispatches via their turn reference, and unknown outcomes stay failed
-with the visible Resume requirement.
+with the visible Resume requirement. Publication capture is terminal-observation based and
+cannot exhaustively attribute opaque scripts (wrapped commands or suppressed output) while
+preserving unrestricted terminal access; such output is treated as uncertain capture and
+pauses automation with a visible reason and an explicit resume rather than guessing. The
+five-attempts-per-60-minute safety cap deliberately bounds legitimate rapid review cycles
+too: it is a safety stop, not a claim that every repeated turn is a loop.
 
 ## Verification and rollout
 
@@ -267,12 +303,24 @@ with the visible Resume requirement.
 - Disposable pilot: leave several comments within two minutes, observe one ordinary follow-up,
   same-PR update and normal explanation. New comments during that turn wait for the next batch.
   Restart with an ambiguous interrupted turn and verify a visible resume requirement.
+- Publication-capture manual test on a fresh disposable task/PR: (1) enable Auto address
+  comments and publish reviewer feedback; (2) verify one implementation follow-up posts
+  replies and its published identities are recorded in the COMMENT-0 record; (3) verify those
+  replies do not trigger another follow-up; (4) publish feedback from another reviewer using
+  the same account and verify it remains eligible; (5) verify capture uncertainty and the
+  five-attempt rate-limit pause automation while manual terminal work still functions.
 
 Use focused backend/UI tests, typechecks and repository Biome checks for supported files.
 Isolate HOME/USERPROFILE and Git subprocess environments. Planning changes no runtime settings,
 environment variables or deployment. Proposed timing stays 120/600 seconds; only the PR record
 gains this minimal comment block. Document actual storage/schema changes and auth read/push
 permissions in implementation PRs; pilot one task before expanding.
+
+Deployment requirements for the publication-capture change: none. The new
+`commentAutomation.publication` and `autoSendAttempts`/`autoSendPaused` fields are optional
+additions to the existing COMMENT-0 record (old records load with empty attribution state),
+no environment variables, settings, or manual migration are required, and no publication
+command is ever run by the observer.
 
 After actual service/device changes, update `billy-the-ape/homelab-documentation` through a
 Ready for Review PR with deployed configuration, storage, permissions and rollback.

@@ -257,6 +257,61 @@ export const runtimePrCommentOwnerSchema = z.object({
 export type RuntimePrCommentOwner = z.infer<typeof runtimePrCommentOwnerSchema>;
 
 /**
+ * One implementation-published GitHub feedback identity (kind + numeric
+ * database id), namespaced like the feedback event provider ids
+ * (`conversation-123`, `inline-123`, `review-123`) and scoped to the
+ * record's canonical PR. Publication attribution metadata only — not a
+ * ledger of fixes, decisions, or repair outcomes.
+ */
+export const runtimePrPublishedIdentitySchema = z.object({
+	kind: z.enum(["conversation", "inline", "review"]),
+	id: z.number().int().positive(),
+});
+export type RuntimePrPublishedIdentity = z.infer<typeof runtimePrPublishedIdentitySchema>;
+
+/**
+ * A publication capture that started but has not been resolved (tool
+ * result missing, ambiguous, or interrupted by a restart). Minimal
+ * correlation metadata only — no command text, tokens, or bodies.
+ */
+export const runtimePrPublicationPendingSchema = z.object({
+	/** SDK tool call id (or a generated id when the event had none). */
+	captureId: z.string(),
+	taskId: z.string(),
+	workspaceId: z.string(),
+	/** Minimal operation label, e.g. "gh pr comment". */
+	operation: z.string(),
+	kind: z.enum(["conversation", "inline", "review"]),
+	/** Resolved target PR when the command made it determinable. */
+	target: z
+		.object({
+			host: z.string(),
+			repository: z.string(),
+			number: z.number().int().positive(),
+		})
+		.nullable(),
+	startedAt: z.number().int().nonnegative(),
+	/** True when the exact identity is unknowable from existing evidence. */
+	uncertain: z.boolean(),
+	uncertainReason: z.string().nullable(),
+});
+export type RuntimePrPublicationPending = z.infer<typeof runtimePrPublicationPendingSchema>;
+
+export const runtimePrPublicationAttributionSchema = z.object({
+	/** Deduplicated published identities; retained for the PR's lifetime. */
+	published: z.array(runtimePrPublishedIdentitySchema).default([]),
+	pending: z.array(runtimePrPublicationPendingSchema).default([]),
+});
+export type RuntimePrPublicationAttribution = z.infer<typeof runtimePrPublicationAttributionSchema>;
+
+/** One durably recorded automatic send attempt (rolling safety cap input). */
+export const runtimePrAutoSendAttemptSchema = z.object({
+	dispatchId: z.string(),
+	attemptedAt: z.number().int().nonnegative(),
+});
+export type RuntimePrAutoSendAttempt = z.infer<typeof runtimePrAutoSendAttemptSchema>;
+
+/**
  * Minimal comment automation block in the PR tracking record. No comment
  * bodies, per-item dispositions, batch ledgers, or repair-budget counters
  * are durable fields.
@@ -271,6 +326,12 @@ export const runtimePrCommentAutomationSchema = z.object({
 	/** Watermark preserved when previously dispatched feedback disappears. */
 	lastDispatchedFeedbackFingerprint: runtimePrFeedbackFingerprintSchema.nullable(),
 	dispatch: runtimePrCommentDispatchSchema.nullable(),
+	/** Implementation-published feedback excluded from automatic handling. */
+	publication: runtimePrPublicationAttributionSchema,
+	/** Automatic send attempts within the rolling 60-minute safety window. */
+	autoSendAttempts: z.array(runtimePrAutoSendAttemptSchema).default([]),
+	/** Safety cap tripped; explicit Resume required, never auto-resumed. */
+	autoSendPaused: z.boolean().default(false),
 });
 export type RuntimePrCommentAutomation = z.infer<typeof runtimePrCommentAutomationSchema>;
 
@@ -336,6 +397,8 @@ export const runtimeTaskPrTrackingStateSchema = z.object({
 	blocker: z.string().nullable(),
 	/** A failed dispatch that can be resumed via "Resume comment handling". */
 	resumable: z.boolean(),
+	/** True when Resume must acknowledge the unresolved capture risk. */
+	resumeRequiresAcknowledgment: z.boolean().default(false),
 });
 export type RuntimeTaskPrTrackingState = z.infer<typeof runtimeTaskPrTrackingStateSchema>;
 
@@ -348,6 +411,8 @@ export type RuntimeTaskPrTrackingStateResponse = z.infer<typeof runtimeTaskPrTra
 
 export const runtimeTaskPrCommentResumeRequestSchema = z.object({
 	taskId: z.string(),
+	/** Explicitly accept the unresolved publication capture risk. */
+	acknowledgeCaptureUncertainty: z.boolean().optional(),
 });
 export type RuntimeTaskPrCommentResumeRequest = z.infer<typeof runtimeTaskPrCommentResumeRequestSchema>;
 

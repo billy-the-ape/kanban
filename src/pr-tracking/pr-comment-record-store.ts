@@ -104,6 +104,9 @@ export function createInitialPrTrackingRecord(input: {
 			firstPendingAt: null,
 			lastDispatchedFeedbackFingerprint: null,
 			dispatch: null,
+			publication: { published: [], pending: [] },
+			autoSendAttempts: [],
+			autoSendPaused: false,
 		},
 	};
 }

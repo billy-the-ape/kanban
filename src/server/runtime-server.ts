@@ -189,6 +189,22 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				// recording) without a reload; only fired when the card changed.
 				broadcastWorkspaceStateUpdated: (workspacePath) =>
 					void broadcastRuntimeWorkspaceStateUpdatedWithReconcile(scope.workspaceId, workspacePath),
+				// COMMENT-0: publication capture for implementation sessions.
+				// Only this (task) service installs the observer; review
+				// session services never do, which is what keeps reviewer
+				// output out of the implementation attribution set.
+				recordPrPublicationToolEvent: (input) =>
+					prCommentAutomationService.recordPrPublicationToolEvent({
+						workspaceId: scope.workspaceId,
+						workspacePath: input.workspacePath,
+						taskId: input.taskId,
+						phase: input.phase,
+						toolCallId: input.toolCallId,
+						toolName: input.toolName,
+						commands: input.commands,
+						output: input.output,
+						error: input.error,
+					}),
 			});
 			clineTaskSessionServiceByWorkspaceId.set(scope.workspaceId, service);
 			deps.runtimeStateHub.trackClineTaskSessionService(scope.workspaceId, scope.workspacePath, service);
@@ -319,7 +335,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		ghClient: createGitHubPrClient(),
 		warn: (message) => deps.warn(`[pr-comment-automation] ${message}`),
 	});
-	prCommentAutomationService.start();
+	void prCommentAutomationService.start();
 	// PRTRACK-1: runtime-wide PR tracking state (coordinator + durable record
 	// store + consumer registry). One coordinator serves every workspace; the
 	// trpc API and board-save reconciliation share these singletons.

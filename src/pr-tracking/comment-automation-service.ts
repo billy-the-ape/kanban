@@ -12,12 +12,22 @@
 // further automatic instructions for that PR until an explicit Resume;
 // restarts reconcile in-flight dispatches without ever re-running an
 // accepted prompt.
+//
+// Implementation-agent publication attribution: the implementation session's
+// own `gh pr comment` / `gh api` / `gh pr review --comment` writes are
+// observed from native Cline tool events (implementation sessions only) and
+// their exact comment/review identities are persisted in the record's
+// `publication` block, then excluded from every fingerprint, pending count,
+// deadline, and captured dispatch aggregate. A rolling safety cap allows at
+// most five automatic send attempts per PR in 60 minutes; a sixth pauses
+// automation until an explicit Resume.
 import { randomUUID } from "node:crypto";
 import type { ClineTaskSessionService } from "../cline-sdk/cline-task-session-service";
 import type {
 	RuntimeGitHubPrTrackingRecord,
 	RuntimePrCommentAutomation,
 	RuntimePrCommentOwner,
+	RuntimePrPublicationPending,
 	RuntimeTaskChatSendRequest,
 	RuntimeTaskChatSendResponse,
 	RuntimeTaskPrCommentResumeResponse,
@@ -33,6 +43,12 @@ import type { PrFeedbackEvent } from "./feedback-fingerprint";
 import { computePrFeedbackFingerprint, findPrFeedbackPendingEvents } from "./feedback-fingerprint";
 import type { GitHubPrClient, GitHubPrSnapshot } from "./github-pr-client";
 import { listPrTrackingRecords, loadPrTrackingRecord, upsertPrTrackingRecord } from "./pr-comment-record-store";
+import {
+	analyzePrPublication,
+	type PrPublishedIdentity,
+	prPublishedIdentityKey,
+	resolvePublicationOutput,
+} from "./pr-publication-attribution";
 
 export interface PrCommentAutomationWorkspaceScope {
 	workspaceId: string;
@@ -63,6 +79,9 @@ const DEBOUNCE_MS = 120_000;
 const MAX_PENDING_MS = 600_000;
 const DISPATCH_RETRY_MS = 30_000;
 const BACKOFF_SCHEDULE_MS = [60_000, 120_000, 240_000, 480_000, 900_000];
+/** Bounded automatic-turn backstop: at most N sends per PR per window. */
+const MAX_AUTO_SEND_PER_WINDOW = 5;
+const AUTO_SEND_WINDOW_MS = 60 * 60 * 1000;
 /** Columns whose tasks count as active comment-handling subscriptions. */
 const ACTIVE_COLUMN_IDS = new Set(["backlog", "in_progress", "review"]);
 
@@ -95,6 +114,41 @@ export interface PrCommentAutomationServiceDependencies {
 	ghClient: GitHubPrClient;
 	now?: () => number;
 	warn?: (message: string) => void;
+}
+
+/**
+ * Drops feedback events whose exact identities the implementation session
+ * published (attribution metadata from the record's `publication` block).
+ * Applied before every fingerprint, pending, deadline, and captured
+ * aggregate computation — polling, dispatch validation, Resume, and
+ * restart recovery all go through it.
+ */
+function excludePublishedEvents(
+	events: PrFeedbackEvent[],
+	published: Array<{ kind: "conversation" | "inline" | "review"; id: number }>,
+): PrFeedbackEvent[] {
+	if (published.length === 0) {
+		return events;
+	}
+	const excluded = new Set(published.map(prPublishedIdentityKey));
+	return events.filter((event) => !excluded.has(event.providerId));
+}
+
+/** Keeps only distinct attempts inside the rolling safety window. */
+function pruneAutoSendAttempts(
+	attempts: Array<{ dispatchId: string; attemptedAt: number }>,
+	nowMs: number,
+): Array<{ dispatchId: string; attemptedAt: number }> {
+	const seen = new Set<string>();
+	const kept: Array<{ dispatchId: string; attemptedAt: number }> = [];
+	for (const attempt of attempts) {
+		if (attempt.attemptedAt < nowMs - AUTO_SEND_WINDOW_MS || seen.has(attempt.dispatchId)) {
+			continue;
+		}
+		seen.add(attempt.dispatchId);
+		kept.push(attempt);
+	}
+	return kept;
 }
 
 /**
@@ -164,7 +218,8 @@ export function applyPrPollOutcome(
 			nextAutomation.dispatch = null;
 		}
 	} else {
-		const pending = findPrFeedbackPendingEvents(input.snapshot.events, automation.lastDispatchedFeedbackFingerprint);
+		const events = excludePublishedEvents(input.snapshot.events, automation.publication.published);
+		const pending = findPrFeedbackPendingEvents(events, automation.lastDispatchedFeedbackFingerprint);
 		const dispatch = automation.dispatch;
 		const inFlight = dispatch !== null && (dispatch.status === "queued" || dispatch.status === "running");
 		const failed = dispatch !== null && dispatch.status === "failed";
@@ -250,6 +305,12 @@ export function applyPrPollOutcome(
 
 export class PrCommentAutomationService {
 	private readonly subscriptions = new Map<string, PrSubscriptionState>();
+	/**
+	 * In-memory capture-pause fallback: PR keys whose attribution update
+	 * could not be persisted (store failure). Settle waits on these until
+	 * a later write succeeds or the user resumes; never a silent resume.
+	 */
+	private readonly captureBlocked = new Set<string>();
 	private timer: NodeJS.Timeout | null = null;
 	private started = false;
 
@@ -264,21 +325,20 @@ export class PrCommentAutomationService {
 	}
 
 	/** Reconciles durable state from a restart, then starts the poll tick. */
-	start(): void {
+	async start(): Promise<void> {
 		if (this.started) {
 			return;
 		}
 		this.started = true;
-		void (async () => {
-			try {
-				await this.reconcileRestartedDispatches();
-				for (const scope of this.deps.listManagedWorkspaces()) {
-					await this.refreshWorkspace(scope);
-				}
-			} catch (error) {
-				this.warn(`startup reconciliation failed: ${error instanceof Error ? error.message : String(error)}`);
+		try {
+			await this.reconcileRestartedDispatches();
+			await this.reconcilePublicationCaptures();
+			for (const scope of this.deps.listManagedWorkspaces()) {
+				await this.refreshWorkspace(scope);
 			}
-		})();
+		} catch (error) {
+			this.warn(`startup reconciliation failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
 		this.timer = setInterval(() => {
 			void this.runTick().catch((error: unknown) => {
 				this.warn(`tick failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -518,6 +578,18 @@ export class PrCommentAutomationService {
 		if (dispatch !== null && dispatch.status !== "queued" && dispatch.status !== "completed") {
 			return;
 		}
+		// Safety cap tripped: only an explicit Resume continues (it resets
+		// the attempt history). Never auto-resumes when the window expires.
+		if (automation.autoSendPaused) {
+			return;
+		}
+		// Wait while a publication capture is unresolved: a dispatch racing
+		// an in-flight implementation reply could send work the reply is
+		// already addressing or that was never recorded.
+		if (automation.publication.pending.length > 0 || this.captureBlocked.has(sub.key)) {
+			sub.dispatchRetryAt = nowMs + DISPATCH_RETRY_MS;
+			return;
+		}
 		if (sub.dispatchRetryAt !== null && nowMs < sub.dispatchRetryAt) {
 			return;
 		}
@@ -559,7 +631,10 @@ export class PrCommentAutomationService {
 			await this.cancelPendingRecord(sub);
 			return;
 		}
-		const pending = findPrFeedbackPendingEvents(snapshot.events, automation.lastDispatchedFeedbackFingerprint);
+		const pending = findPrFeedbackPendingEvents(
+			excludePublishedEvents(snapshot.events, automation.publication.published),
+			automation.lastDispatchedFeedbackFingerprint,
+		);
 		if (pending.length === 0) {
 			await this.cancelPendingRecord(sub);
 			return;
@@ -594,13 +669,46 @@ export class PrCommentAutomationService {
 		events: PrFeedbackEvent[],
 	): Promise<void> {
 		const identity = { accessScopeId, pr: sub.pr };
+		const nowMs = this.nowMs();
+		// Final fresh attribution check before sending: a capture that lands
+		// after the settle's initial read must still hold the send, and the
+		// safety cap is enforced against the durable attempt history.
+		const preCheck = await loadPrTrackingRecord(sub.key);
+		if (preCheck.status !== "ok") {
+			return;
+		}
+		const preAutomation = preCheck.record.commentAutomation;
+		if (preAutomation.publication.pending.length > 0 || this.captureBlocked.has(sub.key)) {
+			sub.dispatchRetryAt = nowMs + DISPATCH_RETRY_MS;
+			return;
+		}
+		if (preAutomation.autoSendPaused) {
+			return;
+		}
+		const windowStart = nowMs - AUTO_SEND_WINDOW_MS;
+		const attemptsInWindow = preAutomation.autoSendAttempts.filter((attempt) => attempt.attemptedAt >= windowStart);
+		if (attemptsInWindow.length >= MAX_AUTO_SEND_PER_WINDOW) {
+			// Bounded backstop tripped: pause with a durable, visible state
+			// that requires an explicit Resume (never auto-resumes).
+			await upsertPrTrackingRecord(sub.key, identity, (record) => ({
+				...record,
+				revision: record.revision + 1,
+				commentAutomation: {
+					...record.commentAutomation,
+					autoSendAttempts: pruneAutoSendAttempts(record.commentAutomation.autoSendAttempts, nowMs),
+					autoSendPaused: true,
+				},
+			}));
+			return;
+		}
 		const dispatchId = randomUUID();
-		const captured = computePrFeedbackFingerprint(events);
+		const captured = computePrFeedbackFingerprint(
+			excludePublishedEvents(events, preAutomation.publication.published),
+		);
 		if (captured === null) {
 			await this.cancelPendingRecord(sub);
 			return;
 		}
-		const nowMs = this.nowMs();
 		await upsertPrTrackingRecord(sub.key, identity, (record) => ({
 			...record,
 			revision: record.revision + 1,
@@ -618,7 +726,8 @@ export class PrCommentAutomationService {
 			},
 		}));
 		// Persist the attempted-at timestamp immediately before invoking the
-		// send so a crash in flight is never ambiguous.
+		// send so a crash in flight is never ambiguous. The attempt joins the
+		// durable safety-cap history (unique per dispatchId) in the same write.
 		await upsertPrTrackingRecord(sub.key, identity, (record) => {
 			const dispatch = record.commentAutomation.dispatch;
 			if (dispatch === null || dispatch.dispatchId !== dispatchId) {
@@ -629,6 +738,10 @@ export class PrCommentAutomationService {
 				revision: record.revision + 1,
 				commentAutomation: {
 					...record.commentAutomation,
+					autoSendAttempts: [
+						...pruneAutoSendAttempts(record.commentAutomation.autoSendAttempts, nowMs),
+						{ dispatchId, attemptedAt: nowMs },
+					],
 					dispatch: { ...dispatch, attemptedAt: nowMs },
 				},
 			};
@@ -787,6 +900,345 @@ export class PrCommentAutomationService {
 	}
 
 	/**
+	 * Capture entry point from implementation-session tool events. Only task
+	 * session services wire this observer (review sessions never do), so
+	 * reviewer output is never attributed as implementation output. The
+	 * observer never denies, rewrites, or fails the terminal command; it
+	 * only establishes pending state before execution and persists exact
+	 * identities after.
+	 */
+	async recordPrPublicationToolEvent(input: {
+		workspaceId: string;
+		workspacePath: string;
+		taskId: string;
+		phase: "started" | "finished";
+		toolCallId: string | null;
+		toolName: string | null;
+		commands: string[];
+		output: string | null;
+		error: string | null;
+	}): Promise<void> {
+		const state = await this.deps.loadWorkspaceState(input.workspacePath).catch(() => null);
+		if (!state) {
+			return;
+		}
+		const card = state.board.columns
+			.flatMap((column) => column.cards)
+			.find((candidate) => candidate.id === input.taskId);
+		if (!card) {
+			return;
+		}
+		// Captured regardless of the "auto address comments" setting, so
+		// later enabling it cannot process already-recorded implementation
+		// replies.
+		const linked = (card.pullRequests ?? []).filter(
+			(pullRequest) => pullRequest.provider === "github" && pullRequest.host === "github.com",
+		);
+		if (linked.length === 0) {
+			return;
+		}
+		const targets = linked.map((pullRequest) => ({
+			host: pullRequest.host,
+			repository: pullRequest.repository,
+			number: pullRequest.number,
+		}));
+		const observation = analyzePrPublication({
+			toolName: input.toolName,
+			commands: input.commands,
+			output: input.phase === "started" ? null : input.output,
+			error: input.error,
+			linkedPullRequests: targets,
+		});
+		if (observation.status === "none" || observation.target === null) {
+			return;
+		}
+		const pullRequest = linked.find(
+			(candidate) =>
+				candidate.host === observation.target?.host &&
+				candidate.repository === observation.target?.repository &&
+				candidate.number === observation.target?.number,
+		);
+		if (!pullRequest) {
+			return;
+		}
+		const key = getPullRequestIdentityKey(pullRequest);
+		let accessScopeId: string;
+		try {
+			accessScopeId = await this.deps.getGitHubAccessScopeId();
+		} catch {
+			// No resolvable scope: nothing could have been published through
+			// gh, but do not let dispatch race an unresolvable capture.
+			this.captureBlocked.add(key);
+			this.warn(`cannot resolve GitHub access scope for publication capture`);
+			return;
+		}
+		const identity = { accessScopeId, pr: pullRequest };
+		const captureId = input.toolCallId ?? randomUUID();
+		try {
+			if (input.phase === "started" && observation.status === "pending") {
+				await this.upsertCapturePending(key, identity, {
+					captureId,
+					taskId: input.taskId,
+					workspaceId: input.workspaceId,
+					operation: observation.operation ?? "pr publication",
+					kind: observation.kind ?? "conversation",
+					target: observation.target,
+					uncertain: false,
+					uncertainReason: null,
+				});
+				return;
+			}
+			if (observation.status === "failed") {
+				// The write clearly failed: nothing was published; drop any
+				// start-phase pending entry.
+				await this.upsertCapturePending(key, identity, null, captureId);
+				return;
+			}
+			if (observation.status === "published") {
+				await this.applyPublishedIdentities(key, identity, observation.identities, captureId);
+				return;
+			}
+			// uncertain: visible pause until reconciled or explicitly resumed.
+			await this.upsertCapturePending(key, identity, {
+				captureId,
+				taskId: input.taskId,
+				workspaceId: input.workspaceId,
+				operation: observation.operation ?? "pr publication",
+				kind: observation.kind ?? "conversation",
+				target: observation.target,
+				uncertain: true,
+				uncertainReason: observation.reason ?? "The publication identity could not be confirmed.",
+			});
+		} catch (error) {
+			// Storage failure: pause in memory; settle must not race a
+			// capture that could not be recorded.
+			this.captureBlocked.add(key);
+			this.warn(`publication capture persistence failed: ${error instanceof Error ? error.message : String(error)}`);
+			return;
+		}
+		this.captureBlocked.delete(key);
+	}
+
+	/**
+	 * Persists one capture-pending entry (idempotent per captureId), or
+	 * removes the entry for `removeCaptureId` when `pending` is null.
+	 */
+	private async upsertCapturePending(
+		key: string,
+		identity: { accessScopeId: string; pr: RuntimeTaskPullRequest },
+		pending: Omit<RuntimePrPublicationPending, "startedAt"> | null,
+		removeCaptureId?: string,
+	): Promise<void> {
+		await upsertPrTrackingRecord(key, identity, (record) => {
+			const automation = record.commentAutomation;
+			const current = automation.publication.pending;
+			const next = current.filter((entry) => entry.captureId !== removeCaptureId);
+			let changed = next.length !== current.length;
+			if (pending !== null) {
+				const index = next.findIndex((entry) => entry.captureId === pending.captureId);
+				if (index < 0) {
+					next.push({ ...pending, startedAt: this.nowMs() });
+					changed = true;
+				} else {
+					const existing = next[index];
+					if (
+						existing !== undefined &&
+						(existing.uncertain !== pending.uncertain || existing.uncertainReason !== pending.uncertainReason)
+					) {
+						next[index] = { ...existing, uncertain: pending.uncertain, uncertainReason: pending.uncertainReason };
+						changed = true;
+					}
+				}
+			}
+			if (!changed) {
+				return record;
+			}
+			return {
+				...record,
+				revision: record.revision + 1,
+				commentAutomation: {
+					...automation,
+					publication: { ...automation.publication, pending: next },
+				},
+			};
+		});
+	}
+
+	/**
+	 * Persists newly captured published identities (deduplicated; retained
+	 * for the tracked PR's lifetime) and drops the capture's pending entry.
+	 * Recording a reply also removes any pending scheduling caused solely by
+	 * it; a forced re-poll re-derives the reviewer-only state with the
+	 * exclusion applied. Idempotent for duplicate events.
+	 */
+	private async applyPublishedIdentities(
+		key: string,
+		identity: { accessScopeId: string; pr: RuntimeTaskPullRequest },
+		identities: PrPublishedIdentity[],
+		captureId: string,
+	): Promise<void> {
+		let added = false;
+		await upsertPrTrackingRecord(key, identity, (record) => {
+			const automation = record.commentAutomation;
+			const published = [...automation.publication.published];
+			const seen = new Set(published.map(prPublishedIdentityKey));
+			for (const entry of identities) {
+				const entryKey = prPublishedIdentityKey(entry);
+				if (!seen.has(entryKey)) {
+					published.push(entry);
+					seen.add(entryKey);
+					added = true;
+				}
+			}
+			const pending = automation.publication.pending.filter((entry) => entry.captureId !== captureId);
+			if (!added && pending.length === automation.publication.pending.length) {
+				return record;
+			}
+			// The pending scheduling and queued intent are intentionally left
+			// in place: the forced re-poll (or the due settle) re-derives
+			// them with the exclusion applied, which drops scheduling caused
+			// solely by the recorded reply while preserving a reviewer's
+			// existing quiet-time deadline.
+			return {
+				...record,
+				revision: record.revision + 1,
+				commentAutomation: {
+					...automation,
+					publication: { published, pending },
+				},
+			};
+		});
+		if (!added) {
+			return;
+		}
+		// Force an immediate re-poll so remaining reviewer feedback keeps its
+		// own quiet window (not the reply's extended one).
+		const subscription = this.subscriptions.get(key);
+		if (subscription) {
+			subscription.nextPollAt = 0;
+		}
+	}
+
+	/**
+	 * Restart reconciliation for unresolved publication captures. Each
+	 * pending entry is re-resolved from the exact existing tool result in the
+	 * task transcript (read-only); when the transcript no longer holds the
+	 * result, the entry becomes an explicit uncertainty that pauses
+	 * automatic handling until reconciled or explicitly resumed. Nothing is
+	 * silently cleared because a session finished or restarted, and no
+	 * publication command is ever run here.
+	 */
+	private async reconcilePublicationCaptures(): Promise<void> {
+		const records = await listPrTrackingRecords();
+		for (const record of records) {
+			const pending = record.commentAutomation.publication.pending;
+			if (pending.length === 0) {
+				continue;
+			}
+			const newIdentities: PrPublishedIdentity[] = [];
+			const dropped = new Set<string>();
+			const uncertainties = new Map<string, string>();
+			for (const entry of pending) {
+				let resolution: ReturnType<typeof resolvePublicationOutput> | null = null;
+				const scope = this.deps
+					.listManagedWorkspaces()
+					.find((candidate) => candidate.workspaceId === entry.workspaceId);
+				if (scope) {
+					try {
+						const sessionService = await this.deps.getClineTaskSessionService(scope);
+						const messages = await sessionService.loadTaskSessionMessages(entry.taskId);
+						const toolResult = messages.find(
+							(message) =>
+								message.meta?.toolCallId === entry.captureId && message.meta?.hookEventName === "tool_call_end",
+						);
+						if (toolResult) {
+							resolution = resolvePublicationOutput({
+								operations: [
+									{
+										operation: entry.operation,
+										kind: entry.kind,
+										explicitRepository: null,
+										explicitNumber: null,
+									},
+								],
+								target: entry.target,
+								output: toolResult.content,
+								error: null,
+							});
+						}
+					} catch {
+						// Transcript unavailable: fall through to uncertainty.
+					}
+				}
+				if (resolution?.status === "published") {
+					newIdentities.push(...resolution.identities);
+					dropped.add(entry.captureId);
+				} else if (resolution?.status === "failed") {
+					dropped.add(entry.captureId);
+				} else {
+					uncertainties.set(
+						entry.captureId,
+						entry.uncertainReason ?? `Capture was interrupted; the published identity could not be confirmed.`,
+					);
+				}
+			}
+			if (dropped.size === 0 && uncertainties.size === 0) {
+				continue;
+			}
+			await upsertPrTrackingRecord(
+				record.canonicalPrKey,
+				{ accessScopeId: record.accessScopeId, pr: record.pr },
+				(current) => {
+					const automation = current.commentAutomation;
+					const published = [...automation.publication.published];
+					const seen = new Set(published.map(prPublishedIdentityKey));
+					for (const identity of newIdentities) {
+						const identityKey = prPublishedIdentityKey(identity);
+						if (!seen.has(identityKey)) {
+							published.push(identity);
+							seen.add(identityKey);
+						}
+					}
+					const nextPending = automation.publication.pending
+						.filter((entry) => !dropped.has(entry.captureId))
+						.map((entry) => {
+							const reason = uncertainties.get(entry.captureId);
+							return reason !== undefined && !entry.uncertain
+								? { ...entry, uncertain: true, uncertainReason: reason }
+								: entry;
+						});
+					const changed =
+						published.length !== automation.publication.published.length ||
+						nextPending.length !== automation.publication.pending.length ||
+						nextPending.some((entry, index) => {
+							const original = automation.publication.pending[index];
+							return original === undefined || original.uncertain !== entry.uncertain;
+						});
+					if (!changed) {
+						return current;
+					}
+					return {
+						...current,
+						revision: current.revision + 1,
+						commentAutomation: {
+							...automation,
+							...(newIdentities.length > 0
+								? {
+										pendingFeedbackFingerprint: null,
+										pendingCount: null,
+										debounceDeadline: null,
+										firstPendingAt: null,
+									}
+								: {}),
+							publication: { published, pending: nextPending },
+						},
+					};
+				},
+			);
+		}
+	}
+
+	/**
 	 * Restart reconciliation: a queued intent that was provably never sent is
 	 * re-queued (re-validated at its deadline); a dispatched or running
 	 * intent whose turn state cannot be established becomes a failed dispatch
@@ -886,6 +1338,7 @@ export class PrCommentAutomationService {
 			dispatch: null,
 			blocker: null,
 			resumable: false,
+			resumeRequiresAcknowledgment: false,
 		};
 		const state = await this.deps.loadWorkspaceState(scope.workspacePath);
 		const card = state.board.columns.flatMap((column) => column.cards).find((candidate) => candidate.id === taskId);
@@ -952,10 +1405,18 @@ export class PrCommentAutomationService {
 		const record = loaded.record;
 		const automation = record.commentAutomation;
 		const sub = this.subscriptions.get(key);
-		const blocker =
-			sub !== undefined && sub.candidates.size > 1 && automation.repairOwner === null
-				? `Multiple tasks have comment handling enabled for this pull request. Choose one repair owner.`
-				: null;
+		const uncertainEntry = automation.publication.pending.find((entry) => entry.uncertain);
+		const capturePaused = this.captureBlocked.has(key);
+		const blocker = capturePaused
+			? `Publication capture could not be persisted; automatic comment handling is paused for this pull request.`
+			: uncertainEntry
+				? (uncertainEntry.uncertainReason ??
+					`An implementation comment could not be identified; automatic comment handling is paused.`)
+				: automation.autoSendPaused === true
+					? `Automatic comment handling is paused after ${MAX_AUTO_SEND_PER_WINDOW} attempts in the last hour. Resume to continue.`
+					: sub !== undefined && sub.candidates.size > 1 && automation.repairOwner === null
+						? `Multiple tasks have comment handling enabled for this pull request. Choose one repair owner.`
+						: null;
 		return {
 			ok: true,
 			state: {
@@ -966,19 +1427,29 @@ export class PrCommentAutomationService {
 				pendingDeadline: automation.debounceDeadline,
 				dispatch: automation.dispatch,
 				blocker,
-				resumable: automation.dispatch?.status === "failed",
+				resumable:
+					automation.dispatch?.status === "failed" ||
+					automation.autoSendPaused === true ||
+					uncertainEntry !== undefined ||
+					capturePaused,
+				resumeRequiresAcknowledgment: uncertainEntry !== undefined || capturePaused,
 			},
 		};
 	}
 
 	/**
-	 * Explicit "Resume comment handling": allowed only for a failed dispatch,
-	 * rechecks PR open state and scope with a fresh read, and dispatches
-	 * exactly one new instruction. Fingerprint history is retained.
+	 * Explicit "Resume comment handling": allowed for a failed dispatch, a
+	 * tripped safety-cap pause, or an unresolved capture uncertainty (the
+	 * last two require nothing else; an uncertain capture additionally
+	 * requires explicit acknowledgment). Rechecks PR open state and scope
+	 * with a fresh read, and dispatches exactly one new instruction when a
+	 * failed dispatch is involved. Fingerprint history is retained; the
+	 * rate-limit history is reset by this explicit action only.
 	 */
 	async resumeCommentHandling(
 		scope: PrCommentAutomationWorkspaceScope,
 		taskId: string,
+		options: { acknowledgeCaptureUncertainty?: boolean } = {},
 	): Promise<RuntimeTaskPrCommentResumeResponse> {
 		const state = await this.deps.loadWorkspaceState(scope.workspacePath);
 		const card = state.board.columns.flatMap((column) => column.cards).find((candidate) => candidate.id === taskId);
@@ -1003,8 +1474,51 @@ export class PrCommentAutomationService {
 		}
 		const record = loaded.record;
 		const automation = record.commentAutomation;
-		if (automation.dispatch?.status !== "failed") {
-			return { ok: false, error: `There is no failed comment-handling dispatch to resume.`, dispatched: false };
+		const hasFailedDispatch = automation.dispatch?.status === "failed";
+		const ratePaused = automation.autoSendPaused === true;
+		const uncertainEntry = automation.publication.pending.find((entry) => entry.uncertain);
+		if (!hasFailedDispatch && !ratePaused && !uncertainEntry) {
+			return { ok: false, error: `There is nothing to resume.`, dispatched: false };
+		}
+		if (uncertainEntry && options.acknowledgeCaptureUncertainty !== true) {
+			return {
+				ok: false,
+				error: `Publication capture is unresolved: an unidentified implementation comment could retrigger comment handling. Resume with acknowledgment to accept that risk.`,
+				dispatched: false,
+			};
+		}
+		if (ratePaused || uncertainEntry) {
+			// Explicit user Resume: clear the acknowledged capture
+			// uncertainty and reset the rate-limit history. This is the
+			// explicit acknowledgment itself, never a silent bypass.
+			await upsertPrTrackingRecord(key, { accessScopeId: record.accessScopeId, pr: record.pr }, (current) => {
+				const currentAutomation = current.commentAutomation;
+				if (
+					!currentAutomation.autoSendPaused &&
+					!currentAutomation.publication.pending.some((entry) => entry.uncertain)
+				) {
+					return current;
+				}
+				return {
+					...current,
+					revision: current.revision + 1,
+					commentAutomation: {
+						...currentAutomation,
+						publication: {
+							...currentAutomation.publication,
+							pending: currentAutomation.publication.pending.filter((entry) => !entry.uncertain),
+						},
+						autoSendAttempts: [],
+						autoSendPaused: false,
+					},
+				};
+			});
+			this.captureBlocked.delete(key);
+		}
+		if (!hasFailedDispatch) {
+			// Only a pause was resolved; normal scheduling continues from the
+			// next poll once feedback is pending.
+			return { ok: true, dispatched: false };
 		}
 		if (automation.repairOwner?.taskId !== taskId) {
 			return { ok: false, error: `This task is not the current repair owner.`, dispatched: false };
@@ -1027,7 +1541,10 @@ export class PrCommentAutomationService {
 		if (snapshot.prState !== "open") {
 			return { ok: false, error: `The pull request is no longer open.`, dispatched: false };
 		}
-		const pending = findPrFeedbackPendingEvents(snapshot.events, automation.lastDispatchedFeedbackFingerprint);
+		const pending = findPrFeedbackPendingEvents(
+			excludePublishedEvents(snapshot.events, automation.publication.published),
+			automation.lastDispatchedFeedbackFingerprint,
+		);
 		if (pending.length === 0) {
 			// Nothing left to address: close the failure, keep the history.
 			const identity = { accessScopeId: record.accessScopeId, pr: record.pr };
