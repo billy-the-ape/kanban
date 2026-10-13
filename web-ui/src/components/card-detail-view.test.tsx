@@ -9,6 +9,27 @@ import { LocalStorageKey } from "@/storage/local-storage-store";
 import { TERMINAL_THEME_COLORS } from "@/terminal/theme-colors";
 import type { BoardCard, BoardColumn, CardSelection } from "@/types";
 
+const trpcClientMocks = vi.hoisted(() => ({
+	addTaskPullRequest: vi.fn(),
+	removeTaskPullRequest: vi.fn(),
+	refreshTaskPullRequests: vi.fn(),
+}));
+
+vi.mock("@/runtime/trpc-client", () => ({
+	getRuntimeTrpcClient: () => ({
+		workspace: {
+			addTaskPullRequest: { mutate: trpcClientMocks.addTaskPullRequest },
+			removeTaskPullRequest: { mutate: trpcClientMocks.removeTaskPullRequest },
+			refreshTaskPullRequests: { mutate: trpcClientMocks.refreshTaskPullRequests },
+		},
+	}),
+}));
+
+vi.mock("@/components/app-toaster", () => ({
+	showAppToast: vi.fn(),
+	notifyError: vi.fn(),
+}));
+
 const mockUseRuntimeWorkspaceChanges = vi.fn();
 const {
 	mockAgentTerminalPanel,
@@ -179,6 +200,9 @@ describe("CardDetailView", () => {
 	beforeEach(() => {
 		window.localStorage.clear();
 		mockIsMobile.value = false;
+		trpcClientMocks.addTaskPullRequest.mockReset();
+		trpcClientMocks.removeTaskPullRequest.mockReset();
+		trpcClientMocks.refreshTaskPullRequests.mockReset();
 		previousActEnvironment = (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
 			.IS_REACT_ACT_ENVIRONMENT;
 		(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -999,5 +1023,72 @@ describe("CardDetailView", () => {
 			"a[data-testid='mobile-task-pr-primary-anchor']",
 		) as HTMLAnchorElement | null;
 		expect(anchor?.href).toBe("https://github.com/cline/kanban/pull/99");
+	});
+
+	it("keeps task B's manager open when task A's add response lands late", async () => {
+		let resolveAdd: () => void = () => {};
+		trpcClientMocks.addTaskPullRequest.mockImplementation(
+			() =>
+				new Promise((resolve) => {
+					resolveAdd = () => resolve({ ok: true, pullRequest: null });
+				}),
+		);
+
+		const selection = createSelection();
+		selection.card.pullRequests = [createTaskPullRequest(12, true)];
+
+		await act(async () => {
+			renderMobileDetail(selection);
+		});
+
+		const manageButton = container.querySelector("[data-testid='mobile-task-pr-manage-button']");
+		expect(manageButton).toBeInstanceOf(HTMLElement);
+		if (!(manageButton instanceof Element)) {
+			throw new Error("Expected a manage button.");
+		}
+		await clickElement(manageButton);
+
+		// Submit an add for task A; the mutation stays pending.
+		const urlInput = document.body.querySelector("[data-testid='task-pr-url-input']");
+		expect(urlInput).toBeInstanceOf(HTMLInputElement);
+		if (!(urlInput instanceof HTMLInputElement)) {
+			throw new Error("Expected a URL input.");
+		}
+		await act(async () => {
+			const descriptor = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
+			descriptor?.set?.call(urlInput, "https://github.com/cline/kanban/pull/555");
+			urlInput.dispatchEvent(new Event("input", { bubbles: true }));
+		});
+		const addButton = document.body.querySelector("[data-testid='task-pr-add-button']");
+		expect(addButton).toBeInstanceOf(HTMLButtonElement);
+		if (!(addButton instanceof Element)) {
+			throw new Error("Expected an Add button.");
+		}
+		await clickElement(addButton);
+
+		// Switch to task B and open its manager.
+		const nextSelection = createSelection();
+		nextSelection.card = {
+			...nextSelection.card,
+			id: "task-2",
+			pullRequests: [createTaskPullRequest(99, true)],
+		};
+		await act(async () => {
+			renderMobileDetail(nextSelection);
+		});
+		const manageButtonB = container.querySelector("[data-testid='mobile-task-pr-manage-button']");
+		expect(manageButtonB).toBeInstanceOf(HTMLElement);
+		if (!(manageButtonB instanceof Element)) {
+			throw new Error("Expected a manage button for task B.");
+		}
+		await clickElement(manageButtonB);
+		expect(document.body.querySelector("[data-testid='task-pr-url-input']")).not.toBeNull();
+
+		// Task A's late add response arrives; task B's manager must stay open.
+		await act(async () => {
+			resolveAdd();
+		});
+
+		expect(document.body.querySelector("[data-testid='task-pr-url-input']")).not.toBeNull();
 	});
 });

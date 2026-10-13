@@ -229,12 +229,10 @@ function MobileDetailTabBar({
 	// PRLINK-7: display order — the primary winner first, the rest in recorded order.
 	const orderedPullRequests = getOrderedTaskPullRequests(pullRequests);
 	const primaryPullRequest = orderedPullRequests[0] ?? null;
+	// PRLINK-7: the tab bar is keyed by workspace+task at its call site, so this
+	// open state (and any pending popover state) is dropped with the task and a
+	// late response from task A cannot update task B.
 	const [prManagerOpen, setPrManagerOpen] = useState(false);
-	// PRLINK-7: reset pending/popover state on workspace/task change so a late
-	// response from task A cannot update task B.
-	useEffect(() => {
-		setPrManagerOpen(false);
-	}, [taskId, workspaceId]);
 
 	return (
 		<div className="flex items-center border-b border-border" style={{ minHeight: 36 }}>
@@ -806,6 +804,7 @@ export function CardDetailView({
 		return (
 			<div className="flex min-h-0 flex-1 flex-col overflow-hidden bg-surface-0">
 				<MobileDetailTabBar
+					key={`${selection.card.id}:${currentProjectId ?? "none"}`}
 					activeTab={mobileTab}
 					onTabChange={setMobileTab}
 					taskId={selection.card.id}

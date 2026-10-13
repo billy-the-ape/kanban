@@ -69,14 +69,15 @@ Follow the shared verification/deployment rules in PRLINK-FOLLOWUPS.md.
 - `MobileDetailTabBar` (in `card-detail-view.tsx`) renders the trailing controls from the
   selected card's `pullRequests`: the display-order primary anchor (compact, external, never
   changes meaning) plus the management button. Zero links + workspaceId shows **Link PR** as
-  the management trigger; no workspaceId shows only the readable anchors. The popover is keyed
-  by workspace+task and its open state resets on task/workspace change, so a late response from
-  task A cannot update task B.
+  the management trigger; no workspaceId shows only the readable anchors. `MobileDetailTabBar`
+  is keyed by workspace+task at its call site (and the popover is keyed inside it), so the
+  popover and its open state are dropped with the task — a late response from task A cannot
+  update or close task B's manager.
 - Tests: desktop regressions in `task-pull-request-manager.test.tsx`/`top-bar.test.tsx`, mobile
   popover behavior (visible row meta, 44px targets, controlled open) in
   `task-pull-request-manager.test.tsx`, and mobile tab-bar behavior (zero/one/multiple links,
-  no workspaceId, anchor click does not switch tabs, task-switch reset) in
-  `card-detail-view.test.tsx`.
+  no workspaceId, anchor click does not switch tabs, task-switch reset, and a late add response
+  from task A cannot close task B's manager) in `card-detail-view.test.tsx`.
 
 ## Deployment / rollback
 
