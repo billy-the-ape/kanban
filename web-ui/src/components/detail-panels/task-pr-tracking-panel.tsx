@@ -78,7 +78,6 @@ export function TaskPrTrackingPanel({
 	card: BoardCard;
 	installedConsumers: RuntimePrInstalledConsumer[];
 }): React.ReactElement | null {
-	console.log({ installedConsumers });
 	const client = getRuntimeTrpcClient(workspaceId);
 	const commentsInstalled = installedConsumers.some((consumer) => consumer.kind === "comments");
 	const mergeInstalled = installedConsumers.some((consumer) => consumer.kind === "mergeCompletion");
