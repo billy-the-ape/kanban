@@ -4,6 +4,8 @@ interface UseTrpcQueryOptions<TData> {
 	enabled: boolean;
 	queryFn: () => Promise<TData>;
 	retainDataOnError?: boolean;
+	// This prevents infinite re-renders when data is unchanged
+	noLoading?: boolean;
 }
 
 export interface UseTrpcQueryResult<TData> {
@@ -28,7 +30,7 @@ function toError(value: unknown): Error {
 // request race protection when inputs change, and unmount safety so stale responses
 // do not overwrite newer state. This hook provides that minimal behavior with no cache layer.
 export function useTrpcQuery<TData>(options: UseTrpcQueryOptions<TData>): UseTrpcQueryResult<TData> {
-	const { enabled, queryFn, retainDataOnError = false } = options;
+	const { enabled, queryFn, retainDataOnError = false, noLoading = false } = options;
 	const [data, setData] = useState<TData | null>(null);
 	const [isLoading, setIsLoading] = useState(false);
 	const [isError, setIsError] = useState(false);
@@ -45,14 +47,18 @@ export function useTrpcQuery<TData>(options: UseTrpcQueryOptions<TData>): UseTrp
 
 	const runQuery = useCallback(async (): Promise<TData | null> => {
 		if (!enabled) {
-			setIsLoading(false);
+			if (!noLoading) {
+				setIsLoading(false);
+			}
 			setIsError(false);
 			setError(null);
 			return null;
 		}
 		const requestId = requestIdRef.current + 1;
 		requestIdRef.current = requestId;
-		setIsLoading(true);
+		if (!noLoading) {
+			setIsLoading(true);
+		}
 		setIsError(false);
 		setError(null);
 		try {
@@ -60,8 +66,17 @@ export function useTrpcQuery<TData>(options: UseTrpcQueryOptions<TData>): UseTrp
 			if (!isMountedRef.current || requestIdRef.current !== requestId) {
 				return null;
 			}
-			setData(nextData);
-			setIsLoading(false);
+			setData((data) => {
+				console.log({ data, nextData, eq: JSON.stringify(data) === JSON.stringify(nextData) });
+				if (JSON.stringify(data) === JSON.stringify(nextData)) {
+					return data;
+				}
+				return nextData;
+			});
+
+			if (!noLoading) {
+				setIsLoading(false);
+			}
 			return nextData;
 		} catch (queryError) {
 			if (!isMountedRef.current || requestIdRef.current !== requestId) {
@@ -70,7 +85,9 @@ export function useTrpcQuery<TData>(options: UseTrpcQueryOptions<TData>): UseTrp
 			if (!retainDataOnError) {
 				setData(null);
 			}
-			setIsLoading(false);
+			if (!noLoading) {
+				setIsLoading(false);
+			}
 			setIsError(true);
 			setError(toError(queryError));
 			return null;
