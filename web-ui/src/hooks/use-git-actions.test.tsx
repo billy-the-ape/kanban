@@ -235,7 +235,12 @@ describe("useGitActions", () => {
 			await Promise.resolve();
 		});
 
-		expect(sendTaskChatMessage).toHaveBeenCalledWith("task-1", expect.any(String), { mode: "act" });
+		// LASTPROMPT: generated commit instructions are automated and must
+		// not update the card's latest user prompt preview.
+		expect(sendTaskChatMessage).toHaveBeenCalledWith("task-1", expect.any(String), {
+			mode: "act",
+			source: "automated",
+		});
 		expect(sendTaskSessionInput).not.toHaveBeenCalled();
 		expect(showAppToastMock).not.toHaveBeenCalled();
 	});

@@ -66,6 +66,10 @@ const taskChatPrLinkingMocks = vi.hoisted(() => ({
 	resolveTaskChatPrLinking: vi.fn(async (_input: unknown): Promise<unknown> => undefined),
 }));
 
+const taskLastPromptMocks = vi.hoisted(() => ({
+	recordTaskLastPrompt: vi.fn(async (_input: unknown): Promise<unknown> => "skipped"),
+}));
+
 vi.mock("../../../src/terminal/agent-registry.js", () => ({
 	resolveAgentCommand: agentRegistryMocks.resolveAgentCommand,
 	buildRuntimeConfigResponse: agentRegistryMocks.buildRuntimeConfigResponse,
@@ -140,6 +144,16 @@ vi.mock("../../../src/server/browser.js", () => ({
 vi.mock("../../../src/workspace/task-chat-pr-linking.js", () => ({
 	resolveTaskChatPrLinking: taskChatPrLinkingMocks.resolveTaskChatPrLinking,
 }));
+
+vi.mock("../../../src/workspace/task-last-prompt.js", async () => {
+	const actual = await vi.importActual<typeof import("../../../src/workspace/task-last-prompt")>(
+		"../../../src/workspace/task-last-prompt.js",
+	);
+	return {
+		...actual,
+		recordTaskLastPrompt: taskLastPromptMocks.recordTaskLastPrompt,
+	};
+});
 
 import { buildClineCompactionConfig } from "../../../src/cline-sdk/cline-compaction-config";
 import * as workspaceState from "../../../src/state/workspace-state";
@@ -1522,6 +1536,7 @@ describe("createRuntimeApi startTaskSession", () => {
 	});
 
 	it("returns cline chat messages and sends chat message through cline service", async () => {
+		taskLastPromptMocks.recordTaskLastPrompt.mockClear();
 		const summary = createSummary({ agentId: "cline", pid: null });
 		const latestMessage = {
 			id: "message-1",
@@ -1546,6 +1561,7 @@ describe("createRuntimeApi startTaskSession", () => {
 			getScopedClineTaskSessionService: vi.fn(async () => clineTaskSessionService as never),
 			resolveInteractiveShellCommand: vi.fn(),
 			runCommand: vi.fn(),
+			broadcastRuntimeWorkspaceStateUpdated: vi.fn(),
 		});
 
 		const sendResponse = await api.sendTaskChatMessage(
@@ -1560,6 +1576,19 @@ describe("createRuntimeApi startTaskSession", () => {
 			undefined,
 		);
 		expect(sendResponse.message).toEqual(latestMessage);
+
+		// LASTPROMPT: an accepted user send records the latest prompt.
+		expect(taskLastPromptMocks.recordTaskLastPrompt).toHaveBeenCalledTimes(1);
+		expect(taskLastPromptMocks.recordTaskLastPrompt).toHaveBeenCalledWith(
+			expect.objectContaining({
+				workspaceId: "workspace-1",
+				workspacePath: "/tmp/repo",
+				taskId: "task-1",
+				text: "hello",
+				acceptedAt: expect.any(Number),
+				broadcast: expect.any(Function),
+			}),
+		);
 
 		const messagesResponse = await api.getTaskChatMessages(
 			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
@@ -1634,6 +1663,7 @@ describe("createRuntimeApi startTaskSession", () => {
 	});
 
 	it("omits the PR linking field for candidate-free and rejected sends", async () => {
+		taskLastPromptMocks.recordTaskLastPrompt.mockClear();
 		const summary = createSummary({ agentId: "cline", pid: null });
 		const clineTaskSessionService = createClineTaskSessionServiceMock();
 		clineTaskSessionService.sendTaskSessionInput.mockResolvedValue(summary);
@@ -1656,6 +1686,9 @@ describe("createRuntimeApi startTaskSession", () => {
 		);
 		expect(plain.ok).toBe(true);
 		expect(plain.pullRequestLinking).toBeUndefined();
+		// LASTPROMPT: an accepted user send still records the prompt.
+		expect(taskLastPromptMocks.recordTaskLastPrompt).toHaveBeenCalledTimes(1);
+		taskLastPromptMocks.recordTaskLastPrompt.mockClear();
 
 		// A rejected send must not resolve PR linking at all.
 		taskChatPrLinkingMocks.resolveTaskChatPrLinking.mockClear();
@@ -1667,10 +1700,13 @@ describe("createRuntimeApi startTaskSession", () => {
 		expect(failed.ok).toBe(false);
 		expect(failed.pullRequestLinking).toBeUndefined();
 		expect(taskChatPrLinkingMocks.resolveTaskChatPrLinking).not.toHaveBeenCalled();
+		// LASTPROMPT: a rejected send must not change the preview.
+		expect(taskLastPromptMocks.recordTaskLastPrompt).not.toHaveBeenCalled();
 		clineTaskSessionService.sendTaskSessionInput.mockResolvedValue(summary);
 	});
 
 	it("never resolves PR linking for home-agent chat sends", async () => {
+		taskLastPromptMocks.recordTaskLastPrompt.mockClear();
 		const summary = createSummary({ agentId: "cline", pid: null });
 		const clineTaskSessionService = createClineTaskSessionServiceMock();
 		clineTaskSessionService.sendTaskSessionInput.mockResolvedValue(summary);
@@ -1697,9 +1733,12 @@ describe("createRuntimeApi startTaskSession", () => {
 		expect(response.ok).toBe(true);
 		expect(response.pullRequestLinking).toBeUndefined();
 		expect(taskChatPrLinkingMocks.resolveTaskChatPrLinking).not.toHaveBeenCalled();
+		// LASTPROMPT: home-agent sends never touch the card preview.
+		expect(taskLastPromptMocks.recordTaskLastPrompt).not.toHaveBeenCalled();
 	});
 
 	it("handles clear slash commands without sending them to the model", async () => {
+		taskLastPromptMocks.recordTaskLastPrompt.mockClear();
 		const summary = createSummary({ agentId: "cline", pid: null, state: "idle" });
 		const clineTaskSessionService = createClineTaskSessionServiceMock();
 		clineTaskSessionService.clearTaskSession.mockResolvedValue(summary);
@@ -1730,6 +1769,9 @@ describe("createRuntimeApi startTaskSession", () => {
 		expect(broadcastTaskChatCleared).toHaveBeenCalledWith("workspace-1", "__home_agent__:workspace-1");
 		expect(clineTaskSessionService.sendTaskSessionInput).not.toHaveBeenCalled();
 		expect(clineTaskSessionService.startTaskSession).not.toHaveBeenCalled();
+		// LASTPROMPT: /clear is a session-control command; it leaves the
+		// previous text preview unchanged.
+		expect(taskLastPromptMocks.recordTaskLastPrompt).not.toHaveBeenCalled();
 	});
 
 	it("forwards chat images through the cline service send path", async () => {
@@ -1771,6 +1813,102 @@ describe("createRuntimeApi startTaskSession", () => {
 				mimeType: "image/png",
 			},
 		]);
+	});
+
+	it("records the latest user prompt on accepted sends and preserves non-user text", async () => {
+		taskLastPromptMocks.recordTaskLastPrompt.mockReset();
+		taskLastPromptMocks.recordTaskLastPrompt.mockResolvedValue("recorded");
+		const summary = createSummary({ agentId: "cline", pid: null });
+		const clineTaskSessionService = createClineTaskSessionServiceMock();
+		clineTaskSessionService.sendTaskSessionInput.mockResolvedValue(summary);
+
+		const api = createTestRuntimeApi({
+			getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+			loadScopedRuntimeConfig: vi.fn(async () => createRuntimeConfigState()),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: vi.fn(async () => ({}) as never),
+			getScopedClineTaskSessionService: vi.fn(async () => clineTaskSessionService as never),
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+			broadcastRuntimeWorkspaceStateUpdated: vi.fn(),
+		});
+
+		const scope = { workspaceId: "workspace-1", workspacePath: "/tmp/repo" };
+
+		// A user-authored send is accepted and recorded (trimmed by the API
+		// boundary, internal text preserved).
+		const accepted = await api.sendTaskChatMessage(scope, { taskId: "task-1", text: "  Fix the flaky test  " });
+		expect(accepted.ok).toBe(true);
+		expect(taskLastPromptMocks.recordTaskLastPrompt).toHaveBeenCalledTimes(1);
+		expect(taskLastPromptMocks.recordTaskLastPrompt).toHaveBeenCalledWith(
+			expect.objectContaining({
+				workspaceId: "workspace-1",
+				workspacePath: "/tmp/repo",
+				taskId: "task-1",
+				text: "Fix the flaky test",
+				acceptedAt: expect.any(Number),
+				broadcast: expect.any(Function),
+			}),
+		);
+
+		// Automated sends (generated commit/PR instructions) never touch the preview.
+		taskLastPromptMocks.recordTaskLastPrompt.mockClear();
+		const automated = await api.sendTaskChatMessage(scope, {
+			taskId: "task-1",
+			text: "Commit the changes",
+			source: "automated",
+		});
+		expect(automated.ok).toBe(true);
+		expect(taskLastPromptMocks.recordTaskLastPrompt).not.toHaveBeenCalled();
+
+		// Blank text is rejected by the API boundary and never recorded.
+		const blank = await api.sendTaskChatMessage(scope, { taskId: "task-1", text: "   " });
+		expect(blank.ok).toBe(false);
+		// Image-only sends leave the previous text preview unchanged.
+		const imageOnly = await api.sendTaskChatMessage(scope, {
+			taskId: "task-1",
+			text: "",
+			images: [{ id: "img-1", data: "abc123", mimeType: "image/png" }],
+		});
+		expect(imageOnly.ok).toBe(true);
+		expect(taskLastPromptMocks.recordTaskLastPrompt).not.toHaveBeenCalled();
+	});
+
+	it("records the user prompt after a successful persisted-session rebind", async () => {
+		taskLastPromptMocks.recordTaskLastPrompt.mockReset();
+		taskLastPromptMocks.recordTaskLastPrompt.mockResolvedValue("recorded");
+		const summary = createSummary({ agentId: "cline", pid: null });
+		const clineTaskSessionService = createClineTaskSessionServiceMock();
+		// First send fails (no live session); rebind succeeds and the retry is accepted.
+		clineTaskSessionService.sendTaskSessionInput.mockResolvedValueOnce(null);
+		clineTaskSessionService.rebindPersistedTaskSession.mockResolvedValueOnce(summary);
+		clineTaskSessionService.sendTaskSessionInput.mockResolvedValue(summary);
+
+		const api = createTestRuntimeApi({
+			getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+			loadScopedRuntimeConfig: vi.fn(async () => createRuntimeConfigState()),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: vi.fn(async () => ({}) as never),
+			getScopedClineTaskSessionService: vi.fn(async () => clineTaskSessionService as never),
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+		});
+
+		const response = await api.sendTaskChatMessage(
+			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+			{ taskId: "task-1", text: "Rebind message" },
+		);
+		expect(response.ok).toBe(true);
+		expect(clineTaskSessionService.rebindPersistedTaskSession).toHaveBeenCalledWith("task-1");
+		expect(taskLastPromptMocks.recordTaskLastPrompt).toHaveBeenCalledTimes(1);
+		expect(taskLastPromptMocks.recordTaskLastPrompt).toHaveBeenCalledWith(
+			expect.objectContaining({
+				workspaceId: "workspace-1",
+				workspacePath: "/tmp/repo",
+				taskId: "task-1",
+				text: "Rebind message",
+			}),
+		);
 	});
 
 	it("hydrates persisted cline chat messages when no live in-memory session is loaded", async () => {
@@ -3355,6 +3493,8 @@ describe("return queued task to Backlog", () => {
 								id: "task-1",
 								title: "Queued",
 								prompt: "work",
+								lastPrompt: "Latest user prompt",
+								lastPromptAt: 42,
 								startInPlanMode: false,
 								baseRef: "main",
 								createdAt: 1,
@@ -3404,6 +3544,10 @@ describe("return queued task to Backlog", () => {
 		if (success) {
 			expect(mutate).toHaveBeenCalledTimes(1);
 			expect(state.board.columns[0]?.cards[0]?.id).toBe("task-1");
+			// LASTPROMPT: an explicit reset to Backlog clears the
+			// conversation, so the preview returns to the original prompt.
+			expect(state.board.columns[0]?.cards[0]?.lastPrompt).toBeUndefined();
+			expect(state.board.columns[0]?.cards[0]?.lastPromptAt).toBeUndefined();
 			expect(state.sessions["task-1"]).toBeUndefined();
 			expect(saveDispatch).toHaveBeenCalledWith(
 				expect.objectContaining({ manuallyDeferred: true, status: "blocked" }),

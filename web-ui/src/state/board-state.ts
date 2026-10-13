@@ -196,6 +196,8 @@ function normalizeCard(rawCard: unknown): BoardCard | null {
 		autoFinishOnMerge?: unknown;
 		selectedAutomationPrKey?: unknown;
 		settingsRevision?: unknown;
+		lastPrompt?: unknown;
+		lastPromptAt?: unknown;
 		createdAt?: unknown;
 		updatedAt?: unknown;
 	};
@@ -245,6 +247,14 @@ function normalizeCard(rawCard: unknown): BoardCard | null {
 		...(typeof card.settingsRevision === "number" ? { settingsRevision: card.settingsRevision } : {}),
 		...(typeof card.updateBaseRefBeforeStart === "boolean"
 			? { updateBaseRefBeforeStart: card.updateBaseRefBeforeStart }
+			: {}),
+		// LASTPROMPT: server-owned; carried through board hydration and card
+		// edit/move operations (updateTask spreads the raw card).
+		...(typeof card.lastPrompt === "string" && card.lastPrompt.trim().length > 0
+			? { lastPrompt: card.lastPrompt }
+			: {}),
+		...(typeof card.lastPromptAt === "number" && Number.isFinite(card.lastPromptAt)
+			? { lastPromptAt: card.lastPromptAt }
 			: {}),
 		createdAt: typeof card.createdAt === "number" ? card.createdAt : now,
 		updatedAt: typeof card.updatedAt === "number" ? card.updatedAt : now,

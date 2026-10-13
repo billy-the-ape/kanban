@@ -341,9 +341,16 @@ export function BoardCard({
 		() => normalizePromptForDisplay(card.title) || truncateTaskPromptLabel(card.prompt),
 		[card.prompt, card.title],
 	);
+	// LASTPROMPT: the card preview shows the latest user-authored chat prompt
+	// when present; legacy cards (or a cleared preview) fall back to the
+	// original task prompt. The title keeps its existing fallback behavior.
+	const previewText = useMemo(() => {
+		const lastPrompt = card.lastPrompt?.trim() ?? "";
+		return lastPrompt.length > 0 ? lastPrompt : card.prompt;
+	}, [card.lastPrompt, card.prompt]);
 	const displayDescription = useMemo(
-		() => getTaskPromptDescription(card.prompt, displayTitle),
-		[card.prompt, displayTitle],
+		() => getTaskPromptDescription(previewText, displayTitle),
+		[previewText, displayTitle],
 	);
 
 	useLayoutEffect(() => {

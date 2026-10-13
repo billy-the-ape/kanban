@@ -97,6 +97,7 @@ import { createVerificationRunner } from "../verification/verification-service";
 import { evaluateDependentsUnlock, getGitDeliveryService, readTaskDeliveryReceipt } from "../workspace/git-delivery";
 import { resolveTaskChatPrLinking } from "../workspace/task-chat-pr-linking";
 import { getTaskInitialStartStatus as readTaskInitialStartStatus } from "../workspace/task-initial-start";
+import { clearTaskLastPrompt, recordTaskLastPrompt } from "../workspace/task-last-prompt";
 import { readTaskPreservationRecord } from "../workspace/task-preservation";
 import { resetUnstartedQueuedWorktree } from "../workspace/task-queued-reset";
 import { findTaskBaseRef, readReviewOutcome } from "../workspace/task-review-handoff";
@@ -1348,9 +1349,13 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					if (getTaskColumnId(state.board, body.taskId) !== "in_progress")
 						throw new Error("Task column changed during reset.");
 					const moved = moveTaskToColumn(state.board, body.taskId, "backlog");
+					// LASTPROMPT: an explicit reset to Backlog clears the
+					// conversation, so the card preview returns to the original
+					// task prompt.
+					const board = clearTaskLastPrompt(moved.board, body.taskId);
 					const sessions = { ...state.sessions };
 					delete sessions[body.taskId];
-					return { board: moved.board, sessions, value: undefined };
+					return { board, sessions, value: undefined };
 				});
 				deps.broadcastTaskChatCleared?.(workspaceScope.workspaceId, body.taskId);
 				void deps.broadcastRuntimeWorkspaceStateUpdated?.(workspaceScope.workspaceId, workspaceScope.workspacePath);
@@ -1714,6 +1719,23 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 							compactionSafetyMarginTokens: clineLaunchConfig.compactionSettings?.safetyMarginTokens,
 						});
 					}
+				}
+				// LASTPROMPT: record the latest user-authored prompt as soon
+				// as the send was accepted (queued or successful rebind),
+				// before any model completion. Rejected sends and /clear
+				// return above; home-agent sessions, automated callers, and
+				// blank/image-only sends never participate. The recorder
+				// never throws, so a persistence failure cannot turn an
+				// accepted send into a failure.
+				if (!isHomeAgentSessionId(body.taskId) && body.source !== "automated" && body.text.trim().length > 0) {
+					await recordTaskLastPrompt({
+						workspaceId: workspaceScope.workspaceId,
+						workspacePath: workspaceScope.workspacePath,
+						taskId: body.taskId,
+						text: body.text,
+						acceptedAt: Date.now(),
+						broadcast: deps.broadcastRuntimeWorkspaceStateUpdated,
+					});
 				}
 				const latestMessage = clineTaskSessionService.listMessages(body.taskId).at(-1) ?? null;
 				// PRLINK-8: a link is applied only now that the send (including

@@ -14,6 +14,7 @@ import {
 	moveTaskToColumn,
 	normalizeBoardData,
 	trashTaskAndGetReadyLinkedTaskIds,
+	updateTask,
 	updateTaskTitle,
 } from "@/state/board-state";
 import type { ProgrammaticCardMoveInFlight } from "@/state/drag-rules";
@@ -646,6 +647,72 @@ describe("board dependency state", () => {
 		const updatedTask = disabled.board.columns.find((column) => column.id === "review")?.cards[0];
 		expect(updatedTask?.autoReviewEnabled).toBe(false);
 		expect(updatedTask?.autoReviewMode).toBe("commit");
+	});
+
+	it("keeps the server-owned last user prompt through normalization and card operations", () => {
+		const normalized = normalizeBoardData({
+			columns: [
+				{
+					id: "backlog",
+					cards: [
+						{
+							id: "b",
+							prompt: "Task B",
+							startInPlanMode: false,
+							baseRef: "main",
+							lastPrompt: "  Latest user prompt  ",
+							lastPromptAt: 1234,
+						},
+						{
+							id: "c",
+							prompt: "Task C",
+							startInPlanMode: false,
+							baseRef: "main",
+							lastPrompt: 42,
+							lastPromptAt: "nope",
+						},
+					],
+				},
+				{ id: "in_progress", cards: [] },
+				{ id: "review", cards: [] },
+				{ id: "trash", cards: [] },
+			],
+			dependencies: [],
+		});
+		if (!normalized) {
+			throw new Error("Expected board to normalize");
+		}
+		const cards = normalized.columns.flatMap((column) => column.cards);
+		// Valid server-owned values carry through hydration.
+		expect(cards.find((card) => card.id === "b")?.lastPrompt).toBe("  Latest user prompt  ");
+		expect(cards.find((card) => card.id === "b")?.lastPromptAt).toBe(1234);
+		// Invalid client values are dropped.
+		expect(cards.find((card) => card.id === "c")?.lastPrompt).toBeUndefined();
+		expect(cards.find((card) => card.id === "c")?.lastPromptAt).toBeUndefined();
+
+		// Card edit operations retain the server-owned preview.
+		const updated = updateTask(normalized, "b", {
+			title: "Task B",
+			prompt: "Task B",
+			startInPlanMode: false,
+			autoReviewEnabled: false,
+			autoReviewMode: "commit",
+			images: [],
+			baseRef: "main",
+		});
+		expect(updated.updated).toBe(true);
+		const updatedCard = updated.board.columns.flatMap((column) => column.cards).find((card) => card.id === "b");
+		expect(updatedCard?.lastPrompt).toBe("  Latest user prompt  ");
+		expect(updatedCard?.lastPromptAt).toBe(1234);
+		// The original task prompt stays untouched.
+		expect(updatedCard?.prompt).toBe("Task B");
+
+		// Moving the card retains the preview.
+		const moved = moveTaskToColumn(updated.board, "b", "in_progress");
+		expect(moved.moved).toBe(true);
+		expect(moved.board.columns.find((column) => column.id === "in_progress")?.cards[0]?.lastPrompt).toBe(
+			"  Latest user prompt  ",
+		);
 	});
 
 	it("updates only the task title", () => {

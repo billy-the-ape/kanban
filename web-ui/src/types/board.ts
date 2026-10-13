@@ -57,6 +57,13 @@ export interface BoardCard {
 	selectedAutomationPrKey?: string;
 	/** PRTRACK-1: optimistic-concurrency revision shared by the server-owned settings block. */
 	settingsRevision?: number;
+	/**
+	 * LASTPROMPT: the latest user-authored task-chat prompt (server-owned).
+	 * Display-only: the card preview falls back to `prompt` when absent.
+	 */
+	lastPrompt?: string;
+	/** LASTPROMPT: acceptance timestamp of `lastPrompt` (server-owned). */
+	lastPromptAt?: number;
 	baseRef: string;
 	/** UPD-0: missing values normalize to true; an explicit false disables the pre-start base refresh. */
 	updateBaseRefBeforeStart?: boolean;

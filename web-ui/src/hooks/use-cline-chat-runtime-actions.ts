@@ -27,6 +27,12 @@ export interface ClineChatActionResult {
 export interface SendClineChatMessageOptions {
 	mode?: RuntimeTaskSessionMode;
 	images?: RuntimeTaskImage[];
+	/**
+	 * LASTPROMPT: explicit authorship of the send. Absent reads as
+	 * user-authored; automated callers must mark themselves so the card's
+	 * last-user-prompt preview is preserved.
+	 */
+	source?: "user" | "automated";
 }
 
 interface UseClineChatRuntimeActionsInput {
@@ -64,6 +70,7 @@ export function useClineChatRuntimeActions({
 					text,
 					...(options?.images && options.images.length > 0 ? { images: options.images } : {}),
 					...(options?.mode ? { mode: options.mode } : {}),
+					...(options?.source ? { source: options.source } : {}),
 				});
 				if (!payload.ok) {
 					return { ok: false, message: payload.error ?? "Task chat message failed." };

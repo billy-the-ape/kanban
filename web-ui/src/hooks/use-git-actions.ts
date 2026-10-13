@@ -39,7 +39,7 @@ interface UseGitActionsInput {
 	sendTaskChatMessage: (
 		taskId: string,
 		text: string,
-		options?: { mode?: "plan" | "act" },
+		options?: { mode?: "plan" | "act"; source?: "user" | "automated" },
 	) => Promise<{ ok: boolean; message?: string }>;
 	fetchTaskWorkspaceInfo: (task: BoardCard) => Promise<RuntimeTaskWorkspaceInfoResponse | null>;
 	isGitHistoryOpen: boolean;
@@ -342,7 +342,10 @@ export function useGitActions({
 						: null,
 				});
 				if (shouldUseClineChatForTaskGitActions) {
-					const sent = await sendTaskChatMessage(taskId, prompt, { mode: "act" });
+					// LASTPROMPT: generated commit/PR instructions are
+					// automated; they must not overwrite the latest user-authored
+					// prompt preview on the card.
+					const sent = await sendTaskChatMessage(taskId, prompt, { mode: "act", source: "automated" });
 					if (!sent.ok) {
 						showAppToast({
 							intent: "danger",

@@ -313,6 +313,40 @@ describe("BoardCard", () => {
 		expect(container.textContent).not.toContain("final hidden segment");
 	});
 
+	it("shows the latest user prompt in the preview and keeps the title unchanged", async () => {
+		await act(async () => {
+			root.render(
+				<BoardCard
+					card={createCard({
+						title: "Task title",
+						prompt: "Task title||Original description",
+						lastPrompt: "  Updated by the user ",
+					})}
+					index={0}
+					columnId="backlog"
+				/>,
+			);
+		});
+		expect(container.textContent).toContain("Updated by the user");
+		expect(container.textContent).not.toContain("Original description");
+		// The title keeps its existing fallback behavior.
+		expect(container.textContent).toContain("Task title");
+	});
+
+	it("falls back to the original prompt for legacy cards without a last prompt", async () => {
+		await act(async () => {
+			root.render(
+				<BoardCard
+					card={createCard({ title: "Task title", prompt: "Task title||Original description" })}
+					index={0}
+					columnId="backlog"
+				/>,
+			);
+		});
+		expect(container.textContent).toContain("Original description");
+		expect(container.textContent).not.toContain("Updated by the user");
+	});
+
 	it("reconstructs and shows trashed worktree path when workspace metadata is not tracked", async () => {
 		await act(async () => {
 			root.render(

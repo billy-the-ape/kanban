@@ -802,6 +802,48 @@ function mergeServerOwnedPrCardFields(
 }
 
 /**
+ * LASTPROMPT: server-owned latest user-authored chat prompt. Written only
+ * through the dedicated chat-send recorder under the workspace lock, so a
+ * stale whole-board save can neither erase a recorded prompt nor replace it
+ * with a forged one; completely new cards never accept a client-supplied
+ * `lastPrompt`/`lastPromptAt`.
+ */
+function mergeServerOwnedLastPrompt(clientBoard: RuntimeBoardData, persistedBoard: RuntimeBoardData): RuntimeBoardData {
+	const persistedByTaskId = new Map<string, Pick<RuntimeBoardCard, "lastPrompt" | "lastPromptAt">>();
+	for (const column of persistedBoard.columns) {
+		for (const card of column.cards) {
+			if (card.lastPrompt !== undefined || card.lastPromptAt !== undefined) {
+				persistedByTaskId.set(card.id, {
+					lastPrompt: card.lastPrompt,
+					lastPromptAt: card.lastPromptAt,
+				});
+			}
+		}
+	}
+	return {
+		...clientBoard,
+		columns: clientBoard.columns.map((column) => ({
+			...column,
+			cards: column.cards.map((card) => {
+				const persisted = persistedByTaskId.get(card.id);
+				const mergedCard: RuntimeBoardCard = { ...card };
+				delete mergedCard.lastPrompt;
+				delete mergedCard.lastPromptAt;
+				if (persisted) {
+					if (persisted.lastPrompt !== undefined) {
+						mergedCard.lastPrompt = persisted.lastPrompt;
+					}
+					if (persisted.lastPromptAt !== undefined) {
+						mergedCard.lastPromptAt = persisted.lastPromptAt;
+					}
+				}
+				return mergedCard;
+			}),
+		})),
+	};
+}
+
+/**
  * MERGE-1: server-owned manual-reopen marker. The board is client-owned, but
  * the marker is derived server-side from the persisted -> incoming column
  * transition so a stale client board can neither forge nor drop it:
@@ -867,7 +909,13 @@ export async function saveWorkspaceState(
 		}
 		const persistedBoard = await readWorkspaceBoard(context.workspaceId);
 		const board = applyManualReopenMarkers(
-			mergeServerOwnedPrSettings(mergeServerOwnedPullRequests(parsedPayload.board, persistedBoard), persistedBoard),
+			mergeServerOwnedLastPrompt(
+				mergeServerOwnedPrSettings(
+					mergeServerOwnedPullRequests(parsedPayload.board, persistedBoard),
+					persistedBoard,
+				),
+				persistedBoard,
+			),
 			persistedBoard,
 			Date.now(),
 		);

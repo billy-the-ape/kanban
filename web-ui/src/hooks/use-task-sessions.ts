@@ -72,7 +72,7 @@ export interface UseTaskSessionsResult {
 	sendTaskChatMessage: (
 		taskId: string,
 		text: string,
-		options?: { mode?: RuntimeTaskSessionMode },
+		options?: { mode?: RuntimeTaskSessionMode; source?: "user" | "automated" },
 	) => Promise<ClineChatActionResult>;
 	abortTaskChatTurn: (taskId: string) => Promise<ClineChatActionResult>;
 	cancelTaskChatTurn: (taskId: string) => Promise<ClineChatActionResult>;
