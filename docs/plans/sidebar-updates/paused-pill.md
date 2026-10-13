@@ -2,9 +2,9 @@
 
 Status: implementation-ready plan. Target: `billy-the-ape/kanban` `main`. Source baseline: `879a3a1`.
 
-Order: **1 of 2** in `docs/plans/sidebar-updates/`. Implement in this order: `paused-pill.md` → `tasks-tab.md`. This plan has no dependencies. `tasks-tab.md` depends on the shared module and the registry refactor introduced here. One PR / one squash commit.
+Order: **1 of 2** in `docs/plans/sidebar-updates/`. Implement `paused-pill.md` before `tasks-tab.md`. This plan has no dependencies. `tasks-tab.md` depends on the shared module and the registry refactor introduced here. One implementation PR / one squash commit. Desktop collapse is being handled separately by the user.
 
-All product decisions are made below. The implementer makes no product decisions.
+The behavior and boundaries are defined below. Symbol names are the navigation anchors; line numbers describe the source baseline and may shift. Before coding, read `AGENTS.md` and inspect these symbols on the implementation branch. Preserve changes that have landed since the baseline. If current behavior conflicts with a decision here, report that specific conflict before changing scope.
 
 ## Problem and required outcome
 
@@ -16,9 +16,9 @@ The sidebar shows per-project task pills under each project name (`B | 7`, `IP |
 Required outcome:
 
 - A new display state, **Paused**, shown as a yellow pill `P | n` between `IP` and `R`.
-- Paused is a **display state only**. No new board column, no new lane, no change to card movement, persistence, or the board UI. Paused cards stay in the In Progress column.
+- Paused is a **display state only**. No new board column, lane or persisted session-state value, and no change to card movement or board UI. Paused cards stay in the In Progress column. The persistence changes below prevent stale summaries from overwriting current ones.
 - `IP + P` always equals the number of cards in the In Progress column minus the cards counted as `R` because their agent finished (see the classification table below).
-- Counts are identical for the open project (computed in the browser) and for every other project (computed on the server), because both use the same function.
+- For identical board and effective-session inputs, browser and server counts are identical. The open project can temporarily be ahead because its board has unsaved changes.
 - The stale-`R` bug is fixed at its cause, with a regression test.
 
 ## Root cause of the stale `R` bug (verified by reading the code)
@@ -49,21 +49,24 @@ The fix has two parts:
 
    A **placeholder** summary is one with `state === "idle" && startedAt === null && agentId === null`. `TerminalSessionManager` creates one through `createDefaultSummary` (`src/terminal/session-manager.ts:109-127`, stamped `updatedAt: now()`) when a terminal is attached for a task with no entry (`:977`). It describes no session, so it never classifies a card as Paused.
 
-   `idle` is what the composer's pause button produces (`cancelTaskTurn`, `src/cline-sdk/cline-task-session-service.ts:1004-1033`). `interrupted` comes from stop/abort and runtime shutdown. `failed` counts as Paused because the agent is not working. A queued task (waiting for a concurrency slot) counts as Paused because no agent is working on it yet.
+   `idle` is what the composer's pause button produces (`cancelTaskTurn`, `src/cline-sdk/cline-task-session-service.ts:1004-1033`). `interrupted` comes from stop/abort and runtime shutdown. `failed` counts as Paused because the agent is not working. A queued task (waiting for a concurrency slot) counts as Paused because no agent is working on it yet. The queued check precedes the general running check and only applies while `state === "running"`.
 2. **Counts shape.** `RuntimeProjectTaskCounts` gains a required `paused: number`. `in_progress` now means display state `in_progress` only. Paused cards are **not** also counted in `in_progress`.
 3. **Pill.** Order `B, IP, P, R, D, T`. Paused pill: `id: "paused"`, `title: "Paused"`, `shortLabel: "P"`, `toneClassName: "bg-status-gold/20 text-status-gold"`. Like the other pills, it is hidden when its count is 0, and the selected project row uses its existing `bg-accent-fg/20 text-accent-fg` override.
-4. **Merge rule.** For one task, given two summaries, keep the one with the larger `updatedAt`. On a tie, keep the **later-listed source** in the merge order defined for that call site. Exception: a placeholder candidate never replaces an existing non-placeholder summary, whatever its `updatedAt`, because its fresh timestamp would otherwise mask real session state. This is one shared helper used everywhere summaries from two sources meet.
+4. **Merge rule.** For one task, a real summary always beats a placeholder, regardless of timestamp or source order. If both are real, or both are placeholders, keep the one with the larger `updatedAt`; on a tie, keep the **later-listed source**. With no current summary, keep the candidate. Select the complete winning object, without merging individual fields, changing its timestamp, or mutating either source. This preserves session identity and checkpoint fields. Use the shared helper in the count, snapshot, save and browser-summary paths listed below.
 5. **Server effective sessions** for a workspace, merged in this order (later wins ties): persisted `sessions.json` → terminal manager `listSummaries()` (if a manager exists) → the hub's latest Cline summaries for that workspace (if tracked).
 6. **No board-card visual change.** The card's status marker (`web-ui/src/components/board-card.tsx:449-462`) is out of scope.
+7. **Meaning and limits.** Cards without a real summary remain `IP`; this is the existing optimistic behavior, so the pill is not proof of an active process. Queued tasks count as Paused, as specified above. An explicit Review column still wins over a running summary. Failed tasks display as Paused without clearing their error details. This plan fixes future stale-summary overwrites; it does not invent missing history, repair already-corrupted timestamps, or change startup recovery after an unclean shutdown.
 
 ## Existing implementation map
 
 - `src/core/api-contract.ts:481-488`: `runtimeProjectTaskCountsSchema`.
 - `src/server/workspace-registry.ts`: `createEmptyProjectTaskCounts` (`:80`), `countTasksByColumn` (`:90`), `applyLiveSessionStateToProjectTaskCounts` (`:128`), `summarizeProjectTaskCounts` (`:279`), `buildWorkspaceStateSnapshot` (`:303`), dependency interface `CreateWorkspaceRegistryDependencies` (`:23`).
 - `src/state/workspace-state.ts:346-350`: private `readWorkspaceSessions(workspaceId)`. `loadWorkspaceBoardById` at `:343` is the public pattern to copy.
-- `src/server/runtime-state-hub.ts`: `clinePreviousSummaryByWorkspaceId` (`:67`), `RuntimeStateHub` interface (`:44-62`).
+- `src/server/runtime-state-hub.ts`: `trackClineTaskSessionService`, `clinePreviousSummaryByWorkspaceId` (`:67`), `RuntimeStateHub` interface (`:44-62`), `disposeWorkspace`, `close`.
 - `src/cli.ts:409-422`: `runtimeStateHub` is a `let` assigned after `createWorkspaceRegistry`. Registry dependencies that need the hub must be late-bound closures, like `onTerminalManagerReady`.
-- `src/trpc/workspace-api.ts:443-450`: `saveState` overwrite.
+- `src/trpc/workspace-api.ts:443-450`: `saveState` overwrite; dependency wiring is in `createWorkspaceApi` in `src/server/runtime-server.ts`.
+- `src/state/workspace-state.ts`: `saveWorkspaceState` writes sessions inside the workspace directory lock. Preserve the revision-conflict check and server-owned card-field merges.
+- Browser summary merges: `web-ui/src/runtime/use-runtime-state-stream.ts` (`mergeTaskSessionSummaries`), `web-ui/src/hooks/home-sidebar-agent-panel-session-summary.ts` (`selectNewestTaskSessionSummary`, used by `use-workspace-sync.ts` and `use-task-sessions.ts`). Their tie rules currently differ.
 - `web-ui/src/hooks/app-utils.tsx:23-59`: browser `countTasksByColumn`. Its only caller is `use-project-ui-state.ts:50`.
 - `web-ui/src/hooks/use-project-ui-state.ts`: open-project count override. Called from `web-ui/src/App.tsx:265`, where `sessions` (`App.tsx:87`) is in scope.
 - `web-ui/src/components/project-navigation-panel.tsx`: `TaskCountBadge` (`:40`), pill array in `ProjectRow` (`:700-736`), removal-dialog total (`:96-103`).
@@ -78,7 +81,11 @@ Imports types only from `./api-contract`. No Node imports, because the web UI im
 ```ts
 export type RuntimeTaskDisplayState = "backlog" | "in_progress" | "paused" | "review" | "done" | "trash";
 
-export const PAUSED_TASK_SESSION_STATES: ReadonlySet<RuntimeTaskSessionState> = new Set(["idle", "interrupted", "failed"]);
+export const PAUSED_TASK_SESSION_STATES: ReadonlySet<RuntimeTaskSessionState> = new Set([
+	"idle",
+	"interrupted",
+	"failed",
+]);
 
 export function resolveTaskDisplayState(
 	columnId: RuntimeBoardColumnId,
@@ -97,7 +104,7 @@ export function isPlaceholderSessionSummary(summary: RuntimeTaskSessionSummary):
 export function pickNewerSessionSummary(
 	current: RuntimeTaskSessionSummary | undefined,
 	candidate: RuntimeTaskSessionSummary,
-): RuntimeTaskSessionSummary; // decision 4: candidate wins when candidate.updatedAt >= current.updatedAt, unless candidate is a placeholder and current is not
+): RuntimeTaskSessionSummary; // decision 4: real beats placeholder, then newer wins, then candidate wins ties
 
 export function mergeSessionSummaries(
 	...sources: ReadonlyArray<Iterable<RuntimeTaskSessionSummary>>
@@ -118,7 +125,9 @@ In `src/state/workspace-state.ts`, export `loadWorkspaceSessionsById(workspaceId
 
 ### 4. Hub exposes latest Cline summaries
 
-In `RuntimeStateHub`, add `listClineTaskSessionSummaries(workspaceId: string): RuntimeTaskSessionSummary[]`. It returns `Array.from(clinePreviousSummaryByWorkspaceId.get(workspaceId)?.values() ?? [])`.
+In `RuntimeStateHub`, add `listClineTaskSessionSummaries(workspaceId: string): RuntimeTaskSessionSummary[]`. Keep a workspace-keyed map of the services already registered by `trackClineTaskSessionService`, and return the registered service's `listSummaries()` or `[]`. Reading this accessor must not instantiate a service or hydrate task transcripts. Clear the service reference in `disposeWorkspace` and `close`.
+
+Do not use `clinePreviousSummaryByWorkspaceId` as the read source: it is an event-comparison cache, and `rebindPersistedTaskSession` can change the service's summaries without emitting `onSummary`. Keep that cache for its existing transition detection.
 
 ### 5. Workspace registry
 
@@ -127,19 +136,23 @@ In `RuntimeStateHub`, add `listClineTaskSessionSummaries(workspaceId: string): R
   1. `Object.values(await loadWorkspaceSessionsById(workspaceId))`
   2. `getTerminalManagerForWorkspace(workspaceId)?.listSummaries() ?? []`
   3. `deps.getClineTaskSessionSummaries?.(workspaceId) ?? []`
-- Add a private `loadProjectTaskSnapshot(workspaceId): Promise<{ board: RuntimeBoardData; sessions: Record<string, RuntimeTaskSessionSummary> }>`, which loads the board and `loadEffectiveTaskSessions`. `tasks-tab.md` reuses it, so keep it a named function inside `createWorkspaceRegistry`.
+- Add a private `loadProjectTaskSnapshot(workspaceId): Promise<{ board: RuntimeBoardData; sessions: Record<string, RuntimeTaskSessionSummary> }>`, loading the board and `loadEffectiveTaskSessions` in parallel. It must not create a terminal manager or Cline service. `tasks-tab.md` reuses it, so keep it a named function inside `createWorkspaceRegistry`.
 - `summarizeProjectTaskCounts`: replace the body with `countTasksByDisplayState(snapshot.board, snapshot.sessions)`. Keep the existing cache-on-success and fallback-on-throw behavior (`projectTaskCountsByWorkspaceId`). Use `createEmptyTaskCounts()` from the shared module.
 - Delete the local `createEmptyProjectTaskCounts`, `countTasksByColumn` and `applyLiveSessionStateToProjectTaskCounts`. They are fully replaced.
-- `buildWorkspaceStateSnapshot`: replace the blind overlay loop with `response.sessions = mergeSessionSummaries(Object.values(response.sessions), terminalManager.listSummaries())`.
+- `buildWorkspaceStateSnapshot`: after the existing manager initialization, merge `response.sessions` → terminal manager summaries → the registered Cline service summaries. Reuse the same source order as counts; keep the rest of the workspace response unchanged.
 
 ### 6. `saveState` overwrite fix
 
-In `src/trpc/workspace-api.ts` `saveState`, replace the overwrite loop with `input.sessions = mergeSessionSummaries(Object.values(input.sessions), terminalManager.listSummaries())`. For terminal agents, the terminal manager stays authoritative, because the browser's copy came from that manager and is never newer (ties go to the manager). A frozen hydrated Cline copy no longer replaces the browser's newer one.
+- Add an optional `getClineTaskSessionSummaries` dependency to `CreateWorkspaceApiDependencies`, matching the registry callback. Wire it to `deps.runtimeStateHub.listClineTaskSessionSummaries` in `src/server/runtime-server.ts`. This reads tracked services only; do not call `getScopedClineTaskSessionService` just to save a board.
+- Replace the blind loop with a new sessions record merged in this order: browser input → terminal manager → registered Cline service. Pass a copied input object to `saveWorkspaceState`; do not mutate the request. A newer paused/running Cline summary must beat an older browser or hydrated-manager copy, even if the browser has not received the stream event yet.
+- In `saveWorkspaceState`, **inside the existing directory lock**, read the current persisted sessions and merge them → the supplied sessions record before writing. This closes the remaining disk-overwrite gap, including callers outside tRPC. Missing task ids in one source are not deletion instructions. Keep the existing revision-conflict behavior and atomic writes. Intentional session resets/removals continue through their existing lifecycle APIs.
+- Tie order for the complete save path is therefore disk → browser → terminal → Cline. Terminal and Cline live copies win ties over browser input. Do not claim terminal state is always newer: compare timestamps, and retain the placeholder exception.
 
 ### 7. Browser counts for the open project
 
 - Delete `countTasksByColumn` from `web-ui/src/hooks/app-utils.tsx` and its test cases in `app-utils.test.tsx`, if any.
 - `useProjectUiState` takes a new required input `sessions: Record<string, RuntimeTaskSessionSummary>` and computes `countTasksByDisplayState(board, sessions)` (imported from `@runtime-task-display-state`). Add `sessions` to the `useMemo` dependencies. Pass `sessions` from `App.tsx`.
+- Replace the runtime stream's private timestamp comparison with `pickNewerSessionSummary`, and make `selectNewestTaskSessionSummary` a null-aware wrapper around the same helper (`left` is current, `right` is candidate). Preserve its callers and the no-change return optimization in `useTaskSessions`. Workspace hydration and stream deltas must follow the same real/placeholder and tie rules as server counts. Preserve existing workspace-boundary resets; never merge summaries across projects.
 
 ### 8. Pill rendering
 
@@ -153,31 +166,44 @@ In `src/trpc/workspace-api.ts` `saveState`, replace the overwrite loop with `inp
 ## Tests
 
 - `test/runtime/core/task-display-state.test.ts` (new):
-  - The full decision 1 table, one case per row, including queued `running` (`concurrency_waiting`) → `paused`, other `running` → `in_progress`, and `failed`/`idle`/`interrupted` → `paused`.
+  - The full decision 1 table, one case per row, including queued `running` (`concurrency_waiting`) → `paused`, other `running` → `in_progress`, and `failed`/`idle`/`interrupted` → `paused`. A running task with null hook activity is not queued.
   - `countTasksByDisplayState` over a mixed board: `in_progress + paused + review-from-in_progress` equals the In Progress column length.
-  - `pickNewerSessionSummary` tie and older/newer cases, plus a newer placeholder losing to an older real summary and a placeholder kept when there is no current summary.
+  - `pickNewerSessionSummary` tie and older/newer cases; a newer placeholder loses to an older real summary **in either source order**; two placeholders use timestamps/ties; no current summary keeps the candidate. Inputs are unchanged and the complete winning object's identity/checkpoints are retained.
   - An In Progress card whose only summary is a placeholder classifies as `in_progress`, not `paused`.
   - `mergeSessionSummaries` with three sources.
 - `test/runtime/server/workspace-registry.test.ts`:
   - Add `loadWorkspaceSessionsById` to the `workspace-state` mock.
   - **Regression test for the bug:** the terminal manager's `listSummaries` returns a Cline summary `{ taskId: "task", agentId: "cline", state: "awaiting_review", updatedAt: 100 }`, the board has `task` in `in_progress`, and `getClineTaskSessionSummaries` returns `{ state: "running", updatedAt: 200 }`. Expected counts: `in_progress: 1, review: 0`.
   - The same setup with the Cline summary `state: "idle"`: expected `paused: 1, in_progress: 0`.
+  - A live queued running summary counts as Paused; a newer running summary with the waiting hook replaced counts as In Progress. Exercise both snapshot and counts to catch stale queue metadata.
   - A terminal-agent task whose terminal summary is newer than disk is classified from the terminal summary.
   - A just-attached terminal placeholder (`createDefaultSummary` shape, newest `updatedAt`) over an older persisted `running` summary still counts as `in_progress`.
-  - `buildWorkspaceStateSnapshot` keeps a newer disk summary over an older terminal-manager one.
-- `test/runtime/trpc/workspace-api.test.ts`: `saveState` with a browser summary (`running`, `updatedAt: 200`) and a terminal-manager summary for the same task (`awaiting_review`, `updatedAt: 100`) persists the browser's. With the timestamps reversed, it persists the terminal manager's.
+  - `buildWorkspaceStateSnapshot` keeps a newer disk summary over an older terminal-manager one; a still-newer live Cline summary wins in both snapshot and counts. A counts read for an untracked project creates no manager/service.
+- `test/integration/runtime-state-stream.integration.test.ts`: the new hub accessor sees registered service changes without an `onSummary` event, returns `[]` for an untracked/disposed workspace, and does not start services. Update hub mocks where needed.
+- `test/runtime/trpc/workspace-api.test.ts`: `saveState` with browser `running` at 200 and manager `awaiting_review` at 100 persists the browser's; reverse timestamps and the manager wins. A live Cline `idle` at 300 beats both. The request's sessions object is unchanged, and no scoped Cline service is created for this read.
+- `test/integration/workspace-state.integration.test.ts`: use isolated temporary workspace storage. Saving an older supplied summary cannot replace newer disk state; a newer supplied summary wins; absent ids preserve disk summaries; revision-conflicting saves still reject without writing. Exercise `saveWorkspaceState` directly so this test proves the locked persistence path.
+- `web-ui/src/hooks/use-workspace-sync.test.tsx` and `use-task-sessions.test.tsx`: older real state cannot regress, newer real state beats a placeholder, and incoming real summaries win equal-timestamp ties. Cover the runtime-stream merge in its integration suite as well.
 - `web-ui/src/hooks/use-project-ui-state.test.tsx`: the open project's counts reflect `paused` from local `sessions`. The other projects' server counts pass through unchanged.
 - `web-ui/src/components/project-navigation-panel.test.tsx`: a project with `paused: 2` renders a `P` pill with text `2`, title `Paused`, the `text-status-gold` class, positioned after `IP` and before `R`. `paused: 0` renders no `P` pill.
 
 Run `npm run typecheck`, `npm run web:typecheck`, `npm run test:fast`, `npm run web:test`, and `npx @biomejs/biome check` on the touched files before pushing.
 
+Also run `npx vitest run test/integration/workspace-state.integration.test.ts test/integration/runtime-state-stream.integration.test.ts`: these regression suites are outside `test:fast`. During implementation, run the affected tests first, then the required broader checks once the change is complete. Follow the repository's Biome settings; do not apply Prettier or reformat unrelated files.
+
 ## Acceptance criteria
 
 - Pausing a running Cline task in project A and switching to project B: A's row shows `P | 1` in yellow, and `IP` drops by 1.
-- Resuming that task (sending a message) turns it back into `IP` within one projects broadcast.
+- Sending a message resumes that task; while queued it remains `P`, then becomes `IP` within one projects broadcast after model capacity is granted and the waiting hook is cleared/replaced.
 - A task taken from Review back to In Progress by a follow-up message shows as `IP` in its project's pills while another project is open, including after a runtime restart.
 - Open-project and other-project counts for the same board and sessions are identical.
+- Snapshot, browser stream and save paths cannot restore an older real state or let a terminal placeholder mask real state. Verify counts after save/reload with the live service unavailable, not only through an injected live-summary mock.
 - No board column, lane, drag rule or card visual changes.
+
+## Deployment and implementation handoff
+
+No new environment variables or configuration. Rebuild both runtime and web UI together (`npm run build`) and restart the normal Kanban service; reload existing browser tabs so the counts contract and UI match. No device changes are part of this implementation PR.
+
+The implementation PR description must list the behavior changes, validation results, and manual acceptance steps above, with these deployment actions prominently stated. Mark the PR ready for review after checks pass. If a check is blocked or fails, report the exact result instead of claiming it passed. Keep this plan as the source of scope; do not turn the numbered implementation sections into additional PRs.
 
 ## Out of scope
 
