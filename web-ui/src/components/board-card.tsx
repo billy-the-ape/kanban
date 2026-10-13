@@ -306,7 +306,6 @@ export function BoardCard({
 	/** UPD-1.3: live initial-start preparation stage while a start is in flight. */
 	initialStartStage?: RuntimeTaskInitialStartStage;
 }): React.ReactElement {
-	console.log({ state: sessionSummary?.state, card, sessionSummary });
 	const [isHovered, setIsHovered] = useState(false);
 	const [isEditingTitle, setIsEditingTitle] = useState(false);
 	const [draftTitle, setDraftTitle] = useState(card.title);
