@@ -224,7 +224,14 @@ export function ProjectNavigationPanel({
 					borderRight: "1px solid var(--color-divider)",
 				}}
 			>
-				<button onClick={() => setCollapsed(false)} type="button">
+				<button
+					onClick={() => setCollapsed(false)}
+					type="button"
+					className={cn(
+						"rounded-md text-xs shrink-0 border-0 cursor-pointer flex items-center justify-center bg-transparent text-text-tertiary hover:text-text-secondary hover:bg-surface-2",
+						isMobile ? "w-11 h-11" : "w-8 h-8",
+					)}
+				>
 					<ArrowRightFromLine size={12} />
 				</button>
 				{!isMobile && (
