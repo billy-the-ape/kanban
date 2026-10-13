@@ -1,6 +1,10 @@
 import { getPullRequestIdentityKey, parsePullRequestUrl } from "@runtime-pull-request-links";
 
-import type { RuntimeTaskPullRequest, RuntimeTaskPullRequestRefreshReason } from "@/runtime/types";
+import type {
+	RuntimeTaskPullRequest,
+	RuntimeTaskPullRequestRefreshOutcome,
+	RuntimeTaskPullRequestRefreshReason,
+} from "@/runtime/types";
 
 const MINUTE_MS = 60 * 1000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -51,6 +55,23 @@ export function getPullRequestRefreshMessage(reason: RuntimeTaskPullRequestRefre
 		default:
 			return null;
 	}
+}
+
+/**
+ * PRLINK-9: user-facing messages for a linked-metadata refresh result.
+ * Reports how many links changed and, when anything could not be refreshed,
+ * how many failed (unsupported providers, provider errors, or deadline).
+ */
+export function getLinkedRefreshMessages(updated: number, outcomes: RuntimeTaskPullRequestRefreshOutcome[]): string[] {
+	const messages: string[] = [];
+	if (updated > 0) {
+		messages.push(`Refreshed ${updated} pull request${updated === 1 ? "" : "s"}.`);
+	}
+	const unresolved = outcomes.filter((outcome) => outcome.outcome === "failed" || outcome.outcome === "unsupported");
+	if (unresolved.length > 0) {
+		messages.push(`${unresolved.length} pull request${unresolved.length === 1 ? "" : "s"} could not be refreshed.`);
+	}
+	return messages;
 }
 
 /**

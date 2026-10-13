@@ -165,6 +165,17 @@ export interface CoordinatorState {
 	}>;
 }
 
+/**
+ * PRLINK-9: result of a one-shot display-only metadata refresh.
+ */
+export interface OneShotMetadataRefreshResult {
+	outcome: "refreshed" | "failed";
+	checkedAt: number | null;
+	metadata: GitHubPrMetadataSnapshot | null;
+	/** Sanitized failure category; never raw provider output. */
+	error: string | null;
+}
+
 export interface CreatePrTrackingCoordinatorDependencies {
 	adapter?: GitHubGhAdapter;
 	/**
@@ -215,6 +226,7 @@ export class PrTrackingCoordinator {
 	private readonly subscriptions = new Map<string, TrackedSubscription>();
 	private readonly polls = new Map<string, PrPollState>();
 	private readonly scopes = new Map<string, AccessScope>();
+	private oneShotInFlight = new Map<string, Promise<OneShotMetadataRefreshResult>>();
 	private scopeCache: AccessScope | null = null;
 	private scopeFailure: GhAdapterFailure | null = null;
 	private schedulerLockRelease: (() => Promise<void>) | null = null;
@@ -1531,6 +1543,155 @@ export class PrTrackingCoordinator {
 			state.pollInFlight = null;
 		}
 		return { coalesced: false };
+	}
+
+	/**
+	 * PRLINK-9: one-shot, display-only metadata refresh for a single canonical
+	 * PR. Works without an active task subscription and creates or resumes
+	 * nothing:
+	 *
+	 * - Resolves the runtime's ACTIVE access scope (forced fresh probe, so a
+	 *   re-login or account switch is detected).
+	 * - Coalesces with the existing in-flight read for that (PR, scope): a
+	 *   scheduled poll in flight or a concurrent one-shot.
+	 * - Honors an active Retry-After rate-limit deadline (reports it; never
+	 *   waits and never retries).
+	 * - Performs exactly ONE metadata read: no feedback reads, no consumer
+	 *   dispatch, no terminal stop/resume, no poll re-arm, no scheduler lock.
+	 * - A `not_modified` (304-equivalent) read advances `checkedAt` using
+	 *   validated cached data of the SAME access scope; it never fabricates a
+	 *   snapshot when none exists.
+	 * - Persists the access-scoped metadata snapshot, creating the record when
+	 *   the PR has never been tracked.
+	 */
+	async refreshPrMetadataOnce(canonicalPrKey: string): Promise<OneShotMetadataRefreshResult> {
+		if (!isTrackingSupportedPr(canonicalPrKey)) {
+			return { outcome: "failed", checkedAt: null, metadata: null, error: "unsupported_host" };
+		}
+		const parsed = parseCanonicalPrKey(canonicalPrKey);
+		if (!parsed) {
+			return { outcome: "failed", checkedAt: null, metadata: null, error: "malformed_key" };
+		}
+		const scopeResult = await this.ensureScope(undefined, true);
+		if (!scopeResult.ok) {
+			return {
+				outcome: "failed",
+				checkedAt: null,
+				metadata: null,
+				error: scopeResult.blocker === "auth" ? "auth" : "scope",
+			};
+		}
+		const scope = scopeResult.scope;
+		const key = this.pollKey(canonicalPrKey, scope.accessScopeId);
+		const state = this.polls.get(key);
+		// Coalesce with a scheduled poll in flight for this (PR, scope).
+		if (state?.pollInFlight) {
+			await state.pollInFlight;
+			const metadata = state ? this.currentMetadataFor(state, scope) : null;
+			return metadata
+				? { outcome: "refreshed", checkedAt: metadata.checkedAt, metadata, error: null }
+				: { outcome: "failed", checkedAt: null, metadata: null, error: "no_data" };
+		}
+		// Coalesce with a concurrent one-shot for the same (PR, scope).
+		const inflight = this.oneShotInFlight.get(key);
+		if (inflight) {
+			return inflight;
+		}
+		// Honor an active rate-limit deadline: report, never wait or retry.
+		const now = this.now();
+		if (state && state.rateLimitDeadline !== null && state.rateLimitDeadline > now) {
+			return {
+				outcome: "failed",
+				checkedAt: state.snapshotCheckedAt,
+				metadata: state.metadata,
+				error: "rate_limited",
+			};
+		}
+		const job = this.performOneShotMetadataRead(canonicalPrKey, parsed, scope, state);
+		this.oneShotInFlight.set(key, job);
+		try {
+			return await job;
+		} finally {
+			this.oneShotInFlight.delete(key);
+		}
+	}
+
+	/** The poll state's metadata only when it belongs to the current scope. */
+	private currentMetadataFor(state: PrPollState, scope: AccessScope): GitHubPrMetadataSnapshot | null {
+		const metadata = state.metadata;
+		return metadata && metadata.accessScopeId === scope.accessScopeId ? metadata : null;
+	}
+
+	/** The durable metadata snapshot of the current access scope, if any. */
+	private async loadStoredMetadataSnapshot(
+		canonicalPrKey: string,
+		scope: AccessScope,
+	): Promise<GitHubPrMetadataSnapshot | null> {
+		const recordResult = await this.store.loadRecord(canonicalPrKey);
+		if (!recordResult.ok) {
+			return null;
+		}
+		return recordResult.record.snapshots[scope.accessScopeId] ?? null;
+	}
+
+	/** The single metadata read plus snapshot persistence for a one-shot refresh. */
+	private async performOneShotMetadataRead(
+		canonicalPrKey: string,
+		parsed: ParsedCanonicalPrKey,
+		scope: AccessScope,
+		state: PrPollState | undefined,
+	): Promise<OneShotMetadataRefreshResult> {
+		const now = this.now();
+		const result = await this.adapter.readPrMetadata(parsed, scope, { fresh: false });
+		if (result.kind === "failed") {
+			return {
+				outcome: "failed",
+				checkedAt: state?.snapshotCheckedAt ?? null,
+				metadata: state?.metadata ?? null,
+				error: result.failure.category,
+			};
+		}
+		let metadata: GitHubPrMetadataSnapshot;
+		let nodeId: string | null = null;
+		if (result.kind === "ok") {
+			metadata = result.metadata;
+			nodeId = result.nodeId;
+		} else {
+			// not_modified: advance `checkedAt` only from validated cached data of
+			// the SAME access scope — never fabricate a snapshot.
+			const cached =
+				state?.metadata && state.metadata.accessScopeId === scope.accessScopeId
+					? state.metadata
+					: await this.loadStoredMetadataSnapshot(canonicalPrKey, scope);
+			if (!cached) {
+				return { outcome: "failed", checkedAt: null, metadata: null, error: "no_cached_snapshot" };
+			}
+			metadata = { ...cached, checkedAt: now };
+		}
+		if (state) {
+			state.metadata = metadata;
+			state.snapshotCheckedAt = metadata.checkedAt;
+			if (nodeId) {
+				state.nodeId = nodeId;
+			}
+		}
+		// Persist the access-scoped snapshot; create the record when the PR has
+		// never been tracked (display-only refresh must not depend on it).
+		const recordResult = await this.store.loadRecord(canonicalPrKey);
+		if (!recordResult.ok && recordResult.reason === "not_found") {
+			await this.store.createRecord({
+				canonicalPrKey,
+				provider: "github",
+				host: parsed.host,
+				repository: parsed.repository,
+				number: parsed.number,
+			});
+		}
+		const persisted = await this.store.setMetadataSnapshot(canonicalPrKey, metadata);
+		if (!persisted.ok) {
+			this.warn(`One-shot metadata snapshot persistence failed for ${canonicalPrKey}: ${persisted.reason}`);
+		}
+		return { outcome: "refreshed", checkedAt: metadata.checkedAt, metadata, error: null };
 	}
 
 	/**

@@ -1220,4 +1220,58 @@ describe("pr-tracking-coordinator", () => {
 		const sub = coordinator.getState().subscriptions.find((item) => item.workspaceId === "ws-1");
 		expect(sub?.accessScopeId).toBe("scope-B");
 	});
+
+	it("PRLINK-9: one-shot metadata refresh works with no subscription and creates none", async () => {
+		const harness = makeCoordinator();
+		const coordinator = track(harness.coordinator);
+
+		// No subscription is registered at all: a display-only refresh of a
+		// done task must not create or resume anything.
+		expect(coordinator.getState().subscriptions).toHaveLength(0);
+
+		const result = await coordinator.refreshPrMetadataOnce(PR49);
+		expect(result.outcome).toBe("refreshed");
+		expect(result.error).toBeNull();
+		expect(result.metadata?.state).toBe("open");
+		expect(result.checkedAt).not.toBeNull();
+
+		// Exactly ONE metadata read: no feedback reads, no consumer dispatch.
+		expect(harness.fake.metadataCalls()).toBe(1);
+		expect(harness.fake.metadataFreshFlags()).toEqual([false]);
+		expect(harness.fake.listCalls()).toEqual([]);
+		expect(harness.fake.threadCalls()).toBe(0);
+
+		// Still no subscription was created and no poll was armed.
+		expect(coordinator.getState().subscriptions).toHaveLength(0);
+		expect(coordinator.getState().polls).toHaveLength(0);
+
+		// The access-scoped snapshot was persisted, creating the record for a
+		// PR that was never tracked.
+		const record = await harness.store.loadRecord(PR49);
+		expect(record.ok).toBe(true);
+		if (record.ok && result.checkedAt !== null) {
+			expect(record.record.snapshots["scope-A"]?.checkedAt).toBe(result.checkedAt);
+		}
+	});
+
+	it("PRLINK-9: one-shot not_modified without any cached snapshot never fabricates one", async () => {
+		const harness = makeCoordinator({ metadata: () => ({ kind: "not_modified" }) });
+		const coordinator = track(harness.coordinator);
+
+		const result = await coordinator.refreshPrMetadataOnce(PR49);
+		expect(result.outcome).toBe("failed");
+		expect(result.error).toBe("no_cached_snapshot");
+		expect(result.metadata).toBeNull();
+	});
+
+	it("PRLINK-9: one-shot unsupported host fails without any provider query", async () => {
+		const harness = makeCoordinator();
+		const coordinator = track(harness.coordinator);
+
+		const result = await coordinator.refreshPrMetadataOnce("gitlab|gitlab.com|group/project|7");
+		expect(result.outcome).toBe("failed");
+		expect(result.error).toBe("unsupported_host");
+		expect(harness.fake.scopeCalls()).toBe(0);
+		expect(harness.fake.metadataCalls()).toBe(0);
+	});
 });
