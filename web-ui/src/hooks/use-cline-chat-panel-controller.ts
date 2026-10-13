@@ -1,17 +1,34 @@
 // Builds the view model for the native Cline chat panel.
 // Keep panel-specific UI state here so the panel component can stay mostly
 // declarative and shared across detail and sidebar surfaces.
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import type { ClineChatActionResult } from "@/hooks/use-cline-chat-runtime-actions";
 import { type ClineChatMessage, useClineChatSession } from "@/hooks/use-cline-chat-session";
-import type { RuntimeTaskImage, RuntimeTaskSessionMode, RuntimeTaskSessionSummary } from "@/runtime/types";
+import type {
+	RuntimeTaskChatPrLinking,
+	RuntimeTaskImage,
+	RuntimeTaskSessionMode,
+	RuntimeTaskSessionSummary,
+} from "@/runtime/types";
 import { useTaskWorkspaceSnapshotValue } from "@/stores/workspace-metadata-store";
+
+/**
+ * PRLINK-8: the PR-linking notice for the latest completed chat send. Local
+ * UI state only: it may disappear on reload and is never persisted or sent
+ * to the model.
+ */
+export interface ClineChatPrLinkingNotice {
+	taskId: string;
+	workspaceId: string | null;
+	linking: RuntimeTaskChatPrLinking;
+}
 
 interface UseClineChatPanelControllerInput {
 	taskId: string;
 	summary: RuntimeTaskSessionSummary | null;
 	taskColumnId?: string;
+	workspaceId?: string | null;
 	onSendMessage?: (
 		taskId: string,
 		text: string,
@@ -42,6 +59,8 @@ interface UseClineChatPanelControllerResult {
 	showAgentProgressIndicator: boolean;
 	showActionFooter: boolean;
 	showCancelAutomaticAction: boolean;
+	prLinkingNotice: ClineChatPrLinkingNotice | null;
+	dismissPrLinkingNotice: () => void;
 	handleSendText: (text: string, mode?: RuntimeTaskSessionMode, images?: RuntimeTaskImage[]) => Promise<boolean>;
 	handleSendDraft: (mode?: RuntimeTaskSessionMode, images?: RuntimeTaskImage[]) => Promise<boolean>;
 	handleCancelTurn: () => void;
@@ -62,12 +81,38 @@ export function useClineChatPanelController({
 	onCancelAutomaticAction,
 	cancelAutomaticActionLabel,
 	showMoveToTrash = false,
+	workspaceId = null,
 }: UseClineChatPanelControllerInput): UseClineChatPanelControllerResult {
 	const [draft, setDraft] = useState("");
+	const [prLinkingNotice, setPrLinkingNotice] = useState<ClineChatPrLinkingNotice | null>(null);
 	const reviewWorkspaceSnapshot = useTaskWorkspaceSnapshotValue(taskId);
+	// PRLINK-8: capture the PR-linking outcome of the latest completed send.
+	// Sends are serialized by isSending, so a completed send always replaces
+	// the notice (with a new one or null) and never hides a pending one.
+	const trackPrLinkingSendMessage = useCallback(
+		async (
+			sendTaskId: string,
+			text: string,
+			options?: { mode?: RuntimeTaskSessionMode; images?: RuntimeTaskImage[] },
+		) => {
+			const result = (await onSendMessage?.(sendTaskId, text, options)) ?? {
+				ok: false,
+				message: "No send handler.",
+			};
+			if (result.ok) {
+				setPrLinkingNotice(
+					result.pullRequestLinking
+						? { taskId: sendTaskId, workspaceId, linking: result.pullRequestLinking }
+						: null,
+				);
+			}
+			return result;
+		},
+		[onSendMessage, workspaceId],
+	);
 	const { messages, isSending, isCanceling, error, sendMessage, cancelTurn } = useClineChatSession({
 		taskId,
-		onSendMessage,
+		onSendMessage: trackPrLinkingSendMessage,
 		onCancelTurn,
 		onLoadMessages,
 		incomingMessages,
@@ -99,6 +144,16 @@ export function useClineChatPanelController({
 		[sendMessage],
 	);
 
+	// Clear the notice on task/workspace change so a late response from one
+	// scope can never render under another.
+	useEffect(() => {
+		setPrLinkingNotice(null);
+	}, [taskId, workspaceId]);
+
+	const dismissPrLinkingNotice = useCallback(() => {
+		setPrLinkingNotice(null);
+	}, []);
+
 	const handleSendDraft = useCallback(
 		async (mode?: RuntimeTaskSessionMode, images?: RuntimeTaskImage[]): Promise<boolean> => {
 			const sent = await handleSendText(draft, mode, images);
@@ -127,6 +182,8 @@ export function useClineChatPanelController({
 		showAgentProgressIndicator,
 		showActionFooter,
 		showCancelAutomaticAction,
+		prLinkingNotice,
+		dismissPrLinkingNotice,
 		handleSendText,
 		handleSendDraft,
 		handleCancelTurn,

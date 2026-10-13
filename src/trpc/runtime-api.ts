@@ -27,6 +27,7 @@ import type {
 	RuntimeGitDeliveryReceipt,
 	RuntimePrInstalledConsumer,
 	RuntimeRunUpdateResponse,
+	RuntimeTaskChatPrLinking,
 	RuntimeTaskChatSendRequest,
 	RuntimeTaskChatSendResponse,
 	RuntimeTaskDeliveryInfoResponse,
@@ -101,6 +102,7 @@ import { buildRuntimeConfigResponse, resolveAgentCommand } from "../terminal/age
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { createVerificationRunner } from "../verification/verification-service";
 import { evaluateDependentsUnlock, getGitDeliveryService, readTaskDeliveryReceipt } from "../workspace/git-delivery";
+import { resolveTaskChatPrLinking } from "../workspace/task-chat-pr-linking";
 import { getTaskInitialStartStatus as readTaskInitialStartStatus } from "../workspace/task-initial-start";
 import { readTaskPreservationRecord } from "../workspace/task-preservation";
 import { resetUnstartedQueuedWorktree } from "../workspace/task-queued-reset";
@@ -166,6 +168,17 @@ export function createTaskChatMessageSender(deps: {
 	getScopedClineTaskSessionService: (scope: RuntimeTrpcWorkspaceScope) => Promise<ClineTaskSessionService>;
 	broadcastTaskChatCleared?: (workspaceId: string, taskId: string) => void;
 	resolveClineLaunchConfig: () => Promise<ResolvedClineLaunchConfig>;
+	/**
+	 * PRLINK-8: optional post-send classification for native chat sends only.
+	 * It runs after the send (including the rebind/retry path) succeeded;
+	 * rejected sends and clear commands return before it. The automation
+	 * service sender deliberately does not wire it, so auto-generated
+	 * instructions never feed PR linking. Must never throw.
+	 */
+	resolvePostSendPrLinking?: (
+		scope: RuntimeTrpcWorkspaceScope,
+		body: RuntimeTaskChatSendRequest,
+	) => Promise<RuntimeTaskChatPrLinking | undefined>;
 }): (scope: RuntimeTrpcWorkspaceScope, body: RuntimeTaskChatSendRequest) => Promise<RuntimeTaskChatSendResponse> {
 	return async (workspaceScope, body) => {
 		try {
@@ -226,10 +239,12 @@ export function createTaskChatMessageSender(deps: {
 				}
 			}
 			const latestMessage = clineTaskSessionService.listMessages(body.taskId).at(-1) ?? null;
+			const pullRequestLinking = await deps.resolvePostSendPrLinking?.(workspaceScope, body);
 			return {
 				ok: true,
 				summary,
 				message: latestMessage,
+				...(pullRequestLinking ? { pullRequestLinking } : {}),
 			};
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -281,6 +296,21 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		getScopedClineTaskSessionService: deps.getScopedClineTaskSessionService,
 		broadcastTaskChatCleared: deps.broadcastTaskChatCleared,
 		resolveClineLaunchConfig: () => clineProviderService.resolveLaunchConfig(),
+		resolvePostSendPrLinking: async (workspaceScope, body) => {
+			// PRLINK-8: home-agent sessions never participate.
+			// resolveTaskChatPrLinking never throws.
+			if (isHomeAgentSessionId(body.taskId)) {
+				return undefined;
+			}
+			return resolveTaskChatPrLinking({
+				workspaceId: workspaceScope.workspaceId,
+				workspacePath: workspaceScope.workspacePath,
+				taskId: body.taskId,
+				text: body.text,
+				hasImages: Boolean(body.images && body.images.length > 0),
+				broadcast: deps.broadcastRuntimeWorkspaceStateUpdated,
+			});
+		},
 	});
 
 	// B-2.9: the effective context window (budget override → provider-settings

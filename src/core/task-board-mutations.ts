@@ -153,7 +153,7 @@ function hasDependencyPair(board: RuntimeBoardData, backlogTaskId: string, linke
 	return false;
 }
 
-function findTaskLocation(
+export function findTaskLocation(
 	board: RuntimeBoardData,
 	taskId: string,
 ): {

@@ -1,6 +1,16 @@
 import * as Collapsible from "@radix-ui/react-collapsible";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
-import { ChevronDown, ChevronUp, Ellipsis, ExternalLink, Info, Lightbulb, Plus, X } from "lucide-react";
+import {
+	ArrowRightFromLine,
+	ChevronDown,
+	ChevronUp,
+	Ellipsis,
+	ExternalLink,
+	Info,
+	Lightbulb,
+	Plus,
+	X,
+} from "lucide-react";
 import { type MouseEvent as ReactMouseEvent, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import { canShowFeaturebaseFeedbackButton } from "@/components/featurebase-feedback-button";
 import { Button } from "@/components/ui/button";
@@ -214,6 +224,16 @@ export function ProjectNavigationPanel({
 					borderRight: "1px solid var(--color-divider)",
 				}}
 			>
+				<button
+					onClick={() => setCollapsed(false)}
+					type="button"
+					className={cn(
+						"rounded-md text-xs shrink-0 border-0 cursor-pointer flex items-center justify-center bg-transparent text-text-tertiary hover:text-text-secondary hover:bg-surface-2",
+						isMobile ? "w-11 h-11" : "w-8 h-8",
+					)}
+				>
+					<ArrowRightFromLine size={12} />
+				</button>
 				{!isMobile && (
 					<div
 						role="separator"
@@ -232,9 +252,7 @@ export function ProjectNavigationPanel({
 							type="button"
 							title={project.name}
 							onClick={() => {
-								if (isMobile) {
-									setCollapsed(false);
-								}
+								setCollapsed(false);
 								onSelectProject(project.id);
 							}}
 							className={cn(

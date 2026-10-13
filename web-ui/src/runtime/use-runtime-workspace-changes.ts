@@ -38,17 +38,18 @@ export function useRuntimeWorkspaceChanges(
 			mode,
 		});
 	}, [baseRef, mode, normalizedViewKey, taskId, workspaceId]);
-	const changesQuery = useTrpcQuery<RuntimeWorkspaceChangesResponse>({
+	const { refetch, setData, data, isError } = useTrpcQuery<RuntimeWorkspaceChangesResponse>({
 		enabled: hasWorkspaceScope,
 		queryFn,
+		noLoading: true,
 	});
 
 	const refresh = useCallback(async () => {
 		if (!hasWorkspaceScope) {
 			return;
 		}
-		await changesQuery.refetch();
-	}, [changesQuery.refetch, hasWorkspaceScope]);
+		await refetch();
+	}, [refetch, hasWorkspaceScope]);
 	const previousStateVersionRef = useRef(stateVersion);
 
 	useEffect(() => {
@@ -57,9 +58,9 @@ export function useRuntimeWorkspaceChanges(
 		}
 		previousRequestKeyRef.current = requestKey;
 		if (clearOnViewTransition) {
-			changesQuery.setData(null);
+			setData(null);
 		}
-	}, [changesQuery.setData, clearOnViewTransition, isRequestTransitioning, requestKey]);
+	}, [setData, clearOnViewTransition, isRequestTransitioning, requestKey]);
 
 	useEffect(() => {
 		if (!hasWorkspaceScope) {
@@ -71,20 +72,20 @@ export function useRuntimeWorkspaceChanges(
 			return;
 		}
 		previousStateVersionRef.current = stateVersion;
-		void changesQuery.refetch();
-	}, [changesQuery.refetch, hasWorkspaceScope, requestKey, stateVersion]);
+		void refetch();
+	}, [refetch, hasWorkspaceScope, requestKey, stateVersion]);
 
 	useEffect(() => {
 		if (!hasWorkspaceScope || pollIntervalMs == null) {
 			return;
 		}
 		const interval = window.setInterval(() => {
-			void changesQuery.refetch();
+			void refetch();
 		}, pollIntervalMs);
 		return () => {
 			window.clearInterval(interval);
 		};
-	}, [changesQuery.refetch, hasWorkspaceScope, pollIntervalMs]);
+	}, [refetch, hasWorkspaceScope, pollIntervalMs]);
 
 	if (!taskId) {
 		return {
@@ -105,9 +106,9 @@ export function useRuntimeWorkspaceChanges(
 	}
 
 	const shouldHideDuringTransition = clearOnViewTransition && isRequestTransitioning;
-	const visibleChanges = shouldHideDuringTransition ? null : changesQuery.data;
-	const visibleIsLoading = shouldHideDuringTransition || changesQuery.isLoading;
-	const visibleIsRuntimeAvailable = shouldHideDuringTransition ? true : !changesQuery.isError;
+	const visibleChanges = shouldHideDuringTransition ? null : data;
+	const visibleIsLoading = shouldHideDuringTransition;
+	const visibleIsRuntimeAvailable = shouldHideDuringTransition ? true : !isError;
 
 	return {
 		changes: visibleChanges,

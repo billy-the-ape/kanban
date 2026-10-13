@@ -117,7 +117,7 @@ describe("recordTaskPullRequests", () => {
 				links: [link],
 				source: "agent_tool",
 			});
-			expect(result).toEqual({ recorded: true, changed: true });
+			expect(result).toEqual({ recorded: true, changed: true, outcome: "recorded" });
 
 			const recorded = await loadWorkspaceState(workspacePath);
 			// +1 for the initial saveWorkspaceState, +1 for the record.
@@ -158,7 +158,7 @@ describe("recordTaskPullRequests", () => {
 				links: [link],
 				source: "agent_tool",
 			});
-			expect(first).toEqual({ recorded: true, changed: true });
+			expect(first).toEqual({ recorded: true, changed: true, outcome: "recorded" });
 
 			const second = await recordTaskPullRequests({
 				workspacePath,
@@ -166,7 +166,7 @@ describe("recordTaskPullRequests", () => {
 				links: [link],
 				source: "agent_tool",
 			});
-			expect(second).toEqual({ recorded: false, changed: false });
+			expect(second).toEqual({ recorded: false, changed: false, outcome: "duplicate" });
 
 			const recorded = await loadWorkspaceState(workspacePath);
 			// The repeated no-op must not bump the revision again.
@@ -197,7 +197,7 @@ describe("recordTaskPullRequests", () => {
 				links: [link],
 				source: "agent_tool",
 			});
-			expect(unknownTask).toEqual({ recorded: false, changed: false });
+			expect(unknownTask).toEqual({ recorded: false, changed: false, outcome: "no_task" });
 
 			// A directory with no git repository is an unknown workspace context.
 			const unknownWorkspace = await recordTaskPullRequests({
@@ -206,7 +206,7 @@ describe("recordTaskPullRequests", () => {
 				links: [link],
 				source: "agent_tool",
 			});
-			expect(unknownWorkspace).toEqual({ recorded: false, changed: false });
+			expect(unknownWorkspace).toEqual({ recorded: false, changed: false, outcome: "error" });
 
 			const recorded = await loadWorkspaceState(workspacePath);
 			expect(recorded.revision).toBe(initial.revision + 1);
@@ -238,13 +238,55 @@ describe("recordTaskPullRequests", () => {
 				links: [first, second, duplicate],
 				source: "agent_tool",
 			});
-			expect(result).toEqual({ recorded: true, changed: true });
+			expect(result).toEqual({ recorded: true, changed: true, outcome: "recorded" });
 
 			const recorded = await loadWorkspaceState(workspacePath);
 			expect(findCardPullRequests(recorded.board, "task-1")?.map((pullRequest) => pullRequest.url)).toEqual([
 				"https://github.com/owner/repo/pull/12",
 				"https://gitlab.com/group/subgroup/repo/-/merge_requests/7",
 			]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("reports a throttled duplicate observation as duplicate with a write, not recorded", async () => {
+		const { path: sandboxRoot, cleanup } = createTempDir("kanban-task-pr-ws-");
+		try {
+			const workspacePath = join(sandboxRoot, "project-f");
+			initWorkspace(workspacePath);
+			const link = parseLink("https://github.com/owner/repo/pull/12");
+			const now = Date.now();
+
+			const initial = await loadWorkspaceState(workspacePath);
+			await saveWorkspaceState(workspacePath, {
+				board: createBoard("task-1"),
+				sessions: {},
+				expectedRevision: initial.revision,
+			});
+
+			const first = await recordTaskPullRequests({
+				workspacePath,
+				taskId: "task-1",
+				links: [link],
+				source: "agent_tool",
+				now,
+			});
+			expect(first).toEqual({ recorded: true, changed: true, outcome: "recorded" });
+
+			// Past the 10-minute lastSeenAt throttle: the observation advances
+			// (a write happens) but the identity was already linked.
+			const throttled = await recordTaskPullRequests({
+				workspacePath,
+				taskId: "task-1",
+				links: [link],
+				source: "agent_tool",
+				now: now + 11 * 60 * 1000,
+			});
+			expect(throttled).toEqual({ recorded: false, changed: true, outcome: "duplicate" });
+
+			const recorded = await loadWorkspaceState(workspacePath);
+			expect(findCardPullRequests(recorded.board, "task-1")).toHaveLength(1);
 		} finally {
 			cleanup();
 		}
@@ -268,7 +310,7 @@ describe("recordTaskPullRequests", () => {
 				links: [],
 				source: "agent_tool",
 			});
-			expect(result).toEqual({ recorded: false, changed: false });
+			expect(result).toEqual({ recorded: false, changed: false, outcome: null });
 			expect((await loadWorkspaceState(workspacePath)).revision).toBe(initial.revision + 1);
 		} finally {
 			cleanup();
@@ -319,7 +361,7 @@ it("records against the repo root without phantom entries for a linked worktree 
 			links: [link],
 			source: "agent_tool",
 		});
-		expect(fromWorktree).toEqual({ recorded: false, changed: false });
+		expect(fromWorktree).toEqual({ recorded: false, changed: false, outcome: "error" });
 		expect(await listWorkspaceIndexEntries()).toEqual([{ workspaceId: expect.any(String), repoPath }]);
 
 		// Recording against the repo root reaches the card on the main
@@ -330,7 +372,7 @@ it("records against the repo root without phantom entries for a linked worktree 
 			links: [link],
 			source: "agent_tool",
 		});
-		expect(fromRepo).toEqual({ recorded: true, changed: true });
+		expect(fromRepo).toEqual({ recorded: true, changed: true, outcome: "recorded" });
 		expect(await listWorkspaceIndexEntries()).toEqual([{ workspaceId: expect.any(String), repoPath }]);
 		const recorded = await loadWorkspaceState(repoPath);
 		expect(findCardPullRequests(recorded.board, "task-1")).toHaveLength(1);

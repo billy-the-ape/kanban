@@ -3,10 +3,32 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CardDetailView } from "@/components/card-detail-view";
-import type { RuntimeTaskSessionSummary } from "@/runtime/types";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import type { RuntimeTaskPullRequest, RuntimeTaskSessionSummary } from "@/runtime/types";
 import { LocalStorageKey } from "@/storage/local-storage-store";
 import { TERMINAL_THEME_COLORS } from "@/terminal/theme-colors";
 import type { BoardCard, BoardColumn, CardSelection } from "@/types";
+
+const trpcClientMocks = vi.hoisted(() => ({
+	addTaskPullRequest: vi.fn(),
+	removeTaskPullRequest: vi.fn(),
+	refreshTaskPullRequests: vi.fn(),
+}));
+
+vi.mock("@/runtime/trpc-client", () => ({
+	getRuntimeTrpcClient: () => ({
+		workspace: {
+			addTaskPullRequest: { mutate: trpcClientMocks.addTaskPullRequest },
+			removeTaskPullRequest: { mutate: trpcClientMocks.removeTaskPullRequest },
+			refreshTaskPullRequests: { mutate: trpcClientMocks.refreshTaskPullRequests },
+		},
+	}),
+}));
+
+vi.mock("@/components/app-toaster", () => ({
+	showAppToast: vi.fn(),
+	notifyError: vi.fn(),
+}));
 
 const mockUseRuntimeWorkspaceChanges = vi.fn();
 const {
@@ -27,8 +49,11 @@ vi.mock("react-hotkeys-hook", () => ({
 	useHotkeys: () => {},
 }));
 
+// PRLINK-7: mutable so mobile-specific tests can enable the mobile breakpoint.
+const mockIsMobile = vi.hoisted(() => ({ value: false }));
+
 vi.mock("@/hooks/use-is-mobile", () => ({
-	useIsMobile: () => false,
+	useIsMobile: () => mockIsMobile.value,
 }));
 
 vi.mock("@/components/detail-panels/agent-terminal-panel", () => ({
@@ -174,6 +199,10 @@ describe("CardDetailView", () => {
 
 	beforeEach(() => {
 		window.localStorage.clear();
+		mockIsMobile.value = false;
+		trpcClientMocks.addTaskPullRequest.mockReset();
+		trpcClientMocks.removeTaskPullRequest.mockReset();
+		trpcClientMocks.refreshTaskPullRequests.mockReset();
 		previousActEnvironment = (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
 			.IS_REACT_ACT_ENVIRONMENT;
 		(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -823,5 +852,243 @@ describe("CardDetailView", () => {
 		});
 
 		expect(requireDetailDiffFileTreePanel(container).style.flex).toBe("0 0 18%");
+	});
+
+	// ---- PRLINK-7: mobile PR anchor + manager in the detail tab bar ----
+
+	function createTaskPullRequest(number: number, isPrimary = false): RuntimeTaskPullRequest {
+		return {
+			provider: "github",
+			host: "github.com",
+			repository: "cline/kanban",
+			number,
+			url: `https://github.com/cline/kanban/pull/${number}`,
+			source: "manual",
+			createdAt: 1,
+			isPrimary,
+		};
+	}
+
+	function renderMobileDetail(selection: CardSelection, workspaceId: string | null = "workspace-1"): void {
+		mockIsMobile.value = true;
+		root.render(
+			<TooltipProvider>
+				<CardDetailView
+					selection={selection}
+					currentProjectId={workspaceId}
+					sessionSummary={null}
+					taskSessions={{}}
+					onSessionSummary={() => {}}
+					onCardSelect={() => {}}
+					onTaskDragEnd={() => {}}
+					onMoveToTrash={() => {}}
+					onComplete={() => {}}
+					bottomTerminalOpen={false}
+					bottomTerminalTaskId={null}
+					bottomTerminalSummary={null}
+					onBottomTerminalClose={() => {}}
+				/>
+			</TooltipProvider>,
+		);
+	}
+
+	async function clickElement(element: Element): Promise<void> {
+		await act(async () => {
+			element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+			element.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+		});
+	}
+
+	it("shows a Link PR trigger on mobile when the task has no linked pull requests", async () => {
+		const selection = createSelection();
+
+		await act(async () => {
+			renderMobileDetail(selection);
+		});
+
+		const linkPrButton = container.querySelector("[data-testid='mobile-task-pr-link-pr-button']");
+		expect(linkPrButton).toBeInstanceOf(HTMLButtonElement);
+		expect(container.querySelector("a[data-testid='mobile-task-pr-primary-anchor']")).toBeNull();
+		expect(container.querySelector("[data-testid='mobile-task-pr-manage-button']")).toBeNull();
+
+		if (!(linkPrButton instanceof Element)) {
+			throw new Error("Expected a Link PR button.");
+		}
+		await clickElement(linkPrButton);
+
+		expect(document.body.querySelector("[data-testid='task-pr-url-input']")).not.toBeNull();
+	});
+
+	it("renders the primary anchor and the manage button for a linked task on mobile", async () => {
+		const selection = createSelection();
+		selection.card.pullRequests = [createTaskPullRequest(12, true), createTaskPullRequest(99)];
+
+		await act(async () => {
+			renderMobileDetail(selection);
+		});
+
+		const anchor = container.querySelector(
+			"a[data-testid='mobile-task-pr-primary-anchor']",
+		) as HTMLAnchorElement | null;
+		expect(anchor?.href).toBe("https://github.com/cline/kanban/pull/12");
+		expect(anchor?.getAttribute("aria-label")).toContain("PR #12");
+		expect(anchor?.className).toContain("min-h-11");
+
+		const manageButton = container.querySelector("[data-testid='mobile-task-pr-manage-button']");
+		expect(manageButton).toBeInstanceOf(HTMLButtonElement);
+
+		if (!(manageButton instanceof Element)) {
+			throw new Error("Expected a manage button.");
+		}
+		await clickElement(manageButton);
+
+		expect(document.body.querySelector("[data-testid='task-pr-url-input']")).not.toBeNull();
+		expect(document.body.querySelector("[data-testid='task-pr-row-meta-12']")).not.toBeNull();
+		expect(document.body.querySelector("[data-testid='task-pr-row-meta-99']")).not.toBeNull();
+		const removeButton = document.body.querySelector("[data-testid='task-pr-remove-12']") as HTMLButtonElement | null;
+		expect(removeButton?.className).toContain("min-h-11");
+	});
+
+	it("keeps the active tab when the mobile PR anchor is tapped", async () => {
+		const selection = createSelection();
+		selection.card.pullRequests = [createTaskPullRequest(12, true)];
+
+		await act(async () => {
+			renderMobileDetail(selection);
+		});
+
+		const anchor = container.querySelector("a[data-testid='mobile-task-pr-primary-anchor']");
+		expect(anchor).toBeInstanceOf(HTMLAnchorElement);
+		if (!(anchor instanceof HTMLAnchorElement)) {
+			throw new Error("Expected a primary anchor.");
+		}
+
+		await act(async () => {
+			anchor.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+		});
+
+		const chatButton = Array.from(container.querySelectorAll("button")).find(
+			(button) => button.textContent?.trim() === "Chat",
+		);
+		const diffButton = Array.from(container.querySelectorAll("button")).find(
+			(button) => button.textContent?.trim() === "Diff",
+		);
+		expect(chatButton?.className).toContain("text-accent");
+		expect(diffButton?.className).not.toContain("text-accent");
+	});
+
+	it("renders the anchor but no manage trigger on mobile when there is no workspace", async () => {
+		const selection = createSelection();
+		selection.card.pullRequests = [createTaskPullRequest(12, true)];
+
+		await act(async () => {
+			renderMobileDetail(selection, null);
+		});
+
+		const anchor = container.querySelector("a[data-testid='mobile-task-pr-primary-anchor']");
+		expect(anchor).toBeInstanceOf(HTMLAnchorElement);
+		expect(container.querySelector("[data-testid='mobile-task-pr-manage-button']")).toBeNull();
+		expect(container.querySelector("[data-testid='mobile-task-pr-link-pr-button']")).toBeNull();
+	});
+
+	it("closes the PR manager and drops task A state when switching tasks on mobile", async () => {
+		const selection = createSelection();
+		selection.card.pullRequests = [createTaskPullRequest(12, true)];
+
+		await act(async () => {
+			renderMobileDetail(selection);
+		});
+
+		const manageButton = container.querySelector("[data-testid='mobile-task-pr-manage-button']");
+		expect(manageButton).toBeInstanceOf(HTMLElement);
+		if (!(manageButton instanceof Element)) {
+			throw new Error("Expected a manage button.");
+		}
+		await clickElement(manageButton);
+		expect(document.body.querySelector("[data-testid='task-pr-url-input']")).not.toBeNull();
+
+		const nextSelection = createSelection();
+		nextSelection.card = {
+			...nextSelection.card,
+			id: "task-2",
+			pullRequests: [createTaskPullRequest(99, true)],
+		};
+
+		await act(async () => {
+			renderMobileDetail(nextSelection);
+		});
+
+		expect(document.body.querySelector("[data-testid='task-pr-url-input']")).toBeNull();
+		const anchor = container.querySelector(
+			"a[data-testid='mobile-task-pr-primary-anchor']",
+		) as HTMLAnchorElement | null;
+		expect(anchor?.href).toBe("https://github.com/cline/kanban/pull/99");
+	});
+
+	it("keeps task B's manager open when task A's add response lands late", async () => {
+		let resolveAdd: () => void = () => {};
+		trpcClientMocks.addTaskPullRequest.mockImplementation(
+			() =>
+				new Promise((resolve) => {
+					resolveAdd = () => resolve({ ok: true, pullRequest: null });
+				}),
+		);
+
+		const selection = createSelection();
+		selection.card.pullRequests = [createTaskPullRequest(12, true)];
+
+		await act(async () => {
+			renderMobileDetail(selection);
+		});
+
+		const manageButton = container.querySelector("[data-testid='mobile-task-pr-manage-button']");
+		expect(manageButton).toBeInstanceOf(HTMLElement);
+		if (!(manageButton instanceof Element)) {
+			throw new Error("Expected a manage button.");
+		}
+		await clickElement(manageButton);
+
+		// Submit an add for task A; the mutation stays pending.
+		const urlInput = document.body.querySelector("[data-testid='task-pr-url-input']");
+		expect(urlInput).toBeInstanceOf(HTMLInputElement);
+		if (!(urlInput instanceof HTMLInputElement)) {
+			throw new Error("Expected a URL input.");
+		}
+		await act(async () => {
+			const descriptor = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
+			descriptor?.set?.call(urlInput, "https://github.com/cline/kanban/pull/555");
+			urlInput.dispatchEvent(new Event("input", { bubbles: true }));
+		});
+		const addButton = document.body.querySelector("[data-testid='task-pr-add-button']");
+		expect(addButton).toBeInstanceOf(HTMLButtonElement);
+		if (!(addButton instanceof Element)) {
+			throw new Error("Expected an Add button.");
+		}
+		await clickElement(addButton);
+
+		// Switch to task B and open its manager.
+		const nextSelection = createSelection();
+		nextSelection.card = {
+			...nextSelection.card,
+			id: "task-2",
+			pullRequests: [createTaskPullRequest(99, true)],
+		};
+		await act(async () => {
+			renderMobileDetail(nextSelection);
+		});
+		const manageButtonB = container.querySelector("[data-testid='mobile-task-pr-manage-button']");
+		expect(manageButtonB).toBeInstanceOf(HTMLElement);
+		if (!(manageButtonB instanceof Element)) {
+			throw new Error("Expected a manage button for task B.");
+		}
+		await clickElement(manageButtonB);
+		expect(document.body.querySelector("[data-testid='task-pr-url-input']")).not.toBeNull();
+
+		// Task A's late add response arrives; task B's manager must stay open.
+		await act(async () => {
+			resolveAdd();
+		});
+
+		expect(document.body.querySelector("[data-testid='task-pr-url-input']")).not.toBeNull();
 	});
 });

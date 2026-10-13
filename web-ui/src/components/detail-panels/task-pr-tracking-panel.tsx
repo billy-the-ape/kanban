@@ -200,6 +200,8 @@ export function TaskPrTrackingPanel({
 				) : null}
 			</div>
 
+			{/* TODO: ADD PRS LIST WITH LINK & DETAILS, ALLOW "MAIN" PR TO BE SELECTED */}
+
 			<div className="flex flex-col gap-1.5">
 				<PrTrackingCheckbox
 					label="Auto address PR review comments"

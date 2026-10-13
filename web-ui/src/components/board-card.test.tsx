@@ -246,7 +246,18 @@ describe("BoardCard", () => {
 		expect((completeButton as HTMLButtonElement | null)?.disabled).toBe(true);
 		expect(completeButton?.querySelector("svg.animate-spin")).toBeTruthy();
 
-		const discardButton = container.querySelector('button[aria-label="Discard task"]');
+		// The discard button no longer appears on review cards; it lives on done cards.
+		expect(container.querySelector('button[aria-label="Discard task"]')).toBeNull();
+
+		await act(async () => {
+			root.render(
+				<TooltipProvider>
+					<BoardCard card={createCard()} index={0} columnId="done" isMoveToTrashLoading />
+				</TooltipProvider>,
+			);
+		});
+
+		const discardButton = container.querySelector('button[aria-label="Discard completed task"]');
 		expect(discardButton).toBeInstanceOf(HTMLButtonElement);
 		expect((discardButton as HTMLButtonElement | null)?.disabled).toBe(true);
 		expect(discardButton?.querySelector("svg.animate-spin")).toBeTruthy();
@@ -793,7 +804,13 @@ function createPullRequest(overrides?: Partial<RuntimeTaskPullRequest>): Runtime
 function getCardHeaderRow(container: HTMLElement): HTMLDivElement | null {
 	const shell = container.querySelector(".kb-board-card-shell");
 	const cardBody = shell?.firstElementChild as HTMLDivElement | null;
-	return cardBody?.firstElementChild as HTMLDivElement | null;
+	// The card body leads with an empty placeholder row; the header row is the first
+	// row that contains the compact PR link.
+	return (
+		Array.from(cardBody?.children ?? []).find(
+			(child): child is HTMLDivElement => child instanceof HTMLDivElement && child.querySelector("a") !== null,
+		) ?? null
+	);
 }
 
 describe("BoardCard pull request links", () => {
