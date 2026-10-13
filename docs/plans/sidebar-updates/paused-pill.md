@@ -10,7 +10,7 @@ All product decisions are made below. The implementer makes no product decisions
 
 The sidebar shows per-project task pills under each project name (`B | 7`, `IP | 2`, `R | 1`, `D | 21`, `T | 1`). There are two gaps:
 
-1. **No Paused state.** An In Progress card whose agent stopped working (the user pressed the pause/cancel button in the chat composer, the session was interrupted, or the agent failed) still counts as `IP`. The user wants `IP` to mean "an agent is working on this right now" and wants stopped cards shown as a separate yellow `P | n` pill.
+1. **No Paused state.** An In Progress card whose agent stopped working (the task is queued waiting for a slot, the user pressed the pause/cancel button in the chat composer, the session was interrupted, or the agent failed) still counts as `IP`. The user wants `IP` to mean "an agent is working on this right now" and wants stopped cards shown as a separate yellow `P | n` pill.
 2. **Bug: wrong purple `R` pill for projects that are not open.** A card that went from In Review back to In Progress (the user sent a follow-up message, which moves it back automatically) keeps showing as `R` in another project's pills.
 
 Required outcome:
