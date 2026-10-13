@@ -3319,7 +3319,26 @@ describe("return queued task to Backlog", () => {
 // writes nothing; the route streams it to the response (covered in
 // test/runtime/server/task-diagnostics-download.test.ts).
 describe("createRuntimeApi buildTaskDiagnosticsExportPlan (DIAG-3)", () => {
+	let previousHome: string | undefined;
+	let previousUserProfile: string | undefined;
+	let tempHome: string;
+	beforeEach(() => {
+		// gatherTaskDiagnosticsCore reads dispatch records, delivery receipts,
+		// and preservation state under os.homedir(); isolate from the
+		// developer's real ~/.cline so leftover records cannot change these
+		// assertions (AGENTS.md).
+		previousHome = process.env.HOME;
+		previousUserProfile = process.env.USERPROFILE;
+		tempHome = mkdtempSync(join(tmpdir(), "kanban-diag3-plan-home-"));
+		process.env.HOME = tempHome;
+		process.env.USERPROFILE = tempHome;
+	});
 	afterEach(() => {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+		else process.env.USERPROFILE = previousUserProfile;
+		rmSync(tempHome, { recursive: true, force: true });
 		vi.restoreAllMocks();
 	});
 
