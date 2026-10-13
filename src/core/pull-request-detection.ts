@@ -34,43 +34,65 @@ export function splitCommandFragments(command: string): string[] {
 /**
  * Tokenizes a fragment quote-aware (single and double quotes collapse their
  * contents into one token, so quoted numbers/bodies are never mistaken for
- * positionals), skipping leading env assignments (`FOO=bar cmd`).
+ * positionals), backslash-escape-aware (an escaped quote is a literal
+ * character and never opens or closes a quoted region), skipping leading env
+ * assignments (`FOO=bar cmd`).
  */
 export function tokenizeCommandFragment(fragment: string): string[] {
 	const rawTokens: string[] = [];
 	let current = "";
 	let inSingle = false;
 	let inDouble = false;
-	for (const char of fragment) {
+	let index = 0;
+	while (index < fragment.length) {
+		const char = fragment[index] ?? "";
+		const next = index + 1 < fragment.length ? (fragment[index + 1] ?? "") : "";
 		if (inSingle) {
+			// POSIX: backslashes are literal inside single quotes.
 			if (char === "'") {
 				inSingle = false;
 			} else {
 				current += char;
 			}
+			index += 1;
 		} else if (inDouble) {
-			if (char === '"') {
+			if (char === "\\" && next !== "") {
+				// An escaped character inside double quotes is literal.
+				current += next;
+				index += 2;
+			} else if (char === '"') {
 				inDouble = false;
+				index += 1;
 			} else {
 				current += char;
+				index += 1;
 			}
+		} else if (char === "\\" && next !== "") {
+			// An escaped character outside quotes is literal (an escaped
+			// quote does not open a quoted region).
+			current += next;
+			index += 2;
 		} else if (char === "'") {
 			inSingle = true;
+			index += 1;
 		} else if (char === '"') {
 			inDouble = true;
+			index += 1;
 		} else if (/\s/.test(char)) {
 			if (current.length > 0) {
 				rawTokens.push(current);
 				current = "";
 			}
+			index += 1;
 		} else {
 			current += char;
+			index += 1;
 		}
 	}
 	if (current.length > 0) {
 		rawTokens.push(current);
 	}
-	let index = 0;
+	index = 0;
 	while (index < rawTokens.length && ENV_ASSIGNMENT_PATTERN.test(rawTokens[index] ?? "")) {
 		index += 1;
 	}

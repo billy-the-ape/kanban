@@ -107,10 +107,10 @@ describe("github pr client", () => {
 					{ id: 4, state: "DISMISSED", body: "dismissed", submitted_at: "2026-10-01T00:00:00Z" },
 				],
 				inline: [
-					{ id: 10, body: "inline note", updated_at: "2026-10-02T00:00:00Z" },
-					{ id: 11, body: "resolved inline", updated_at: "2026-10-02T00:00:00Z" },
-					{ id: 12, body: "", updated_at: "2026-10-02T00:00:00Z" },
-					{ id: 13, body: "   ", updated_at: "2026-10-02T00:00:00Z" },
+					{ id: 10, body: "inline note", updated_at: "2026-10-02T00:00:00Z", pull_request_review_id: 5 },
+					{ id: 11, body: "resolved inline", updated_at: "2026-10-02T00:00:00Z", pull_request_review_id: 5 },
+					{ id: 12, body: "", updated_at: "2026-10-02T00:00:00Z", pull_request_review_id: 5 },
+					{ id: 13, body: "   ", updated_at: "2026-10-02T00:00:00Z", pull_request_review_id: 5 },
 				],
 				conversation: [
 					{ id: 20, body: "human comment", updated_at: "2026-10-03T00:00:00Z", user: { type: "User" } },
@@ -132,6 +132,9 @@ describe("github pr client", () => {
 		expect(snapshot.events.find((event) => event.providerId === "review-1")?.updatedAt).toBe(
 			Date.parse("2026-10-01T00:00:00Z"),
 		);
+		// Inline events carry their review id so the self-retrigger guard can
+		// exclude comments submitted inside a published review.
+		expect(snapshot.events.find((event) => event.providerId === "inline-10")?.pullRequestReviewId).toBe(5);
 	});
 
 	it("sends the GraphQL PR number as a plain typed -F variable", async () => {

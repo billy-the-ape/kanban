@@ -153,8 +153,10 @@ export interface PrCommentAutomationServiceDependencies {
 /**
  * Drops feedback events whose exact identities the implementation session
  * published (attribution metadata from the record's `publication` block).
- * Applied before every fingerprint, pending, deadline, and captured
- * aggregate computation — polling, dispatch validation, Resume, and
+ * Inline comments submitted inside a published review carry that review's id
+ * but no captured identity of their own, so they are excluded via the review
+ * id as well. Applied before every fingerprint, pending, deadline, and
+ * captured aggregate computation — polling, dispatch validation, Resume, and
  * restart recovery all go through it.
  */
 function excludePublishedEvents(
@@ -165,7 +167,18 @@ function excludePublishedEvents(
 		return events;
 	}
 	const excluded = new Set(published.map(prPublishedIdentityKey));
-	return events.filter((event) => !excluded.has(event.providerId));
+	const publishedReviewIds = new Set(
+		published.filter((identity) => identity.kind === "review").map((identity) => identity.id),
+	);
+	return events.filter(
+		(event) =>
+			!excluded.has(event.providerId) &&
+			!(
+				event.pullRequestReviewId !== undefined &&
+				event.pullRequestReviewId !== null &&
+				publishedReviewIds.has(event.pullRequestReviewId)
+			),
+	);
 }
 
 /** Keeps only distinct attempts inside the rolling safety window. */
@@ -1640,6 +1653,20 @@ export class PrCommentAutomationService {
 						revision: current.revision + 1,
 						commentAutomation: {
 							...current.commentAutomation,
+							// The turn provably produced post-attempt output, so
+							// the captured batch was dispatched: advance the
+							// watermark (and clear the pending-tracking fields,
+							// as the post-send upsert does) so the same
+							// feedback cannot be requeued after restart.
+							...(completed
+								? {
+										pendingFeedbackFingerprint: null,
+										pendingCount: null,
+										debounceDeadline: null,
+										firstPendingAt: null,
+										lastDispatchedFeedbackFingerprint: currentDispatch.fingerprint,
+									}
+								: {}),
 							dispatch: {
 								...currentDispatch,
 								status: completed ? "completed" : "failed",

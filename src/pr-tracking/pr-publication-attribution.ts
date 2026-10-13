@@ -38,7 +38,7 @@ export interface PrPublicationTarget {
 
 /** A recognized PR-feedback write operation in one command fragment. */
 export interface PrPublicationOperation {
-	/** Minimal label for attribution: "gh pr comment" | "gh api" | "gh pr review". */
+	/** Minimal label for attribution: "gh pr comment" | "gh api" | "gh api graphql" | "gh pr review". */
 	operation: string;
 	/**
 	 * The feedback kind the write produces, or null for a write-looking
@@ -119,6 +119,12 @@ const GH_API_VALUE_FLAGS = new Set([
 ]);
 /** `gh api` payload flags: their presence implies a POST when no method is given. */
 const GH_API_PAYLOAD_FLAGS = new Set(["-f", "-F", "--field", "--raw-field", "--input"]);
+/**
+ * GraphQL mutations that create PR feedback items — the only `gh api graphql`
+ * calls that can produce a new eligible feedback event.
+ */
+const GRAPHQL_FEEDBACK_MUTATION_PATTERN =
+	/\b(addComment|addPullRequestReview|addPullRequestReviewComment|addCommentsToDraftReview)\(/;
 
 function isDigits(value: string): boolean {
 	return value.length > 0 && /^\d+$/.test(value);
@@ -127,11 +133,14 @@ function isDigits(value: string): boolean {
 /**
  * Scans one fragment for a `-R/--repo <owner/repo>` or a positional PR
  * number. A bare digits token is a PR number only when it directly follows
- * the action (before any flag) or is the sole positional after value flags.
+ * the action (before any flag) or is the sole positional after value flags;
+ * anything else (a stray number inside a body, one of several positionals)
+ * is ignored rather than mistaken for a selection.
  */
 function readPrSelection(tokens: string[], from: number): { repository: string | null; number: number | null } {
 	let repository: string | null = null;
 	let number: number | null = null;
+	const positionals: string[] = [];
 	for (let i = from; i < tokens.length; i += 1) {
 		const token = tokens[i] ?? "";
 		if (token === "-R" || token === "--repo") {
@@ -146,8 +155,15 @@ function readPrSelection(tokens: string[], from: number): { repository: string |
 		if (token.startsWith("-")) {
 			continue;
 		}
-		if (isDigits(token) && number === null) {
-			number = Number.parseInt(token, 10);
+		positionals.push(token);
+	}
+	const firstToken = tokens[from] ?? "";
+	if (isDigits(firstToken)) {
+		number = Number.parseInt(firstToken, 10);
+	} else if (positionals.length === 1) {
+		const sole = positionals[0] ?? "";
+		if (isDigits(sole)) {
+			number = Number.parseInt(sole, 10);
 		}
 	}
 	return { repository, number };
@@ -273,21 +289,34 @@ export function detectPublicationOperations(commands: string[]): PrPublicationOp
 					continue;
 				}
 				const normalizedEndpoint = endpoint.replace(/^\/+/, "");
+				if (normalizedEndpoint === "graphql") {
+					// GraphQL calls cannot publish REST comment identities.
+					// Only a query carrying a comment-creating mutation is a
+					// recognized (unattributable, kind null) publication; a
+					// query not present in the command text (e.g. an
+					// `--input` file) cannot be ruled out and is treated the
+					// same way. Read and other-mutation calls stay ignored.
+					const inlineQuery = tokens.find((token) => token.startsWith("query="));
+					const createsFeedback = inlineQuery === undefined || GRAPHQL_FEEDBACK_MUTATION_PATTERN.test(inlineQuery);
+					if (createsFeedback) {
+						const repoFlag = tokens.findIndex((token) => token === "-R" || token === "--repo");
+						push({
+							operation: "gh api graphql",
+							kind: null,
+							explicitRepository: repoFlag !== -1 ? (tokens[repoFlag + 1] ?? null) : null,
+							explicitNumber: null,
+							fragment,
+						});
+					}
+					continue;
+				}
 				const parsed = parseApiWriteEndpoint(normalizedEndpoint);
 				const repoMatch = /^repos\/([^/]+)\/([^/]+)/.exec(normalizedEndpoint);
 				const numberMatch = /\/(\d+)\/(comments|reviews)/.exec(normalizedEndpoint);
 				if (!parsed) {
-					// A write-looking `gh api` call whose endpoint does not
-					// match a known PR-feedback shape: a recognized
-					// publication whose output can never be attributed
-					// (kind null) — never silently dropped.
-					push({
-						operation: "gh api",
-						kind: null,
-						explicitRepository: repoMatch ? `${repoMatch[1]}/${repoMatch[2]}` : null,
-						explicitNumber: numberMatch ? Number.parseInt(numberMatch[1], 10) : null,
-						fragment,
-					});
+					// A write to an endpoint that cannot create PR feedback
+					// (labels, requested_reviewers, ...): no feedback identity
+					// can be published, so the write is not a publication.
 					continue;
 				}
 				push({

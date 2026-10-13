@@ -1302,6 +1302,61 @@ describe("COMMENT-0 publication capture", () => {
 		expect(record.commentAutomation.dispatch?.error).toContain("restart interrupted");
 	});
 
+	it("advances the dispatched watermark when restart reconciliation completes an attempted dispatch", async () => {
+		const event = makeEvent({ providerId: "conversation-1", updatedAt: NOW });
+		const fp = fingerprintOf([event]);
+		// Crash between the attemptedAt write and the post-send write: the
+		// batch was captured and attempted, but the watermark never landed.
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			taskBindings: [{ workspaceId: "w1", taskId: "t1", terminal: false }],
+			commentAutomation: {
+				...record.commentAutomation,
+				repairOwner: { workspaceId: "w1", taskId: "t1", revision: 1 },
+				lastDispatchedFeedbackFingerprint: null,
+				pendingFeedbackFingerprint: fp,
+				pendingCount: 1,
+				firstPendingAt: NOW - 120_000,
+				debounceDeadline: NOW - 61_000,
+				dispatch: {
+					dispatchId: "d-attempted",
+					attemptedAt: NOW - 5_000,
+					fingerprint: fp,
+					ownerRevision: 1,
+					status: "queued",
+					turnRef: null,
+					error: null,
+				},
+			},
+		}));
+		const harness = makeService({
+			workspaceStates: new Map<string, RuntimeWorkspaceStateResponse>([
+				[
+					"/w1",
+					makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })], {
+						t1: makeSummary({ state: "idle", lastOutputAt: NOW - 1_000 }),
+					}),
+				],
+			]),
+			snapshot: { events: [event] },
+		});
+		await harness.service.start();
+		expect(harness.sent).toHaveLength(0);
+		const record = await load();
+		expect(record.commentAutomation.dispatch?.status).toBe("completed");
+		// The watermark advances with the completion, so the same feedback
+		// cannot be requeued after the restart.
+		expect(record.commentAutomation.lastDispatchedFeedbackFingerprint).toEqual(fp);
+		expect(record.commentAutomation.pendingFeedbackFingerprint).toBeNull();
+		expect(record.commentAutomation.pendingCount).toBeNull();
+		expect(record.commentAutomation.debounceDeadline).toBeNull();
+		expect(record.commentAutomation.firstPendingAt).toBeNull();
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(0);
+	});
+
 	it("does not advance the dispatched watermark past an ignored implementation reply", async () => {
 		const reviewer = makeEvent({ providerId: "conversation-1", updatedAt: NOW - 471_000 });
 		const reply = makeEvent({ providerId: "conversation-9", updatedAt: NOW });
@@ -1322,6 +1377,50 @@ describe("COMMENT-0 publication capture", () => {
 		const record = await load();
 		expect(record.commentAutomation.lastDispatchedFeedbackFingerprint).toEqual(reviewerFp);
 		expect(record.commentAutomation.lastDispatchedFeedbackFingerprint?.watermark).toBe(NOW - 471_000);
+	});
+
+	it("does not retrigger on inline comments submitted inside a published review", async () => {
+		const reviewer = makeEvent({ providerId: "conversation-1", updatedAt: NOW - 471_000 });
+		// The session submitted a review (id 55) carrying this inline comment
+		// via a payload; only the review id was captured.
+		const ownInline = makeEvent({
+			kind: "inline",
+			providerId: "inline-77",
+			updatedAt: NOW - 460_000,
+			pullRequestReviewId: 55,
+		});
+		// A different reviewer's inline comment (review 99) stays eligible.
+		const otherInline = makeEvent({
+			kind: "inline",
+			providerId: "inline-78",
+			updatedAt: NOW - 450_000,
+			pullRequestReviewId: 99,
+		});
+		await seedOwner();
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			commentAutomation: {
+				...record.commentAutomation,
+				publication: {
+					...record.commentAutomation.publication,
+					published: [{ kind: "review", id: 55 }],
+				},
+			},
+		}));
+		const harness = makeService({
+			workspaceStates: cardState(),
+			snapshot: { events: [reviewer, ownInline, otherInline] },
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(1);
+		const record = await load();
+		// The batch holds the reviewer's comment and the other inline comment
+		// only; the own-review inline stayed excluded.
+		expect(record.commentAutomation.lastDispatchedFeedbackFingerprint).toEqual(
+			fingerprintOf([reviewer, otherInline]),
+		);
 	});
 
 	it("captures publications even while auto-address is disabled", async () => {
@@ -1674,18 +1773,44 @@ describe("COMMENT-0 publication capture", () => {
 		expect(record.commentAutomation.publication.pending).toEqual([]);
 	});
 
-	it("pauses with an uncertain capture for a gh api write to an unparseable endpoint", async () => {
+	it("ignores a gh api write to an endpoint that cannot create PR feedback", async () => {
 		const harness = makeService({ workspaceStates: cardState() });
 		await harness.service.recordPrPublicationToolEvent(
 			toolEvent({
-				commands: ["gh api -X POST repos/octo/repo/pulls/42/review_requests"],
-				output: JSON.stringify({ id: 3, url: "https://api.github.com/repos/octo/repo/pulls/42" }),
+				commands: ["gh api -X POST repos/octo/repo/pulls/42/labels -f label=bug"],
+				output: JSON.stringify({ id: 3, url: "https://api.github.com/repos/octo/repo/pulls/42/labels/bug" }),
+			}),
+		);
+		const loaded = await loadPrTrackingRecord(KEY);
+		expect(loaded.status).not.toBe("ok");
+	});
+
+	it("pauses with an uncertain capture for a comment-creating graphql mutation", async () => {
+		const harness = makeService({ workspaceStates: cardState() });
+		await harness.service.recordPrPublicationToolEvent(
+			toolEvent({
+				commands: ["gh api graphql -f query='mutation { addComment(input: {body: \"addressing\"}) }'"],
+				output: JSON.stringify({ data: { addComment: { comment: { databaseId: 512 } } } }),
 			}),
 		);
 		const record = await load();
 		expect(record.commentAutomation.publication.published).toEqual([]);
 		expect(record.commentAutomation.publication.pending).toHaveLength(1);
 		expect(record.commentAutomation.publication.pending[0]?.uncertain).toBe(true);
+	});
+
+	it("ignores a graphql read during a comment-handling turn", async () => {
+		const harness = makeService({ workspaceStates: cardState() });
+		await harness.service.recordPrPublicationToolEvent(
+			toolEvent({
+				commands: [
+					"gh api graphql -f query='query { pullRequest { reviewThreads(first: 20) { nodes { isResolved } } } }'",
+				],
+				output: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } }),
+			}),
+		);
+		const loaded = await loadPrTrackingRecord(KEY);
+		expect(loaded.status).not.toBe("ok");
 	});
 
 	it("registers only the write fragment's identity from a structured multi-fragment result", async () => {

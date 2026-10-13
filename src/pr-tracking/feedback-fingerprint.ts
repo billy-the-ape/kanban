@@ -28,6 +28,12 @@ export interface PrFeedbackEvent {
 	bodyDigest: string;
 	/** Transient raw body; not stored durably. */
 	body: string;
+	/**
+	 * For inline (review) comments: the id of the review the comment belongs
+	 * to. Lets inline comments submitted inside a session-published review
+	 * be excluded even though only the review id itself was captured.
+	 */
+	pullRequestReviewId?: number | null;
 }
 
 const TOKEN_SEPARATOR = "\u001f";

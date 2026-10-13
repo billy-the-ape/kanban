@@ -97,6 +97,7 @@ interface InlineCommentEntry {
 	id: unknown;
 	body: unknown;
 	updated_at: unknown;
+	pull_request_review_id: unknown;
 }
 
 interface ConversationCommentEntry {
@@ -293,6 +294,7 @@ function mapInlineComments(entries: InlineCommentEntry[], resolvedIds: Set<numbe
 			updatedAt,
 			bodyDigest: sha256Hex(body),
 			body,
+			pullRequestReviewId: typeof entry.pull_request_review_id === "number" ? entry.pull_request_review_id : null,
 		});
 	}
 	return events;

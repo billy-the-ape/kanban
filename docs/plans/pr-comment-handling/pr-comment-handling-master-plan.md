@@ -355,6 +355,51 @@ end-to-end capture, unparseable-endpoint pause, structured multi-fragment scopin
 stale-capture blocker/acknowledged-resume cycle). These fixes postdate v0.2.31 and ship
 with the next release; the restart caveat for already-recorded captures still applies.
 
+Review fixes applied (fifth review round, same PR):
+
+- `gh api graphql`: a read-only `graphql` call (reading/resolving review
+  threads with `-f query=...` is the normal flow during a comment-handling
+  turn) no longer surfaces as an unattributable write. A `graphql` call is
+  recognized as a publication only when its inline query carries a
+  comment-creating mutation (`addComment`, `addPullRequestReview`,
+  `addPullRequestReviewComment`, `addCommentsToDraftReview`) or the query is
+  not present in the command text (e.g. an `--input` file) and cannot be
+  ruled out; in both cases it is a `kind: null` operation that yields an
+  explicit uncertain capture, since a GraphQL response cannot attribute a
+  REST comment identity. Inline reads stay ignored.
+- Non-feedback REST write endpoints (labels, requested_reviewers, ...): the
+  fourth-round `kind: null` fallback for unknown endpoints is reverted. A
+  write to an endpoint that cannot create PR feedback is not a publication
+  and stays ignored; the `kind: null` uncertain path remains only for
+  `graphql` writes.
+- Restart reconciliation watermark: when a restart reconcile settles an
+  attempted dispatch (`queued` with a recorded `attemptedAt`) as `completed`
+  from post-attempt session output, it now also advances
+  `lastDispatchedFeedbackFingerprint` to the dispatch's captured fingerprint
+  and clears the pending-tracking fields (as the post-send upsert does), so
+  the same feedback batch cannot be requeued and re-sent after restart. A
+  `failed` reconcile outcome does not advance the watermark (no evidence the
+  prompt was accepted), so an explicit Resume can still re-send it.
+- Inline comments inside a published review: the client now carries
+  `pull_request_review_id` on inline feedback events, and
+  `excludePublishedEvents` additionally excludes inline events whose review
+  id is in the record's published set. A review submitted with inline
+  `comments[]` through a payload no longer re-triggers a follow-up on its
+  own inline comments.
+- Command tokenizer and PR-number selection: `tokenizeCommandFragment` now
+  honours backslash escapes (an escaped quote is a literal character and
+  never opens or closes a quoted region), and `readPrSelection` accepts a
+  bare number only directly after the action or as the sole positional, as
+  its doc comment describes. A number inside a quoted body with escaped
+  quotes is no longer read as an explicit PR selection.
+
+Tests: new graphql, non-feedback-endpoint, and selection-strictness cases in
+`pr-publication-attribution.test.ts` (22 cases total), plus additions to
+`comment-automation-service.test.ts` (graphql-mutation pause, graphql-read
+ignore, non-feedback write ignore, the restart watermark advance for an
+attempted dispatch, and inline exclusion under a published review) and
+`github-pr-client.test.ts` (`pullRequestReviewId` carried on inline events).
+
 Documented v1 deviations: a terminal PR observation cancels queued dispatch but keeps the owner
 held until its candidate is no longer enabled; dispatch waits for conflicting writers before
 sending (the normal send path provides model-queue admission) but does not yet gate on

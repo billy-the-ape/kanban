@@ -42,30 +42,61 @@ describe("detectPublicationOperations gh api value flags", () => {
 	});
 });
 
-describe("detectPublicationOperations unparseable write endpoints", () => {
-	it("recognizes a write-looking gh api endpoint as an unattributable operation", () => {
-		const fragment = "gh api -X POST repos/octo/repo/pulls/42/review_requests";
+describe("detectPublicationOperations non-feedback writes", () => {
+	it("ignores writes to endpoints that cannot create PR feedback", () => {
+		expect(
+			detectPublicationOperations([
+				"gh api -X POST repos/octo/repo/pulls/42/labels -f label=bug",
+				"gh api -X POST repos/octo/repo/pulls/42/requested_reviewers -f reviewers=octo",
+				"gh api -X POST repos/octo/repo/pulls/42/review_requests",
+			]),
+		).toEqual([]);
+	});
+
+	it("ignores read-looking calls to those endpoints", () => {
+		expect(detectPublicationOperations(["gh api -X GET repos/octo/repo/pulls/42/review_requests"])).toEqual([]);
+	});
+});
+
+describe("detectPublicationOperations graphql", () => {
+	it("ignores a graphql read that carries no comment-creating mutation", () => {
+		const fragment =
+			"gh api graphql -f query='query { pullRequest { reviewThreads(first: 20) { nodes { isResolved } } } }'";
+		expect(detectPublicationOperations([fragment])).toEqual([]);
+	});
+
+	it("recognizes a comment-creating graphql mutation as an unattributable operation", () => {
+		const fragment = "gh api graphql -f query='mutation { addComment(input: {body: \"addressing\"}) }'";
 		expect(detectPublicationOperations([fragment])).toEqual([
 			{
-				operation: "gh api",
+				operation: "gh api graphql",
 				kind: null,
-				explicitRepository: "octo/repo",
+				explicitRepository: null,
 				explicitNumber: null,
 				fragment,
 			},
 		]);
 	});
 
-	it("never treats read-looking calls as unattributable writes", () => {
-		expect(detectPublicationOperations(["gh api -X GET repos/octo/repo/pulls/42/review_requests"])).toEqual([]);
+	it("treats a graphql call whose query is not in the command text as unattributable", () => {
+		const fragment = "gh api graphql --input mutation.json";
+		expect(detectPublicationOperations([fragment])).toEqual([
+			{
+				operation: "gh api graphql",
+				kind: null,
+				explicitRepository: null,
+				explicitNumber: null,
+				fragment,
+			},
+		]);
 	});
 });
 
-describe("analyzePrPublication unparseable endpoints", () => {
-	it("pauses with an uncertain capture (never silent-none) for an unattributable write", () => {
+describe("analyzePrPublication graphql writes", () => {
+	it("pauses with an uncertain capture for a comment-creating graphql mutation", () => {
 		const observation = analyzePrPublication({
 			toolName: "run_command",
-			commands: ["gh api -X POST repos/octo/repo/pulls/42/review_requests"],
+			commands: ["gh api graphql -f query='mutation { addComment(input: {body: \"addressing\"}) }'"],
 			output: null,
 			error: null,
 			linkedPullRequests: [TARGET],
@@ -75,16 +106,81 @@ describe("analyzePrPublication unparseable endpoints", () => {
 		expect(observation.reason).toContain("cannot be attributed");
 	});
 
-	it("stays uncertain even when the write returns output", () => {
+	it("stays uncertain even when the mutation returns output", () => {
 		const observation = analyzePrPublication({
 			toolName: "run_command",
-			commands: ["gh api -X POST repos/octo/repo/pulls/42/review_requests"],
-			output: JSON.stringify({ id: 3, url: "https://api.github.com/repos/octo/repo/pulls/42" }),
+			commands: ["gh api graphql -f query='mutation { addPullRequestReviewComment(input: {body: \"inline\"}) }'"],
+			output: JSON.stringify({ data: { addPullRequestReviewComment: { comment: { databaseId: 512 } } } }),
 			error: null,
 			linkedPullRequests: [TARGET],
 		});
 		expect(observation.status).toBe("uncertain");
 		expect(observation.identities).toEqual([]);
+	});
+});
+
+describe("readPrSelection positional number strictness", () => {
+	it("reads a number directly after the action", () => {
+		expect(detectPublicationOperations(["gh pr comment 42 -b 'x'"])).toEqual([
+			{
+				operation: "gh pr comment",
+				kind: "conversation",
+				explicitRepository: null,
+				explicitNumber: 42,
+				fragment: "gh pr comment 42 -b 'x'",
+			},
+		]);
+	});
+
+	it("reads a number as the sole positional after value flags", () => {
+		expect(detectPublicationOperations(["gh pr comment -b 'x' 42"])).toEqual([
+			{
+				operation: "gh pr comment",
+				kind: "conversation",
+				explicitRepository: null,
+				explicitNumber: 42,
+				fragment: "gh pr comment -b 'x' 42",
+			},
+		]);
+	});
+
+	it("does not read a stray number that is one of several positionals", () => {
+		expect(detectPublicationOperations(["gh pr comment -b 'x' 12 34"])).toEqual([
+			{
+				operation: "gh pr comment",
+				kind: "conversation",
+				explicitRepository: null,
+				explicitNumber: null,
+				fragment: "gh pr comment -b 'x' 12 34",
+			},
+		]);
+	});
+
+	it("reads a -R repository plus a number", () => {
+		expect(detectPublicationOperations(["gh pr comment -R octo/repo 43"])).toEqual([
+			{
+				operation: "gh pr comment",
+				kind: "conversation",
+				explicitRepository: "octo/repo",
+				explicitNumber: 43,
+				fragment: "gh pr comment -R octo/repo 43",
+			},
+		]);
+	});
+
+	it("does not read a number that escapes out of a quoted body", () => {
+		// Escaped quotes inside the double-quoted body keep the whole body a
+		// single token, so the embedded number is never a positional.
+		const fragment = 'gh pr comment --body "Fixed \\"the parser 12 bug\\""';
+		expect(detectPublicationOperations([fragment])).toEqual([
+			{
+				operation: "gh pr comment",
+				kind: "conversation",
+				explicitRepository: null,
+				explicitNumber: null,
+				fragment,
+			},
+		]);
 	});
 });
 
