@@ -149,7 +149,7 @@ describe("useRuntimeWorkspaceChanges", () => {
 
 		expect(snapshots.at(-1)).toMatchObject({
 			paths: [],
-			isLoading: true,
+			isLoading: false,
 			isRuntimeAvailable: true,
 		});
 
@@ -205,7 +205,7 @@ describe("useRuntimeWorkspaceChanges", () => {
 
 		expect(snapshots.at(-1)).toMatchObject({
 			paths: [],
-			isLoading: true,
+			isLoading: false,
 			isRuntimeAvailable: true,
 		});
 
@@ -263,7 +263,7 @@ describe("useRuntimeWorkspaceChanges", () => {
 
 		expect(snapshots.at(-1)).toMatchObject({
 			paths: ["turn-1.ts"],
-			isLoading: true,
+			isLoading: false,
 			isRuntimeAvailable: true,
 		});
 
