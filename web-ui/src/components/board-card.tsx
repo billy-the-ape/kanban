@@ -40,6 +40,7 @@ import {
 	clampTextWithInlineSuffix,
 	getTaskPromptDescription,
 	normalizePromptForDisplay,
+	normalizeTaskPromptPreview,
 	truncateTaskPromptLabel,
 } from "@/utils/task-prompt";
 import { DEFAULT_TEXT_MEASURE_FONT, measureTextWidth, readElementFontShorthand } from "@/utils/text-measure";
@@ -344,14 +345,15 @@ export function BoardCard({
 	// LASTPROMPT: the card preview shows the latest user-authored chat prompt
 	// when present; legacy cards (or a cleared preview) fall back to the
 	// original task prompt. The title keeps its existing fallback behavior.
-	const previewText = useMemo(() => {
+	const displayDescription = useMemo(() => {
 		const lastPrompt = card.lastPrompt?.trim() ?? "";
-		return lastPrompt.length > 0 ? lastPrompt : card.prompt;
-	}, [card.lastPrompt, card.prompt]);
-	const displayDescription = useMemo(
-		() => getTaskPromptDescription(previewText, displayTitle),
-		[previewText, displayTitle],
-	);
+		if (lastPrompt.length > 0) {
+			// Chat text is not a "title||details" task prompt, so it must not
+			// go through title-prefix removal — only display normalization.
+			return normalizeTaskPromptPreview(lastPrompt);
+		}
+		return getTaskPromptDescription(card.prompt, displayTitle);
+	}, [card.lastPrompt, card.prompt, displayTitle]);
 
 	useLayoutEffect(() => {
 		if (descriptionRect.width > 0 || !displayDescription) {

@@ -146,9 +146,7 @@ vi.mock("../../../src/workspace/task-chat-pr-linking.js", () => ({
 }));
 
 vi.mock("../../../src/workspace/task-last-prompt.js", async () => {
-	const actual = await vi.importActual<typeof import("../../../src/workspace/task-last-prompt")>(
-		"../../../src/workspace/task-last-prompt.js",
-	);
+	const actual = await vi.importActual<typeof TaskLastPromptModule>("../../../src/workspace/task-last-prompt.js");
 	return {
 		...actual,
 		recordTaskLastPrompt: taskLastPromptMocks.recordTaskLastPrompt,
@@ -160,6 +158,7 @@ import * as workspaceState from "../../../src/state/workspace-state";
 import * as dispatchRecords from "../../../src/task-dispatch/dispatch-records";
 import type { RuntimeTrpcContext } from "../../../src/trpc/app-router";
 import { type CreateRuntimeApiDependencies, createRuntimeApi } from "../../../src/trpc/runtime-api";
+import type * as TaskLastPromptModule from "../../../src/workspace/task-last-prompt";
 import * as queuedReset from "../../../src/workspace/task-queued-reset";
 import { createGitTestEnv } from "../../utilities/git-env";
 
