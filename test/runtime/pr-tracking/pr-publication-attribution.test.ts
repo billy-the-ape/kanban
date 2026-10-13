@@ -376,3 +376,58 @@ describe("detectPublicationOperations gh api repo placeholders", () => {
 		expect(observation.identities).toEqual([{ kind: "conversation", id: 77 }]);
 	});
 });
+
+describe("detectPublicationOperations wrapped gh invocations", () => {
+	it.each([
+		"timeout 30 gh pr comment 42 -b 'addressed'",
+		"env GH_DEBUG=1 gh pr comment 42 -b 'addressed'",
+		"command gh pr comment 42 -b 'addressed'",
+		"/usr/bin/gh pr comment 42 -b 'addressed'",
+	])("detects %s", (fragment) => {
+		expect(detectPublicationOperations([fragment])).toEqual([
+			{ operation: "gh pr comment", kind: "conversation", explicitRepository: null, explicitNumber: 42, fragment },
+		]);
+	});
+
+	it.each([
+		["bash -c \"gh pr comment 42 -b 'addressed'\"", "gh pr comment 42 -b 'addressed'"],
+		[
+			"sh -lc 'gh api repos/octo/repo/issues/42/comments -f body=x'",
+			"gh api repos/octo/repo/issues/42/comments -f body=x",
+		],
+	])("detects the gh call inside %s", (command, inner) => {
+		const operations = detectPublicationOperations([command]);
+		expect(operations).toHaveLength(1);
+		expect(operations[0]?.fragment).toBe(inner);
+		expect(operations[0]?.explicitNumber).toBe(42);
+	});
+
+	it("ignores gh text that is only an argument of another command", () => {
+		expect(
+			detectPublicationOperations(["rg 'gh pr comment' src", 'echo "gh api repos/o/r/issues/1/comments"']),
+		).toEqual([]);
+	});
+});
+
+describe("detectPublicationOperations gh api attached payload forms", () => {
+	it.each([
+		["gh api repos/octo/repo/issues/5/comments --field=body=x", "conversation"],
+		["gh api repos/octo/repo/issues/5/comments --raw-field=body=x", "conversation"],
+		["gh api repos/octo/repo/issues/5/comments -fbody=x", "conversation"],
+		["gh api repos/octo/repo/issues/5/comments -Fbody=@reply.md", "conversation"],
+		["gh api repos/octo/repo/pulls/5/reviews --input=review.json", "review"],
+	])("treats %s as a write", (fragment, kind) => {
+		expect(detectPublicationOperations([fragment])).toEqual([
+			{ operation: "gh api", kind, explicitRepository: "octo/repo", explicitNumber: 5, fragment },
+		]);
+	});
+
+	it("reads a graphql query passed as --field=query=... for the mutation check", () => {
+		expect(detectPublicationOperations(["gh api graphql --field=query='query { viewer { login } }'"])).toEqual([]);
+		expect(
+			detectPublicationOperations([
+				"gh api graphql --field=query='mutation { addComment(input: {}) { clientMutationId } }'",
+			]),
+		).toHaveLength(1);
+	});
+});

@@ -138,6 +138,9 @@ const GH_API_VALUE_FLAGS = new Set([
 ]);
 /** `gh api` payload flags: their presence implies a POST when no method is given. */
 const GH_API_PAYLOAD_FLAGS = new Set(["-f", "-F", "--field", "--raw-field", "--input"]);
+/** Shells whose `-c '<script>'` argument is scanned for wrapped `gh` writes. */
+const SHELL_COMMANDS = new Set(["bash", "sh", "zsh", "dash"]);
+const MAX_SHELL_WRAP_DEPTH = 3;
 /**
  * GraphQL mutations that create PR feedback items — the only `gh api graphql`
  * calls that can produce a new eligible feedback event.
@@ -224,137 +227,201 @@ export function detectPublicationOperations(commands: string[]): PrPublicationOp
 		seen.add(shape);
 		operations.push(operation);
 	};
+	const visit = (fragment: string, depth: number): void => {
+		const fragmentTokens = tokenizeCommandFragment(fragment);
+		// `bash -c '<script>'` (possibly itself wrapped): detect inside the
+		// inline script rather than silently ignoring it.
+		const script = depth < MAX_SHELL_WRAP_DEPTH ? shellInlineScript(fragmentTokens) : null;
+		if (script !== null) {
+			for (const inner of splitCommandFragments(script)) {
+				visit(inner, depth + 1);
+			}
+			return;
+		}
+		const tokens = ghInvocation(fragmentTokens);
+		if (tokens !== null) {
+			detectGhOperation(tokens, fragment, push);
+		}
+	};
 	for (const command of commands) {
 		for (const fragment of splitCommandFragments(command)) {
-			const tokens = tokenizeCommandFragment(fragment);
-			const commandName = tokens[0] ?? "";
-			if (commandName !== "gh") {
-				continue;
-			}
-			const group = tokens[1] ?? "";
-			if (group === "pr") {
-				const action = tokens[2] ?? "";
-				if (action === "comment") {
-					if (tokens.slice(3).includes("--web")) {
-						continue;
-					}
-					const selection = readPrSelection(tokens, 3);
-					push({
-						operation: "gh pr comment",
-						kind: "conversation",
-						explicitRepository: selection.repository,
-						explicitNumber: selection.number,
-						fragment,
-					});
-				} else if (action === "review" && isPublishingReview(tokens.slice(3))) {
-					if (tokens.slice(3).includes("--web")) {
-						continue;
-					}
-					const selection = readPrSelection(tokens, 3);
-					push({
-						operation: "gh pr review",
-						kind: "review",
-						explicitRepository: selection.repository,
-						explicitNumber: selection.number,
-						fragment,
-					});
-				}
-			} else if (group === "api") {
-				let i = 2;
-				let method: string | null = null;
-				let hasPayload = false;
-				let endpoint: string | null = null;
-				// `gh api [METHOD] ENDPOINT [flags]`: real gh takes the method
-				// via flags, so scan from the token after "api".
-				while (i < tokens.length) {
-					const token = tokens[i] ?? "";
-					if (token.startsWith("--") && token.includes("=")) {
-						// `--flag=value` form: consumes itself.
-						if (token.startsWith("--method=")) {
-							method = token.slice("--method=".length).toUpperCase();
-						}
-						i += 1;
-						continue;
-					}
-					if (token === "-X" || token === "--method") {
-						method = (tokens[i + 1] ?? "").toUpperCase() || method;
-						i += 2;
-						continue;
-					}
-					if (token.startsWith("-X") && token.length > 2) {
-						method = token.slice(2).toUpperCase();
-						i += 1;
-						continue;
-					}
-					if (GH_API_VALUE_FLAGS.has(token)) {
-						if (GH_API_PAYLOAD_FLAGS.has(token)) {
-							hasPayload = true;
-						}
-						i += 2;
-						continue;
-					}
-					if (token.startsWith("-")) {
-						// Valueless flags (`--paginate`, `--silent`, `--slurp`, `--help`, ...).
-						i += 1;
-						continue;
-					}
-					if (endpoint === null) {
-						endpoint = token;
-					}
-					i += 1;
-				}
-				const effective = method ?? (hasPayload ? "POST" : "GET");
-				if (!endpoint || !GH_API_WRITE_METHODS.has(effective)) {
-					continue;
-				}
-				const normalizedEndpoint = endpoint.replace(/^\/+/, "");
-				if (normalizedEndpoint === "graphql") {
-					// GraphQL calls cannot publish REST comment identities.
-					// Only a query carrying a comment-creating mutation is a
-					// recognized (unattributable, kind null) publication; a
-					// query not present in the command text (e.g. an
-					// `--input` file) cannot be ruled out and is treated the
-					// same way. Read and other-mutation calls stay ignored.
-					const inlineQuery = tokens.find((token) => token.startsWith("query="));
-					const createsFeedback = inlineQuery === undefined || GRAPHQL_FEEDBACK_MUTATION_PATTERN.test(inlineQuery);
-					if (createsFeedback) {
-						const repoFlag = tokens.findIndex((token) => token === "-R" || token === "--repo");
-						push({
-							operation: "gh api graphql",
-							kind: null,
-							explicitRepository: repoFlag !== -1 ? (tokens[repoFlag + 1] ?? null) : null,
-							explicitNumber: null,
-							fragment,
-						});
-					}
-					continue;
-				}
-				const parsed = parseApiWriteEndpoint(normalizedEndpoint);
-				const repoMatch = /^repos\/([^/]+)\/([^/]+)/.exec(normalizedEndpoint);
-				// gh fills `{owner}/{repo}` (and `:owner/:repo`) from the current
-				// repository: that is an implicit selector, not an explicit one.
-				const explicitRepository =
-					repoMatch && !GH_REPO_PLACEHOLDERS.has(repoMatch[1]) && !GH_REPO_PLACEHOLDERS.has(repoMatch[2])
-						? `${repoMatch[1]}/${repoMatch[2]}`
-						: null;
-				const numberMatch = /\/(\d+)\/(comments|reviews)/.exec(normalizedEndpoint);
-				if (!parsed) {
-					// A write to an endpoint that cannot create PR feedback
-					// (labels, requested_reviewers, ...): no feedback identity
-					// can be published, so the write is not a publication.
-					continue;
-				}
-				push({
-					operation: "gh api",
-					kind: parsed.kind,
-					explicitRepository,
-					explicitNumber: numberMatch ? Number.parseInt(numberMatch[1], 10) : null,
-					fragment,
-				});
-			}
+			visit(fragment, 0);
 		}
 	}
 	return operations;
+}
+
+/**
+ * The `gh` invocation inside a possibly wrapped fragment (`timeout 30 gh`,
+ * `env X=1 gh`, `command gh`, `sudo gh`, `/usr/bin/gh`, ...): the tokens from
+ * the first token whose basename is `gh`, normalized to start with "gh".
+ */
+function ghInvocation(tokens: string[]): string[] | null {
+	const index = tokens.findIndex((token) => commandBasename(token) === "gh");
+	return index === -1 ? null : ["gh", ...tokens.slice(index + 1)];
+}
+
+/** The inline script of a (possibly wrapped) `bash|sh|zsh|dash -c '<script>'`, if any. */
+function shellInlineScript(tokens: string[]): string | null {
+	const shellIndex = tokens.findIndex((token) => SHELL_COMMANDS.has(commandBasename(token)));
+	if (shellIndex === -1) {
+		return null;
+	}
+	for (let i = shellIndex + 1; i < tokens.length; i += 1) {
+		const token = tokens[i] ?? "";
+		if (!token.startsWith("-")) {
+			return null;
+		}
+		// `-c`, or combined short options such as `-lc` / `-ec`.
+		if (/^-[a-z]*c[a-z]*$/.test(token)) {
+			return tokens[i + 1] ?? null;
+		}
+	}
+	return null;
+}
+
+function commandBasename(token: string): string {
+	return token.slice(token.lastIndexOf("/") + 1);
+}
+
+/** Classifies one `gh ...` invocation (tokens start with "gh") and records any publication operation. */
+function detectGhOperation(
+	tokens: string[],
+	fragment: string,
+	push: (operation: PrPublicationOperation) => void,
+): void {
+	const group = tokens[1] ?? "";
+	if (group === "pr") {
+		const action = tokens[2] ?? "";
+		if (action === "comment") {
+			if (tokens.slice(3).includes("--web")) {
+				return;
+			}
+			const selection = readPrSelection(tokens, 3);
+			push({
+				operation: "gh pr comment",
+				kind: "conversation",
+				explicitRepository: selection.repository,
+				explicitNumber: selection.number,
+				fragment,
+			});
+		} else if (action === "review" && isPublishingReview(tokens.slice(3))) {
+			if (tokens.slice(3).includes("--web")) {
+				return;
+			}
+			const selection = readPrSelection(tokens, 3);
+			push({
+				operation: "gh pr review",
+				kind: "review",
+				explicitRepository: selection.repository,
+				explicitNumber: selection.number,
+				fragment,
+			});
+		}
+	} else if (group === "api") {
+		let i = 2;
+		let method: string | null = null;
+		let hasPayload = false;
+		let endpoint: string | null = null;
+		// `gh api [METHOD] ENDPOINT [flags]`: real gh takes the method
+		// via flags, so scan from the token after "api".
+		while (i < tokens.length) {
+			const token = tokens[i] ?? "";
+			if (token.startsWith("--") && token.includes("=")) {
+				// `--flag=value` form: consumes itself.
+				const flag = token.slice(0, token.indexOf("="));
+				if (flag === "--method") {
+					method = token.slice("--method=".length).toUpperCase();
+				} else if (GH_API_PAYLOAD_FLAGS.has(flag)) {
+					hasPayload = true;
+				}
+				i += 1;
+				continue;
+			}
+			if (token === "-X" || token === "--method") {
+				method = (tokens[i + 1] ?? "").toUpperCase() || method;
+				i += 2;
+				continue;
+			}
+			if (token.startsWith("-X") && token.length > 2) {
+				method = token.slice(2).toUpperCase();
+				i += 1;
+				continue;
+			}
+			if (/^-[fF]./.test(token)) {
+				// Attached short payload flag (`-fbody=x`, `-Fbody=@file`).
+				hasPayload = true;
+				i += 1;
+				continue;
+			}
+			if (GH_API_VALUE_FLAGS.has(token)) {
+				if (GH_API_PAYLOAD_FLAGS.has(token)) {
+					hasPayload = true;
+				}
+				i += 2;
+				continue;
+			}
+			if (token.startsWith("-")) {
+				// Valueless flags (`--paginate`, `--silent`, `--slurp`, `--help`, ...).
+				i += 1;
+				continue;
+			}
+			if (endpoint === null) {
+				endpoint = token;
+			}
+			i += 1;
+		}
+		const effective = method ?? (hasPayload ? "POST" : "GET");
+		if (!endpoint || !GH_API_WRITE_METHODS.has(effective)) {
+			return;
+		}
+		const normalizedEndpoint = endpoint.replace(/^\/+/, "");
+		if (normalizedEndpoint === "graphql") {
+			// GraphQL calls cannot publish REST comment identities.
+			// Only a query carrying a comment-creating mutation is a
+			// recognized (unattributable, kind null) publication; a
+			// query not present in the command text (e.g. an
+			// `--input` file) cannot be ruled out and is treated the
+			// same way. Read and other-mutation calls stay ignored.
+			const inlineQuery = tokens
+				.map((token) => token.replace(/^(--field=|--raw-field=|-[fF])/, ""))
+				.find((token) => token.startsWith("query="));
+			const createsFeedback = inlineQuery === undefined || GRAPHQL_FEEDBACK_MUTATION_PATTERN.test(inlineQuery);
+			if (createsFeedback) {
+				const repoFlag = tokens.findIndex((token) => token === "-R" || token === "--repo");
+				push({
+					operation: "gh api graphql",
+					kind: null,
+					explicitRepository: repoFlag !== -1 ? (tokens[repoFlag + 1] ?? null) : null,
+					explicitNumber: null,
+					fragment,
+				});
+			}
+			return;
+		}
+		const parsed = parseApiWriteEndpoint(normalizedEndpoint);
+		const repoMatch = /^repos\/([^/]+)\/([^/]+)/.exec(normalizedEndpoint);
+		// gh fills `{owner}/{repo}` (and `:owner/:repo`) from the current
+		// repository: that is an implicit selector, not an explicit one.
+		const explicitRepository =
+			repoMatch && !GH_REPO_PLACEHOLDERS.has(repoMatch[1]) && !GH_REPO_PLACEHOLDERS.has(repoMatch[2])
+				? `${repoMatch[1]}/${repoMatch[2]}`
+				: null;
+		const numberMatch = /\/(\d+)\/(comments|reviews)/.exec(normalizedEndpoint);
+		if (!parsed) {
+			// A write to an endpoint that cannot create PR feedback
+			// (labels, requested_reviewers, ...): no feedback identity
+			// can be published, so the write is not a publication.
+			return;
+		}
+		push({
+			operation: "gh api",
+			kind: parsed.kind,
+			explicitRepository,
+			explicitNumber: numberMatch ? Number.parseInt(numberMatch[1], 10) : null,
+			fragment,
+		});
+	}
 }
 
 function sameTarget(left: PrPublicationTarget | null, right: PrPublicationTarget | null): boolean {
