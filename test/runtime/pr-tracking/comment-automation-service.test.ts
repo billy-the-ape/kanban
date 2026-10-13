@@ -1,3 +1,5 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClineTaskSessionService } from "../../../src/cline-sdk/cline-task-session-service";
 import type {
@@ -22,6 +24,7 @@ import { computePrFeedbackFingerprint } from "../../../src/pr-tracking/feedback-
 import type { GitHubPrSnapshot } from "../../../src/pr-tracking/github-pr-client";
 import {
 	createInitialPrTrackingRecord,
+	getPrTrackingRecordPath,
 	loadPrTrackingRecord,
 	upsertPrTrackingRecord,
 } from "../../../src/pr-tracking/pr-comment-record-store";
@@ -611,6 +614,68 @@ describe("PrCommentAutomationService", () => {
 		expect(automation.pendingFeedbackFingerprint).toBeNull();
 		expect(automation.pendingCount).toBeNull();
 		expect(automation.lastDispatchedFeedbackFingerprint).toEqual(fingerprint);
+	});
+
+	it("restarts the quiet window at settle when feedback arrived after the last poll", async () => {
+		const first = makeEvent({ providerId: "conversation-1", updatedAt: NOW });
+		const snapshot: Partial<GitHubPrSnapshot> = { events: [first] };
+		let clock = NOW;
+		const harness = makeService({
+			workspaceStates: new Map([
+				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })])],
+			]),
+			snapshot,
+			now: () => clock,
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		// Past the 60s + 5s jitter poll interval: this tick polls again, so
+		// the next poll is due no earlier than NOW + 126s.
+		clock = NOW + 66_000;
+		await harness.service.runTick();
+		expect(harness.snapshotCalls).toHaveLength(2);
+		expect(harness.sent).toHaveLength(0);
+		// A second comment lands between polls; the next poll is not due
+		// before the persisted deadline (NOW + 120s), so only settle sees it.
+		const second = makeEvent({ providerId: "conversation-2", updatedAt: NOW + 110_000 });
+		snapshot.events = [first, second];
+		clock = NOW + 120_000;
+		await harness.service.runTick();
+		expect(harness.snapshotCalls).toHaveLength(3);
+		expect(harness.sent).toHaveLength(0);
+		const loaded = await loadPrTrackingRecord(KEY);
+		if (loaded.status !== "ok") {
+			throw new Error("unreachable");
+		}
+		expect(loaded.record.commentAutomation.debounceDeadline).toBe(NOW + 230_000);
+		expect(loaded.record.commentAutomation.pendingCount).toBe(2);
+		clock = NOW + 231_000;
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(1);
+	});
+
+	it("backs off polling when the record write throws", async () => {
+		const event = makeEvent({ providerId: "conversation-1", updatedAt: NOW });
+		const recordPath = getPrTrackingRecordPath(KEY);
+		await mkdir(dirname(recordPath), { recursive: true });
+		await writeFile(recordPath, "{ not json", "utf8");
+		let clock = NOW;
+		const harness = makeService({
+			workspaceStates: new Map([
+				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })])],
+			]),
+			snapshot: { events: [event] },
+			now: () => clock,
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		expect(harness.snapshotCalls).toHaveLength(1);
+		// Regression: a malformed record made every 10s tick re-poll GitHub.
+		clock += 10_000;
+		await harness.service.runTick();
+		clock += 10_000;
+		await harness.service.runTick();
+		expect(harness.snapshotCalls).toHaveLength(1);
 	});
 
 	it("does not send twice when ticks overlap", async () => {

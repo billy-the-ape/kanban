@@ -111,6 +111,8 @@ describe("github pr client", () => {
 					{ id: 11, body: "resolved inline", updated_at: "2026-10-02T00:00:00Z", pull_request_review_id: 5 },
 					{ id: 12, body: "", updated_at: "2026-10-02T00:00:00Z", pull_request_review_id: 5 },
 					{ id: 13, body: "   ", updated_at: "2026-10-02T00:00:00Z", pull_request_review_id: 5 },
+					// A draft comment inside the unsubmitted PENDING review 2.
+					{ id: 14, body: "draft inline", updated_at: "2026-10-02T00:00:00Z", pull_request_review_id: 2 },
 				],
 				conversation: [
 					{ id: 20, body: "human comment", updated_at: "2026-10-03T00:00:00Z", user: { type: "User" } },

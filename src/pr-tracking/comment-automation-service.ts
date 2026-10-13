@@ -674,22 +674,32 @@ export class PrCommentAutomationService {
 			return;
 		}
 		const scope = this.firstCandidateScope(sub);
-		const snapshot = await this.deps.ghClient.fetchSnapshot(
-			{ host: sub.pr.host, repository: sub.pr.repository, number: sub.pr.number },
-			scope.workspacePath,
-			accessScopeId,
-		);
-		if (!snapshot.complete) {
-			// Partial failures cannot dispatch: back off and retry later.
+		const backOff = (): void => {
 			sub.consecutiveFailures += 1;
 			sub.nextPollAt = nowMs + backoffMs(sub.consecutiveFailures);
-			return;
+		};
+		try {
+			const snapshot = await this.deps.ghClient.fetchSnapshot(
+				{ host: sub.pr.host, repository: sub.pr.repository, number: sub.pr.number },
+				scope.workspacePath,
+				accessScopeId,
+			);
+			if (!snapshot.complete) {
+				// Partial failures cannot dispatch: back off and retry later.
+				backOff();
+				return;
+			}
+			const candidates = [...sub.candidates.values()];
+			await upsertPrTrackingRecord(sub.key, { accessScopeId, pr: sub.pr }, (record) =>
+				applyPrPollOutcome(record, { candidates, snapshot, nowMs }),
+			);
+		} catch (error) {
+			// A throwing fetch or record write (malformed record, disk error)
+			// must back off too; otherwise every tick re-polls GitHub.
+			backOff();
+			throw error;
 		}
 		sub.consecutiveFailures = 0;
-		const candidates = [...sub.candidates.values()];
-		await upsertPrTrackingRecord(sub.key, { accessScopeId, pr: sub.pr }, (record) =>
-			applyPrPollOutcome(record, { candidates, snapshot, nowMs }),
-		);
 		sub.nextPollAt = nowMs + POLL_INTERVAL_MS + Math.floor(Math.random() * POLL_JITTER_MS);
 	}
 
@@ -830,6 +840,24 @@ export class PrCommentAutomationService {
 		if (pending.length === 0) {
 			await this.cancelPendingRecord(sub);
 			return;
+		}
+		// The persisted deadline came from the last poll. Feedback that
+		// arrived since then restarts the quiet window (still capped from
+		// first pending), so a reviewer who is still commenting is never
+		// interrupted mid-batch.
+		const freshFingerprint = computePrFeedbackFingerprint(pending);
+		if (freshFingerprint !== null) {
+			const freshDeadline = Math.min(
+				Math.max(freshFingerprint.watermark + DEBOUNCE_MS, automation.debounceDeadline),
+				(automation.firstPendingAt ?? nowMs) + MAX_PENDING_MS,
+			);
+			if (nowMs < freshDeadline) {
+				const candidates = [...sub.candidates.values()];
+				await upsertPrTrackingRecord(sub.key, { accessScopeId, pr: sub.pr }, (current) =>
+					applyPrPollOutcome(current, { candidates, snapshot, nowMs }),
+				);
+				return;
+			}
 		}
 		// Wait while a conflicting writer, review, or manual operation is
 		// active: never inject feedback mid-turn.

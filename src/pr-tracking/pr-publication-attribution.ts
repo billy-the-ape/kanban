@@ -98,6 +98,25 @@ const GH_VALUE_FLAGS = new Set([
 	"--project",
 ]);
 /** `gh api` flags whose next token is a value. */
+/** gh substitutes these endpoint segments from the current repository. */
+const GH_REPO_PLACEHOLDERS = new Set(["{owner}", "{repo}", ":owner", ":repo"]);
+
+/**
+ * Whether `gh pr review` arguments publish a review that can carry feedback:
+ * a comment or request-changes review (both require a body), or an approval
+ * with a body. A bare approval publishes no feedback text.
+ */
+function isPublishingReview(args: string[]): boolean {
+	const has = (...flags: string[]): boolean =>
+		args.some(
+			(arg) => flags.includes(arg) || flags.some((flag) => flag.startsWith("--") && arg.startsWith(`${flag}=`)),
+		);
+	if (has("--comment", "-c", "--request-changes", "-r")) {
+		return true;
+	}
+	return has("--approve", "-a") && has("--body", "-b", "--body-file", "-F");
+}
+
 const GH_API_VALUE_FLAGS = new Set([
 	"-f",
 	"-F",
@@ -227,7 +246,7 @@ export function detectPublicationOperations(commands: string[]): PrPublicationOp
 						explicitNumber: selection.number,
 						fragment,
 					});
-				} else if (action === "review" && tokens.slice(3).includes("--comment")) {
+				} else if (action === "review" && isPublishingReview(tokens.slice(3))) {
 					if (tokens.slice(3).includes("--web")) {
 						continue;
 					}
@@ -312,6 +331,12 @@ export function detectPublicationOperations(commands: string[]): PrPublicationOp
 				}
 				const parsed = parseApiWriteEndpoint(normalizedEndpoint);
 				const repoMatch = /^repos\/([^/]+)\/([^/]+)/.exec(normalizedEndpoint);
+				// gh fills `{owner}/{repo}` (and `:owner/:repo`) from the current
+				// repository: that is an implicit selector, not an explicit one.
+				const explicitRepository =
+					repoMatch && !GH_REPO_PLACEHOLDERS.has(repoMatch[1]) && !GH_REPO_PLACEHOLDERS.has(repoMatch[2])
+						? `${repoMatch[1]}/${repoMatch[2]}`
+						: null;
 				const numberMatch = /\/(\d+)\/(comments|reviews)/.exec(normalizedEndpoint);
 				if (!parsed) {
 					// A write to an endpoint that cannot create PR feedback
@@ -322,7 +347,7 @@ export function detectPublicationOperations(commands: string[]): PrPublicationOp
 				push({
 					operation: "gh api",
 					kind: parsed.kind,
-					explicitRepository: repoMatch ? `${repoMatch[1]}/${repoMatch[2]}` : null,
+					explicitRepository,
 					explicitNumber: numberMatch ? Number.parseInt(numberMatch[1], 10) : null,
 					fragment,
 				});

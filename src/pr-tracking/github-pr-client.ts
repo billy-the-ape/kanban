@@ -274,10 +274,30 @@ function mapReviews(entries: ReviewEntry[]): PrFeedbackEvent[] {
 	return events;
 }
 
-function mapInlineComments(entries: InlineCommentEntry[], resolvedIds: Set<number>): PrFeedbackEvent[] {
+/** Ids of unsubmitted (PENDING) reviews: their draft inline comments are not feedback yet. */
+function pendingReviewIds(entries: ReviewEntry[]): Set<number> {
+	const ids = new Set<number>();
+	for (const entry of entries) {
+		if (entry.state === "PENDING" && typeof entry.id === "number") {
+			ids.add(entry.id);
+		}
+	}
+	return ids;
+}
+
+function mapInlineComments(
+	entries: InlineCommentEntry[],
+	resolvedIds: Set<number>,
+	draftReviewIds: Set<number>,
+): PrFeedbackEvent[] {
 	const events: PrFeedbackEvent[] = [];
 	for (const entry of entries) {
 		if (typeof entry.id !== "number" || resolvedIds.has(entry.id)) {
+			continue;
+		}
+		// The authenticated user's own draft comments are returned by this
+		// endpoint too; they are unpublished until the review is submitted.
+		if (typeof entry.pull_request_review_id === "number" && draftReviewIds.has(entry.pull_request_review_id)) {
 			continue;
 		}
 		const body = typeof entry.body === "string" ? entry.body.trim() : "";
@@ -422,7 +442,7 @@ export function createGitHubPrClient(
 				htmlUrl: typeof metadata.html_url === "string" ? metadata.html_url : null,
 				events: [
 					...mapReviews(reviews.items),
-					...mapInlineComments(inlineComments.items, resolved.ids),
+					...mapInlineComments(inlineComments.items, resolved.ids, pendingReviewIds(reviews.items)),
 					...mapConversationComments(conversationComments.items),
 				],
 			};

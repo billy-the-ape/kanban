@@ -329,3 +329,50 @@ describe("resolvePublicationOutput multi-object guard", () => {
 		expect(resolution.identities).toEqual([]);
 	});
 });
+
+describe("detectPublicationOperations gh pr review forms", () => {
+	it.each([
+		"gh pr review 42 -c -b 'addressed'",
+		"gh pr review 42 --comment -b 'addressed'",
+		"gh pr review 42 -r -b 'needs work'",
+		"gh pr review 42 --request-changes --body 'needs work'",
+		"gh pr review 42 -a -b 'looks good'",
+		"gh pr review 42 --approve --body='looks good'",
+	])("recognizes %s as a review publication", (fragment) => {
+		expect(detectPublicationOperations([fragment])).toEqual([
+			{ operation: "gh pr review", kind: "review", explicitRepository: null, explicitNumber: 42, fragment },
+		]);
+	});
+
+	it("ignores a bare approval, which publishes no feedback text", () => {
+		expect(detectPublicationOperations(["gh pr review 42 --approve", "gh pr review 42 -a"])).toEqual([]);
+	});
+});
+
+describe("detectPublicationOperations gh api repo placeholders", () => {
+	it.each([
+		"gh api repos/{owner}/{repo}/issues/42/comments -f body='addressing'",
+		"gh api repos/:owner/:repo/issues/42/comments -f body='addressing'",
+	])("treats %s as an implicit repository selector", (fragment) => {
+		expect(detectPublicationOperations([fragment])).toEqual([
+			{ operation: "gh api", kind: "conversation", explicitRepository: null, explicitNumber: 42, fragment },
+		]);
+	});
+
+	it("attributes a placeholder write to the single linked PR instead of dropping it", () => {
+		const observation = analyzePrPublication({
+			toolName: "run_command",
+			commands: ["gh api repos/{owner}/{repo}/issues/42/comments -f body='addressing'"],
+			output: JSON.stringify({
+				id: 77,
+				issue_url: "https://api.github.com/repos/octo/repo/issues/42",
+				html_url: "https://github.com/octo/repo/pull/42#issuecomment-77",
+			}),
+			error: null,
+			linkedPullRequests: [TARGET],
+		});
+		expect(observation.status).toBe("published");
+		expect(observation.target).toEqual(TARGET);
+		expect(observation.identities).toEqual([{ kind: "conversation", id: 77 }]);
+	});
+});
