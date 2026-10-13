@@ -678,6 +678,50 @@ describe("PrCommentAutomationService", () => {
 		expect(harness.snapshotCalls).toHaveLength(1);
 	});
 
+	it("never re-sends a queued dispatch whose send was already attempted", async () => {
+		// The post-send write failed (or a restart left the record behind):
+		// the dispatch is still queued but attemptedAt is set.
+		const event = makeEvent({ providerId: "conversation-1", updatedAt: NOW - 471_000 });
+		const fingerprint = fingerprintOf([event]);
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			taskBindings: [{ workspaceId: "w1", taskId: "t1", terminal: false }],
+			commentAutomation: {
+				...record.commentAutomation,
+				repairOwner: { workspaceId: "w1", taskId: "t1", revision: 1 },
+				pendingFeedbackFingerprint: fingerprint,
+				pendingCount: 1,
+				firstPendingAt: NOW - 590_000,
+				debounceDeadline: NOW - 351_000,
+				dispatch: {
+					dispatchId: "d-attempted",
+					attemptedAt: NOW - 60_000,
+					fingerprint,
+					ownerRevision: 1,
+					status: "queued",
+					turnRef: null,
+					error: null,
+				},
+			},
+		}));
+		const harness = makeService({
+			workspaceStates: new Map([
+				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })])],
+			]),
+			snapshot: { events: [event] },
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(0);
+		const loaded = await loadPrTrackingRecord(KEY);
+		if (loaded.status !== "ok") {
+			throw new Error("unreachable");
+		}
+		expect(loaded.record.commentAutomation.dispatch?.status).toBe("failed");
+		expect(loaded.record.commentAutomation.dispatch?.error).toContain("outcome is unknown");
+	});
+
 	it("does not send twice when ticks overlap", async () => {
 		const event = makeEvent({ providerId: "conversation-1", updatedAt: NOW - 471_000 });
 		const fingerprint = fingerprintOf([event]);

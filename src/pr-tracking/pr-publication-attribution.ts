@@ -146,7 +146,7 @@ const MAX_SHELL_WRAP_DEPTH = 3;
  * calls that can produce a new eligible feedback event.
  */
 const GRAPHQL_FEEDBACK_MUTATION_PATTERN =
-	/\b(addComment|addPullRequestReview|addPullRequestReviewComment|addCommentsToDraftReview)\(/;
+	/\b(?:addComment|addPullRequestReview\w*|addCommentsToDraftReview|submitPullRequestReview)\s*[({]/;
 
 function isDigits(value: string): boolean {
 	return value.length > 0 && /^\d+$/.test(value);
@@ -386,7 +386,11 @@ function detectGhOperation(
 			const inlineQuery = tokens
 				.map((token) => token.replace(/^(--field=|--raw-field=|-[fF])/, ""))
 				.find((token) => token.startsWith("query="));
-			const createsFeedback = inlineQuery === undefined || GRAPHQL_FEEDBACK_MUTATION_PATTERN.test(inlineQuery);
+			// `query=@file` reads the query from a file, which cannot be ruled out.
+			const createsFeedback =
+				inlineQuery === undefined ||
+				inlineQuery.startsWith("query=@") ||
+				GRAPHQL_FEEDBACK_MUTATION_PATTERN.test(inlineQuery);
 			if (createsFeedback) {
 				const repoFlag = tokens.findIndex((token) => token === "-R" || token === "--repo");
 				push({

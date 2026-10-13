@@ -431,3 +431,17 @@ describe("detectPublicationOperations gh api attached payload forms", () => {
 		).toHaveLength(1);
 	});
 });
+
+describe("detectPublicationOperations graphql feedback mutations", () => {
+	it.each([
+		"gh api graphql -f query='mutation { addPullRequestReviewThreadReply(input: {}) { comment { id } } }'",
+		"gh api graphql -f query='mutation { addPullRequestReviewThread(input: {}) { thread { id } } }'",
+		"gh api graphql -f query='mutation { submitPullRequestReview(input: {}) { pullRequestReview { id } } }'",
+		"gh api graphql -f query='mutation { addComment (input: {}) { clientMutationId } }'",
+		"gh api graphql -F query=@reply.graphql",
+	])("treats %s as an unattributable publication", (fragment) => {
+		expect(detectPublicationOperations([fragment])).toEqual([
+			{ operation: "gh api graphql", kind: null, explicitRepository: null, explicitNumber: null, fragment },
+		]);
+	});
+});

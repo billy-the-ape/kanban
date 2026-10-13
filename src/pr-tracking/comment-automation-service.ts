@@ -366,6 +366,8 @@ export class PrCommentAutomationService {
 	 * a later write succeeds or the user resumes; never a silent resume.
 	 */
 	private readonly captureBlocked = new Set<string>();
+	/** PR keys with a send in progress (between the `attemptedAt` write and the outcome write). */
+	private readonly sendsInFlight = new Set<string>();
 	private timer: NodeJS.Timeout | null = null;
 	private started = false;
 	private disposed = false;
@@ -774,6 +776,18 @@ export class PrCommentAutomationService {
 			return;
 		}
 
+		// A queued dispatch whose send was already attempted (the post-send
+		// write failed, or a restart left it behind) has an unknown outcome:
+		// never send it again automatically; surface it for an explicit Resume.
+		if (
+			dispatch !== null &&
+			dispatch.status === "queued" &&
+			dispatch.attemptedAt !== null &&
+			!this.sendsInFlight.has(sub.key)
+		) {
+			await this.setDispatchFailed(sub, `A previous send attempt's outcome is unknown; resume manually.`);
+			return;
+		}
 		// A failed dispatch is sticky: only an explicit Resume can retry it.
 		// dispatch === null or completed stays dispatchable so records that
 		// predate queued-intent creation (or lost it) still settle when due.
@@ -948,33 +962,11 @@ export class PrCommentAutomationService {
 				},
 			},
 		}));
-		// Persist the attempted-at timestamp immediately before invoking the
-		// send so a crash in flight is never ambiguous. The attempt joins the
-		// durable safety-cap history (unique per dispatchId) in the same write.
-		await upsertPrTrackingRecord(sub.key, identity, (record) => {
-			const dispatch = record.commentAutomation.dispatch;
-			if (dispatch === null || dispatch.dispatchId !== dispatchId) {
-				return record;
-			}
-			return {
-				...record,
-				revision: record.revision + 1,
-				commentAutomation: {
-					...record.commentAutomation,
-					autoSendAttempts: [
-						...pruneAutoSendAttempts(record.commentAutomation.autoSendAttempts, nowMs),
-						{ dispatchId, attemptedAt: nowMs },
-					],
-					dispatch: { ...dispatch, attemptedAt: nowMs },
-				},
-			};
-		});
-		const response = await this.deps.sendTaskChatMessage(scope, {
-			taskId: owner.taskId,
-			text: buildCommentHandlingInstruction(sub.pr.url),
-			mode: "act",
-		});
-		if (response.ok) {
+		this.sendsInFlight.add(sub.key);
+		try {
+			// Persist the attempted-at timestamp immediately before invoking the
+			// send so a crash in flight is never ambiguous. The attempt joins the
+			// durable safety-cap history (unique per dispatchId) in the same write.
 			await upsertPrTrackingRecord(sub.key, identity, (record) => {
 				const dispatch = record.commentAutomation.dispatch;
 				if (dispatch === null || dispatch.dispatchId !== dispatchId) {
@@ -985,38 +977,65 @@ export class PrCommentAutomationService {
 					revision: record.revision + 1,
 					commentAutomation: {
 						...record.commentAutomation,
-						pendingFeedbackFingerprint: null,
-						pendingCount: null,
-						debounceDeadline: null,
-						firstPendingAt: null,
-						lastDispatchedFeedbackFingerprint: captured,
-						dispatch: {
-							...dispatch,
-							status: "running",
-							turnRef: response.message?.id ?? null,
-							error: null,
-						},
+						autoSendAttempts: [
+							...pruneAutoSendAttempts(record.commentAutomation.autoSendAttempts, nowMs),
+							{ dispatchId, attemptedAt: nowMs },
+						],
+						dispatch: { ...dispatch, attemptedAt: nowMs },
 					},
 				};
 			});
-			return { status: "sent" };
-		}
-		const error = response.error ?? `Could not send the comment-handling instruction.`;
-		await upsertPrTrackingRecord(sub.key, identity, (record) => {
-			const dispatch = record.commentAutomation.dispatch;
-			if (dispatch === null || dispatch.dispatchId !== dispatchId) {
-				return record;
+			const response = await this.deps.sendTaskChatMessage(scope, {
+				taskId: owner.taskId,
+				text: buildCommentHandlingInstruction(sub.pr.url),
+				mode: "act",
+			});
+			if (response.ok) {
+				await upsertPrTrackingRecord(sub.key, identity, (record) => {
+					const dispatch = record.commentAutomation.dispatch;
+					if (dispatch === null || dispatch.dispatchId !== dispatchId) {
+						return record;
+					}
+					return {
+						...record,
+						revision: record.revision + 1,
+						commentAutomation: {
+							...record.commentAutomation,
+							pendingFeedbackFingerprint: null,
+							pendingCount: null,
+							debounceDeadline: null,
+							firstPendingAt: null,
+							lastDispatchedFeedbackFingerprint: captured,
+							dispatch: {
+								...dispatch,
+								status: "running",
+								turnRef: response.message?.id ?? null,
+								error: null,
+							},
+						},
+					};
+				});
+				return { status: "sent" };
 			}
-			return {
-				...record,
-				revision: record.revision + 1,
-				commentAutomation: {
-					...record.commentAutomation,
-					dispatch: { ...dispatch, status: "failed", error },
-				},
-			};
-		});
-		return { status: "held", reason: error };
+			const error = response.error ?? `Could not send the comment-handling instruction.`;
+			await upsertPrTrackingRecord(sub.key, identity, (record) => {
+				const dispatch = record.commentAutomation.dispatch;
+				if (dispatch === null || dispatch.dispatchId !== dispatchId) {
+					return record;
+				}
+				return {
+					...record,
+					revision: record.revision + 1,
+					commentAutomation: {
+						...record.commentAutomation,
+						dispatch: { ...dispatch, status: "failed", error },
+					},
+				};
+			});
+			return { status: "held", reason: error };
+		} finally {
+			this.sendsInFlight.delete(sub.key);
+		}
 	}
 
 	private async setDispatchCompleted(sub: PrSubscriptionState): Promise<void> {
