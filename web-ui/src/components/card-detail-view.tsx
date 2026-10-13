@@ -330,6 +330,8 @@ function DiffModeButton({
 	);
 }
 
+type ToolbarOptions = RuntimeWorkspaceChangesMode | "pull_requests";
+
 function DiffToolbar({
 	mode,
 	onModeChange,
@@ -338,8 +340,8 @@ function DiffToolbar({
 	hideExpand,
 	reviewControl,
 }: {
-	mode: RuntimeWorkspaceChangesMode;
-	onModeChange: (mode: RuntimeWorkspaceChangesMode) => void;
+	mode: ToolbarOptions;
+	onModeChange: (mode: ToolbarOptions) => void;
 	isExpanded: boolean;
 	onToggleExpand: () => void;
 	hideExpand?: boolean;
@@ -365,7 +367,7 @@ function DiffToolbar({
 				<DiffModeButton active={mode === "last_turn"} onClick={() => onModeChange("last_turn")}>
 					Last Turn
 				</DiffModeButton>
-				<DiffModeButton active={mode === "pr_view"} onClick={() => onModeChange("pr_view")}>
+				<DiffModeButton active={mode === "pull_requests"} onClick={() => onModeChange("pull_requests")}>
 					PRs (0)
 					{/* TODO: SHOW ACTUAL NUMBER OF PRS ASSOCIATED TO THIS TASK */}
 				</DiffModeButton>
@@ -523,7 +525,7 @@ export function CardDetailView({
 	const terminalThemeColors = useTerminalThemeColors();
 	const [selectedPath, setSelectedPath] = useState<string | null>(null);
 	const [diffComments, setDiffComments] = useState<Map<string, DiffLineComment>>(new Map());
-	const [diffMode, setDiffMode] = useState<RuntimeWorkspaceChangesMode>("working_copy");
+	const [diffMode, setDiffMode] = useState<ToolbarOptions>("working_copy");
 	const [isDiffExpanded, setIsDiffExpanded] = useState(false);
 	const {
 		taskCardsPanelRatio,
@@ -577,7 +579,7 @@ export function CardDetailView({
 		selection.card.id,
 		currentProjectId,
 		selection.card.baseRef,
-		diffMode,
+		diffMode === "pull_requests" ? "working_copy" : diffMode,
 		taskWorkspaceStateVersion,
 		isDocumentVisible && !gitHistoryPanel && selection.column.id !== "trash" ? DETAIL_DIFF_POLL_INTERVAL_MS : null,
 		lastTurnViewKey,
@@ -840,7 +842,7 @@ export function CardDetailView({
 								/>
 							) : null}
 							<div className="flex min-h-0 flex-1">
-								{diffMode === "pr_view" ? (
+								{diffMode === "pull_requests" ? (
 									<TaskPrTrackingPanel
 										workspaceId={currentProjectId}
 										taskId={selection.card.id}
@@ -993,7 +995,7 @@ export function CardDetailView({
 									/>
 								) : null}
 								<div className="flex min-h-0 flex-1">
-									{diffMode === "pr_view" ? (
+									{diffMode === "pull_requests" ? (
 										<TaskPrTrackingPanel
 											workspaceId={currentProjectId}
 											taskId={selection.card.id}
