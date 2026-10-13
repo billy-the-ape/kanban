@@ -2,7 +2,7 @@
 
 Status: implementation-ready plan. Target: `billy-the-ape/kanban` `main`. Source baseline: `879a3a1`.
 
-Order: **1 of 3** in `docs/plans/sidebar-updates/`. Implement in this order: `paused-pill.md` → `tasks-tab.md` → `desktop-collapse.md`. This plan has no dependencies. `tasks-tab.md` depends on the shared module and the registry refactor introduced here. One PR / one squash commit.
+Order: **1 of 2** in `docs/plans/sidebar-updates/`. Implement in this order: `paused-pill.md` → `tasks-tab.md`. This plan has no dependencies. `tasks-tab.md` depends on the shared module and the registry refactor introduced here. One PR / one squash commit.
 
 All product decisions are made below. The implementer makes no product decisions.
 
@@ -41,14 +41,15 @@ The fix has two parts:
    | Column | Effective session summary | Display state |
    | --- | --- | --- |
    | `in_progress` | none, or a placeholder (see below) | `in_progress` (avoids a flash of Paused before a just-started session reports) |
-   | `in_progress` | `state === "running"`, including queued (`latestHookActivity.hookEventName === "concurrency_waiting"`) | `in_progress` |
+   | `in_progress` | `state === "running"` and queued for a concurrency slot (`latestHookActivity?.hookEventName === "concurrency_waiting"`) | `paused` |
+   | `in_progress` | `state === "running"`, not queued | `in_progress` |
    | `in_progress` | `state === "awaiting_review"` | `review` (keeps today's behavior for projects that are not open) |
    | `in_progress` | `state` is `"idle"`, `"interrupted"` or `"failed"` | `paused` |
    | any other column | any | the column id |
 
    A **placeholder** summary is one with `state === "idle" && startedAt === null && agentId === null`. `TerminalSessionManager` creates one through `createDefaultSummary` (`src/terminal/session-manager.ts:109-127`, stamped `updatedAt: now()`) when a terminal is attached for a task with no entry (`:977`). It describes no session, so it never classifies a card as Paused.
 
-   `idle` is what the composer's pause button produces (`cancelTaskTurn`, `src/cline-sdk/cline-task-session-service.ts:1004-1033`). `interrupted` comes from stop/abort and runtime shutdown. `failed` counts as Paused because the agent is not working.
+   `idle` is what the composer's pause button produces (`cancelTaskTurn`, `src/cline-sdk/cline-task-session-service.ts:1004-1033`). `interrupted` comes from stop/abort and runtime shutdown. `failed` counts as Paused because the agent is not working. A queued task (waiting for a concurrency slot) counts as Paused because no agent is working on it yet.
 2. **Counts shape.** `RuntimeProjectTaskCounts` gains a required `paused: number`. `in_progress` now means display state `in_progress` only. Paused cards are **not** also counted in `in_progress`.
 3. **Pill.** Order `B, IP, P, R, D, T`. Paused pill: `id: "paused"`, `title: "Paused"`, `shortLabel: "P"`, `toneClassName: "bg-status-gold/20 text-status-gold"`. Like the other pills, it is hidden when its count is 0, and the selected project row uses its existing `bg-accent-fg/20 text-accent-fg` override.
 4. **Merge rule.** For one task, given two summaries, keep the one with the larger `updatedAt`. On a tie, keep the **later-listed source** in the merge order defined for that call site. Exception: a placeholder candidate never replaces an existing non-placeholder summary, whatever its `updatedAt`, because its fresh timestamp would otherwise mask real session state. This is one shared helper used everywhere summaries from two sources meet.
@@ -152,7 +153,7 @@ In `src/trpc/workspace-api.ts` `saveState`, replace the overwrite loop with `inp
 ## Tests
 
 - `test/runtime/core/task-display-state.test.ts` (new):
-  - The full decision 1 table, one case per row, including queued `running` → `in_progress`, and `failed`/`idle`/`interrupted` → `paused`.
+  - The full decision 1 table, one case per row, including queued `running` (`concurrency_waiting`) → `paused`, other `running` → `in_progress`, and `failed`/`idle`/`interrupted` → `paused`.
   - `countTasksByDisplayState` over a mixed board: `in_progress + paused + review-from-in_progress` equals the In Progress column length.
   - `pickNewerSessionSummary` tie and older/newer cases, plus a newer placeholder losing to an older real summary and a placeholder kept when there is no current summary.
   - An In Progress card whose only summary is a placeholder classifies as `in_progress`, not `paused`.

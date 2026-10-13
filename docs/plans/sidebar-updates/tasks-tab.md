@@ -2,7 +2,7 @@
 
 Status: implementation-ready plan. Target: `billy-the-ape/kanban` `main`. Source baseline: `879a3a1`.
 
-Order: **2 of 3** in `docs/plans/sidebar-updates/`. It **depends on `paused-pill.md`**, which must be merged first. That plan provides `src/core/task-display-state.ts` (`RuntimeTaskDisplayState`, `resolveTaskDisplayState`, `mergeSessionSummaries`), the `@runtime-task-display-state` alias, `loadProjectTaskSnapshot` in the workspace registry, and `web-ui/src/components/project-task-count-badges.ts` (`TASK_DISPLAY_STATE_ORDER`, `TASK_DISPLAY_STATE_BADGE_META`). It is independent of `desktop-collapse.md`. One PR / one squash commit.
+Order: **2 of 2** in `docs/plans/sidebar-updates/`. It **depends on `paused-pill.md`**, which must be merged first. That plan provides `src/core/task-display-state.ts` (`RuntimeTaskDisplayState`, `resolveTaskDisplayState`, `mergeSessionSummaries`), the `@runtime-task-display-state` alias, `loadProjectTaskSnapshot` in the workspace registry, and `web-ui/src/components/project-task-count-badges.ts` (`TASK_DISPLAY_STATE_ORDER`, `TASK_DISPLAY_STATE_BADGE_META`). One PR / one squash commit.
 
 All product decisions are made below. The implementer makes no product decisions.
 
