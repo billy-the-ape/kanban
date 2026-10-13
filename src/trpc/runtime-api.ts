@@ -3,10 +3,9 @@
 // workspace actions, but detailed Cline, terminal, and config behavior
 // should stay in focused services instead of accumulating here.
 
-import { createWriteStream } from "node:fs";
-import { mkdir, rm } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { TRPCError } from "@trpc/server";
 import {
 	buildClineCompactionConfig,
@@ -55,7 +54,6 @@ import {
 	parseClineProviderSettingsSaveRequest,
 	parseClineUpdateProviderRequest,
 	parseCommandRunRequest,
-	parseDiagnosticsExportRequest,
 	parseRuntimeConfigSaveRequest,
 	parseShellSessionStartRequest,
 	parseTaskChatAbortRequest,
@@ -77,12 +75,11 @@ import {
 import { isHomeAgentSessionId } from "../core/home-agent-session";
 import { getTaskColumnId, moveTaskToColumn } from "../core/task-board-mutations";
 import { computeTaskPhase, isDeliveryResumable, type TaskPhaseInput } from "../core/task-diagnostics";
-import { streamTaskDiagnosticsExportV3 } from "../core/task-diagnostics-export-stream";
-import { buildTaskDiagnosticsExportV3 } from "../core/task-diagnostics-export-v3";
+import { buildTaskDiagnosticsExportV3, type TaskDiagnosticsExportV3Plan } from "../core/task-diagnostics-export-v3";
 import { resolveTaskTitle } from "../core/task-title.js";
 import { reconcileOrphanedSessionSummary, resolveWorkspaceSessionSummaries } from "../core/workspace-session-summaries";
 import { openInBrowser } from "../server/browser";
-import { getRuntimeHomePath, loadWorkspaceBoardById, mutateWorkspaceState } from "../state/workspace-state";
+import { loadWorkspaceBoardById, mutateWorkspaceState } from "../state/workspace-state";
 import { readTaskDispatchRecord, writeTaskDispatchRecord } from "../task-dispatch/dispatch-records";
 import {
 	collectTaskDispatchSessions,
@@ -1296,72 +1293,31 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			taskDiagnosticsActionInFlight.set(dedupKey, run);
 			return await run;
 		},
-		// DIAG-2: streams the full-fidelity diagnostic bundle (schemaVersion 3)
-		// to ~/.cline/kanban/diagnostics/ (never into the workspace itself).
-		// The bundle carries the unmodified, complete transcripts of every
-		// session the task owns plus the full operational diagnostics response;
-		// the streaming serializer keeps memory bounded and an aborted client
-		// can never receive a truncated bundle as a success.
-		exportTaskDiagnostics: async (workspaceScope, input) => {
-			try {
-				const body = parseDiagnosticsExportRequest(input);
-				const snapshot = await gatherTaskDiagnosticsSnapshot(workspaceScope, body.taskId);
-				const diagnostics = await buildTaskDiagnosticsResponse(workspaceScope, snapshot);
-				const { taskSnapshot, reviewSnapshot } = await deps
-					.getTaskExportSnapshot(workspaceScope, body.taskId)
-					.catch(() => ({ taskSnapshot: null, reviewSnapshot: null }));
-				const plan = await buildTaskDiagnosticsExportV3({
-					taskId: body.taskId,
-					diagnostics,
-					taskPrompt: snapshot.taskPrompt,
-					sessionSnapshots: [
-						...(taskSnapshot ? [taskSnapshot] : []),
-						...(reviewSnapshot && reviewSnapshot.segments.length > 0 ? [reviewSnapshot] : []),
-					],
-					sessionSource: snapshot.session.source,
-					sessionSummary: snapshot.session.summary,
-					capturedAt: Date.now(),
-					exportedAt: new Date().toISOString(),
-				});
-				const safeTaskId = body.taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
-				const bundlePath = join(getRuntimeHomePath(), "diagnostics", `task-${safeTaskId}-${Date.now()}.json`);
-				await mkdir(dirname(bundlePath), { recursive: true });
-				const bundleStream = createWriteStream(bundlePath);
-				// A write error can arrive before end() is called; an "error" event
-				// with no listener crashes the process, and without one the mutation
-				// would hang on a stream that never closes.
-				const bundleStreamFailed = new Promise<never>((_, reject) => {
-					bundleStream.once("error", reject);
-				});
-				// Abort the serializer from the failure path so it cannot stay
-				// suspended on backpressure or artifact I/O with an open fd.
-				const exportController = new AbortController();
-				try {
-					await Promise.race([
-						(async () => {
-							await streamTaskDiagnosticsExportV3(bundleStream, plan, { signal: exportController.signal });
-							// Close the target so the bundle is durable before we report
-							// success. The end callback receives the flush error directly
-							// (the "error" event only lands after the fd closes), so it
-							// is the source of truth for a failed final flush.
-							await new Promise<void>((resolve, reject) => {
-								bundleStream.end((endError?: Error | null) => (endError ? reject(endError) : resolve()));
-							});
-						})(),
-						bundleStreamFailed,
-					]);
-				} catch (streamError) {
-					exportController.abort();
-					bundleStream.destroy();
-					// Never leave a truncated bundle behind.
-					await rm(bundlePath, { force: true }).catch(() => undefined);
-					throw streamError;
-				}
-				return { ok: true, bundlePath, redactions: [], error: null };
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				return { ok: false, bundlePath: null, redactions: [], error: message };
-			}
+		// DIAG-3: assemble the full-fidelity diagnostic export plan
+		// (schemaVersion 3) for the GET download route. Read-only: it never
+		// starts, restarts, or mutates a session and never writes host files;
+		// the route streams the plan to the response and the client owns the
+		// resulting file. A missing transcript snapshot degrades to an
+		// explicit transcript gap, never an error.
+		buildTaskDiagnosticsExportPlan: async (workspaceScope, taskId): Promise<TaskDiagnosticsExportV3Plan> => {
+			const snapshot = await gatherTaskDiagnosticsSnapshot(workspaceScope, taskId);
+			const diagnostics = await buildTaskDiagnosticsResponse(workspaceScope, snapshot);
+			const { taskSnapshot, reviewSnapshot } = await deps
+				.getTaskExportSnapshot(workspaceScope, taskId)
+				.catch(() => ({ taskSnapshot: null, reviewSnapshot: null }));
+			return await buildTaskDiagnosticsExportV3({
+				taskId,
+				diagnostics,
+				taskPrompt: snapshot.taskPrompt,
+				sessionSnapshots: [
+					...(taskSnapshot ? [taskSnapshot] : []),
+					...(reviewSnapshot && reviewSnapshot.segments.length > 0 ? [reviewSnapshot] : []),
+				],
+				sessionSource: snapshot.session.source,
+				sessionSummary: snapshot.session.summary,
+				capturedAt: Date.now(),
+				exportedAt: new Date().toISOString(),
+			});
 		},
 		returnQueuedTaskToBacklog: async (workspaceScope, input) => {
 			const body = parseTaskSessionStopRequest(input);

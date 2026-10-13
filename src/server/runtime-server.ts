@@ -62,6 +62,7 @@ import {
 } from "./request-auth-gate";
 import type { RuntimeStateHub } from "./runtime-state-hub";
 import { runStartupTaskWorkspaceMaintenance } from "./startup-maintenance";
+import { handleTaskDiagnosticsDownload, TASK_DIAGNOSTICS_DOWNLOAD_PATHNAME } from "./task-diagnostics-download";
 import { isTaskWriterActive } from "./task-writer-activity";
 import type { WorkspaceRegistry } from "./workspace-registry";
 
@@ -660,6 +661,16 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			}
 			if (pathname.startsWith("/api/trpc")) {
 				await trpcHttpHandler(req, res);
+				return;
+			}
+			// DIAG-3: full-fidelity diagnostics download, dispatched after the
+			// auth gate and before the unmatched /api/ 404. Streams the
+			// schemaVersion 3 bundle to the response; never writes host files.
+			if (pathname === TASK_DIAGNOSTICS_DOWNLOAD_PATHNAME) {
+				await handleTaskDiagnosticsDownload(req, res, requestUrl, {
+					buildExportPlan: (scope, taskId) => buildRuntimeApi().buildTaskDiagnosticsExportPlan(scope, taskId),
+					warn: deps.warn,
+				});
 				return;
 			}
 			if (pathname.startsWith("/api/")) {

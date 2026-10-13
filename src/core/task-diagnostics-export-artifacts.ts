@@ -136,13 +136,16 @@ export async function resolveTaskToolFullOutput(input: {
 			await Promise.all(indexedEntries.map((entry) => resolveContainedArtifactPath(input.taskId, entry.fileName)))
 		).filter((candidate): candidate is { path: string; fileName: string } => candidate !== null);
 		if (resolved.length === 1) {
-			return {
-				status: "resolved",
-				artifactFileName: resolved[0].fileName,
-				artifactPath: resolved[0].path,
-				contentFormat: await classifyArtifactContentFormat(resolved[0].path).catch(() => "text" as const),
-				gap: null,
-			};
+			const only = resolved[0];
+			if (only) {
+				return {
+					status: "resolved",
+					artifactFileName: only.fileName,
+					artifactPath: only.path,
+					contentFormat: await classifyArtifactContentFormat(only.path).catch(() => "text" as const),
+					gap: null,
+				};
+			}
 		}
 		if (resolved.length > 1) {
 			return {
@@ -162,18 +165,21 @@ export async function resolveTaskToolFullOutput(input: {
 	const entries = await readdir(getTaskContextArtifactsDir(input.taskId)).catch(() => []);
 	const matches = entries.filter((name) => name.startsWith(prefix) && name.endsWith(".txt"));
 	if (matches.length === 1) {
+		const candidate = matches[0];
 		// Run the single match through the same containment check as every
 		// other reference (a bare stat follows symlinks and would accept an
 		// escape symlink).
-		const resolved = await resolveContainedArtifactPath(input.taskId, matches[0]);
-		if (resolved) {
-			return {
-				status: "resolved",
-				artifactFileName: resolved.fileName,
-				artifactPath: resolved.path,
-				contentFormat: await classifyArtifactContentFormat(resolved.path).catch(() => "text" as const),
-				gap: null,
-			};
+		if (candidate) {
+			const resolved = await resolveContainedArtifactPath(input.taskId, candidate);
+			if (resolved) {
+				return {
+					status: "resolved",
+					artifactFileName: resolved.fileName,
+					artifactPath: resolved.path,
+					contentFormat: await classifyArtifactContentFormat(resolved.path).catch(() => "text" as const),
+					gap: null,
+				};
+			}
 		}
 	} else if (matches.length > 1) {
 		return {

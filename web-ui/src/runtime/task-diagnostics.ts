@@ -1,9 +1,10 @@
 // B-10: web-side wrappers for the operational-controls & diagnostics
-// procedures. The runtime owns the phase model, action availability, and
-// redaction; these helpers only translate failures into usable shapes.
+// procedures. The runtime owns the phase model, action availability, and the
+// full-fidelity export bundle (DIAG-3 downloads it; see
+// task-diagnostics-download.ts); these helpers only translate failures into
+// usable shapes.
 import { getRuntimeTrpcClient } from "@/runtime/trpc-client";
 import type {
-	RuntimeDiagnosticsExportResponse,
 	RuntimeTaskDiagnosticsActionName,
 	RuntimeTaskDiagnosticsActionResponse,
 	RuntimeTaskDiagnosticsResponse,
@@ -51,17 +52,5 @@ export async function fetchTaskPhases(
 		return response.phases;
 	} catch {
 		return {};
-	}
-}
-
-/** B-10.7: write the redacted diagnostic bundle (explicit operator action only). */
-export async function exportTaskDiagnostics(
-	workspaceId: string | null,
-	taskId: string,
-): Promise<RuntimeDiagnosticsExportResponse | null> {
-	try {
-		return await getRuntimeTrpcClient(workspaceId).runtime.exportTaskDiagnostics.mutate({ taskId });
-	} catch {
-		return null;
 	}
 }

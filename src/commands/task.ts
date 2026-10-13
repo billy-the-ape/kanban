@@ -1,3 +1,7 @@
+import { createWriteStream } from "node:fs";
+import { rm } from "node:fs/promises";
+import { resolve } from "node:path";
+import { Readable } from "node:stream";
 import { createTRPCProxyClient, httpBatchLink } from "@trpc/client";
 import type { Command } from "commander";
 
@@ -1358,14 +1362,118 @@ async function taskQueueCommand(input: { cwd: string; projectPath?: string }): P
 	return { ...phases, workspacePath: workspaceRepoPath };
 }
 
+/**
+ * DIAG-3: download the task's full-fidelity diagnostics bundle (schemaVersion
+ * 3 JSON) from the runtime's GET download route into the caller-named file.
+ * The bundle includes the complete unredacted conversation, so it is only
+ * written after a successful, complete download; a partial download is
+ * deleted and reported as a failure.
+ */
 async function taskExportDiagnosticsCommand(input: {
 	cwd: string;
 	taskId: string;
+	output: string;
 	projectPath?: string;
 }): Promise<JsonRecord> {
-	const { workspaceRepoPath, runtimeClient } = await connectTaskWorkspace(input);
-	const result = await runtimeClient.runtime.exportTaskDiagnostics.mutate({ taskId: input.taskId });
-	return { ...result, workspacePath: workspaceRepoPath };
+	const workspaceRepoPath = await resolveWorkspaceRepoPath(input.projectPath, input.cwd);
+	const workspaceId = await ensureRuntimeWorkspace(workspaceRepoPath);
+	const outputFilePath = resolve(input.cwd, input.output);
+	const url = buildKanbanRuntimeUrl(
+		`/api/task-diagnostics/download?workspaceId=${encodeURIComponent(workspaceId)}&taskId=${encodeURIComponent(
+			input.taskId,
+		)}`,
+	);
+	const runtimeFetch = await getRuntimeFetch();
+	const response = await runtimeFetch(url);
+	if (!response.ok) {
+		const detail = await readRuntimeJsonErrorDetail(response);
+		await response.body?.cancel().catch(() => undefined);
+		process.exitCode = 1;
+		return {
+			ok: false,
+			error: `Diagnostics download failed: ${detail}`,
+			outputPath: outputFilePath,
+			bytes: 0,
+			completeness: null,
+		};
+	}
+	const responseBody = response.body;
+	if (!responseBody) {
+		process.exitCode = 1;
+		return {
+			ok: false,
+			error: "Diagnostics download failed: empty response body.",
+			outputPath: outputFilePath,
+			bytes: 0,
+			completeness: null,
+		};
+	}
+	const stream = Readable.fromWeb(responseBody);
+	let bytes = 0;
+	const writeStream = createWriteStream(outputFilePath);
+	// A write error can arrive before end() is called; an "error" event with no
+	// listener crashes the process, and without one this command would hang on
+	// a stream that never closes.
+	const writeStreamFailed = new Promise<never>((_, reject) => {
+		writeStream.once("error", reject);
+	});
+	try {
+		await Promise.race([
+			(async () => {
+				for await (const chunk of stream) {
+					const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
+					bytes += buffer.length;
+					if (!writeStream.write(buffer)) {
+						await new Promise<void>((resolveWait) => writeStream.once("drain", resolveWait));
+					}
+				}
+				// Close the target so the file is durable before we report success.
+				// The end callback receives the flush error directly (the "error"
+				// event only lands after the fd closes), so it is the source of
+				// truth for a failed final flush.
+				await new Promise<void>((resolveEnd, rejectEnd) => {
+					writeStream.end((endError?: Error | null) => (endError ? rejectEnd(endError) : resolveEnd()));
+				});
+			})(),
+			writeStreamFailed,
+		]);
+	} catch (error) {
+		stream.destroy();
+		writeStream.destroy();
+		// Never leave a truncated bundle behind.
+		await rm(outputFilePath, { force: true }).catch(() => undefined);
+		process.exitCode = 1;
+		return {
+			ok: false,
+			error: `Diagnostics download failed: ${error instanceof Error ? error.message : String(error)}`,
+			outputPath: outputFilePath,
+			bytes,
+			completeness: null,
+		};
+	}
+	const completeness = response.headers.get("x-kanban-diagnostics-completeness");
+	return {
+		ok: true,
+		outputPath: outputFilePath,
+		bytes,
+		workspacePath: workspaceRepoPath,
+		completeness:
+			completeness === "complete" || completeness === "partial" || completeness === "unavailable"
+				? completeness
+				: null,
+	};
+}
+
+async function readRuntimeJsonErrorDetail(response: Response): Promise<string> {
+	try {
+		const body = (await response.json()) as { error?: unknown };
+		if (typeof body.error === "string" && body.error.trim().length > 0) {
+			return body.error.trim();
+		}
+	} catch {
+		// Non-JSON error body: fall back to the HTTP status.
+	}
+	return `HTTP ${response.status}`;
 }
 
 async function deleteTaskCommand(input: {
@@ -1820,15 +1928,19 @@ export function registerTaskCommand(program: Command): void {
 
 	task
 		.command("export-diag")
-		.description("Write the task's redacted diagnostic bundle to ~/.cline/kanban/diagnostics/ and print its path.")
+		.description(
+			"Download the task's full-fidelity diagnostics bundle (schemaVersion 3 JSON) to the file given by --output.",
+		)
 		.requiredOption("--task-id <id>", "Task ID.")
+		.requiredOption("--output <file>", "Destination file for the downloaded bundle.")
 		.option("--project-path <path>", "Workspace path. Defaults to current directory workspace.")
-		.action(async (options: { taskId: string; projectPath?: string }) => {
+		.action(async (options: { taskId: string; output: string; projectPath?: string }) => {
 			await runTaskCommand(
 				async () =>
 					await taskExportDiagnosticsCommand({
 						cwd: process.cwd(),
 						taskId: options.taskId,
+						output: options.output,
 						projectPath: options.projectPath,
 					}),
 			);

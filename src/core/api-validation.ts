@@ -12,7 +12,6 @@ import {
 	type RuntimeClineUpdateProviderRequest,
 	type RuntimeCommandRunRequest,
 	type RuntimeConfigSaveRequest,
-	type RuntimeDiagnosticsExportRequest,
 	type RuntimeDirectoryListRequest,
 	type RuntimeGitCheckoutRequest,
 	type RuntimeHookIngestRequest,
@@ -56,7 +55,6 @@ import {
 	runtimeClineUpdateProviderRequestSchema,
 	runtimeCommandRunRequestSchema,
 	runtimeConfigSaveRequestSchema,
-	runtimeDiagnosticsExportRequestSchema,
 	runtimeDirectoryListRequestSchema,
 	runtimeGitCheckoutRequestSchema,
 	runtimeHookIngestRequestSchema,
@@ -379,17 +377,6 @@ export function parseTaskPhasesRequest(value: unknown): RuntimeTaskPhasesRequest
 	const parsed = parseWithSchema(runtimeTaskPhasesRequestSchema, value);
 	return {
 		taskIds: parsed.taskIds.map((taskId) => taskId.trim()).filter((taskId) => taskId.length > 0),
-	};
-}
-
-export function parseDiagnosticsExportRequest(value: unknown): RuntimeDiagnosticsExportRequest {
-	const parsed = parseWithSchema(runtimeDiagnosticsExportRequestSchema, value);
-	const taskId = parsed.taskId.trim();
-	if (!taskId) {
-		throw new Error("Diagnostics export taskId cannot be empty.");
-	}
-	return {
-		taskId,
 	};
 }
 
