@@ -1,6 +1,6 @@
 # PRLINK-8 — Link from a URL sent in native task chat
 
-**Status: READY FOR IMPLEMENTATION. Depends on v1; independent of 6/7/9.**
+**Status: IMPLEMENTED (this PR). Depends on v1; independent of 6/7/9.**
 Master plan: [v1](../complete/pr-linking/PR_LINKING_PLAN.md). Shared context: [follow-ups](PRLINK-FOLLOWUPS.md).
 Deliver as one native-Cline chat PR. Terminal input support is explicitly deferred.
 
@@ -82,3 +82,28 @@ may already be an assistant/tool message when the send finishes.
 Acceptance: bare-URL shortcut works without reload; prose references require a user click;
 link-save errors do not fail or repeat the agent turn.
 Follow the shared verification/deployment rules in PRLINK-FOLLOWUPS.md.
+
+## Implementation notes (final state)
+
+- `src/core/pull-request-links.ts`: pure `classifyTaskChatMessageForPrLink`
+  (`auto_link` | `suggestions` | `none`, capped at three). `extractPullRequestLinks` now
+  also unwraps markdown links (`](` split into `) (`) and strips trailing `>`/backticks, so
+  `[text](url)`, `<url>`, and code-fenced references reach the suggestion path.
+- `src/workspace/task-pull-requests.ts`: the recorder now returns an `outcome`
+  (`recorded` | `duplicate` | `no_task` | `error` | `null`); the throttled `lastSeenAt` advance
+  is a write (`changed: true`) reported as `duplicate`, distinct from write failure.
+- `src/workspace/task-chat-pr-linking.ts`: `resolveTaskChatPrLinking` orchestrates
+  classify → recorder (`source: "manual"`) → authoritative `alreadyLinked` re-read; broadcasts
+  only on a write; `no_task`/`error` map to `failed` while the send stays ok.
+- `src/trpc/runtime-api.ts`: `sendTaskChatMessage` resolves linking only after a successful,
+  non-home-agent send and returns the optional `pullRequestLinking` field.
+- web-ui: the chat controller captures the latest completed send's outcome and clears the
+  notice on task/workspace change; `ClineChatPrLinkNotice` renders the linked/already_linked/
+  suggestions/failed states and reuses `workspace.addTaskPullRequest`/
+  `workspace.removeTaskPullRequest` with pending/error states and a scope guard against late
+  callbacks.
+- Tests: classifier matrix (`test/runtime/core/pull-request-links.test.ts`), outcome/recorder
+  coverage (`test/workspace/task-pull-requests.test.ts`), end-to-end resolution
+  (`test/workspace/task-chat-pr-linking.test.ts`), send wiring (`test/runtime/trpc/runtime-api.test.ts`),
+  and UI coverage in `clinet-chat-pr-link-notice.test.tsx`, `clinet-agent-chat-panel.test.tsx`,
+  and `use-cline-chat-runtime-actions.test.tsx`.

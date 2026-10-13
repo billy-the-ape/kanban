@@ -13,10 +13,10 @@ import React, {
 	useRef,
 	useState,
 } from "react";
-
 import { ClineChatComposer } from "@/components/detail-panels/cline-chat-composer";
 import { ClineChatMessageItem } from "@/components/detail-panels/cline-chat-message-item";
 import { getCompletedAssistantMessageId } from "@/components/detail-panels/cline-chat-message-utils";
+import { ClineChatPrLinkNotice } from "@/components/detail-panels/cline-chat-pr-link-notice";
 import {
 	buildClineAgentModelPickerOptions,
 	buildClineSelectedModelButtonText,
@@ -149,6 +149,8 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 			showAgentProgressIndicator,
 			showActionFooter,
 			showCancelAutomaticAction,
+			prLinkingNotice,
+			dismissPrLinkingNotice,
 			handleSendText,
 			handleSendDraft,
 			handleCancelTurn,
@@ -156,6 +158,7 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 			taskId,
 			summary,
 			taskColumnId,
+			workspaceId,
 			onSendMessage,
 			onCancelTurn,
 			onLoadMessages,
@@ -473,6 +476,16 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 						workspaceId={workspaceId}
 					/>
 				</div>
+				{prLinkingNotice && prLinkingNotice.taskId === taskId && prLinkingNotice.workspaceId === workspaceId ? (
+					<div className="px-2 pb-2">
+						<ClineChatPrLinkNotice
+							taskId={taskId}
+							linking={prLinkingNotice.linking}
+							workspaceId={workspaceId}
+							onDismiss={dismissPrLinkingNotice}
+						/>
+					</div>
+				) : null}
 				{showActionFooter ? (
 					<div className="flex flex-col gap-2 px-3 pb-3">
 						{showReviewActions ? (

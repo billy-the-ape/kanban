@@ -26,6 +26,7 @@ import type {
 	RuntimeGitDeliveryReceipt,
 	RuntimePrInstalledConsumer,
 	RuntimeRunUpdateResponse,
+	RuntimeTaskChatPrLinking,
 	RuntimeTaskDeliveryInfoResponse,
 	RuntimeTaskDeliveryStartResponse,
 	RuntimeTaskDiagnosticsActionResponse,
@@ -94,6 +95,7 @@ import { buildRuntimeConfigResponse, resolveAgentCommand } from "../terminal/age
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { createVerificationRunner } from "../verification/verification-service";
 import { evaluateDependentsUnlock, getGitDeliveryService, readTaskDeliveryReceipt } from "../workspace/git-delivery";
+import { resolveTaskChatPrLinking } from "../workspace/task-chat-pr-linking";
 import { getTaskInitialStartStatus as readTaskInitialStartStatus } from "../workspace/task-initial-start";
 import { readTaskPreservationRecord } from "../workspace/task-preservation";
 import { resetUnstartedQueuedWorktree } from "../workspace/task-queued-reset";
@@ -1714,10 +1716,26 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					}
 				}
 				const latestMessage = clineTaskSessionService.listMessages(body.taskId).at(-1) ?? null;
+				// PRLINK-8: a link is applied only now that the send (including
+				// the rebind/retry path) succeeded. Home-agent sessions never
+				// participate, and rejected sends return above without the
+				// field. resolveTaskChatPrLinking never throws.
+				let pullRequestLinking: RuntimeTaskChatPrLinking | undefined;
+				if (!isHomeAgentSessionId(body.taskId)) {
+					pullRequestLinking = await resolveTaskChatPrLinking({
+						workspaceId: workspaceScope.workspaceId,
+						workspacePath: workspaceScope.workspacePath,
+						taskId: body.taskId,
+						text: body.text,
+						hasImages: Boolean(body.images && body.images.length > 0),
+						broadcast: deps.broadcastRuntimeWorkspaceStateUpdated,
+					});
+				}
 				return {
 					ok: true,
 					summary,
 					message: latestMessage,
+					...(pullRequestLinking ? { pullRequestLinking } : {}),
 				};
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);

@@ -278,4 +278,54 @@ describe("useClineChatRuntimeActions", () => {
 		expect(abortTaskChatTurnMutateMock).not.toHaveBeenCalled();
 		expect(cancelTaskChatTurnMutateMock).not.toHaveBeenCalled();
 	});
+	it("surfaces pullRequestLinking from successful sends and omits it otherwise", async () => {
+		const state: { snapshot: HookSnapshot | null } = { snapshot: null };
+
+		const linking = {
+			status: "suggestions" as const,
+			links: [
+				{
+					provider: "github" as const,
+					host: "github.com",
+					repository: "owner/repo",
+					number: 12,
+					url: "https://github.com/owner/repo/pull/12",
+					alreadyLinked: false,
+				},
+			],
+		};
+		sendTaskChatMessageMutateMock
+			.mockResolvedValueOnce({
+				ok: true,
+				summary: createSummary("task-1"),
+				message: null,
+				pullRequestLinking: linking,
+			})
+			.mockResolvedValueOnce({ ok: true, summary: createSummary("task-1"), message: null });
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					currentProjectId="project-1"
+					onSessionSummary={vi.fn()}
+					onSnapshot={(snapshot) => {
+						state.snapshot = snapshot;
+					}}
+				/>,
+			);
+		});
+
+		const snapshot = state.snapshot;
+		if (!snapshot) {
+			throw new Error("Expected hook snapshot.");
+		}
+
+		const withLinking = await snapshot.sendTaskChatMessage("task-1", "https://github.com/owner/repo/pull/12");
+		expect(withLinking.ok).toBe(true);
+		expect(withLinking.pullRequestLinking).toEqual(linking);
+
+		const withoutLinking = await snapshot.sendTaskChatMessage("task-1", "No URLs here");
+		expect(withoutLinking.ok).toBe(true);
+		expect(withoutLinking.pullRequestLinking).toBeUndefined();
+	});
 });

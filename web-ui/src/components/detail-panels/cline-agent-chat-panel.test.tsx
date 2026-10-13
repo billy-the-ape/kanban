@@ -1163,4 +1163,105 @@ describe("ClineAgentChatPanel", () => {
 		expect(container.textContent).not.toContain("Open PR");
 		expect(container.textContent).toContain("Move To Trash");
 	});
+	it("shows the PR linking notice for the latest completed send and clears it on task change", async () => {
+		const linking = {
+			status: "suggestions" as const,
+			links: [
+				{
+					provider: "github" as const,
+					host: "github.com",
+					repository: "owner/repo",
+					number: 12,
+					url: "https://github.com/owner/repo/pull/12",
+					alreadyLinked: false,
+				},
+			],
+		};
+		const onSendMessage = vi.fn(async () => ({
+			ok: true,
+			chatMessage: null,
+			pullRequestLinking: linking,
+		}));
+		const panelRef = createRef<ClineAgentChatPanelHandle>();
+
+		await act(async () => {
+			renderPanel(
+				root,
+				<ClineAgentChatPanel
+					ref={panelRef}
+					taskId="task-1"
+					summary={createSummary("running")}
+					onLoadMessages={async () => []}
+					onSendMessage={onSendMessage}
+				/>,
+			);
+		});
+
+		await act(async () => {
+			if (panelRef.current) {
+				await panelRef.current.sendText("Please review the pull request");
+			}
+		});
+
+		expect(onSendMessage).toHaveBeenCalledWith("task-1", "Please review the pull request", { mode: "act" });
+		expect(container.textContent).toContain("Link owner/repo#12 to this task");
+
+		// A task switch clears the latest-send notice.
+		await act(async () => {
+			renderPanel(
+				root,
+				<ClineAgentChatPanel
+					taskId="task-2"
+					summary={createSummary("running", null, { taskId: "task-2" })}
+					onLoadMessages={async () => []}
+					onSendMessage={onSendMessage}
+				/>,
+			);
+			await Promise.resolve();
+		});
+		expect(container.textContent).not.toContain("Link owner/repo#12 to this task");
+	});
+
+	it("shows a linked confirmation with Remove link for a bare-URL send", async () => {
+		const onSendMessage = vi.fn(async () => ({
+			ok: true,
+			chatMessage: null,
+			pullRequestLinking: {
+				status: "linked" as const,
+				links: [
+					{
+						provider: "github" as const,
+						host: "github.com",
+						repository: "owner/repo",
+						number: 12,
+						url: "https://github.com/owner/repo/pull/12",
+						alreadyLinked: false,
+					},
+				],
+			},
+		}));
+		const panelRef = createRef<ClineAgentChatPanelHandle>();
+
+		await act(async () => {
+			renderPanel(
+				root,
+				<ClineAgentChatPanel
+					ref={panelRef}
+					taskId="task-1"
+					summary={createSummary("running")}
+					onLoadMessages={async () => []}
+					onSendMessage={onSendMessage}
+				/>,
+			);
+		});
+
+		await act(async () => {
+			if (panelRef.current) {
+				await panelRef.current.sendText("https://github.com/owner/repo/pull/12");
+			}
+		});
+
+		expect(container.textContent).toContain("Linked owner/repo#12");
+		expect(container.textContent).toContain("Remove link");
+	});
 });
