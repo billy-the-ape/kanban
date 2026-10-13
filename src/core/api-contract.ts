@@ -30,7 +30,7 @@ export const runtimeWorkspaceChangesRequestSchema = z.object({
 });
 export type RuntimeWorkspaceChangesRequest = z.infer<typeof runtimeWorkspaceChangesRequestSchema>;
 
-export const runtimeWorkspaceChangesModeSchema = z.enum(["working_copy", "last_turn"]);
+export const runtimeWorkspaceChangesModeSchema = z.enum(["working_copy", "last_turn", "pr_view"]);
 export type RuntimeWorkspaceChangesMode = z.infer<typeof runtimeWorkspaceChangesModeSchema>;
 
 export const runtimeWorkspaceChangesResponseSchema = z.object({

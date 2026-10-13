@@ -27,7 +27,7 @@ export function useRuntimeWorkspaceChanges(
 	const previousRequestKeyRef = useRef(requestKey);
 	const isRequestTransitioning = hasWorkspaceScope && previousRequestKeyRef.current !== requestKey;
 	const queryFn = useCallback(async () => {
-		if (!taskId || !workspaceId || !baseRef) {
+		if (!taskId || !workspaceId || !baseRef || mode === "pr_view") {
 			throw new Error("Missing workspace scope.");
 		}
 		void normalizedViewKey;
@@ -85,6 +85,15 @@ export function useRuntimeWorkspaceChanges(
 			window.clearInterval(interval);
 		};
 	}, [changesQuery.refetch, hasWorkspaceScope, pollIntervalMs]);
+
+	if (mode === "pr_view") {
+		return {
+			changes: null,
+			isLoading: false,
+			isRuntimeAvailable: true,
+			refresh: () => Promise.resolve(),
+		};
+	}
 
 	if (!taskId) {
 		return {

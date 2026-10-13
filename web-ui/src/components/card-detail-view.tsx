@@ -10,7 +10,6 @@ import { ColumnContextPanel } from "@/components/detail-panels/column-context-pa
 import { type DiffLineComment, DiffViewerPanel } from "@/components/detail-panels/diff-viewer-panel";
 import { FileTreePanel } from "@/components/detail-panels/file-tree-panel";
 import { TaskDiagnosticsPanel } from "@/components/detail-panels/task-diagnostics-panel";
-import { TaskPrTrackingPanel } from "@/components/detail-panels/task-pr-tracking-panel";
 import { TaskReviewControl } from "@/components/detail-panels/task-review-control";
 import { TaskPullRequestLink } from "@/components/task-pull-request-link";
 import { TaskPullRequestManagerPopover } from "@/components/task-pull-request-manager";
@@ -39,6 +38,7 @@ import { useTerminalThemeColors } from "@/terminal/theme-colors";
 import { type BoardCard, type CardSelection, getTaskAutoReviewCancelButtonLabel } from "@/types";
 import { useWindowEvent } from "@/utils/react-use";
 import { formatPullRequestLabel } from "@/utils/task-pull-requests";
+import { TaskPrTrackingPanel } from "./detail-panels/task-pr-tracking-panel";
 
 // We still poll the open detail diff because line content can change without changing
 // the overall file or line counts that drive the shared workspace metadata stream.
@@ -364,6 +364,10 @@ function DiffToolbar({
 				</DiffModeButton>
 				<DiffModeButton active={mode === "last_turn"} onClick={() => onModeChange("last_turn")}>
 					Last Turn
+				</DiffModeButton>
+				<DiffModeButton active={mode === "pr_view"} onClick={() => onModeChange("pr_view")}>
+					PRs (0)
+					{/* TODO: SHOW ACTUAL NUMBER OF PRS ASSOCIATED TO THIS TASK */}
 				</DiffModeButton>
 			</div>
 			{reviewControl ? <div className="ml-auto">{reviewControl}</div> : null}
@@ -836,7 +840,14 @@ export function CardDetailView({
 								/>
 							) : null}
 							<div className="flex min-h-0 flex-1">
-								{isWorkspaceChangesPending ? (
+								{diffMode === "pr_view" ? (
+									<TaskPrTrackingPanel
+										workspaceId={currentProjectId}
+										taskId={selection.card.id}
+										card={selection.card}
+										installedConsumers={runtimeConfig?.installedPrConsumers ?? []}
+									/>
+								) : isWorkspaceChangesPending ? (
 									<WorkspaceChangesLoadingPanel panelFlex="1 1 0" />
 								) : hasNoWorkspaceFileChanges ? (
 									<WorkspaceChangesEmptyPanel title={emptyDiffTitle} />
@@ -948,12 +959,7 @@ export function CardDetailView({
 				{/* B-10: collapsible diagnostics strip (phase, git, preserved work, context, actions). */}
 				<TaskDiagnosticsPanel workspaceId={currentProjectId} taskId={selection.card.id} />
 				{/* PRTRACK-1: PR tracking settings + state (checkboxes, blocker, repair owner). */}
-				<TaskPrTrackingPanel
-					workspaceId={currentProjectId}
-					taskId={selection.card.id}
-					card={selection.card}
-					installedConsumers={runtimeConfig?.installedPrConsumers ?? []}
-				/>
+
 				{gitHistoryPanel ? (
 					<div className="flex min-h-0 flex-1 overflow-hidden">{gitHistoryPanel}</div>
 				) : (
@@ -987,7 +993,14 @@ export function CardDetailView({
 									/>
 								) : null}
 								<div className="flex min-h-0 flex-1">
-									{isWorkspaceChangesPending ? (
+									{diffMode === "pr_view" ? (
+										<TaskPrTrackingPanel
+											workspaceId={currentProjectId}
+											taskId={selection.card.id}
+											card={selection.card}
+											installedConsumers={runtimeConfig?.installedPrConsumers ?? []}
+										/>
+									) : isWorkspaceChangesPending ? (
 										<WorkspaceChangesLoadingPanel panelFlex={detailDiffFileTreePanelFlex} />
 									) : hasNoWorkspaceFileChanges ? (
 										<WorkspaceChangesEmptyPanel title={emptyDiffTitle} />
