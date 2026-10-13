@@ -143,7 +143,12 @@ describe("buildBoundedToolResultExcerpt", () => {
 			expect(output.length).toBeLessThanOrEqual(boundChars);
 			expect(output).toContain("Full content: fake-artifact.txt");
 			expect(result?.result?.isError).toBe(true);
-			expect(writeArtifact).toHaveBeenCalledWith({ taskId: "task-1", toolCallId: "call-1", content: fullOutput });
+			expect(writeArtifact).toHaveBeenCalledWith({
+				taskId: "task-1",
+				toolCallId: "call-1",
+				content: fullOutput,
+				onIndexWriteError: expect.any(Function),
+			});
 			expect(logger.log).toHaveBeenCalledWith(
 				expect.stringContaining("Bounded oversized tool result"),
 				expect.objectContaining({ originalChars: fullOutput.length, artifactPath: "fake-artifact.txt" }),
@@ -229,6 +234,7 @@ describe("buildBoundedToolResultExcerpt", () => {
 				taskId: "task-1",
 				toolCallId: "call-1",
 				content: JSON.stringify(output),
+				onIndexWriteError: expect.any(Function),
 			});
 			expect(logger.log).toHaveBeenCalledWith(
 				expect.stringContaining("Bounded oversized tool result"),
@@ -263,6 +269,7 @@ describe("buildBoundedToolResultExcerpt", () => {
 				taskId: "task-1",
 				toolCallId: "call-1",
 				content: JSON.stringify(output),
+				onIndexWriteError: expect.any(Function),
 			});
 		});
 

@@ -129,6 +129,21 @@ describe("resolveTaskToolFullOutput (DIAG-2 2b)", () => {
 		expect(evidence.status).toBe("invalid");
 	});
 
+	it("containment-checks the filename-fallback match, not just stats it (escape symlink)", async () => {
+		const outsideFile = join(temp.path, "secret-fallback.txt");
+		await writeFile(outsideFile, "secret");
+		const dir = getTaskContextArtifactsDir("task-1");
+		await mkdir(dir, { recursive: true });
+		// The symlink's own name matches the deterministic artifact prefix, so
+		// the fallback lookup finds exactly one match — it must still be
+		// containment-checked, not just stat'd (stat follows symlinks).
+		await symlink(outsideFile, join(dir, "call-fb-123-abcdef01.txt"));
+		const evidence = await resolveTaskToolFullOutput({ taskId: "task-1", toolCallId: "call-fb" });
+		expect(evidence.status).toBe("missing");
+		expect(evidence.artifactFileName).toBeNull();
+		expect(evidence.artifactPath).toBeNull();
+	});
+
 	it("reports an ambiguous multi-match instead of guessing an authoritative artifact", async () => {
 		// Two writes for the same tool call (a retry) leave two surviving artifacts.
 		await writeTaskContextArtifact({ taskId: "task-1", toolCallId: "call-ambig", content: "first" });

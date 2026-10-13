@@ -1327,15 +1327,27 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				const bundlePath = join(getRuntimeHomePath(), "diagnostics", `task-${safeTaskId}-${Date.now()}.json`);
 				await mkdir(dirname(bundlePath), { recursive: true });
 				const bundleStream = createWriteStream(bundlePath);
+				// A write error can arrive before end() is called; an "error" event
+				// with no listener crashes the process, and without one the mutation
+				// would hang on a stream that never closes.
+				const bundleStreamFailed = new Promise<never>((_, reject) => {
+					bundleStream.once("error", reject);
+				});
 				try {
-					await streamTaskDiagnosticsExportV3(bundleStream, plan);
-					// Close the target so the bundle is durable before we report success.
-					await new Promise<void>((resolve, reject) => {
-						bundleStream.once("error", reject);
-						bundleStream.end(() => resolve());
-					});
+					await Promise.race([
+						(async () => {
+							await streamTaskDiagnosticsExportV3(bundleStream, plan);
+							// Close the target so the bundle is durable before we report success.
+							await new Promise<void>((resolve) => {
+								bundleStream.end(() => resolve());
+							});
+						})(),
+						bundleStreamFailed,
+					]);
 				} catch (streamError) {
 					bundleStream.destroy();
+					// Never leave a truncated bundle behind.
+					await rm(bundlePath, { force: true }).catch(() => undefined);
 					throw streamError;
 				}
 				return { ok: true, bundlePath, redactions: [], error: null };

@@ -16,7 +16,7 @@
 // an escape symlink, or a non-file is an explicit "invalid" gap). The content
 // is only classified (`json-text` vs `text`) — never parsed and re-serialized.
 import { readdir, readFile, realpath, stat } from "node:fs/promises";
-import { basename, join, resolve, sep } from "node:path";
+import { basename, resolve, sep } from "node:path";
 import { readTaskArtifactIndex } from "../workspace/task-artifact-index";
 import { getTaskContextArtifactsDir, sanitizeToolCallIdForArtifactName } from "../workspace/task-artifacts";
 
@@ -159,14 +159,16 @@ export async function resolveTaskToolFullOutput(input: {
 	const entries = await readdir(getTaskContextArtifactsDir(input.taskId)).catch(() => []);
 	const matches = entries.filter((name) => name.startsWith(prefix) && name.endsWith(".txt"));
 	if (matches.length === 1) {
-		const candidate = join(getTaskContextArtifactsDir(input.taskId), matches[0]);
-		const info = await stat(candidate).catch(() => null);
-		if (info?.isFile()) {
+		// Run the single match through the same containment check as every
+		// other reference (a bare stat follows symlinks and would accept an
+		// escape symlink).
+		const resolved = await resolveContainedArtifactPath(input.taskId, matches[0]);
+		if (resolved) {
 			return {
 				status: "resolved",
-				artifactFileName: matches[0],
-				artifactPath: candidate,
-				contentFormat: await classifyArtifactContentFormat(candidate).catch(() => "text" as const),
+				artifactFileName: resolved.fileName,
+				artifactPath: resolved.path,
+				contentFormat: await classifyArtifactContentFormat(resolved.path).catch(() => "text" as const),
 				gap: null,
 			};
 		}
