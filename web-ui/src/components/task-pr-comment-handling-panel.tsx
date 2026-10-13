@@ -30,14 +30,17 @@ interface TaskPrCommentHandlingPanelProps {
  * turns). Server state is authoritative; polling refreshes it while mounted.
  */
 export function TaskPrCommentHandlingPanel({ workspaceId, taskId, pullRequests }: TaskPrCommentHandlingPanelProps) {
-	const { state } = useTaskPrTrackingState(workspaceId, taskId, true);
+	const { state, refresh } = useTaskPrTrackingState(workspaceId, taskId, true);
 	const [toggling, setToggling] = useState(false);
+	// Holds the requested value until the post-mutation refresh lands, so the
+	// checkbox does not snap back while the server state catches up.
+	const [optimisticEnabled, setOptimisticEnabled] = useState<boolean | null>(null);
 	const [resuming, setResuming] = useState(false);
 	const [showAckDialog, setShowAckDialog] = useState(false);
 
 	const githubPrs = pullRequests.filter((pullRequest) => pullRequest.host === "github.com");
 	const hasEligiblePr = githubPrs.length === 1;
-	const enabled = state?.enabled ?? false;
+	const enabled = optimisticEnabled ?? state?.enabled ?? false;
 	const supported = state?.supported ?? true;
 	const dispatch = state?.dispatch ?? null;
 	const pendingCount = state?.pendingCount ?? 0;
@@ -49,6 +52,7 @@ export function TaskPrCommentHandlingPanel({ workspaceId, taskId, pullRequests }
 			return;
 		}
 		setToggling(true);
+		setOptimisticEnabled(checked);
 		try {
 			const response = await getRuntimeTrpcClient(workspaceId).runtime.setTaskPrAutomationSettings.mutate({
 				taskId,
@@ -63,6 +67,8 @@ export function TaskPrCommentHandlingPanel({ workspaceId, taskId, pullRequests }
 				message: error instanceof Error ? error.message : "Could not update comment handling.",
 			});
 		} finally {
+			await refresh();
+			setOptimisticEnabled(null);
 			setToggling(false);
 		}
 	};
@@ -86,6 +92,7 @@ export function TaskPrCommentHandlingPanel({ workspaceId, taskId, pullRequests }
 				message: error instanceof Error ? error.message : "Could not resume comment handling.",
 			});
 		} finally {
+			await refresh();
 			setResuming(false);
 		}
 	};
@@ -173,7 +180,9 @@ export function TaskPrCommentHandlingPanel({ workspaceId, taskId, pullRequests }
 							void handleToggle(checked);
 						}
 					}}
-					disabled={!hasEligiblePr || !supported || toggling}
+					// Only enabling is gated: an enabled task can always be
+					// turned off, even after its PR set stops being eligible.
+					disabled={(!enabled && (!hasEligiblePr || !supported)) || toggling}
 					aria-label="Handle pull request comments"
 					data-testid="task-pr-comment-toggle"
 					className="h-3.5 w-3.5 shrink-0 cursor-pointer rounded-sm border border-border bg-surface-0 data-[state=checked]:border-accent data-[state=checked]:bg-accent focus-visible:outline-2 focus-visible:outline-accent disabled:cursor-default disabled:opacity-50"

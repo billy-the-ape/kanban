@@ -169,6 +169,7 @@ function makeService(
 			workspacePath: string;
 		}) => Promise<ClineTaskSessionService>;
 		now?: () => number;
+		getGitHubAccessScopeId?: () => Promise<string>;
 	} = {},
 ) {
 	const workspaces = overrides.workspaces ?? [{ workspaceId: "w1", workspacePath: "/w1" }];
@@ -195,7 +196,7 @@ function makeService(
 				? overrides.send(scope, body)
 				: { ok: true, summary: null, message: { id: "msg-1", role: "user", content: body.text, createdAt: NOW } };
 		},
-		getGitHubAccessScopeId: async () => "scope-1",
+		getGitHubAccessScopeId: overrides.getGitHubAccessScopeId ?? (async () => "scope-1"),
 		// Harness effective-agent resolution: the card's explicit agentId
 		// stands in for the live session's agent; `selectedAgentId` stands
 		// in for the workspace's selected agent (Cline by default, as in
@@ -876,7 +877,8 @@ describe("PrCommentAutomationService", () => {
 			send: async () => ({ ok: false, summary: null, error: "model down" }),
 		});
 		const result = await harness.service.resumeCommentHandling(scope, "t1");
-		expect(result).toEqual({ ok: true, dispatched: true });
+		// The send was attempted but failed: Resume reports it, not success.
+		expect(result).toEqual({ ok: false, error: "model down", dispatched: false });
 		const loaded = await loadPrTrackingRecord(KEY);
 		expect(loaded.status).toBe("ok");
 		if (loaded.status !== "ok") {
@@ -884,6 +886,50 @@ describe("PrCommentAutomationService", () => {
 		}
 		expect(loaded.record.commentAutomation.dispatch?.status).toBe("failed");
 		expect(loaded.record.commentAutomation.dispatch?.error).toBe("model down");
+	});
+
+	it("resume of a failed dispatch resets the attempt history so the safety cap does not swallow it", async () => {
+		const dispatched = makeEvent({ providerId: "conversation-1", updatedAt: NOW - 10_000 });
+		const dispatchedFp = fingerprintOf([dispatched]);
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			taskBindings: [{ workspaceId: "w1", taskId: "t1", terminal: false }],
+			commentAutomation: {
+				...record.commentAutomation,
+				repairOwner: { workspaceId: "w1", taskId: "t1", revision: 1 },
+				lastDispatchedFeedbackFingerprint: dispatchedFp,
+				// The fifth attempt in the window failed; the cap has not
+				// tripped yet, so the record is not paused.
+				autoSendAttempts: [1, 2, 3, 4, 5].map((i) => ({ dispatchId: `d${i}`, attemptedAt: NOW - i * 60_000 })),
+				autoSendPaused: false,
+				dispatch: {
+					dispatchId: "d1",
+					attemptedAt: NOW - 60_000,
+					fingerprint: dispatchedFp,
+					ownerRevision: 1,
+					status: "failed",
+					turnRef: null,
+					error: "boom",
+				},
+			},
+		}));
+		const newer = makeEvent({ providerId: "conversation-9", updatedAt: NOW });
+		const harness = makeService({
+			workspaceStates: new Map([
+				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })])],
+			]),
+			snapshot: { events: [dispatched, newer] },
+		});
+		expect(await harness.service.resumeCommentHandling(scope, "t1")).toEqual({ ok: true, dispatched: true });
+		expect(harness.sent).toHaveLength(1);
+		const loaded = await loadPrTrackingRecord(KEY);
+		if (loaded.status !== "ok") {
+			throw new Error("unreachable");
+		}
+		expect(loaded.record.commentAutomation.autoSendPaused).toBe(false);
+		expect(loaded.record.commentAutomation.autoSendAttempts).toHaveLength(1);
+		expect(loaded.record.commentAutomation.dispatch?.status).toBe("running");
 	});
 });
 
@@ -1897,6 +1943,46 @@ describe("COMMENT-0 publication capture", () => {
 		clock += 61_000;
 		await harness.service.runTick();
 		expect(harness.sent).toHaveLength(1);
+	});
+
+	it("an unpersisted capture is resumable with acknowledgment and clears on Resume", async () => {
+		const reviewer = makeEvent({ providerId: "conversation-1", updatedAt: NOW - 471_000 });
+		await seedOwner();
+		let scopeAvailable = false;
+		const harness = makeService({
+			workspaceStates: cardState(),
+			snapshot: { events: [reviewer] },
+			getGitHubAccessScopeId: async () => {
+				if (!scopeAvailable) {
+					throw new Error("gh auth unavailable");
+				}
+				return "scope-1";
+			},
+		});
+		await harness.service.refreshWorkspace(scope);
+		// The capture cannot resolve its access scope: an in-memory pause.
+		await harness.service.recordPrPublicationToolEvent(toolEvent({ phase: "started" }));
+		scopeAvailable = true;
+		let state = await harness.service.getTaskPrTrackingState(scope, "t1");
+		if (!state.ok) {
+			throw new Error("unreachable");
+		}
+		expect(state.state.blocker).toContain("could not be persisted");
+		expect(state.state.resumable).toBe(true);
+		expect(state.state.resumeRequiresAcknowledgment).toBe(true);
+
+		// The offered Resume is honored: rejected without acknowledgment,
+		// accepted with it, and the blocker clears.
+		expect(await harness.service.resumeCommentHandling(scope, "t1")).toMatchObject({ ok: false, dispatched: false });
+		expect(await harness.service.resumeCommentHandling(scope, "t1", { acknowledgeCaptureUncertainty: true })).toEqual(
+			{ ok: true, dispatched: false },
+		);
+		state = await harness.service.getTaskPrTrackingState(scope, "t1");
+		if (!state.ok) {
+			throw new Error("unreachable");
+		}
+		expect(state.state.blocker).toBeNull();
+		expect(state.state.resumable).toBe(false);
 	});
 });
 

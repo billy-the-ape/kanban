@@ -11,6 +11,8 @@ const POLL_INTERVAL_MS = 5000;
  * while `active` (the detail popover is open). The response is authoritative:
  * it reflects the card's opt-in, the linked PR, pending feedback, dispatch
  * status, and visible blockers. No comment bodies cross the boundary.
+ * `refresh` lets callers re-read immediately after a mutation instead of
+ * waiting for the next poll.
  */
 export function useTaskPrTrackingState(
 	workspaceId: string,
@@ -19,6 +21,7 @@ export function useTaskPrTrackingState(
 ): {
 	state: RuntimeTaskPrTrackingState | null;
 	isPending: boolean;
+	refresh: () => Promise<void>;
 } {
 	const [state, setState] = useState<RuntimeTaskPrTrackingState | null>(null);
 	const [isPending, setIsPending] = useState(false);
@@ -54,5 +57,5 @@ export function useTaskPrTrackingState(
 		active && taskId !== null ? POLL_INTERVAL_MS : null,
 	);
 
-	return { state, isPending };
+	return { state, isPending, refresh };
 }

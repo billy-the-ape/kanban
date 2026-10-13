@@ -6,6 +6,7 @@ import { TaskPrCommentHandlingPanel } from "@/components/task-pr-comment-handlin
 import type { RuntimeTaskPrTrackingState, RuntimeTaskPullRequest } from "@/runtime/types";
 
 const useTaskPrTrackingStateMock = vi.hoisted(() => vi.fn());
+const setSettingsMock = vi.hoisted(() => vi.fn());
 
 vi.mock("@/hooks/use-task-pr-tracking-state", () => ({
 	useTaskPrTrackingState: useTaskPrTrackingStateMock,
@@ -14,7 +15,7 @@ vi.mock("@/hooks/use-task-pr-tracking-state", () => ({
 vi.mock("@/runtime/trpc-client", () => ({
 	getRuntimeTrpcClient: () => ({
 		runtime: {
-			setTaskPrAutomationSettings: { mutate: async () => ({ ok: true, error: null }) },
+			setTaskPrAutomationSettings: { mutate: setSettingsMock },
 			resumeTaskPrCommentHandling: { mutate: async () => ({ ok: true, dispatched: false }) },
 		},
 	}),
@@ -52,6 +53,8 @@ describe("TaskPrCommentHandlingPanel", () => {
 
 	beforeEach(() => {
 		useTaskPrTrackingStateMock.mockReset();
+		setSettingsMock.mockReset();
+		setSettingsMock.mockResolvedValue({ ok: true, autoAddressComments: false });
 		previousActEnvironment = (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
 			.IS_REACT_ACT_ENVIRONMENT;
 		(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -73,12 +76,57 @@ describe("TaskPrCommentHandlingPanel", () => {
 		}
 	});
 
-	function render(state: RuntimeTaskPrTrackingState): void {
-		useTaskPrTrackingStateMock.mockReturnValue({ state, isPending: false });
+	function render(
+		state: RuntimeTaskPrTrackingState,
+		pullRequests: RuntimeTaskPullRequest[] = [PR],
+		refresh: () => Promise<void> = async () => undefined,
+	): void {
+		useTaskPrTrackingStateMock.mockReturnValue({ state, isPending: false, refresh });
 		act(() => {
-			root.render(<TaskPrCommentHandlingPanel workspaceId="w1" taskId="t1" pullRequests={[PR]} />);
+			root.render(<TaskPrCommentHandlingPanel workspaceId="w1" taskId="t1" pullRequests={pullRequests} />);
 		});
 	}
+
+	function toggle(): HTMLButtonElement {
+		const element = document.querySelector('[data-testid="task-pr-comment-toggle"]');
+		if (!(element instanceof HTMLButtonElement)) {
+			throw new Error("toggle not rendered");
+		}
+		return element;
+	}
+
+	it("lets an enabled task turn comment handling off after its PR set becomes ineligible", () => {
+		const second: RuntimeTaskPullRequest = { ...PR, number: 43, url: "https://github.com/octo/repo/pull/43" };
+		render(makeState({ enabled: true }), [PR, second]);
+		expect(toggle().disabled).toBe(false);
+		render(makeState({ enabled: false }), [PR, second]);
+		expect(toggle().disabled).toBe(true);
+	});
+
+	it("keeps the requested value until the post-toggle refresh lands", async () => {
+		let resolveRefresh: () => void = () => undefined;
+		const refresh = vi.fn(
+			() =>
+				new Promise<void>((resolve) => {
+					resolveRefresh = resolve;
+				}),
+		);
+		render(makeState({ enabled: true }), [PR], refresh);
+		expect(toggle().getAttribute("data-state")).toBe("checked");
+		await act(async () => {
+			toggle().click();
+		});
+		expect(setSettingsMock).toHaveBeenCalledWith({ taskId: "t1", autoAddressComments: false });
+		expect(refresh).toHaveBeenCalledTimes(1);
+		// The server state still says enabled, but the checkbox does not snap
+		// back while the refresh is in flight.
+		expect(toggle().getAttribute("data-state")).toBe("unchecked");
+		expect(toggle().disabled).toBe(true);
+		await act(async () => {
+			resolveRefresh();
+		});
+		expect(toggle().disabled).toBe(false);
+	});
 
 	it("keeps the blocker and Resume visible while feedback is still pending", () => {
 		// Regression: the pending status line used to hide both the pause

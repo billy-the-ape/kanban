@@ -992,7 +992,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			} else {
 				throw new Error("No active runtime config provider is available.");
 			}
-			const configResponse = buildConfigResponse(scopedRuntimeConfig);
+			const configResponse = await buildConfigResponse(scopedRuntimeConfig);
 			return {
 				...configResponse,
 				// PRTRACK-1: the installed-consumer signal for the browser.

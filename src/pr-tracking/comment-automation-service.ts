@@ -77,6 +77,13 @@ interface PrSubscriptionState {
 	settleInFlight: boolean;
 }
 
+/**
+ * What a dispatch attempt did: sent the instruction, found nothing left to
+ * address, or was held (pause, unresolved capture, failed send, ...) with a
+ * user-visible reason.
+ */
+type DispatchOutcome = { status: "sent" } | { status: "nothing-pending" } | { status: "held"; reason: string };
+
 const POLL_INTERVAL_MS = 60_000;
 const POLL_JITTER_MS = 5_000;
 const TICK_INTERVAL_MS = 10_000;
@@ -89,6 +96,7 @@ const BACKOFF_SCHEDULE_MS = [60_000, 120_000, 240_000, 480_000, 900_000];
 /** Bounded automatic-turn backstop: at most N sends per PR per window. */
 const MAX_AUTO_SEND_PER_WINDOW = 5;
 const AUTO_SEND_WINDOW_MS = 60 * 60 * 1000;
+const RATE_LIMIT_PAUSED_REASON = `Automatic comment handling is paused after ${MAX_AUTO_SEND_PER_WINDOW} attempts in the last hour. Resume to continue.`;
 /**
  * A start-phase capture whose tool result never arrived (turn cancelled,
  * host interrupted, ...) is stale after this long: it becomes an explicit
@@ -851,7 +859,7 @@ export class PrCommentAutomationService {
 		scope: PrCommentAutomationWorkspaceScope,
 		accessScopeId: string,
 		events: PrFeedbackEvent[],
-	): Promise<void> {
+	): Promise<DispatchOutcome> {
 		const identity = { accessScopeId, pr: sub.pr };
 		const nowMs = this.nowMs();
 		// Final fresh attribution check before sending: a capture that lands
@@ -859,15 +867,18 @@ export class PrCommentAutomationService {
 		// safety cap is enforced against the durable attempt history.
 		const preCheck = await loadPrTrackingRecord(sub.key);
 		if (preCheck.status !== "ok") {
-			return;
+			return { status: "held", reason: `The PR tracking record is unavailable.` };
 		}
 		const preAutomation = preCheck.record.commentAutomation;
 		if (preAutomation.publication.pending.length > 0 || this.captureBlocked.has(sub.key)) {
 			sub.dispatchRetryAt = nowMs + DISPATCH_RETRY_MS;
-			return;
+			return {
+				status: "held",
+				reason: `An implementation comment is still being captured; comment handling continues once it resolves.`,
+			};
 		}
 		if (preAutomation.autoSendPaused) {
-			return;
+			return { status: "held", reason: RATE_LIMIT_PAUSED_REASON };
 		}
 		const windowStart = nowMs - AUTO_SEND_WINDOW_MS;
 		const attemptsInWindow = preAutomation.autoSendAttempts.filter((attempt) => attempt.attemptedAt >= windowStart);
@@ -883,7 +894,7 @@ export class PrCommentAutomationService {
 					autoSendPaused: true,
 				},
 			}));
-			return;
+			return { status: "held", reason: RATE_LIMIT_PAUSED_REASON };
 		}
 		const dispatchId = randomUUID();
 		const captured = computePrFeedbackFingerprint(
@@ -891,7 +902,7 @@ export class PrCommentAutomationService {
 		);
 		if (captured === null) {
 			await this.cancelPendingRecord(sub);
-			return;
+			return { status: "nothing-pending" };
 		}
 		await upsertPrTrackingRecord(sub.key, identity, (record) => ({
 			...record,
@@ -960,8 +971,9 @@ export class PrCommentAutomationService {
 					},
 				};
 			});
-			return;
+			return { status: "sent" };
 		}
+		const error = response.error ?? `Could not send the comment-handling instruction.`;
 		await upsertPrTrackingRecord(sub.key, identity, (record) => {
 			const dispatch = record.commentAutomation.dispatch;
 			if (dispatch === null || dispatch.dispatchId !== dispatchId) {
@@ -972,14 +984,11 @@ export class PrCommentAutomationService {
 				revision: record.revision + 1,
 				commentAutomation: {
 					...record.commentAutomation,
-					dispatch: {
-						...dispatch,
-						status: "failed",
-						error: response.error ?? `Could not send the comment-handling instruction.`,
-					},
+					dispatch: { ...dispatch, status: "failed", error },
 				},
 			};
 		});
+		return { status: "held", reason: error };
 	}
 
 	private async setDispatchCompleted(sub: PrSubscriptionState): Promise<void> {
@@ -1779,7 +1788,7 @@ export class PrCommentAutomationService {
 						? STALE_PENDING_CAPTURE_REASON
 						: `An implementation comment could not be identified; automatic comment handling is paused.`))
 				: automation.autoSendPaused === true
-					? `Automatic comment handling is paused after ${MAX_AUTO_SEND_PER_WINDOW} attempts in the last hour. Resume to continue.`
+					? RATE_LIMIT_PAUSED_REASON
 					: sub !== undefined && sub.candidates.size > 1 && automation.repairOwner === null
 						? `Multiple tasks have comment handling enabled for this pull request. Choose one repair owner.`
 						: null;
@@ -1809,8 +1818,9 @@ export class PrCommentAutomationService {
 	 * last two require nothing else; an uncertain capture additionally
 	 * requires explicit acknowledgment). Rechecks PR open state and scope
 	 * with a fresh read, and dispatches exactly one new instruction when a
-	 * failed dispatch is involved. Fingerprint history is retained; the
-	 * rate-limit history is reset by this explicit action only.
+	 * failed dispatch is involved; `dispatched` reports whether it was
+	 * actually sent. Fingerprint history is retained; the rate-limit history
+	 * is reset by this explicit action only.
 	 */
 	async resumeCommentHandling(
 		scope: PrCommentAutomationWorkspaceScope,
@@ -1847,48 +1857,52 @@ export class PrCommentAutomationService {
 		const uncertainEntry = automation.publication.pending.find(
 			(entry) => entry.uncertain || this.isCapturePendingStale(entry, nowMs),
 		);
-		if (!hasFailedDispatch && !ratePaused && !uncertainEntry) {
+		// An unpersisted capture is surfaced as resumable (with
+		// acknowledgment) by getTaskPrTrackingState; Resume must accept it.
+		const capturePaused = this.captureBlocked.has(key);
+		const captureUnresolved = uncertainEntry !== undefined || capturePaused;
+		if (!hasFailedDispatch && !ratePaused && !captureUnresolved) {
 			return { ok: false, error: `There is nothing to resume.`, dispatched: false };
 		}
-		if (uncertainEntry && options.acknowledgeCaptureUncertainty !== true) {
+		if (captureUnresolved && options.acknowledgeCaptureUncertainty !== true) {
 			return {
 				ok: false,
 				error: `Publication capture is unresolved: an unidentified implementation comment could retrigger comment handling. Resume with acknowledgment to accept that risk.`,
 				dispatched: false,
 			};
 		}
-		if (ratePaused || uncertainEntry) {
-			// Explicit user Resume: clear the acknowledged capture
-			// uncertainty and reset the rate-limit history. This is the
-			// explicit acknowledgment itself, never a silent bypass.
-			await upsertPrTrackingRecord(key, { accessScopeId: record.accessScopeId, pr: record.pr }, (current) => {
-				const currentAutomation = current.commentAutomation;
-				if (
-					!currentAutomation.autoSendPaused &&
-					!currentAutomation.publication.pending.some(
-						(entry) => entry.uncertain || this.isCapturePendingStale(entry, nowMs),
-					)
-				) {
-					return current;
-				}
-				return {
-					...current,
-					revision: current.revision + 1,
-					commentAutomation: {
-						...currentAutomation,
-						publication: {
-							...currentAutomation.publication,
-							pending: currentAutomation.publication.pending.filter(
-								(entry) => !(entry.uncertain || this.isCapturePendingStale(entry, nowMs)),
-							),
-						},
-						autoSendAttempts: [],
-						autoSendPaused: false,
+		// Explicit user Resume: clear the acknowledged capture uncertainty and
+		// reset the rate-limit history, so a failed-dispatch Resume is not
+		// immediately re-paused by the cap. This is the explicit
+		// acknowledgment itself, never a silent bypass.
+		await upsertPrTrackingRecord(key, { accessScopeId: record.accessScopeId, pr: record.pr }, (current) => {
+			const currentAutomation = current.commentAutomation;
+			if (
+				!currentAutomation.autoSendPaused &&
+				currentAutomation.autoSendAttempts.length === 0 &&
+				!currentAutomation.publication.pending.some(
+					(entry) => entry.uncertain || this.isCapturePendingStale(entry, nowMs),
+				)
+			) {
+				return current;
+			}
+			return {
+				...current,
+				revision: current.revision + 1,
+				commentAutomation: {
+					...currentAutomation,
+					publication: {
+						...currentAutomation.publication,
+						pending: currentAutomation.publication.pending.filter(
+							(entry) => !(entry.uncertain || this.isCapturePendingStale(entry, nowMs)),
+						),
 					},
-				};
-			});
-			this.captureBlocked.delete(key);
-		}
+					autoSendAttempts: [],
+					autoSendPaused: false,
+				},
+			};
+		});
+		this.captureBlocked.delete(key);
 		if (!hasFailedDispatch) {
 			// Only a pause was resolved; normal scheduling continues from the
 			// next poll once feedback is pending.
@@ -1963,8 +1977,11 @@ export class PrCommentAutomationService {
 		if (!owner) {
 			return { ok: false, error: `The repair owner is unavailable.`, dispatched: false };
 		}
-		await this.executeDispatch(sub, owner, candidate, record.accessScopeId, snapshot.events);
-		return { ok: true, dispatched: true };
+		const outcome = await this.executeDispatch(sub, owner, candidate, record.accessScopeId, snapshot.events);
+		if (outcome.status === "held") {
+			return { ok: false, error: outcome.reason, dispatched: false };
+		}
+		return { ok: true, dispatched: outcome.status === "sent" };
 	}
 }
 
