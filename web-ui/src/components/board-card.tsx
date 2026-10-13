@@ -618,7 +618,6 @@ export function BoardCard({
 								isDependencyTarget && "kb-board-card-dependency-target",
 							)}
 						>
-							<div className="flex items-center gap-2"></div>
 							<div className="flex items-center gap-2" style={{ minHeight: 24 }}>
 								{statusMarker ? <div className="inline-flex items-center">{statusMarker}</div> : null}
 								<div className="flex-1 min-w-0">
