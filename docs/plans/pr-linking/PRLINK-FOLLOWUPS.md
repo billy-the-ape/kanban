@@ -15,6 +15,9 @@ the old PL numbering in that historical master plan does not create another card
 | [PRLINK-9](PRLINK-9.md) | Pure provider boundaries and identity-based explicit refresh | v1 + 6 + existing tracking foundation |
 | [PRLINK-10](PRLINK-10.md) | PR view in changes panel with shared management | 6 + 7 + 9 |
 
+PRLINK-7 is implemented (mobile primary anchor and shared manager); its plan document records
+the final state.
+
 Recommended sequence: 6 → 7 → 8 → 9 → 10. Each task includes decisions, integration points,
 error/concurrency behavior and acceptance. Do not add a preliminary planning PR or expand into
 extra implementation PRs by default. Each agent reads its task, this index, relevant existing code
