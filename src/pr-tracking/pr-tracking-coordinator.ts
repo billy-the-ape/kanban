@@ -513,7 +513,12 @@ export class PrTrackingCoordinator {
 				sourceEvents: { reviews: null, conversation: null, inline: null, threads: null },
 				freshSources: new Set(),
 				accessBlocker: null,
-				metadataNeedsFresh: false,
+				// A fresh poll state has no metadata, and the adapter's digest
+				// cache may already be warm (e.g. a display-only one-shot
+				// metadata refresh ran earlier). The first poll must read
+				// fresh so it always gets a body; a not_modified first poll
+				// would leave prState null until the PR body next changes.
+				metadataNeedsFresh: true,
 			};
 			this.polls.set(key, state);
 		}

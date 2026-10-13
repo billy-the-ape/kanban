@@ -105,7 +105,8 @@ Follow the shared verification/deployment rules in PRLINK-FOLLOWUPS.md.
   `remote-context.ts`, `url-parser.ts`) and are exposed through `src/core/pull-request-links.ts` and
   `src/core/pull-request-detection.ts`. The strict WHATWG-URL parser in `url-parser.ts` replaces the old
   regex parser; GitHub keeps trailing path/query/fragment stripping (`/pull/12/files` → `/pull/12`),
-  GitLab/Bitbucket keep the number as the last path segment.
+  GitLab/Bitbucket also keep trailing path segments stripped (`/diffs`, `/diff`, `/overview`),
+  matching the old regex parsers so copied Files/Diffs-tab URLs canonicalize to the bare PR/MR URL.
 - `workspace.refreshTaskPullRequest` / `workspace.refreshLinkedTaskPullRequests` (in
   `src/workspace/task-pull-request-refresh.ts`) refresh already-linked PRs by identity. They resolve the
   provider from the link, reject unsupported providers/hosts, coalesce concurrent clicks, cap linked
@@ -123,3 +124,11 @@ Follow the shared verification/deployment rules in PRLINK-FOLLOWUPS.md.
   server-owned `recordTaskPullRequests` path), `test/runtime/pr-tracking/pr-tracking-coordinator.test.ts`
   (one-shot refresh creates no subscription/consumer), and updated `task-pull-request-lookup`/
   `pull-request-links`/`pull-request-detection` tests.
+- Review fixes: the GitLab `-/merge_requests/<n>` marker may sit anywhere in the path (trailing
+  segments like `/diffs` are stripped) and Bitbucket accepts trailing segments (`/diff`, `/overview`),
+  restoring the old parsers' copied-tab-URL behavior. A freshly created PR poll state always forces a
+  fresh first metadata read (`metadataNeedsFresh: true`), so a subscription added after a one-shot
+  refresh (which warms the adapter digest cache) still loads its `prState` on the first poll instead
+  of reading `not_modified` with no metadata. Linked/single refresh applies no write and reports no
+  `updated` when the stored state and title are unchanged (no revision churn on repeated refreshes).
+  The web-ui maps the new `no_remote` refresh reason to a user-facing message.

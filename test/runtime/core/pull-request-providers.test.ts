@@ -171,4 +171,30 @@ describe("URL link classification", () => {
 		].join("\n");
 		expect(extractPullRequestLinks(text).map((link) => link.number)).toEqual([12, 13]);
 	});
+
+	it("canonicalizes GitLab and Bitbucket tab URLs with trailing path segments", () => {
+		// Copied Files/Diffs-tab URLs parse and canonicalize to the bare MR/PR
+		// URL (the old regex parsers allowed trailing path segments).
+		expect(parsePullRequestUrl("https://gitlab.com/g/p/-/merge_requests/7/diffs")).toEqual({
+			provider: "gitlab",
+			host: "gitlab.com",
+			repository: "g/p",
+			number: 7,
+			url: "https://gitlab.com/g/p/-/merge_requests/7",
+		});
+		// The marker may sit deeper in nested-group paths.
+		expect(parsePullRequestUrl("https://gitlab.com/group/sub/project/-/merge_requests/9/commits")?.url).toBe(
+			"https://gitlab.com/group/sub/project/-/merge_requests/9",
+		);
+		expect(parsePullRequestUrl("https://bitbucket.org/w/r/pull-requests/5/diff")).toEqual({
+			provider: "bitbucket",
+			host: "bitbucket.org",
+			repository: "w/r",
+			number: 5,
+			url: "https://bitbucket.org/w/r/pull-requests/5",
+		});
+		expect(parsePullRequestUrl("https://bitbucket.org/w/r/pull-requests/5/overview")?.url).toBe(
+			"https://bitbucket.org/w/r/pull-requests/5",
+		);
+	});
 });

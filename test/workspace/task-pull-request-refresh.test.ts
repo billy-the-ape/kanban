@@ -558,4 +558,42 @@ describe("refreshLinkedTaskPullRequests", () => {
 			cleanup();
 		}
 	});
+
+	it("does not bump the revision or count links whose snapshot did not change", async () => {
+		const { path: sandboxRoot, cleanup } = createTempDir("kanban-task-pr-refresh-ws-");
+		try {
+			const entry = createEntry();
+			const workspacePath = await seedWorkspace(sandboxRoot, "task-1", "review", [entry]);
+			let checkedAt = 2000;
+			const harness = makeRefreshHarness(workspacePath, () =>
+				refreshedResult({ metadata: metadata({ state: "open", checkedAt }) }),
+			);
+
+			const first = await refreshLinkedTaskPullRequests({
+				workspacePath,
+				taskId: "task-1",
+				refresh: harness.refresh,
+			});
+			expect(first.updated).toBe(1);
+			const revisionAfterFirst = (await loadWorkspaceState(workspacePath)).revision;
+
+			// A second pass where the provider confirms the same state with a
+			// newer observation timestamp and no title: no write, no revision
+			// bump, and nothing counted as updated.
+			checkedAt = 3000;
+			const second = await refreshLinkedTaskPullRequests({
+				workspacePath,
+				taskId: "task-1",
+				refresh: harness.refresh,
+			});
+			expect(second.ok).toBe(true);
+			expect(second.updated).toBe(0);
+			expect(second.outcomes).toEqual([expect.objectContaining({ outcome: "refreshed" })]);
+			const afterSecond = await loadWorkspaceState(workspacePath);
+			expect(afterSecond.revision).toBe(revisionAfterFirst);
+			expect(findCardPullRequests(afterSecond, "task-1")?.[0]?.stateCheckedAt).toBe(2000);
+		} finally {
+			cleanup();
+		}
+	});
 });

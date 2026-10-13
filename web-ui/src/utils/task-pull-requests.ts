@@ -48,6 +48,8 @@ export function getPullRequestRefreshMessage(reason: RuntimeTaskPullRequestRefre
 			return "Could not query GitHub";
 		case "no_worktree":
 			return "Task worktree no longer exists";
+		case "no_remote":
+			return "No recognized origin remote for this task's worktree";
 		case "no_branch":
 			return "Could not determine the current branch";
 		case "no_task":

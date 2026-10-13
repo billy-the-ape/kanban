@@ -96,8 +96,10 @@ function outcomeFor(
 /**
  * Applies refreshed snapshots under the workspace lock. Re-validates every
  * link against the CURRENT board (never resurrects a removed/replaced link,
- * applies nothing when the task is gone) and ignores results that are not
- * newer than the stored `stateCheckedAt` (a concurrent write won).
+ * applies nothing when the task is gone), ignores results that are not
+ * newer than the stored `stateCheckedAt` (a concurrent write won), and skips
+ * writes whose state and title are unchanged (a successful re-read must not
+ * bump the revision, the card `updatedAt`, or count as `updated`).
  */
 async function applyRefreshedSnapshots(
 	workspacePath: string,
@@ -126,6 +128,11 @@ async function applyRefreshedSnapshots(
 			const storedCheckedAt = existing.stateCheckedAt;
 			if (storedCheckedAt !== undefined && item.metadata.checkedAt <= storedCheckedAt) {
 				// Stale result: a newer observation already won.
+				continue;
+			}
+			const titleChanged = item.metadata.title !== undefined && existing.title !== item.metadata.title;
+			if (existing.state === item.metadata.state && !titleChanged) {
+				// Unchanged snapshot: no write, no revision bump, not counted.
 				continue;
 			}
 			const updated = updateTaskPullRequestSnapshot(board, taskId, item.canonicalPrKey, {

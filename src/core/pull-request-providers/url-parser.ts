@@ -117,22 +117,28 @@ function matchProviderShape(segments: string[], provider: RuntimeTaskPullRequest
 			return { provider, repository: `${owner}/${repo}`, number, pathSuffix: `pull/${number}` };
 		}
 		case "gitlab": {
-			// group[/subgroup...]/repo/-/merge_requests/<number>
-			const last = segments.length;
-			if (last < 4) {
+			// group[/subgroup...]/repo/-/merge_requests/<number>, where the
+			// `-/merge_requests/<number>` marker may sit anywhere in the
+			// segments; trailing path segments after the number (e.g.
+			// `/diffs`) are ignored in the canonical URL.
+			const markerIndex = segments.findIndex((segment, index) => {
+				if (segment !== "-") {
+					return false;
+				}
+				const action = segments[index + 1];
+				if (!action || action.toLowerCase() !== "merge_requests") {
+					return false;
+				}
+				return toPositivePrNumber(segments[index + 2] ?? "") !== null;
+			});
+			if (markerIndex === -1) {
 				return null;
 			}
-			const marker = segments[last - 3];
-			const action = segments[last - 2];
-			const rawNumber = segments[last - 1];
-			if (marker !== "-" || !action || action.toLowerCase() !== "merge_requests") {
+			const repoParts = segments.slice(0, markerIndex);
+			if (repoParts.length === 0 || !repoParts.every(isValidRepositorySegment)) {
 				return null;
 			}
-			const repoParts = segments.slice(0, last - 3);
-			if (!repoParts.every(isValidRepositorySegment)) {
-				return null;
-			}
-			const number = toPositivePrNumber(rawNumber ?? "");
+			const number = toPositivePrNumber(segments[markerIndex + 2] ?? "");
 			if (number === null) {
 				return null;
 			}
@@ -141,8 +147,9 @@ function matchProviderShape(segments: string[], provider: RuntimeTaskPullRequest
 		case "bitbucket": {
 			// workspace/repo/pull-requests/<number> (bitbucket.org only — the
 			// caller enforces the known host; Bitbucket Server layouts are
-			// unsupported).
-			if (segments.length !== 4) {
+			// unsupported). Trailing path segments after the number (e.g.
+			// `/diff`, `/overview`) are ignored in the canonical URL.
+			if (segments.length < 4) {
 				return null;
 			}
 			const [workspace, repo, action, rawNumber] = segments;
