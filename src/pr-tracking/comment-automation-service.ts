@@ -89,6 +89,15 @@ const BACKOFF_SCHEDULE_MS = [60_000, 120_000, 240_000, 480_000, 900_000];
 /** Bounded automatic-turn backstop: at most N sends per PR per window. */
 const MAX_AUTO_SEND_PER_WINDOW = 5;
 const AUTO_SEND_WINDOW_MS = 60 * 60 * 1000;
+/**
+ * A start-phase capture whose tool result never arrived (turn cancelled,
+ * host interrupted, ...) is stale after this long: it becomes an explicit
+ * uncertainty so the visible blocker/Resume flow surfaces instead of a
+ * silent settle block that only a restart would resolve.
+ */
+const CAPTURE_PENDING_STALE_MS = 10 * 60 * 1000;
+const STALE_PENDING_CAPTURE_REASON =
+	"A publication command started but its result never arrived; the published identity could not be confirmed.";
 /** Columns whose tasks count as active comment-handling subscriptions. */
 const ACTIVE_COLUMN_IDS = new Set(["backlog", "in_progress", "review"]);
 
@@ -688,6 +697,10 @@ export class PrCommentAutomationService {
 		}
 		const record = loaded.record;
 		const automation = record.commentAutomation;
+		// A start-phase capture whose tool result never arrived becomes an
+		// explicit uncertainty: the visible blocker/Resume flow surfaces
+		// instead of a silent settle block that only a restart would resolve.
+		await this.markStalePendingCaptures(sub.key, record);
 		const dispatch = automation.dispatch;
 		const owner = automation.repairOwner;
 
@@ -1238,6 +1251,51 @@ export class PrCommentAutomationService {
 	}
 
 	/**
+	 * True for a start-phase (non-uncertain) capture whose tool result never
+	 * arrived within the stale window (turn cancelled, host interrupted, ...).
+	 */
+	private isCapturePendingStale(entry: RuntimePrPublicationPending, nowMs: number): boolean {
+		return !entry.uncertain && nowMs - entry.startedAt > CAPTURE_PENDING_STALE_MS;
+	}
+
+	/**
+	 * Persists stale pending captures as explicit uncertainties (visible in
+	 * the panel and resumable with acknowledgment). Idempotent per captureId.
+	 */
+	private async markStalePendingCaptures(key: string, record: RuntimeGitHubPrTrackingRecord): Promise<void> {
+		const nowMs = this.nowMs();
+		const staleIds = record.commentAutomation.publication.pending
+			.filter((entry) => this.isCapturePendingStale(entry, nowMs))
+			.map((entry) => entry.captureId);
+		if (staleIds.length === 0) {
+			return;
+		}
+		const stale = new Set(staleIds);
+		await upsertPrTrackingRecord(key, { accessScopeId: record.accessScopeId, pr: record.pr }, (current) => {
+			const automation = current.commentAutomation;
+			const changed = automation.publication.pending.some((entry) => stale.has(entry.captureId) && !entry.uncertain);
+			if (!changed) {
+				return current;
+			}
+			return {
+				...current,
+				revision: current.revision + 1,
+				commentAutomation: {
+					...automation,
+					publication: {
+						...automation.publication,
+						pending: automation.publication.pending.map((entry) =>
+							stale.has(entry.captureId) && !entry.uncertain
+								? { ...entry, uncertain: true, uncertainReason: STALE_PENDING_CAPTURE_REASON }
+								: entry,
+						),
+					},
+				},
+			};
+		});
+	}
+
+	/**
 	 * Persists one capture-pending entry (idempotent per captureId), or
 	 * removes the entry for `removeCaptureId` when `pending` is null.
 	 */
@@ -1392,6 +1450,10 @@ export class PrCommentAutomationService {
 										kind: entry.kind,
 										explicitRepository: null,
 										explicitNumber: null,
+										// Restart recovery has the transcript content but not
+										// the original fragment: plain-text scan with the
+										// multi-object guard.
+										fragment: "",
 									},
 								],
 								target: entry.target,
@@ -1675,13 +1737,20 @@ export class PrCommentAutomationService {
 		const record = loaded.record;
 		const automation = record.commentAutomation;
 		const sub = this.subscriptions.get(key);
-		const uncertainEntry = automation.publication.pending.find((entry) => entry.uncertain);
+		const nowMs = this.nowMs();
+		// A stale start-phase capture (result never arrived) surfaces as the
+		// same blocker/resume flow as an explicit uncertainty.
+		const uncertainEntry = automation.publication.pending.find(
+			(entry) => entry.uncertain || this.isCapturePendingStale(entry, nowMs),
+		);
 		const capturePaused = this.captureBlocked.has(key);
 		const blocker = capturePaused
 			? `Publication capture could not be persisted; automatic comment handling is paused for this pull request.`
 			: uncertainEntry
 				? (uncertainEntry.uncertainReason ??
-					`An implementation comment could not be identified; automatic comment handling is paused.`)
+					(this.isCapturePendingStale(uncertainEntry, nowMs)
+						? STALE_PENDING_CAPTURE_REASON
+						: `An implementation comment could not be identified; automatic comment handling is paused.`))
 				: automation.autoSendPaused === true
 					? `Automatic comment handling is paused after ${MAX_AUTO_SEND_PER_WINDOW} attempts in the last hour. Resume to continue.`
 					: sub !== undefined && sub.candidates.size > 1 && automation.repairOwner === null
@@ -1746,7 +1815,11 @@ export class PrCommentAutomationService {
 		const automation = record.commentAutomation;
 		const hasFailedDispatch = automation.dispatch?.status === "failed";
 		const ratePaused = automation.autoSendPaused === true;
-		const uncertainEntry = automation.publication.pending.find((entry) => entry.uncertain);
+		const nowMs = this.nowMs();
+		// A stale start-phase capture follows the same acknowledgment flow.
+		const uncertainEntry = automation.publication.pending.find(
+			(entry) => entry.uncertain || this.isCapturePendingStale(entry, nowMs),
+		);
 		if (!hasFailedDispatch && !ratePaused && !uncertainEntry) {
 			return { ok: false, error: `There is nothing to resume.`, dispatched: false };
 		}
@@ -1765,7 +1838,9 @@ export class PrCommentAutomationService {
 				const currentAutomation = current.commentAutomation;
 				if (
 					!currentAutomation.autoSendPaused &&
-					!currentAutomation.publication.pending.some((entry) => entry.uncertain)
+					!currentAutomation.publication.pending.some(
+						(entry) => entry.uncertain || this.isCapturePendingStale(entry, nowMs),
+					)
 				) {
 					return current;
 				}
@@ -1776,7 +1851,9 @@ export class PrCommentAutomationService {
 						...currentAutomation,
 						publication: {
 							...currentAutomation.publication,
-							pending: currentAutomation.publication.pending.filter((entry) => !entry.uncertain),
+							pending: currentAutomation.publication.pending.filter(
+								(entry) => !(entry.uncertain || this.isCapturePendingStale(entry, nowMs)),
+							),
 						},
 						autoSendAttempts: [],
 						autoSendPaused: false,

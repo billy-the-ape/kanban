@@ -1660,6 +1660,119 @@ describe("COMMENT-0 publication capture", () => {
 		const record = await load();
 		expect(record.commentAutomation.publication.published).toEqual([{ kind: "review", id: 55 }]);
 	});
+
+	it("captures a gh api write that uses the -q jq filter", async () => {
+		const commands = ["gh api -q .html_url -X POST repos/octo/repo/issues/42/comments -f body='addressing'"];
+		const harness = makeService({ workspaceStates: cardState() });
+		await harness.service.recordPrPublicationToolEvent(toolEvent({ phase: "started", commands }));
+		expect((await load()).commentAutomation.publication.pending).toHaveLength(1);
+		await harness.service.recordPrPublicationToolEvent(
+			toolEvent({ phase: "finished", commands, output: "https://github.com/octo/repo/pull/42#issuecomment-91" }),
+		);
+		const record = await load();
+		expect(record.commentAutomation.publication.published).toEqual([{ kind: "conversation", id: 91 }]);
+		expect(record.commentAutomation.publication.pending).toEqual([]);
+	});
+
+	it("pauses with an uncertain capture for a gh api write to an unparseable endpoint", async () => {
+		const harness = makeService({ workspaceStates: cardState() });
+		await harness.service.recordPrPublicationToolEvent(
+			toolEvent({
+				commands: ["gh api -X POST repos/octo/repo/pulls/42/review_requests"],
+				output: JSON.stringify({ id: 3, url: "https://api.github.com/repos/octo/repo/pulls/42" }),
+			}),
+		);
+		const record = await load();
+		expect(record.commentAutomation.publication.published).toEqual([]);
+		expect(record.commentAutomation.publication.pending).toHaveLength(1);
+		expect(record.commentAutomation.publication.pending[0]?.uncertain).toBe(true);
+	});
+
+	it("registers only the write fragment's identity from a structured multi-fragment result", async () => {
+		const write = "gh pr comment -b 'addressing'";
+		const read = "gh pr view 42 --json comments";
+		const output = JSON.stringify([
+			{ query: write, result: "https://github.com/octo/repo/pull/42#issuecomment-9", success: true },
+			{
+				query: read,
+				result: JSON.stringify([{ id: 7, issue_url: "https://github.com/octo/repo/issues/42" }]),
+				success: true,
+			},
+		]);
+		const harness = makeService({ workspaceStates: cardState() });
+		await harness.service.recordPrPublicationToolEvent(toolEvent({ commands: [`${write} && ${read}`], output }));
+		const record = await load();
+		expect(record.commentAutomation.publication.published).toEqual([{ kind: "conversation", id: 9 }]);
+		expect(record.commentAutomation.publication.pending).toEqual([]);
+	});
+
+	it("surfaces a stale pending capture and resumes after acknowledgment", async () => {
+		const reviewer = makeEvent({ providerId: "conversation-1", updatedAt: NOW - 471_000 });
+		const fp = fingerprintOf([reviewer]);
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			taskBindings: [{ workspaceId: "w1", taskId: "t1", terminal: false }],
+			commentAutomation: {
+				...record.commentAutomation,
+				repairOwner: { workspaceId: "w1", taskId: "t1", revision: 1 },
+				pendingFeedbackFingerprint: fp,
+				pendingCount: 1,
+				firstPendingAt: NOW - 590_000,
+				debounceDeadline: NOW - 351_000,
+			},
+		}));
+		let clock = NOW;
+		const harness = makeService({
+			workspaceStates: cardState(),
+			snapshot: { events: [reviewer] },
+			now: () => clock,
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.recordPrPublicationToolEvent(toolEvent({ phase: "started" }));
+		// A fresh pending capture blocks the due dispatch silently.
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(0);
+		let state = await harness.service.getTaskPrTrackingState(scope, "t1");
+		expect(state.ok).toBe(true);
+		if (!state.ok) {
+			throw new Error("unreachable");
+		}
+		expect(state.state.blocker).toBeNull();
+
+		// No finished event within the stale window: the capture becomes an
+		// explicit uncertainty and the blocker surfaces.
+		clock += 11 * 60_000;
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(0);
+		let record = await load();
+		expect(record.commentAutomation.publication.pending).toHaveLength(1);
+		expect(record.commentAutomation.publication.pending[0]?.uncertain).toBe(true);
+		expect(record.commentAutomation.publication.pending[0]?.uncertainReason).toContain("result never arrived");
+
+		state = await harness.service.getTaskPrTrackingState(scope, "t1");
+		if (!state.ok) {
+			throw new Error("unreachable");
+		}
+		expect(state.state.blocker).toContain("result never arrived");
+		expect(state.state.resumable).toBe(true);
+		expect(state.state.resumeRequiresAcknowledgment).toBe(true);
+
+		// Resume without acknowledgment is rejected; with acknowledgment it
+		// clears the capture and the due dispatch proceeds.
+		expect(await harness.service.resumeCommentHandling(scope, "t1")).toMatchObject({ ok: false, dispatched: false });
+		expect(await harness.service.resumeCommentHandling(scope, "t1", { acknowledgeCaptureUncertainty: true })).toEqual(
+			{
+				ok: true,
+				dispatched: false,
+			},
+		);
+		record = await load();
+		expect(record.commentAutomation.publication.pending).toEqual([]);
+		clock += 61_000;
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(1);
+	});
 });
 
 // Regression: refreshes, ticks, and the startup reconcile are fire-and-forget

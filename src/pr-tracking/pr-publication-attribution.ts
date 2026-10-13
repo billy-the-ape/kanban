@@ -40,9 +40,17 @@ export interface PrPublicationTarget {
 export interface PrPublicationOperation {
 	/** Minimal label for attribution: "gh pr comment" | "gh api" | "gh pr review". */
 	operation: string;
-	kind: PrPublishedIdentityKind;
+	/**
+	 * The feedback kind the write produces, or null for a write-looking
+	 * `gh api` call whose endpoint cannot be attributed to a comment,
+	 * review, or inline reply: it is a recognized publication whose output
+	 * can never yield identities (always an uncertain capture).
+	 */
+	kind: PrPublishedIdentityKind | null;
 	explicitRepository: string | null;
 	explicitNumber: number | null;
+	/** The command fragment that produced this operation (ties output to the write). */
+	fragment: string;
 }
 
 export type PrPublicationStatus = "none" | "pending" | "published" | "failed" | "uncertain";
@@ -99,12 +107,15 @@ const GH_API_VALUE_FLAGS = new Set([
 	"--header",
 	"--input",
 	"--jq",
+	"-q",
 	"--hostname",
 	"-t",
 	"--template",
 	"--cache",
 	"--method",
 	"-X",
+	"-p",
+	"--preview",
 ]);
 /** `gh api` payload flags: their presence implies a POST when no method is given. */
 const GH_API_PAYLOAD_FLAGS = new Set(["-f", "-F", "--field", "--raw-field", "--input"]);
@@ -171,7 +182,7 @@ export function detectPublicationOperations(commands: string[]): PrPublicationOp
 	const operations: PrPublicationOperation[] = [];
 	const seen = new Set<string>();
 	const push = (operation: PrPublicationOperation): void => {
-		const shape = `${operation.operation}|${operation.kind}|${operation.explicitRepository}|${operation.explicitNumber}`;
+		const shape = `${operation.operation}|${operation.kind}|${operation.explicitRepository}|${operation.explicitNumber}|${operation.fragment}`;
 		if (seen.has(shape)) {
 			return;
 		}
@@ -198,6 +209,7 @@ export function detectPublicationOperations(commands: string[]): PrPublicationOp
 						kind: "conversation",
 						explicitRepository: selection.repository,
 						explicitNumber: selection.number,
+						fragment,
 					});
 				} else if (action === "review" && tokens.slice(3).includes("--comment")) {
 					if (tokens.slice(3).includes("--web")) {
@@ -209,6 +221,7 @@ export function detectPublicationOperations(commands: string[]): PrPublicationOp
 						kind: "review",
 						explicitRepository: selection.repository,
 						explicitNumber: selection.number,
+						fragment,
 					});
 				}
 			} else if (group === "api") {
@@ -246,7 +259,7 @@ export function detectPublicationOperations(commands: string[]): PrPublicationOp
 						continue;
 					}
 					if (token.startsWith("-")) {
-						// Valueless flags (`-q`, `--quiet`, `--help`, ...).
+						// Valueless flags (`--paginate`, `--silent`, `--slurp`, `--help`, ...).
 						i += 1;
 						continue;
 					}
@@ -261,16 +274,28 @@ export function detectPublicationOperations(commands: string[]): PrPublicationOp
 				}
 				const normalizedEndpoint = endpoint.replace(/^\/+/, "");
 				const parsed = parseApiWriteEndpoint(normalizedEndpoint);
-				if (!parsed) {
-					continue;
-				}
 				const repoMatch = /^repos\/([^/]+)\/([^/]+)/.exec(normalizedEndpoint);
 				const numberMatch = /\/(\d+)\/(comments|reviews)/.exec(normalizedEndpoint);
+				if (!parsed) {
+					// A write-looking `gh api` call whose endpoint does not
+					// match a known PR-feedback shape: a recognized
+					// publication whose output can never be attributed
+					// (kind null) — never silently dropped.
+					push({
+						operation: "gh api",
+						kind: null,
+						explicitRepository: repoMatch ? `${repoMatch[1]}/${repoMatch[2]}` : null,
+						explicitNumber: numberMatch ? Number.parseInt(numberMatch[1], 10) : null,
+						fragment,
+					});
+					continue;
+				}
 				push({
 					operation: "gh api",
 					kind: parsed.kind,
 					explicitRepository: repoMatch ? `${repoMatch[1]}/${repoMatch[2]}` : null,
 					explicitNumber: numberMatch ? Number.parseInt(numberMatch[1], 10) : null,
+					fragment,
 				});
 			}
 		}
@@ -502,7 +527,9 @@ function extractUrlIdentities(
 		return [];
 	}
 	const identities: PrPublishedIdentity[] = [];
-	const kinds = new Set(operations.map((operation) => operation.kind));
+	const kinds = new Set(
+		operations.map((operation) => operation.kind).filter((kind): kind is PrPublishedIdentityKind => kind !== null),
+	);
 	if (kinds.has("conversation")) {
 		const pattern = /https?:\/\/([^/]+)\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:\/discussions\/|#issuecomment-)(\d+)/g;
 		for (const match of text.matchAll(pattern)) {
@@ -551,11 +578,24 @@ function hasClearFailureEvidence(output: string | null, error: string | null): b
 	return candidates.some((value) => pattern.test(value));
 }
 
+/** A Cline command-tool structured result entry: `{query, result, success}`. */
+function isCommandResultEntry(object: Record<string, unknown>): boolean {
+	return typeof object.query === "string" && typeof object.success === "boolean" && "result" in object;
+}
+
+const MULTI_OBJECT_UNCERTAINTY_REASON =
+	"The output contained several GitHub objects; the published identity could not be confirmed.";
+
 /**
  * Resolves a recognized write's tool output to exact published identities.
  * Identities come only from attributable API responses or returned URLs for
- * the resolved target; a clear API/CLI failure means nothing was published;
- * anything else is explicit uncertainty (never a guess).
+ * the resolved target, tied to the write invocation: when the output is a
+ * structured per-fragment command result, only the result(s) whose query is
+ * a write fragment contribute, so a read fragment in the same tool call can
+ * never register identities. Several identity-bearing objects in the
+ * evidence (a listing mixed into the write's output) can never register —
+ * it is explicit uncertainty, never a guess. A clear API/CLI failure means
+ * nothing was published; anything else is explicit uncertainty.
  */
 export function resolvePublicationOutput(input: {
 	operations: PrPublicationOperation[];
@@ -564,18 +604,68 @@ export function resolvePublicationOutput(input: {
 	error: string | null;
 }): PrPublicationOutputResult {
 	const text = input.output ?? "";
+	const writeFragments = input.operations
+		.map((operation) => operation.fragment)
+		.filter((fragment) => fragment.length > 0);
+	// Scope the evidence to the write fragment(s). A structured per-fragment
+	// result array reduces to the write fragment's own result(s); plain
+	// output is used as-is (also the restart-recovery path, where the
+	// fragment is not known and the multi-object guard below still applies).
+	const entries = extractJsonObjects(text).filter(isCommandResultEntry);
+	const matched =
+		entries.length > 0 && writeFragments.length > 0
+			? entries.filter((entry) => {
+					const query = typeof entry.query === "string" ? entry.query : "";
+					// The entry's query must contain the write fragment: a read
+					// fragment that prefixes the write must not contribute.
+					return writeFragments.some((fragment) => query.includes(fragment));
+				})
+			: [];
+	const candidateTexts: string[] = [];
+	for (const entry of matched) {
+		const result = entry.result;
+		if (typeof result === "string") {
+			candidateTexts.push(result);
+		} else if (result !== null && typeof result === "object") {
+			candidateTexts.push(JSON.stringify(result));
+		}
+	}
+	if (candidateTexts.length === 0) {
+		candidateTexts.push(text);
+	}
 	const collected: PrPublishedIdentity[] = [];
 	let sawError = false;
-	for (const object of extractJsonObjects(text)) {
-		const mapped = mapApiResponseIdentity(object, input.target);
-		if (mapped.kind === "error") {
-			sawError = true;
-			continue;
+	let identityObjects = 0;
+	let totalObjects = 0;
+	for (const candidate of candidateTexts) {
+		const objects = extractJsonObjects(candidate);
+		totalObjects += objects.length;
+		for (const object of objects) {
+			const mapped = mapApiResponseIdentity(object, input.target);
+			if (mapped.kind === "error") {
+				sawError = true;
+				continue;
+			}
+			if (mapped.identities.length > 0) {
+				// One identity-bearing object per write operation: a listing
+				// (several objects) is never registered.
+				identityObjects += 1;
+				collected.push(...mapped.identities);
+			}
 		}
-		collected.push(...mapped.identities);
+	}
+	if (identityObjects > 1) {
+		return { status: "uncertain", identities: [], reason: MULTI_OBJECT_UNCERTAINTY_REASON };
 	}
 	if (collected.length === 0) {
-		collected.push(...extractUrlIdentities(text, input.operations, input.target));
+		// A multi-object output that yielded no identities is not safe for
+		// the URL fallback (a listing's URLs are not the write's).
+		if (totalObjects > 1) {
+			return { status: "uncertain", identities: [], reason: MULTI_OBJECT_UNCERTAINTY_REASON };
+		}
+		for (const candidate of candidateTexts) {
+			collected.push(...extractUrlIdentities(candidate, input.operations, input.target));
+		}
 	}
 	const deduped: PrPublishedIdentity[] = [];
 	const seen = new Set<string>();
@@ -640,6 +730,21 @@ export function analyzePrPublication(input: {
 			kind: primary.kind,
 			identities: [],
 			reason: unlinked ? null : "Could not resolve which linked pull request the publication targets.",
+		};
+	}
+	// A write whose endpoint cannot be attributed to a comment, review, or
+	// inline reply can never yield identities from its output: an explicit
+	// uncertainty even before execution finishes.
+	if (operations.some((operation) => operation.kind === null)) {
+		return {
+			status: "uncertain",
+			target,
+			explicitUnlinked: false,
+			operation: primary.operation,
+			kind: primary.kind,
+			identities: [],
+			reason:
+				"The gh api write targeted an endpoint that cannot be attributed to a PR comment, review, or inline reply.",
 		};
 	}
 	if (input.output === null) {

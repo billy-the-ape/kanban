@@ -1,6 +1,6 @@
 # PR comment handling — master plan
 
-Updated: 2026-10-09. Status: COMMENT-0 implemented, plus the second-round review fixes (see "Implementation status" below). Repository: `billy-the-ape/kanban`.
+Updated: 2026-10-13. Status: COMMENT-0 implemented, plus the second-, third-, and fourth-round review fixes (see "Implementation status" below). Repository: `billy-the-ape/kanban`.
 
 ## Goal and dependencies
 
@@ -325,6 +325,35 @@ Review fixes applied (third review round, same PR):
   `sameTarget`, API-response `hasTarget`, and returned-URL validation), matching
   `getPullRequestIdentityKey` semantics, so a case-differing `-R` selector or URL still
   attributes to the linked PR instead of becoming an uncertain capture.
+
+Review fixes applied (fourth review round, same PR):
+
+- `gh api` value flags: `-q` (short `--jq`) and `-p`/`--preview` take a value and are now in
+  the value-consumption flag set, so their values can no longer be mistaken for the endpoint
+  (the valueless-flag branch comment is corrected to match).
+- Unparseable `gh api` write endpoints: a write-looking `gh api` call whose endpoint does not
+  match a known PR-feedback shape is no longer silently dropped. It is recognized as an
+  operation with `kind: null`, and `analyzePrPublication` returns an explicit uncertainty
+  (never `none`) so the capture pauses visibly instead of vanishing.
+- Identities tied to the write invocation: operations now carry the command fragment that
+  produced them, and `resolvePublicationOutput` reduces a Cline structured per-fragment
+  result (`{query, result, success}` entries) to the write fragment's own result(s) before
+  scanning for identities, so a read fragment in the same tool call can never register
+  identities. Cap: when the write's evidence contains more than one identity-bearing JSON
+  object (a listing mixed into the output), nothing is registered and the capture is
+  explicitly uncertain; the URL fallback is skipped for multi-object output.
+- Stale pending captures: a start-phase capture whose tool result never arrived (turn
+  cancelled, host interrupted, ...) is marked an explicit uncertainty after 10 minutes,
+  persisted on settle and surfaced through the existing visible
+  `blocker`/`resumable`/`resumeRequiresAcknowledgment` flow, cleared only by an explicit
+  acknowledged Resume. It no longer blocks settle silently until a restart reconciles it.
+
+Tests: new `test/runtime/pr-tracking/pr-publication-attribution.test.ts` (14 cases covering
+the flag fixes, unparseable-endpoint uncertainty, write-fragment scoping, and the
+multi-object guard) plus four new cases in `comment-automation-service.test.ts` (`-q`
+end-to-end capture, unparseable-endpoint pause, structured multi-fragment scoping, and the
+stale-capture blocker/acknowledged-resume cycle). These fixes postdate v0.2.31 and ship
+with the next release; the restart caveat for already-recorded captures still applies.
 
 Documented v1 deviations: a terminal PR observation cancels queued dispatch but keeps the owner
 held until its candidate is no longer enabled; dispatch waits for conflicting writers before

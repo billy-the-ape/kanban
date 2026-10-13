@@ -1,0 +1,235 @@
+import { describe, expect, it } from "vitest";
+import {
+	analyzePrPublication,
+	detectPublicationOperations,
+	type PrPublicationOperation,
+	type PrPublicationTarget,
+	resolvePublicationOutput,
+} from "../../../src/pr-tracking/pr-publication-attribution";
+
+const TARGET: PrPublicationTarget = { host: "github.com", repository: "octo/repo", number: 42 };
+
+describe("detectPublicationOperations gh api value flags", () => {
+	it("treats the -q jq filter value as a flag value, not the endpoint", () => {
+		const fragment = "gh api -q .html_url -X POST repos/octo/repo/issues/5/comments -f body='addressing'";
+		expect(detectPublicationOperations([fragment])).toEqual([
+			{
+				operation: "gh api",
+				kind: "conversation",
+				explicitRepository: "octo/repo",
+				explicitNumber: 5,
+				fragment,
+			},
+		]);
+	});
+
+	it("treats the -p/--preview value as a flag value, not the endpoint", () => {
+		const fragment = "gh api -p alpha repos/octo/repo/pulls/7/comments/11/replies -f body='inline'";
+		expect(detectPublicationOperations([fragment])).toEqual([
+			{
+				operation: "gh api",
+				kind: "inline",
+				explicitRepository: "octo/repo",
+				explicitNumber: 7,
+				fragment,
+			},
+		]);
+	});
+
+	it("keeps -q from mistaking the jq expression for an endpoint on reads", () => {
+		// A jq-filtered read stays out of detection entirely.
+		expect(detectPublicationOperations(["gh api -q .issue_url GET repos/octo/repo/issues/5/comments/9"])).toEqual([]);
+	});
+});
+
+describe("detectPublicationOperations unparseable write endpoints", () => {
+	it("recognizes a write-looking gh api endpoint as an unattributable operation", () => {
+		const fragment = "gh api -X POST repos/octo/repo/pulls/42/review_requests";
+		expect(detectPublicationOperations([fragment])).toEqual([
+			{
+				operation: "gh api",
+				kind: null,
+				explicitRepository: "octo/repo",
+				explicitNumber: null,
+				fragment,
+			},
+		]);
+	});
+
+	it("never treats read-looking calls as unattributable writes", () => {
+		expect(detectPublicationOperations(["gh api -X GET repos/octo/repo/pulls/42/review_requests"])).toEqual([]);
+	});
+});
+
+describe("analyzePrPublication unparseable endpoints", () => {
+	it("pauses with an uncertain capture (never silent-none) for an unattributable write", () => {
+		const observation = analyzePrPublication({
+			toolName: "run_command",
+			commands: ["gh api -X POST repos/octo/repo/pulls/42/review_requests"],
+			output: null,
+			error: null,
+			linkedPullRequests: [TARGET],
+		});
+		expect(observation.status).toBe("uncertain");
+		expect(observation.target).toEqual(TARGET);
+		expect(observation.reason).toContain("cannot be attributed");
+	});
+
+	it("stays uncertain even when the write returns output", () => {
+		const observation = analyzePrPublication({
+			toolName: "run_command",
+			commands: ["gh api -X POST repos/octo/repo/pulls/42/review_requests"],
+			output: JSON.stringify({ id: 3, url: "https://api.github.com/repos/octo/repo/pulls/42" }),
+			error: null,
+			linkedPullRequests: [TARGET],
+		});
+		expect(observation.status).toBe("uncertain");
+		expect(observation.identities).toEqual([]);
+	});
+});
+
+describe("resolvePublicationOutput write-fragment scoping", () => {
+	const writeOperation: PrPublicationOperation = {
+		operation: "gh pr comment",
+		kind: "conversation",
+		explicitRepository: null,
+		explicitNumber: null,
+		fragment: "gh pr comment -b 'addressing'",
+	};
+
+	it("registers only the write fragment's identity from a structured multi-fragment result", () => {
+		const output = JSON.stringify([
+			{
+				query: "gh pr comment -b 'addressing'",
+				result: "https://github.com/octo/repo/pull/42#issuecomment-9",
+				success: true,
+			},
+			{
+				query: "gh pr view 42 --json comments",
+				result: JSON.stringify([{ id: 7, issue_url: "https://github.com/octo/repo/issues/42" }]),
+				success: true,
+			},
+		]);
+		const resolution = resolvePublicationOutput({
+			operations: [writeOperation],
+			target: TARGET,
+			output,
+			error: null,
+		});
+		expect(resolution.status).toBe("published");
+		expect(resolution.identities).toEqual([{ kind: "conversation", id: 9 }]);
+	});
+
+	it("scopes to the write fragment's JSON result and ignores a read fragment's listing", () => {
+		const output = JSON.stringify([
+			{
+				query: "gh api repos/octo/repo/issues/5/comments -f body=x",
+				result: JSON.stringify({ id: 9, issue_url: "https://github.com/octo/repo/issues/42" }),
+				success: true,
+			},
+			{
+				query: "gh api repos/octo/repo/issues/5/comments",
+				result: JSON.stringify([
+					{ id: 1, issue_url: "https://github.com/octo/repo/issues/42" },
+					{ id: 2, issue_url: "https://github.com/octo/repo/issues/42" },
+				]),
+				success: true,
+			},
+		]);
+		const resolution = resolvePublicationOutput({
+			operations: [
+				{
+					operation: "gh api",
+					kind: "conversation",
+					explicitRepository: "octo/repo",
+					explicitNumber: 5,
+					fragment: "gh api repos/octo/repo/issues/5/comments -f body=x",
+				},
+			],
+			target: TARGET,
+			output,
+			error: null,
+		});
+		expect(resolution.status).toBe("published");
+		expect(resolution.identities).toEqual([{ kind: "conversation", id: 9 }]);
+	});
+
+	it("still publishes from a structured entry whose result is plain text", () => {
+		const output = JSON.stringify([
+			{
+				query: "gh pr comment -b 'addressing'",
+				result: "https://github.com/octo/repo/pull/42#issuecomment-11",
+				success: true,
+			},
+		]);
+		const resolution = resolvePublicationOutput({
+			operations: [writeOperation],
+			target: TARGET,
+			output,
+			error: null,
+		});
+		expect(resolution.status).toBe("published");
+		expect(resolution.identities).toEqual([{ kind: "conversation", id: 11 }]);
+	});
+});
+
+describe("resolvePublicationOutput multi-object guard", () => {
+	const commentOperation: PrPublicationOperation = {
+		operation: "gh pr comment",
+		kind: "conversation",
+		explicitRepository: null,
+		explicitNumber: null,
+		fragment: "gh pr comment -b 'addressing'",
+	};
+
+	it("treats a listing mixed into the write's own output as uncertain", () => {
+		const output = JSON.stringify([
+			{ id: 9, issue_url: "https://github.com/octo/repo/issues/42" },
+			{ id: 7, issue_url: "https://github.com/octo/repo/issues/42" },
+		]);
+		const resolution = resolvePublicationOutput({
+			operations: [commentOperation],
+			target: TARGET,
+			output,
+			error: null,
+		});
+		expect(resolution.status).toBe("uncertain");
+		expect(resolution.identities).toEqual([]);
+		expect(resolution.reason).toContain("several GitHub objects");
+	});
+
+	it("treats a multi-object output that yields no identities as uncertain, not URL-scannable", () => {
+		const output = JSON.stringify([{ name: "a" }, { name: "b" }]);
+		const resolution = resolvePublicationOutput({
+			operations: [commentOperation],
+			target: TARGET,
+			output,
+			error: null,
+		});
+		expect(resolution.status).toBe("uncertain");
+		expect(resolution.identities).toEqual([]);
+	});
+
+	it("still publishes a single attributable response object", () => {
+		const output = JSON.stringify({ id: 9, issue_url: "https://github.com/octo/repo/issues/42" });
+		const resolution = resolvePublicationOutput({
+			operations: [commentOperation],
+			target: TARGET,
+			output,
+			error: null,
+		});
+		expect(resolution.status).toBe("published");
+		expect(resolution.identities).toEqual([{ kind: "conversation", id: 9 }]);
+	});
+
+	it("still fails cleanly on a clear CLI failure", () => {
+		const resolution = resolvePublicationOutput({
+			operations: [commentOperation],
+			target: TARGET,
+			output: "gh: failed to create comment",
+			error: null,
+		});
+		expect(resolution.status).toBe("failed");
+		expect(resolution.identities).toEqual([]);
+	});
+});
