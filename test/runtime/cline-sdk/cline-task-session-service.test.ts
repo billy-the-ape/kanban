@@ -13,6 +13,10 @@ import type {
 	StartClineSessionRuntimeResult,
 } from "../../../src/cline-sdk/cline-session-runtime";
 import { createSessionId } from "../../../src/cline-sdk/cline-session-state";
+import {
+	buildSyntheticSessionHeader,
+	type ClineTaskExportSnapshot,
+} from "../../../src/cline-sdk/cline-task-export-snapshot";
 import type { ClineTaskSessionService } from "../../../src/cline-sdk/cline-task-session-service";
 import { createInMemoryClineTaskSessionService } from "../../../src/cline-sdk/cline-task-session-service";
 import { createClineWatcherRegistry } from "../../../src/cline-sdk/cline-watcher-registry";
@@ -255,6 +259,39 @@ function createFakeClineSessionRuntime(): FakeClineSessionRuntimeController {
 			},
 			canRestartTaskSession(taskId: string): boolean {
 				return lastStartRequestByTaskId.has(taskId);
+			},
+			// DIAG-2: the fake has no durable records; mirror the real runtime's
+			// synthetic-segment behavior for the bound session only.
+			async getTaskExportSnapshot(taskId: string): Promise<ClineTaskExportSnapshot | null> {
+				const boundSessionId = sessionIdByTaskId.get(taskId);
+				if (!boundSessionId) {
+					return null;
+				}
+				const startRequest = lastStartRequestByTaskId.get(taskId);
+				return {
+					kind: "task",
+					taskId,
+					capturedAt: Date.now(),
+					listingTruncated: false,
+					segments: [
+						{
+							header: buildSyntheticSessionHeader({
+								sessionId: boundSessionId,
+								kind: "task",
+								providerId: startRequest?.providerId ?? null,
+								modelId: startRequest?.modelId ?? null,
+								cwd: startRequest?.cwd ?? null,
+							}),
+							artifactTaskId: taskId,
+							launchConfig: null,
+							transcript: { status: "complete", reason: null },
+							messages: [],
+							liveTail: null,
+							readError: null,
+							toolOrigins: [],
+						},
+					],
+				};
 			},
 			async resolveRestartStartRequest(taskId: string) {
 				return lastStartRequestByTaskId.get(taskId) ?? null;

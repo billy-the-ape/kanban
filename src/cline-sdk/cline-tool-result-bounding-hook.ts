@@ -177,6 +177,17 @@ export function createClineToolResultBoundingHook(
 				taskId: options.taskId,
 				toolCallId,
 				content: fullText,
+				// DIAG-2: the sidecar index is diagnostic-only; a failed index write is
+				// logged and never breaks the session (the excerpt still carries the
+				// artifact reference line).
+				onIndexWriteError: (error) => {
+					options.logger?.log("Failed to record the full tool-result artifact in the sidecar index", {
+						severity: "warn",
+						toolName,
+						toolCallId,
+						error: toErrorMessage(error),
+					});
+				},
 			});
 		} catch (error) {
 			options.logger?.log(

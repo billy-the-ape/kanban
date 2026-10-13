@@ -45,6 +45,14 @@ import { resolveTaskCwd } from "../workspace/task-worktree";
 import { buildClineCompactionConfig } from "./cline-compaction-config";
 import type { ResolvedClineLaunchConfig } from "./cline-provider-service";
 import type { ClineLaunchConfigResolver } from "./cline-session-runtime";
+import { buildSessionIdPrefix } from "./cline-session-state";
+import {
+	type ClineTaskExportSegment,
+	type ClineTaskExportSnapshot,
+	type ClineTaskExportSnapshotOptions,
+	compareExportStringValues,
+	labelSegmentToolOrigins,
+} from "./cline-task-export-snapshot";
 import type { ClineTaskSessionService, StartClineTaskSessionRequest } from "./cline-task-session-service";
 import { buildReviewInitialPrompt, buildReviewRepairPrompt, buildVerificationRepairPrompt } from "./review-prompt";
 import { createReviewToolPolicy } from "./review-tool-policy";
@@ -108,6 +116,17 @@ export interface ClineReviewSessionService {
 	 * `<taskId>::verification-repair-N`; the base task ids hold worker slots.
 	 */
 	listSessionSummaries(): RuntimeTaskSessionSummary[];
+	/**
+	 * DIAG-2 (2a): read-only export snapshot of the task's review lineage:
+	 * the review session (kind "review") plus every verification repair
+	 * session (kind "verification-repair"), in creation order, each with its
+	 * durable transcript and (while running) its live tail. Never pauses,
+	 * clears, or mutates review state.
+	 */
+	getSessionExportSnapshot(
+		baseTaskId: string,
+		options?: ClineTaskExportSnapshotOptions,
+	): Promise<ClineTaskExportSnapshot>;
 	getReviewInfo(taskId: string): Promise<RuntimeTaskReviewInfoResponse>;
 	dispose(): Promise<void>;
 }
@@ -179,7 +198,42 @@ function terminalFailureReason(summary: RuntimeTaskSessionSummary): string | nul
 	return null;
 }
 
-/** B-6: applies the documented defaults when no review policy is configured (off, 2 repair rounds). */
+/**
+ * Parses the `<ts>-<rand8>` tail of a session id as produced by
+ * createSessionId: `<taskId prefix>-<epoch ms>-<8-char base36>`.
+ */
+const REPAIR_SESSION_ID_SUFFIX_PATTERN = /^(\d+)-\d{13}-[0-9a-z]{8}$/;
+
+/**
+ * DIAG-2 (2a): classifies a review-lineage session id into its session kind
+ * and the service-scoped task id whose context-artifacts directory owns the
+ * session's full tool outputs. Null for ids outside the review lineage.
+ */
+function classifyReviewSegmentKind(
+	sessionId: string,
+	baseTaskId: string,
+): { kind: "review" | "verification-repair"; serviceTaskId: string } | null {
+	const reviewTaskId = reviewSessionIdForTask(baseTaskId);
+	const reviewPrefix = buildSessionIdPrefix(reviewTaskId);
+	if (sessionId.startsWith(reviewPrefix)) {
+		return { kind: "review", serviceTaskId: reviewTaskId };
+	}
+	// Repair sessions are started under `<review id>::verification-repair-<N>`,
+	// so their session ids share the prefix ending right after `repair-`.
+	const repairPrefix = buildSessionIdPrefix(`${reviewTaskId}${VERIFICATION_REPAIR_SESSION_SUFFIX.slice(0, -1)}`);
+	if (sessionId.startsWith(repairPrefix)) {
+		const rest = sessionId.slice(repairPrefix.length);
+		const match = REPAIR_SESSION_ID_SUFFIX_PATTERN.exec(rest);
+		const round = match ? Number(match[1]) : null;
+		const serviceTaskId =
+			round !== null && Number.isSafeInteger(round) && round > 0
+				? `${reviewTaskId}${VERIFICATION_REPAIR_SESSION_SUFFIX}${round}`
+				: `${reviewTaskId}${VERIFICATION_REPAIR_SESSION_SUFFIX}`;
+		return { kind: "verification-repair", serviceTaskId };
+	}
+	return null;
+}
+
 function resolveEffectiveReviewPolicy(policy: RuntimeReviewPolicy | undefined): RuntimeReviewPolicy {
 	if (policy) {
 		return {
@@ -228,6 +282,124 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 	/** B-11.2: live review/repair sessions (they hold the base tasks' worker slots). */
 	listSessionSummaries(): RuntimeTaskSessionSummary[] {
 		return this.sessionService.listSummaries();
+	}
+
+	/**
+	 * DIAG-2 (2a): read-only export snapshot of the task's review lineage.
+	 * The review session's own snapshot plus one per verification repair
+	 * session (each repair round owns a separate session) are merged by
+	 * session id, de-duplicated, and sorted in creation order. Segments are
+	 * kind-tagged ("review" / "verification-repair") and carry the
+	 * service-scoped task id that owns each session's context-artifacts
+	 * directory. Never pauses, clears, or mutates review state.
+	 */
+	async getSessionExportSnapshot(
+		baseTaskId: string,
+		options?: ClineTaskExportSnapshotOptions,
+	): Promise<ClineTaskExportSnapshot> {
+		const reviewTaskId = reviewSessionIdForTask(baseTaskId);
+		const repairTaskIdBase = `${reviewTaskId}${VERIFICATION_REPAIR_SESSION_SUFFIX}`;
+		const wantedTaskIds = new Set<string>([reviewTaskId, repairTaskIdBase]);
+		// Live repair sessions are only enumerable through their summaries;
+		// durable-only repair sessions are found through the common prefix query.
+		for (const summary of this.sessionService.listSummaries()) {
+			if (summary.taskId === reviewTaskId || summary.taskId.startsWith(repairTaskIdBase)) {
+				wantedTaskIds.add(summary.taskId);
+			}
+		}
+		const ownerPaths = options?.ownerPaths ?? (await this.resolveReviewExportOwnerPaths(baseTaskId));
+		// The bare repair base id prefixes no session id on its own (each round
+		// appends its number first); the common prefix ends after `repair-`.
+		const repairSessionIdPrefix = buildSessionIdPrefix(
+			`${reviewTaskId}${VERIFICATION_REPAIR_SESSION_SUFFIX.slice(0, -1)}`,
+		);
+		const snapshots = (
+			await Promise.all(
+				[...wantedTaskIds].map(async (sessionTaskId) => {
+					try {
+						return await this.sessionService.getTaskExportSnapshot(sessionTaskId, {
+							ownerPaths,
+							...(sessionTaskId === repairTaskIdBase ? { sessionIdPrefix: repairSessionIdPrefix } : {}),
+						});
+					} catch {
+						return null;
+					}
+				}),
+			)
+		).filter((snapshot): snapshot is ClineTaskExportSnapshot => snapshot !== null);
+
+		const merged = new Map<string, ClineTaskExportSegment>();
+		let listingTruncated = false;
+		let capturedAt = Date.now();
+		for (const snapshot of snapshots) {
+			listingTruncated = listingTruncated || snapshot.listingTruncated;
+			capturedAt = Math.max(capturedAt, snapshot.capturedAt);
+			for (const segment of snapshot.segments) {
+				const existing = merged.get(segment.header.sessionId);
+				if (!existing) {
+					merged.set(segment.header.sessionId, segment);
+					continue;
+				}
+				// The same session may be reachable through the repair prefix
+				// and the specific repair id; the specific id owns the
+				// session's context-artifacts directory.
+				if (segment.artifactTaskId.length > existing.artifactTaskId.length) {
+					existing.artifactTaskId = segment.artifactTaskId;
+				}
+				if (existing.readError !== null && segment.readError === null) {
+					existing.readError = null;
+					existing.messages = segment.messages;
+					existing.transcript = segment.transcript;
+				}
+				if (!existing.liveTail && segment.liveTail) {
+					existing.liveTail = segment.liveTail;
+				}
+			}
+		}
+		const segments = [...merged.values()];
+		segments.sort(
+			(a, b) =>
+				compareExportStringValues(a.header.startedAt ?? "", b.header.startedAt ?? "") ||
+				compareExportStringValues(a.header.sessionId, b.header.sessionId),
+		);
+		for (const segment of segments) {
+			const classification = classifyReviewSegmentKind(segment.header.sessionId, baseTaskId);
+			if (classification) {
+				segment.header.kind = classification.kind;
+				segment.artifactTaskId = classification.serviceTaskId;
+			}
+		}
+		labelSegmentToolOrigins(segments);
+		return {
+			kind: "review",
+			taskId: baseTaskId,
+			capturedAt,
+			listingTruncated,
+			segments,
+		};
+	}
+
+	/**
+	 * Default ownership filter for review/repair export snapshots: the main
+	 * repo checkout plus the task's worktree (the review sessions' cwd).
+	 * Returns undefined (no filtering) when the worktree cannot be resolved —
+	 * including the transcript is better than silently dropping it.
+	 */
+	private async resolveReviewExportOwnerPaths(baseTaskId: string): Promise<string[] | undefined> {
+		const repoPath = this.repoPath.trim();
+		if (!repoPath) {
+			return undefined;
+		}
+		try {
+			const baseRef = await this.evidence.loadTaskBaseRef(baseTaskId);
+			if (!baseRef) {
+				return undefined;
+			}
+			const worktreePath = await this.evidence.resolveWorktreePath(baseTaskId, baseRef);
+			return [repoPath, worktreePath];
+		} catch {
+			return undefined;
+		}
 	}
 
 	async startTaskReview(input: ClineReviewStartInput): Promise<RuntimeTaskReviewStartResponse> {

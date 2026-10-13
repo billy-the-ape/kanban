@@ -20,6 +20,7 @@ import { join } from "node:path";
 
 import { lockedFileSystem } from "../fs/locked-file-system";
 import { getTaskWorktreesHomePath } from "../state/workspace-state";
+import { appendTaskArtifactIndexEntry } from "./task-artifact-index";
 import { normalizeTaskIdForWorktreePath } from "./task-worktree-path";
 
 const CONTEXT_ARTIFACTS_DIR_NAME = "context-artifacts";
@@ -32,22 +33,28 @@ export function getTaskContextArtifactsDir(taskId: string): string {
 }
 
 /**
+ * Sanitizes a tool call id into a deterministic file-name stem. Shared by the
+ * artifact file name and the DIAG-2 filename-based export fallback so both stay aligned.
+ */
+export function sanitizeToolCallIdForArtifactName(toolCallId: string): string {
+	const sanitized = toolCallId
+		.replace(/[^A-Za-z0-9._-]+/g, "-")
+		.slice(0, ARTIFACT_TOOL_CALL_ID_MAX_CHARS)
+		.replace(/^[.-]+|[.-]+$/g, "");
+	return sanitized || "tool-call";
+}
+
+/**
  * File name for one artifact: `<sanitized toolCallId>-<timestampMs>-<random>.txt`.
- * Characters that are not filesystem-safe in a tool call id are collapsed to dashes, the id
- * is capped in length, and the timestamp plus random suffix keep same-millisecond writes
- * distinct instead of overwriting each other.
+ * The timestamp plus random suffix keep same-millisecond writes distinct instead of
+ * overwriting each other.
  */
 export function buildTaskContextArtifactFileName(
 	toolCallId: string,
 	timestampMs: number = Date.now(),
 	randomSuffix: string = randomBytes(ARTIFACT_RANDOM_SUFFIX_BYTES).toString("hex"),
 ): string {
-	const sanitized = toolCallId
-		.replace(/[^A-Za-z0-9._-]+/g, "-")
-		.slice(0, ARTIFACT_TOOL_CALL_ID_MAX_CHARS)
-		.replace(/^[.-]+|[.-]+$/g, "");
-	const idPart = sanitized || "tool-call";
-	return `${idPart}-${timestampMs}-${randomSuffix}.txt`;
+	return `${sanitizeToolCallIdForArtifactName(toolCallId)}-${timestampMs}-${randomSuffix}.txt`;
 }
 
 export interface WriteTaskContextArtifactInput {
@@ -59,19 +66,36 @@ export interface WriteTaskContextArtifactInput {
 	content: string;
 	/** Timestamp injection for deterministic file names (tests). */
 	timestampMs?: number;
+	/**
+	 * DIAG-2: best-effort sidecar index write is diagnostic-only. A failure is
+	 * reported here (so the caller can log it) and never rejects the write,
+	 * mirroring how an artifact write failure is treated.
+	 */
+	onIndexWriteError?: (error: unknown) => void;
 }
 
 /**
  * Atomically writes the full tool-result content under this task's context-artifacts
  * directory and returns the absolute artifact path. Uses the locked filesystem so concurrent
  * writers never observe a partial file (lock + temp + rename, parent dirs created on demand).
+ *
+ * After the artifact is written, a `toolCallId -> fileName` entry is appended to the
+ * best-effort sidecar index (DIAG-2) so an export can resolve the full output without
+ * guessing the file name; an index failure is reported through `input.onIndexWriteError`.
  */
 export async function writeTaskContextArtifact(input: WriteTaskContextArtifactInput): Promise<string> {
-	const path = join(
-		getTaskContextArtifactsDir(input.taskId),
-		buildTaskContextArtifactFileName(input.toolCallId, input.timestampMs ?? Date.now()),
-	);
+	const fileName = buildTaskContextArtifactFileName(input.toolCallId, input.timestampMs ?? Date.now());
+	const path = join(getTaskContextArtifactsDir(input.taskId), fileName);
 	await lockedFileSystem.writeTextFileAtomic(path, input.content);
+	try {
+		await appendTaskArtifactIndexEntry({
+			taskId: input.taskId,
+			toolCallId: input.toolCallId,
+			fileName,
+		});
+	} catch (error) {
+		input.onIndexWriteError?.(error);
+	}
 	return path;
 }
 

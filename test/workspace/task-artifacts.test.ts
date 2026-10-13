@@ -3,7 +3,7 @@
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
+import { TASK_ARTIFACT_INDEX_FILE_NAME } from "../../src/workspace/task-artifact-index";
 import {
 	buildTaskContextArtifactFileName,
 	getTaskContextArtifactsDir,
@@ -75,9 +75,13 @@ describe("task context artifacts", () => {
 		});
 		const dir = getTaskContextArtifactsDir("task-2");
 		const entries = await readdir(dir);
-		expect(entries).toHaveLength(1);
-		expect(entries[0]).toBe(path.split("/").pop());
-		expect(entries[0]).not.toContain(".tmp.");
+		// The artifact file plus the DIAG-2 sidecar index — and no leftover temp files.
+		expect(entries).toHaveLength(2);
+		expect(entries).toContain(TASK_ARTIFACT_INDEX_FILE_NAME);
+		expect(entries).toContain(path.split("/").pop());
+		for (const entry of entries) {
+			expect(entry).not.toContain(".tmp.");
+		}
 	});
 
 	it("rejects when reading a missing artifact", async () => {

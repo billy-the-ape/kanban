@@ -447,6 +447,18 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			getScopedTerminalManager,
 			getScopedClineTaskSessionService,
 			getScopedReviewSessionService,
+			// DIAG-2: read-only, typed transcript export snapshots for the
+			// full-fidelity diagnostics bundle. Snapshot building never pauses
+			// or clears sessions; a failure degrades to an explicit gap.
+			getTaskExportSnapshot: async (scope, taskId) => {
+				const taskSnapshot = await getScopedClineTaskSessionService(scope)
+					.then((service) => service.getTaskExportSnapshot(taskId))
+					.catch(() => null);
+				const reviewSnapshot = await getScopedReviewSessionService(scope)
+					.then((reviewSessionService) => reviewSessionService.getSessionExportSnapshot(taskId))
+					.catch(() => null);
+				return { taskSnapshot, reviewSnapshot };
+			},
 			resolveInteractiveShellCommand: deps.resolveInteractiveShellCommand,
 			runCommand: deps.runCommand,
 			broadcastClineMcpAuthStatusesUpdated: deps.runtimeStateHub.broadcastClineMcpAuthStatusesUpdated,

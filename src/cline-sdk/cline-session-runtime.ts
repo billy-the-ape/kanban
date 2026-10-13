@@ -25,6 +25,17 @@ import type { ResolvedClineLaunchConfig } from "./cline-provider-service";
 import { createKanbanClineLogger } from "./cline-runtime-logger";
 import { buildSessionIdPrefix, createSessionId } from "./cline-session-state";
 import {
+	buildAllowlistedSessionHeader,
+	buildLaunchConfigFromStartRequest,
+	buildSyntheticSessionHeader,
+	type ClineTaskExportSegment,
+	type ClineTaskExportSnapshot,
+	type ClineTaskExportSnapshotOptions,
+	compareExportStringValues,
+	extractLaunchConfigFromRecord,
+	labelSegmentToolOrigins,
+} from "./cline-task-export-snapshot";
+import {
 	buildPersistedTaskLaunchConfig,
 	mergeTaskLaunchConfigIntoMetadata,
 	readPersistedTaskLaunchConfig,
@@ -187,6 +198,17 @@ export interface ClineSessionRuntime {
 	 * neither is available. Overflow recovery budgets against this (B-3).
 	 */
 	resolveRestartStartRequest(taskId: string): Promise<ClineSessionRestartStartRequest | null>;
+	/**
+	 * DIAG-2 (2a): read-only export snapshot of every SDK session owned by
+	 * this task (session-id prefix match + recorded cwd/workspaceRoot
+	 * ownership), oldest first, including the currently bound session even
+	 * when its durable record does not exist yet. Never pauses, clears, or
+	 * mutates task state. Returns null when the task has no session at all.
+	 */
+	getTaskExportSnapshot(
+		taskId: string,
+		options?: ClineTaskExportSnapshotOptions,
+	): Promise<ClineTaskExportSnapshot | null>;
 	readPersistedTaskSession(taskId: string): Promise<ClinePersistedTaskSessionSnapshot | null>;
 	dispose(): Promise<void>;
 }
@@ -269,6 +291,8 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 	private readonly schedulerOwner = Symbol("cline-runtime");
 	private readonly turnGenerationByTaskId = new Map<string, number>();
 	private disposed = false;
+	/** DIAG-2 (2a): explicit session-listing limit for export snapshots (Decision 3). */
+	static readonly EXPORT_SESSION_LIST_LIMIT = 1000;
 
 	constructor(options: CreateInMemoryClineSessionRuntimeOptions = {}) {
 		this.onTaskEvent = options.onTaskEvent ?? null;
@@ -660,6 +684,96 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		}
 		const launchPolicy = await this.resolveRestartedLaunchPolicy(lastStartRequest);
 		return { ...lastStartRequest, ...launchPolicy };
+	}
+
+	/**
+	 * DIAG-2 (2a): read-only export snapshot of the task's session lineage.
+	 * Enumerates with an explicit limit (Decision 3), filters by session-id
+	 * prefix and recorded cwd/workspaceRoot ownership, sorts in creation
+	 * order, and includes the currently bound session even when its durable
+	 * record has not been created yet (local SDK mode persists on the first
+	 * send). Never pauses, clears, or mutates task state.
+	 */
+	async getTaskExportSnapshot(
+		taskId: string,
+		options: ClineTaskExportSnapshotOptions = {},
+	): Promise<ClineTaskExportSnapshot | null> {
+		const sessionHost = await this.ensureSessionHost();
+		const prefix = options.sessionIdPrefix ?? buildSessionIdPrefix(taskId);
+		const ownerPaths = (options.ownerPaths ?? []).map((path) => path.trim()).filter((path) => path.length > 0);
+		const listed = await sessionHost.list(InMemoryClineSessionRuntime.EXPORT_SESSION_LIST_LIMIT);
+		const listingTruncated = listed.length === InMemoryClineSessionRuntime.EXPORT_SESSION_LIST_LIMIT;
+		const matches = listed.filter(
+			(record) =>
+				record.sessionId.startsWith(prefix) &&
+				(ownerPaths.length === 0 || ownerPaths.includes(record.cwd) || ownerPaths.includes(record.workspaceRoot)),
+		);
+		matches.sort(
+			(a, b) =>
+				compareExportStringValues(a.startedAt ?? "", b.startedAt ?? "") ||
+				compareExportStringValues(a.updatedAt ?? "", b.updatedAt ?? ""),
+		);
+		const segments: ClineTaskExportSegment[] = [];
+		for (const record of matches) {
+			let messages: ClineSdkPersistedMessage[];
+			let readError: string | null = null;
+			try {
+				messages = await sessionHost.readMessages(record.sessionId);
+			} catch (error) {
+				messages = [];
+				readError = error instanceof Error ? error.message : String(error);
+			}
+			segments.push({
+				header: buildAllowlistedSessionHeader(record, "task"),
+				artifactTaskId: taskId,
+				launchConfig: extractLaunchConfigFromRecord(record),
+				transcript: {
+					status: readError === null ? "complete" : "unavailable",
+					reason: readError,
+				},
+				messages,
+				liveTail: null,
+				readError,
+				toolOrigins: [],
+			});
+		}
+		const activeSessionId = this.sessionIdByTaskId.get(taskId);
+		if (activeSessionId && !segments.some((segment) => segment.header.sessionId === activeSessionId)) {
+			const startRequest = this.lastStartRequestByTaskId.get(taskId);
+			segments.push({
+				header: buildSyntheticSessionHeader({
+					sessionId: activeSessionId,
+					kind: "task",
+					providerId: startRequest?.providerId ?? null,
+					modelId: startRequest?.modelId ?? null,
+					cwd: startRequest?.cwd ?? null,
+				}),
+				artifactTaskId: taskId,
+				launchConfig: startRequest
+					? buildLaunchConfigFromStartRequest({
+							mode: startRequest.mode ?? null,
+							systemPrompt: startRequest.systemPrompt,
+							reasoningEffort: startRequest.reasoningEffort ?? null,
+						})
+					: null,
+				transcript: { status: "complete", reason: null },
+				messages: [],
+				liveTail: null,
+				readError: null,
+				toolOrigins: [],
+			});
+		}
+		if (segments.length === 0) {
+			return null;
+		}
+		labelSegmentToolOrigins(segments);
+		return {
+			kind: "task",
+			taskId,
+			capturedAt: Date.now(),
+			listingTruncated,
+			segments,
+		};
 	}
 
 	/**

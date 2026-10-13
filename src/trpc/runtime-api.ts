@@ -3,9 +3,10 @@
 // workspace actions, but detailed Cline, terminal, and config behavior
 // should stay in focused services instead of accumulating here.
 
-import { rm } from "node:fs/promises";
+import { createWriteStream } from "node:fs";
+import { mkdir, rm } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { TRPCError } from "@trpc/server";
 import {
 	buildClineCompactionConfig,
@@ -17,6 +18,7 @@ import { createClineMcpSettingsService } from "../cline-sdk/cline-mcp-settings-s
 import { createClineProviderService } from "../cline-sdk/cline-provider-service";
 import type { ClineReviewSessionService } from "../cline-sdk/cline-review-session-service";
 import { isClineClearSlashCommand } from "../cline-sdk/cline-slash-commands";
+import type { ClineTaskExportSnapshot } from "../cline-sdk/cline-task-export-snapshot";
 import type { ClineTaskSessionService } from "../cline-sdk/cline-task-session-service";
 import type { RuntimeConfigState } from "../config/runtime-config";
 import { updateGlobalRuntimeConfig, updateRuntimeConfig } from "../config/runtime-config";
@@ -75,10 +77,10 @@ import {
 import { isHomeAgentSessionId } from "../core/home-agent-session";
 import { getTaskColumnId, moveTaskToColumn } from "../core/task-board-mutations";
 import { computeTaskPhase, isDeliveryResumable, type TaskPhaseInput } from "../core/task-diagnostics";
-import { buildTaskDiagnosticsExportBundle } from "../core/task-diagnostics-export";
+import { streamTaskDiagnosticsExportV3 } from "../core/task-diagnostics-export-stream";
+import { buildTaskDiagnosticsExportV3 } from "../core/task-diagnostics-export-v3";
 import { resolveTaskTitle } from "../core/task-title.js";
 import { reconcileOrphanedSessionSummary, resolveWorkspaceSessionSummaries } from "../core/workspace-session-summaries";
-import { lockedFileSystem } from "../fs/locked-file-system";
 import { openInBrowser } from "../server/browser";
 import { getRuntimeHomePath, loadWorkspaceBoardById, mutateWorkspaceState } from "../state/workspace-state";
 import { readTaskDispatchRecord, writeTaskDispatchRecord } from "../task-dispatch/dispatch-records";
@@ -117,6 +119,16 @@ export interface CreateRuntimeApiDependencies {
 	getScopedClineTaskSessionService: (scope: RuntimeTrpcWorkspaceScope) => Promise<ClineTaskSessionService>;
 	/** B-6: the per-workspace bounded review session service (its own Cline session instance). */
 	getScopedReviewSessionService?: (scope: RuntimeTrpcWorkspaceScope) => Promise<ClineReviewSessionService>;
+	/**
+	 * DIAG-2: read-only, typed transcript export snapshot of every session a
+	 * task owns (working + review + verification repair). The diagnostics
+	 * export streams the full, unmodified bundle; a missing snapshot degrades
+	 * to an explicit transcript gap, never an error.
+	 */
+	getTaskExportSnapshot: (
+		workspaceScope: RuntimeTrpcWorkspaceScope,
+		taskId: string,
+	) => Promise<{ taskSnapshot: ClineTaskExportSnapshot | null; reviewSnapshot: ClineTaskExportSnapshot | null }>;
 	resolveInteractiveShellCommand: () => { binary: string; args: string[] };
 	runCommand: (command: string, cwd: string) => Promise<RuntimeCommandRunResponse>;
 	broadcastClineMcpAuthStatusesUpdated?: (
@@ -1284,23 +1296,68 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			taskDiagnosticsActionInFlight.set(dedupKey, run);
 			return await run;
 		},
-		// B-10.7: write the redacted diagnostic bundle for a task to
-		// ~/.cline/kanban/diagnostics/ (never into the workspace itself).
+		// DIAG-2: streams the full-fidelity diagnostic bundle (schemaVersion 3)
+		// to ~/.cline/kanban/diagnostics/ (never into the workspace itself).
+		// The bundle carries the unmodified, complete transcripts of every
+		// session the task owns plus the full operational diagnostics response;
+		// the streaming serializer keeps memory bounded and an aborted client
+		// can never receive a truncated bundle as a success.
 		exportTaskDiagnostics: async (workspaceScope, input) => {
 			try {
 				const body = parseDiagnosticsExportRequest(input);
 				const snapshot = await gatherTaskDiagnosticsSnapshot(workspaceScope, body.taskId);
 				const diagnostics = await buildTaskDiagnosticsResponse(workspaceScope, snapshot);
-				const { bundle, redactions } = buildTaskDiagnosticsExportBundle({
+				const { taskSnapshot, reviewSnapshot } = await deps
+					.getTaskExportSnapshot(workspaceScope, body.taskId)
+					.catch(() => ({ taskSnapshot: null, reviewSnapshot: null }));
+				const plan = await buildTaskDiagnosticsExportV3({
+					taskId: body.taskId,
 					diagnostics,
-					transcriptMessageCount: snapshot.contextSnapshot?.messages.length ?? 0,
-					homeDirectory: homedir(),
+					taskPrompt: snapshot.taskPrompt,
+					sessionSnapshots: [
+						...(taskSnapshot ? [taskSnapshot] : []),
+						...(reviewSnapshot && reviewSnapshot.segments.length > 0 ? [reviewSnapshot] : []),
+					],
+					sessionSource: snapshot.session.source,
+					sessionSummary: snapshot.session.summary,
+					capturedAt: Date.now(),
 					exportedAt: new Date().toISOString(),
 				});
 				const safeTaskId = body.taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
 				const bundlePath = join(getRuntimeHomePath(), "diagnostics", `task-${safeTaskId}-${Date.now()}.json`);
-				await lockedFileSystem.writeTextFileAtomic(bundlePath, JSON.stringify(bundle, null, 2));
-				return { ok: true, bundlePath, redactions, error: null };
+				await mkdir(dirname(bundlePath), { recursive: true });
+				const bundleStream = createWriteStream(bundlePath);
+				// A write error can arrive before end() is called; an "error" event
+				// with no listener crashes the process, and without one the mutation
+				// would hang on a stream that never closes.
+				const bundleStreamFailed = new Promise<never>((_, reject) => {
+					bundleStream.once("error", reject);
+				});
+				// Abort the serializer from the failure path so it cannot stay
+				// suspended on backpressure or artifact I/O with an open fd.
+				const exportController = new AbortController();
+				try {
+					await Promise.race([
+						(async () => {
+							await streamTaskDiagnosticsExportV3(bundleStream, plan, { signal: exportController.signal });
+							// Close the target so the bundle is durable before we report
+							// success. The end callback receives the flush error directly
+							// (the "error" event only lands after the fd closes), so it
+							// is the source of truth for a failed final flush.
+							await new Promise<void>((resolve, reject) => {
+								bundleStream.end((endError?: Error | null) => (endError ? reject(endError) : resolve()));
+							});
+						})(),
+						bundleStreamFailed,
+					]);
+				} catch (streamError) {
+					exportController.abort();
+					bundleStream.destroy();
+					// Never leave a truncated bundle behind.
+					await rm(bundlePath, { force: true }).catch(() => undefined);
+					throw streamError;
+				}
+				return { ok: true, bundlePath, redactions: [], error: null };
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				return { ok: false, bundlePath: null, redactions: [], error: message };
