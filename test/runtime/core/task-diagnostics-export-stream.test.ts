@@ -303,4 +303,29 @@ describe("streamTaskDiagnosticsExportV3", () => {
 		expect(target.output.startsWith('{"schemaVersion":3,')).toBe(true);
 		expect(() => JSON.parse(target.output)).toThrow();
 	});
+
+	it("throws immediately when writing to an already-destroyed target", async () => {
+		const target = new CollectingWritable();
+		target.destroy();
+		await expect(streamTaskDiagnosticsExportV3(target, createPlan())).rejects.toThrow(
+			"Export stream target was closed before the write was accepted.",
+		);
+	});
+
+	it("rejects (never hangs) when the target is destroyed while the writer waits for drain", async () => {
+		// highWaterMark 1 forces backpressure on every write, so the writer
+		// parks on the drain wait; _write swallows chunks and never drains.
+		const slow = new Writable({
+			highWaterMark: 1,
+			write(_chunk: Buffer | string, _encoding: BufferEncoding, _callback: (error?: Error) => void) {
+				// Intentionally do nothing: no callback, no drain.
+			},
+		});
+		const streamPromise = streamTaskDiagnosticsExportV3(slow, createPlan());
+		// Let the serializer reach the drain wait, then destroy the target
+		// (simulating the mutation's failure path) — the writer must settle.
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		slow.destroy();
+		await expect(streamPromise).rejects.toThrow("Export stream target was closed while waiting for drain.");
+	});
 });

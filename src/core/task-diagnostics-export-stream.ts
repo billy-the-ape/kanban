@@ -12,7 +12,6 @@
 // can never be delivered as a success. The stream never creates host exports or
 // temporary files — it only writes to the provided target.
 
-import { once } from "node:events";
 import { createReadStream } from "node:fs";
 import type { Readable, Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
@@ -43,13 +42,47 @@ class JsonStreamWriter {
 			this.aborted = true;
 			throw new Error("Export stream aborted.");
 		}
+		if (this.target.destroyed || this.target.errored) {
+			throw new Error("Export stream target was closed before the write was accepted.");
+		}
 		if (!this.target.write(chunk)) {
-			await once(this.target, "drain");
-			if (isAborted(this.signal)) {
+			await this.waitForDrain();
+			if (this.aborted || isAborted(this.signal)) {
 				this.aborted = true;
 				throw new Error("Export stream aborted.");
 			}
 		}
+	}
+
+	/**
+	 * Waits for the target's next `drain`, but also settles when the target
+	 * errors or closes: a destroyed target (e.g. from the export mutation's
+	 * failure path) never emits another `drain`, so waiting for it alone would
+	 * hang the serializer with the artifact fd left open.
+	 */
+	private waitForDrain(): Promise<void> {
+		return new Promise<void>((resolve, reject) => {
+			const onDrain = () => {
+				cleanup();
+				resolve();
+			};
+			const onError = (error: Error) => {
+				cleanup();
+				reject(error);
+			};
+			const onClose = () => {
+				cleanup();
+				reject(new Error("Export stream target was closed while waiting for drain."));
+			};
+			const cleanup = () => {
+				this.target.removeListener("drain", onDrain);
+				this.target.removeListener("error", onError);
+				this.target.removeListener("close", onClose);
+			};
+			this.target.once("drain", onDrain);
+			this.target.once("error", onError);
+			this.target.once("close", onClose);
+		});
 	}
 
 	async writeString(value: string): Promise<void> {
@@ -239,23 +272,29 @@ async function streamArtifactText(
 	const readStream = readArtifact(artifactPath);
 	const decoder = new StringDecoder("utf8");
 	const encoder = createJsonStringEncoder();
-	for await (const chunk of readStream) {
-		const text = decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-		const encoded = encoder.append(text);
-		if (encoded.length > 0) {
-			await writer.write(encoded);
+	try {
+		for await (const chunk of readStream) {
+			const text = decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+			const encoded = encoder.append(text);
+			if (encoded.length > 0) {
+				await writer.write(encoded);
+			}
 		}
+		const tail = decoder.end();
+		const tailEncoded = encoder.append(tail);
+		if (tailEncoded.length > 0) {
+			await writer.write(tailEncoded);
+		}
+		const pending = encoder.finish();
+		if (pending.length > 0) {
+			await writer.write(pending);
+		}
+		await writer.write('"');
+	} finally {
+		// The artifact fd must not outlive the stream attempt when a
+		// mid-artifact write failure interrupts the loop.
+		readStream.destroy();
 	}
-	const tail = decoder.end();
-	const tailEncoded = encoder.append(tail);
-	if (tailEncoded.length > 0) {
-		await writer.write(tailEncoded);
-	}
-	const pending = encoder.finish();
-	if (pending.length > 0) {
-		await writer.write(pending);
-	}
-	await writer.write('"');
 }
 
 /**

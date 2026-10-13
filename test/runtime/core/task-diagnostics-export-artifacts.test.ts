@@ -68,13 +68,16 @@ describe("resolveTaskToolFullOutput (DIAG-2 2b)", () => {
 		expect(evidence.artifactFileName).toMatch(/^call-fb-\d+-[0-9a-f]{8}\.txt$/);
 	});
 
-	it("resolves both legacy reference styles from persisted excerpt text", async () => {
+	it("resolves all legacy reference styles from persisted excerpt text", async () => {
 		const dir = getTaskContextArtifactsDir("task-1");
 		await mkdir(dir, { recursive: true });
 		await writeFile(join(dir, "legacy-1-111-abcdef01.txt"), "legacy output");
 		const fullContentText = `excerpt head\n\nFull content: ${join(dir, "legacy-1-111-abcdef01.txt")}\n\ntail`;
 		const fullOutputText = `excerpt head\n\nfull output: ${join(dir, "legacy-1-111-abcdef01.txt")}\n\ntail`;
-		for (const persistedResultText of [fullContentText, fullOutputText]) {
+		// The real command-excerpt marker is bracketed; the capture must stop
+		// at the closing bracket, not swallow it.
+		const fullOutputBracketedText = `excerpt head\n\n... [truncated 5 lines; full output: ${join(dir, "legacy-1-111-abcdef01.txt")}]\n\ntail`;
+		for (const persistedResultText of [fullContentText, fullOutputText, fullOutputBracketedText]) {
 			const evidence = await resolveTaskToolFullOutput({
 				taskId: "task-1",
 				toolCallId: "legacy-1",

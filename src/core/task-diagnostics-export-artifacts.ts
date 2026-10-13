@@ -43,7 +43,10 @@ export const TASK_ARTIFACT_TRUNCATION_MARKER_PATTERN =
 	/\.{3}\s*\[truncated \d+ (?:chars\]\.{3}|lines(?:; full output: [^\]]+)?\])/;
 
 /** Legacy reference patterns in persisted excerpt text (both excerpt families). */
-const LEGACY_FULL_OUTPUT_PATTERNS: RegExp[] = [/Full content: (\S+)/, /full output: (\S+)/];
+// The lowercase `full output:` reference appears inside the bracketed excerpt
+// marker (`... [truncated N lines; full output: <path>]`), so the capture must
+// stop at the closing bracket; `\S+` would swallow it and realpath would fail.
+const LEGACY_FULL_OUTPUT_PATTERNS: RegExp[] = [/Full content: (\S+)/, /full output: ([^\s\]]+)/];
 
 function isContainedInParent(parent: string, candidate: string): boolean {
 	return candidate === parent || candidate.startsWith(parent + sep);

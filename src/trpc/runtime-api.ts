@@ -1333,18 +1333,25 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				const bundleStreamFailed = new Promise<never>((_, reject) => {
 					bundleStream.once("error", reject);
 				});
+				// Abort the serializer from the failure path so it cannot stay
+				// suspended on backpressure or artifact I/O with an open fd.
+				const exportController = new AbortController();
 				try {
 					await Promise.race([
 						(async () => {
-							await streamTaskDiagnosticsExportV3(bundleStream, plan);
-							// Close the target so the bundle is durable before we report success.
-							await new Promise<void>((resolve) => {
-								bundleStream.end(() => resolve());
+							await streamTaskDiagnosticsExportV3(bundleStream, plan, { signal: exportController.signal });
+							// Close the target so the bundle is durable before we report
+							// success. The end callback receives the flush error directly
+							// (the "error" event only lands after the fd closes), so it
+							// is the source of truth for a failed final flush.
+							await new Promise<void>((resolve, reject) => {
+								bundleStream.end((endError?: Error | null) => (endError ? reject(endError) : resolve()));
 							});
 						})(),
 						bundleStreamFailed,
 					]);
 				} catch (streamError) {
+					exportController.abort();
 					bundleStream.destroy();
 					// Never leave a truncated bundle behind.
 					await rm(bundlePath, { force: true }).catch(() => undefined);
