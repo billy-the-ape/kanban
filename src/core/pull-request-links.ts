@@ -110,17 +110,22 @@ export function parsePullRequestUrl(raw: string): ParsedPullRequestLink | null {
 }
 
 const CANDIDATE_URL_PATTERN = /https?:\/\/\S+/gi;
-const TRAILING_PROSE_PUNCTUATION_PATTERN = /[.,:;'"()\]]+$/;
+const TRAILING_PROSE_PUNCTUATION_PATTERN = /[.,:;'"()\]>`]+$/;
+// A markdown link `[text](url)` is a single non-whitespace run; splitting it
+// at `](` keeps the two URLs as separate candidates.
+const MARKDOWN_LINK_SEPARATOR_PATTERN = /\]\(/g;
 
 /**
  * Scans arbitrary text for pull-request URLs. Trailing prose punctuation
- * (e.g. `.../pull/12).`) is stripped before parsing; results are deduped by
- * identity key in first-appearance order.
+ * (e.g. `.../pull/12).`, `>`, and closing backticks/brackets) is stripped
+ * before parsing; results are deduped by identity key in first-appearance
+ * order.
  */
 export function extractPullRequestLinks(text: string): ParsedPullRequestLink[] {
 	const links: ParsedPullRequestLink[] = [];
 	const seen = new Set<string>();
-	for (const match of text.matchAll(CANDIDATE_URL_PATTERN)) {
+	const normalized = text.replace(MARKDOWN_LINK_SEPARATOR_PATTERN, ") (");
+	for (const match of normalized.matchAll(CANDIDATE_URL_PATTERN)) {
 		const candidate = (match[0] ?? "").replace(TRAILING_PROSE_PUNCTUATION_PATTERN, "");
 		const parsed = parsePullRequestUrl(candidate);
 		if (!parsed) {
@@ -147,6 +152,44 @@ export function getPullRequestIdentityKey(pullRequest: {
 	number: number;
 }): string {
 	return `${pullRequest.provider}|${pullRequest.host.toLowerCase()}|${pullRequest.repository.toLowerCase()}|${pullRequest.number}`;
+}
+
+// --- PRLINK-8: native chat bare-URL shortcut ----------------------------------
+
+/**
+ * PRLINK-8: classification of a native task chat message for PR linking.
+ * Pure: no I/O, no settings. A trimmed message that is exactly one valid
+ * bare HTTP(S) PR URL with no attached images is an auto-link shortcut.
+ * Everything else (prose mentions, markdown/angle wrappers, code fences,
+ * trailing punctuation, multiple/duplicate URLs, attached images) falls
+ * through to the suggestion path with at most three deduped links.
+ * Slash-command exclusion happens before this helper is called.
+ */
+export type TaskChatPrLinkCandidate =
+	| { kind: "auto_link"; link: ParsedPullRequestLink }
+	| { kind: "suggestions"; links: ParsedPullRequestLink[] }
+	| { kind: "none" };
+
+export const MAX_CHAT_PR_LINK_SUGGESTIONS = 3;
+
+export function classifyTaskChatMessageForPrLink(text: string, hasImages: boolean): TaskChatPrLinkCandidate {
+	const trimmed = text.trim();
+	if (trimmed.length === 0) {
+		return { kind: "none" };
+	}
+	// parsePullRequestUrl is anchored, so a match means the entire trimmed
+	// message is exactly one bare PR URL (suffixes/fragments canonicalized).
+	if (!hasImages) {
+		const link = parsePullRequestUrl(trimmed);
+		if (link) {
+			return { kind: "auto_link", link };
+		}
+	}
+	const links = extractPullRequestLinks(trimmed).slice(0, MAX_CHAT_PR_LINK_SUGGESTIONS);
+	if (links.length === 0) {
+		return { kind: "none" };
+	}
+	return { kind: "suggestions", links };
 }
 
 // --- PRLINK-6: primary display selection --------------------------------------

@@ -2090,11 +2090,48 @@ export const runtimeTaskChatSendRequestSchema = z.object({
 });
 export type RuntimeTaskChatSendRequest = z.infer<typeof runtimeTaskChatSendRequestSchema>;
 
+// PRLINK-8: pull-request linking derived from a native chat send. The field
+// is local UI guidance for the latest completed send, never a new message
+// type and never injected into the model transcript.
+export const runtimeTaskChatPrLinkingLinkSchema = z.object({
+	provider: runtimeTaskPullRequestProviderSchema,
+	host: z.string(),
+	repository: z.string(),
+	number: z.number().int().positive(),
+	/** Canonical URL produced by the shared parser. */
+	url: z.string(),
+	/** True when the task card already carries this identity. */
+	alreadyLinked: z.boolean(),
+});
+export type RuntimeTaskChatPrLinkingLink = z.infer<typeof runtimeTaskChatPrLinkingLinkSchema>;
+
+export const runtimeTaskChatPrLinkingSchema = z.object({
+	/**
+	 * linked: a bare-URL send was recorded as source:manual.
+	 * already_linked: the identity was already linked (no duplicate write).
+	 * suggestions: prose references found; the user must click to link.
+	 * failed: the message was sent but the link could not be saved.
+	 */
+	status: z.enum(["linked", "already_linked", "suggestions", "failed"]),
+	/** Canonical parsed identifiers, at most three. */
+	links: z.array(runtimeTaskChatPrLinkingLinkSchema).max(3),
+	/** Concise sanitized message, present only when status is failed. */
+	error: z.string().optional(),
+});
+export type RuntimeTaskChatPrLinking = z.infer<typeof runtimeTaskChatPrLinkingSchema>;
+
 export const runtimeTaskChatSendResponseSchema = z.object({
 	ok: z.boolean(),
 	summary: runtimeTaskSessionSummarySchema.nullable(),
 	message: runtimeTaskChatMessageSchema.nullable().optional(),
 	error: z.string().optional(),
+	/**
+	 * PRLINK-8: pull-request linking derived from the just-sent chat message.
+	 * Present only on successful native chat sends that produced candidates;
+	 * absent for rejected sends, slash commands, home-agent sessions, and
+	 * messages with no pull-request URLs.
+	 */
+	pullRequestLinking: runtimeTaskChatPrLinkingSchema.optional(),
 });
 export type RuntimeTaskChatSendResponse = z.infer<typeof runtimeTaskChatSendResponseSchema>;
 

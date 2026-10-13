@@ -6,6 +6,7 @@ import { useCallback } from "react";
 import { getRuntimeTrpcClient } from "@/runtime/trpc-client";
 import type {
 	RuntimeTaskChatMessage,
+	RuntimeTaskChatPrLinking,
 	RuntimeTaskImage,
 	RuntimeTaskSessionMode,
 	RuntimeTaskSessionSummary,
@@ -15,6 +16,12 @@ export interface ClineChatActionResult {
 	ok: boolean;
 	message?: string;
 	chatMessage?: RuntimeTaskChatMessage | null;
+	/**
+	 * PRLINK-8: PR linking derived from this send (bare-URL shortcut or
+	 * prose suggestions). Absent when the send produced no candidates or
+	 * was rejected.
+	 */
+	pullRequestLinking?: RuntimeTaskChatPrLinking;
 }
 
 export interface SendClineChatMessageOptions {
@@ -67,6 +74,7 @@ export function useClineChatRuntimeActions({
 				return {
 					ok: true,
 					chatMessage: payload.message ?? null,
+					...(payload.pullRequestLinking ? { pullRequestLinking: payload.pullRequestLinking } : {}),
 				};
 			} catch (error) {
 				return { ok: false, message: toErrorMessage(error) };
