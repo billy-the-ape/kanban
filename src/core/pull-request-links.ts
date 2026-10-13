@@ -177,9 +177,10 @@ export function classifyTaskChatMessageForPrLink(text: string, hasImages: boolea
 	if (trimmed.length === 0) {
 		return { kind: "none" };
 	}
-	// parsePullRequestUrl is anchored, so a match means the entire trimmed
-	// message is exactly one bare PR URL (suffixes/fragments canonicalized).
-	if (!hasImages) {
+	// The auto-link shortcut requires a whitespace-free message: a bare URL has
+	// no spaces. (The GitLab MR pattern's repository group is lazy and can span
+	// whitespace, so anchoring alone does not guarantee a single-URL match.)
+	if (!hasImages && !/\s/.test(trimmed)) {
 		const link = parsePullRequestUrl(trimmed);
 		if (link) {
 			return { kind: "auto_link", link };

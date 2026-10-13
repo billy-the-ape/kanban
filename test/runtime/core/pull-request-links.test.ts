@@ -297,6 +297,29 @@ describe("classifyTaskChatMessageForPrLink", () => {
 		});
 	});
 
+	it("never auto-links a whitespace message, even when the lazy GitLab pattern spans it", () => {
+		const text =
+			"https://gitlab.com/g/r/-/merge_requests/7 please compare with https://gitlab.com/g/r/-/merge_requests/8";
+		const candidate = classifyTaskChatMessageForPrLink(text, false);
+		expect(candidate.kind).toBe("suggestions");
+		if (candidate.kind === "suggestions") {
+			expect(
+				candidate.links.map((link) => ({ repository: link.repository, number: link.number, url: link.url })),
+			).toEqual([
+				{
+					repository: "g/r",
+					number: 7,
+					url: "https://gitlab.com/g/r/-/merge_requests/7",
+				},
+				{
+					repository: "g/r",
+					number: 8,
+					url: "https://gitlab.com/g/r/-/merge_requests/8",
+				},
+			]);
+		}
+	});
+
 	it("falls back to suggestions when the bare URL has attached images", () => {
 		const candidate = classifyTaskChatMessageForPrLink(bareUrl, true);
 		expect(candidate).toEqual({ kind: "suggestions", links: [expect.objectContaining({ number: 12 })] });
