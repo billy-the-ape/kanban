@@ -327,6 +327,9 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				)
 				.map((workspace) => ({ workspaceId: workspace.workspaceId, workspacePath: workspace.workspacePath })),
 		loadWorkspaceState: (workspacePath) => loadWorkspaceState(workspacePath),
+		// Startup reconciliation must not fail dispatches for workspaces
+		// that are indexed but not loaded yet.
+		resolveWorkspacePathById: async (workspaceId) => (await loadWorkspaceContextById(workspaceId))?.repoPath ?? null,
 		getClineTaskSessionService: getScopedClineTaskSessionService,
 		getTerminalManager: getScopedTerminalManager,
 		sendTaskChatMessage: createTaskChatMessageSender({

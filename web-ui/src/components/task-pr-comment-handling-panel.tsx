@@ -133,6 +133,19 @@ export function TaskPrCommentHandlingPanel({ workspaceId, taskId, pullRequests }
 				{resumeButton}
 			</span>
 		);
+	} else if (blocker || state?.resumable) {
+		// A blocker (rate-limit pause, capture uncertainty, ...) wins over
+		// the pending status line: the pause must stay visible and its
+		// Resume must stay reachable while feedback is still pending.
+		statusLine = (
+			<span
+				className="flex items-center gap-1.5 text-[11px] text-status-orange"
+				data-testid="task-pr-comment-status-blocked"
+			>
+				{blocker ? <span className="min-w-0">{blocker}</span> : null}
+				{resumeButton}
+			</span>
+		);
 	} else if (pendingCount > 0 && pendingDeadline !== null) {
 		const remainingSeconds = Math.max(0, Math.ceil((pendingDeadline - Date.now()) / 1000));
 		statusLine = (
@@ -140,16 +153,6 @@ export function TaskPrCommentHandlingPanel({ workspaceId, taskId, pullRequests }
 				{remainingSeconds > 0
 					? `Waiting to address ${pendingCount} new ${pendingCount === 1 ? "comment" : "comments"} in ${remainingSeconds}s`
 					: `Addressing ${pendingCount} new ${pendingCount === 1 ? "comment" : "comments"} shortly`}
-			</span>
-		);
-	} else if (blocker) {
-		statusLine = (
-			<span
-				className="flex items-center gap-1.5 text-[11px] text-status-orange"
-				data-testid="task-pr-comment-status-blocked"
-			>
-				<span className="min-w-0">{blocker}</span>
-				{resumeButton}
 			</span>
 		);
 	} else if (enabled) {

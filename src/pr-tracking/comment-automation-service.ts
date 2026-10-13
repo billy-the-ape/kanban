@@ -112,6 +112,14 @@ export interface PrCommentAutomationServiceDependencies {
 	loadWorkspaceState: (workspacePath: string) => Promise<RuntimeWorkspaceStateResponse>;
 	getClineTaskSessionService: (scope: PrCommentAutomationWorkspaceScope) => Promise<ClineTaskSessionService>;
 	getTerminalManager: (scope: PrCommentAutomationWorkspaceScope) => Promise<TerminalSessionManager>;
+	/**
+	 * Resolves a workspaceId to its path from the durable workspace index —
+	 * including workspaces that are not (yet) in `listManagedWorkspaces`.
+	 * Restart reconciliation uses this so a queued dispatch for a not-yet
+	 * loaded workspace is never wrongly failed at startup. Optional for test
+	 * harnesses; when absent, only managed workspaces are reconciled.
+	 */
+	resolveWorkspacePathById?: (workspaceId: string) => Promise<string | null>;
 	/** Reusable backend chat send — the same path the browser's sendTaskChatMessage uses. */
 	sendTaskChatMessage: (
 		scope: PrCommentAutomationWorkspaceScope,
@@ -1338,6 +1346,23 @@ export class PrCommentAutomationService {
 	 * silently cleared because a session finished or restarted, and no
 	 * publication command is ever run here.
 	 */
+	/**
+	 * Resolves a workspaceId to a scope: managed workspaces first, then the
+	 * durable workspace index (for workspaces not loaded yet at startup).
+	 */
+	private async resolveWorkspaceScope(workspaceId: string): Promise<PrCommentAutomationWorkspaceScope | null> {
+		const managed = this.deps.listManagedWorkspaces().find((scope) => scope.workspaceId === workspaceId);
+		if (managed) {
+			return managed;
+		}
+		const resolver = this.deps.resolveWorkspacePathById;
+		if (!resolver) {
+			return null;
+		}
+		const workspacePath = await resolver(workspaceId).catch(() => null);
+		return workspacePath ? { workspaceId, workspacePath } : null;
+	}
+
 	private async reconcilePublicationCaptures(): Promise<void> {
 		const records = await listPrTrackingRecords();
 		for (const record of records) {
@@ -1350,9 +1375,7 @@ export class PrCommentAutomationService {
 			const uncertainties = new Map<string, string>();
 			for (const entry of pending) {
 				let resolution: ReturnType<typeof resolvePublicationOutput> | null = null;
-				const scope = this.deps
-					.listManagedWorkspaces()
-					.find((candidate) => candidate.workspaceId === entry.workspaceId);
+				const scope = await this.resolveWorkspaceScope(entry.workspaceId);
 				if (scope) {
 					try {
 						const sessionService = await this.deps.getClineTaskSessionService(scope);
@@ -1469,10 +1492,9 @@ export class PrCommentAutomationService {
 			let sessionState: string | null = null;
 			let sessionLastOutputAt: number | null = null;
 			let taskExists = false;
+			let workspaceStateUnavailable = false;
 			if (owner) {
-				const workspace = this.deps
-					.listManagedWorkspaces()
-					.find((scope) => scope.workspaceId === owner.workspaceId);
+				const workspace = await this.resolveWorkspaceScope(owner.workspaceId);
 				if (workspace) {
 					const state = await this.deps.loadWorkspaceState(workspace.workspacePath).catch(() => null);
 					if (state) {
@@ -1494,8 +1516,16 @@ export class PrCommentAutomationService {
 							null;
 						sessionState = session?.state ?? null;
 						sessionLastOutputAt = session?.lastOutputAt ?? null;
+					} else {
+						// The owner's workspace exists but is not loaded yet:
+						// no evidence either way. Leave the dispatch as-is; it
+						// reconciles when the workspace loads.
+						workspaceStateUnavailable = true;
 					}
 				}
+			}
+			if (workspaceStateUnavailable) {
+				continue;
 			}
 			if (dispatch.status === "queued" && dispatch.attemptedAt === null) {
 				if (!owner || !taskExists) {

@@ -161,6 +161,13 @@ function makeService(
 		) => Promise<RuntimeTaskChatSendResponse>;
 		/** Stands in for the workspace's selected agent (default: cline). */
 		selectedAgentId?: RuntimeAgentId;
+		/** Stands in for the durable workspace index (default: nothing resolves). */
+		resolveWorkspacePathById?: (workspaceId: string) => Promise<string | null>;
+		/** Stands in for the per-workspace Cline session service (default: idle). */
+		getClineTaskSessionService?: (scope: {
+			workspaceId: string;
+			workspacePath: string;
+		}) => Promise<ClineTaskSessionService>;
 		now?: () => number;
 	} = {},
 ) {
@@ -179,8 +186,9 @@ function makeService(
 				}
 				return state;
 			}),
-		getClineTaskSessionService: async () => idleCline,
+		getClineTaskSessionService: overrides.getClineTaskSessionService ?? (async () => idleCline),
 		getTerminalManager: async () => idleTerminal,
+		resolveWorkspacePathById: overrides.resolveWorkspacePathById,
 		sendTaskChatMessage: async (scope, body) => {
 			sent.push({ scope, body });
 			return overrides.send
@@ -1419,6 +1427,238 @@ describe("COMMENT-0 publication capture", () => {
 		const record = await load();
 		expect(record.commentAutomation.dispatch?.status).toBe("completed");
 		expect(record.commentAutomation.dispatch?.error).toBeNull();
+	});
+
+	// Regression: startup reconciliation resolved owners only from
+	// listManagedWorkspaces, so a queued/running dispatch for an indexed but
+	// not-yet-loaded workspace was permanently failed at startup.
+	it("keeps a queued dispatch for an indexed-but-unloaded workspace at startup", async () => {
+		const fp = fingerprintOf([makeEvent({ providerId: "conversation-1", updatedAt: NOW })]);
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			taskBindings: [{ workspaceId: "w2", taskId: "t9", terminal: false }],
+			commentAutomation: {
+				...record.commentAutomation,
+				repairOwner: { workspaceId: "w2", taskId: "t9", revision: 1 },
+				dispatch: {
+					dispatchId: "d-queued-w2",
+					attemptedAt: null,
+					fingerprint: fp,
+					ownerRevision: 1,
+					status: "queued",
+					turnRef: null,
+					error: null,
+				},
+			},
+		}));
+		const harness = makeService({
+			workspaces: [{ workspaceId: "w1", workspacePath: "/w1" }],
+			workspaceStates: cardState(),
+			// w2 is in the workspace index but has no loaded state yet.
+			resolveWorkspacePathById: async (workspaceId) => (workspaceId === "w2" ? "/w2" : null),
+		});
+		await harness.service.start();
+		const record = await load();
+		expect(record.commentAutomation.dispatch?.status).toBe("queued");
+	});
+
+	it("keeps a running dispatch for an indexed-but-unloaded workspace at startup", async () => {
+		const fp = fingerprintOf([makeEvent({ providerId: "conversation-1", updatedAt: NOW })]);
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			taskBindings: [{ workspaceId: "w2", taskId: "t9", terminal: false }],
+			commentAutomation: {
+				...record.commentAutomation,
+				repairOwner: { workspaceId: "w2", taskId: "t9", revision: 1 },
+				lastDispatchedFeedbackFingerprint: fp,
+				dispatch: {
+					dispatchId: "d-running-w2",
+					attemptedAt: NOW - 5_000,
+					fingerprint: fp,
+					ownerRevision: 1,
+					status: "running",
+					turnRef: null,
+					error: null,
+				},
+			},
+		}));
+		const harness = makeService({
+			workspaces: [{ workspaceId: "w1", workspacePath: "/w1" }],
+			workspaceStates: cardState(),
+			resolveWorkspacePathById: async (workspaceId) => (workspaceId === "w2" ? "/w2" : null),
+		});
+		await harness.service.start();
+		const record = await load();
+		expect(record.commentAutomation.dispatch?.status).toBe("running");
+	});
+
+	it("reconciles a dispatch through the workspace index when the workspace is not managed", async () => {
+		const fp = fingerprintOf([makeEvent({ providerId: "conversation-1", updatedAt: NOW })]);
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			taskBindings: [{ workspaceId: "w2", taskId: "t9", terminal: false }],
+			commentAutomation: {
+				...record.commentAutomation,
+				repairOwner: { workspaceId: "w2", taskId: "t9", revision: 1 },
+				lastDispatchedFeedbackFingerprint: fp,
+				dispatch: {
+					dispatchId: "d-indexed-w2",
+					attemptedAt: NOW - 5_000,
+					fingerprint: fp,
+					ownerRevision: 1,
+					status: "running",
+					turnRef: null,
+					error: null,
+				},
+			},
+		}));
+		const harness = makeService({
+			workspaces: [{ workspaceId: "w1", workspacePath: "/w1" }],
+			workspaceStates: new Map<string, RuntimeWorkspaceStateResponse>([
+				["/w1", cardState().get("/w1") ?? makeState([])],
+				[
+					"/w2",
+					makeState([makeCard({ id: "t9", autoAddressComments: true, pullRequests: [PR] })], {
+						t9: makeSummary({ state: "idle", lastOutputAt: NOW + 1_000 }),
+					}),
+				],
+			]),
+			resolveWorkspacePathById: async (workspaceId) => (workspaceId === "w2" ? "/w2" : null),
+		});
+		await harness.service.start();
+		const record = await load();
+		expect(record.commentAutomation.dispatch?.status).toBe("completed");
+		expect(record.commentAutomation.dispatch?.error).toBeNull();
+	});
+
+	it("reconciles a pending capture for an indexed-but-unmanaged workspace from its transcript", async () => {
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			commentAutomation: {
+				...record.commentAutomation,
+				publication: {
+					published: [],
+					pending: [
+						{
+							captureId: "call-9",
+							taskId: "t9",
+							workspaceId: "w2",
+							operation: "gh pr comment",
+							kind: "conversation",
+							target: { host: "github.com", repository: "octo/repo", number: 42 },
+							startedAt: NOW - 5_000,
+							uncertain: false,
+							uncertainReason: null,
+						},
+					],
+				},
+			},
+		}));
+		const harness = makeService({
+			workspaces: [{ workspaceId: "w1", workspacePath: "/w1" }],
+			workspaceStates: cardState(),
+			resolveWorkspacePathById: async (workspaceId) => (workspaceId === "w2" ? "/w2" : null),
+			getClineTaskSessionService: async () =>
+				({
+					loadTaskSessionMessages: async () => [
+						{
+							id: "m1",
+							role: "tool",
+							content: "https://github.com/octo/repo/pull/42#issuecomment-77",
+							createdAt: NOW,
+							meta: { toolName: "run_command", hookEventName: "tool_call_end", toolCallId: "call-9" },
+						},
+					],
+				}) as unknown as ClineTaskSessionService,
+		});
+		await harness.service.start();
+		const record = await load();
+		expect(record.commentAutomation.publication.pending).toHaveLength(0);
+		expect(record.commentAutomation.publication.published).toEqual([{ kind: "conversation", id: 77 }]);
+	});
+
+	it("captures a gh api in-thread inline reply write (…/comments/<id>/replies)", async () => {
+		const harness = makeService({ workspaceStates: cardState() });
+		await harness.service.recordPrPublicationToolEvent(
+			toolEvent({
+				commands: ["gh api -X POST repos/octo/repo/pulls/42/comments/77/replies -f body='addressed'"],
+				output: JSON.stringify({
+					id: 99,
+					pull_request_url: "https://api.github.com/repos/octo/repo/pulls/42",
+					html_url: "https://github.com/octo/repo/pull/42#discussion_r99",
+					path: "src/a.ts",
+					diff_hunk: "@@",
+					user: { login: "octo" },
+				}),
+			}),
+		);
+		const record = await load();
+		expect(record.commentAutomation.publication.published).toEqual([{ kind: "inline", id: 99 }]);
+	});
+
+	it("captures a gh api write with a leading-slash endpoint", async () => {
+		const harness = makeService({ workspaceStates: cardState() });
+		await harness.service.recordPrPublicationToolEvent(
+			toolEvent({
+				commands: ["gh api -X POST /repos/octo/repo/pulls/42/comments/77 -f body='inline note'"],
+				output: JSON.stringify({
+					id: 98,
+					pull_request_url: "https://api.github.com/repos/octo/repo/pulls/42",
+					html_url: "https://github.com/octo/repo/pull/42#discussion_r98",
+					path: "src/a.ts",
+					diff_hunk: "@@",
+				}),
+			}),
+		);
+		const record = await load();
+		expect(record.commentAutomation.publication.published).toEqual([{ kind: "inline", id: 98 }]);
+	});
+
+	it("attributes a case-differing explicit repository selector to the linked PR", async () => {
+		const upperPr: RuntimeTaskPullRequest = {
+			provider: "github",
+			host: "github.com",
+			repository: "Octo/Repo",
+			number: 42,
+			url: "https://github.com/Octo/Repo/pull/42",
+			source: "manual",
+			createdAt: 1,
+		};
+		const harness = makeService({
+			workspaceStates: new Map<string, RuntimeWorkspaceStateResponse>([
+				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [upperPr] })])],
+			]),
+		});
+		await harness.service.recordPrPublicationToolEvent(
+			toolEvent({
+				commands: ["gh pr comment 42 -R octo/repo -b 'addressing the review'"],
+				output: "https://github.com/Octo/Repo/pull/42#issuecomment-88",
+			}),
+		);
+		const record = await load();
+		expect(record.commentAutomation.publication.published).toEqual([{ kind: "conversation", id: 88 }]);
+	});
+
+	it("captures a submitted review from a real response shape (no comments array)", async () => {
+		const harness = makeService({ workspaceStates: cardState() });
+		await harness.service.recordPrPublicationToolEvent(
+			toolEvent({
+				commands: ["gh pr review 42 --comment -b 'addressing the review'"],
+				output: JSON.stringify({
+					id: 55,
+					state: "commented",
+					pull_request_url: "https://api.github.com/repos/octo/repo/pulls/42",
+					html_url: "https://github.com/octo/repo/pull/42",
+					submitted_at: "2026-10-12T00:00:00Z",
+				}),
+			}),
+		);
+		const record = await load();
+		expect(record.commentAutomation.publication.published).toEqual([{ kind: "review", id: 55 }]);
 	});
 });
 

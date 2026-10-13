@@ -147,11 +147,14 @@ function parseApiWriteEndpoint(endpoint: string): { kind: PrPublishedIdentityKin
 	//   repos/O/R/issues/N/comments[?/C]   conversation comment create/edit
 	//   repos/O/R/pulls/N/comments[?/C]     inline (review) comment create/edit
 	//   repos/O/R/pulls/N/reviews           review submission (may carry inlines)
-	const match = /^repos\/([^/]+)\/([^/]+)\/(issues|pulls)\/(\d+)\/(comments)(?:\/\d+)?$/.exec(endpoint);
+	// `gh api` accepts a leading slash, so normalize before matching.
+	const normalized = endpoint.replace(/^\/+/, "");
+	// In-thread replies use `.../comments/<id>/replies` (still inline kind).
+	const match = /^repos\/([^/]+)\/([^/]+)\/(issues|pulls)\/(\d+)\/comments(?:\/\d+(?:\/replies)?)?$/.exec(normalized);
 	if (match) {
 		return { kind: match[3] === "issues" ? "conversation" : "inline" };
 	}
-	const reviews = /^repos\/([^/]+)\/([^/]+)\/(pulls)\/(\d+)\/(reviews)$/.exec(endpoint);
+	const reviews = /^repos\/([^/]+)\/([^/]+)\/(pulls)\/(\d+)\/(reviews)$/.exec(normalized);
 	if (reviews) {
 		return { kind: "review" };
 	}
@@ -256,12 +259,13 @@ export function detectPublicationOperations(commands: string[]): PrPublicationOp
 				if (!endpoint || !GH_API_WRITE_METHODS.has(effective)) {
 					continue;
 				}
-				const parsed = parseApiWriteEndpoint(endpoint);
+				const normalizedEndpoint = endpoint.replace(/^\/+/, "");
+				const parsed = parseApiWriteEndpoint(normalizedEndpoint);
 				if (!parsed) {
 					continue;
 				}
-				const repoMatch = /^repos\/([^/]+)\/([^/]+)/.exec(endpoint);
-				const numberMatch = /\/(\d+)\/(comments|reviews)/.exec(endpoint);
+				const repoMatch = /^repos\/([^/]+)\/([^/]+)/.exec(normalizedEndpoint);
+				const numberMatch = /\/(\d+)\/(comments|reviews)/.exec(normalizedEndpoint);
 				push({
 					operation: "gh api",
 					kind: parsed.kind,
@@ -279,7 +283,8 @@ function sameTarget(left: PrPublicationTarget | null, right: PrPublicationTarget
 		left !== null &&
 		right !== null &&
 		left.host === right.host &&
-		left.repository === right.repository &&
+		// GitHub treats owner/repo case-insensitively.
+		left.repository.toLowerCase() === right.repository.toLowerCase() &&
 		left.number === right.number
 	);
 }
@@ -289,12 +294,15 @@ function matchLinked(
 	repository: string | null,
 	number: number | null,
 ): PrPublicationTarget | null {
-	if (repository !== null && number !== null) {
-		const match = linked.find((target) => target.repository === repository && target.number === number);
+	// GitHub treats owner/repo case-insensitively; linked repositories keep
+	// the case of the pasted URL.
+	const repo = repository === null ? null : repository.toLowerCase();
+	if (repo !== null && number !== null) {
+		const match = linked.find((target) => target.repository.toLowerCase() === repo && target.number === number);
 		return match ?? null;
 	}
-	if (repository !== null) {
-		const onRepo = linked.filter((target) => target.repository === repository);
+	if (repo !== null) {
+		const onRepo = linked.filter((target) => target.repository.toLowerCase() === repo);
 		return onRepo.length === 1 ? onRepo[0] : null;
 	}
 	if (number !== null) {
@@ -440,7 +448,8 @@ function mapApiResponseIdentity(
 		const repo = repoMatch ? `${repoMatch[1]}/${repoMatch[2]}` : null;
 		const numberMatch = /(?:\/pull|\/pulls|\/issues)\/(\d+)/.exec(value);
 		const number = numberMatch ? Number.parseInt(numberMatch[1], 10) : null;
-		return repo === target.repository && number === target.number;
+		// GitHub treats owner/repo case-insensitively.
+		return repo !== null && repo.toLowerCase() === target.repository.toLowerCase() && number === target.number;
 	};
 	if (id === null) {
 		// API error response (or something without an identity).
@@ -453,15 +462,19 @@ function mapApiResponseIdentity(
 		if (path !== undefined && diffHunk !== undefined) {
 			return { kind: "identities", identities: [{ kind: "inline", id }] };
 		}
-		if (typeof state === "string" && Array.isArray(object.comments)) {
+		if (typeof state === "string") {
 			// A submitted review response: the review itself plus every
-			// inline comment it returned.
+			// inline comment it returned. Real `POST /pulls/N/reviews`
+			// responses carry no `comments` array, so it is optional.
 			const identities: PrPublishedIdentity[] = [{ kind: "review", id }];
-			for (const comment of object.comments) {
-				if (comment !== null && typeof comment === "object" && !Array.isArray(comment)) {
-					const commentId = readPositiveInt(comment as Record<string, unknown>, "id");
-					if (commentId !== null) {
-						identities.push({ kind: "inline", id: commentId });
+			const comments = object.comments;
+			if (Array.isArray(comments)) {
+				for (const comment of comments) {
+					if (comment !== null && typeof comment === "object" && !Array.isArray(comment)) {
+						const commentId = readPositiveInt(comment as Record<string, unknown>, "id");
+						if (commentId !== null) {
+							identities.push({ kind: "inline", id: commentId });
+						}
 					}
 				}
 			}
@@ -495,7 +508,7 @@ function extractUrlIdentities(
 		for (const match of text.matchAll(pattern)) {
 			if (
 				match[1] === target.host &&
-				`${match[2]}/${match[3]}` === target.repository &&
+				`${match[2]}/${match[3]}`.toLowerCase() === target.repository.toLowerCase() &&
 				Number.parseInt(match[4], 10) === target.number
 			) {
 				identities.push({ kind: "conversation", id: Number.parseInt(match[5], 10) });
@@ -507,7 +520,7 @@ function extractUrlIdentities(
 		for (const match of text.matchAll(pattern)) {
 			if (
 				match[1] === target.host &&
-				`${match[2]}/${match[3]}` === target.repository &&
+				`${match[2]}/${match[3]}`.toLowerCase() === target.repository.toLowerCase() &&
 				Number.parseInt(match[4], 10) === target.number
 			) {
 				identities.push({ kind: "inline", id: Number.parseInt(match[5], 10) });
@@ -519,7 +532,7 @@ function extractUrlIdentities(
 		for (const match of text.matchAll(pattern)) {
 			if (
 				match[1] === target.host &&
-				`${match[2]}/${match[3]}` === target.repository &&
+				`${match[2]}/${match[3]}`.toLowerCase() === target.repository.toLowerCase() &&
 				Number.parseInt(match[4], 10) === target.number
 			) {
 				identities.push({ kind: "review", id: Number.parseInt(match[5], 10) });

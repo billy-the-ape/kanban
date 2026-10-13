@@ -303,6 +303,29 @@ Review fixes applied (second review round, same PR):
 - Review feedback events use `submitted_at` (falling back to `updated_at`), matching the real
   review object shape from `GET /pulls/{n}/reviews`.
 
+Review fixes applied (third review round, same PR):
+
+- Resume stays reachable while feedback is pending: the panel renders the blocker/resume branch
+  before the pending-countdown branch, so a rate-limit pause, capture uncertainty, or capture
+  persistence failure keeps both the visible reason and the Resume button while feedback is
+  still queued (a new web-ui component test pins both orderings).
+- Startup reconciliation no longer fails work that is not yet loaded: the service resolves the
+  repair owner's (and pending captures') workspace through a new optional
+  `resolveWorkspacePathById` dependency (injected from the durable workspace index via
+  `loadWorkspaceContextById`), covering workspaces that are indexed but have no terminal
+  manager yet. A queued dispatch for such a workspace is left as-is at startup (re-validated
+  when it loads) instead of being permanently failed, a running dispatch keeps its
+  unknown-outcome semantics only when the workspace is genuinely unresolvable, and pending
+  captures resolve from the transcript through the index-resolved scope.
+- `gh api` publication writes: `parseApiWriteEndpoint` normalizes leading slashes and matches
+  in-thread inline reply writes (`.../pulls/N/comments/<id>/replies`), and a submitted review
+  is recognized from the real response shape (`state` + `pull_request_url` + id) without
+  requiring a `comments` array (extracted when present).
+- Repository identity is case-insensitive everywhere it is compared (`matchLinked`,
+  `sameTarget`, API-response `hasTarget`, and returned-URL validation), matching
+  `getPullRequestIdentityKey` semantics, so a case-differing `-R` selector or URL still
+  attributes to the linked PR instead of becoming an uncertain capture.
+
 Documented v1 deviations: a terminal PR observation cancels queued dispatch but keeps the owner
 held until its candidate is no longer enabled; dispatch waits for conflicting writers before
 sending (the normal send path provides model-queue admission) but does not yet gate on
