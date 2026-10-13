@@ -1,5 +1,6 @@
 import type { DropResult } from "@hello-pangea/dnd";
-import { Files, GitCompareArrows, Maximize2, MessageSquare, Minimize2, X } from "lucide-react";
+import { getOrderedTaskPullRequests } from "@runtime-pull-request-links";
+import { Files, GitCompareArrows, GitPullRequest, Link, Maximize2, MessageSquare, Minimize2, X } from "lucide-react";
 import type { MouseEvent as ReactMouseEvent, ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useHotkeys } from "react-hotkeys-hook";
@@ -11,6 +12,8 @@ import { FileTreePanel } from "@/components/detail-panels/file-tree-panel";
 import { TaskDiagnosticsPanel } from "@/components/detail-panels/task-diagnostics-panel";
 import { TaskPrTrackingPanel } from "@/components/detail-panels/task-pr-tracking-panel";
 import { TaskReviewControl } from "@/components/detail-panels/task-review-control";
+import { TaskPullRequestLink } from "@/components/task-pull-request-link";
+import { TaskPullRequestManagerPopover } from "@/components/task-pull-request-manager";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/components/ui/cn";
 import type { ClineChatActionResult } from "@/hooks/use-cline-chat-runtime-actions";
@@ -25,6 +28,7 @@ import type {
 	RuntimeAgentId,
 	RuntimeClineReasoningEffort,
 	RuntimeConfigResponse,
+	RuntimeTaskPullRequest,
 	RuntimeTaskSessionMode,
 	RuntimeTaskSessionSummary,
 	RuntimeWorkspaceChangesMode,
@@ -34,6 +38,7 @@ import { useTaskWorkspaceStateVersionValue } from "@/stores/workspace-metadata-s
 import { useTerminalThemeColors } from "@/terminal/theme-colors";
 import { type BoardCard, type CardSelection, getTaskAutoReviewCancelButtonLabel } from "@/types";
 import { useWindowEvent } from "@/utils/react-use";
+import { formatPullRequestLabel } from "@/utils/task-pull-requests";
 
 // We still poll the open detail diff because line content can change without changing
 // the overall file or line counts that drive the shared workspace metadata stream.
@@ -208,11 +213,27 @@ const MOBILE_TABS: { id: MobileTab; label: string; icon: React.ReactElement }[] 
 function MobileDetailTabBar({
 	activeTab,
 	onTabChange,
+	taskId,
+	workspaceId,
+	pullRequests,
 }: {
 	activeTab: MobileTab;
 	onTabChange: (tab: MobileTab) => void;
+	/** PRLINK-7: task/workspace scope for the trailing PR anchor and manager. */
+	taskId: string;
+	workspaceId: string | null;
+	/** PRLINK-7: PRs recorded for the selected task (from the board card). */
+	pullRequests: RuntimeTaskPullRequest[];
 }): React.ReactElement {
 	const tabs = MOBILE_TABS;
+	// PRLINK-7: display order — the primary winner first, the rest in recorded order.
+	const orderedPullRequests = getOrderedTaskPullRequests(pullRequests);
+	const primaryPullRequest = orderedPullRequests[0] ?? null;
+	// PRLINK-7: the tab bar is keyed by workspace+task at its call site, so this
+	// open state (and any pending popover state) is dropped with the task and a
+	// late response from task A cannot update task B.
+	const [prManagerOpen, setPrManagerOpen] = useState(false);
+
 	return (
 		<div className="flex items-center border-b border-border" style={{ minHeight: 36 }}>
 			{tabs.map((tab) => (
@@ -220,7 +241,7 @@ function MobileDetailTabBar({
 					key={tab.id}
 					type="button"
 					className={cn(
-						"relative flex flex-1 items-center justify-center gap-1.5 px-2 py-2 text-xs font-medium transition-colors",
+						"relative flex min-w-0 flex-1 items-center justify-center gap-1.5 px-2 py-2 text-xs font-medium transition-colors",
 						activeTab === tab.id ? "text-accent" : "text-text-secondary",
 					)}
 					onClick={() => onTabChange(tab.id)}
@@ -230,6 +251,51 @@ function MobileDetailTabBar({
 					{activeTab === tab.id ? <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-accent" /> : null}
 				</button>
 			))}
+			<div className="flex min-w-0 shrink-0 items-center">
+				{primaryPullRequest ? (
+					<TaskPullRequestLink
+						pullRequest={primaryPullRequest}
+						variant="compact"
+						ariaLabel={`Open ${formatPullRequestLabel(primaryPullRequest, "full")} in ${primaryPullRequest.repository}`}
+						dataTestId="mobile-task-pr-primary-anchor"
+						className="min-h-11 max-w-24"
+					/>
+				) : null}
+				{workspaceId ? (
+					<TaskPullRequestManagerPopover
+						key={`${workspaceId}:${taskId}`}
+						open={prManagerOpen}
+						onOpenChange={setPrManagerOpen}
+						workspaceId={workspaceId}
+						taskId={taskId}
+						pullRequests={pullRequests}
+						mobile
+						trigger={
+							orderedPullRequests.length === 0 ? (
+								<Button
+									variant="ghost"
+									size="sm"
+									icon={<Link size={14} />}
+									className="min-h-11"
+									aria-label="Link pull request"
+									data-testid="mobile-task-pr-link-pr-button"
+								>
+									Link PR
+								</Button>
+							) : (
+								<Button
+									variant="ghost"
+									size="sm"
+									icon={<GitPullRequest size={14} />}
+									className="min-h-11 min-w-11"
+									aria-label="Manage pull requests"
+									data-testid="mobile-task-pr-manage-button"
+								/>
+							)
+						}
+					/>
+				) : null}
+			</div>
 		</div>
 	);
 }
@@ -737,7 +803,14 @@ export function CardDetailView({
 	if (isMobile) {
 		return (
 			<div className="flex min-h-0 flex-1 flex-col overflow-hidden bg-surface-0">
-				<MobileDetailTabBar activeTab={mobileTab} onTabChange={setMobileTab} />
+				<MobileDetailTabBar
+					key={`${selection.card.id}:${currentProjectId ?? "none"}`}
+					activeTab={mobileTab}
+					onTabChange={setMobileTab}
+					taskId={selection.card.id}
+					workspaceId={currentProjectId}
+					pullRequests={selection.card.pullRequests ?? []}
+				/>
 				<div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
 					<div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
 						{/* Chat panel */}

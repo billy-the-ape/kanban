@@ -14,10 +14,15 @@ export function TaskPullRequestLink({
 	pullRequest,
 	variant,
 	className,
+	ariaLabel,
+	dataTestId,
 }: {
 	pullRequest: RuntimeTaskPullRequest;
 	variant: "full" | "compact";
 	className?: string;
+	/** PRLINK-7: accessible name (mobile anchors must not rely on hover tooltips). */
+	ariaLabel?: string;
+	dataTestId?: string;
 }): React.ReactElement {
 	const stateTint =
 		pullRequest.state === "merged"
@@ -41,6 +46,8 @@ export function TaskPullRequestLink({
 				href={pullRequest.url}
 				target="_blank"
 				rel="noopener noreferrer"
+				aria-label={ariaLabel}
+				data-testid={dataTestId}
 				onMouseDown={handleStopPropagation}
 				onClick={handleStopPropagation}
 				className={cn(

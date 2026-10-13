@@ -1,11 +1,12 @@
 import * as RadixPopover from "@radix-ui/react-popover";
 import { getOrderedTaskPullRequests } from "@runtime-pull-request-links";
 import { Link, Plus, RefreshCw, Star, StarOff, X } from "lucide-react";
-import { useState } from "react";
+import { type ReactNode, useState } from "react";
 
 import { showAppToast } from "@/components/app-toaster";
 import { TaskPullRequestLink } from "@/components/task-pull-request-link";
 import { Button } from "@/components/ui/button";
+import { cn } from "@/components/ui/cn";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip } from "@/components/ui/tooltip";
 import { getRuntimeTrpcClient } from "@/runtime/trpc-client";
@@ -23,21 +24,40 @@ const MAKE_PRIMARY_TOOLTIP =
 	"Make primary for display. The Automation PR is selected separately in PR tracking settings.";
 const CLEAR_PRIMARY_TOOLTIP = "Use automatic display order";
 
-interface TaskPullRequestManagerProps {
+interface TaskPullRequestManagerPopoverProps {
+	trigger: ReactNode;
 	workspaceId: string;
 	taskId: string;
 	pullRequests: RuntimeTaskPullRequest[];
+	/**
+	 * PRLINK-7: mobile presentation — 44px touch targets, a scrollable
+	 * viewport-bounded list, and visible repository/state information in
+	 * each row so nothing depends on a hover tooltip.
+	 */
+	mobile?: boolean;
+	/** PRLINK-7: controlled open state; the popover is uncontrolled when omitted. */
+	open?: boolean;
+	onOpenChange?: (open: boolean) => void;
 }
 
 /**
- * PRLINK-5: manual PR link management for the selected task.
- * Renders the "+"/"Link PR" affordance next to the PR links in the top-bar
- * branch control plus a popover with URL input, the recorded list, and the
- * opt-in refresh action. Server responses are authoritative; board state
- * refreshes via the runtime's state broadcast.
+ * PRLINK-5/6: manual PR link management for a task. URL input, the recorded
+ * list with Add/Remove/display-primary actions, and the opt-in refresh.
+ * Server responses are authoritative; board state refreshes via the
+ * runtime's state broadcast. The trigger and open state are configurable
+ * so desktop (top bar) and mobile (detail tab bar) share one manager
+ * without duplicating mutation logic.
  */
-export function TaskPullRequestManager({ workspaceId, taskId, pullRequests }: TaskPullRequestManagerProps) {
-	const [open, setOpen] = useState(false);
+export function TaskPullRequestManagerPopover({
+	trigger,
+	workspaceId,
+	taskId,
+	pullRequests,
+	mobile = false,
+	open,
+	onOpenChange,
+}: TaskPullRequestManagerPopoverProps) {
+	const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
 	const [url, setUrl] = useState("");
 	const [submitting, setSubmitting] = useState(false);
 	const [formError, setFormError] = useState<string | null>(null);
@@ -45,11 +65,23 @@ export function TaskPullRequestManager({ workspaceId, taskId, pullRequests }: Ta
 	// PRLINK-6: pending display-primary actions (server response is authoritative).
 	const [primaryPendingKey, setPrimaryPendingKey] = useState<string | null>(null);
 	const [refreshing, setRefreshing] = useState(false);
+	const isOpen = open ?? uncontrolledOpen;
 	const validationError = url.trim() ? validatePullRequestUrlShape(url) : null;
 	const canSubmit = validationError === null && !submitting;
 	// PRLINK-6: display order — the primary winner first, the rest in recorded order.
 	const orderedPullRequests = getOrderedTaskPullRequests(pullRequests);
 	const winnerPullRequest = orderedPullRequests[0];
+	const actionButtonClass = mobile ? "min-h-11 min-w-11 shrink-0 p-0" : "h-6 w-6 shrink-0 px-0";
+
+	const handleOpenChange = (nextOpen: boolean): void => {
+		if (submitting) {
+			return;
+		}
+		if (open === undefined) {
+			setUncontrolledOpen(nextOpen);
+		}
+		onOpenChange?.(nextOpen);
+	};
 
 	const handleAdd = async (): Promise<void> => {
 		if (!canSubmit) {
@@ -66,7 +98,7 @@ export function TaskPullRequestManager({ workspaceId, taskId, pullRequests }: Ta
 				setUrl("");
 				setFormError(null);
 				// Close optimistically; the authoritative entry arrives via the broadcast.
-				setOpen(false);
+				handleOpenChange(false);
 				return;
 			}
 			const message = response.error || "Could not add the pull request.";
@@ -183,36 +215,17 @@ export function TaskPullRequestManager({ workspaceId, taskId, pullRequests }: Ta
 	};
 
 	return (
-		<RadixPopover.Root
-			open={open}
-			onOpenChange={(next) => {
-				if (!submitting) {
-					setOpen(next);
-				}
-			}}
-		>
-			<RadixPopover.Trigger asChild>
-				{pullRequests.length === 0 ? (
-					<Button variant="ghost" size="sm" icon={<Link size={12} />} data-testid="task-pr-link-pr-button">
-						Link PR
-					</Button>
-				) : (
-					<Button
-						variant="ghost"
-						size="sm"
-						icon={<Plus size={14} />}
-						aria-label="Manage pull requests"
-						data-testid="task-pr-manage-button"
-						title="Manage pull requests"
-					/>
-				)}
-			</RadixPopover.Trigger>
+		<RadixPopover.Root open={isOpen} onOpenChange={handleOpenChange}>
+			<RadixPopover.Trigger asChild>{trigger}</RadixPopover.Trigger>
 			<RadixPopover.Portal>
 				<RadixPopover.Content
 					side="bottom"
 					align="start"
 					sideOffset={4}
-					className="z-50 flex w-72 flex-col gap-2 rounded-md border border-border bg-surface-2 p-2 shadow-lg outline-none"
+					className={cn(
+						"z-50 flex w-72 flex-col gap-2 rounded-md border border-border bg-surface-2 p-2 shadow-lg outline-none",
+						mobile && "max-h-[60vh]",
+					)}
 					style={{ animation: "kb-tooltip-show 100ms ease" }}
 				>
 					<form
@@ -255,7 +268,10 @@ export function TaskPullRequestManager({ workspaceId, taskId, pullRequests }: Ta
 						</Button>
 					</form>
 					<div className="h-px bg-border" />
-					<div className="flex min-h-0 flex-col gap-1" data-testid="task-pr-list">
+					<div
+						className={cn("flex min-h-0 flex-col gap-1", mobile && "overflow-y-auto")}
+						data-testid="task-pr-list"
+					>
 						{orderedPullRequests.length === 0 ? (
 							<p className="m-0 text-xs text-text-tertiary">No pull requests linked yet.</p>
 						) : (
@@ -266,14 +282,30 @@ export function TaskPullRequestManager({ workspaceId, taskId, pullRequests }: Ta
 								const isExplicitPrimary = isWinner && pullRequest.isPrimary === true;
 								const isPrimaryPending = primaryPendingKey === key;
 								const isClearPrimaryPending = primaryPendingKey === CLEAR_PRIMARY_PENDING_KEY;
+								// PRLINK-7: on mobile the repository, state, and winner label are
+								// visible in the row instead of living in a hover tooltip.
+								const rowMetaParts = [pullRequest.repository, pullRequest.state ?? "state unknown"];
+								if (isWinner) {
+									rowMetaParts.push(isExplicitPrimary ? "primary for display" : "shown by default");
+								}
 								return (
-									<div key={key} className="flex items-center gap-1.5">
-										<TaskPullRequestLink
-											pullRequest={pullRequest}
-											variant="full"
-											className="min-w-0 flex-1 truncate"
-										/>
-										{isWinner ? (
+									<div key={key} className="flex min-w-0 items-center gap-1.5">
+										<div className="min-w-0 flex-1">
+											<TaskPullRequestLink
+												pullRequest={pullRequest}
+												variant="full"
+												className="min-w-0 max-w-full"
+											/>
+											{mobile ? (
+												<span
+													className="block truncate text-[10px] text-text-tertiary"
+													data-testid={`task-pr-row-meta-${pullRequest.number}`}
+												>
+													{rowMetaParts.join(" · ")}
+												</span>
+											) : null}
+										</div>
+										{isWinner && !mobile ? (
 											<span
 												className="shrink-0 text-[10px] text-text-tertiary"
 												data-testid={
@@ -292,7 +324,7 @@ export function TaskPullRequestManager({ workspaceId, taskId, pullRequests }: Ta
 													icon={isClearPrimaryPending ? <Spinner size={10} /> : <StarOff size={12} />}
 													disabled={isClearPrimaryPending}
 													onClick={() => void handleClearPrimary()}
-													className="h-6 w-6 shrink-0 px-0"
+													className={actionButtonClass}
 													data-testid="task-pr-use-automatic-order"
 												/>
 											</Tooltip>
@@ -305,7 +337,7 @@ export function TaskPullRequestManager({ workspaceId, taskId, pullRequests }: Ta
 													icon={isPrimaryPending ? <Spinner size={10} /> : <Star size={12} />}
 													disabled={isPrimaryPending}
 													onClick={() => void handleMakePrimary(pullRequest)}
-													className="h-6 w-6 shrink-0 px-0"
+													className={actionButtonClass}
 													data-testid={`task-pr-make-primary-${pullRequest.number}`}
 												/>
 											</Tooltip>
@@ -317,7 +349,7 @@ export function TaskPullRequestManager({ workspaceId, taskId, pullRequests }: Ta
 											icon={isRemoving ? <Spinner size={10} /> : <X size={12} />}
 											disabled={isRemoving}
 											onClick={() => void handleRemove(pullRequest)}
-											className="h-6 w-6 shrink-0 px-0"
+											className={actionButtonClass}
 											data-testid={`task-pr-remove-${pullRequest.number}`}
 										/>
 									</div>
@@ -332,6 +364,7 @@ export function TaskPullRequestManager({ workspaceId, taskId, pullRequests }: Ta
 						icon={refreshing ? <Spinner size={12} /> : <RefreshCw size={12} />}
 						disabled={refreshing}
 						onClick={() => void handleRefresh()}
+						className={cn(mobile && "min-h-11")}
 						data-testid="task-pr-refresh-button"
 					>
 						{refreshing ? "Refreshing" : "Refresh"}
@@ -339,5 +372,41 @@ export function TaskPullRequestManager({ workspaceId, taskId, pullRequests }: Ta
 				</RadixPopover.Content>
 			</RadixPopover.Portal>
 		</RadixPopover.Root>
+	);
+}
+
+interface TaskPullRequestManagerProps {
+	workspaceId: string;
+	taskId: string;
+	pullRequests: RuntimeTaskPullRequest[];
+}
+
+/**
+ * PRLINK-5: desktop top-bar affordance. The "+"/"Link PR" trigger plus the
+ * shared manager popover (uncontrolled open state).
+ */
+export function TaskPullRequestManager({ workspaceId, taskId, pullRequests }: TaskPullRequestManagerProps) {
+	return (
+		<TaskPullRequestManagerPopover
+			workspaceId={workspaceId}
+			taskId={taskId}
+			pullRequests={pullRequests}
+			trigger={
+				pullRequests.length === 0 ? (
+					<Button variant="ghost" size="sm" icon={<Link size={12} />} data-testid="task-pr-link-pr-button">
+						Link PR
+					</Button>
+				) : (
+					<Button
+						variant="ghost"
+						size="sm"
+						icon={<Plus size={14} />}
+						aria-label="Manage pull requests"
+						data-testid="task-pr-manage-button"
+						title="Manage pull requests"
+					/>
+				)
+			}
+		/>
 	);
 }
