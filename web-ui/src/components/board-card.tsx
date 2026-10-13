@@ -8,6 +8,7 @@ import {
 	AlertTriangle,
 	Bot,
 	Check,
+	CheckCircle,
 	GitBranch,
 	Pause,
 	Pencil,
@@ -42,6 +43,7 @@ import {
 	truncateTaskPromptLabel,
 } from "@/utils/task-prompt";
 import { DEFAULT_TEXT_MEASURE_FONT, measureTextWidth, readElementFontShorthand } from "@/utils/text-measure";
+import { ColumnIndicator } from "./ui/column-indicator";
 
 interface CardSessionActivity {
 	dotColor: string;
@@ -183,6 +185,9 @@ function getCardSessionActivity(summary: RuntimeTaskSessionSummary | undefined):
 	const toolInputSummary = hookActivity?.toolInputSummary?.trim() ?? null;
 	const finalMessage = hookActivity?.finalMessage?.trim();
 	const hookEventName = hookActivity?.hookEventName?.trim() ?? null;
+	if (hookEventName?.toLocaleLowerCase().includes("error")) {
+		return { dotColor: SESSION_ACTIVITY_COLOR.error, text: finalMessage || hookEventName };
+	}
 	if (summary.state === "awaiting_review" && finalMessage) {
 		return { dotColor: SESSION_ACTIVITY_COLOR.success, text: finalMessage };
 	}
@@ -301,6 +306,7 @@ export function BoardCard({
 	/** UPD-1.3: live initial-start preparation stage while a start is in flight. */
 	initialStartStage?: RuntimeTaskInitialStartStage;
 }): React.ReactElement {
+	console.log({ state: sessionSummary?.state, card, sessionSummary });
 	const [isHovered, setIsHovered] = useState(false);
 	const [isEditingTitle, setIsEditingTitle] = useState(false);
 	const [draftTitle, setDraftTitle] = useState(card.title);
@@ -449,14 +455,25 @@ export function BoardCard({
 		if (isCreditLimit) {
 			return <AlertTriangle size={12} className="text-status-orange" />;
 		}
-		if (columnId === "in_progress") {
-			if (sessionSummary?.latestHookActivity?.hookEventName === "concurrency_waiting") {
-				return <Pause size={12} className="text-status-orange" />;
+		switch (columnId) {
+			case "in_progress": {
+				if (
+					sessionSummary?.state === "idle" ||
+					sessionSummary?.latestHookActivity?.hookEventName === "concurrency_waiting"
+				) {
+					return <Pause size={12} className="text-status-orange" />;
+				}
+				if (sessionSummary?.state === "failed") {
+					return <AlertCircle size={12} className="text-status-red" />;
+				}
+				return <Spinner size={12} className="text-status-blue" />;
 			}
-			if (sessionSummary?.state === "failed") {
-				return <AlertCircle size={12} className="text-status-red" />;
+			case "review": {
+				return <ColumnIndicator columnId={columnId} />;
 			}
-			return <Spinner size={12} />;
+			case "done": {
+				return <CheckCircle size={12} className="text-status-green" />;
+			}
 		}
 		return null;
 	};
@@ -602,6 +619,7 @@ export function BoardCard({
 								isDependencyTarget && "kb-board-card-dependency-target",
 							)}
 						>
+							<div className="flex items-center gap-2"></div>
 							<div className="flex items-center gap-2" style={{ minHeight: 24 }}>
 								{statusMarker ? <div className="inline-flex items-center">{statusMarker}</div> : null}
 								<div className="flex-1 min-w-0">
@@ -701,33 +719,19 @@ export function BoardCard({
 										}}
 									/>
 								) : columnId === "review" ? (
-									<div className="flex items-center">
-										<Button
-											icon={isCompleteLoading ? <Spinner size={13} /> : <Check size={13} />}
-											variant="ghost"
-											size="sm"
-											className="text-status-green hover:text-status-green"
-											disabled={isCompleteLoading}
-											aria-label="Complete task"
-											onMouseDown={stopEvent}
-											onClick={(event) => {
-												stopEvent(event);
-												onComplete?.(card.id);
-											}}
-										/>
-										<Button
-											icon={isMoveToTrashLoading ? <Spinner size={13} /> : <Trash2 size={13} />}
-											variant="ghost"
-											size="sm"
-											disabled={isMoveToTrashLoading}
-											aria-label="Discard task"
-											onMouseDown={stopEvent}
-											onClick={(event) => {
-												stopEvent(event);
-												onMoveToTrash?.(card.id);
-											}}
-										/>
-									</div>
+									<Button
+										icon={isCompleteLoading ? <Spinner size={13} /> : <Check size={13} />}
+										variant="ghost"
+										size="sm"
+										className="text-status-green hover:text-status-green"
+										disabled={isCompleteLoading}
+										aria-label="Complete task"
+										onMouseDown={stopEvent}
+										onClick={(event) => {
+											stopEvent(event);
+											onComplete?.(card.id);
+										}}
+									/>
 								) : columnId === "done" ? (
 									<div className="flex items-center">
 										<Tooltip side="bottom" content="Reopen in Review">

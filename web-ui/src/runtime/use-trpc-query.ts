@@ -67,7 +67,6 @@ export function useTrpcQuery<TData>(options: UseTrpcQueryOptions<TData>): UseTrp
 				return null;
 			}
 			setData((data) => {
-				console.log({ data, nextData, eq: JSON.stringify(data) === JSON.stringify(nextData) });
 				if (JSON.stringify(data) === JSON.stringify(nextData)) {
 					return data;
 				}
