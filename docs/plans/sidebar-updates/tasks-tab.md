@@ -23,7 +23,7 @@ Today the sidebar has two tabs, **Projects** and **Kanban Agent**. There is no w
      - a state pill (`rounded-full text-[10px] px-1.5 py-px font-medium` with the state's tone class, showing its `shortLabel`, with `title` set to the state title);
      - the project name (`text-[11px] text-text-secondary truncate min-w-0 flex-1`);
      - the relative age (`text-[11px] text-text-tertiary shrink-0`, format from `formatApproximateAge`, e.g. `5m ago`).
-   - The whole item is a `<button type="button">` styled like a project row: `kb-project-row w-full text-left rounded-md`, `padding: 6px 8px`.
+   - The whole item is a `<button type="button">` styled like a project row: `kb-project-row w-full text-left rounded-md px-2 py-1.5`.
    - No action menu and no agent activity text.
 7. **Click:** opens the task's detail view. If the task is in the open project, select it directly. Otherwise, switch to its project and select it once that project's board has loaded (see the pending-open hook). On mobile, also close the sidebar, the same way project selection does.
 8. **Data source and refresh budget:** a new global tRPC query `projects.listTasks` returns tasks from indexed projects without starting agents or creating terminal managers. Query it with `getRuntimeTrpcClient(null)`; it is independent of the selected project's request header. Fetch only while the home Tasks tab is expanded and the browser document is visible. A change in the **raw** runtime-stream `projects` array marks the data dirty; do not use `displayedProjects`, whose local overlay would cause unnecessary requests.
