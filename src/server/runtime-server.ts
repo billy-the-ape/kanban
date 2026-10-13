@@ -334,6 +334,23 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			broadcastTaskChatCleared: deps.runtimeStateHub.broadcastTaskChatCleared,
 			resolveClineLaunchConfig: () => clineProviderService.resolveLaunchConfig(),
 		}),
+		// COMMENT-0: same effective-agent semantics as task start and PR
+		// tracking — a live session's agent when one exists, else the
+		// workspace's selected agent.
+		getEffectiveTaskAgentId: async (scope, taskId): Promise<RuntimeAgentId | null> => {
+			try {
+				const state = await loadWorkspaceState(scope.workspacePath);
+				const sessionAgent = state.sessions[taskId]?.agentId;
+				if (sessionAgent) {
+					return sessionAgent;
+				}
+			} catch {
+				// No readable session state: fall through to the
+				// workspace's selected agent below.
+			}
+			const config = await deps.workspaceRegistry.loadScopedRuntimeConfig(scope);
+			return config.selectedAgentId;
+		},
 		getGitHubAccessScopeId: resolveAccessScopeId,
 		ghClient: createGitHubPrClient(),
 		warn: (message) => deps.warn(`[pr-comment-automation] ${message}`),

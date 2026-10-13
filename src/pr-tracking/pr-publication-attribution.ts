@@ -58,6 +58,16 @@ export interface PrPublicationObservation {
 	status: PrPublicationStatus;
 	/** The linked PR this operation resolved to, when determinable. */
 	target: PrPublicationTarget | null;
+	/**
+	 * True when every operation carried an explicit selector (repository
+	 * and/or PR number, including the endpoint of a `gh api` write) that
+	 * matches no linked PR: the write demonstrably targets another PR, so
+	 * this task's automation is unaffected. An ambiguous selector
+	 * (unparseable or matching nothing without being explicit) leaves
+	 * `target` null WITHOUT this flag: every linked PR must be treated as
+	 * an uncertain capture.
+	 */
+	explicitUnlinked: boolean;
 	operation: string | null;
 	kind: PrPublishedIdentityKind | null;
 	identities: PrPublishedIdentity[];
@@ -66,7 +76,6 @@ export interface PrPublicationObservation {
 }
 
 const GH_API_WRITE_METHODS = new Set(["POST", "PUT", "PATCH"]);
-const GH_API_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
 /** Flags whose next token is a value (skipped when scanning for positionals). */
 const GH_VALUE_FLAGS = new Set([
 	"-b",
@@ -80,6 +89,25 @@ const GH_VALUE_FLAGS = new Set([
 	"--milestone",
 	"--project",
 ]);
+/** `gh api` flags whose next token is a value. */
+const GH_API_VALUE_FLAGS = new Set([
+	"-f",
+	"-F",
+	"-H",
+	"--field",
+	"--raw-field",
+	"--header",
+	"--input",
+	"--jq",
+	"--hostname",
+	"-t",
+	"--template",
+	"--cache",
+	"--method",
+	"-X",
+]);
+/** `gh api` payload flags: their presence implies a POST when no method is given. */
+const GH_API_PAYLOAD_FLAGS = new Set(["-f", "-F", "--field", "--raw-field", "--input"]);
 
 function isDigits(value: string): boolean {
 	return value.length > 0 && /^\d+$/.test(value);
@@ -181,17 +209,49 @@ export function detectPublicationOperations(commands: string[]): PrPublicationOp
 					});
 				}
 			} else if (group === "api") {
-				let i = 1;
+				let i = 2;
 				let method: string | null = null;
-				if (i < tokens.length && GH_API_METHODS.has(tokens[i] ?? "")) {
-					method = tokens[i];
+				let hasPayload = false;
+				let endpoint: string | null = null;
+				// `gh api [METHOD] ENDPOINT [flags]`: real gh takes the method
+				// via flags, so scan from the token after "api".
+				while (i < tokens.length) {
+					const token = tokens[i] ?? "";
+					if (token.startsWith("--") && token.includes("=")) {
+						// `--flag=value` form: consumes itself.
+						if (token.startsWith("--method=")) {
+							method = token.slice("--method=".length).toUpperCase();
+						}
+						i += 1;
+						continue;
+					}
+					if (token === "-X" || token === "--method") {
+						method = (tokens[i + 1] ?? "").toUpperCase() || method;
+						i += 2;
+						continue;
+					}
+					if (token.startsWith("-X") && token.length > 2) {
+						method = token.slice(2).toUpperCase();
+						i += 1;
+						continue;
+					}
+					if (GH_API_VALUE_FLAGS.has(token)) {
+						if (GH_API_PAYLOAD_FLAGS.has(token)) {
+							hasPayload = true;
+						}
+						i += 2;
+						continue;
+					}
+					if (token.startsWith("-")) {
+						// Valueless flags (`-q`, `--quiet`, `--help`, ...).
+						i += 1;
+						continue;
+					}
+					if (endpoint === null) {
+						endpoint = token;
+					}
 					i += 1;
 				}
-				const endpoint = tokens[i] ?? null;
-				const rest = tokens.slice(i + 1);
-				const hasPayload = rest.some(
-					(token) => token === "-f" || token === "-F" || token === "--field" || token === "--raw-field",
-				);
 				const effective = method ?? (hasPayload ? "POST" : "GET");
 				if (!endpoint || !GH_API_WRITE_METHODS.has(effective)) {
 					continue;
@@ -201,12 +261,12 @@ export function detectPublicationOperations(commands: string[]): PrPublicationOp
 					continue;
 				}
 				const repoMatch = /^repos\/([^/]+)\/([^/]+)/.exec(endpoint);
-				const numberMatch = /\/\d+/.exec(endpoint);
+				const numberMatch = /\/(\d+)\/(comments|reviews)/.exec(endpoint);
 				push({
 					operation: "gh api",
 					kind: parsed.kind,
 					explicitRepository: repoMatch ? `${repoMatch[1]}/${repoMatch[2]}` : null,
-					explicitNumber: numberMatch ? Number.parseInt(numberMatch[0].slice(1), 10) : null,
+					explicitNumber: numberMatch ? Number.parseInt(numberMatch[1], 10) : null,
 				});
 			}
 		}
@@ -244,6 +304,18 @@ function matchLinked(
 	// No explicit selector: only safe with exactly one linked PR (the
 	// command's implicit selector targets that PR's branch).
 	return linked.length === 1 ? linked[0] : null;
+}
+
+/**
+ * True when every operation explicitly selected a target (repository and/or
+ * number) and none of those explicit selections matches a linked PR.
+ */
+function isExplicitUnlinked(operations: PrPublicationOperation[], linked: PrPublicationTarget[]): boolean {
+	return operations.every(
+		(operation) =>
+			(operation.explicitRepository !== null || operation.explicitNumber !== null) &&
+			matchLinked(linked, operation.explicitRepository, operation.explicitNumber) === null,
+	);
 }
 
 /**
@@ -349,7 +421,10 @@ function mapApiResponseIdentity(
 		return { kind: "identities", identities: [] };
 	}
 	const id = readPositiveInt(object, "id");
-	const url = readString(object, "url") ?? readString(object, "html_url");
+	// Prefer html_url: the `url` field of an API comment object is a
+	// comment endpoint URL (`.../issues/comments/<id>`) that does not carry
+	// the PR number.
+	const url = readString(object, "html_url") ?? readString(object, "url");
 	const issueUrl = readString(object, "issue_url");
 	const pullRequestUrl = readString(object, "pull_request_url");
 	const path = object.path;
@@ -359,7 +434,9 @@ function mapApiResponseIdentity(
 		if (!value) {
 			return false;
 		}
-		const repoMatch = /github\.com\/([^/\s?#]+)\/([^/\s?#]+)/.exec(value);
+		// Handles both `https://github.com/O/R/...` and
+		// `https://api.github.com/repos/O/R/...` URL forms.
+		const repoMatch = /(?:api\.)?github\.com(?:\/repos)?\/([^/\s?#]+)\/([^/\s?#]+)/.exec(value);
 		const repo = repoMatch ? `${repoMatch[1]}/${repoMatch[2]}` : null;
 		const numberMatch = /(?:\/pull|\/pulls|\/issues)\/(\d+)/.exec(value);
 		const number = numberMatch ? Number.parseInt(numberMatch[1], 10) : null;
@@ -524,24 +601,39 @@ export function analyzePrPublication(input: {
 	void input.toolName; // detection is command-based, like the PRLINK-0 gate
 	const operations = detectPublicationOperations(input.commands);
 	if (operations.length === 0) {
-		return { status: "none", target: null, operation: null, kind: null, identities: [], reason: null };
+		return {
+			status: "none",
+			target: null,
+			explicitUnlinked: false,
+			operation: null,
+			kind: null,
+			identities: [],
+			reason: null,
+		};
 	}
 	const target = resolvePublicationTarget(operations, input.linkedPullRequests);
 	const primary = operations[0];
 	if (target === null) {
+		// An explicit selector that matches no linked PR demonstrably targets
+		// another PR: no capture, no pause. An ambiguous selector (unquoted
+		// numbers inside bodies, no selector with several linked PRs, ...)
+		// is uncertain for every linked PR and must pause automation.
+		const unlinked = isExplicitUnlinked(operations, input.linkedPullRequests);
 		return {
-			status: "uncertain",
+			status: unlinked ? "none" : "uncertain",
 			target: null,
+			explicitUnlinked: unlinked,
 			operation: primary.operation,
 			kind: primary.kind,
 			identities: [],
-			reason: "Could not resolve which linked pull request the publication targets.",
+			reason: unlinked ? null : "Could not resolve which linked pull request the publication targets.",
 		};
 	}
 	if (input.output === null) {
 		return {
 			status: "pending",
 			target,
+			explicitUnlinked: false,
 			operation: primary.operation,
 			kind: primary.kind,
 			identities: [],
@@ -557,6 +649,7 @@ export function analyzePrPublication(input: {
 	return {
 		status: resolved.status,
 		target,
+		explicitUnlinked: false,
 		operation: primary.operation,
 		kind: primary.kind,
 		identities: resolved.identities,

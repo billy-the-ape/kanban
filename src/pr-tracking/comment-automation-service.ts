@@ -24,6 +24,8 @@
 import { randomUUID } from "node:crypto";
 import type { ClineTaskSessionService } from "../cline-sdk/cline-task-session-service";
 import type {
+	RuntimeAgentId,
+	RuntimeBoardCard,
 	RuntimeGitHubPrTrackingRecord,
 	RuntimePrCommentAutomation,
 	RuntimePrCommentOwner,
@@ -34,9 +36,11 @@ import type {
 	RuntimeTaskPrTrackingState,
 	RuntimeTaskPrTrackingStateResponse,
 	RuntimeTaskPullRequest,
+	RuntimeTaskSessionSummary,
 	RuntimeWorkspaceStateResponse,
 } from "../core/api-contract";
 import { getPullRequestIdentityKey } from "../core/pull-request-links";
+import { resolveWorkspaceSessionSummaries } from "../core/workspace-session-summaries";
 import { isTaskWriterActive } from "../server/task-writer-activity";
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import type { PrFeedbackEvent } from "./feedback-fingerprint";
@@ -45,6 +49,7 @@ import type { GitHubPrClient, GitHubPrSnapshot } from "./github-pr-client";
 import { listPrTrackingRecords, loadPrTrackingRecord, upsertPrTrackingRecord } from "./pr-comment-record-store";
 import {
 	analyzePrPublication,
+	type PrPublicationObservation,
 	type PrPublishedIdentity,
 	prPublishedIdentityKey,
 	resolvePublicationOutput,
@@ -112,6 +117,16 @@ export interface PrCommentAutomationServiceDependencies {
 		scope: PrCommentAutomationWorkspaceScope,
 		body: RuntimeTaskChatSendRequest,
 	) => Promise<RuntimeTaskChatSendResponse>;
+	/**
+	 * Effective agent for a card — a live session's agent when one exists,
+	 * else the workspace's selected agent (same precedence as task start).
+	 * Optional for test harnesses; when absent, only an explicit per-card
+	 * `agentId: "cline"` counts as supported.
+	 */
+	getEffectiveTaskAgentId?: (
+		scope: PrCommentAutomationWorkspaceScope,
+		taskId: string,
+	) => Promise<RuntimeAgentId | null>;
 	getGitHubAccessScopeId: () => Promise<string>;
 	ghClient: GitHubPrClient;
 	now?: () => number;
@@ -417,6 +432,57 @@ export class PrCommentAutomationService {
 		await this.track(this.syncWorkspaceSubscriptions(scope));
 	}
 
+	/**
+	 * COMMENT-0 v1 support gate: the task's effective agent must be the
+	 * native Cline agent. An unset per-card agentId inherits the
+	 * workspace's selected agent (resolved like task start), not Cline.
+	 */
+	private async isClineAgentTask(scope: PrCommentAutomationWorkspaceScope, card: RuntimeBoardCard): Promise<boolean> {
+		let effectiveAgentId: RuntimeAgentId | null = null;
+		if (this.deps.getEffectiveTaskAgentId) {
+			try {
+				effectiveAgentId = await this.deps.getEffectiveTaskAgentId(scope, card.id);
+			} catch {
+				effectiveAgentId = null;
+			}
+		}
+		if (effectiveAgentId === null && card.agentId === "cline") {
+			// Resolver unavailable: only an explicit per-card Cline counts.
+			effectiveAgentId = "cline";
+		}
+		return effectiveAgentId === "cline";
+	}
+
+	/**
+	 * Live session summary for a task: persisted state reconciled against
+	 * the terminal manager and the in-memory Cline summaries (the same
+	 * resolution buildWorkspaceStateSnapshot uses). The raw persisted
+	 * sessions file is only written on browser saves/shutdown and must
+	 * never settle dispatch turns on its own.
+	 */
+	private async resolveLiveSessionSummary(
+		candidate: PrCommentCandidate,
+		taskId: string,
+	): Promise<RuntimeTaskSessionSummary | null> {
+		const state = await this.deps.loadWorkspaceState(candidate.workspacePath).catch(() => null);
+		if (!state) {
+			return null;
+		}
+		let terminal: TerminalSessionManager | null = null;
+		let cline: ClineTaskSessionService | null = null;
+		try {
+			terminal = await this.deps.getTerminalManager(candidate);
+			cline = await this.deps.getClineTaskSessionService(candidate);
+		} catch {
+			terminal = null;
+			cline = null;
+		}
+		if (!terminal || !cline) {
+			return state.sessions[taskId] ?? null;
+		}
+		return resolveWorkspaceSessionSummaries(state.sessions, terminal, cline.listSummaries())[taskId] ?? null;
+	}
+
 	private async syncWorkspaceSubscriptions(scope: PrCommentAutomationWorkspaceScope): Promise<void> {
 		let state: RuntimeWorkspaceStateResponse;
 		try {
@@ -434,40 +500,44 @@ export class PrCommentAutomationService {
 				if (card.autoAddressComments !== true) {
 					continue;
 				}
-				for (const pullRequest of card.pullRequests ?? []) {
-					if (pullRequest.provider !== "github" || pullRequest.host !== "github.com") {
-						continue;
-					}
-					const key = getPullRequestIdentityKey(pullRequest);
-					const candidateId = `${scope.workspaceId}/${card.id}`;
-					const candidate: PrCommentCandidate = {
-						workspaceId: scope.workspaceId,
-						workspacePath: scope.workspacePath,
-						taskId: card.id,
-					};
-					activeCandidateIds.set(`${key}/${candidateId}`, candidate);
-					const existing = this.subscriptions.get(key);
-					const sub =
-						existing ??
-						({
-							key,
-							pr: pullRequest,
-							candidates: new Map<string, PrCommentCandidate>(),
-							nextPollAt: 0,
-							dispatchRetryAt: null,
-							consecutiveFailures: 0,
-							pollInFlight: false,
-							settleInFlight: false,
-						} satisfies PrSubscriptionState);
-					if (!existing) {
-						this.subscriptions.set(key, sub);
-					}
-					if (!sub.candidates.has(candidateId)) {
-						// New candidate: poll immediately.
-						sub.nextPollAt = 0;
-					}
-					sub.candidates.set(candidateId, candidate);
+				// Same eligibility as the detail surface and Resume: exactly
+				// one linked github.com PR and the native Cline agent.
+				const prs = (card.pullRequests ?? []).filter(
+					(pullRequest) => pullRequest.provider === "github" && pullRequest.host === "github.com",
+				);
+				const pullRequest = prs.length === 1 ? (prs[0] ?? null) : null;
+				if (pullRequest === null || !(await this.isClineAgentTask(scope, card))) {
+					continue;
 				}
+				const key = getPullRequestIdentityKey(pullRequest);
+				const candidateId = `${scope.workspaceId}/${card.id}`;
+				const candidate: PrCommentCandidate = {
+					workspaceId: scope.workspaceId,
+					workspacePath: scope.workspacePath,
+					taskId: card.id,
+				};
+				activeCandidateIds.set(`${key}/${candidateId}`, candidate);
+				const existing = this.subscriptions.get(key);
+				const sub =
+					existing ??
+					({
+						key,
+						pr: pullRequest,
+						candidates: new Map<string, PrCommentCandidate>(),
+						nextPollAt: 0,
+						dispatchRetryAt: null,
+						consecutiveFailures: 0,
+						pollInFlight: false,
+						settleInFlight: false,
+					} satisfies PrSubscriptionState);
+				if (!existing) {
+					this.subscriptions.set(key, sub);
+				}
+				if (!sub.candidates.has(candidateId)) {
+					// New candidate: poll immediately.
+					sub.nextPollAt = 0;
+				}
+				sub.candidates.set(candidateId, candidate);
 			}
 		}
 		for (const [key, sub] of [...this.subscriptions]) {
@@ -623,16 +693,27 @@ export class PrCommentAutomationService {
 				await this.setDispatchFailed(sub, `The repair owner task is no longer enabled; resume manually.`);
 				return;
 			}
-			const state = await this.deps.loadWorkspaceState(candidate.workspacePath).catch(() => null);
-			const session = state?.sessions[owner.taskId] ?? null;
+			const session = await this.resolveLiveSessionSummary(candidate, owner.taskId);
 			if (session?.state === "running") {
 				return;
 			}
-			if (session?.state === "failed" || session?.state === "interrupted") {
+			// Only settle turns that produced output after the dispatch was
+			// accepted: a stale persisted state from before the dispatch must
+			// never complete or fail it. No evidence yet: keep waiting.
+			if (
+				session === null ||
+				dispatch.attemptedAt === null ||
+				session.lastOutputAt === null ||
+				session.lastOutputAt < dispatch.attemptedAt
+			) {
+				sub.dispatchRetryAt = nowMs + DISPATCH_RETRY_MS;
+				return;
+			}
+			if (session.state === "failed" || session.state === "interrupted") {
 				await this.setDispatchFailed(sub, `The comment-handling turn ended without completion.`);
 				return;
 			}
-			if (session?.state === "idle" || session?.state === "awaiting_review") {
+			if (session.state === "idle" || session.state === "awaiting_review") {
 				await this.setDispatchCompleted(sub);
 				return;
 			}
@@ -1018,7 +1099,17 @@ export class PrCommentAutomationService {
 			error: input.error,
 			linkedPullRequests: targets,
 		});
-		if (observation.status === "none" || observation.target === null) {
+		if (observation.status === "none") {
+			// Includes an explicit selector that targets a PR not linked to
+			// this task: the write demonstrably does not touch our PRs.
+			return;
+		}
+		if (observation.target === null) {
+			// Ambiguous: the write may touch any of this task's linked PRs
+			// but the exact target cannot be established. Every linked PR
+			// gets an uncertain capture so automation pauses visibly (a
+			// silent drop would let the reply retrigger handling).
+			await this.markAmbiguousCapture(input, linked, observation);
 			return;
 		}
 		const pullRequest = linked.find(
@@ -1086,6 +1177,56 @@ export class PrCommentAutomationService {
 			return;
 		}
 		this.captureBlocked.delete(key);
+	}
+
+	/**
+	 * Marks every linked PR with an uncertain capture: a recognized write
+	 * happened but none of this task's linked PRs could be attributed with
+	 * confidence. Automation pauses visibly until the ambiguity is resolved
+	 * or explicitly resumed.
+	 */
+	private async markAmbiguousCapture(
+		input: { workspaceId: string; taskId: string; toolCallId: string | null },
+		linked: RuntimeTaskPullRequest[],
+		observation: PrPublicationObservation,
+	): Promise<void> {
+		let accessScopeId: string;
+		try {
+			accessScopeId = await this.deps.getGitHubAccessScopeId();
+		} catch {
+			for (const pullRequest of linked) {
+				this.captureBlocked.add(getPullRequestIdentityKey(pullRequest));
+			}
+			this.warn(`cannot resolve GitHub access scope for publication capture`);
+			return;
+		}
+		const captureId = input.toolCallId ?? randomUUID();
+		for (const pullRequest of linked) {
+			const key = getPullRequestIdentityKey(pullRequest);
+			try {
+				await this.upsertCapturePending(
+					key,
+					{ accessScopeId, pr: pullRequest },
+					{
+						captureId,
+						taskId: input.taskId,
+						workspaceId: input.workspaceId,
+						operation: observation.operation ?? "pr publication",
+						kind: observation.kind ?? "conversation",
+						target: null,
+						uncertain: true,
+						uncertainReason:
+							observation.reason ??
+							"Could not identify which linked pull request the implementation comment posted to.",
+					},
+				);
+			} catch (error) {
+				this.captureBlocked.add(key);
+				this.warn(
+					`publication capture persistence failed: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
 	}
 
 	/**
@@ -1323,8 +1464,10 @@ export class PrCommentAutomationService {
 			if (dispatch === null || (dispatch.status !== "queued" && dispatch.status !== "running")) {
 				continue;
 			}
+
 			const owner = record.commentAutomation.repairOwner;
 			let sessionState: string | null = null;
+			let sessionLastOutputAt: number | null = null;
 			let taskExists = false;
 			if (owner) {
 				const workspace = this.deps
@@ -1336,7 +1479,21 @@ export class PrCommentAutomationService {
 						taskExists = state.board.columns.some((column) =>
 							column.cards.some((card) => card.id === owner.taskId),
 						);
-						sessionState = state.sessions[owner.taskId]?.state ?? null;
+						// Live resolution: the persisted sessions file alone is not
+						// trustworthy evidence of a turn's outcome.
+						const session =
+							(await this.resolveLiveSessionSummary(
+								{
+									workspaceId: owner.workspaceId,
+									workspacePath: workspace.workspacePath,
+									taskId: owner.taskId,
+								},
+								owner.taskId,
+							)) ??
+							state.sessions[owner.taskId] ??
+							null;
+						sessionState = session?.state ?? null;
+						sessionLastOutputAt = session?.lastOutputAt ?? null;
 					}
 				}
 			}
@@ -1371,6 +1528,13 @@ export class PrCommentAutomationService {
 			if (sessionState === "running") {
 				continue; // The turn may still be our turn; settle it live.
 			}
+			// Live post-dispatch evidence settles the dispatch as it actually
+			// ended; without it the outcome is unknown.
+			const completed =
+				dispatch.attemptedAt !== null &&
+				sessionLastOutputAt !== null &&
+				sessionLastOutputAt >= dispatch.attemptedAt &&
+				(sessionState === "idle" || sessionState === "awaiting_review");
 			await upsertPrTrackingRecord(
 				record.canonicalPrKey,
 				{ accessScopeId: record.accessScopeId, pr: record.pr },
@@ -1386,8 +1550,10 @@ export class PrCommentAutomationService {
 							...current.commentAutomation,
 							dispatch: {
 								...currentDispatch,
-								status: "failed",
-								error: `A restart interrupted comment handling and the outcome is unknown; resume manually.`,
+								status: completed ? "completed" : "failed",
+								error: completed
+									? null
+									: `A restart interrupted comment handling and the outcome is unknown; resume manually.`,
 							},
 						},
 					};
@@ -1421,7 +1587,9 @@ export class PrCommentAutomationService {
 		const prs = (card.pullRequests ?? []).filter(
 			(pullRequest) => pullRequest.provider === "github" && pullRequest.host === "github.com",
 		);
-		const supported = (card.agentId ?? "cline") === "cline";
+		// Same effective-agent gate as subscription and dispatch (an unset
+		// card agentId inherits the workspace's selected agent, not Cline).
+		const supported = enabled ? await this.isClineAgentTask(scope, card) : (card.agentId ?? "cline") === "cline";
 		if (!enabled) {
 			return { ok: true, state: { ...neutral, pr: prs[0] ?? null } };
 		}

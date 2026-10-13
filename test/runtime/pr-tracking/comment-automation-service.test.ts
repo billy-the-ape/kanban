@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClineTaskSessionService } from "../../../src/cline-sdk/cline-task-session-service";
 import type {
+	RuntimeAgentId,
 	RuntimeBoardData,
 	RuntimeGitHubPrTrackingRecord,
 	RuntimePrFeedbackFingerprint,
@@ -10,6 +11,7 @@ import type {
 	RuntimeTaskSessionSummary,
 	RuntimeWorkspaceStateResponse,
 } from "../../../src/core/api-contract";
+import { getPullRequestIdentityKey } from "../../../src/core/pull-request-links";
 import {
 	applyPrPollOutcome,
 	buildCommentHandlingInstruction,
@@ -115,8 +117,31 @@ function makeState(
 	};
 }
 
-const idleCline = { getSummary: () => null } as unknown as ClineTaskSessionService;
-const idleTerminal = { getSummary: () => null } as unknown as TerminalSessionManager;
+function makeSummary(
+	overrides: Partial<Pick<RuntimeTaskSessionSummary, "state" | "lastOutputAt" | "agentId">> = {},
+): RuntimeTaskSessionSummary {
+	return {
+		taskId: "t1",
+		state: overrides.state ?? "idle",
+		agentId: overrides.agentId ?? null,
+		workspacePath: "/w1",
+		pid: null,
+		startedAt: NOW - 10_000,
+		updatedAt: NOW,
+		lastOutputAt: overrides.lastOutputAt ?? null,
+		reviewReason: null,
+		exitCode: null,
+		lastHookAt: null,
+		latestHookActivity: null,
+	};
+}
+
+const idleCline = { getSummary: () => null, listSummaries: () => [] } as unknown as ClineTaskSessionService;
+const idleTerminal = {
+	getSummary: () => null,
+	listSummaries: () => [],
+	hasActiveProcess: () => false,
+} as unknown as TerminalSessionManager;
 
 async function upsertSeed(
 	mutator: (record: RuntimeGitHubPrTrackingRecord) => RuntimeGitHubPrTrackingRecord,
@@ -134,6 +159,8 @@ function makeService(
 			scope: { workspaceId: string; workspacePath: string },
 			body: RuntimeTaskChatSendRequest,
 		) => Promise<RuntimeTaskChatSendResponse>;
+		/** Stands in for the workspace's selected agent (default: cline). */
+		selectedAgentId?: RuntimeAgentId;
 		now?: () => number;
 	} = {},
 ) {
@@ -161,6 +188,17 @@ function makeService(
 				: { ok: true, summary: null, message: { id: "msg-1", role: "user", content: body.text, createdAt: NOW } };
 		},
 		getGitHubAccessScopeId: async () => "scope-1",
+		// Harness effective-agent resolution: the card's explicit agentId
+		// stands in for the live session's agent; `selectedAgentId` stands
+		// in for the workspace's selected agent (Cline by default, as in
+		// the pre-gate harness behavior).
+		getEffectiveTaskAgentId: async (scope, taskId) => {
+			const state = workspaceStates.get(scope.workspacePath);
+			const card = state
+				? state.board.columns.flatMap((column) => column.cards).find((candidate) => candidate.id === taskId)
+				: null;
+			return card?.agentId ?? overrides.selectedAgentId ?? "cline";
+		},
 		ghClient: {
 			fetchSnapshot: async (): Promise<GitHubPrSnapshot> => {
 				snapshotCalls.push("fetchSnapshot");
@@ -419,6 +457,27 @@ describe("PrCommentAutomationService", () => {
 		});
 		const result = await harness.service.getTaskPrTrackingState(scope, "t1");
 		expect(result.ok).toBe(true);
+		expect(result.state.enabled).toBe(true);
+		expect(result.state.supported).toBe(false);
+		expect(result.state.blocker).toContain("Cline");
+	});
+
+	it("does not subscribe a task whose workspace-selected agent is not Cline", async () => {
+		const harness = makeService({
+			workspaceStates: new Map([
+				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })])],
+			]),
+			selectedAgentId: "claude",
+			snapshot: { events: [makeEvent({ providerId: "conversation-1" })] },
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(0);
+		const result = await harness.service.getTaskPrTrackingState(scope, "t1");
+		expect(result.ok).toBe(true);
+		if (!result.ok) {
+			throw new Error("unreachable");
+		}
 		expect(result.state.enabled).toBe(true);
 		expect(result.state.supported).toBe(false);
 		expect(result.state.blocker).toContain("Cline");
@@ -866,6 +925,27 @@ describe("COMMENT-0 publication capture", () => {
 			},
 		}));
 
+	const seedRunningDispatch = (fingerprint: RuntimePrFeedbackFingerprint) =>
+		upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			taskBindings: [{ workspaceId: "w1", taskId: "t1", terminal: false }],
+			commentAutomation: {
+				...record.commentAutomation,
+				repairOwner: { workspaceId: "w1", taskId: "t1", revision: 1 },
+				lastDispatchedFeedbackFingerprint: fingerprint,
+				dispatch: {
+					dispatchId: "d-live",
+					attemptedAt: NOW - 5_000,
+					fingerprint,
+					ownerRevision: 1,
+					status: "running",
+					turnRef: null,
+					error: null,
+				},
+			},
+		}));
+
 	it("excludes recorded implementation replies from pending feedback and sends once", async () => {
 		const reviewer = makeEvent({ providerId: "conversation-1", updatedAt: NOW - 471_000 });
 		const reply = makeEvent({ providerId: "conversation-9", updatedAt: NOW - 100_000 });
@@ -1247,6 +1327,98 @@ describe("COMMENT-0 publication capture", () => {
 		);
 		const record = await load();
 		expect(record.commentAutomation.publication.published).toEqual([{ kind: "conversation", id: 9 }]);
+	});
+
+	it("pauses every linked PR with an uncertain capture when the target is ambiguous", async () => {
+		const secondPr = { ...PR, number: 43, url: "https://github.com/octo/repo/pull/43" };
+		const harness = makeService({
+			workspaceStates: new Map<string, RuntimeWorkspaceStateResponse>([
+				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR, secondPr] })])],
+			]),
+		});
+		await harness.service.recordPrPublicationToolEvent(toolEvent());
+		const record = await load();
+		expect(record.commentAutomation.publication.pending).toHaveLength(1);
+		expect(record.commentAutomation.publication.pending[0]?.uncertain).toBe(true);
+		const second = await loadPrTrackingRecord(getPullRequestIdentityKey(secondPr));
+		expect(second.status).toBe("ok");
+		if (second.status !== "ok") {
+			throw new Error("second record unavailable");
+		}
+		expect(second.record.commentAutomation.publication.pending).toHaveLength(1);
+		expect(second.record.commentAutomation.publication.pending[0]?.uncertain).toBe(true);
+	});
+
+	it("ignores an explicit write that targets a PR not linked to the task", async () => {
+		const harness = makeService({ workspaceStates: cardState() });
+		await harness.service.recordPrPublicationToolEvent(
+			toolEvent({
+				commands: ["gh pr comment 43 -b 'on another PR'"],
+				output: "https://github.com/octo/repo/pull/43#issuecomment-77",
+			}),
+		);
+		const loaded = await loadPrTrackingRecord(KEY);
+		expect(loaded.status).not.toBe("ok");
+	});
+
+	it("does not settle a running dispatch from stale pre-dispatch session state", async () => {
+		const event = makeEvent({ providerId: "conversation-1", updatedAt: NOW });
+		await seedRunningDispatch(fingerprintOf([event]));
+		const harness = makeService({
+			workspaceStates: new Map<string, RuntimeWorkspaceStateResponse>([
+				[
+					"/w1",
+					makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })], {
+						t1: makeSummary({ state: "idle", lastOutputAt: NOW - 3_600_000 }),
+					}),
+				],
+			]),
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(0);
+		const record = await load();
+		expect(record.commentAutomation.dispatch?.status).toBe("running");
+	});
+
+	it("completes a running dispatch once session output postdates the dispatch", async () => {
+		const event = makeEvent({ providerId: "conversation-1", updatedAt: NOW });
+		await seedRunningDispatch(fingerprintOf([event]));
+		const harness = makeService({
+			workspaceStates: new Map<string, RuntimeWorkspaceStateResponse>([
+				[
+					"/w1",
+					makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })], {
+						t1: makeSummary({ state: "idle", lastOutputAt: NOW + 1_000 }),
+					}),
+				],
+			]),
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(0);
+		const record = await load();
+		expect(record.commentAutomation.dispatch?.status).toBe("completed");
+		expect(record.commentAutomation.dispatch?.error).toBeNull();
+	});
+
+	it("completes a restart-surviving dispatch with post-dispatch live evidence", async () => {
+		const event = makeEvent({ providerId: "conversation-1", updatedAt: NOW });
+		await seedRunningDispatch(fingerprintOf([event]));
+		const harness = makeService({
+			workspaceStates: new Map<string, RuntimeWorkspaceStateResponse>([
+				[
+					"/w1",
+					makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })], {
+						t1: makeSummary({ state: "idle", lastOutputAt: NOW + 1_000 }),
+					}),
+				],
+			]),
+		});
+		await harness.service.start();
+		const record = await load();
+		expect(record.commentAutomation.dispatch?.status).toBe("completed");
+		expect(record.commentAutomation.dispatch?.error).toBeNull();
 	});
 });
 

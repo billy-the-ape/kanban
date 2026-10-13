@@ -1,6 +1,6 @@
 # PR comment handling — master plan
 
-Updated: 2026-10-09. Status: COMMENT-0 implemented (see "Implementation status" below). Repository: `billy-the-ape/kanban`.
+Updated: 2026-10-09. Status: COMMENT-0 implemented, plus the second-round review fixes (see "Implementation status" below). Repository: `billy-the-ape/kanban`.
 
 ## Goal and dependencies
 
@@ -275,6 +275,33 @@ and Biome checks:
   (`applyPrPollOutcome` semantics plus service state/resume/dispatch behavior with injected
   dependencies) and `github-pr-client.test.ts` (eligibility, completeness, pagination and
   access-scope errors via an injected command runner).
+
+Review fixes applied (second review round, same PR):
+
+- Effective-agent gate: subscription (`refreshWorkspace`/`syncWorkspaceSubscriptions`) and the
+  detail surface (`getTaskPrTrackingState`) now require the task's *effective* agent to be the
+  native Cline agent — the live session's agent when one exists, else the workspace's selected
+  agent — via a new optional `getEffectiveTaskAgentId` dependency on the service (injected in
+  the runtime server with the same precedence as task start). A card with an unset `agentId`
+  no longer counts as Cline when the workspace selects another agent.
+- Publication capture no longer rides the PR-link gate: the session-service tool observer runs
+  the COMMENT-0 capture before the `links.length === 0` early return, so `gh pr comment`
+  publications are recorded for tasks that never created a PR link.
+- Ambiguous captures pause visibly: an unresolvable write target (no/ambiguous selector with
+  several linked PRs) now records an *uncertain* capture on every linked PR
+  (`markAmbiguousCapture`), pausing automation with a visible reason instead of silently
+  dropping it; only an explicit selector that demonstrably targets a non-linked PR
+  (`explicitUnlinked`) stays ignored.
+- Turn outcome via live evidence: settling a running dispatch resolves the session through the
+  live owners (`resolveWorkspaceSessionSummaries` over terminal + Cline summaries) and accepts
+  the outcome only when `lastOutputAt` postdates `dispatch.attemptedAt`; stale persisted
+  pre-dispatch state never completes or fails the dispatch, and restart reconciliation applies
+  the same evidence rule (completed when post-dispatch output is proven, otherwise failed with
+  the visible Resume requirement).
+- `tokenizeCommandFragment` is now quote-aware: quoted numbers/bodies collapse into single
+  tokens and can never be mistaken for PR-number positionals in detection or attribution.
+- Review feedback events use `submitted_at` (falling back to `updated_at`), matching the real
+  review object shape from `GET /pulls/{n}/reviews`.
 
 Documented v1 deviations: a terminal PR observation cancels queued dispatch but keeps the owner
 held until its candidate is no longer enabled; dispatch waits for conflicting writers before

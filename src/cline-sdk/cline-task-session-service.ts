@@ -1548,6 +1548,20 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					// create` prints the "already exists" PR URL to stderr.
 					output: [tool.output, tool.error].filter((part): part is string => Boolean(part)).join("\n") || null,
 				});
+				// COMMENT-0: publication capture for this implementation session
+				// (review sessions never install this observer). Best-effort; a
+				// storage failure pauses automation inside the callback, never
+				// here and never against the tool.
+				const commands = extractCommandStrings(tool.toolInput);
+				if (commands.length > 0) {
+					void this.capturePrPublicationToolEvent(taskId, "finished", {
+						toolCallId: tool.toolCallId,
+						toolName: tool.toolName,
+						commands,
+						output: tool.output,
+						error: tool.error,
+					});
+				}
 				if (links.length === 0) {
 					return;
 				}
@@ -1568,20 +1582,6 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					.catch(() => {
 						// recordTaskPullRequests is best-effort by contract; nothing to escalate.
 					});
-				// COMMENT-0: publication capture for this implementation session
-				// (review sessions never install this observer). Best-effort; a
-				// storage failure pauses automation inside the callback, never
-				// here and never against the tool.
-				const commands = extractCommandStrings(tool.toolInput);
-				if (commands.length > 0) {
-					void this.capturePrPublicationToolEvent(taskId, "finished", {
-						toolCallId: tool.toolCallId,
-						toolName: tool.toolName,
-						commands,
-						output: tool.output,
-						error: tool.error,
-					});
-				}
 			},
 		});
 		const currentSummary = entry.summary;

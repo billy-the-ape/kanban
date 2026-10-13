@@ -100,10 +100,11 @@ describe("github pr client", () => {
 		const runner = makeRunner(
 			baseRoutes({
 				reviews: [
-					{ id: 1, state: "COMMENTED", body: "review note", updated_at: "2026-10-01T00:00:00Z" },
-					{ id: 2, state: "PENDING", body: "unpublished", updated_at: "2026-10-01T00:00:00Z" },
-					{ id: 3, state: "APPROVED", body: "  ", updated_at: "2026-10-01T00:00:00Z" },
-					{ id: 4, state: "DISMISSED", body: "dismissed", updated_at: "2026-10-01T00:00:00Z" },
+					// Real review objects carry submitted_at (no updated_at).
+					{ id: 1, state: "COMMENTED", body: "review note", submitted_at: "2026-10-01T00:00:00Z" },
+					{ id: 2, state: "PENDING", body: "unpublished", submitted_at: "2026-10-01T00:00:00Z" },
+					{ id: 3, state: "APPROVED", body: "  ", submitted_at: "2026-10-01T00:00:00Z" },
+					{ id: 4, state: "DISMISSED", body: "dismissed", submitted_at: "2026-10-01T00:00:00Z" },
 				],
 				inline: [
 					{ id: 10, body: "inline note", updated_at: "2026-10-02T00:00:00Z" },
@@ -160,7 +161,8 @@ describe("github pr client", () => {
 		const runner = makeRunner([
 			{
 				prefix: reviewsBase,
-				respond: () => jsonResponse([{ id: 1, state: "COMMENTED", body: "x", updated_at: "2026-10-01T00:00:00Z" }]),
+				respond: () =>
+					jsonResponse([{ id: 1, state: "COMMENTED", body: "x", submitted_at: "2026-10-01T00:00:00Z" }]),
 			},
 			{
 				prefix: inlineBase,
@@ -192,9 +194,9 @@ describe("github pr client", () => {
 			id: index + 1,
 			state: "COMMENTED",
 			body: `note ${index}`,
-			updated_at: "2026-10-01T00:00:00Z",
+			submitted_at: "2026-10-01T00:00:00Z",
 		}));
-		const shortPage = [{ id: 101, state: "COMMENTED", body: "note 100", updated_at: "2026-10-01T00:00:00Z" }];
+		const shortPage = [{ id: 101, state: "COMMENTED", body: "note 100", submitted_at: "2026-10-01T00:00:00Z" }];
 		let page1Seen = 0;
 		let page2Seen = 0;
 		const runner: GitHubPrCommandRunner = (args) => {

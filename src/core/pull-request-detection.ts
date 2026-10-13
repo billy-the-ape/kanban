@@ -31,14 +31,50 @@ export function splitCommandFragments(command: string): string[] {
 		.filter(Boolean);
 }
 
-/** Tokenizes a fragment, skipping leading env assignments (`FOO=bar cmd`). */
+/**
+ * Tokenizes a fragment quote-aware (single and double quotes collapse their
+ * contents into one token, so quoted numbers/bodies are never mistaken for
+ * positionals), skipping leading env assignments (`FOO=bar cmd`).
+ */
 export function tokenizeCommandFragment(fragment: string): string[] {
-	const tokens = fragment.split(/\s+/).filter(Boolean);
+	const rawTokens: string[] = [];
+	let current = "";
+	let inSingle = false;
+	let inDouble = false;
+	for (const char of fragment) {
+		if (inSingle) {
+			if (char === "'") {
+				inSingle = false;
+			} else {
+				current += char;
+			}
+		} else if (inDouble) {
+			if (char === '"') {
+				inDouble = false;
+			} else {
+				current += char;
+			}
+		} else if (char === "'") {
+			inSingle = true;
+		} else if (char === '"') {
+			inDouble = true;
+		} else if (/\s/.test(char)) {
+			if (current.length > 0) {
+				rawTokens.push(current);
+				current = "";
+			}
+		} else {
+			current += char;
+		}
+	}
+	if (current.length > 0) {
+		rawTokens.push(current);
+	}
 	let index = 0;
-	while (index < tokens.length && ENV_ASSIGNMENT_PATTERN.test(tokens[index] ?? "")) {
+	while (index < rawTokens.length && ENV_ASSIGNMENT_PATTERN.test(rawTokens[index] ?? "")) {
 		index += 1;
 	}
-	return tokens.slice(index);
+	return rawTokens.slice(index);
 }
 
 function firstNonFlagToken(tokens: string[], fromIndex: number): string | null {

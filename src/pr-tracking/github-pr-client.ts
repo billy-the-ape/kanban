@@ -88,6 +88,8 @@ interface ReviewEntry {
 	id: unknown;
 	state: unknown;
 	body: unknown;
+	// GET /pulls/{n}/reviews has no updated_at; submitted_at is the timestamp.
+	submitted_at: unknown;
 	updated_at: unknown;
 }
 
@@ -254,7 +256,9 @@ function mapReviews(entries: ReviewEntry[]): PrFeedbackEvent[] {
 		if (!body || typeof entry.id !== "number") {
 			continue;
 		}
-		const updatedAt = toEpochMs(entry.updated_at);
+		// Real review objects carry submitted_at; updated_at only exists
+		// after the review itself is edited, so it is a fallback.
+		const updatedAt = toEpochMs(entry.submitted_at) || toEpochMs(entry.updated_at);
 		if (updatedAt === 0) {
 			continue;
 		}
