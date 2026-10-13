@@ -1,6 +1,6 @@
 # PR linking — settled post-v1 implementation tasks
 
-Updated: 2026-10-09. **Planning only; no follow-up implementation is delivered by this PR.**
+Updated: 2026-10-13. **This revision changes plans only; implementation progress is recorded below.**
 These five documents are implementation-ready specifications, one PR each. Preserve their IDs.
 The landed v1 plans now live in [complete/pr-linking](../complete/pr-linking/PR_LINKING_PLAN.md);
 the old PL numbering in that historical master plan does not create another card series.
@@ -13,10 +13,17 @@ the old PL numbering in that historical master plan does not create another card
 | [PRLINK-7](PRLINK-7.md) | Mobile primary anchor and shared manager | v1 + 6 |
 | [PRLINK-8](PRLINK-8.md) | Native chat bare-URL shortcut and explicit prose suggestions | v1 |
 | [PRLINK-9](PRLINK-9.md) | Pure provider boundaries and identity-based explicit refresh | v1 + 6 + existing tracking foundation |
-| [PRLINK-10](PRLINK-10.md) | PR view in changes panel with shared management | 6 + 7 + 9 |
+| [PRLINK-10](PRLINK-10.md) | Complete existing PRs view with linked-PR management and tracking settings | 6 + 7 + 9 |
 
 PRLINK-7 is implemented (mobile primary anchor and shared manager); its plan document records
 the final state.
+
+PRLINK-10 is partially implemented on main: the PRs segment and tracking-panel relocation landed
+manually on 2026-10-13. Keep that placement. The count, linked-PR list/actions, remembered diff mode
+and request/visibility guards remain implementation work; the tab shell does not complete the task.
+Both TODOs in card-detail-view and task-pr-tracking-panel belong to PRLINK-10: count every stored
+link, and interpret "MAIN" selection as **Primary for display**, separate from **Automation PR**.
+Its revised task document is the authority for this remaining work.
 
 Recommended sequence: 6 → 7 → 8 → 9 → 10. Each task includes decisions, integration points,
 error/concurrency behavior and acceptance. Do not add a preliminary planning PR or expand into
@@ -31,19 +38,26 @@ They also predated the tracking foundation now present on main. These documents 
 
 - createdAt is first recorded; lastSeenAt is throttled observation, not snapshot freshness.
 - Primary for display and Automation PR are separate. Display selection never authorizes automation.
-- Mobile uses a direct primary anchor plus a consistent manager button beside Chat/Diff.
+- Mobile uses a direct primary anchor plus a consistent manager button beside the existing
+  Chat/Diff/Files tabs; PRs remains a segment inside Diff.
 - Native chat supports the lone-URL shortcut; prose needs a click. Raw terminal input is excluded.
 - GitHub.com explicit metadata reads share the existing tracking coordinator. Other providers retain
   parsing/manual links; no new GitLab/Bitbucket networking or delivery.
 - PRs occupy a UI view, not a git-diff API mode. External anchors retain their external behavior.
+- Existing tracking settings and lifecycle information now live inside PRs; preserve one instance
+  there, with no second automation selector or polling loop. Stored links do not depend on tracking
+  consumers, tracking-query success or diff availability. PR view visibility gates its data reads.
 - Find PRs for branch and Refresh linked PRs are distinct operations.
 
 ## Integration ownership and baseline
 
 PR #63 originally targeted feat/task-pr-links at 0e4f3ec. V1 is now landed and archived.
-These revised plans are based on main 292e12cbbcfdcfca04a7c9a6a6cc79602a9bc72d and preserve current
-source. Reinspect the current implementation before each task; historical line numbers and status
-labels in older master plans are not proof of current behavior.
+The earlier revisions used main 292e12cbbcfdcfca04a7c9a6a6cc79602a9bc72d. PRLINK-10's placement and
+remaining scope were reconciled against main `ced5894b46e628de5fe39fb88a38c55d2409235c` on 2026-10-13,
+including manual tab/relocation commits `0015d40` and `65291b1`. Preserve these landed changes;
+the earlier "do not move tracking settings" instruction is superseded by PRLINK-10's revised layout.
+Reinspect the current implementation before each task; historical line numbers and status labels
+in older master plans are not proof of current behavior.
 
 Read the [tracking foundation](../github-pr-tracking/github-pr-tracking-master-plan.md),
 [merge tracking](../pr-merge-tracking/pr-merge-tracking-master-plan.md) and
