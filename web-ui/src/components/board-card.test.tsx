@@ -313,6 +313,78 @@ describe("BoardCard", () => {
 		expect(container.textContent).not.toContain("final hidden segment");
 	});
 
+	it("shows the latest user prompt in the preview and keeps the title unchanged", async () => {
+		await act(async () => {
+			root.render(
+				<BoardCard
+					card={createCard({
+						title: "Task title",
+						prompt: "Task title||Original description",
+						lastPrompt: "  Updated by the user ",
+					})}
+					index={0}
+					columnId="backlog"
+				/>,
+			);
+		});
+		expect(container.textContent).toContain("Updated by the user");
+		expect(container.textContent).not.toContain("Original description");
+		// The title keeps its existing fallback behavior.
+		expect(container.textContent).toContain("Task title");
+	});
+
+	it("does not strip the card title from a latest user prompt preview", async () => {
+		// A chat prompt that starts with the card title keeps its full text
+		// instead of rendering only the remainder after the title.
+		await act(async () => {
+			root.render(
+				<BoardCard
+					card={createCard({
+						title: "Fix the flaky test",
+						prompt: "Fix the flaky test||Original description",
+						lastPrompt: "Fix the flaky test and also update docs",
+					})}
+					index={0}
+					columnId="backlog"
+				/>,
+			);
+		});
+		expect(container.textContent).toContain("Fix the flaky test and also update docs");
+	});
+
+	it("keeps the full latest user prompt when it equals the card title", async () => {
+		await act(async () => {
+			root.render(
+				<BoardCard
+					card={createCard({
+						title: "Fix the flaky test",
+						prompt: "Fix the flaky test||Original description",
+						lastPrompt: "Fix the flaky test",
+					})}
+					index={0}
+					columnId="backlog"
+				/>,
+			);
+		});
+		// The title renders once and the (identical) description renders
+		// again, so the text must appear at least twice.
+		expect((container.textContent?.match(/Fix the flaky test/g) ?? []).length).toBeGreaterThanOrEqual(2);
+	});
+
+	it("falls back to the original prompt for legacy cards without a last prompt", async () => {
+		await act(async () => {
+			root.render(
+				<BoardCard
+					card={createCard({ title: "Task title", prompt: "Task title||Original description" })}
+					index={0}
+					columnId="backlog"
+				/>,
+			);
+		});
+		expect(container.textContent).toContain("Original description");
+		expect(container.textContent).not.toContain("Updated by the user");
+	});
+
 	it("reconstructs and shows trashed worktree path when workspace metadata is not tracked", async () => {
 		await act(async () => {
 			root.render(

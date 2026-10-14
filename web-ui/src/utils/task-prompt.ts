@@ -23,6 +23,15 @@ function stripOuterXmlTag(text: string): string {
 		.trim();
 }
 
+/**
+ * Normalizes free-form prompt text for display without treating it as a
+ * "title||details" task prompt (no title-prefix removal). Used for
+ * user-authored chat prompts shown on board cards.
+ */
+export function normalizeTaskPromptPreview(text: string): string {
+	return stripOuterXmlTag(normalizePromptForDisplay(text));
+}
+
 export function getTaskPromptDescription(prompt: string, title: string): string {
 	const normalizedPrompt = stripOuterXmlTag(normalizePromptForDisplay(prompt));
 	const normalizedTitle = normalizePromptForDisplay(title);

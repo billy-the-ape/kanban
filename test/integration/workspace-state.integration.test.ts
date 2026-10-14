@@ -22,6 +22,7 @@ import {
 	removeWorkspaceIndexEntry,
 	saveWorkspaceState,
 } from "../../src/state/workspace-state";
+import { recordTaskLastPrompt } from "../../src/workspace/task-last-prompt";
 import { createGitTestEnv } from "../utilities/git-env";
 import { createTempDir } from "../utilities/temp-dir";
 
@@ -176,6 +177,121 @@ describe.sequential("workspace-state integration", () => {
 				const loadedAfterConflict = await loadWorkspaceState(workspacePath);
 				expect(loadedAfterConflict.revision).toBe(2);
 				expect(loadedAfterConflict.board.columns[0]?.cards[0]?.prompt).toBe("Task Two");
+			} finally {
+				cleanup();
+			}
+		});
+	});
+
+	it("keeps the server-recorded last user prompt across whole-board saves", async () => {
+		await withTemporaryHome(async () => {
+			const { path: sandboxRoot, cleanup } = createTempDir("kanban-last-prompt-");
+			try {
+				const workspacePath = join(sandboxRoot, "project-last-prompt");
+				mkdirSync(workspacePath, { recursive: true });
+				initGitRepository(workspacePath);
+
+				const initial = await loadWorkspaceState(workspacePath);
+				await saveWorkspaceState(workspacePath, {
+					board: createBoard("Last prompt task"),
+					sessions: {},
+					expectedRevision: initial.revision,
+				});
+
+				const recorded = await recordTaskLastPrompt({
+					workspaceId: "workspace-1",
+					workspacePath,
+					taskId: "task-1",
+					text: "Fix the flaky test",
+					acceptedAt: 12345,
+				});
+				expect(recorded).toBe("recorded");
+
+				let loaded = await loadWorkspaceState(workspacePath);
+				expect(findCard(loaded.board, "task-1")?.lastPrompt).toBe("Fix the flaky test");
+				expect(findCard(loaded.board, "task-1")?.lastPromptAt).toBe(12345);
+				// The original task prompt remains the startup source of truth.
+				expect(findCard(loaded.board, "task-1")?.prompt).toBe("Last prompt task");
+
+				// (a) A client board that omits the field must not erase the
+				// recorded prompt.
+				const stripLastPrompt = (board: RuntimeBoardData): RuntimeBoardData => ({
+					...board,
+					columns: board.columns.map((column) => ({
+						...column,
+						cards: column.cards.map((card) => {
+							const nextCard = { ...card };
+							delete nextCard.lastPrompt;
+							delete nextCard.lastPromptAt;
+							return nextCard;
+						}),
+					})),
+				});
+				const omitSave = await saveWorkspaceState(workspacePath, {
+					board: stripLastPrompt(loaded.board),
+					sessions: {},
+					expectedRevision: loaded.revision,
+				});
+				expect(findCard(omitSave.board, "task-1")?.lastPrompt).toBe("Fix the flaky test");
+				expect(findCard(omitSave.board, "task-1")?.lastPromptAt).toBe(12345);
+
+				// (b) A stale or forged client value must not overwrite the
+				// recorded prompt.
+				const forgedSave = await saveWorkspaceState(workspacePath, {
+					board: {
+						...omitSave.board,
+						columns: omitSave.board.columns.map((column) => ({
+							...column,
+							cards: column.cards.map((card) =>
+								card.id === "task-1" ? { ...card, lastPrompt: "Forged prompt", lastPromptAt: 99999 } : card,
+							),
+						})),
+					},
+					sessions: {},
+					expectedRevision: omitSave.revision,
+				});
+				expect(findCard(forgedSave.board, "task-1")?.lastPrompt).toBe("Fix the flaky test");
+				expect(findCard(forgedSave.board, "task-1")?.lastPromptAt).toBe(12345);
+
+				// (c) A brand-new card must not accept a client-supplied
+				// lastPrompt.
+				const newCardBoard: RuntimeBoardData = {
+					...forgedSave.board,
+					columns: forgedSave.board.columns.map((column) =>
+						column.id === "in_progress"
+							? {
+									...column,
+									cards: [
+										{
+											id: "task-2",
+											title: "New task",
+											prompt: "New task",
+											startInPlanMode: false,
+											baseRef: "main",
+											createdAt: Date.now(),
+											updatedAt: Date.now(),
+											lastPrompt: "Forged for a new card",
+											lastPromptAt: 99999,
+										},
+										...column.cards,
+									],
+								}
+							: column,
+					),
+				};
+				const newCardSave = await saveWorkspaceState(workspacePath, {
+					board: newCardBoard,
+					sessions: {},
+					expectedRevision: forgedSave.revision,
+				});
+				const savedCards = newCardSave.board.columns.flatMap((column) => column.cards);
+				expect(savedCards.find((card) => card.id === "task-1")?.lastPrompt).toBe("Fix the flaky test");
+				// Legacy cards without the field (and new cards) stay clean.
+				expect(savedCards.find((card) => card.id === "task-2")?.lastPrompt).toBeUndefined();
+				expect(savedCards.find((card) => card.id === "task-2")?.lastPromptAt).toBeUndefined();
+
+				loaded = await loadWorkspaceState(workspacePath);
+				expect(findCard(loaded.board, "task-1")?.lastPrompt).toBe("Fix the flaky test");
 			} finally {
 				cleanup();
 			}

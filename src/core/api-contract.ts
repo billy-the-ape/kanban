@@ -508,6 +508,23 @@ export const runtimeBoardCardSchema = z
 		 * task reaches Done or Trash.
 		 */
 		manualReopenAt: z.number().optional(),
+		/**
+		 * LASTPROMPT: the latest user-authored task-chat prompt (server-owned).
+		 * Display-only: the card's description preview falls back to `prompt`
+		 * when this is absent, and `prompt` always remains the original task
+		 * description used for startup/review/dispatch/recovery. Optional so
+		 * legacy cards keep working without backfill. Written only through the
+		 * native chat-send path under the workspace lock, and restored over any
+		 * client-supplied value by `saveWorkspaceState` (stale/omitted/forged
+		 * values never win; new cards never accept it).
+		 */
+		lastPrompt: z.string().optional(),
+		/**
+		 * LASTPROMPT: server-owned acceptance timestamp of `lastPrompt`. Used
+		 * to order concurrent accepted sends (an older accepted prompt never
+		 * overwrites a newer one, regardless of async completion order).
+		 */
+		lastPromptAt: z.number().int().nonnegative().optional(),
 		createdAt: z.number(),
 		updatedAt: z.number(),
 	})
@@ -2302,6 +2319,13 @@ export const runtimeTaskChatSendRequestSchema = z.object({
 	text: z.string(),
 	images: z.array(runtimeTaskImageSchema).optional(),
 	mode: runtimeTaskSessionModeSchema.optional(),
+	/**
+	 * LASTPROMPT: explicit authorship of the send. Absent reads as
+	 * user-authored; automated callers (generated commit/PR instructions)
+	 * must mark themselves so the card's last-user-prompt preview is
+	 * preserved.
+	 */
+	source: z.enum(["user", "automated"]).optional(),
 });
 export type RuntimeTaskChatSendRequest = z.infer<typeof runtimeTaskChatSendRequestSchema>;
 

@@ -104,6 +104,7 @@ import { createVerificationRunner } from "../verification/verification-service";
 import { evaluateDependentsUnlock, getGitDeliveryService, readTaskDeliveryReceipt } from "../workspace/git-delivery";
 import { resolveTaskChatPrLinking } from "../workspace/task-chat-pr-linking";
 import { getTaskInitialStartStatus as readTaskInitialStartStatus } from "../workspace/task-initial-start";
+import { clearTaskLastPrompt, recordTaskLastPrompt } from "../workspace/task-last-prompt";
 import { readTaskPreservationRecord } from "../workspace/task-preservation";
 import { resetUnstartedQueuedWorktree } from "../workspace/task-queued-reset";
 import { findTaskBaseRef, readReviewOutcome } from "../workspace/task-review-handoff";
@@ -168,6 +169,19 @@ export function createTaskChatMessageSender(deps: {
 	getScopedClineTaskSessionService: (scope: RuntimeTrpcWorkspaceScope) => Promise<ClineTaskSessionService>;
 	broadcastTaskChatCleared?: (workspaceId: string, taskId: string) => void;
 	resolveClineLaunchConfig: () => Promise<ResolvedClineLaunchConfig>;
+	/**
+	 * LASTPROMPT: optional post-send recording of the latest user-authored
+	 * prompt on the task card. It runs after the send (including the
+	 * rebind/retry path) succeeded; rejected sends and clear commands
+	 * return before it. The automation service sender deliberately does
+	 * not wire it, so auto-generated instructions never update the card
+	 * preview. Must never throw.
+	 */
+	recordLastUserPrompt?: (
+		scope: RuntimeTrpcWorkspaceScope,
+		body: RuntimeTaskChatSendRequest,
+		acceptedAt: number,
+	) => Promise<void>;
 	/**
 	 * PRLINK-8: optional post-send classification for native chat sends only.
 	 * It runs after the send (including the rebind/retry path) succeeded;
@@ -238,6 +252,15 @@ export function createTaskChatMessageSender(deps: {
 					});
 				}
 			}
+			// LASTPROMPT: record the latest user-authored prompt as soon as
+			// the send was accepted (queued or successful rebind), before
+			// any model completion. Rejected sends and /clear return above;
+			// home-agent sessions, automated callers, and blank/image-only
+			// sends never participate. The recorder never throws, so a
+			// persistence failure cannot turn an accepted send into a failure.
+			if (!isHomeAgentSessionId(body.taskId) && body.source !== "automated" && body.text.trim().length > 0) {
+				await deps.recordLastUserPrompt?.(workspaceScope, body, Date.now());
+			}
 			const latestMessage = clineTaskSessionService.listMessages(body.taskId).at(-1) ?? null;
 			const pullRequestLinking = await deps.resolvePostSendPrLinking?.(workspaceScope, body);
 			return {
@@ -296,6 +319,19 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		getScopedClineTaskSessionService: deps.getScopedClineTaskSessionService,
 		broadcastTaskChatCleared: deps.broadcastTaskChatCleared,
 		resolveClineLaunchConfig: () => clineProviderService.resolveLaunchConfig(),
+		// LASTPROMPT: only the browser sender records the latest user prompt;
+		// the COMMENT-0 automation service sender leaves it unwired so
+		// auto-generated instructions never update the card preview.
+		recordLastUserPrompt: async (workspaceScope, body, acceptedAt) => {
+			await recordTaskLastPrompt({
+				workspaceId: workspaceScope.workspaceId,
+				workspacePath: workspaceScope.workspacePath,
+				taskId: body.taskId,
+				text: body.text,
+				acceptedAt,
+				broadcast: deps.broadcastRuntimeWorkspaceStateUpdated,
+			});
+		},
 		resolvePostSendPrLinking: async (workspaceScope, body) => {
 			// PRLINK-8: home-agent sessions never participate.
 			// resolveTaskChatPrLinking never throws.
@@ -1474,9 +1510,13 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					if (getTaskColumnId(state.board, body.taskId) !== "in_progress")
 						throw new Error("Task column changed during reset.");
 					const moved = moveTaskToColumn(state.board, body.taskId, "backlog");
+					// LASTPROMPT: an explicit reset to Backlog clears the
+					// conversation, so the card preview returns to the original
+					// task prompt.
+					const board = clearTaskLastPrompt(moved.board, body.taskId);
 					const sessions = { ...state.sessions };
 					delete sessions[body.taskId];
-					return { board: moved.board, sessions, value: undefined };
+					return { board, sessions, value: undefined };
 				});
 				deps.broadcastTaskChatCleared?.(workspaceScope.workspaceId, body.taskId);
 				void deps.broadcastRuntimeWorkspaceStateUpdated?.(workspaceScope.workspaceId, workspaceScope.workspacePath);
