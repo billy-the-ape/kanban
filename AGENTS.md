@@ -17,6 +17,7 @@ TypeScript principles
 - Prefer SDK-provided types, schemas, helpers, and model metadata over local redefinitions. For things like Cline SDK reasoning settings, use the SDK's source of truth whenever possible instead of recreating unions, support checks, or shapes in Kanban.
 - NEVER use inline imports. No await import("./foo.js"), no import("pkg").Type in type positions, and no dynamic imports for types. Always use standard top-level imports.
 - NEVER remove or downgrade code to fix type errors from outdated dependencies. Upgrade the dependency instead.
+- In async code, a `const x = await ...; if (x === null) { fail(); }` narrowing does NOT survive a later `await` (TS resets it), so passing `x` (narrowed to non-null) to a function after another await is a type error. Use `const x = (await ...) ?? fail();` (where `fail(): never`) to keep the value non-null across awaits.
 
 Code quality
 - Use `npm run format` first whenever lint or formatting is a concern, and only fix whatever remains after.
