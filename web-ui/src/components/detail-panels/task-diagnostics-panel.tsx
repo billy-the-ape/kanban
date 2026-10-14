@@ -278,6 +278,10 @@ function ActionsSection({
 					{exporting ? "Exporting…" : "Export diagnostics"}
 				</Button>
 			</div>
+			<p className="m-0 mt-1.5 text-[11px] leading-snug text-text-tertiary">
+				The download includes the full conversation, system prompt, and tool inputs, outputs, and errors. Review
+				before sharing.
+			</p>
 		</DiagnosticsSection>
 	);
 }

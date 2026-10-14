@@ -5,7 +5,11 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { RuntimeConfigState } from "../../../src/config/runtime-config";
-import type { RuntimeTaskSessionSummary, RuntimeWorkspaceStateResponse } from "../../../src/core/api-contract";
+import type {
+	RuntimeBoardData,
+	RuntimeTaskSessionSummary,
+	RuntimeWorkspaceStateResponse,
+} from "../../../src/core/api-contract";
 
 const agentRegistryMocks = vi.hoisted(() => ({
 	resolveAgentCommand: vi.fn(),
@@ -16,6 +20,16 @@ const taskWorktreeMocks = vi.hoisted(() => ({
 	prepareInitialTaskWorktree: vi.fn(),
 	resolveTaskCwd: vi.fn(),
 	taskWorktreeExists: vi.fn(async () => false),
+	getTaskPreservationInfo: vi.fn(async () => ({
+		ok: true,
+		worktreeExists: false,
+		worktreePath: "/tmp/worktree",
+		headCommit: null,
+		dirty: false,
+		changedFiles: [],
+		commitsAheadOfBase: 0,
+		preservation: null,
+	})),
 }));
 
 const turnCheckpointMocks = vi.hoisted(() => ({
@@ -79,6 +93,7 @@ vi.mock("../../../src/workspace/task-worktree.js", () => ({
 	prepareInitialTaskWorktree: taskWorktreeMocks.prepareInitialTaskWorktree,
 	resolveTaskCwd: taskWorktreeMocks.resolveTaskCwd,
 	taskWorktreeExists: taskWorktreeMocks.taskWorktreeExists,
+	getTaskPreservationInfo: taskWorktreeMocks.getTaskPreservationInfo,
 }));
 
 vi.mock("../../../src/workspace/turn-checkpoints.js", () => ({
@@ -163,11 +178,21 @@ import * as queuedReset from "../../../src/workspace/task-queued-reset";
 import { createGitTestEnv } from "../../utilities/git-env";
 
 function createTestRuntimeApi(
-	deps: Omit<CreateRuntimeApiDependencies, "getUpdateStatus" | "runUpdateNow"> &
-		Partial<Pick<CreateRuntimeApiDependencies, "getUpdateStatus" | "runUpdateNow">>,
+	deps: Omit<CreateRuntimeApiDependencies, "getUpdateStatus" | "runUpdateNow" | "getTaskExportSnapshot"> &
+		Partial<Pick<CreateRuntimeApiDependencies, "getUpdateStatus" | "runUpdateNow" | "getTaskExportSnapshot">>,
 ): RuntimeTrpcContext["runtimeApi"] {
 	return createRuntimeApi({
 		...deps,
+		// DIAG-2: default read-only snapshot source; export-specific tests
+		// override it with a scripted fake.
+		getTaskExportSnapshot:
+			deps.getTaskExportSnapshot ??
+			vi.fn(async () => ({
+				taskSnapshot: null,
+				taskSnapshotError: null,
+				reviewSnapshot: null,
+				reviewSnapshotError: null,
+			})),
 		getUpdateStatus:
 			deps.getUpdateStatus ??
 			vi.fn(() => ({
@@ -3557,6 +3582,195 @@ describe("return queued task to Backlog", () => {
 			expect(saveDispatch).not.toHaveBeenCalled();
 			expect(state.sessions["task-1"]).toBeDefined();
 		}
+	});
+});
+
+// DIAG-3: full-fidelity diagnostics export plan assembly for the GET download
+// route. The method is read-only — it returns the schemaVersion 3 plan and
+// writes nothing; the route streams it to the response (covered in
+// test/runtime/server/task-diagnostics-download.test.ts).
+describe("createRuntimeApi buildTaskDiagnosticsExportPlan (DIAG-3)", () => {
+	let previousHome: string | undefined;
+	let previousUserProfile: string | undefined;
+	let tempHome: string;
+	beforeEach(() => {
+		// gatherTaskDiagnosticsCore reads dispatch records, delivery receipts,
+		// and preservation state under os.homedir(); isolate from the
+		// developer's real ~/.cline so leftover records cannot change these
+		// assertions (AGENTS.md).
+		previousHome = process.env.HOME;
+		previousUserProfile = process.env.USERPROFILE;
+		tempHome = mkdtempSync(join(tmpdir(), "kanban-diag3-plan-home-"));
+		process.env.HOME = tempHome;
+		process.env.USERPROFILE = tempHome;
+	});
+	afterEach(() => {
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+		else process.env.USERPROFILE = previousUserProfile;
+		rmSync(tempHome, { recursive: true, force: true });
+		vi.restoreAllMocks();
+	});
+
+	function createExportBoard(): RuntimeBoardData {
+		return {
+			dependencies: [],
+			columns: [
+				{ id: "backlog", title: "Backlog", cards: [] },
+				{
+					id: "review",
+					title: "Review",
+					cards: [
+						{
+							id: "task-1",
+							title: "Add billing export for ACME",
+							prompt: "Add billing export for ACME",
+							startInPlanMode: false,
+							baseRef: "main",
+							createdAt: 1,
+							updatedAt: 1,
+						},
+					],
+				},
+			],
+		};
+	}
+
+	function createTaskExportSnapshot(kind: "task" | "review", sessionId: string) {
+		return {
+			kind,
+			taskId: kind === "review" ? "task-1::review" : "task-1",
+			capturedAt: 1760246400000,
+			enumerationErrors: [],
+			listingTruncated: false,
+			segments: [
+				{
+					header: {
+						sessionId,
+						kind,
+						source: "core",
+						status: "completed",
+						startedAt: "2026-10-12T09:00:00.000Z",
+						endedAt: "2026-10-12T09:30:00.000Z",
+						updatedAt: "2026-10-12T09:30:00.000Z",
+						provider: "anthropic",
+						model: "claude-sonnet-4.6",
+						cwd: "/tmp/worktree",
+						workspaceRoot: "/tmp/worktree",
+						exitCode: 0,
+					},
+					artifactTaskId: kind === "review" ? "task-1::review" : "task-1",
+					launchConfig: { mode: "act", systemPrompt: "", reasoningEffort: null },
+					transcript: { status: "complete", reason: null },
+					messages: [
+						{
+							role: kind === "review" ? "user" : "assistant",
+							content: kind === "review" ? "Review ACME billing export" : "ACME billing export implemented",
+							sessionId,
+						},
+					],
+					liveTail: null,
+					readError: null,
+					toolOrigins: [],
+				},
+			],
+		};
+	}
+
+	function createExportApi(getTaskExportSnapshot: (scope: unknown, taskId: string) => Promise<unknown>) {
+		return createTestRuntimeApi({
+			getActiveWorkspaceId: () => "workspace-1",
+			loadScopedRuntimeConfig: async () => createRuntimeConfigState(),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: async () => ({ getSummary: () => null }) as never,
+			getScopedClineTaskSessionService: async () => createClineTaskSessionServiceMock() as never,
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+			getTaskExportSnapshot: getTaskExportSnapshot as never,
+		});
+	}
+
+	type PlanBundle = {
+		schemaVersion: number;
+		completeness: { status: string; reasons: string[]; warnings: string[] };
+		diagnostics: { ok: boolean; task: { id: string; title: string } | null };
+		taskPrompt: string | null;
+		sessions: Array<{
+			kind: string;
+			taskId: string;
+			segments: Array<{ messages: Array<{ content: unknown }> }>;
+		}>;
+	};
+
+	it("returns a schemaVersion 3 plan with both session groups and unredacted content", async () => {
+		vi.spyOn(workspaceState, "loadWorkspaceBoardById").mockResolvedValue(createExportBoard());
+		const api = createExportApi(async () => ({
+			taskSnapshot: createTaskExportSnapshot("task", "task-1-1000-abc12345"),
+			reviewSnapshot: createTaskExportSnapshot("review", "task-1-1001-def67890"),
+		}));
+		const plan: PlanBundle = await api.buildTaskDiagnosticsExportPlan(
+			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+			"task-1",
+		);
+		expect(plan.schemaVersion).toBe(3);
+		expect(plan.diagnostics.ok).toBe(true);
+		expect(plan.diagnostics.task?.title).toBe("Add billing export for ACME");
+		expect(plan.taskPrompt).toBe("Add billing export for ACME");
+		expect(plan.sessions.map((session) => session.kind)).toEqual(["task", "review"]);
+		expect(plan.sessions[0]?.taskId).toBe("task-1");
+		expect(plan.sessions[1]?.taskId).toBe("task-1::review");
+		expect(plan.sessions[0]?.segments[0]?.messages[0]?.content).toBe("ACME billing export implemented");
+		expect(plan.sessions[1]?.segments[0]?.messages[0]?.content).toBe("Review ACME billing export");
+		expect(plan.completeness.status).toBe("complete");
+	});
+
+	it("still returns operational diagnostics when no session is recorded", async () => {
+		vi.spyOn(workspaceState, "loadWorkspaceBoardById").mockResolvedValue(createExportBoard());
+		const api = createExportApi(async () => ({ taskSnapshot: null, reviewSnapshot: null }));
+		const plan: PlanBundle = await api.buildTaskDiagnosticsExportPlan(
+			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+			"task-1",
+		);
+		expect(plan.schemaVersion).toBe(3);
+		expect(plan.diagnostics.ok).toBe(true);
+		expect(plan.diagnostics.task?.id).toBe("task-1");
+		expect(plan.sessions).toEqual([]);
+		expect(plan.completeness.status).toBe("unavailable");
+		expect(plan.completeness.reasons).toContain("no Cline session transcript is recorded for this task");
+	});
+
+	it("carries a review snapshot read failure as an explicit completeness gap", async () => {
+		vi.spyOn(workspaceState, "loadWorkspaceBoardById").mockResolvedValue(createExportBoard());
+		const api = createExportApi(async () => ({
+			taskSnapshot: createTaskExportSnapshot("task", "task-1-1000-abc12345"),
+			taskSnapshotError: null,
+			reviewSnapshot: null,
+			reviewSnapshotError: "session host unavailable",
+		}));
+		const plan: PlanBundle = await api.buildTaskDiagnosticsExportPlan(
+			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+			"task-1",
+		);
+		expect(plan.diagnostics.ok).toBe(true);
+		expect(plan.sessions.map((session) => session.kind)).toEqual(["task"]);
+		expect(plan.completeness.status).toBe("partial");
+		expect(plan.completeness.reasons).toContain("session class review snapshot failed: session host unavailable");
+	});
+
+	it("degrades to an unavailable transcript when snapshot building fails", async () => {
+		vi.spyOn(workspaceState, "loadWorkspaceBoardById").mockResolvedValue(createExportBoard());
+		const api = createExportApi(async () => {
+			throw new Error("session host unavailable");
+		});
+		const plan: PlanBundle = await api.buildTaskDiagnosticsExportPlan(
+			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+			"task-1",
+		);
+		expect(plan.diagnostics.ok).toBe(true);
+		expect(plan.sessions).toEqual([]);
+		expect(plan.completeness.status).toBe("unavailable");
+		expect(plan.completeness.reasons).toContain("session class task snapshot failed: session host unavailable");
 	});
 });
 

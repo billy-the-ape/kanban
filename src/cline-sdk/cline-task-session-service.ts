@@ -14,6 +14,7 @@ import { isHomeAgentSessionId } from "../core/home-agent-session";
 import { detectCreatedPullRequests } from "../core/pull-request-detection";
 import { resolveHomeAgentAppendSystemPrompt } from "../prompts/append-system-prompt";
 import { recordTaskPullRequests } from "../workspace/task-pull-requests";
+import { getTaskWorktreePath } from "../workspace/task-worktree";
 import { captureTaskTurnCheckpoint, deleteTaskTurnCheckpointRef } from "../workspace/turn-checkpoints";
 import {
 	type CompactClineConversationMessagesResult,
@@ -60,6 +61,11 @@ import {
 	setOrCreateAssistantMessage,
 	updateSummary,
 } from "./cline-session-state";
+import {
+	buildSessionExportLiveTail,
+	type ClineTaskExportSnapshot,
+	type ClineTaskExportSnapshotOptions,
+} from "./cline-task-export-snapshot";
 import {
 	type ClineRuntimeSetupLease,
 	type ClineWatcherRegistry,
@@ -149,6 +155,18 @@ export interface ClineTaskSessionService {
 		messages: ClineTaskMessage[];
 		lastCompaction: RuntimeClineContextCompactionEvent | null;
 	} | null>;
+	/**
+	 * DIAG-2 (2a): read-only export snapshot of every session this task owns
+	 * (working session + its restart lineage), oldest first, with the live
+	 * in-memory tail attached to the currently bound session (Decision 4).
+	 * Never pauses, clears, or mutates task state. Returns null when the task
+	 * has no session at all. `options.ownerPaths` overrides the default
+	 * ownership filter (workspace repo path + task worktree path).
+	 */
+	getTaskExportSnapshot(
+		taskId: string,
+		options?: ClineTaskExportSnapshotOptions,
+	): Promise<ClineTaskExportSnapshot | null>;
 	applyTurnCheckpoint(taskId: string, checkpoint: RuntimeTaskTurnCheckpoint): RuntimeTaskSessionSummary | null;
 	dispose(): Promise<void>;
 }
@@ -1377,6 +1395,59 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		const messages = await this.messageRepository.hydrateTaskMessages(taskId, async () => persisted).catch(() => []);
 		const lastCompaction = this.latestCompactionByTaskId.get(taskId) ?? (await readTaskCompactionEvent(taskId));
 		return { messages, lastCompaction };
+	}
+
+	/**
+	 * DIAG-2 (2a): read-only export snapshot of every session this task owns.
+	 * The default ownership filter is the workspace repo path plus the task's
+	 * worktree path (home agent sessions run directly in the repo checkout).
+	 * For the currently bound session, the live in-memory tail beyond the
+	 * durable transcript is attached (Decision 4). Building the snapshot never
+	 * pauses, clears, or mutates task state.
+	 */
+	async getTaskExportSnapshot(
+		taskId: string,
+		options?: ClineTaskExportSnapshotOptions,
+	): Promise<ClineTaskExportSnapshot | null> {
+		const snapshot = await this.sessionRuntime.getTaskExportSnapshot(taskId, {
+			ownerPaths: options?.ownerPaths ?? (await this.resolveDefaultExportOwnerPaths(taskId)),
+			sessionIdPrefix: options?.sessionIdPrefix,
+		});
+		if (!snapshot) {
+			return null;
+		}
+		const entry = this.messageRepository.getTaskEntry(taskId);
+		const boundSessionId = this.sessionRuntime.getTaskSessionId(taskId);
+		if (entry && boundSessionId) {
+			const segment = snapshot.segments.find((candidate) => candidate.header.sessionId === boundSessionId);
+			if (segment) {
+				// Decision 5: keep the available live evidence even when the
+				// durable transcript could not be read — the segment's
+				// readError and unavailable status still report the gap.
+				const liveTail = buildSessionExportLiveTail(segment.messages, entry.messages);
+				if (liveTail) {
+					segment.liveTail = liveTail;
+				}
+			}
+		}
+		return snapshot;
+	}
+
+	/**
+	 * Default ownership filter for the export snapshot: the workspace repo
+	 * path plus the task worktree path. Home agent sessions run directly in
+	 * the repo checkout, so they are owned by the repo path alone. Returns
+	 * undefined (no filtering) when no repo root is known.
+	 */
+	private async resolveDefaultExportOwnerPaths(taskId: string): Promise<string[] | undefined> {
+		const workspacePath = this.options.workspacePath?.trim();
+		if (!workspacePath) {
+			return undefined;
+		}
+		if (isHomeAgentSessionId(taskId)) {
+			return [workspacePath];
+		}
+		return [workspacePath, getTaskWorktreePath(workspacePath, taskId)];
 	}
 
 	applyTurnCheckpoint(taskId: string, checkpoint: RuntimeTaskTurnCheckpoint): RuntimeTaskSessionSummary | null {

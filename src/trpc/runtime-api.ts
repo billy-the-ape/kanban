@@ -18,6 +18,7 @@ import type { ResolvedClineLaunchConfig } from "../cline-sdk/cline-provider-serv
 import { createClineProviderService } from "../cline-sdk/cline-provider-service";
 import type { ClineReviewSessionService } from "../cline-sdk/cline-review-session-service";
 import { isClineClearSlashCommand } from "../cline-sdk/cline-slash-commands";
+import type { ClineTaskExportSnapshot } from "../cline-sdk/cline-task-export-snapshot";
 import type { ClineTaskSessionService } from "../cline-sdk/cline-task-session-service";
 import type { RuntimeConfigState } from "../config/runtime-config";
 import { updateGlobalRuntimeConfig, updateRuntimeConfig } from "../config/runtime-config";
@@ -57,7 +58,6 @@ import {
 	parseClineProviderSettingsSaveRequest,
 	parseClineUpdateProviderRequest,
 	parseCommandRunRequest,
-	parseDiagnosticsExportRequest,
 	parseRuntimeConfigSaveRequest,
 	parseShellSessionStartRequest,
 	parseTaskChatAbortRequest,
@@ -82,13 +82,12 @@ import {
 import { isHomeAgentSessionId } from "../core/home-agent-session";
 import { getTaskColumnId, moveTaskToColumn, setTaskAutoAddressComments } from "../core/task-board-mutations";
 import { computeTaskPhase, isDeliveryResumable, type TaskPhaseInput } from "../core/task-diagnostics";
-import { buildTaskDiagnosticsExportBundle } from "../core/task-diagnostics-export";
+import { buildTaskDiagnosticsExportV3, type TaskDiagnosticsExportV3Plan } from "../core/task-diagnostics-export-v3";
 import { resolveTaskTitle } from "../core/task-title.js";
 import { reconcileOrphanedSessionSummary, resolveWorkspaceSessionSummaries } from "../core/workspace-session-summaries";
-import { lockedFileSystem } from "../fs/locked-file-system";
 import type { PrCommentAutomationService } from "../pr-tracking/comment-automation-service";
 import { openInBrowser } from "../server/browser";
-import { getRuntimeHomePath, loadWorkspaceBoardById, mutateWorkspaceState } from "../state/workspace-state";
+import { loadWorkspaceBoardById, mutateWorkspaceState } from "../state/workspace-state";
 import { readTaskDispatchRecord, writeTaskDispatchRecord } from "../task-dispatch/dispatch-records";
 import {
 	collectTaskDispatchSessions,
@@ -127,6 +126,23 @@ export interface CreateRuntimeApiDependencies {
 	getScopedClineTaskSessionService: (scope: RuntimeTrpcWorkspaceScope) => Promise<ClineTaskSessionService>;
 	/** B-6: the per-workspace bounded review session service (its own Cline session instance). */
 	getScopedReviewSessionService?: (scope: RuntimeTrpcWorkspaceScope) => Promise<ClineReviewSessionService>;
+	/**
+	 * DIAG-2: read-only, typed transcript export snapshot of every session a
+	 * task owns (working + review + verification repair). The diagnostics
+	 * export streams the full, unmodified bundle; a missing snapshot degrades
+	 * to an explicit transcript gap, never an error.
+	 */
+	getTaskExportSnapshot: (
+		workspaceScope: RuntimeTrpcWorkspaceScope,
+		taskId: string,
+	) => Promise<{
+		taskSnapshot: ClineTaskExportSnapshot | null;
+		/** Non-null when the task class snapshot read failed (Decision 5: carried as an export gap). */
+		taskSnapshotError: string | null;
+		reviewSnapshot: ClineTaskExportSnapshot | null;
+		/** Non-null when the review/repair lineage snapshot read failed (Decision 5: carried as an export gap). */
+		reviewSnapshotError: string | null;
+	}>;
 	resolveInteractiveShellCommand: () => { binary: string; args: string[] };
 	runCommand: (command: string, cwd: string) => Promise<RuntimeCommandRunResponse>;
 	broadcastClineMcpAuthStatusesUpdated?: (
@@ -1448,27 +1464,47 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			taskDiagnosticsActionInFlight.set(dedupKey, run);
 			return await run;
 		},
-		// B-10.7: write the redacted diagnostic bundle for a task to
-		// ~/.cline/kanban/diagnostics/ (never into the workspace itself).
-		exportTaskDiagnostics: async (workspaceScope, input) => {
-			try {
-				const body = parseDiagnosticsExportRequest(input);
-				const snapshot = await gatherTaskDiagnosticsSnapshot(workspaceScope, body.taskId);
-				const diagnostics = await buildTaskDiagnosticsResponse(workspaceScope, snapshot);
-				const { bundle, redactions } = buildTaskDiagnosticsExportBundle({
-					diagnostics,
-					transcriptMessageCount: snapshot.contextSnapshot?.messages.length ?? 0,
-					homeDirectory: homedir(),
-					exportedAt: new Date().toISOString(),
+		// DIAG-3: assemble the full-fidelity diagnostic export plan
+		// (schemaVersion 3) for the GET download route. Read-only: it never
+		// starts, restarts, or mutates a session and never writes host files;
+		// the route streams the plan to the response and the client owns the
+		// resulting file. A missing transcript snapshot degrades to an
+		// explicit transcript gap, never an error.
+		buildTaskDiagnosticsExportPlan: async (workspaceScope, taskId): Promise<TaskDiagnosticsExportV3Plan> => {
+			const snapshot = await gatherTaskDiagnosticsSnapshot(workspaceScope, taskId);
+			const diagnostics = await buildTaskDiagnosticsResponse(workspaceScope, snapshot);
+			const { taskSnapshot, taskSnapshotError, reviewSnapshot, reviewSnapshotError } = await deps
+				.getTaskExportSnapshot(workspaceScope, taskId)
+				.catch((error) => {
+					// Decision 5: a snapshot class that failed to read is a gap the
+					// export must carry, not a silent omission.
+					const message = error instanceof Error ? error.message : String(error);
+					return {
+						taskSnapshot: null,
+						taskSnapshotError: message,
+						reviewSnapshot: null,
+						reviewSnapshotError: message,
+					};
 				});
-				const safeTaskId = body.taskId.replace(/[^a-zA-Z0-9_-]/g, "_");
-				const bundlePath = join(getRuntimeHomePath(), "diagnostics", `task-${safeTaskId}-${Date.now()}.json`);
-				await lockedFileSystem.writeTextFileAtomic(bundlePath, JSON.stringify(bundle, null, 2));
-				return { ok: true, bundlePath, redactions, error: null };
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				return { ok: false, bundlePath: null, redactions: [], error: message };
-			}
+			return await buildTaskDiagnosticsExportV3({
+				taskId,
+				diagnostics,
+				taskPrompt: snapshot.taskPrompt,
+				sessionSnapshots: [
+					...(taskSnapshot ? [taskSnapshot] : []),
+					...(reviewSnapshot && (reviewSnapshot.segments.length > 0 || reviewSnapshot.enumerationErrors.length > 0)
+						? [reviewSnapshot]
+						: []),
+				],
+				snapshotFailures: [
+					...(taskSnapshotError ? [{ kind: "task" as const, reason: taskSnapshotError }] : []),
+					...(reviewSnapshotError ? [{ kind: "review" as const, reason: reviewSnapshotError }] : []),
+				],
+				sessionSource: snapshot.session.source,
+				sessionSummary: snapshot.session.summary,
+				capturedAt: Date.now(),
+				exportedAt: new Date().toISOString(),
+			});
 		},
 		returnQueuedTaskToBacklog: async (workspaceScope, input) => {
 			const body = parseTaskSessionStopRequest(input);

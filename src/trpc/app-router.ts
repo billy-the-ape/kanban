@@ -38,8 +38,6 @@ import type {
 	RuntimeConfigResponse,
 	RuntimeConfigSaveRequest,
 	RuntimeDebugResetAllStateResponse,
-	RuntimeDiagnosticsExportRequest,
-	RuntimeDiagnosticsExportResponse,
 	RuntimeDirectoryListRequest,
 	RuntimeDirectoryListResponse,
 	RuntimeFeaturebaseTokenResponse,
@@ -193,8 +191,6 @@ import {
 	runtimeConfigResponseSchema,
 	runtimeConfigSaveRequestSchema,
 	runtimeDebugResetAllStateResponseSchema,
-	runtimeDiagnosticsExportRequestSchema,
-	runtimeDiagnosticsExportResponseSchema,
 	runtimeDirectoryListRequestSchema,
 	runtimeDirectoryListResponseSchema,
 	runtimeFeaturebaseTokenResponseSchema,
@@ -315,6 +311,7 @@ import {
 	runtimeWorktreeEnsureRequestSchema,
 	runtimeWorktreeEnsureResponseSchema,
 } from "../core/api-contract";
+import type { TaskDiagnosticsExportV3Plan } from "../core/task-diagnostics-export-v3";
 
 export interface RuntimeTrpcWorkspaceScope {
 	workspaceId: string;
@@ -382,11 +379,15 @@ export interface RuntimeTrpcContext {
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskPhasesRequest,
 		) => Promise<RuntimeTaskPhasesResponse>;
-		/** B-10.7: write the redacted diagnostic bundle to disk. */
-		exportTaskDiagnostics: (
+		/**
+		 * DIAG-3: assemble the full-fidelity (schemaVersion 3) diagnostics
+		 * export plan for the GET download route. Read-only; the route streams
+		 * it to the response (nothing is written to the host).
+		 */
+		buildTaskDiagnosticsExportPlan: (
 			scope: RuntimeTrpcWorkspaceScope,
-			input: RuntimeDiagnosticsExportRequest,
-		) => Promise<RuntimeDiagnosticsExportResponse>;
+			taskId: string,
+		) => Promise<TaskDiagnosticsExportV3Plan>;
 		/** B-9: backend-owned sequential task dispatch — run one queue pass for this workspace. */
 		dispatchReadyTasks: (scope: RuntimeTrpcWorkspaceScope) => Promise<RuntimeTaskDispatchRunResponse>;
 		/** B-9: read-only queue status (ready/blocked tasks, active worker, dispatch records). */
@@ -802,12 +803,6 @@ export const runtimeAppRouter = t.router({
 			.output(runtimeTaskPhasesResponseSchema)
 			.query(async ({ ctx, input }) => {
 				return await ctx.runtimeApi.getTaskPhases(ctx.workspaceScope, input);
-			}),
-		exportTaskDiagnostics: workspaceProcedure
-			.input(runtimeDiagnosticsExportRequestSchema)
-			.output(runtimeDiagnosticsExportResponseSchema)
-			.mutation(async ({ ctx, input }) => {
-				return await ctx.runtimeApi.exportTaskDiagnostics(ctx.workspaceScope, input);
 			}),
 		// B-9: backend-owned sequential task dispatch ("reliable queue").
 		dispatchReadyTasks: workspaceProcedure.output(runtimeTaskDispatchRunResponseSchema).mutation(async ({ ctx }) => {

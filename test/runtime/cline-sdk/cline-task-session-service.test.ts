@@ -13,6 +13,10 @@ import type {
 	StartClineSessionRuntimeResult,
 } from "../../../src/cline-sdk/cline-session-runtime";
 import { createSessionId } from "../../../src/cline-sdk/cline-session-state";
+import {
+	buildSyntheticSessionHeader,
+	type ClineTaskExportSnapshot,
+} from "../../../src/cline-sdk/cline-task-export-snapshot";
 import type { ClineTaskSessionService } from "../../../src/cline-sdk/cline-task-session-service";
 import { createInMemoryClineTaskSessionService } from "../../../src/cline-sdk/cline-task-session-service";
 import { createClineWatcherRegistry } from "../../../src/cline-sdk/cline-watcher-registry";
@@ -112,6 +116,7 @@ interface FakeClineSessionRuntimeController {
 	readPersistedTaskSessionMock: ReadPersistedTaskSessionMock;
 	disposeMock: DisposeMock;
 	createRuntime(options: CreateInMemoryClineSessionRuntimeOptions): ClineSessionRuntime;
+	exportSnapshotReadErrorByTaskId: Map<string, string>;
 	getTaskSessionId(taskId: string): string | null;
 	bindTaskSession(taskId: string, sessionId: string): void;
 	emitAgentEvent(sessionId: string, event: unknown): void;
@@ -139,6 +144,7 @@ function createFakeClineSessionRuntime(): FakeClineSessionRuntimeController {
 		Omit<StartClineSessionRuntimeRequest, "prompt" | "images" | "initialMessages">
 	>();
 	let onTaskEvent: ((taskId: string, event: unknown) => void) | null = null;
+	const exportSnapshotReadErrorByTaskId = new Map<string, string>();
 
 	const bindTaskSession = (taskId: string, sessionId: string) => {
 		const previousSessionId = sessionIdByTaskId.get(taskId);
@@ -256,6 +262,41 @@ function createFakeClineSessionRuntime(): FakeClineSessionRuntimeController {
 			canRestartTaskSession(taskId: string): boolean {
 				return lastStartRequestByTaskId.has(taskId);
 			},
+			// DIAG-2: the fake has no durable records; mirror the real runtime's
+			// synthetic-segment behavior for the bound session only.
+			async getTaskExportSnapshot(taskId: string): Promise<ClineTaskExportSnapshot | null> {
+				const boundSessionId = sessionIdByTaskId.get(taskId);
+				if (!boundSessionId) {
+					return null;
+				}
+				const startRequest = lastStartRequestByTaskId.get(taskId);
+				const readError = exportSnapshotReadErrorByTaskId.get(taskId) ?? null;
+				return {
+					kind: "task",
+					taskId,
+					capturedAt: Date.now(),
+					listingTruncated: false,
+					enumerationErrors: [],
+					segments: [
+						{
+							header: buildSyntheticSessionHeader({
+								sessionId: boundSessionId,
+								kind: "task",
+								providerId: startRequest?.providerId ?? null,
+								modelId: startRequest?.modelId ?? null,
+								cwd: startRequest?.cwd ?? null,
+							}),
+							artifactTaskId: taskId,
+							launchConfig: null,
+							transcript: { status: readError === null ? "complete" : "unavailable", reason: readError },
+							messages: [],
+							liveTail: null,
+							readError,
+							toolOrigins: [],
+						},
+					],
+				};
+			},
 			async resolveRestartStartRequest(taskId: string) {
 				return lastStartRequestByTaskId.get(taskId) ?? null;
 			},
@@ -318,6 +359,7 @@ function createFakeClineSessionRuntime(): FakeClineSessionRuntimeController {
 		readPersistedTaskSessionMock,
 		disposeMock,
 		createRuntime,
+		exportSnapshotReadErrorByTaskId,
 		getTaskSessionId(taskId: string): string | null {
 			return sessionIdByTaskId.get(taskId) ?? null;
 		},
@@ -1417,6 +1459,38 @@ describe("InMemoryClineTaskSessionService", () => {
 		expect(toolMessages[0]?.content).toContain("Tool: Read");
 		expect(toolMessages[0]?.content).toContain("Input:");
 		expect(toolMessages[0]?.content).toContain("Output:");
+	});
+	it("attaches the live tail even when the durable transcript read failed (Decision 5)", async () => {
+		const { service, runtime } = createTrackedService();
+		await service.startTaskSession({
+			taskId: "task-1",
+			cwd: "/tmp/worktree",
+			prompt: "",
+		});
+
+		const sessionId = await waitForTaskSessionId(runtime, "task-1");
+
+		runtime.emitAgentEvent(sessionId, {
+			type: "content_start",
+			contentType: "text",
+			text: "Working on it",
+		});
+		runtime.emitAgentEvent(sessionId, {
+			type: "content_end",
+			contentType: "text",
+			text: "Working on it",
+		});
+
+		// Simulate a durable transcript read failure for the bound session.
+		runtime.exportSnapshotReadErrorByTaskId.set("task-1", "corrupted transcript");
+
+		const snapshot = await service.getTaskExportSnapshot("task-1");
+		const segment = snapshot?.segments.find((candidate) => candidate.header.sessionId === sessionId);
+		expect(segment?.readError).toBe("corrupted transcript");
+		// Decision 5: keep the available live evidence; the segment's
+		// readError and unavailable status still report the gap.
+		expect(segment?.liveTail).not.toBeNull();
+		expect(segment?.liveTail?.messages.length ?? 0).toBeGreaterThan(0);
 	});
 
 	it("transitions between running and awaiting_review for user-attention tools", async () => {

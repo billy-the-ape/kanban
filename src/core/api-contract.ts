@@ -2848,23 +2848,6 @@ export const runtimeTaskPhasesResponseSchema = z.object({
 });
 export type RuntimeTaskPhasesResponse = z.infer<typeof runtimeTaskPhasesResponseSchema>;
 
-// B-10.7: redacted diagnostic export.
-
-export const runtimeDiagnosticsExportRequestSchema = z.object({
-	taskId: z.string().min(1),
-});
-export type RuntimeDiagnosticsExportRequest = z.infer<typeof runtimeDiagnosticsExportRequestSchema>;
-
-export const runtimeDiagnosticsExportResponseSchema = z.object({
-	ok: z.boolean(),
-	/** Absolute path of the written bundle (JSON); null on failure. */
-	bundlePath: z.string().nullable(),
-	/** Categories of private material excluded from the bundle. */
-	redactions: z.array(z.string()),
-	error: z.string().nullable(),
-});
-export type RuntimeDiagnosticsExportResponse = z.infer<typeof runtimeDiagnosticsExportResponseSchema>;
-
 // ── PRTRACK-0: GitHub PR tracking foundation (provider-free contract) ─────────
 //
 // The durable record is keyed by the canonical PR identity produced by
