@@ -3443,3 +3443,26 @@ describe("createRuntimeApi loadConfig", () => {
 		expect(response.installedPrConsumers).toEqual([]);
 	});
 });
+
+describe("createRuntimeApi sendTaskChatMessage input validation", () => {
+	it("returns ok:false for invalid input instead of throwing", async () => {
+		const api = createTestRuntimeApi({
+			getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+			loadScopedRuntimeConfig: vi.fn(async () => createRuntimeConfigState()),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: vi.fn(async () => ({}) as never),
+			getScopedClineTaskSessionService: vi.fn(async () => createClineTaskSessionServiceMock() as never),
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+		});
+
+		const response = await api.sendTaskChatMessage({ workspaceId: "workspace-1", workspacePath: "/tmp/repo" }, {
+			taskId: "",
+			text: "",
+		} as never);
+
+		expect(response.ok).toBe(false);
+		expect(response.summary).toBeNull();
+		expect(typeof response.error).toBe("string");
+	});
+});

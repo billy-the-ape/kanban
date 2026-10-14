@@ -1783,7 +1783,14 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			return response;
 		},
 		sendTaskChatMessage: async (workspaceScope, input) => {
-			const body = parseTaskChatSendRequest(input);
+			// Invalid input is a send failure for the caller, never a thrown
+			// procedure error (the response shape it had before the extraction).
+			let body: ReturnType<typeof parseTaskChatSendRequest>;
+			try {
+				body = parseTaskChatSendRequest(input);
+			} catch (error) {
+				return { ok: false, summary: null, error: error instanceof Error ? error.message : String(error) };
+			}
 			return await sendTaskChatMessageCore(workspaceScope, body);
 		},
 		// --- COMMENT-0: PR comment automation --------------------------------

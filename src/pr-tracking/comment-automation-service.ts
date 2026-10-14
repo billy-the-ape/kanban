@@ -362,8 +362,10 @@ export class PrCommentAutomationService {
 	private readonly subscriptions = new Map<string, PrSubscriptionState>();
 	/**
 	 * In-memory capture-pause fallback: PR keys whose attribution update
-	 * could not be persisted (store failure). Settle waits on these until
-	 * a later write succeeds or the user resumes; never a silent resume.
+	 * could not be persisted (store failure or an unresolvable GitHub access
+	 * scope). Settle waits on these until a later publication capture for
+	 * the same PR is persisted or the user resumes with acknowledgment.
+	 * Being in memory, the pause does not survive a process restart.
 	 */
 	private readonly captureBlocked = new Set<string>();
 	/** PR keys with a send in progress (between the `attemptedAt` write and the outcome write). */
