@@ -29,7 +29,10 @@ import {
 	type RuntimeTaskDiagnosticsActionRequest,
 	type RuntimeTaskDiagnosticsRequest,
 	type RuntimeTaskPhasesRequest,
+	type RuntimeTaskPrAutomationSettingsRequest,
+	type RuntimeTaskPrCommentResumeRequest,
 	type RuntimeTaskPreservationRequest,
+	type RuntimeTaskPrTrackingStateRequest,
 	type RuntimeTaskPullRequestLinkRequest,
 	type RuntimeTaskPullRequestPrimaryRequest,
 	type RuntimeTaskPullRequestsRefreshRequest,
@@ -73,7 +76,10 @@ import {
 	runtimeTaskDiagnosticsActionRequestSchema,
 	runtimeTaskDiagnosticsRequestSchema,
 	runtimeTaskPhasesRequestSchema,
+	runtimeTaskPrAutomationSettingsRequestSchema,
+	runtimeTaskPrCommentResumeRequestSchema,
 	runtimeTaskPreservationRequestSchema,
+	runtimeTaskPrTrackingStateRequestSchema,
 	runtimeTaskPullRequestLinkRequestSchema,
 	runtimeTaskPullRequestPrimaryRequestSchema,
 	runtimeTaskPullRequestsRefreshRequestSchema,
@@ -757,6 +763,42 @@ export function parseTaskPullRequestPrimaryRequest(value: unknown): RuntimeTaskP
 
 export function parseTaskPullRequestsRefreshRequest(value: unknown): RuntimeTaskPullRequestsRefreshRequest {
 	const parsed = parseWithSchema(runtimeTaskPullRequestsRefreshRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Missing taskId");
+	}
+	return {
+		...parsed,
+		taskId,
+	};
+}
+
+export function parseTaskPrAutomationSettingsRequest(value: unknown): RuntimeTaskPrAutomationSettingsRequest {
+	const parsed = parseWithSchema(runtimeTaskPrAutomationSettingsRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Missing taskId");
+	}
+	return {
+		...parsed,
+		taskId,
+	};
+}
+
+export function parseTaskPrTrackingStateRequest(value: unknown): RuntimeTaskPrTrackingStateRequest {
+	const parsed = parseWithSchema(runtimeTaskPrTrackingStateRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Missing taskId");
+	}
+	return {
+		...parsed,
+		taskId,
+	};
+}
+
+export function parseTaskPrCommentResumeRequest(value: unknown): RuntimeTaskPrCommentResumeRequest {
+	const parsed = parseWithSchema(runtimeTaskPrCommentResumeRequestSchema, value);
 	const taskId = parsed.taskId.trim();
 	if (!taskId) {
 		throw new Error("Missing taskId");
