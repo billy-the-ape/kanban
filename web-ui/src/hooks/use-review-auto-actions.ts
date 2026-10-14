@@ -39,6 +39,15 @@ function isTaskAutoReviewEnabled(task: BoardCard): boolean {
 	return task.autoReviewEnabled === true;
 }
 
+/**
+ * The card-level `pullRequests` array is server-owned link state. Any stored
+ * entry counts as a linked PR regardless of provider, source, or PR status —
+ * no provider lookup is involved.
+ */
+function hasLinkedPullRequests(card: BoardCard): boolean {
+	return (card.pullRequests?.length ?? 0) > 0;
+}
+
 interface TaskGitActionLoadingStateLike {
 	commitSource: string | null;
 	prSource: string | null;
@@ -219,6 +228,10 @@ export function useReviewAutoActions({
 				}
 
 				const autoReviewMode = resolveTaskAutoReviewMode(reviewTask.autoReviewMode);
+				// A task that already has a stored linked PR in Kanban does not
+				// need the generated Auto-PR instruction; Auto-commit is
+				// unaffected. Stored entries only — no provider lookup.
+				const suppressAutoPr = autoReviewMode === "pr" && hasLinkedPullRequests(reviewTask);
 				const loadingState = taskGitActionLoadingByTaskId[reviewTask.id];
 				const isGitActionInFlight =
 					autoReviewMode === "commit"
@@ -274,7 +287,12 @@ export function useReviewAutoActions({
 					continue;
 				}
 
-				if ((changedFiles ?? 0) <= 0 || isGitActionInFlight || hasSentAutoReviewPrompt(promptKey)) {
+				if (
+					(changedFiles ?? 0) <= 0 ||
+					isGitActionInFlight ||
+					hasSentAutoReviewPrompt(promptKey) ||
+					suppressAutoPr
+				) {
 					clearAutoReviewTimer(reviewTask.id);
 					continue;
 				}
@@ -289,6 +307,11 @@ export function useReviewAutoActions({
 					}
 					const latestMode = resolveTaskAutoReviewMode(latestSelection.card.autoReviewMode);
 					if (latestMode !== autoReviewMode) {
+						return;
+					}
+					if (latestMode === "pr" && hasLinkedPullRequests(latestSelection.card)) {
+						// A linked PR appeared while the timer was pending — the
+						// latest card state wins; do not send the Auto-PR prompt.
 						return;
 					}
 					if (!completeOnGitActionSuccessRef.current && hasSentAutoReviewPrompt(promptKey)) {
