@@ -173,6 +173,14 @@ function isCardCreditLimitError(summary: RuntimeTaskSessionSummary | undefined):
 	return summary.latestHookActivity?.notificationType === "credit_limit";
 }
 
+function getIsErrorSummary(summary: RuntimeTaskSessionSummary) {
+	return (
+		summary.state === "failed" ||
+		summary.latestHookActivity?.activityText?.trim().startsWith("Failed ") ||
+		summary.latestHookActivity?.hookEventName?.trim().toLocaleLowerCase().includes("error")
+	);
+}
+
 function getCardSessionActivity(summary: RuntimeTaskSessionSummary | undefined): CardSessionActivity | null {
 	if (!summary) {
 		return null;
@@ -186,8 +194,12 @@ function getCardSessionActivity(summary: RuntimeTaskSessionSummary | undefined):
 	const toolInputSummary = hookActivity?.toolInputSummary?.trim() ?? null;
 	const finalMessage = hookActivity?.finalMessage?.trim();
 	const hookEventName = hookActivity?.hookEventName?.trim() ?? null;
-	if (hookEventName?.toLocaleLowerCase().includes("error")) {
-		return { dotColor: SESSION_ACTIVITY_COLOR.error, text: finalMessage || hookEventName };
+
+	if (getIsErrorSummary(summary)) {
+		return {
+			dotColor: SESSION_ACTIVITY_COLOR.error,
+			text: finalMessage || activityText || hookEventName || summary.state,
+		};
 	}
 	if (summary.state === "awaiting_review" && finalMessage) {
 		return { dotColor: SESSION_ACTIVITY_COLOR.success, text: finalMessage };
@@ -203,19 +215,17 @@ function getCardSessionActivity(summary: RuntimeTaskSessionSummary | undefined):
 		};
 	}
 	if (activityText) {
-		let dotColor: string =
-			summary.state === "failed" ? SESSION_ACTIVITY_COLOR.error : SESSION_ACTIVITY_COLOR.thinking;
+		let dotColor: string = SESSION_ACTIVITY_COLOR.thinking;
 		let text = activityText;
+
 		const toolCallLabel = resolveToolCallLabel(activityText, toolName, toolInputSummary);
 		if (toolCallLabel) {
-			if (text.startsWith("Failed ")) {
-				dotColor = SESSION_ACTIVITY_COLOR.error;
-			}
 			return {
 				dotColor,
 				text: toolCallLabel,
 			};
 		}
+
 		if (text.startsWith("Final: ")) {
 			dotColor = SESSION_ACTIVITY_COLOR.success;
 			text = text.slice(7);
@@ -225,16 +235,10 @@ function getCardSessionActivity(summary: RuntimeTaskSessionSummary | undefined):
 			dotColor = SESSION_ACTIVITY_COLOR.waiting;
 		} else if (text.startsWith("Waiting for review")) {
 			dotColor = SESSION_ACTIVITY_COLOR.success;
-		} else if (text.startsWith("Failed ")) {
-			dotColor = SESSION_ACTIVITY_COLOR.error;
 		} else if (text === "Agent active" || text === "Working on task" || text.startsWith("Resumed")) {
 			return { dotColor: SESSION_ACTIVITY_COLOR.thinking, text: "Thinking..." };
 		}
 		return { dotColor, text };
-	}
-	if (summary.state === "failed") {
-		const failedText = finalMessage ?? activityText ?? "Task failed to start";
-		return { dotColor: SESSION_ACTIVITY_COLOR.error, text: failedText };
 	}
 	if (summary.state === "awaiting_review") {
 		return { dotColor: SESSION_ACTIVITY_COLOR.success, text: "Waiting for review" };
@@ -471,7 +475,7 @@ export function BoardCard({
 				) {
 					return <Pause size={12} className="text-status-orange" />;
 				}
-				if (sessionSummary?.state === "failed") {
+				if (sessionSummary && getIsErrorSummary(sessionSummary)) {
 					return <AlertCircle size={12} className="text-status-red" />;
 				}
 				return <Spinner size={12} className="text-status-blue" />;

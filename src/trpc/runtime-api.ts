@@ -14,6 +14,7 @@ import {
 import { buildTaskContextUsage } from "../cline-sdk/cline-context-usage";
 import { createClineMcpRuntimeService } from "../cline-sdk/cline-mcp-runtime-service";
 import { createClineMcpSettingsService } from "../cline-sdk/cline-mcp-settings-service";
+import type { ResolvedClineLaunchConfig } from "../cline-sdk/cline-provider-service";
 import { createClineProviderService } from "../cline-sdk/cline-provider-service";
 import type { ClineReviewSessionService } from "../cline-sdk/cline-review-session-service";
 import { isClineClearSlashCommand } from "../cline-sdk/cline-slash-commands";
@@ -27,6 +28,8 @@ import type {
 	RuntimePrInstalledConsumer,
 	RuntimeRunUpdateResponse,
 	RuntimeTaskChatPrLinking,
+	RuntimeTaskChatSendRequest,
+	RuntimeTaskChatSendResponse,
 	RuntimeTaskDeliveryInfoResponse,
 	RuntimeTaskDeliveryStartResponse,
 	RuntimeTaskDiagnosticsActionResponse,
@@ -67,6 +70,9 @@ import {
 	parseTaskDiagnosticsActionRequest,
 	parseTaskDiagnosticsRequest,
 	parseTaskPhasesRequest,
+	parseTaskPrAutomationSettingsRequest,
+	parseTaskPrCommentResumeRequest,
+	parseTaskPrTrackingStateRequest,
 	parseTaskReviewInfoRequest,
 	parseTaskReviewStartRequest,
 	parseTaskSessionInputRequest,
@@ -74,12 +80,13 @@ import {
 	parseTaskSessionStopRequest,
 } from "../core/api-validation";
 import { isHomeAgentSessionId } from "../core/home-agent-session";
-import { getTaskColumnId, moveTaskToColumn } from "../core/task-board-mutations";
+import { getTaskColumnId, moveTaskToColumn, setTaskAutoAddressComments } from "../core/task-board-mutations";
 import { computeTaskPhase, isDeliveryResumable, type TaskPhaseInput } from "../core/task-diagnostics";
 import { buildTaskDiagnosticsExportBundle } from "../core/task-diagnostics-export";
 import { resolveTaskTitle } from "../core/task-title.js";
 import { reconcileOrphanedSessionSummary, resolveWorkspaceSessionSummaries } from "../core/workspace-session-summaries";
 import { lockedFileSystem } from "../fs/locked-file-system";
+import type { PrCommentAutomationService } from "../pr-tracking/comment-automation-service";
 import { openInBrowser } from "../server/browser";
 import { getRuntimeHomePath, loadWorkspaceBoardById, mutateWorkspaceState } from "../state/workspace-state";
 import { readTaskDispatchRecord, writeTaskDispatchRecord } from "../task-dispatch/dispatch-records";
@@ -134,6 +141,8 @@ export interface CreateRuntimeApiDependencies {
 	broadcastRuntimeWorkspaceStateUpdated?: (workspaceId: string, workspacePath: string) => void;
 	/** B-9: surface fire-and-forget dispatch pass failures (a missed pass is retried by the next trigger). */
 	warnTaskDispatchError?: (error: unknown) => void;
+	/** COMMENT-0: the runtime-wide comment-handling observer (optional in partial harnesses). */
+	getPrCommentAutomationService?: () => PrCommentAutomationService | null;
 	/**
 	 * PRTRACK-1: the installed PR tracking consumers. Surfaced in the runtime
 	 * config response as the browser's installed-consumer signal (checkbox
@@ -150,6 +159,125 @@ export interface CreateRuntimeApiDependencies {
 		scope: RuntimeTrpcWorkspaceScope,
 		taskId: string,
 	) => Promise<{ busy: boolean; reason: string | null }>;
+}
+
+/**
+ * The reusable backend task-chat sender — the same path the browser's
+ * `sendTaskChatMessage` procedure and the COMMENT-0 automation service use.
+ */
+export function createTaskChatMessageSender(deps: {
+	getScopedClineTaskSessionService: (scope: RuntimeTrpcWorkspaceScope) => Promise<ClineTaskSessionService>;
+	broadcastTaskChatCleared?: (workspaceId: string, taskId: string) => void;
+	resolveClineLaunchConfig: () => Promise<ResolvedClineLaunchConfig>;
+	/**
+	 * LASTPROMPT: optional post-send recording of the latest user-authored
+	 * prompt on the task card. It runs after the send (including the
+	 * rebind/retry path) succeeded; rejected sends and clear commands
+	 * return before it. The automation service sender deliberately does
+	 * not wire it, so auto-generated instructions never update the card
+	 * preview. Must never throw.
+	 */
+	recordLastUserPrompt?: (
+		scope: RuntimeTrpcWorkspaceScope,
+		body: RuntimeTaskChatSendRequest,
+		acceptedAt: number,
+	) => Promise<void>;
+	/**
+	 * PRLINK-8: optional post-send classification for native chat sends only.
+	 * It runs after the send (including the rebind/retry path) succeeded;
+	 * rejected sends and clear commands return before it. The automation
+	 * service sender deliberately does not wire it, so auto-generated
+	 * instructions never feed PR linking. Must never throw.
+	 */
+	resolvePostSendPrLinking?: (
+		scope: RuntimeTrpcWorkspaceScope,
+		body: RuntimeTaskChatSendRequest,
+	) => Promise<RuntimeTaskChatPrLinking | undefined>;
+}): (scope: RuntimeTrpcWorkspaceScope, body: RuntimeTaskChatSendRequest) => Promise<RuntimeTaskChatSendResponse> {
+	return async (workspaceScope, body) => {
+		try {
+			const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
+			if (isClineClearSlashCommand(body.text)) {
+				const summary = await clineTaskSessionService.clearTaskSession(body.taskId);
+				deps.broadcastTaskChatCleared?.(workspaceScope.workspaceId, body.taskId);
+				return {
+					ok: true,
+					summary,
+					message: null,
+				};
+			}
+			const requestedMode = body.mode;
+			let summary = await clineTaskSessionService.sendTaskSessionInput(
+				body.taskId,
+				body.text,
+				requestedMode,
+				body.images,
+			);
+			if (!summary) {
+				if (!isHomeAgentSessionId(body.taskId)) {
+					const reboundSummary = await clineTaskSessionService.rebindPersistedTaskSession(body.taskId);
+					if (reboundSummary) {
+						summary = await clineTaskSessionService.sendTaskSessionInput(
+							body.taskId,
+							body.text,
+							requestedMode,
+							body.images,
+						);
+					}
+					if (!summary) {
+						return {
+							ok: false,
+							summary: null,
+							error: "Task chat session is not running.",
+						};
+					}
+				} else {
+					const clineLaunchConfig = await deps.resolveClineLaunchConfig();
+					summary = await clineTaskSessionService.startTaskSession({
+						taskId: body.taskId,
+						cwd: workspaceScope.workspacePath,
+						prompt: body.text,
+						images: body.images,
+						resumeFromPersistence: true,
+						providerId: clineLaunchConfig.providerId,
+						modelId: clineLaunchConfig.modelId,
+						mode: requestedMode,
+						apiKey: clineLaunchConfig.apiKey,
+						baseUrl: clineLaunchConfig.baseUrl,
+						reasoningEffort: clineLaunchConfig.reasoningEffort,
+						contextWindowTokens: clineLaunchConfig.contextWindowTokens,
+						contextWindowSource: clineLaunchConfig.contextWindowSource,
+						compaction: buildClineCompactionConfig({ launchConfig: clineLaunchConfig }),
+						compactionSafetyMarginTokens: clineLaunchConfig.compactionSettings?.safetyMarginTokens,
+					});
+				}
+			}
+			// LASTPROMPT: record the latest user-authored prompt as soon as
+			// the send was accepted (queued or successful rebind), before
+			// any model completion. Rejected sends and /clear return above;
+			// home-agent sessions, automated callers, and blank/image-only
+			// sends never participate. The recorder never throws, so a
+			// persistence failure cannot turn an accepted send into a failure.
+			if (!isHomeAgentSessionId(body.taskId) && body.source !== "automated" && body.text.trim().length > 0) {
+				await deps.recordLastUserPrompt?.(workspaceScope, body, Date.now());
+			}
+			const latestMessage = clineTaskSessionService.listMessages(body.taskId).at(-1) ?? null;
+			const pullRequestLinking = await deps.resolvePostSendPrLinking?.(workspaceScope, body);
+			return {
+				ok: true,
+				summary,
+				message: latestMessage,
+				...(pullRequestLinking ? { pullRequestLinking } : {}),
+			};
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			return {
+				ok: false,
+				summary: null,
+				error: message,
+			};
+		}
+	};
 }
 
 async function resolveExistingTaskCwdOrEnsure(options: {
@@ -187,6 +315,39 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		join(homedir(), ".cline", "kanban"),
 		join(homedir(), ".cline", "worktrees"),
 	] as const;
+	const sendTaskChatMessageCore = createTaskChatMessageSender({
+		getScopedClineTaskSessionService: deps.getScopedClineTaskSessionService,
+		broadcastTaskChatCleared: deps.broadcastTaskChatCleared,
+		resolveClineLaunchConfig: () => clineProviderService.resolveLaunchConfig(),
+		// LASTPROMPT: only the browser sender records the latest user prompt;
+		// the COMMENT-0 automation service sender leaves it unwired so
+		// auto-generated instructions never update the card preview.
+		recordLastUserPrompt: async (workspaceScope, body, acceptedAt) => {
+			await recordTaskLastPrompt({
+				workspaceId: workspaceScope.workspaceId,
+				workspacePath: workspaceScope.workspacePath,
+				taskId: body.taskId,
+				text: body.text,
+				acceptedAt,
+				broadcast: deps.broadcastRuntimeWorkspaceStateUpdated,
+			});
+		},
+		resolvePostSendPrLinking: async (workspaceScope, body) => {
+			// PRLINK-8: home-agent sessions never participate.
+			// resolveTaskChatPrLinking never throws.
+			if (isHomeAgentSessionId(body.taskId)) {
+				return undefined;
+			}
+			return resolveTaskChatPrLinking({
+				workspaceId: workspaceScope.workspaceId,
+				workspacePath: workspaceScope.workspacePath,
+				taskId: body.taskId,
+				text: body.text,
+				hasImages: Boolean(body.images && body.images.length > 0),
+				broadcast: deps.broadcastRuntimeWorkspaceStateUpdated,
+			});
+		},
+	});
 
 	// B-2.9: the effective context window (budget override → provider-settings
 	// override → provider metadata → fallback) is diagnostic input for the
@@ -1662,111 +1823,73 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			return response;
 		},
 		sendTaskChatMessage: async (workspaceScope, input) => {
+			// Invalid input is a send failure for the caller, never a thrown
+			// procedure error (the response shape it had before the extraction).
+			let body: ReturnType<typeof parseTaskChatSendRequest>;
 			try {
-				const body = parseTaskChatSendRequest(input);
-				const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
-				if (isClineClearSlashCommand(body.text)) {
-					const summary = await clineTaskSessionService.clearTaskSession(body.taskId);
-					deps.broadcastTaskChatCleared?.(workspaceScope.workspaceId, body.taskId);
-					return {
-						ok: true,
-						summary,
-						message: null,
-					};
-				}
-				const requestedMode = body.mode;
-				let summary = await clineTaskSessionService.sendTaskSessionInput(
-					body.taskId,
-					body.text,
-					requestedMode,
-					body.images,
-				);
-				if (!summary) {
-					if (!isHomeAgentSessionId(body.taskId)) {
-						const reboundSummary = await clineTaskSessionService.rebindPersistedTaskSession(body.taskId);
-						if (reboundSummary) {
-							summary = await clineTaskSessionService.sendTaskSessionInput(
-								body.taskId,
-								body.text,
-								requestedMode,
-								body.images,
-							);
-						}
-						if (!summary) {
-							return {
-								ok: false,
-								summary: null,
-								error: "Task chat session is not running.",
-							};
-						}
-					} else {
-						const clineLaunchConfig = await clineProviderService.resolveLaunchConfig();
-						summary = await clineTaskSessionService.startTaskSession({
-							taskId: body.taskId,
-							cwd: workspaceScope.workspacePath,
-							prompt: body.text,
-							images: body.images,
-							resumeFromPersistence: true,
-							providerId: clineLaunchConfig.providerId,
-							modelId: clineLaunchConfig.modelId,
-							mode: requestedMode,
-							apiKey: clineLaunchConfig.apiKey,
-							baseUrl: clineLaunchConfig.baseUrl,
-							reasoningEffort: clineLaunchConfig.reasoningEffort,
-							contextWindowTokens: clineLaunchConfig.contextWindowTokens,
-							contextWindowSource: clineLaunchConfig.contextWindowSource,
-							compaction: buildClineCompactionConfig({ launchConfig: clineLaunchConfig }),
-							compactionSafetyMarginTokens: clineLaunchConfig.compactionSettings?.safetyMarginTokens,
-						});
-					}
-				}
-				// LASTPROMPT: record the latest user-authored prompt as soon
-				// as the send was accepted (queued or successful rebind),
-				// before any model completion. Rejected sends and /clear
-				// return above; home-agent sessions, automated callers, and
-				// blank/image-only sends never participate. The recorder
-				// never throws, so a persistence failure cannot turn an
-				// accepted send into a failure.
-				if (!isHomeAgentSessionId(body.taskId) && body.source !== "automated" && body.text.trim().length > 0) {
-					await recordTaskLastPrompt({
-						workspaceId: workspaceScope.workspaceId,
-						workspacePath: workspaceScope.workspacePath,
-						taskId: body.taskId,
-						text: body.text,
-						acceptedAt: Date.now(),
-						broadcast: deps.broadcastRuntimeWorkspaceStateUpdated,
-					});
-				}
-				const latestMessage = clineTaskSessionService.listMessages(body.taskId).at(-1) ?? null;
-				// PRLINK-8: a link is applied only now that the send (including
-				// the rebind/retry path) succeeded. Home-agent sessions never
-				// participate, and rejected sends return above without the
-				// field. resolveTaskChatPrLinking never throws.
-				let pullRequestLinking: RuntimeTaskChatPrLinking | undefined;
-				if (!isHomeAgentSessionId(body.taskId)) {
-					pullRequestLinking = await resolveTaskChatPrLinking({
-						workspaceId: workspaceScope.workspaceId,
-						workspacePath: workspaceScope.workspacePath,
-						taskId: body.taskId,
-						text: body.text,
-						hasImages: Boolean(body.images && body.images.length > 0),
-						broadcast: deps.broadcastRuntimeWorkspaceStateUpdated,
-					});
-				}
-				return {
-					ok: true,
-					summary,
-					message: latestMessage,
-					...(pullRequestLinking ? { pullRequestLinking } : {}),
-				};
+				body = parseTaskChatSendRequest(input);
 			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
+				return { ok: false, summary: null, error: error instanceof Error ? error.message : String(error) };
+			}
+			return await sendTaskChatMessageCore(workspaceScope, body);
+		},
+		// --- COMMENT-0: PR comment automation --------------------------------
+		setTaskPrAutomationSettings: async (workspaceScope, input) => {
+			const body = parseTaskPrAutomationSettingsRequest(input);
+			const board = await loadWorkspaceBoardById(workspaceScope.workspaceId).catch(() => null);
+			if (!board || !board.columns.flatMap((column) => column.cards).some((card) => card.id === body.taskId)) {
+				return { ok: false, error: `Task "${body.taskId}" not found.` };
+			}
+			await mutateWorkspaceState(workspaceScope.workspacePath, (state) => {
+				const mutation = setTaskAutoAddressComments(state.board, body.taskId, body.autoAddressComments);
+				return { board: mutation.board, value: mutation };
+			});
+			deps.broadcastRuntimeWorkspaceStateUpdated?.(workspaceScope.workspaceId, workspaceScope.workspacePath);
+			const automationService = deps.getPrCommentAutomationService?.() ?? null;
+			if (automationService) {
+				// Subscription changes are reflected immediately (no 60s wait).
+				await automationService.refreshWorkspace(workspaceScope).catch(() => null);
+			}
+			return {
+				ok: true,
+				autoAddressComments: body.autoAddressComments,
+			};
+		},
+		getTaskPrTrackingState: async (workspaceScope, input) => {
+			const body = parseTaskPrTrackingStateRequest(input);
+			const automationService = deps.getPrCommentAutomationService?.() ?? null;
+			if (!automationService) {
 				return {
 					ok: false,
-					summary: null,
-					error: message,
+					error: "Comment tracking is not available in this runtime.",
+					state: {
+						enabled: false,
+						supported: true,
+						pr: null,
+						pendingCount: 0,
+						pendingDeadline: null,
+						dispatch: null,
+						blocker: null,
+						resumable: false,
+						resumeRequiresAcknowledgment: false,
+					},
 				};
 			}
+			return await automationService.getTaskPrTrackingState(workspaceScope, body.taskId);
+		},
+		resumeTaskPrCommentHandling: async (workspaceScope, input) => {
+			const body = parseTaskPrCommentResumeRequest(input);
+			const automationService = deps.getPrCommentAutomationService?.() ?? null;
+			if (!automationService) {
+				return {
+					ok: false,
+					error: "Comment tracking is not available in this runtime.",
+					dispatched: false,
+				};
+			}
+			return await automationService.resumeCommentHandling(workspaceScope, body.taskId, {
+				acknowledgeCaptureUncertainty: body.acknowledgeCaptureUncertainty,
+			});
 		},
 		startShellSession: async (workspaceScope, input) => {
 			try {
