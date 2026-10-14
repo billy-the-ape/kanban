@@ -9,6 +9,7 @@ import {
 	classifyArtifactContentFormat,
 	resolveTaskToolFullOutput,
 } from "../../../src/core/task-diagnostics-export-artifacts";
+import type * as WorkspaceState from "../../../src/state/workspace-state";
 import {
 	appendTaskArtifactIndexEntry,
 	readTaskArtifactIndex,
@@ -22,7 +23,7 @@ const workspaceStateMocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../../../src/state/workspace-state.js", async (importOriginal) => {
-	const original = await importOriginal<typeof import("../../../src/state/workspace-state")>();
+	const original = await importOriginal<typeof WorkspaceState>();
 	return {
 		...original,
 		getTaskWorktreesHomePath: workspaceStateMocks.getTaskWorktreesHomePath,

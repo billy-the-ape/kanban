@@ -89,6 +89,7 @@ const GH_VALUE_FLAGS = new Set([
 	"-b",
 	"--body",
 	"--body-file",
+	"-F",
 	"-R",
 	"--repo",
 	"-l",
@@ -153,11 +154,11 @@ function isDigits(value: string): boolean {
 }
 
 /**
- * Scans one fragment for a `-R/--repo <owner/repo>` or a positional PR
- * number. A bare digits token is a PR number only when it directly follows
- * the action (before any flag) or is the sole positional after value flags;
- * anything else (a stray number inside a body, one of several positionals)
- * is ignored rather than mistaken for a selection.
+ * Scans one fragment for a `-R/--repo <owner/repo>` (or `-R=...`/`--repo=...`)
+ * or a positional PR number. A bare digits token is a PR number only when it
+ * directly follows the action (before any flag) or is the sole positional
+ * after value flags; anything else (a stray number inside a body, one of
+ * several positionals) is ignored rather than mistaken for a selection.
  */
 function readPrSelection(tokens: string[], from: number): { repository: string | null; number: number | null } {
 	let repository: string | null = null;
@@ -168,6 +169,10 @@ function readPrSelection(tokens: string[], from: number): { repository: string |
 		if (token === "-R" || token === "--repo") {
 			repository = tokens[i + 1] ?? repository;
 			i += 1;
+			continue;
+		}
+		if (token.startsWith("--repo=") || token.startsWith("-R=")) {
+			repository = token.slice(token.indexOf("=") + 1);
 			continue;
 		}
 		if (GH_VALUE_FLAGS.has(token)) {

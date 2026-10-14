@@ -18,9 +18,10 @@
 //     reconciliation read budget) while a writer session is active or the
 //     merge_completion reservation is held by another task;
 //   - never rearm once a completion or a block is persisted (the binding's
-//     mergeCompletion + terminalStop markers survive restarts); a crash that
-//     persisted the completion but never moved the board is recovered on the
-//     next observation (the move is idempotent);
+//     mergeCompletion + terminalStop markers survive restarts); a crash
+//     cannot strand a card because the idempotent board move lands before
+//     the completion persist, so any pre-persist crash is simply retried
+//     from scratch on the next observation;
 //   - a task that was manually reopened from Done after a merge (server-
 //     derived manualReopenAt marker) is not sent back to Done by the SAME
 //     merge commit — only a later merge (a different merge commit) completes
@@ -308,13 +309,13 @@ export async function reconcileMergeCompletion(
 		// turns a persistent gap into "needs human").
 		return { action: "pending", reason: "merge_commit_unavailable" };
 	}
-	// Idempotency + manual-reopen guard, with crash recovery. The SAME merge
-	// commit was already consumed for this binding and the card is in an
-	// active column (Done/Trash skip above). The server-derived manualReopenAt
-	// marker means a human reopened it from Done — do not send it back.
-	// Without the marker the board move never landed (crash after the
-	// completion persisted): fall through and re-run the idempotent
-	// completion so the straggler reaches Done.
+	// Idempotency + manual-reopen guard. The SAME merge commit was already
+	// consumed for this binding and the card is in an active column (Done/
+	// Trash skip above). The server-derived manualReopenAt marker means a
+	// human reopened it from Done — do not send it back. Without the marker
+	// a persisted completion and an active column should not coexist (the
+	// move precedes the persist); fall through and re-run the idempotent
+	// completion defensively.
 	const prior = binding.mergeCompletion;
 	if (
 		prior !== null &&
@@ -338,7 +339,6 @@ export async function reconcileMergeCompletion(
 	if (reservation.status !== "reserved") {
 		return { action: "pending", reason: `reservation_${reservation.status}` };
 	}
-	const releaseHeld = true;
 	try {
 		// Worktree checks (a missing worktree still verifies the base branch).
 		let inspection: PrMergeWorktreeInspection | null = null;
@@ -441,13 +441,11 @@ export async function reconcileMergeCompletion(
 		});
 		return { action: "completed" };
 	} finally {
-		if (releaseHeld) {
-			// The reservation always releases when the episode ends (success,
-			// block, or a pending retry) so the next task can claim it.
-			await releasePrOperation(deps.store, prKey, "merge_completion", task, deps.now).catch((error) => {
-				warn(`PR merge completion reservation release failed: ${String(error)}`);
-			});
-		}
+		// The reservation always releases when the episode ends (success,
+		// block, or a pending retry) so the next task can claim it.
+		await releasePrOperation(deps.store, prKey, "merge_completion", task, deps.now).catch((error) => {
+			warn(`PR merge completion reservation release failed: ${String(error)}`);
+		});
 	}
 }
 

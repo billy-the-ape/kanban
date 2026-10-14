@@ -15,8 +15,10 @@
 // one atomic `mutateWorkspaceState` after re-validation (task still exists,
 // link still recorded under the same identity, result newer than the stored
 // snapshot), so a concurrent unlink/task-deletion can never resurrect a
-// link and a stale result is ignored. Duplicate refresh clicks for the same
-// task coalesce onto one in-flight run.
+// link and a stale result is ignored. This level adds no run-level dedup:
+// a duplicate refresh click starts a second pass, but the coordinator's
+// one-shot refresh coalesces concurrent reads for the SAME (PR, scope)
+// onto one in-flight provider read.
 import type {
 	GitHubPrMetadataSnapshot,
 	RuntimeBoardData,

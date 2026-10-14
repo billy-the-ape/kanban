@@ -1,7 +1,7 @@
 # PRLINK-8 — Link from a URL sent in native task chat
 
 **Status: IMPLEMENTED (this PR). Depends on v1; independent of 6/7/9.**
-Master plan: [v1](../complete/pr-linking/PR_LINKING_PLAN.md). Shared context: [follow-ups](PRLINK-FOLLOWUPS.md).
+Master plan: [v1](../PR_LINKING_PLAN.md). Shared context: [follow-ups](PRLINK-FOLLOWUPS.md).
 Deliver as one native-Cline chat PR. Terminal input support is explicitly deferred.
 
 ## Fixed user behavior

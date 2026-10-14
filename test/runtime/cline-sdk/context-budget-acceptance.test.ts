@@ -41,6 +41,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type * as ClineCoreModule from "@clinebot/core";
 import { ClineCore } from "@clinebot/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createClineCompactionBeforeModelHook } from "../../../src/cline-sdk/cline-compaction-before-model-hook";
@@ -68,6 +69,7 @@ import type {
 	ClineSdkAgentMessage,
 	ClineSdkAgentMessagePart,
 } from "../../../src/cline-sdk/sdk-runtime-boundary";
+import type * as WorkspaceState from "../../../src/state/workspace-state";
 import { readTaskContextArtifact } from "../../../src/workspace/task-artifacts";
 import { createFakeMcpRuntimeService, createFakeRuntimeSetup } from "../../utilities/cline-session-service-harness";
 import {
@@ -105,7 +107,7 @@ const workspaceStateMocks = vi.hoisted(() => ({
 // runtime, ...) for the e2e scenarios; stub only the provider-settings and
 // model-catalog surface so the S1/S2 provider-service tests stay hermetic.
 vi.mock("@clinebot/core", async (importOriginal) => {
-	const original = await importOriginal<typeof import("@clinebot/core")>();
+	const original = await importOriginal<typeof ClineCoreModule>();
 	return {
 		...original,
 		getLocalProviderModels: providerModelMocks.getLocalProviderModels,
@@ -150,7 +152,7 @@ vi.mock("../../../src/workspace/turn-checkpoints.js", () => ({
 }));
 
 vi.mock("../../../src/state/workspace-state.js", async (importOriginal) => {
-	const original = await importOriginal<typeof import("../../../src/state/workspace-state")>();
+	const original = await importOriginal<typeof WorkspaceState>();
 	return {
 		...original,
 		getTaskWorktreesHomePath: workspaceStateMocks.getTaskWorktreesHomePath,

@@ -3,6 +3,7 @@
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as WorkspaceState from "../../src/state/workspace-state";
 import { TASK_ARTIFACT_INDEX_FILE_NAME } from "../../src/workspace/task-artifact-index";
 import {
 	buildTaskContextArtifactFileName,
@@ -17,7 +18,7 @@ const workspaceStateMocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../../src/state/workspace-state.js", async (importOriginal) => {
-	const original = await importOriginal<typeof import("../../src/state/workspace-state")>();
+	const original = await importOriginal<typeof WorkspaceState>();
 	return {
 		...original,
 		getTaskWorktreesHomePath: workspaceStateMocks.getTaskWorktreesHomePath,
