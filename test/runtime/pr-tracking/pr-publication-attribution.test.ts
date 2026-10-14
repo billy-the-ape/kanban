@@ -445,3 +445,45 @@ describe("detectPublicationOperations graphql feedback mutations", () => {
 		]);
 	});
 });
+
+describe("detectPublicationOperations multi-line commands", () => {
+	it("joins backslash-newline continuations into one gh api write", () => {
+		const command = "gh api repos/octo/repo/issues/5/comments \\\n  -f body='Fixed'";
+		expect(detectPublicationOperations([command])).toEqual([
+			{
+				operation: "gh api",
+				kind: "conversation",
+				explicitRepository: "octo/repo",
+				explicitNumber: 5,
+				fragment: command,
+			},
+		]);
+	});
+
+	it("reads the method and endpoint across continuation lines", () => {
+		const command = "gh api -X POST \\\n  repos/octo/repo/pulls/5/comments/9/replies \\\n  -f body=x";
+		expect(detectPublicationOperations([command])).toMatchObject([{ kind: "inline", explicitNumber: 5 }]);
+	});
+
+	it("recognizes a gh pr review flag on a continuation line", () => {
+		expect(detectPublicationOperations(["gh pr review 5 \\\n  --comment -b 'addressed'"])).toMatchObject([
+			{ operation: "gh pr review", explicitNumber: 5 },
+		]);
+	});
+
+	it("keeps a quoted multi-line graphql query in one fragment", () => {
+		const command = "gh api graphql -f query='\n  mutation {\n    addComment(input: {}) { clientMutationId }\n  }'";
+		expect(detectPublicationOperations([command])).toHaveLength(1);
+		expect(detectPublicationOperations(["gh api graphql -f query='\n  query {\n    viewer { login }\n  }'"])).toEqual(
+			[],
+		);
+	});
+
+	it("still splits real command separators", () => {
+		expect(
+			detectPublicationOperations(["git push && gh pr comment 5 -b 'a; b'\necho done | cat"]).map(
+				(operation) => operation.fragment,
+			),
+		).toEqual(["gh pr comment 5 -b 'a; b'"]);
+	});
+});

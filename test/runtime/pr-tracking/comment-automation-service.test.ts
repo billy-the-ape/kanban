@@ -722,6 +722,46 @@ describe("PrCommentAutomationService", () => {
 		expect(loaded.record.commentAutomation.dispatch?.error).toContain("outcome is unknown");
 	});
 
+	it("sends one instruction when two Resumes race", async () => {
+		const dispatched = makeEvent({ providerId: "conversation-1", updatedAt: NOW - 10_000 });
+		const dispatchedFp = fingerprintOf([dispatched]);
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			taskBindings: [{ workspaceId: "w1", taskId: "t1", terminal: false }],
+			commentAutomation: {
+				...record.commentAutomation,
+				repairOwner: { workspaceId: "w1", taskId: "t1", revision: 1 },
+				lastDispatchedFeedbackFingerprint: dispatchedFp,
+				dispatch: {
+					dispatchId: "d1",
+					attemptedAt: NOW - 5_000,
+					fingerprint: dispatchedFp,
+					ownerRevision: 1,
+					status: "failed",
+					turnRef: null,
+					error: "boom",
+				},
+			},
+		}));
+		const newer = makeEvent({ providerId: "conversation-9", updatedAt: NOW });
+		const harness = makeService({
+			workspaceStates: new Map([
+				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })])],
+			]),
+			snapshot: { events: [dispatched, newer] },
+		});
+		const results = await Promise.all([
+			harness.service.resumeCommentHandling(scope, "t1"),
+			harness.service.resumeCommentHandling(scope, "t1"),
+		]);
+		expect(harness.sent).toHaveLength(1);
+		expect(results.filter((result) => result.dispatched)).toHaveLength(1);
+		// A later Resume after the send landed does not send again either.
+		expect((await harness.service.resumeCommentHandling(scope, "t1")).dispatched).toBe(false);
+		expect(harness.sent).toHaveLength(1);
+	});
+
 	it("does not send twice when ticks overlap", async () => {
 		const event = makeEvent({ providerId: "conversation-1", updatedAt: NOW - 471_000 });
 		const fingerprint = fingerprintOf([event]);

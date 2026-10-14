@@ -904,6 +904,26 @@ export class PrCommentAutomationService {
 		accessScopeId: string,
 		events: PrFeedbackEvent[],
 	): Promise<DispatchOutcome> {
+		// One send per PR at a time: a concurrent settle or Resume (two tabs)
+		// must never deliver the instruction twice.
+		if (this.sendsInFlight.has(sub.key)) {
+			return { status: "held", reason: `A comment-handling send is already in progress for this pull request.` };
+		}
+		this.sendsInFlight.add(sub.key);
+		try {
+			return await this.sendDispatch(sub, owner, scope, accessScopeId, events);
+		} finally {
+			this.sendsInFlight.delete(sub.key);
+		}
+	}
+
+	private async sendDispatch(
+		sub: PrSubscriptionState,
+		owner: RuntimePrCommentOwner,
+		scope: PrCommentAutomationWorkspaceScope,
+		accessScopeId: string,
+		events: PrFeedbackEvent[],
+	): Promise<DispatchOutcome> {
 		const identity = { accessScopeId, pr: sub.pr };
 		const nowMs = this.nowMs();
 		// Final fresh attribution check before sending: a capture that lands
@@ -923,6 +943,15 @@ export class PrCommentAutomationService {
 		}
 		if (preAutomation.autoSendPaused) {
 			return { status: "held", reason: RATE_LIMIT_PAUSED_REASON };
+		}
+		const currentDispatch = preAutomation.dispatch;
+		if (
+			currentDispatch !== null &&
+			(currentDispatch.status === "running" ||
+				(currentDispatch.status === "queued" && currentDispatch.attemptedAt !== null))
+		) {
+			// Another send (e.g. a second Resume) already went out.
+			return { status: "held", reason: `The comment-handling instruction was already sent.` };
 		}
 		const windowStart = nowMs - AUTO_SEND_WINDOW_MS;
 		const attemptsInWindow = preAutomation.autoSendAttempts.filter((attempt) => attempt.attemptedAt >= windowStart);
@@ -964,62 +993,38 @@ export class PrCommentAutomationService {
 				},
 			},
 		}));
-		this.sendsInFlight.add(sub.key);
-		try {
-			// Persist the attempted-at timestamp immediately before invoking the
-			// send so a crash in flight is never ambiguous. The attempt joins the
-			// durable safety-cap history (unique per dispatchId) in the same write.
-			await upsertPrTrackingRecord(sub.key, identity, (record) => {
-				const dispatch = record.commentAutomation.dispatch;
-				if (dispatch === null || dispatch.dispatchId !== dispatchId) {
-					return record;
-				}
-				return {
-					...record,
-					revision: record.revision + 1,
-					commentAutomation: {
-						...record.commentAutomation,
-						autoSendAttempts: [
-							...pruneAutoSendAttempts(record.commentAutomation.autoSendAttempts, nowMs),
-							{ dispatchId, attemptedAt: nowMs },
-						],
-						dispatch: { ...dispatch, attemptedAt: nowMs },
-					},
-				};
-			});
-			const response = await this.deps.sendTaskChatMessage(scope, {
-				taskId: owner.taskId,
-				text: buildCommentHandlingInstruction(sub.pr.url),
-				mode: "act",
-			});
-			if (response.ok) {
-				await upsertPrTrackingRecord(sub.key, identity, (record) => {
-					const dispatch = record.commentAutomation.dispatch;
-					if (dispatch === null || dispatch.dispatchId !== dispatchId) {
-						return record;
-					}
-					return {
-						...record,
-						revision: record.revision + 1,
-						commentAutomation: {
-							...record.commentAutomation,
-							pendingFeedbackFingerprint: null,
-							pendingCount: null,
-							debounceDeadline: null,
-							firstPendingAt: null,
-							lastDispatchedFeedbackFingerprint: captured,
-							dispatch: {
-								...dispatch,
-								status: "running",
-								turnRef: response.message?.id ?? null,
-								error: null,
-							},
-						},
-					};
-				});
-				return { status: "sent" };
+		// Persist the attempted-at timestamp immediately before invoking the
+		// send so a crash in flight is never ambiguous. The attempt joins the
+		// durable safety-cap history (unique per dispatchId) in the same write.
+		const attempted = await upsertPrTrackingRecord(sub.key, identity, (record) => {
+			const dispatch = record.commentAutomation.dispatch;
+			if (dispatch === null || dispatch.dispatchId !== dispatchId) {
+				return record;
 			}
-			const error = response.error ?? `Could not send the comment-handling instruction.`;
+			return {
+				...record,
+				revision: record.revision + 1,
+				commentAutomation: {
+					...record.commentAutomation,
+					autoSendAttempts: [
+						...pruneAutoSendAttempts(record.commentAutomation.autoSendAttempts, nowMs),
+						{ dispatchId, attemptedAt: nowMs },
+					],
+					dispatch: { ...dispatch, attemptedAt: nowMs },
+				},
+			};
+		});
+		// The intent can be cancelled between the two writes (toggle off,
+		// feedback resolved, PR closed): never send without a durable attempt.
+		if (attempted.commentAutomation.dispatch?.dispatchId !== dispatchId) {
+			return { status: "nothing-pending" };
+		}
+		const response = await this.deps.sendTaskChatMessage(scope, {
+			taskId: owner.taskId,
+			text: buildCommentHandlingInstruction(sub.pr.url),
+			mode: "act",
+		});
+		if (response.ok) {
 			await upsertPrTrackingRecord(sub.key, identity, (record) => {
 				const dispatch = record.commentAutomation.dispatch;
 				if (dispatch === null || dispatch.dispatchId !== dispatchId) {
@@ -1030,14 +1035,38 @@ export class PrCommentAutomationService {
 					revision: record.revision + 1,
 					commentAutomation: {
 						...record.commentAutomation,
-						dispatch: { ...dispatch, status: "failed", error },
+						pendingFeedbackFingerprint: null,
+						pendingCount: null,
+						debounceDeadline: null,
+						firstPendingAt: null,
+						lastDispatchedFeedbackFingerprint: captured,
+						dispatch: {
+							...dispatch,
+							status: "running",
+							turnRef: response.message?.id ?? null,
+							error: null,
+						},
 					},
 				};
 			});
-			return { status: "held", reason: error };
-		} finally {
-			this.sendsInFlight.delete(sub.key);
+			return { status: "sent" };
 		}
+		const error = response.error ?? `Could not send the comment-handling instruction.`;
+		await upsertPrTrackingRecord(sub.key, identity, (record) => {
+			const dispatch = record.commentAutomation.dispatch;
+			if (dispatch === null || dispatch.dispatchId !== dispatchId) {
+				return record;
+			}
+			return {
+				...record,
+				revision: record.revision + 1,
+				commentAutomation: {
+					...record.commentAutomation,
+					dispatch: { ...dispatch, status: "failed", error },
+				},
+			};
+		});
+		return { status: "held", reason: error };
 	}
 
 	private async setDispatchCompleted(sub: PrSubscriptionState): Promise<void> {

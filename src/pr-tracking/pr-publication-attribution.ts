@@ -13,7 +13,7 @@
 // preserving unrestricted terminal access. Those cases surface as an
 // explicit capture uncertainty instead of silently registering (or missing)
 // identities.
-import { splitCommandFragments, tokenizeCommandFragment } from "../core/pull-request-detection";
+import { tokenizeCommandFragment } from "../core/pull-request-detection";
 
 export type PrPublishedIdentityKind = "conversation" | "inline" | "review";
 
@@ -228,12 +228,13 @@ export function detectPublicationOperations(commands: string[]): PrPublicationOp
 		operations.push(operation);
 	};
 	const visit = (fragment: string, depth: number): void => {
-		const fragmentTokens = tokenizeCommandFragment(fragment);
+		// Backslash-newline continuations join physical lines into one command.
+		const fragmentTokens = tokenizeCommandFragment(fragment.replace(LINE_CONTINUATION_PATTERN, " "));
 		// `bash -c '<script>'` (possibly itself wrapped): detect inside the
 		// inline script rather than silently ignoring it.
 		const script = depth < MAX_SHELL_WRAP_DEPTH ? shellInlineScript(fragmentTokens) : null;
 		if (script !== null) {
-			for (const inner of splitCommandFragments(script)) {
+			for (const inner of splitShellFragments(script)) {
 				visit(inner, depth + 1);
 			}
 			return;
@@ -244,11 +245,71 @@ export function detectPublicationOperations(commands: string[]): PrPublicationOp
 		}
 	};
 	for (const command of commands) {
-		for (const fragment of splitCommandFragments(command)) {
+		for (const fragment of splitShellFragments(command)) {
 			visit(fragment, 0);
 		}
 	}
 	return operations;
+}
+
+const LINE_CONTINUATION_PATTERN = /\\\r?\n/g;
+
+/**
+ * Splits a shell command line into fragments at `&&`, `||`, `;`, `|` and
+ * newlines, but never inside quotes or at a backslash-escaped character, so
+ * a multi-line command (`\` continuations, a quoted multi-line GraphQL
+ * query or body) stays one fragment. Fragments keep their original text so
+ * they can be matched against per-fragment command results.
+ */
+function splitShellFragments(command: string): string[] {
+	const fragments: string[] = [];
+	let start = 0;
+	let quote: "'" | '"' | null = null;
+	let index = 0;
+	while (index < command.length) {
+		const char = command[index] ?? "";
+		const next = command[index + 1] ?? "";
+		if (quote !== null) {
+			if (quote === '"' && char === "\\") {
+				index += 2;
+				continue;
+			}
+			if (char === quote) {
+				quote = null;
+			}
+			index += 1;
+			continue;
+		}
+		if (char === "\\") {
+			// Escaped character, including a `\` line continuation (CRLF too).
+			index += next === "\r" && command[index + 2] === "\n" ? 3 : 2;
+			continue;
+		}
+		if (char === "'" || char === '"') {
+			quote = char;
+			index += 1;
+			continue;
+		}
+		let operatorLength = 0;
+		if (char === "\n" || char === ";") {
+			operatorLength = 1;
+		} else if (char === "\r" && next === "\n") {
+			operatorLength = 2;
+		} else if (char === "&" && next === "&") {
+			operatorLength = 2;
+		} else if (char === "|") {
+			operatorLength = next === "|" ? 2 : 1;
+		}
+		if (operatorLength > 0) {
+			fragments.push(command.slice(start, index));
+			index += operatorLength;
+			start = index;
+			continue;
+		}
+		index += 1;
+	}
+	fragments.push(command.slice(start));
+	return fragments.map((fragment) => fragment.trim()).filter(Boolean);
 }
 
 /**
