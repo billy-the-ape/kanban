@@ -254,6 +254,36 @@ describe("applyPrPollOutcome", () => {
 		expect(next.taskBindings).toEqual([{ workspaceId: "w1", taskId: "t1", terminal: false }]);
 	});
 
+	it("fails a sent dispatch when ownership moves to another task", () => {
+		const event = makeEvent({ providerId: "conversation-1", updatedAt: NOW });
+		const fingerprint = fingerprintOf([event]);
+		const record = {
+			...baseRecord(),
+			commentAutomation: {
+				...baseRecord().commentAutomation,
+				repairOwner: { workspaceId: "w1", taskId: "t1", revision: 1 },
+				dispatch: {
+					dispatchId: "d1",
+					attemptedAt: NOW - 5_000,
+					fingerprint,
+					ownerRevision: 1,
+					status: "running" as const,
+					turnRef: "msg-1",
+					error: null,
+				},
+			},
+		};
+		// t1 is no longer enabled; t2 is now the only candidate.
+		const next = applyPrPollOutcome(record, {
+			candidates: [secondCandidate],
+			snapshot: makeSnapshot({ events: [event] }),
+			nowMs: NOW,
+		});
+		expect(next.commentAutomation.repairOwner).toMatchObject({ workspaceId: "w2", taskId: "t2" });
+		expect(next.commentAutomation.dispatch?.status).toBe("failed");
+		expect(next.commentAutomation.dispatch?.error).toContain("repair owner changed");
+	});
+
 	it("caps the deadline at 600s from the first pending observation", () => {
 		const first = makeEvent({ providerId: "conversation-1", updatedAt: NOW });
 		const record = applyPrPollOutcome(baseRecord(), {

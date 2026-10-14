@@ -760,7 +760,8 @@ function hasClearFailureEvidence(output: string | null, error: string | null): b
 	if (candidates.length === 0) {
 		return false;
 	}
-	const pattern = /^\s*gh: |^HTTP [45]\d\d|^\s*HTTP [45]\d\d|GraphQL/i;
+	// Anchored: a word like "GraphQL" in an echoed command or body is not a failure.
+	const pattern = /^\s*(?:gh: |HTTP [45]\d\d|GraphQL: )/i;
 	return candidates.some((value) => pattern.test(value));
 }
 
@@ -807,8 +808,13 @@ export function resolvePublicationOutput(input: {
 					return writeFragments.some((fragment) => query.includes(fragment));
 				})
 			: [];
+	// Structured output: only the entries' results are evidence, never their
+	// `query` (the echoed command text, bodies included). When no entry
+	// matches a write fragment (e.g. restart recovery, or an inner fragment
+	// of a wrapped command), every entry's result is evidence.
+	const evidenceEntries = matched.length > 0 ? matched : entries;
 	const candidateTexts: string[] = [];
-	for (const entry of matched) {
+	for (const entry of evidenceEntries) {
 		const result = entry.result;
 		if (typeof result === "string") {
 			candidateTexts.push(result);
@@ -816,7 +822,7 @@ export function resolvePublicationOutput(input: {
 			candidateTexts.push(JSON.stringify(result));
 		}
 	}
-	if (candidateTexts.length === 0) {
+	if (entries.length === 0) {
 		candidateTexts.push(text);
 	}
 	const collected: PrPublishedIdentity[] = [];
@@ -865,7 +871,16 @@ export function resolvePublicationOutput(input: {
 	if (deduped.length > 0) {
 		return { status: "published", identities: deduped, reason: null };
 	}
-	if (sawError || hasClearFailureEvidence(input.output, input.error)) {
+	const failureEvidence =
+		entries.length === 0
+			? hasClearFailureEvidence(input.output, input.error)
+			: matched.length > 0
+				? // Only the matched write entry's own result counts as failure
+					// evidence; an unrelated failed read says nothing about the write.
+					matched.some((entry) => entry.success === false) ||
+					hasClearFailureEvidence(candidateTexts.join("\n"), input.error)
+				: hasClearFailureEvidence(null, input.error);
+	if (sawError || failureEvidence) {
 		return { status: "failed", identities: [], reason: null };
 	}
 	return {

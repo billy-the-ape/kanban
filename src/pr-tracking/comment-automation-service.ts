@@ -257,6 +257,25 @@ export function applyPrPollOutcome(
 	}
 
 	const nextAutomation: RuntimePrCommentAutomation = { ...automation, repairOwner: owner };
+	// A sent dispatch belongs to the owner it was sent to. When ownership
+	// moves to another task, its turn can no longer be settled from the new
+	// owner's session: fail it visibly (Resume) instead of waiting forever.
+	const previousOwner = automation.repairOwner;
+	const ownerChanged =
+		previousOwner !== null &&
+		(owner === null || owner.workspaceId !== previousOwner.workspaceId || owner.taskId !== previousOwner.taskId);
+	const sentDispatch = automation.dispatch;
+	if (
+		ownerChanged &&
+		sentDispatch !== null &&
+		(sentDispatch.status === "running" || (sentDispatch.status === "queued" && sentDispatch.attemptedAt !== null))
+	) {
+		nextAutomation.dispatch = {
+			...sentDispatch,
+			status: "failed",
+			error: `The repair owner changed while comments were being addressed; resume manually.`,
+		};
+	}
 	if (terminal || owner === null) {
 		// Terminal PR observation or blocked owner: cancel the queued intent
 		// and pending scheduling. The dispatched watermark and in-flight or

@@ -487,3 +487,57 @@ describe("detectPublicationOperations multi-line commands", () => {
 		).toEqual(["gh pr comment 5 -b 'a; b'"]);
 	});
 });
+
+describe("resolvePublicationOutput never reads the echoed command text", () => {
+	const reviewOperation: PrPublicationOperation = {
+		operation: "gh pr review",
+		kind: "review",
+		explicitRepository: null,
+		explicitNumber: 42,
+		fragment: "gh pr review 42 --comment --body 'fixed the GraphQL query'",
+	};
+
+	it("does not classify a successful write as failed because its body mentions GraphQL", () => {
+		const output = JSON.stringify([{ query: reviewOperation.fragment, result: "", success: true }]);
+		const resolution = resolvePublicationOutput({
+			operations: [reviewOperation],
+			target: TARGET,
+			output,
+			error: null,
+		});
+		expect(resolution.status).toBe("uncertain");
+	});
+
+	it("still treats an anchored gh GraphQL error as a failure", () => {
+		const output = JSON.stringify([
+			{ query: reviewOperation.fragment, result: "GraphQL: Could not resolve to a PullRequest", success: false },
+		]);
+		const resolution = resolvePublicationOutput({
+			operations: [reviewOperation],
+			target: TARGET,
+			output,
+			error: null,
+		});
+		expect(resolution.status).toBe("failed");
+	});
+
+	it("never registers a URL quoted in the command when no entry matches the fragment", () => {
+		// Restart recovery (empty fragment) or a wrapped inner fragment: the
+		// echoed query cites a reviewer comment; only the result is evidence.
+		const output = JSON.stringify([
+			{
+				query: 'bash -c "gh pr comment 42 --body \\"see https://github.com/octo/repo/pull/42#issuecomment-111\\""',
+				result: "https://github.com/octo/repo/pull/42#issuecomment-222",
+				success: true,
+			},
+		]);
+		const resolution = resolvePublicationOutput({
+			operations: [{ ...reviewOperation, operation: "gh pr comment", kind: "conversation", fragment: "" }],
+			target: TARGET,
+			output,
+			error: null,
+		});
+		expect(resolution.status).toBe("published");
+		expect(resolution.identities).toEqual([{ kind: "conversation", id: 222 }]);
+	});
+});
