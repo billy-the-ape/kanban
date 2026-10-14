@@ -15,12 +15,14 @@ function createLineageSnapshot(
 	taskId: string,
 	sessionIds: string[],
 	listingTruncated = false,
+	enumerationErrors: string[] = [],
 ): ClineTaskExportSnapshot {
 	return {
 		kind: "task",
 		taskId,
 		capturedAt: 1760000000000,
 		listingTruncated,
+		enumerationErrors,
 		segments: sessionIds.map((sessionId) => ({
 			header: buildSyntheticSessionHeader({
 				sessionId,
@@ -124,5 +126,22 @@ describe("ClineReviewSessionService.getSessionExportSnapshot (DIAG-2 2a)", () =>
 		expect(snapshot.taskId).toBe("task-noreview");
 		expect(snapshot.segments).toEqual([]);
 		expect(snapshot.listingTruncated).toBe(false);
+	});
+
+	it("records per-session snapshot read failures as explicit enumeration gaps", async () => {
+		const sessionService = {
+			getTaskExportSnapshot: vi.fn(async (taskId: string) => {
+				if (taskId === "task-1::review") {
+					throw new Error("corrupted transcript store");
+				}
+				return null;
+			}),
+			listSummaries: vi.fn(() => []),
+		} as unknown as ClineTaskSessionService;
+		const service = createService(sessionService);
+		const snapshot = await service.getSessionExportSnapshot("task-1", { ownerPaths: ["/tmp/worktree"] });
+		// Decision 5: a failed read is carried into the export, never dropped.
+		expect(snapshot.segments).toEqual([]);
+		expect(snapshot.enumerationErrors).toEqual(["session task-1::review: corrupted transcript store"]);
 	});
 });

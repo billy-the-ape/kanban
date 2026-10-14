@@ -173,7 +173,13 @@ function createTestRuntimeApi(
 		// DIAG-2: default read-only snapshot source; export-specific tests
 		// override it with a scripted fake.
 		getTaskExportSnapshot:
-			deps.getTaskExportSnapshot ?? vi.fn(async () => ({ taskSnapshot: null, reviewSnapshot: null })),
+			deps.getTaskExportSnapshot ??
+			vi.fn(async () => ({
+				taskSnapshot: null,
+				taskSnapshotError: null,
+				reviewSnapshot: null,
+				reviewSnapshotError: null,
+			})),
 		getUpdateStatus:
 			deps.getUpdateStatus ??
 			vi.fn(() => ({
@@ -3493,6 +3499,7 @@ describe("createRuntimeApi buildTaskDiagnosticsExportPlan (DIAG-3)", () => {
 			kind,
 			taskId: kind === "review" ? "task-1::review" : "task-1",
 			capturedAt: 1760246400000,
+			enumerationErrors: [],
 			listingTruncated: false,
 			segments: [
 				{
@@ -3590,6 +3597,24 @@ describe("createRuntimeApi buildTaskDiagnosticsExportPlan (DIAG-3)", () => {
 		expect(plan.completeness.reasons).toContain("no Cline session transcript is recorded for this task");
 	});
 
+	it("carries a review snapshot read failure as an explicit completeness gap", async () => {
+		vi.spyOn(workspaceState, "loadWorkspaceBoardById").mockResolvedValue(createExportBoard());
+		const api = createExportApi(async () => ({
+			taskSnapshot: createTaskExportSnapshot("task", "task-1-1000-abc12345"),
+			taskSnapshotError: null,
+			reviewSnapshot: null,
+			reviewSnapshotError: "session host unavailable",
+		}));
+		const plan: PlanBundle = await api.buildTaskDiagnosticsExportPlan(
+			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+			"task-1",
+		);
+		expect(plan.diagnostics.ok).toBe(true);
+		expect(plan.sessions.map((session) => session.kind)).toEqual(["task"]);
+		expect(plan.completeness.status).toBe("partial");
+		expect(plan.completeness.reasons).toContain("session class review snapshot failed: session host unavailable");
+	});
+
 	it("degrades to an unavailable transcript when snapshot building fails", async () => {
 		vi.spyOn(workspaceState, "loadWorkspaceBoardById").mockResolvedValue(createExportBoard());
 		const api = createExportApi(async () => {
@@ -3602,6 +3627,7 @@ describe("createRuntimeApi buildTaskDiagnosticsExportPlan (DIAG-3)", () => {
 		expect(plan.diagnostics.ok).toBe(true);
 		expect(plan.sessions).toEqual([]);
 		expect(plan.completeness.status).toBe("unavailable");
+		expect(plan.completeness.reasons).toContain("session class task snapshot failed: session host unavailable");
 	});
 });
 

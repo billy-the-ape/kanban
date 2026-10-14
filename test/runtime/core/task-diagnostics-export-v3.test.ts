@@ -119,6 +119,7 @@ function createSnapshot(
 		taskId: "task-1",
 		capturedAt: 1000,
 		listingTruncated: false,
+		enumerationErrors: [],
 		segments: [
 			{
 				header: buildSyntheticSessionHeader({
@@ -269,6 +270,7 @@ describe("buildTaskDiagnosticsExportV3", () => {
 			taskId: "task-1",
 			capturedAt: 1000,
 			listingTruncated: false,
+			enumerationErrors: [],
 			segments: [
 				{
 					header: buildSyntheticSessionHeader({
@@ -347,5 +349,52 @@ describe("buildTaskDiagnosticsExportV3", () => {
 			},
 		]);
 		expect(plan.completeness.status).toBe("unavailable");
+	});
+
+	it("carries snapshot-class read failures as explicit completeness gaps (Decision 5)", async () => {
+		const plan = await buildTaskDiagnosticsExportV3(
+			baseInput({
+				sessionSnapshots: [createSnapshot({ messages: [] })],
+				snapshotFailures: [{ kind: "review", reason: "review host down" }],
+			}),
+		);
+		expect(plan.sessions.map((session) => session.kind)).toEqual(["task"]);
+		expect(plan.completeness.status).toBe("partial");
+		expect(plan.completeness.reasons).toContain("session class review snapshot failed: review host down");
+	});
+
+	it("exports a review class whose enumeration failed as an explicit gap, not a silent omission", async () => {
+		const reviewSnapshot = createSnapshot({
+			kind: "review",
+			taskId: "task-1::review",
+			enumerationErrors: ["session task-1::review: corrupted transcript store"],
+			segments: [],
+		});
+		const plan = await buildTaskDiagnosticsExportV3(
+			baseInput({ sessionSnapshots: [createSnapshot({ messages: [] }), reviewSnapshot] }),
+		);
+		const reviewSession = plan.sessions.find((session) => session.kind === "review");
+		expect(reviewSession?.segments).toEqual([]);
+		expect(reviewSession?.transcript.reason).toBe("session enumeration failed for this class");
+		expect(plan.completeness.status).toBe("partial");
+		expect(plan.completeness.reasons).toContain(
+			"session class review snapshot read failed: session task-1::review: corrupted transcript store",
+		);
+		expect(plan.completeness.reasons).toContain("session enumeration failed for at least one session of this class");
+	});
+
+	it("distinguishes an empty review lineage from a failed review enumeration", async () => {
+		const reviewSnapshot = createSnapshot({ kind: "review", taskId: "task-1::review", segments: [] });
+		const plan = await buildTaskDiagnosticsExportV3(
+			baseInput({ sessionSnapshots: [createSnapshot({ messages: [] }), reviewSnapshot] }),
+		);
+		const reviewSession = plan.sessions.find((session) => session.kind === "review");
+		expect(reviewSession?.transcript.reason).toBe("no recorded sessions of this class");
+		// An empty review lineage is normal (no review ran), not a gap: the
+		// capture stays complete, unlike a failed enumeration.
+		expect(plan.completeness.status).toBe("complete");
+		expect(plan.completeness.reasons).not.toContain(
+			"session enumeration failed for at least one session of this class",
+		);
 	});
 });

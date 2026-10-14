@@ -14,9 +14,14 @@
 // Every reference is untrusted: it is resolved + realpath'd and must stay
 // inside this task's context-artifacts directory (a sibling task's artifact,
 // an escape symlink, or a non-file is an explicit "invalid" gap). The content
-// is only classified (`json-text` vs `text`) — never parsed and re-serialized.
-import { readdir, readFile, realpath, stat } from "node:fs/promises";
+// is only classified (`json-text` vs `text`) — never parsed and re-serialized:
+// the classification comes from the sidecar index (recorded at archive time)
+// or, for legacy artifacts, from a bounded streaming check that never holds
+// the whole file or a parsed copy in memory.
+import { createReadStream } from "node:fs";
+import { readdir, realpath, stat } from "node:fs/promises";
 import { basename, resolve, sep } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { readTaskArtifactIndex } from "../workspace/task-artifact-index";
 import { getTaskContextArtifactsDir, sanitizeToolCallIdForArtifactName } from "../workspace/task-artifacts";
 
@@ -34,13 +39,15 @@ export interface TaskArtifactFullOutputEvidence {
 }
 
 /**
- * Character-based excerpt marker (`...[truncated N chars]...`) and command
- * line-based marker (`... [truncated N lines]` / `... [truncated N lines; full
- * output: <path>]`). Either one means the persisted result is a bounded
- * excerpt with a full-content artifact.
+ * Truncation marker in a persisted tool result: the character-based excerpt
+ * marker (`...[truncated N chars]...` or `... [truncated N chars]`), and the
+ * command line-based marker (`... [truncated N lines]` / `... [truncated N
+ * lines; full output: <path>]`), plus their char-based counterparts (`...
+ * [truncated N chars; full output: <path>]`). Either one means the persisted
+ * result is a bounded excerpt with a full-content artifact.
  */
 export const TASK_ARTIFACT_TRUNCATION_MARKER_PATTERN =
-	/\.{3}\s*\[truncated \d+ (?:chars\]\.{3}|lines(?:; full output: [^\]]+)?\])/;
+	/\.{3}\s*\[truncated \d+ (?:chars|lines)(?:; full output: [^\]]+)?\](?:\.{3})?/;
 
 /** Legacy reference patterns in persisted excerpt text (both excerpt families). */
 // The lowercase `full output:` reference appears inside the bracketed excerpt
@@ -87,19 +94,296 @@ async function resolveContainedArtifactPath(
 	return { path: realPath, fileName: basename(realPath) };
 }
 
-/** Classifies stored content without ever embedding a parsed copy. */
+/**
+ * Classifies stored content without ever embedding a parsed copy and without
+ * holding the whole file in memory (Decision 8: the bundle must not cause an
+ * unbounded allocation or a synchronous JSON.parse pause before the download
+ * headers are sent). The file is streamed through a constant-memory JSON
+ * syntax validator. Matches the historical full-read semantics: only a
+ * document whose first non-whitespace character is `{` or `[` and that parses
+ * as exactly one complete JSON document is `json-text`.
+ */
 export async function classifyArtifactContentFormat(artifactPath: string): Promise<"json-text" | "text"> {
-	const content = await readFile(artifactPath, "utf8");
-	const trimmed = content.trim();
-	if (trimmed.length === 0 || !(trimmed.startsWith("{") || trimmed.startsWith("["))) {
-		return "text";
-	}
+	const readStream = createReadStream(artifactPath);
 	try {
-		JSON.parse(trimmed);
-		return "json-text";
+		const decoder = new StringDecoder("utf8");
+		const chunks = readStream[Symbol.asyncIterator]();
+		let pendingText: string | null = null;
+		const readChunk = async (): Promise<string | null> => {
+			for (;;) {
+				if (pendingText !== null) {
+					const text = pendingText;
+					pendingText = null;
+					return text;
+				}
+				const next = await chunks.next();
+				if (next.done) {
+					const tail = decoder.end();
+					return tail.length > 0 ? tail : null;
+				}
+				const value = next.value;
+				pendingText = decoder.write(typeof value === "string" ? Buffer.from(value) : value);
+			}
+		};
+		return (await validateStreamedJsonArtifact(readChunk)) ? "json-text" : "text";
 	} catch {
 		return "text";
+	} finally {
+		readStream.destroy();
 	}
+}
+
+/**
+ * Streaming single-document JSON syntax validator (constant memory): pulls
+ * characters from `readChunk` (null ends the stream) and validates strict JSON
+ * syntax without building a value graph. Throws on invalid input.
+ */
+async function validateStreamedJsonArtifact(readChunk: () => Promise<string | null>): Promise<boolean> {
+	const fail = (): never => {
+		throw new SyntaxError("invalid JSON");
+	};
+
+	let buffer = "";
+	let offset = 0;
+	let streamEnded = false;
+	// Compact the buffer once it grows past 1 MiB so a multi-MB artifact never
+	// holds more than a bounded tail in memory.
+	const compact = (): void => {
+		if (offset > 0 && buffer.length > 1_048_576) {
+			buffer = buffer.slice(offset);
+			offset = 0;
+		}
+	};
+
+	const peek = async (): Promise<string | null> => {
+		while (offset >= buffer.length) {
+			if (streamEnded) {
+				return null;
+			}
+			const chunk = await readChunk();
+			if (chunk === null) {
+				streamEnded = true;
+				if (offset >= buffer.length) {
+					return null;
+				}
+			} else if (chunk.length > 0) {
+				buffer = offset >= buffer.length ? chunk : buffer.slice(offset) + chunk;
+				offset = 0;
+			}
+		}
+		compact();
+		return buffer.charAt(offset);
+	};
+
+	const take = async (): Promise<string | null> => {
+		const ch = await peek();
+		if (ch === null) {
+			return null;
+		}
+		offset += 1;
+		return ch;
+	};
+
+	const skipWhitespace = async (): Promise<void> => {
+		for (;;) {
+			const ch = await peek();
+			if (ch === null || !isJsonWhitespace(ch)) {
+				return;
+			}
+			offset += 1;
+		}
+	};
+
+	const takeDigits = async (requireAtLeastOne: boolean): Promise<void> => {
+		let count = 0;
+		for (;;) {
+			const ch = await peek();
+			if (ch !== null && isDigitChar(ch)) {
+				offset += 1;
+				count += 1;
+				continue;
+			}
+			break;
+		}
+		if (requireAtLeastOne && count === 0) {
+			fail();
+		}
+	};
+
+	const parseString = async (): Promise<void> => {
+		// Opening quote already consumed.
+		for (;;) {
+			const ch = (await take()) ?? fail();
+			if (ch === "\\") {
+				const escaped = (await take()) ?? fail();
+				if (escaped === "u") {
+					for (let i = 0; i < 4; i += 1) {
+						const hex = (await take()) ?? fail();
+						if (!/[0-9a-fA-F]/.test(hex)) {
+							fail();
+						}
+					}
+					continue;
+				}
+				if (!'"\\/bfnrt'.includes(escaped)) {
+					fail();
+				}
+				continue;
+			}
+			if (ch === '"') {
+				return;
+			}
+		}
+	};
+
+	const parseLiteral = async (rest: string): Promise<void> => {
+		for (const expected of rest) {
+			const ch = await take();
+			if (ch !== expected) {
+				fail();
+			}
+		}
+	};
+
+	const parseNumber = async (firstDigit: string): Promise<void> => {
+		// `firstDigit` already consumed. Leading zeros are not allowed beyond
+		// the single zero itself.
+		if (firstDigit !== "0") {
+			await takeDigits(false);
+		}
+		const next = await peek();
+		if (next === ".") {
+			offset += 1;
+			await takeDigits(true);
+		}
+		const exponent = await peek();
+		if (exponent === "e" || exponent === "E") {
+			offset += 1;
+			const sign = await peek();
+			if (sign === "+" || sign === "-") {
+				offset += 1;
+			}
+			await takeDigits(true);
+		}
+	};
+
+	const parseValue = async (): Promise<void> => {
+		await skipWhitespace();
+		const ch = (await take()) ?? fail();
+		if (ch === "{") {
+			await parseObject();
+			return;
+		}
+		if (ch === "[") {
+			await parseArray();
+			return;
+		}
+		if (ch === '"') {
+			await parseString();
+			return;
+		}
+		if (ch === "t") {
+			await parseLiteral("rue");
+			return;
+		}
+		if (ch === "f") {
+			await parseLiteral("alse");
+			return;
+		}
+		if (ch === "n") {
+			await parseLiteral("ull");
+			return;
+		}
+		if (ch === "-") {
+			const digit = (await take()) ?? fail();
+			if (!isDigitChar(digit)) {
+				fail();
+			}
+			await parseNumber(digit);
+			return;
+		}
+		if (isDigitChar(ch)) {
+			await parseNumber(ch);
+			return;
+		}
+		fail();
+	};
+
+	const parseObject = async (): Promise<void> => {
+		// Opening brace already consumed.
+		await skipWhitespace();
+		if ((await peek()) === "}") {
+			offset += 1;
+			return;
+		}
+		for (;;) {
+			await skipWhitespace();
+			const key = await take();
+			if (key !== '"') {
+				fail();
+			}
+			await parseString();
+			await skipWhitespace();
+			const colon = await take();
+			if (colon !== ":") {
+				fail();
+			}
+			await parseValue();
+			await skipWhitespace();
+			const separator = await take();
+			if (separator === ",") {
+				continue;
+			}
+			if (separator === "}") {
+				return;
+			}
+			fail();
+		}
+	};
+
+	const parseArray = async (): Promise<void> => {
+		// Opening bracket already consumed.
+		await skipWhitespace();
+		if ((await peek()) === "]") {
+			offset += 1;
+			return;
+		}
+		for (;;) {
+			await parseValue();
+			await skipWhitespace();
+			const separator = await take();
+			if (separator === ",") {
+				continue;
+			}
+			if (separator === "]") {
+				return;
+			}
+			fail();
+		}
+	};
+
+	// Historical classifier semantics: only a root object or array counts as
+	// json-text (a document rooted at a number/string/literal stays `text`).
+	await skipWhitespace();
+	const first = await take();
+	if (first !== "{" && first !== "[") {
+		return false;
+	}
+	if (first === "{") {
+		await parseObject();
+	} else {
+		await parseArray();
+	}
+	await skipWhitespace();
+	return (await peek()) === null;
+}
+
+function isJsonWhitespace(ch: string): boolean {
+	return ch === " " || ch === "\t" || ch === "\n" || ch === "\r";
+}
+
+function isDigitChar(ch: string): boolean {
+	return ch >= "0" && ch <= "9";
 }
 
 /**
@@ -138,11 +422,16 @@ export async function resolveTaskToolFullOutput(input: {
 		if (resolved.length === 1) {
 			const only = resolved[0];
 			if (only) {
+				// Prefer the classification recorded at archive time; fall back
+				// to the bounded streaming check for index entries written
+				// before that field existed.
+				const recordedFormat = indexedEntries.find((entry) => entry.fileName === only.fileName)?.contentFormat;
 				return {
 					status: "resolved",
 					artifactFileName: only.fileName,
 					artifactPath: only.path,
-					contentFormat: await classifyArtifactContentFormat(only.path).catch(() => "text" as const),
+					contentFormat:
+						recordedFormat ?? (await classifyArtifactContentFormat(only.path).catch(() => "text" as const)),
 					gap: null,
 				};
 			}

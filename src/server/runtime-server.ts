@@ -10,6 +10,7 @@ import {
 	type ClineReviewSessionService,
 	createClineReviewSessionService,
 } from "../cline-sdk/cline-review-session-service";
+import type { ClineTaskExportSnapshot } from "../cline-sdk/cline-task-export-snapshot";
 import {
 	type ClineTaskSessionService,
 	createInMemoryClineTaskSessionService,
@@ -534,13 +535,27 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			// full-fidelity diagnostics bundle. Snapshot building never pauses
 			// or clears sessions; a failure degrades to an explicit gap.
 			getTaskExportSnapshot: async (scope, taskId) => {
-				const taskSnapshot = await getScopedClineTaskSessionService(scope)
-					.then((service) => service.getTaskExportSnapshot(taskId))
-					.catch(() => null);
-				const reviewSnapshot = await getScopedReviewSessionService(scope)
-					.then((reviewSessionService) => reviewSessionService.getSessionExportSnapshot(taskId))
-					.catch(() => null);
-				return { taskSnapshot, reviewSnapshot };
+				// Decision 5: a failed class read is captured (task vs. review/repair)
+				// and carried into the export as an explicit gap.
+				let taskSnapshot: ClineTaskExportSnapshot | null = null;
+				let taskSnapshotError: string | null = null;
+				try {
+					taskSnapshot = await getScopedClineTaskSessionService(scope).then((service) =>
+						service.getTaskExportSnapshot(taskId),
+					);
+				} catch (error) {
+					taskSnapshotError = error instanceof Error ? error.message : String(error);
+				}
+				let reviewSnapshot: ClineTaskExportSnapshot | null = null;
+				let reviewSnapshotError: string | null = null;
+				try {
+					reviewSnapshot = await getScopedReviewSessionService(scope).then((reviewSessionService) =>
+						reviewSessionService.getSessionExportSnapshot(taskId),
+					);
+				} catch (error) {
+					reviewSnapshotError = error instanceof Error ? error.message : String(error);
+				}
+				return { taskSnapshot, taskSnapshotError, reviewSnapshot, reviewSnapshotError };
 			},
 			resolveInteractiveShellCommand: deps.resolveInteractiveShellCommand,
 			runCommand: deps.runCommand,

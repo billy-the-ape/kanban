@@ -313,20 +313,36 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 		const repairSessionIdPrefix = buildSessionIdPrefix(
 			`${reviewTaskId}${VERIFICATION_REPAIR_SESSION_SUFFIX.slice(0, -1)}`,
 		);
-		const snapshots = (
-			await Promise.all(
-				[...wantedTaskIds].map(async (sessionTaskId) => {
-					try {
-						return await this.sessionService.getTaskExportSnapshot(sessionTaskId, {
+		const snapshotsWithErrors = await Promise.all(
+			[...wantedTaskIds].map(async (sessionTaskId) => {
+				try {
+					return {
+						sessionTaskId,
+						snapshot: await this.sessionService.getTaskExportSnapshot(sessionTaskId, {
 							ownerPaths,
 							...(sessionTaskId === repairTaskIdBase ? { sessionIdPrefix: repairSessionIdPrefix } : {}),
-						});
-					} catch {
-						return null;
-					}
-				}),
-			)
-		).filter((snapshot): snapshot is ClineTaskExportSnapshot => snapshot !== null);
+						}),
+						error: null,
+					};
+				} catch (error) {
+					// A per-session snapshot read failure is an explicit gap
+					// (Decision 5), never a silently dropped transcript.
+					return {
+						sessionTaskId,
+						snapshot: null,
+						error: error instanceof Error ? error.message : String(error),
+					};
+				}
+			}),
+		);
+		const enumerationErrors: string[] = [];
+		const snapshots = snapshotsWithErrors.flatMap((result) => {
+			if (result.error !== null) {
+				enumerationErrors.push(`session ${result.sessionTaskId}: ${result.error}`);
+				return [];
+			}
+			return result.snapshot ? [result.snapshot] : [];
+		});
 
 		const merged = new Map<string, ClineTaskExportSegment>();
 		let listingTruncated = false;
@@ -375,6 +391,7 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 			taskId: baseTaskId,
 			capturedAt,
 			listingTruncated,
+			enumerationErrors,
 			segments,
 		};
 	}

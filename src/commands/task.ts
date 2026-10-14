@@ -1,5 +1,5 @@
 import { createWriteStream } from "node:fs";
-import { rm } from "node:fs/promises";
+import { rename, rm } from "node:fs/promises";
 import { resolve } from "node:path";
 import { Readable } from "node:stream";
 import { createTRPCProxyClient, httpBatchLink } from "@trpc/client";
@@ -1365,9 +1365,11 @@ async function taskQueueCommand(input: { cwd: string; projectPath?: string }): P
 /**
  * DIAG-3: download the task's full-fidelity diagnostics bundle (schemaVersion
  * 3 JSON) from the runtime's GET download route into the caller-named file.
- * The bundle includes the complete unredacted conversation, so it is only
- * written after a successful, complete download; a partial download is
- * deleted and reported as a failure.
+ * The bundle includes the complete unredacted conversation, so the download
+ * streams to a temporary sibling file and is atomically renamed over the
+ * destination only after a successful, complete download. A partial download
+ * leaves the temp file for cleanup (which deletes only the temp file) and
+ * never destroys or truncates a pre-existing destination file.
  */
 async function taskExportDiagnosticsCommand(input: {
 	cwd: string;
@@ -1378,6 +1380,10 @@ async function taskExportDiagnosticsCommand(input: {
 	const workspaceRepoPath = await resolveWorkspaceRepoPath(input.projectPath, input.cwd);
 	const workspaceId = await ensureRuntimeWorkspace(workspaceRepoPath);
 	const outputFilePath = resolve(input.cwd, input.output);
+	// The destination is only replaced after a fully successful download: the
+	// stream lands in a temp sibling file that is renamed into place at the
+	// end, so a pre-existing file is never truncated or deleted by a failure.
+	const tempFilePath = `${outputFilePath}.${process.pid}.tmp`;
 	const url = buildKanbanRuntimeUrl(
 		`/api/task-diagnostics/download?workspaceId=${encodeURIComponent(workspaceId)}&taskId=${encodeURIComponent(
 			input.taskId,
@@ -1410,7 +1416,7 @@ async function taskExportDiagnosticsCommand(input: {
 	}
 	const stream = Readable.fromWeb(responseBody);
 	let bytes = 0;
-	const writeStream = createWriteStream(outputFilePath);
+	const writeStream = createWriteStream(tempFilePath);
 	// A write error can arrive before end() is called; an "error" event with no
 	// listener crashes the process, and without one this command would hang on
 	// a stream that never closes.
@@ -1440,12 +1446,29 @@ async function taskExportDiagnosticsCommand(input: {
 	} catch (error) {
 		stream.destroy();
 		writeStream.destroy();
-		// Never leave a truncated bundle behind.
-		await rm(outputFilePath, { force: true }).catch(() => undefined);
+		// Never leave a truncated bundle behind, and never touch the
+		// pre-existing destination — only the temp file is cleaned up.
+		await rm(tempFilePath, { force: true }).catch(() => undefined);
 		process.exitCode = 1;
 		return {
 			ok: false,
 			error: `Diagnostics download failed: ${error instanceof Error ? error.message : String(error)}`,
+			outputPath: outputFilePath,
+			bytes,
+			completeness: null,
+		};
+	}
+	// The full stream landed intact; atomically replace the destination.
+	try {
+		await rename(tempFilePath, outputFilePath);
+	} catch (error) {
+		await rm(tempFilePath, { force: true }).catch(() => undefined);
+		process.exitCode = 1;
+		return {
+			ok: false,
+			error: `Diagnostics download failed: could not move the downloaded bundle into place: ${
+				error instanceof Error ? error.message : String(error)
+			}`,
 			outputPath: outputFilePath,
 			bytes,
 			completeness: null,

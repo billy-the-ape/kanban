@@ -24,10 +24,38 @@ export interface TaskArtifactIndexEntry {
 	toolCallId: string;
 	fileName: string;
 	writtenAt: string;
+	/**
+	 * DIAG-2: content classification recorded at archive time so an export can
+	 * label the artifact without re-reading (and re-parsing) a potentially
+	 * large file before the download response starts.
+	 */
+	contentFormat?: TaskArtifactContentFormat;
 }
 
 /** toolCallId -> artifact entries in append order. */
 export type TaskArtifactIndex = Record<string, TaskArtifactIndexEntry[]>;
+
+/** Classification of stored artifact content. */
+export type TaskArtifactContentFormat = "json-text" | "text";
+
+/**
+ * Classifies already-in-memory content at archive time (same rules as the
+ * export's streaming classifier in src/core/task-diagnostics-export-artifacts).
+ * Runs once per artifact write, when the content is already loaded for the
+ * write itself.
+ */
+export function classifyTaskArtifactContentFormat(content: string): TaskArtifactContentFormat {
+	const trimmed = content.trim();
+	if (trimmed.length === 0 || !(trimmed.startsWith("{") || trimmed.startsWith("["))) {
+		return "text";
+	}
+	try {
+		JSON.parse(trimmed);
+		return "json-text";
+	} catch {
+		return "text";
+	}
+}
 
 export function getTaskContextArtifactsIndexPath(taskId: string): string {
 	return join(getTaskContextArtifactsDir(taskId), TASK_ARTIFACT_INDEX_FILE_NAME);
@@ -47,7 +75,10 @@ function isTaskArtifactIndex(value: unknown): value is TaskArtifactIndex {
 				typeof entry === "object" &&
 				typeof entry.toolCallId === "string" &&
 				typeof entry.fileName === "string" &&
-				typeof entry.writtenAt === "string",
+				typeof entry.writtenAt === "string" &&
+				(entry.contentFormat === undefined ||
+					entry.contentFormat === "json-text" ||
+					entry.contentFormat === "text"),
 		);
 	});
 }
@@ -78,6 +109,7 @@ export async function appendTaskArtifactIndexEntry(input: {
 	taskId: string;
 	toolCallId: string;
 	fileName: string;
+	contentFormat?: TaskArtifactContentFormat;
 }): Promise<void> {
 	const indexPath = getTaskContextArtifactsIndexPath(input.taskId);
 	await lockedFileSystem.withLock(
@@ -92,6 +124,7 @@ export async function appendTaskArtifactIndexEntry(input: {
 				toolCallId: input.toolCallId,
 				fileName: input.fileName,
 				writtenAt: new Date().toISOString(),
+				...(input.contentFormat !== undefined ? { contentFormat: input.contentFormat } : {}),
 			};
 			const existing = index[input.toolCallId];
 			if (existing) {

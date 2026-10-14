@@ -134,7 +134,14 @@ export interface CreateRuntimeApiDependencies {
 	getTaskExportSnapshot: (
 		workspaceScope: RuntimeTrpcWorkspaceScope,
 		taskId: string,
-	) => Promise<{ taskSnapshot: ClineTaskExportSnapshot | null; reviewSnapshot: ClineTaskExportSnapshot | null }>;
+	) => Promise<{
+		taskSnapshot: ClineTaskExportSnapshot | null;
+		/** Non-null when the task class snapshot read failed (Decision 5: carried as an export gap). */
+		taskSnapshotError: string | null;
+		reviewSnapshot: ClineTaskExportSnapshot | null;
+		/** Non-null when the review/repair lineage snapshot read failed (Decision 5: carried as an export gap). */
+		reviewSnapshotError: string | null;
+	}>;
 	resolveInteractiveShellCommand: () => { binary: string; args: string[] };
 	runCommand: (command: string, cwd: string) => Promise<RuntimeCommandRunResponse>;
 	broadcastClineMcpAuthStatusesUpdated?: (
@@ -1430,16 +1437,32 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		buildTaskDiagnosticsExportPlan: async (workspaceScope, taskId): Promise<TaskDiagnosticsExportV3Plan> => {
 			const snapshot = await gatherTaskDiagnosticsSnapshot(workspaceScope, taskId);
 			const diagnostics = await buildTaskDiagnosticsResponse(workspaceScope, snapshot);
-			const { taskSnapshot, reviewSnapshot } = await deps
+			const { taskSnapshot, taskSnapshotError, reviewSnapshot, reviewSnapshotError } = await deps
 				.getTaskExportSnapshot(workspaceScope, taskId)
-				.catch(() => ({ taskSnapshot: null, reviewSnapshot: null }));
+				.catch((error) => {
+					// Decision 5: a snapshot class that failed to read is a gap the
+					// export must carry, not a silent omission.
+					const message = error instanceof Error ? error.message : String(error);
+					return {
+						taskSnapshot: null,
+						taskSnapshotError: message,
+						reviewSnapshot: null,
+						reviewSnapshotError: message,
+					};
+				});
 			return await buildTaskDiagnosticsExportV3({
 				taskId,
 				diagnostics,
 				taskPrompt: snapshot.taskPrompt,
 				sessionSnapshots: [
 					...(taskSnapshot ? [taskSnapshot] : []),
-					...(reviewSnapshot && reviewSnapshot.segments.length > 0 ? [reviewSnapshot] : []),
+					...(reviewSnapshot && (reviewSnapshot.segments.length > 0 || reviewSnapshot.enumerationErrors.length > 0)
+						? [reviewSnapshot]
+						: []),
+				],
+				snapshotFailures: [
+					...(taskSnapshotError ? [{ kind: "task" as const, reason: taskSnapshotError }] : []),
+					...(reviewSnapshotError ? [{ kind: "review" as const, reason: reviewSnapshotError }] : []),
 				],
 				sessionSource: snapshot.session.source,
 				sessionSummary: snapshot.session.summary,

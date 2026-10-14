@@ -1420,7 +1420,10 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		const boundSessionId = this.sessionRuntime.getTaskSessionId(taskId);
 		if (entry && boundSessionId) {
 			const segment = snapshot.segments.find((candidate) => candidate.header.sessionId === boundSessionId);
-			if (segment && segment.readError === null) {
+			if (segment) {
+				// Decision 5: keep the available live evidence even when the
+				// durable transcript could not be read — the segment's
+				// readError and unavailable status still report the gap.
 				const liveTail = buildSessionExportLiveTail(segment.messages, entry.messages);
 				if (liveTail) {
 					segment.liveTail = liveTail;

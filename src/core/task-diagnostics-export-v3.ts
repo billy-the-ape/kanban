@@ -125,6 +125,13 @@ export interface BuildTaskDiagnosticsExportV3Input {
 	sessionSummary: RuntimeTaskSessionSummary | null;
 	capturedAt: number;
 	exportedAt: string;
+	/**
+	 * Snapshot class read/enumeration failures reported by the runtime (Decision
+	 * 5): e.g. the task snapshot succeeded but the review/repair lineage
+	 * snapshot read threw. Each entry is a completeness gap, never silently
+	 * dropped (and distinct from "the class has no recorded sessions").
+	 */
+	snapshotFailures?: Array<{ kind: ClineTaskExportKind; reason: string }>;
 	/** Full-output resolver override (tests). */
 	artifactResolver?: (input: {
 		taskId: string;
@@ -264,8 +271,16 @@ export async function buildTaskDiagnosticsExportV3(
 	const warnings: string[] = [];
 	const sessions: TaskDiagnosticsExportSession[] = [];
 
+	for (const failure of input.snapshotFailures ?? []) {
+		reasons.push(`session class ${failure.kind} snapshot failed: ${failure.reason}`);
+	}
+
 	for (const snapshot of input.sessionSnapshots) {
-		const groupReason: string | null = snapshot.listingTruncated ? "session listing may be truncated" : null;
+		const groupReason: string | null = snapshot.listingTruncated
+			? "session listing may be truncated"
+			: snapshot.enumerationErrors.length > 0
+				? "session enumeration failed for at least one session of this class"
+				: null;
 		const segments: TaskDiagnosticsExportSegment[] = [];
 		for (const segment of snapshotSegments(snapshot)) {
 			let transcriptStatus: TaskDiagnosticsExportTranscriptStatus = "complete";
@@ -299,6 +314,9 @@ export async function buildTaskDiagnosticsExportV3(
 		}
 		if (groupReason) {
 			reasons.push(groupReason);
+		}
+		for (const error of snapshot.enumerationErrors) {
+			reasons.push(`session class ${snapshot.kind} snapshot read failed: ${error}`);
 		}
 		for (const segment of segments) {
 			for (const evidence of segment.toolEvidence) {
@@ -334,7 +352,9 @@ export async function buildTaskDiagnosticsExportV3(
 						: sessionTranscriptStatus === "partial"
 							? "at least one session transcript of this class is partial"
 							: segments.length === 0
-								? "no recorded sessions of this class"
+								? snapshot.enumerationErrors.length > 0
+									? "session enumeration failed for this class"
+									: "no recorded sessions of this class"
 								: "a durable transcript could not be read for at least one session of this class",
 			},
 			summary: null,

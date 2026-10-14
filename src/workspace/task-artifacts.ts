@@ -20,7 +20,7 @@ import { join } from "node:path";
 
 import { lockedFileSystem } from "../fs/locked-file-system";
 import { getTaskWorktreesHomePath } from "../state/workspace-state";
-import { appendTaskArtifactIndexEntry } from "./task-artifact-index";
+import { appendTaskArtifactIndexEntry, classifyTaskArtifactContentFormat } from "./task-artifact-index";
 import { normalizeTaskIdForWorktreePath } from "./task-worktree-path";
 
 const CONTEXT_ARTIFACTS_DIR_NAME = "context-artifacts";
@@ -87,11 +87,14 @@ export async function writeTaskContextArtifact(input: WriteTaskContextArtifactIn
 	const fileName = buildTaskContextArtifactFileName(input.toolCallId, input.timestampMs ?? Date.now());
 	const path = join(getTaskContextArtifactsDir(input.taskId), fileName);
 	await lockedFileSystem.writeTextFileAtomic(path, input.content);
+	// Record the content classification alongside the file reference so an
+	// export can label the artifact without re-reading it (DIAG-2).
 	try {
 		await appendTaskArtifactIndexEntry({
 			taskId: input.taskId,
 			toolCallId: input.toolCallId,
 			fileName,
+			contentFormat: classifyTaskArtifactContentFormat(input.content),
 		});
 	} catch (error) {
 		input.onIndexWriteError?.(error);

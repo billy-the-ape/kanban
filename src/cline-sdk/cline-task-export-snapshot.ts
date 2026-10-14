@@ -113,6 +113,13 @@ export interface ClineTaskExportSnapshot {
 	 * the oldest segments may then be missing (Decision 3).
 	 */
 	listingTruncated: boolean;
+	/**
+	 * Per-session snapshot read failures encountered while enumerating this
+	 * class (Decision 5: a failed read/enumeration is carried into the export
+	 * as a gap, never silently dropped). Distinguishes "the class has no
+	 * recorded sessions" from "one of them could not be read".
+	 */
+	enumerationErrors: string[];
 	/** Segments in creation order (oldest first). */
 	segments: ClineTaskExportSegment[];
 }

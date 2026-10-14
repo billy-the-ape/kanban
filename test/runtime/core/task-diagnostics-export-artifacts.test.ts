@@ -1,7 +1,7 @@
 // DIAG-2 (2b): full-tool-output recovery alongside its transcript position —
 // sidecar-index resolution, filename fallback, legacy reference parsing,
 // untrusted-reference rejection, and explicit per-result gaps.
-import { mkdir, readFile, symlink, unlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -9,7 +9,11 @@ import {
 	classifyArtifactContentFormat,
 	resolveTaskToolFullOutput,
 } from "../../../src/core/task-diagnostics-export-artifacts";
-import { readTaskArtifactIndex, TASK_ARTIFACT_INDEX_FILE_NAME } from "../../../src/workspace/task-artifact-index";
+import {
+	appendTaskArtifactIndexEntry,
+	readTaskArtifactIndex,
+	TASK_ARTIFACT_INDEX_FILE_NAME,
+} from "../../../src/workspace/task-artifact-index";
 import { getTaskContextArtifactsDir, writeTaskContextArtifact } from "../../../src/workspace/task-artifacts";
 import { createTempDir } from "../../utilities/temp-dir";
 
@@ -38,9 +42,11 @@ describe("resolveTaskToolFullOutput (DIAG-2 2b)", () => {
 		workspaceStateMocks.getTaskWorktreesHomePath.mockReset();
 	});
 
-	it("resolves the full output through the sidecar index with exact content (50k+ chars, json-text)", async () => {
-		const content = JSON.stringify({ rows: Array.from({ length: 3000 }, (_, i) => ({ id: i, note: "value" })) });
-		expect(content.length).toBeGreaterThan(50000);
+	it("resolves the full output through the sidecar index with exact content (2MB+, streamed json-text)", async () => {
+		// Larger than the historical 64KB cap: the classifier must stream
+		// (constant memory) instead of reading the whole file into memory.
+		const content = JSON.stringify({ rows: Array.from({ length: 150000 }, (_, i) => ({ id: i, note: "value" })) });
+		expect(content.length).toBeGreaterThan(2000000);
 		await writeTaskContextArtifact({ taskId: "task-1", toolCallId: "call_abc", content });
 		const evidence = await resolveTaskToolFullOutput({ taskId: "task-1", toolCallId: "call_abc" });
 		expect(evidence.status).toBe("resolved");
@@ -49,6 +55,18 @@ describe("resolveTaskToolFullOutput (DIAG-2 2b)", () => {
 		expect(evidence.contentFormat).toBe("json-text");
 		expect(evidence.gap).toBeNull();
 		expect(await readFile(evidence.artifactPath ?? "", "utf8")).toBe(content);
+	});
+
+	it("labels a multi-MB non-JSON artifact that looks like JSON as text (no full-read parse)", async () => {
+		// Starts with `{` and is truncated mid-document: JSON.parse would throw
+		// on the full read; the streaming validator must report text without
+		// holding the whole file or a parsed copy.
+		const content = `{ "rows": [1, 2, 3,${" 4".repeat(1000000)}`;
+		expect(content.length).toBeGreaterThan(2000000);
+		await writeTaskContextArtifact({ taskId: "task-1", toolCallId: "call-big", content });
+		const evidence = await resolveTaskToolFullOutput({ taskId: "task-1", toolCallId: "call-big" });
+		expect(evidence.status).toBe("resolved");
+		expect(evidence.contentFormat).toBe("text");
 	});
 
 	it("classifies raw non-JSON artifact content as text", async () => {
@@ -86,6 +104,63 @@ describe("resolveTaskToolFullOutput (DIAG-2 2b)", () => {
 			expect(evidence.status).toBe("resolved");
 			expect(evidence.artifactFileName).toBe("legacy-1-111-abcdef01.txt");
 		}
+	});
+	it("resolves the current bracketed marker styles (chars and lines, with reference)", async () => {
+		const dir = getTaskContextArtifactsDir("task-1");
+		await mkdir(dir, { recursive: true });
+		await writeFile(join(dir, "current-1-111-abcdef01.txt"), "current output");
+		const reference = join(dir, "current-1-111-abcdef01.txt");
+		const styles = [
+			`head ... [truncated 120 lines; full output: ${reference}] tail`,
+			`head ... [truncated 4096 chars; full output: ${reference}] tail`,
+		];
+		for (const persistedResultText of styles) {
+			const evidence = await resolveTaskToolFullOutput({
+				taskId: "task-1",
+				toolCallId: "current-1",
+				persistedResultText,
+			});
+			expect(evidence.status).toBe("resolved");
+			expect(evidence.artifactFileName).toBe("current-1-111-abcdef01.txt");
+		}
+		// A referenceless marker still resolves through the deterministic
+		// filename fallback (no reference to parse).
+		const evidence = await resolveTaskToolFullOutput({
+			taskId: "task-1",
+			toolCallId: "current-1",
+			persistedResultText: "head ... [truncated 4096 chars] tail",
+		});
+		expect(evidence.status).toBe("resolved");
+	});
+
+	it("trusts the content format recorded in the sidecar index without re-reading the file", async () => {
+		const dir = getTaskContextArtifactsDir("task-1");
+		await mkdir(dir, { recursive: true });
+		const fileName = "call-rec-1-abcdef01.txt";
+		// Plain-text content, but the index records json-text: the recorded
+		// classification must win (no re-read, no re-classification).
+		await writeFile(join(dir, fileName), "plain text content");
+		await appendTaskArtifactIndexEntry({
+			taskId: "task-1",
+			toolCallId: "call-rec",
+			fileName,
+			contentFormat: "json-text",
+		});
+		const evidence = await resolveTaskToolFullOutput({ taskId: "task-1", toolCallId: "call-rec" });
+		expect(evidence.status).toBe("resolved");
+		expect(evidence.artifactFileName).toBe(fileName);
+		expect(evidence.contentFormat).toBe("json-text");
+	});
+
+	it("falls back to the streaming classifier for index entries written before contentFormat existed", async () => {
+		const dir = getTaskContextArtifactsDir("task-1");
+		await mkdir(dir, { recursive: true });
+		const fileName = "call-old-1-abcdef01.txt";
+		await writeFile(join(dir, fileName), '{"a": 1}');
+		await appendTaskArtifactIndexEntry({ taskId: "task-1", toolCallId: "call-old", fileName });
+		const evidence = await resolveTaskToolFullOutput({ taskId: "task-1", toolCallId: "call-old" });
+		expect(evidence.status).toBe("resolved");
+		expect(evidence.contentFormat).toBe("json-text");
 	});
 
 	it("reports an explicit gap when no artifact survives", async () => {
@@ -197,11 +272,43 @@ describe("classifyArtifactContentFormat", () => {
 		const jsonPath = join(dir, "json.txt");
 		const textPath = join(dir, "text.txt");
 		const brokenJsonPath = join(dir, "broken.txt");
+		const arrayPath = join(dir, "array.txt");
+		const scalarPath = join(dir, "scalar.txt");
+		const trailingPath = join(dir, "trailing.txt");
+		const escapePath = join(dir, "escape.txt");
 		await writeFile(jsonPath, '{"a": [1, 2, 3]}');
 		await writeFile(textPath, "hello { not json");
 		await writeFile(brokenJsonPath, '{"a": 1,');
+		await writeFile(arrayPath, "[1, 2, [3]]");
+		await writeFile(scalarPath, "123");
+		await writeFile(trailingPath, '{"a": 1} trailing');
+		await writeFile(escapePath, '{"a": "\\u0041\\n"}');
 		expect(await classifyArtifactContentFormat(jsonPath)).toBe("json-text");
 		expect(await classifyArtifactContentFormat(textPath)).toBe("text");
 		expect(await classifyArtifactContentFormat(brokenJsonPath)).toBe("text");
+		// Root arrays count; a bare scalar root stays text (legacy semantics).
+		expect(await classifyArtifactContentFormat(arrayPath)).toBe("json-text");
+		expect(await classifyArtifactContentFormat(scalarPath)).toBe("text");
+		// Trailing content after the document keeps it text (single document).
+		expect(await classifyArtifactContentFormat(trailingPath)).toBe("text");
+		expect(await classifyArtifactContentFormat(escapePath)).toBe("json-text");
+	});
+
+	it("classifies a multi-MB document by streaming, never holding the whole file", async () => {
+		// 3MB of valid JSON built without ever materializing a second full copy:
+		// the streaming validator must report json-text in constant memory.
+		const dir = getTaskContextArtifactsDir("task-1");
+		await mkdir(dir, { recursive: true });
+		const largePath = join(dir, "large.txt");
+		const row = JSON.stringify({ id: 1, note: "value" });
+		const chunk = `, ${row}`;
+		await writeFile(largePath, `[${row}`);
+		for (let i = 0; i < 80000; i += 1) {
+			await appendFile(largePath, chunk);
+		}
+		await appendFile(largePath, `]`);
+		const info = await stat(largePath);
+		expect(info.size).toBeGreaterThan(2000000);
+		expect(await classifyArtifactContentFormat(largePath)).toBe("json-text");
 	});
 });

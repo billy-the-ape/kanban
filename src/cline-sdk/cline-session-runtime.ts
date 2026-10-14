@@ -772,6 +772,9 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			taskId,
 			capturedAt: Date.now(),
 			listingTruncated,
+			// Individual durable-read failures are recorded per segment (readError);
+			// a whole-listing failure throws instead.
+			enumerationErrors: [],
 			segments,
 		};
 	}
