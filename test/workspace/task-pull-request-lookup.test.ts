@@ -13,6 +13,7 @@ import {
 	fireReviewPullRequestLookup,
 	lookupTaskPullRequests,
 	type TaskPullRequestGhRunner,
+	type TaskPullRequestRemoteResolver,
 } from "../../src/workspace/task-pull-request-lookup";
 import { createGitTestEnv } from "../utilities/git-env";
 import { createTempDir } from "../utilities/temp-dir";
@@ -38,6 +39,11 @@ function createGhResult(stdout: string): {
 function createGhRunner(entries: unknown[]): TaskPullRequestGhRunner {
 	return vi.fn(async () => createGhResult(JSON.stringify(entries)));
 }
+
+// PRLINK-9: branch discovery now requires a usable origin remote. The fixture
+// worktrees are not real repos with remotes, so tests inject a fake resolver
+// returning a valid github.com origin (the same repo the gh fake answers for).
+const fakeOriginRemote: TaskPullRequestRemoteResolver = vi.fn(async () => "https://github.com/owner/repo");
 
 function createBoard(task: { id: string; pullRequests?: RuntimeTaskPullRequest[] }): RuntimeBoardData {
 	return {
@@ -149,6 +155,7 @@ describe("lookupTaskPullRequests", () => {
 			taskId: "task-1",
 			branch: "task/branch-1",
 			gh,
+			resolveOriginRemote: fakeOriginRemote,
 		});
 
 		expect(result).toMatchObject({ recorded: 2, reason: "updated" });
@@ -161,7 +168,7 @@ describe("lookupTaskPullRequests", () => {
 				"--state",
 				"all",
 				"--json",
-				"number,url,title,state",
+				"number,url,title,state,isDraft",
 				"--limit",
 				"5",
 			],
@@ -189,6 +196,7 @@ describe("lookupTaskPullRequests", () => {
 			taskId: "task-1",
 			branch: "task/branch-1",
 			gh: createGhRunner([{ url: "https://github.com/owner/repo/pull/12", title: "Old title", state: "OPEN" }]),
+			resolveOriginRemote: fakeOriginRemote,
 		});
 		expect(first).toMatchObject({ recorded: 1, reason: "updated" });
 
@@ -197,6 +205,7 @@ describe("lookupTaskPullRequests", () => {
 			taskId: "task-1",
 			branch: "task/branch-1",
 			gh: createGhRunner([{ url: "https://github.com/owner/repo/pull/12", title: "New title", state: "MERGED" }]),
+			resolveOriginRemote: fakeOriginRemote,
 		});
 		expect(second).toMatchObject({ recorded: 1, reason: "updated" });
 
@@ -210,6 +219,7 @@ describe("lookupTaskPullRequests", () => {
 			taskId: "task-1",
 			branch: "task/branch-1",
 			gh: createGhRunner([{ url: "https://github.com/owner/repo/pull/12", title: "New title", state: "MERGED" }]),
+			resolveOriginRemote: fakeOriginRemote,
 		});
 		expect(third).toMatchObject({ recorded: 0, reason: "unchanged" });
 		expect((await loadWorkspaceState(workspacePath)).revision).toBe(afterRefresh.revision);
@@ -221,6 +231,7 @@ describe("lookupTaskPullRequests", () => {
 			taskId: "task-1",
 			branch: "task/branch-1",
 			gh: createGhRunner([{ url: "https://github.com/owner/repo/pull/12", title: "Kept title", state: "OPEN" }]),
+			resolveOriginRemote: fakeOriginRemote,
 		});
 		const revisionAfterFirst = (await loadWorkspaceState(workspacePath)).revision;
 
@@ -231,6 +242,7 @@ describe("lookupTaskPullRequests", () => {
 			// gh can return no title; the stored title must survive and the
 			// missing title must not count as a change.
 			gh: createGhRunner([{ url: "https://github.com/owner/repo/pull/12", state: "OPEN" }]),
+			resolveOriginRemote: fakeOriginRemote,
 		});
 
 		expect(result).toMatchObject({ recorded: 0, reason: "unchanged" });
@@ -245,6 +257,7 @@ describe("lookupTaskPullRequests", () => {
 			taskId: "task-1",
 			branch: "task/branch-1",
 			gh: createGhRunner([]),
+			resolveOriginRemote: fakeOriginRemote,
 		});
 
 		expect(result).toMatchObject({ recorded: 0, reason: "none_found" });
@@ -258,6 +271,7 @@ describe("lookupTaskPullRequests", () => {
 			taskId: "task-1",
 			branch: "task/branch-1",
 			gh: vi.fn(async () => ({ ok: false, stdout: "", stderr: "", exitCode: 127, missingBinary: true })),
+			resolveOriginRemote: fakeOriginRemote,
 		});
 		expect(missing).toMatchObject({ recorded: 0, reason: "no_gh" });
 
@@ -266,6 +280,7 @@ describe("lookupTaskPullRequests", () => {
 			taskId: "task-1",
 			branch: "task/branch-1",
 			gh: vi.fn(async () => ({ ok: false, stdout: "", stderr: "not logged in", exitCode: 1, missingBinary: false })),
+			resolveOriginRemote: fakeOriginRemote,
 		});
 		expect(failed).toMatchObject({ recorded: 0, reason: "gh_failed" });
 
@@ -274,7 +289,7 @@ describe("lookupTaskPullRequests", () => {
 		expect(findCardPullRequests(state.board, "task-1")).toBeUndefined();
 	});
 
-	it("no-ops when the task is missing, the worktree is gone, or the branch is unresolvable", async () => {
+	it("no-ops when the task is missing, the worktree is gone, the branch is unresolvable, or there is no origin remote", async () => {
 		const missingTask = await lookupTaskPullRequests({
 			workspacePath,
 			taskId: "nope",
@@ -300,6 +315,17 @@ describe("lookupTaskPullRequests", () => {
 			gh: createGhRunner([{ url: "https://github.com/owner/repo/pull/12", state: "OPEN" }]),
 		});
 		expect(noBranch).toMatchObject({ recorded: 0, reason: "no_branch" });
+
+		// A resolvable branch but no usable origin remote: no discovery, no gh call.
+		const noRemote = await lookupTaskPullRequests({
+			workspacePath,
+			taskId: "task-1",
+			branch: "task/branch-1",
+			gh: createGhRunner([{ url: "https://github.com/owner/repo/pull/12", state: "OPEN" }]),
+			resolveOriginRemote: async () => null,
+		});
+		expect(noRemote).toMatchObject({ recorded: 0, reason: "no_remote" });
+
 		expect(
 			(
 				await lookupTaskPullRequests({
@@ -463,7 +489,13 @@ describe("fireReviewPullRequestLookup", () => {
 			const gh = createGhRunner([{ url: "https://github.com/owner/repo/pull/21", title: "Found", state: "OPEN" }]);
 			const onChanged = vi.fn();
 
-			fireReviewPullRequestLookup({ workspacePath, taskId: "task-1", gh, onChanged });
+			fireReviewPullRequestLookup({
+				workspacePath,
+				taskId: "task-1",
+				gh,
+				onChanged,
+				resolveOriginRemote: fakeOriginRemote,
+			});
 			await vi.waitFor(
 				() => {
 					expect(onChanged).toHaveBeenCalledTimes(1);

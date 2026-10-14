@@ -13,7 +13,7 @@
 // preserving unrestricted terminal access. Those cases surface as an
 // explicit capture uncertainty instead of silently registering (or missing)
 // identities.
-import { tokenizeCommandFragment } from "../core/pull-request-detection";
+import { tokenizeCommandFragment } from "../core/pull-request-providers/creation-command-gate";
 
 export type PrPublishedIdentityKind = "conversation" | "inline" | "review";
 

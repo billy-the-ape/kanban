@@ -33,8 +33,10 @@ import {
 	type RuntimeTaskPrCommentResumeRequest,
 	type RuntimeTaskPreservationRequest,
 	type RuntimeTaskPrTrackingStateRequest,
+	type RuntimeTaskPullRequestLinkedRefreshRequest,
 	type RuntimeTaskPullRequestLinkRequest,
 	type RuntimeTaskPullRequestPrimaryRequest,
+	type RuntimeTaskPullRequestSingleRefreshRequest,
 	type RuntimeTaskPullRequestsRefreshRequest,
 	type RuntimeTaskReviewInfoRequest,
 	type RuntimeTaskReviewStartRequest,
@@ -80,8 +82,10 @@ import {
 	runtimeTaskPrCommentResumeRequestSchema,
 	runtimeTaskPreservationRequestSchema,
 	runtimeTaskPrTrackingStateRequestSchema,
+	runtimeTaskPullRequestLinkedRefreshRequestSchema,
 	runtimeTaskPullRequestLinkRequestSchema,
 	runtimeTaskPullRequestPrimaryRequestSchema,
+	runtimeTaskPullRequestSingleRefreshRequestSchema,
 	runtimeTaskPullRequestsRefreshRequestSchema,
 	runtimeTaskReviewInfoRequestSchema,
 	runtimeTaskReviewStartRequestSchema,
@@ -763,6 +767,36 @@ export function parseTaskPullRequestPrimaryRequest(value: unknown): RuntimeTaskP
 
 export function parseTaskPullRequestsRefreshRequest(value: unknown): RuntimeTaskPullRequestsRefreshRequest {
 	const parsed = parseWithSchema(runtimeTaskPullRequestsRefreshRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Missing taskId");
+	}
+	return {
+		...parsed,
+		taskId,
+	};
+}
+
+// PRLINK-9: provider-aware metadata refresh of already-linked PRs.
+export function parseTaskPullRequestSingleRefreshRequest(value: unknown): RuntimeTaskPullRequestSingleRefreshRequest {
+	const parsed = parseWithSchema(runtimeTaskPullRequestSingleRefreshRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	const url = parsed.url.trim();
+	if (!taskId) {
+		throw new Error("Missing taskId");
+	}
+	if (!url) {
+		throw new Error("Missing pull request URL");
+	}
+	return {
+		...parsed,
+		taskId,
+		url,
+	};
+}
+
+export function parseTaskPullRequestLinkedRefreshRequest(value: unknown): RuntimeTaskPullRequestLinkedRefreshRequest {
+	const parsed = parseWithSchema(runtimeTaskPullRequestLinkedRefreshRequestSchema, value);
 	const taskId = parsed.taskId.trim();
 	if (!taskId) {
 		throw new Error("Missing taskId");

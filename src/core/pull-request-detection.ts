@@ -1,4 +1,4 @@
-// PRLINK-0: narrow PR-creation detection gate.
+// PRLINK-0/9: narrow PR-creation detection gate.
 //
 // Returns linked pull requests ONLY when the tool call itself creates a PR
 // (gh/glab/hub creation commands, `git push -o merge_request.create`, or an
@@ -6,11 +6,15 @@
 // from the tool output only — never from the command text — so review
 // sessions reading PRs (`gh pr view`) adopt nothing. Misses are recoverable
 // via deterministic delivery, branch lookup (PRLINK-5), or manual add.
+//
+// PRLINK-9: the pure command gate rules live in
+// `src/core/pull-request-providers/creation-command-gate.ts`.
 
 import { parseCommandOutputEntries } from "../cline-sdk/cline-command-output-excerpt";
 import { extractCommandStrings } from "../cline-sdk/review-tool-policy";
 import type { ParsedPullRequestLink } from "./pull-request-links";
 import { extractPullRequestLinks, parsePullRequestUrl } from "./pull-request-links";
+import { commandHasPrCreatingSegment, isPrCreatingMcpTool } from "./pull-request-providers/creation-command-gate";
 
 export interface PullRequestDetectionInput {
 	toolName: string | null;
@@ -19,138 +23,7 @@ export interface PullRequestDetectionInput {
 	output: string | null;
 }
 
-const COMMAND_FRAGMENT_SPLIT_PATTERN = /&&|\|\||;|\||\r?\n/;
-const ENV_ASSIGNMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*=/;
 const MAX_STRUCTURED_OUTPUT_DEPTH = 4;
-
-/** Splits a command line at unquoted-ish shell operators and newlines. */
-export function splitCommandFragments(command: string): string[] {
-	return command
-		.split(COMMAND_FRAGMENT_SPLIT_PATTERN)
-		.map((fragment) => fragment.trim())
-		.filter(Boolean);
-}
-
-/**
- * Tokenizes a fragment quote-aware (single and double quotes collapse their
- * contents into one token, so quoted numbers/bodies are never mistaken for
- * positionals), backslash-escape-aware (an escaped quote is a literal
- * character and never opens or closes a quoted region), skipping leading env
- * assignments (`FOO=bar cmd`).
- */
-export function tokenizeCommandFragment(fragment: string): string[] {
-	const rawTokens: string[] = [];
-	let current = "";
-	let inSingle = false;
-	let inDouble = false;
-	let index = 0;
-	while (index < fragment.length) {
-		const char = fragment[index] ?? "";
-		const next = index + 1 < fragment.length ? (fragment[index + 1] ?? "") : "";
-		if (inSingle) {
-			// POSIX: backslashes are literal inside single quotes.
-			if (char === "'") {
-				inSingle = false;
-			} else {
-				current += char;
-			}
-			index += 1;
-		} else if (inDouble) {
-			if (char === "\\" && next !== "") {
-				// An escaped character inside double quotes is literal.
-				current += next;
-				index += 2;
-			} else if (char === '"') {
-				inDouble = false;
-				index += 1;
-			} else {
-				current += char;
-				index += 1;
-			}
-		} else if (char === "\\" && next !== "") {
-			// An escaped character outside quotes is literal (an escaped
-			// quote does not open a quoted region).
-			current += next;
-			index += 2;
-		} else if (char === "'") {
-			inSingle = true;
-			index += 1;
-		} else if (char === '"') {
-			inDouble = true;
-			index += 1;
-		} else if (/\s/.test(char)) {
-			if (current.length > 0) {
-				rawTokens.push(current);
-				current = "";
-			}
-			index += 1;
-		} else {
-			current += char;
-			index += 1;
-		}
-	}
-	if (current.length > 0) {
-		rawTokens.push(current);
-	}
-	index = 0;
-	while (index < rawTokens.length && ENV_ASSIGNMENT_PATTERN.test(rawTokens[index] ?? "")) {
-		index += 1;
-	}
-	return rawTokens.slice(index);
-}
-
-function firstNonFlagToken(tokens: string[], fromIndex: number): string | null {
-	for (let i = fromIndex; i < tokens.length; i += 1) {
-		const token = tokens[i] ?? "";
-		if (!token.startsWith("-")) {
-			return token;
-		}
-	}
-	return null;
-}
-
-/**
- * True when the fragment invokes a PR-creating command:
- * `gh pr create`, `glab mr create`, `hub pull-request`, or
- * `git push ... -o merge_request.create`.
- */
-function isPrCreatingCommand(tokens: string[]): boolean {
-	const command = tokens[0] ?? "";
-	switch (command) {
-		case "gh": {
-			const group = firstNonFlagToken(tokens, 1);
-			const action = firstNonFlagToken(tokens, 2);
-			return group === "pr" && action === "create";
-		}
-		case "glab": {
-			const group = firstNonFlagToken(tokens, 1);
-			const action = firstNonFlagToken(tokens, 2);
-			return group === "mr" && action === "create";
-		}
-		case "hub":
-			return firstNonFlagToken(tokens, 1) === "pull-request";
-		case "git": {
-			const subcommand = firstNonFlagToken(tokens, 1);
-			if (subcommand !== "push") {
-				return false;
-			}
-			return tokens.slice(2).some((token) => token === "merge_request.create");
-		}
-		default:
-			return false;
-	}
-}
-
-function commandHasPrCreatingSegment(command: string): boolean {
-	return splitCommandFragments(command).some((fragment) => isPrCreatingCommand(tokenizeCommandFragment(fragment)));
-}
-
-function isPrCreatingMcpTool(toolName: string | null): boolean {
-	if (!toolName) {
-		return false;
-	}
-	return toolName.endsWith("create_pull_request") || toolName.endsWith("create_merge_request");
-}
 
 function findWebUrlInValue(value: unknown, depth: number): string | null {
 	if (value === null || typeof value !== "object" || depth > MAX_STRUCTURED_OUTPUT_DEPTH) {

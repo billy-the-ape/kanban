@@ -90,6 +90,8 @@ export function normalizePrMetadata(raw: unknown, accessScopeId: string, checked
 			: draft
 				? "draft"
 				: "open";
+	// PRLINK-9: optional display title projected from the same read.
+	const title = asString(pr.title);
 	return {
 		accessScopeId,
 		checkedAt,
@@ -101,6 +103,7 @@ export function normalizePrMetadata(raw: unknown, accessScopeId: string, checked
 		headSha: asString(head?.sha),
 		mergedAt: merged ? (asIsoMs(pr.merged_at) ?? checkedAt) : null,
 		mergeCommitSha: merged ? (asString(pr.merge_commit_sha) ?? null) : null,
+		...(title !== null ? { title } : {}),
 	};
 }
 

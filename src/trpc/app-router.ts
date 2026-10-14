@@ -123,9 +123,12 @@ import type {
 	RuntimeTaskPrTrackingResumeResponse,
 	RuntimeTaskPrTrackingStateRequest,
 	RuntimeTaskPrTrackingStateResponse,
+	RuntimeTaskPullRequestLinkedRefreshRequest,
 	RuntimeTaskPullRequestLinkRequest,
 	RuntimeTaskPullRequestLinkResponse,
 	RuntimeTaskPullRequestPrimaryRequest,
+	RuntimeTaskPullRequestRefreshResponse,
+	RuntimeTaskPullRequestSingleRefreshRequest,
 	RuntimeTaskPullRequestsRefreshRequest,
 	RuntimeTaskPullRequestsRefreshResponse,
 	RuntimeTaskReviewInfoRequest,
@@ -275,9 +278,12 @@ import {
 	runtimeTaskPrTrackingResumeResponseSchema,
 	runtimeTaskPrTrackingStateRequestSchema,
 	runtimeTaskPrTrackingStateResponseSchema,
+	runtimeTaskPullRequestLinkedRefreshRequestSchema,
 	runtimeTaskPullRequestLinkRequestSchema,
 	runtimeTaskPullRequestLinkResponseSchema,
 	runtimeTaskPullRequestPrimaryRequestSchema,
+	runtimeTaskPullRequestRefreshResponseSchema,
+	runtimeTaskPullRequestSingleRefreshRequestSchema,
 	runtimeTaskPullRequestsRefreshRequestSchema,
 	runtimeTaskPullRequestsRefreshResponseSchema,
 	runtimeTaskReviewInfoRequestSchema,
@@ -566,6 +572,16 @@ export interface RuntimeTrpcContext {
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskPullRequestsRefreshRequest,
 		) => Promise<RuntimeTaskPullRequestsRefreshResponse>;
+		/** PRLINK-9: one-shot provider metadata refresh for one linked PR (by URL). */
+		refreshTaskPullRequestEntry: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskPullRequestSingleRefreshRequest,
+		) => Promise<RuntimeTaskPullRequestRefreshResponse>;
+		/** PRLINK-9: one-shot provider metadata refresh for every linked PR. */
+		refreshLinkedTaskPullRequests: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskPullRequestLinkedRefreshRequest,
+		) => Promise<RuntimeTaskPullRequestRefreshResponse>;
 	};
 	projectsApi: {
 		listProjects: (preferredWorkspaceId: string | null) => Promise<RuntimeProjectsResponse>;
@@ -1084,6 +1100,19 @@ export const runtimeAppRouter = t.router({
 			.output(runtimeTaskPullRequestsRefreshResponseSchema)
 			.mutation(async ({ ctx, input }) => {
 				return await ctx.workspaceApi.refreshTaskPullRequests(ctx.workspaceScope, input);
+			}),
+		// PRLINK-9: provider-aware metadata refresh of already-linked PRs.
+		refreshTaskPullRequestEntry: workspaceProcedure
+			.input(runtimeTaskPullRequestSingleRefreshRequestSchema)
+			.output(runtimeTaskPullRequestRefreshResponseSchema)
+			.mutation(async ({ ctx, input }) => {
+				return await ctx.workspaceApi.refreshTaskPullRequestEntry(ctx.workspaceScope, input);
+			}),
+		refreshLinkedTaskPullRequests: workspaceProcedure
+			.input(runtimeTaskPullRequestLinkedRefreshRequestSchema)
+			.output(runtimeTaskPullRequestRefreshResponseSchema)
+			.mutation(async ({ ctx, input }) => {
+				return await ctx.workspaceApi.refreshLinkedTaskPullRequests(ctx.workspaceScope, input);
 			}),
 		getWorkspaceChanges: workspaceProcedure.output(runtimeWorkspaceChangesResponseSchema).query(async ({ ctx }) => {
 			return await ctx.workspaceApi.loadWorkspaceChanges(ctx.workspaceScope);

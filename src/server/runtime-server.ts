@@ -680,6 +680,8 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 						deps.warn(`[pr-tracking] Reconcile pass failed for ${scope.workspaceId}: ${error}`);
 					});
 				},
+				// PRLINK-9: one-shot metadata refresh of already-linked PRs.
+				getPrTrackingCoordinator: () => getPrTrackingState().coordinator,
 			}),
 			projectsApi: createProjectsApi({
 				getActiveWorkspacePath: deps.workspaceRegistry.getActiveWorkspacePath,

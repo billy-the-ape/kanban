@@ -87,6 +87,7 @@ describe("getPullRequestRefreshMessage", () => {
 		expect(getPullRequestRefreshMessage("no_gh")).toBe("GitHub CLI (gh) not found");
 		expect(getPullRequestRefreshMessage("gh_failed")).toBe("Could not query GitHub");
 		expect(getPullRequestRefreshMessage("no_worktree")).toBe("Task worktree no longer exists");
+		expect(getPullRequestRefreshMessage("no_remote")).toBe("No recognized origin remote for this task's worktree");
 		expect(getPullRequestRefreshMessage("no_branch")).toBe("Could not determine the current branch");
 	});
 

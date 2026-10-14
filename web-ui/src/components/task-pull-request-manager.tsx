@@ -14,6 +14,7 @@ import { getRuntimeTrpcClient } from "@/runtime/trpc-client";
 import type { RuntimeTaskPullRequest } from "@/runtime/types";
 import {
 	formatPullRequestLabel,
+	getLinkedRefreshMessages,
 	getPullRequestKey,
 	getPullRequestRefreshMessage,
 	validatePullRequestUrlShape,
@@ -24,6 +25,8 @@ const CLEAR_PRIMARY_PENDING_KEY = "__clear-primary__";
 const MAKE_PRIMARY_TOOLTIP =
 	"Make primary for display. The Automation PR is selected separately in PR tracking settings.";
 const CLEAR_PRIMARY_TOOLTIP = "Use automatic display order";
+const REFRESH_LINKED_TOOLTIP =
+	"Refresh this pull request's state and title from the provider. Works even when the task is done or the link came from another branch.";
 
 interface TaskPullRequestManagerPopoverProps {
 	trigger: ReactNode;
@@ -66,6 +69,8 @@ export function TaskPullRequestManagerPopover({
 	// PRLINK-6: pending display-primary actions (server response is authoritative).
 	const [primaryPendingKey, setPrimaryPendingKey] = useState<string | null>(null);
 	const [refreshing, setRefreshing] = useState(false);
+	// PRLINK-9: per-row provider metadata refresh pending keys.
+	const [refreshingKey, setRefreshingKey] = useState<string | null>(null);
 	const isOpen = open ?? uncontrolledOpen;
 	const validationError = url.trim() ? validatePullRequestUrlShape(url) : null;
 	const canSubmit = validationError === null && !submitting;
@@ -194,7 +199,8 @@ export function TaskPullRequestManagerPopover({
 		}
 		setRefreshing(true);
 		try {
-			const response = await getRuntimeTrpcClient(workspaceId).workspace.refreshTaskPullRequests.mutate({ taskId });
+			const client = getRuntimeTrpcClient(workspaceId);
+			const response = await client.workspace.refreshTaskPullRequests.mutate({ taskId });
 			if (!response.ok) {
 				showAppToast({ intent: "warning", message: response.error || "Refresh failed." });
 				return;
@@ -205,6 +211,14 @@ export function TaskPullRequestManagerPopover({
 			if (message) {
 				showAppToast({ intent: "primary", message });
 			}
+			// PRLINK-9: also refresh the stored links' metadata via the
+			// provider (works for Done tasks and other branches/repos).
+			if (pullRequests.length > 0) {
+				const linked = await client.workspace.refreshLinkedTaskPullRequests.mutate({ taskId });
+				for (const linkedMessage of getLinkedRefreshMessages(linked.updated, linked.outcomes)) {
+					showAppToast({ intent: "primary", message: linkedMessage });
+				}
+			}
 		} catch (error) {
 			showAppToast({
 				intent: "warning",
@@ -212,6 +226,35 @@ export function TaskPullRequestManagerPopover({
 			});
 		} finally {
 			setRefreshing(false);
+		}
+	};
+
+	// PRLINK-9: refresh ONE stored link's metadata via the provider.
+	const handleRefreshLinked = async (pullRequest: RuntimeTaskPullRequest): Promise<void> => {
+		const key = getPullRequestKey(pullRequest);
+		setRefreshingKey(key);
+		try {
+			const response = await getRuntimeTrpcClient(workspaceId).workspace.refreshTaskPullRequestEntry.mutate({
+				taskId,
+				url: pullRequest.url,
+			});
+			if (!response.ok) {
+				showAppToast({
+					intent: "warning",
+					message: response.error || "Could not refresh the pull request.",
+				});
+				return;
+			}
+			for (const message of getLinkedRefreshMessages(response.updated, response.outcomes)) {
+				showAppToast({ intent: "primary", message });
+			}
+		} catch (error) {
+			showAppToast({
+				intent: "warning",
+				message: error instanceof Error ? error.message : "Could not refresh the pull request.",
+			});
+		} finally {
+			setRefreshingKey(null);
 		}
 	};
 
@@ -283,6 +326,7 @@ export function TaskPullRequestManagerPopover({
 								const isExplicitPrimary = isWinner && pullRequest.isPrimary === true;
 								const isPrimaryPending = primaryPendingKey === key;
 								const isClearPrimaryPending = primaryPendingKey === CLEAR_PRIMARY_PENDING_KEY;
+								const isRefreshingLinked = refreshingKey === key;
 								// PRLINK-7: on mobile the repository, state, and winner label are
 								// visible in the row instead of living in a hover tooltip.
 								const rowMetaParts = [pullRequest.repository, pullRequest.state ?? "state unknown"];
@@ -342,6 +386,31 @@ export function TaskPullRequestManagerPopover({
 													data-testid={`task-pr-make-primary-${pullRequest.number}`}
 												/>
 											</Tooltip>
+										)}
+										{!mobile ? (
+											<Tooltip content={REFRESH_LINKED_TOOLTIP}>
+												<Button
+													variant="ghost"
+													size="sm"
+													aria-label={REFRESH_LINKED_TOOLTIP}
+													icon={isRefreshingLinked ? <Spinner size={10} /> : <RefreshCw size={12} />}
+													disabled={isRefreshingLinked || refreshing}
+													onClick={() => void handleRefreshLinked(pullRequest)}
+													className={actionButtonClass}
+													data-testid={`task-pr-refresh-linked-${pullRequest.number}`}
+												/>
+											</Tooltip>
+										) : (
+											<Button
+												variant="ghost"
+												size="sm"
+												aria-label={`Refresh ${formatPullRequestLabel(pullRequest, "full")}`}
+												icon={isRefreshingLinked ? <Spinner size={10} /> : <RefreshCw size={12} />}
+												disabled={isRefreshingLinked || refreshing}
+												onClick={() => void handleRefreshLinked(pullRequest)}
+												className={actionButtonClass}
+												data-testid={`task-pr-refresh-linked-${pullRequest.number}`}
+											/>
 										)}
 										<Button
 											variant="ghost"

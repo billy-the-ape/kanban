@@ -214,6 +214,7 @@ export type RuntimeTaskPullRequestsRefreshRequest = z.infer<typeof runtimeTaskPu
 export const runtimeTaskPullRequestRefreshReasonSchema = z.enum([
 	"no_task",
 	"no_worktree",
+	"no_remote",
 	"no_branch",
 	"no_gh",
 	"gh_failed",
@@ -233,6 +234,53 @@ export const runtimeTaskPullRequestsRefreshResponseSchema = z.object({
 	error: z.string().optional(),
 });
 export type RuntimeTaskPullRequestsRefreshResponse = z.infer<typeof runtimeTaskPullRequestsRefreshResponseSchema>;
+
+// PRLINK-9: provider-aware metadata refresh of already-linked PRs. The
+// current `refreshTaskPullRequests` only lists PRs for the task's current
+// branch; these routes refresh the stored links by identity instead.
+//
+// A single refresh names one link by URL; the linked refresh covers every
+// existing link (capped at 20) with at most 4 in-flight reads and a bounded
+// overall deadline. Both return per-identity outcomes and an updated count.
+export const runtimeTaskPullRequestSingleRefreshRequestSchema = z.object({
+	taskId: z.string(),
+	url: z.string().min(1).max(2048),
+});
+export type RuntimeTaskPullRequestSingleRefreshRequest = z.infer<
+	typeof runtimeTaskPullRequestSingleRefreshRequestSchema
+>;
+
+export const runtimeTaskPullRequestLinkedRefreshRequestSchema = z.object({
+	taskId: z.string(),
+});
+export type RuntimeTaskPullRequestLinkedRefreshRequest = z.infer<
+	typeof runtimeTaskPullRequestLinkedRefreshRequestSchema
+>;
+
+/**
+ * Per-identity outcome of a metadata refresh. `checkedAt` and `error` are
+ * set where applicable; errors are sanitized category strings, never raw
+ * provider output.
+ */
+export const runtimeTaskPullRequestRefreshOutcomeSchema = z.object({
+	provider: runtimeTaskPullRequestProviderSchema,
+	host: z.string(),
+	repository: z.string(),
+	number: z.number().int().positive(),
+	outcome: z.enum(["refreshed", "unsupported", "failed", "unlinked"]),
+	checkedAt: z.number().optional(),
+	error: z.string().optional(),
+});
+export type RuntimeTaskPullRequestRefreshOutcome = z.infer<typeof runtimeTaskPullRequestRefreshOutcomeSchema>;
+
+export const runtimeTaskPullRequestRefreshResponseSchema = z.object({
+	ok: z.boolean(),
+	/** Number of linked entries whose snapshot actually changed. */
+	updated: z.number().int().nonnegative(),
+	outcomes: z.array(runtimeTaskPullRequestRefreshOutcomeSchema),
+	error: z.string().optional(),
+});
+export type RuntimeTaskPullRequestRefreshResponse = z.infer<typeof runtimeTaskPullRequestRefreshResponseSchema>;
 
 // --- PR comment automation (COMMENT-0) ----------------------------------------
 
@@ -2846,6 +2894,11 @@ export const githubPrMetadataSnapshotSchema = z
 		headSha: z.string().nullable(),
 		mergedAt: z.number().nullable(),
 		mergeCommitSha: z.string().nullable(),
+		/**
+		 * PRLINK-9: optional display title projected from the same read
+		 * (no second fetch). Optional so older snapshots keep validating.
+		 */
+		title: z.string().optional(),
 	})
 	.passthrough();
 export type GitHubPrMetadataSnapshot = z.infer<typeof githubPrMetadataSnapshotSchema>;

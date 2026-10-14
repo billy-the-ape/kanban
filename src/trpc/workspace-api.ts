@@ -8,6 +8,7 @@ import type {
 	RuntimeGitSyncAction,
 	RuntimeGitSyncResponse,
 	RuntimeTaskPullRequestLinkResponse,
+	RuntimeTaskPullRequestRefreshResponse,
 	RuntimeTaskPullRequestsRefreshResponse,
 	RuntimeTaskSessionSummary,
 	RuntimeWorkspaceChangesMode,
@@ -17,8 +18,10 @@ import type {
 import {
 	parseGitCheckoutRequest,
 	parseTaskPreservationRequest,
+	parseTaskPullRequestLinkedRefreshRequest,
 	parseTaskPullRequestLinkRequest,
 	parseTaskPullRequestPrimaryRequest,
+	parseTaskPullRequestSingleRefreshRequest,
 	parseTaskPullRequestsRefreshRequest,
 	parseWorktreeDeleteRequest,
 	parseWorktreeEnsureRequest,
@@ -26,6 +29,7 @@ import {
 import { getPullRequestIdentityKey, parsePullRequestUrl } from "../core/pull-request-links";
 import { removeTaskPullRequest, setPrimaryTaskPullRequest } from "../core/task-board-mutations";
 import { resolveWorkspaceSessionSummaries } from "../core/workspace-session-summaries";
+import type { PrTrackingCoordinator } from "../pr-tracking/pr-tracking-coordinator";
 import { isTaskWriterActive } from "../server/task-writer-activity";
 import {
 	loadWorkspaceBoardById,
@@ -49,6 +53,10 @@ import {
 	fireReviewPullRequestLookup,
 	lookupTaskPullRequests,
 } from "../workspace/task-pull-request-lookup";
+import {
+	refreshLinkedTaskPullRequests as refreshLinkedTaskPullRequestsCore,
+	refreshTaskPullRequestEntry as refreshTaskPullRequestEntryCore,
+} from "../workspace/task-pull-request-refresh";
 import { recordTaskPullRequests } from "../workspace/task-pull-requests";
 import { listBlockedTaskCleanups, runTaskWorkspaceMaintenance } from "../workspace/task-workspace-maintenance";
 import {
@@ -76,6 +84,11 @@ export interface CreateWorkspaceApiDependencies {
 	refreshPrCommentTracking?: (scope: { workspaceId: string; workspacePath: string }) => void;
 	/** PRTRACK-1: reconcile task-derived PR tracking subscriptions after a board change. */
 	runPrTrackingReconcilePass?: (scope: { workspaceId: string; workspacePath: string }) => void;
+	/**
+	 * PRLINK-9: the tracking coordinator backing the one-shot metadata refresh
+	 * of already-linked PRs. Null when PR tracking is not available.
+	 */
+	getPrTrackingCoordinator?: () => PrTrackingCoordinator | null;
 }
 
 function normalizeOptionalTaskWorkspaceScopeInput(
@@ -736,6 +749,93 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 					updated: 0,
 					error: error instanceof Error ? error.message : String(error),
 				} satisfies RuntimeTaskPullRequestsRefreshResponse;
+			}
+		},
+		// PRLINK-9: provider-aware metadata refresh of ONE linked PR (by URL).
+		refreshTaskPullRequestEntry: async (workspaceScope, input): Promise<RuntimeTaskPullRequestRefreshResponse> => {
+			try {
+				const body = parseTaskPullRequestSingleRefreshRequest(input);
+				const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
+				if (!taskExistsOnBoard(board, body.taskId)) {
+					return {
+						ok: false,
+						updated: 0,
+						outcomes: [],
+						error: `Task "${body.taskId}" not found`,
+					} satisfies RuntimeTaskPullRequestRefreshResponse;
+				}
+				const coordinator = deps.getPrTrackingCoordinator?.();
+				if (!coordinator) {
+					return {
+						ok: false,
+						updated: 0,
+						outcomes: [],
+						error: "PR tracking is not available",
+					} satisfies RuntimeTaskPullRequestRefreshResponse;
+				}
+				const result = await refreshTaskPullRequestEntryCore({
+					workspacePath: workspaceScope.workspacePath,
+					taskId: body.taskId,
+					url: body.url,
+					refresh: (canonicalPrKey) => coordinator.refreshPrMetadataOnce(canonicalPrKey),
+				});
+				if (result.updated > 0) {
+					void deps.broadcastRuntimeWorkspaceStateUpdated(
+						workspaceScope.workspaceId,
+						workspaceScope.workspacePath,
+					);
+				}
+				return result;
+			} catch (error) {
+				return {
+					ok: false,
+					updated: 0,
+					outcomes: [],
+					error: error instanceof Error ? error.message : String(error),
+				} satisfies RuntimeTaskPullRequestRefreshResponse;
+			}
+		},
+		// PRLINK-9: provider-aware metadata refresh of EVERY linked PR.
+		refreshLinkedTaskPullRequests: async (workspaceScope, input): Promise<RuntimeTaskPullRequestRefreshResponse> => {
+			try {
+				const body = parseTaskPullRequestLinkedRefreshRequest(input);
+				const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
+				if (!taskExistsOnBoard(board, body.taskId)) {
+					return {
+						ok: false,
+						updated: 0,
+						outcomes: [],
+						error: `Task "${body.taskId}" not found`,
+					} satisfies RuntimeTaskPullRequestRefreshResponse;
+				}
+				const coordinator = deps.getPrTrackingCoordinator?.();
+				if (!coordinator) {
+					return {
+						ok: false,
+						updated: 0,
+						outcomes: [],
+						error: "PR tracking is not available",
+					} satisfies RuntimeTaskPullRequestRefreshResponse;
+				}
+				const result = await refreshLinkedTaskPullRequestsCore({
+					workspacePath: workspaceScope.workspacePath,
+					taskId: body.taskId,
+					refresh: (canonicalPrKey) => coordinator.refreshPrMetadataOnce(canonicalPrKey),
+				});
+				if (result.updated > 0) {
+					void deps.broadcastRuntimeWorkspaceStateUpdated(
+						workspaceScope.workspaceId,
+						workspaceScope.workspacePath,
+					);
+				}
+				return result;
+			} catch (error) {
+				return {
+					ok: false,
+					updated: 0,
+					outcomes: [],
+					error: error instanceof Error ? error.message : String(error),
+				} satisfies RuntimeTaskPullRequestRefreshResponse;
 			}
 		},
 		loadWorkspaceChanges: async (workspaceScope) => {

@@ -1,6 +1,6 @@
 # PRLINK-9 — Provider boundaries and explicit linked-PR refresh
 
-**Status: READY FOR IMPLEMENTATION. Depends on v1 and PRLINK-6.**
+**Status: IMPLEMENTED (this PR). Depends on v1 and PRLINK-6.**
 Master plan: [v1](../complete/pr-linking/PR_LINKING_PLAN.md). Shared context: [follow-ups](PRLINK-FOLLOWUPS.md).
 Deliver as one provider/read-path PR. This replaces the draft's unbounded multi-provider rollout.
 
@@ -98,3 +98,37 @@ Coalesce duplicate refresh clicks, disable pending actions and show concise sani
 - GitHub delivery regression, creation detection gates and web-ui shared parsing/labels remain valid.
 
 Follow the shared verification/deployment rules in PRLINK-FOLLOWUPS.md.
+
+## Implementation notes (final state)
+
+- Provider policies live in `src/core/pull-request-providers/` (`capabilities.ts`, `creation-command-gate.ts`,
+  `remote-context.ts`, `url-parser.ts`) and are exposed through `src/core/pull-request-links.ts` and
+  `src/core/pull-request-detection.ts`. The strict WHATWG-URL parser in `url-parser.ts` replaces the old
+  regex parser; GitHub keeps trailing path/query/fragment stripping (`/pull/12/files` → `/pull/12`),
+  GitLab/Bitbucket also keep trailing path segments stripped (`/diffs`, `/diff`, `/overview`),
+  matching the old regex parsers so copied Files/Diffs-tab URLs canonicalize to the bare PR/MR URL.
+- `workspace.refreshTaskPullRequest` / `workspace.refreshLinkedTaskPullRequests` (in
+  `src/workspace/task-pull-request-refresh.ts`) refresh already-linked PRs by identity. They resolve the
+  provider from the link, reject unsupported providers/hosts, coalesce concurrent clicks, cap linked
+  refresh at 20 links, batch at most 4 reads concurrently, enforce a 60s overall deadline (no retry), and
+  apply results under the workspace lock (no resurrection, stale results ignored, no-op writes skipped).
+- The shared tracking coordinator gained `refreshPrMetadataOnce(canonicalPrKey)` (in
+  `src/pr-tracking/pr-tracking-coordinator.ts`): a display-only, access-scoped metadata read that works
+  without an active subscription, creates no subscription/consumer, reuses the read limiter/auth/backoff,
+  and never fabricates a snapshot for a `not_modified` read without cached data.
+- Branch discovery (`src/workspace/task-pull-request-lookup.ts`) now resolves the provider/repository from
+  the task worktree's ORIGIN remote (`resolveBranchDiscoveryContext`); a missing/unrecognized remote yields
+  `no_remote` (no guessed repository). `mapGhPullRequestState` uses gh's `isDraft` bit (merged/closed win).
+- Tests: `test/runtime/core/pull-request-providers.test.ts` (parser/remote/capability matrix),
+  `test/workspace/task-pull-request-refresh.test.ts` (one-shot + linked refresh, seeded via the
+  server-owned `recordTaskPullRequests` path), `test/runtime/pr-tracking/pr-tracking-coordinator.test.ts`
+  (one-shot refresh creates no subscription/consumer), and updated `task-pull-request-lookup`/
+  `pull-request-links`/`pull-request-detection` tests.
+- Review fixes: the GitLab `-/merge_requests/<n>` marker may sit anywhere in the path (trailing
+  segments like `/diffs` are stripped) and Bitbucket accepts trailing segments (`/diff`, `/overview`),
+  restoring the old parsers' copied-tab-URL behavior. A freshly created PR poll state always forces a
+  fresh first metadata read (`metadataNeedsFresh: true`), so a subscription added after a one-shot
+  refresh (which warms the adapter digest cache) still loads its `prState` on the first poll instead
+  of reading `not_modified` with no metadata. Linked/single refresh applies no write and reports no
+  `updated` when the stored state and title are unchanged (no revision churn on repeated refreshes).
+  The web-ui maps the new `no_remote` refresh reason to a user-facing message.

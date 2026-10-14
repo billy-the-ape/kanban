@@ -22,6 +22,7 @@ import type { RuntimeBoardCard, RuntimeBoardData, RuntimeTaskPullRequest } from 
 import { createGitProcessEnv } from "../core/git-process-env";
 import type { ParsedPullRequestLink } from "../core/pull-request-links";
 import { getPullRequestIdentityKey, parsePullRequestUrl } from "../core/pull-request-links";
+import { resolveBranchDiscoveryContext } from "../core/pull-request-providers/remote-context";
 import {
 	addTaskPullRequests,
 	LAST_SEEN_OBSERVATION_THROTTLE_MS,
@@ -44,6 +45,9 @@ export type TaskPullRequestGhRunner = (
 	cwd: string,
 ) => Promise<{ ok: boolean; stdout: string; stderr: string; exitCode: number; missingBinary: boolean }>;
 
+/** Injectable origin-remote reader (tests pass fakes). */
+export type TaskPullRequestRemoteResolver = (worktreePath: string) => Promise<string | null>;
+
 export interface TaskPullRequestLookupInput {
 	workspacePath: string;
 	taskId: string;
@@ -51,11 +55,14 @@ export interface TaskPullRequestLookupInput {
 	branch?: string;
 	/** Injectable gh runner (tests pass fakes). */
 	gh?: TaskPullRequestGhRunner;
+	/** Injectable origin remote reader (tests pass fakes). */
+	resolveOriginRemote?: TaskPullRequestRemoteResolver;
 }
 
 export type TaskPullRequestLookupReason =
 	| "no_task"
 	| "no_worktree"
+	| "no_remote"
 	| "no_branch"
 	| "no_gh"
 	| "gh_failed"
@@ -115,17 +122,40 @@ async function resolveCurrentBranch(worktreePath: string): Promise<string | null
 	}
 }
 
-function mapGhPullRequestState(raw: string): RuntimeTaskPullRequest["state"] | null {
-	// gh's `state` enum is OPEN/MERGED/CLOSED (no draft); leave draft unset.
-	const normalized = raw.toUpperCase();
-	if (normalized === "OPEN") {
-		return "open";
+/**
+ * Reads the task worktree's ORIGIN remote with a direct git call. The provider
+ * and repository for branch discovery come from this remote — never from a
+ * card title or an arbitrary linked PR.
+ */
+async function resolveOriginRemote(worktreePath: string): Promise<string | null> {
+	try {
+		const { stdout } = await execFileAsync("git", ["remote", "get-url", "origin"], {
+			cwd: worktreePath,
+			encoding: "utf8",
+			env: createGitProcessEnv(),
+			signal: AbortSignal.timeout(TASK_PULL_REQUEST_GIT_TIMEOUT_MS),
+		});
+		const remote = String(stdout ?? "").trim();
+		return remote || null;
+	} catch {
+		// No origin remote (or git error): branch discovery is unsupported.
+		return null;
 	}
+}
+
+function mapGhPullRequestState(raw: string, isDraft: boolean): RuntimeTaskPullRequest["state"] | null {
+	// gh's `state` enum is OPEN/MERGED/CLOSED; `isDraft` distinguishes draft
+	// from open. Merged and closed win over draft (a closed draft PR must
+	// never read as pollable "draft").
+	const normalized = raw.toUpperCase();
 	if (normalized === "MERGED") {
 		return "merged";
 	}
 	if (normalized === "CLOSED") {
 		return "closed";
+	}
+	if (normalized === "OPEN") {
+		return isDraft ? "draft" : "open";
 	}
 	return null;
 }
@@ -153,9 +183,12 @@ function parseGhPullRequestEntries(stdout: string): GhPullRequestEntry[] {
 		if (!item || typeof item !== "object") {
 			continue;
 		}
-		const candidate = item as { url?: unknown; title?: unknown; state?: unknown };
+		const candidate = item as { url?: unknown; title?: unknown; state?: unknown; isDraft?: unknown };
 		const url = typeof candidate.url === "string" ? candidate.url : null;
-		const state = typeof candidate.state === "string" ? mapGhPullRequestState(candidate.state) : null;
+		const state =
+			typeof candidate.state === "string"
+				? mapGhPullRequestState(candidate.state, candidate.isDraft === true)
+				: null;
 		const title = typeof candidate.title === "string" && candidate.title.trim() ? candidate.title.trim() : undefined;
 		if (!url || !state) {
 			continue;
@@ -211,8 +244,17 @@ export async function lookupTaskPullRequests(input: TaskPullRequestLookupInput):
 			logLookupFailure(taskId, "no resolvable branch (detached HEAD or git error)");
 			return noOpResult("no_branch");
 		}
+		// PRLINK-9: the provider and repository for discovery come from the
+		// task worktree's ORIGIN remote. Missing, malformed, or unrecognized
+		// remotes yield no discovery — never a guessed repository.
+		const resolveRemote = input.resolveOriginRemote ?? resolveOriginRemote;
+		const discovery = resolveBranchDiscoveryContext(await resolveRemote(worktreePath));
+		if (!discovery) {
+			logLookupFailure(taskId, "no usable origin remote for provider branch discovery");
+			return noOpResult("no_remote");
+		}
 		const ghResult = await gh(
-			["pr", "list", "--head", branch, "--state", "all", "--json", "number,url,title,state", "--limit", "5"],
+			["pr", "list", "--head", branch, "--state", "all", "--json", "number,url,title,state,isDraft", "--limit", "5"],
 			worktreePath,
 		);
 		if (ghResult.missingBinary) {
@@ -317,6 +359,7 @@ export function fireReviewPullRequestLookup(input: {
 	taskId: string;
 	onChanged?: (recorded: number) => void;
 	gh?: TaskPullRequestGhRunner;
+	resolveOriginRemote?: TaskPullRequestRemoteResolver;
 }): void {
 	void (async () => {
 		try {
@@ -329,6 +372,7 @@ export function fireReviewPullRequestLookup(input: {
 				workspacePath: input.workspacePath,
 				taskId: input.taskId,
 				gh: input.gh,
+				...(input.resolveOriginRemote !== undefined ? { resolveOriginRemote: input.resolveOriginRemote } : {}),
 			});
 			if (result.recorded > 0) {
 				input.onChanged?.(result.recorded);

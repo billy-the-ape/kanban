@@ -947,10 +947,10 @@ describe("pr-tracking-coordinator", () => {
 		const coordinator = track(harness.coordinator);
 		expect((await coordinator.addSubscription(descriptor())).status).toBe("active");
 
-		await pollOnce(); // metadata read 0 (fresh=false); snapshot write fails
-		expect(harness.fake.metadataFreshFlags()).toEqual([false]);
+		await pollOnce(); // metadata read 0 (fresh: a new poll state has no metadata); snapshot write fails
+		expect(harness.fake.metadataFreshFlags()).toEqual([true]);
 		await pollOnce(); // metadata read 1 (fresh=true) so applied state catches the digest
-		expect(harness.fake.metadataFreshFlags()).toEqual([false, true]);
+		expect(harness.fake.metadataFreshFlags()).toEqual([true, true]);
 	});
 
 	it("any current card, in any column, keeps a record linked for orphan classification", async () => {
@@ -1175,7 +1175,7 @@ describe("pr-tracking-coordinator", () => {
 		const coordinator = track(harness.coordinator);
 		expect((await coordinator.addSubscription(descriptor())).status).toBe("active");
 
-		await pollOnce(); // fresh authoritative read
+		await pollOnce(); // fresh authoritative read (a new poll state has no metadata)
 		const snapshot = coordinator.getSnapshotsForTask("ws-1", "task-1");
 		expect(snapshot?.isStale).toBe(false);
 		const firstCheckedAt = snapshot?.checkedAt ?? null;
@@ -1184,7 +1184,7 @@ describe("pr-tracking-coordinator", () => {
 		// a healthy PR must not read as stale in its steady state.
 		await pollOnce();
 		expect(harness.fake.metadataCalls()).toBe(2);
-		expect(harness.fake.metadataFreshFlags()).toEqual([false, false]);
+		expect(harness.fake.metadataFreshFlags()).toEqual([true, false]);
 		const secondSnapshot = coordinator.getSnapshotsForTask("ws-1", "task-1");
 		expect(secondSnapshot?.isStale).toBe(false);
 		expect(secondSnapshot?.checkedAt).not.toBe(firstCheckedAt);
@@ -1219,5 +1219,96 @@ describe("pr-tracking-coordinator", () => {
 		await coordinator.refresh(PR49, "scope-A");
 		const sub = coordinator.getState().subscriptions.find((item) => item.workspaceId === "ws-1");
 		expect(sub?.accessScopeId).toBe("scope-B");
+	});
+
+	it("PRLINK-9: one-shot metadata refresh works with no subscription and creates none", async () => {
+		const harness = makeCoordinator();
+		const coordinator = track(harness.coordinator);
+
+		// No subscription is registered at all: a display-only refresh of a
+		// done task must not create or resume anything.
+		expect(coordinator.getState().subscriptions).toHaveLength(0);
+
+		const result = await coordinator.refreshPrMetadataOnce(PR49);
+		expect(result.outcome).toBe("refreshed");
+		expect(result.error).toBeNull();
+		expect(result.metadata?.state).toBe("open");
+		expect(result.checkedAt).not.toBeNull();
+
+		// Exactly ONE metadata read: no feedback reads, no consumer dispatch.
+		expect(harness.fake.metadataCalls()).toBe(1);
+		expect(harness.fake.metadataFreshFlags()).toEqual([false]);
+		expect(harness.fake.listCalls()).toEqual([]);
+		expect(harness.fake.threadCalls()).toBe(0);
+
+		// Still no subscription was created and no poll was armed.
+		expect(coordinator.getState().subscriptions).toHaveLength(0);
+		expect(coordinator.getState().polls).toHaveLength(0);
+
+		// The access-scoped snapshot was persisted, creating the record for a
+		// PR that was never tracked.
+		const record = await harness.store.loadRecord(PR49);
+		expect(record.ok).toBe(true);
+		if (record.ok && result.checkedAt !== null) {
+			expect(record.record.snapshots["scope-A"]?.checkedAt).toBe(result.checkedAt);
+		}
+	});
+
+	it("PRLINK-9: one-shot not_modified without any cached snapshot never fabricates one", async () => {
+		const harness = makeCoordinator({ metadata: () => ({ kind: "not_modified" }) });
+		const coordinator = track(harness.coordinator);
+
+		const result = await coordinator.refreshPrMetadataOnce(PR49);
+		expect(result.outcome).toBe("failed");
+		expect(result.error).toBe("no_cached_snapshot");
+		expect(result.metadata).toBeNull();
+	});
+
+	it("PRLINK-9: one-shot unsupported host fails without any provider query", async () => {
+		const harness = makeCoordinator();
+		const coordinator = track(harness.coordinator);
+
+		const result = await coordinator.refreshPrMetadataOnce("gitlab|gitlab.com|group/project|7");
+		expect(result.outcome).toBe("failed");
+		expect(result.error).toBe("unsupported_host");
+		expect(harness.fake.scopeCalls()).toBe(0);
+		expect(harness.fake.metadataCalls()).toBe(0);
+	});
+
+	it("PRLINK-9: a subscription added after a one-shot refresh loads prState on its first poll", async () => {
+		// Simulate the adapter digest cache: the first read of an unchanged
+		// body (the one-shot) returns a body and warms the cache; later
+		// non-fresh reads of the unchanged body report not_modified.
+		let harnessRef: Harness | undefined;
+		const harness = makeCoordinator({
+			metadata: (callIndex) => {
+				const fresh = harnessRef?.fake.metadataFreshFlags()[callIndex] ?? false;
+				return fresh || callIndex === 0 ? makeMetadata("open", "scope-A", 49) : { kind: "not_modified" };
+			},
+		});
+		harnessRef = harness;
+		const coordinator = track(harness.coordinator);
+
+		// Display-only refresh of an untracked PR: one metadata read, no poll
+		// state left behind (the digest cache is now warm).
+		const oneShot = await coordinator.refreshPrMetadataOnce(PR49);
+		expect(oneShot.outcome).toBe("refreshed");
+		expect(coordinator.getState().polls).toHaveLength(0);
+
+		// A subscription added later must load its prState on the FIRST poll,
+		// even though the digest cache is warm: the fresh poll state has no
+		// metadata and must force a fresh read, so a not_modified first poll
+		// can never strand prState (a merged PR is static, so that would
+		// persist indefinitely).
+		expect((await coordinator.addSubscription(descriptor())).status).toBe("active");
+		await pollOnce();
+
+		expect(harness.fake.metadataCalls()).toBe(2);
+		expect(harness.fake.metadataFreshFlags()).toEqual([false, true]);
+		const record = await harness.store.loadRecord(PR49);
+		expect(record.ok).toBe(true);
+		if (record.ok) {
+			expect(record.record.snapshots["scope-A"]?.state).toBe("open");
+		}
 	});
 });
