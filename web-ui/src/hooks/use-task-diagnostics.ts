@@ -1,10 +1,11 @@
 // B-10.2/3/7: single-task diagnostics state for the detail view — the
 // aggregated query, the operator actions (with a pending state so double
-// clicks never double-run), and the redacted bundle export.
+// clicks never double-run), and the DIAG-3 full-fidelity bundle download.
 import { useCallback, useState } from "react";
 
 import { showAppToast } from "@/components/app-toaster";
-import { exportTaskDiagnostics, fetchTaskDiagnostics, runTaskDiagnosticsAction } from "@/runtime/task-diagnostics";
+import { fetchTaskDiagnostics, runTaskDiagnosticsAction } from "@/runtime/task-diagnostics";
+import { downloadTaskDiagnostics } from "@/runtime/task-diagnostics-download";
 import type { RuntimeTaskDiagnosticsActionName, RuntimeTaskDiagnosticsResponse } from "@/runtime/types";
 import { useTrpcQuery } from "@/runtime/use-trpc-query";
 
@@ -71,21 +72,15 @@ export function useTaskDiagnostics(workspaceId: string | null, taskId: string | 
 		}
 		setExporting(true);
 		try {
-			const response = await exportTaskDiagnostics(workspaceId, taskId);
-			if (response?.ok && response.bundlePath) {
-				const redactionNote =
-					response.redactions.length > 0 ? ` (redacted: ${response.redactions.join(", ")})` : "";
-				showAppToast({
-					intent: "success",
-					message: `Diagnostics bundle written to ${response.bundlePath}${redactionNote}`,
-					timeout: 8000,
-				});
-			} else {
-				showAppToast({
-					intent: "danger",
-					message: `Diagnostics export failed: ${response?.error ?? "runtime request error"}`,
-				});
-			}
+			// DIAG-3: the full-fidelity bundle downloads as a browser file
+			// (client-built filename); nothing is written to the runtime host.
+			await downloadTaskDiagnostics(workspaceId, taskId);
+			showAppToast({ intent: "success", message: "Diagnostics download started." });
+		} catch (error) {
+			showAppToast({
+				intent: "danger",
+				message: `Diagnostics download failed: ${error instanceof Error ? error.message : String(error)}`,
+			});
 		} finally {
 			setExporting(false);
 		}

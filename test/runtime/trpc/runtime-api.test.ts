@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -3314,33 +3314,30 @@ describe("return queued task to Backlog", () => {
 	});
 });
 
-// DIAG-2: the full-fidelity diagnostic export route. The bundle is written to
-// the runtime home (redirected HOME), streamed as schemaVersion 3 JSON, and
-// must never redact task content.
-describe("createRuntimeApi exportTaskDiagnostics (DIAG-2)", () => {
+// DIAG-3: full-fidelity diagnostics export plan assembly for the GET download
+// route. The method is read-only — it returns the schemaVersion 3 plan and
+// writes nothing; the route streams it to the response (covered in
+// test/runtime/server/task-diagnostics-download.test.ts).
+describe("createRuntimeApi buildTaskDiagnosticsExportPlan (DIAG-3)", () => {
 	let previousHome: string | undefined;
 	let previousUserProfile: string | undefined;
 	let tempHome: string;
-
 	beforeEach(() => {
+		// gatherTaskDiagnosticsCore reads dispatch records, delivery receipts,
+		// and preservation state under os.homedir(); isolate from the
+		// developer's real ~/.cline so leftover records cannot change these
+		// assertions (AGENTS.md).
 		previousHome = process.env.HOME;
 		previousUserProfile = process.env.USERPROFILE;
-		tempHome = mkdtempSync(join(tmpdir(), "kanban-diag-export-home-"));
+		tempHome = mkdtempSync(join(tmpdir(), "kanban-diag3-plan-home-"));
 		process.env.HOME = tempHome;
 		process.env.USERPROFILE = tempHome;
 	});
-
 	afterEach(() => {
-		if (previousHome === undefined) {
-			delete process.env.HOME;
-		} else {
-			process.env.HOME = previousHome;
-		}
-		if (previousUserProfile === undefined) {
-			delete process.env.USERPROFILE;
-		} else {
-			process.env.USERPROFILE = previousUserProfile;
-		}
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+		else process.env.USERPROFILE = previousUserProfile;
 		rmSync(tempHome, { recursive: true, force: true });
 		vi.restoreAllMocks();
 	});
@@ -3422,7 +3419,7 @@ describe("createRuntimeApi exportTaskDiagnostics (DIAG-2)", () => {
 		});
 	}
 
-	type ParsedBundle = {
+	type PlanBundle = {
 		schemaVersion: number;
 		completeness: { status: string; reasons: string[]; warnings: string[] };
 		diagnostics: { ok: boolean; task: { id: string; title: string } | null };
@@ -3434,47 +3431,41 @@ describe("createRuntimeApi exportTaskDiagnostics (DIAG-2)", () => {
 		}>;
 	};
 
-	it("writes a schemaVersion 3 bundle with both session groups and unredacted content", async () => {
+	it("returns a schemaVersion 3 plan with both session groups and unredacted content", async () => {
 		vi.spyOn(workspaceState, "loadWorkspaceBoardById").mockResolvedValue(createExportBoard());
 		const api = createExportApi(async () => ({
 			taskSnapshot: createTaskExportSnapshot("task", "task-1-1000-abc12345"),
 			reviewSnapshot: createTaskExportSnapshot("review", "task-1-1001-def67890"),
 		}));
-		const response = await api.exportTaskDiagnostics(
+		const plan: PlanBundle = await api.buildTaskDiagnosticsExportPlan(
 			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
-			{ taskId: "task-1" },
+			"task-1",
 		);
-		expect(response.ok).toBe(true);
-		expect(response.redactions).toEqual([]);
-		expect(response.bundlePath).toContain(join(tempHome, ".cline", "kanban", "diagnostics"));
-		const bundle: ParsedBundle = JSON.parse(readFileSync(response.bundlePath ?? "", "utf8"));
-		expect(bundle.schemaVersion).toBe(3);
-		expect(bundle.diagnostics.ok).toBe(true);
-		expect(bundle.diagnostics.task?.title).toBe("Add billing export for ACME");
-		expect(bundle.taskPrompt).toBe("Add billing export for ACME");
-		expect(bundle.sessions.map((session) => session.kind)).toEqual(["task", "review"]);
-		expect(bundle.sessions[0]?.taskId).toBe("task-1");
-		expect(bundle.sessions[1]?.taskId).toBe("task-1::review");
-		expect(bundle.sessions[0]?.segments[0]?.messages[0]?.content).toBe("ACME billing export implemented");
-		expect(bundle.sessions[1]?.segments[0]?.messages[0]?.content).toBe("Review ACME billing export");
-		expect(bundle.completeness.status).toBe("complete");
+		expect(plan.schemaVersion).toBe(3);
+		expect(plan.diagnostics.ok).toBe(true);
+		expect(plan.diagnostics.task?.title).toBe("Add billing export for ACME");
+		expect(plan.taskPrompt).toBe("Add billing export for ACME");
+		expect(plan.sessions.map((session) => session.kind)).toEqual(["task", "review"]);
+		expect(plan.sessions[0]?.taskId).toBe("task-1");
+		expect(plan.sessions[1]?.taskId).toBe("task-1::review");
+		expect(plan.sessions[0]?.segments[0]?.messages[0]?.content).toBe("ACME billing export implemented");
+		expect(plan.sessions[1]?.segments[0]?.messages[0]?.content).toBe("Review ACME billing export");
+		expect(plan.completeness.status).toBe("complete");
 	});
 
-	it("still exports operational diagnostics when no session is recorded", async () => {
+	it("still returns operational diagnostics when no session is recorded", async () => {
 		vi.spyOn(workspaceState, "loadWorkspaceBoardById").mockResolvedValue(createExportBoard());
 		const api = createExportApi(async () => ({ taskSnapshot: null, reviewSnapshot: null }));
-		const response = await api.exportTaskDiagnostics(
+		const plan: PlanBundle = await api.buildTaskDiagnosticsExportPlan(
 			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
-			{ taskId: "task-1" },
+			"task-1",
 		);
-		expect(response.ok).toBe(true);
-		const bundle: ParsedBundle = JSON.parse(readFileSync(response.bundlePath ?? "", "utf8"));
-		expect(bundle.schemaVersion).toBe(3);
-		expect(bundle.diagnostics.ok).toBe(true);
-		expect(bundle.diagnostics.task?.id).toBe("task-1");
-		expect(bundle.sessions).toEqual([]);
-		expect(bundle.completeness.status).toBe("unavailable");
-		expect(bundle.completeness.reasons).toContain("no Cline session transcript is recorded for this task");
+		expect(plan.schemaVersion).toBe(3);
+		expect(plan.diagnostics.ok).toBe(true);
+		expect(plan.diagnostics.task?.id).toBe("task-1");
+		expect(plan.sessions).toEqual([]);
+		expect(plan.completeness.status).toBe("unavailable");
+		expect(plan.completeness.reasons).toContain("no Cline session transcript is recorded for this task");
 	});
 
 	it("degrades to an unavailable transcript when snapshot building fails", async () => {
@@ -3482,14 +3473,12 @@ describe("createRuntimeApi exportTaskDiagnostics (DIAG-2)", () => {
 		const api = createExportApi(async () => {
 			throw new Error("session host unavailable");
 		});
-		const response = await api.exportTaskDiagnostics(
+		const plan: PlanBundle = await api.buildTaskDiagnosticsExportPlan(
 			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
-			{ taskId: "task-1" },
+			"task-1",
 		);
-		expect(response.ok).toBe(true);
-		const bundle: ParsedBundle = JSON.parse(readFileSync(response.bundlePath ?? "", "utf8"));
-		expect(bundle.diagnostics.ok).toBe(true);
-		expect(bundle.sessions).toEqual([]);
-		expect(bundle.completeness.status).toBe("unavailable");
+		expect(plan.diagnostics.ok).toBe(true);
+		expect(plan.sessions).toEqual([]);
+		expect(plan.completeness.status).toBe("unavailable");
 	});
 });
