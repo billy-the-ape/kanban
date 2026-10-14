@@ -34,6 +34,12 @@ import type { RuntimeTaskInitialStartStage, RuntimeTaskPhaseSummary, RuntimeTask
 import { useTaskWorkspaceSnapshotValue } from "@/stores/workspace-metadata-store";
 import type { BoardCard as BoardCardModel, BoardColumnId } from "@/types";
 import { getTaskAutoReviewCancelButtonLabel } from "@/types";
+import {
+	getIsCardCreditLimitError,
+	getIsErrorCardStatus,
+	getIsPausedCardStatus,
+	getQueuePosition,
+} from "@/utils/card-status";
 import { formatPathForDisplay } from "@/utils/path-display";
 import { useMeasure } from "@/utils/react-use";
 import {
@@ -163,29 +169,11 @@ function resolveToolCallLabel(
 	return formatClineToolCallLabel(parsed.toolName, parsed.toolInputSummary);
 }
 
-function isCardCreditLimitError(summary: RuntimeTaskSessionSummary | undefined): boolean {
-	if (!summary) {
-		return false;
-	}
-	if (summary.state !== "awaiting_review" && summary.state !== "failed" && summary.state !== "interrupted") {
-		return false;
-	}
-	return summary.latestHookActivity?.notificationType === "credit_limit";
-}
-
-function getIsErrorSummary(summary: RuntimeTaskSessionSummary) {
-	return (
-		summary.state === "failed" ||
-		summary.latestHookActivity?.activityText?.trim().startsWith("Failed ") ||
-		summary.latestHookActivity?.hookEventName?.trim().toLocaleLowerCase().includes("error")
-	);
-}
-
 function getCardSessionActivity(summary: RuntimeTaskSessionSummary | undefined): CardSessionActivity | null {
 	if (!summary) {
 		return null;
 	}
-	if (isCardCreditLimitError(summary)) {
+	if (getIsCardCreditLimitError(summary)) {
 		return { dotColor: SESSION_ACTIVITY_COLOR.warning, text: "Out of credits" };
 	}
 	const hookActivity = summary.latestHookActivity;
@@ -195,10 +183,16 @@ function getCardSessionActivity(summary: RuntimeTaskSessionSummary | undefined):
 	const finalMessage = hookActivity?.finalMessage?.trim();
 	const hookEventName = hookActivity?.hookEventName?.trim() ?? null;
 
-	if (getIsErrorSummary(summary)) {
+	if (getIsErrorCardStatus(summary)) {
 		return {
 			dotColor: SESSION_ACTIVITY_COLOR.error,
 			text: finalMessage || activityText || hookEventName || summary.state,
+		};
+	}
+	if (finalMessage?.toLocaleLowerCase() === "waiting for model capacity") {
+		return {
+			dotColor: SESSION_ACTIVITY_COLOR.waiting,
+			text: finalMessage,
 		};
 	}
 	if (summary.state === "awaiting_review" && finalMessage) {
@@ -462,20 +456,25 @@ export function BoardCard({
 		};
 	}, [descriptionFont, descriptionWidth, displayDescription]);
 
-	const isCreditLimit = isCardCreditLimitError(sessionSummary);
 	const renderStatusMarker = () => {
-		if (isCreditLimit) {
+		if (getIsCardCreditLimitError(sessionSummary)) {
 			return <AlertTriangle size={12} className="text-status-orange" />;
+		}
+		if (getIsErrorCardStatus(sessionSummary)) {
+			return <AlertCircle size={12} className="text-status-red" />;
 		}
 		switch (columnId) {
 			case "in_progress": {
-				if (
-					sessionSummary?.state === "idle" ||
-					sessionSummary?.latestHookActivity?.hookEventName === "concurrency_waiting"
-				) {
-					return <Pause size={12} className="text-status-orange" />;
+				if (sessionSummary && getIsPausedCardStatus(sessionSummary)) {
+					const queueNum = getQueuePosition(sessionSummary);
+					return (
+						<div className="relative">
+							<Pause size={12} className="text-status-orange" />
+							{queueNum && queueNum > 0 && <div className="absolute top-0 right-0 text-xs">{queueNum}</div>}
+						</div>
+					);
 				}
-				if (sessionSummary && getIsErrorSummary(sessionSummary)) {
+				if (sessionSummary && getIsErrorCardStatus(sessionSummary)) {
 					return <AlertCircle size={12} className="text-status-red" />;
 				}
 				return <Spinner size={12} className="text-status-blue" />;
@@ -691,18 +690,13 @@ export function BoardCard({
 										className="shrink-0"
 									/>
 								) : null}
-								{columnId !== "trash" ? (
+								{columnId !== "trash" && sessionSummary ? (
 									<TaskPhaseBadge
 										summary={phaseSummary}
 										sessionSummary={sessionSummary}
-										queuePosition={
-											sessionSummary?.state === "running" &&
-											sessionSummary.latestHookActivity?.hookEventName === "concurrency_waiting"
-												? sessionSummary.latestHookActivity.queuePosition
-												: null
-										}
+										queuePosition={getQueuePosition(sessionSummary)}
 										columnId={columnId}
-										className="shrink-0"
+										className="hidden"
 									/>
 								) : null}
 								{isPreparingInitialStart && initialStartStage ? (

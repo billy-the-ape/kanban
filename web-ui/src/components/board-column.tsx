@@ -15,6 +15,7 @@ import {
 } from "@/state/drag-rules";
 import { LocalStorageKey } from "@/storage/local-storage-store";
 import type { BoardCard as BoardCardModel, BoardColumnId, BoardColumn as BoardColumnModel } from "@/types";
+import { getIsPausedCardStatus } from "@/utils/card-status";
 import { cn } from "./ui/cn";
 import { Tooltip } from "./ui/tooltip";
 
@@ -212,63 +213,72 @@ export function BoardColumn({
 								) : null}
 
 								{(() => {
-									const items: ReactNode[] = [];
+									const items: { node: ReactNode; paused: boolean }[] = [];
 									let draggableIndex = 0;
 									for (const card of column.cards) {
+										const session = taskSessions[card.id];
 										if (column.id === "backlog" && editingTaskId === card.id) {
-											items.push(
-												<div
-													key={card.id}
-													data-task-id={card.id}
-													data-column-id={column.id}
-													style={{ marginBottom: 6 }}
-												>
-													{inlineTaskEditor}
-												</div>,
-											);
+											items.push({
+												paused: false,
+												node: (
+													<div
+														key={card.id}
+														data-task-id={card.id}
+														data-column-id={column.id}
+														style={{ marginBottom: 6 }}
+													>
+														{inlineTaskEditor}
+													</div>
+												),
+											});
 											continue;
 										}
-										items.push(
-											<BoardCard
-												key={card.id}
-												card={card}
-												index={draggableIndex}
-												columnId={column.id}
-												sessionSummary={taskSessions[card.id]}
-												phaseSummary={taskPhases?.[card.id]}
-												initialStartStage={initialStartStageByTaskId?.[card.id]}
-												onStart={onStartTask}
-												onMoveToTrash={onMoveToTrashTask}
-												onComplete={onCompleteTask}
-												onRestoreFromTrash={onRestoreFromTrashTask}
-												onCommit={onCommitTask}
-												onOpenPr={onOpenPrTask}
-												onCancelAutomaticAction={onCancelAutomaticTaskAction}
-												isCommitLoading={commitTaskLoadingById?.[card.id] ?? false}
-												isOpenPrLoading={openPrTaskLoadingById?.[card.id] ?? false}
-												isMoveToTrashLoading={moveToTrashLoadingById?.[card.id] ?? false}
-												isCompleteLoading={completeTaskLoadingById?.[card.id] ?? false}
-												cleanupBlockedReason={cleanupBlockedReasonByTaskId?.[card.id] ?? null}
-												onDependencyPointerDown={onDependencyPointerDown}
-												onDependencyPointerEnter={onDependencyPointerEnter}
-												isDependencySource={dependencySourceTaskId === card.id}
-												isDependencyTarget={dependencyTargetTaskId === card.id}
-												isDependencyLinking={isDependencyLinking}
-												workspacePath={workspacePath}
-												defaultClineModelId={defaultClineModelId}
-												onSaveTitle={onSaveTitle}
-												onClick={() => {
-													if (column.id === "backlog") {
-														onEditTask?.(card);
-														return;
-													}
-													onCardClick?.(card);
-												}}
-											/>,
-										);
+										items.push({
+											paused: column.id === "in_progress" && !!session && getIsPausedCardStatus(session),
+											node: (
+												<BoardCard
+													key={card.id}
+													card={card}
+													index={draggableIndex}
+													columnId={column.id}
+													sessionSummary={session}
+													phaseSummary={taskPhases?.[card.id]}
+													initialStartStage={initialStartStageByTaskId?.[card.id]}
+													onStart={onStartTask}
+													onMoveToTrash={onMoveToTrashTask}
+													onComplete={onCompleteTask}
+													onRestoreFromTrash={onRestoreFromTrashTask}
+													onCommit={onCommitTask}
+													onOpenPr={onOpenPrTask}
+													onCancelAutomaticAction={onCancelAutomaticTaskAction}
+													isCommitLoading={commitTaskLoadingById?.[card.id] ?? false}
+													isOpenPrLoading={openPrTaskLoadingById?.[card.id] ?? false}
+													isMoveToTrashLoading={moveToTrashLoadingById?.[card.id] ?? false}
+													isCompleteLoading={completeTaskLoadingById?.[card.id] ?? false}
+													cleanupBlockedReason={cleanupBlockedReasonByTaskId?.[card.id] ?? null}
+													onDependencyPointerDown={onDependencyPointerDown}
+													onDependencyPointerEnter={onDependencyPointerEnter}
+													isDependencySource={dependencySourceTaskId === card.id}
+													isDependencyTarget={dependencyTargetTaskId === card.id}
+													isDependencyLinking={isDependencyLinking}
+													workspacePath={workspacePath}
+													defaultClineModelId={defaultClineModelId}
+													onSaveTitle={onSaveTitle}
+													onClick={() => {
+														if (column.id === "backlog") {
+															onEditTask?.(card);
+															return;
+														}
+														onCardClick?.(card);
+													}}
+												/>
+											),
+										});
 										draggableIndex += 1;
 									}
-									return items;
+									return items
+										.sort((a, b) => (a.paused === b.paused ? 0 : a.paused ? 1 : b.paused ? -1 : 0))
+										.map(({ node }) => node);
 								})()}
 								{cardProvided.placeholder}
 							</div>

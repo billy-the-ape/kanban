@@ -46,19 +46,21 @@ const PHASE_CLASSES: Record<RuntimeTaskPhase, string> = {
 	needs_attention: "bg-surface-3 text-status-red",
 };
 
+interface TaskPhaseBadgeProps {
+	summary: RuntimeTaskPhaseSummary | null | undefined;
+	queuePosition?: number | null;
+	columnId?: BoardColumnId;
+	sessionSummary?: RuntimeTaskSessionSummary;
+	className?: string;
+}
+
 export function TaskPhaseBadge({
 	summary,
 	queuePosition,
 	columnId,
 	sessionSummary,
 	className,
-}: {
-	summary: RuntimeTaskPhaseSummary | null | undefined;
-	queuePosition?: number | null;
-	columnId?: BoardColumnId;
-	sessionSummary?: RuntimeTaskSessionSummary;
-	className?: string;
-}): React.ReactElement | null {
+}: TaskPhaseBadgeProps): React.ReactElement | null {
 	const error = sessionSummary?.reviewReason === "error" || sessionSummary?.state === "failed";
 	if (error) {
 		return (
