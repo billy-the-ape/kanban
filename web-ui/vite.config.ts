@@ -83,6 +83,7 @@ export default defineConfig({
 			"@runtime-agent-catalog": resolve(__dirname, "../src/core/agent-catalog.ts"),
 			"@runtime-cline-tool-call-display": resolve(__dirname, "../src/cline-sdk/cline-tool-call-display.ts"),
 			"@runtime-contract": resolve(__dirname, "../src/core/api-contract.ts"),
+			"@runtime-pr-provider-capabilities": resolve(__dirname, "../src/core/pull-request-providers/capabilities.ts"),
 			"@runtime-home-agent-session": resolve(__dirname, "../src/core/home-agent-session.ts"),
 			"@runtime-pull-request-links": resolve(__dirname, "../src/core/pull-request-links.ts"),
 			"@runtime-shortcuts": resolve(__dirname, "../src/config/shortcut-utils.ts"),

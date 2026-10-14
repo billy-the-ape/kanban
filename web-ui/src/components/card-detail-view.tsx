@@ -335,6 +335,7 @@ type ToolbarOptions = RuntimeWorkspaceChangesMode | "pull_requests";
 function DiffToolbar({
 	mode,
 	onModeChange,
+	prCount,
 	isExpanded,
 	onToggleExpand,
 	hideExpand,
@@ -342,6 +343,8 @@ function DiffToolbar({
 }: {
 	mode: ToolbarOptions;
 	onModeChange: (mode: ToolbarOptions) => void;
+	/** PRLINK-10: stored pull-request count shown on the PRs segment. */
+	prCount: number;
 	isExpanded: boolean;
 	onToggleExpand: () => void;
 	hideExpand?: boolean;
@@ -368,8 +371,7 @@ function DiffToolbar({
 					Last Turn
 				</DiffModeButton>
 				<DiffModeButton active={mode === "pull_requests"} onClick={() => onModeChange("pull_requests")}>
-					PRs (0)
-					{/* TODO: SHOW ACTUAL NUMBER OF PRS ASSOCIATED TO THIS TASK */}
+					PRs ({prCount})
 				</DiffModeButton>
 			</div>
 			{reviewControl ? <div className="ml-auto">{reviewControl}</div> : null}
@@ -525,7 +527,10 @@ export function CardDetailView({
 	const terminalThemeColors = useTerminalThemeColors();
 	const [selectedPath, setSelectedPath] = useState<string | null>(null);
 	const [diffComments, setDiffComments] = useState<Map<string, DiffLineComment>>(new Map());
-	const [diffMode, setDiffMode] = useState<ToolbarOptions>("working_copy");
+	// PRLINK-10: the detail content view is independent of the diff mode so
+	// selecting PRs does not clobber the remembered diff mode.
+	const [detailView, setDetailView] = useState<"changes" | "pull_requests">("changes");
+	const [diffMode, setDiffMode] = useState<RuntimeWorkspaceChangesMode>("working_copy");
 	const [isDiffExpanded, setIsDiffExpanded] = useState(false);
 	const {
 		taskCardsPanelRatio,
@@ -575,15 +580,30 @@ export function CardDetailView({
 					sessionSummary?.previousTurnCheckpoint?.commit ?? "none",
 				].join(":")
 			: null;
+	// PRLINK-10: detail-diff reads run only for a visible changes view.
+	// Desktop: the changes view minus git-history/document-hidden views.
+	// Mobile: the Files tab (which renders the shared file tree) or the
+	// Diff tab showing changes; Chat and the PRs view never schedule diff
+	// reads. Trashed tasks keep the one-time initial read (so the changes
+	// view resolves instead of showing a pending panel forever) but never
+	// poll.
+	const changesViewVisible =
+		isDocumentVisible &&
+		!gitHistoryPanel &&
+		(isMobile
+			? mobileTab === "files" || (mobileTab === "diff" && detailView === "changes")
+			: detailView === "changes");
+	const prViewVisible = detailView === "pull_requests" && (isMobile ? mobileTab === "diff" : true);
 	const { changes: workspaceChanges, isRuntimeAvailable } = useRuntimeWorkspaceChanges(
 		selection.card.id,
 		currentProjectId,
 		selection.card.baseRef,
-		diffMode === "pull_requests" ? "working_copy" : diffMode,
+		diffMode,
 		taskWorkspaceStateVersion,
-		isDocumentVisible && !gitHistoryPanel && selection.column.id !== "trash" ? DETAIL_DIFF_POLL_INTERVAL_MS : null,
+		changesViewVisible && selection.column.id !== "trash" ? DETAIL_DIFF_POLL_INTERVAL_MS : null,
 		lastTurnViewKey,
 		true,
+		changesViewVisible,
 	);
 	const runtimeFiles = workspaceChanges?.files ?? null;
 	const isWorkspaceChangesPending = isRuntimeAvailable && workspaceChanges === null;
@@ -691,10 +711,27 @@ export function CardDetailView({
 		setSelectedPath(availablePaths[0] ?? null);
 	}, [availablePaths, selectedPath]);
 
+	// PRLINK-10: switching tasks or workspaces resets the detail view to
+	// "All Changes" + the changes view, and mobile back to the Chat tab, so a
+	// task's remembered diff mode never leaks into the next task.
 	useEffect(() => {
 		setDiffComments(new Map());
 		setDiffMode("working_copy");
-	}, [selection.card.id]);
+		setDetailView("changes");
+		setMobileTab("chat");
+	}, [selection.card.id, currentProjectId]);
+
+	// PRLINK-10: selecting PRs only switches the content view (the last diff
+	// mode is retained); selecting All Changes / Last Turn sets the diff mode
+	// and returns to the changes view.
+	const handleToolbarModeChange = useCallback((next: ToolbarOptions) => {
+		if (next === "pull_requests") {
+			setDetailView("pull_requests");
+			return;
+		}
+		setDiffMode(next);
+		setDetailView("changes");
+	}, []);
 
 	const handleToggleDiffExpand = useCallback(() => {
 		if (!isDiffExpanded && bottomTerminalOpen) {
@@ -831,23 +868,24 @@ export function CardDetailView({
 							className="min-h-0 min-w-0 flex-1 flex-col"
 							style={{ display: mobileTab === "diff" ? "flex" : "none" }}
 						>
-							{isRuntimeAvailable ? (
-								<DiffToolbar
-									mode={diffMode}
-									onModeChange={setDiffMode}
-									isExpanded={false}
-									onToggleExpand={handleToggleDiffExpand}
-									hideExpand
-									reviewControl={reviewControl}
-								/>
-							) : null}
+							<DiffToolbar
+								mode={detailView === "pull_requests" ? "pull_requests" : diffMode}
+								onModeChange={handleToolbarModeChange}
+								prCount={(selection.card.pullRequests ?? []).length}
+								isExpanded={false}
+								onToggleExpand={handleToggleDiffExpand}
+								hideExpand
+								reviewControl={reviewControl}
+							/>
 							<div className="flex min-h-0 flex-1">
-								{diffMode === "pull_requests" ? (
+								{detailView === "pull_requests" ? (
 									<TaskPrTrackingPanel
 										workspaceId={currentProjectId}
 										taskId={selection.card.id}
 										card={selection.card}
 										installedConsumers={runtimeConfig?.installedPrConsumers ?? []}
+										visible={prViewVisible}
+										mobile={isMobile}
 									/>
 								) : isWorkspaceChangesPending ? (
 									<WorkspaceChangesLoadingPanel panelFlex="1 1 0" />
@@ -880,6 +918,9 @@ export function CardDetailView({
 								workspaceFiles={isRuntimeAvailable ? runtimeFiles : null}
 								selectedPath={selectedPath}
 								onSelectPath={(path: string) => {
+									// Return the Diff tab to the changes view: a file
+									// selection is about the diff, not the PRs view.
+									setDetailView("changes");
 									setSelectedPath(path);
 									setMobileTab("diff");
 								}}
@@ -985,22 +1026,23 @@ export function CardDetailView({
 								className="flex min-h-0 min-w-0 flex-col"
 								style={{ width: isDiffExpanded ? "100%" : diffPanelPercent }}
 							>
-								{isRuntimeAvailable ? (
-									<DiffToolbar
-										mode={diffMode}
-										onModeChange={setDiffMode}
-										isExpanded={isDiffExpanded}
-										onToggleExpand={handleToggleDiffExpand}
-										reviewControl={reviewControl}
-									/>
-								) : null}
+								<DiffToolbar
+									mode={detailView === "pull_requests" ? "pull_requests" : diffMode}
+									onModeChange={handleToolbarModeChange}
+									prCount={(selection.card.pullRequests ?? []).length}
+									isExpanded={isDiffExpanded}
+									onToggleExpand={handleToggleDiffExpand}
+									reviewControl={reviewControl}
+								/>
 								<div className="flex min-h-0 flex-1">
-									{diffMode === "pull_requests" ? (
+									{detailView === "pull_requests" ? (
 										<TaskPrTrackingPanel
 											workspaceId={currentProjectId}
 											taskId={selection.card.id}
 											card={selection.card}
 											installedConsumers={runtimeConfig?.installedPrConsumers ?? []}
+											visible={prViewVisible}
+											mobile={isMobile}
 										/>
 									) : isWorkspaceChangesPending ? (
 										<WorkspaceChangesLoadingPanel panelFlex={detailDiffFileTreePanelFlex} />
