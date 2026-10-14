@@ -1,27 +1,26 @@
+// PRLINK-5/6/7/9/10: manual PR link management for a task. URL input, the
+// recorded list with Add/Remove/display-primary/refresh actions. The
+// mutation orchestration (pending state per action/identity, task-scoped
+// staleness guards, toasts) lives in useTaskPullRequestActions and is shared
+// with the task-detail PRs view; this component only owns the presentation
+// (the trigger, the compact rows, and the open state) so desktop (top bar)
+// and mobile (detail tab bar) share one manager.
+
 import * as RadixPopover from "@radix-ui/react-popover";
 import { getOrderedTaskPullRequests } from "@runtime-pull-request-links";
 import { Link, Plus, RefreshCw, Star, StarOff, X } from "lucide-react";
 import { type ReactNode, useState } from "react";
 
-import { showAppToast } from "@/components/app-toaster";
 import { TaskPrCommentHandlingPanel } from "@/components/task-pr-comment-handling-panel";
 import { TaskPullRequestLink } from "@/components/task-pull-request-link";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/components/ui/cn";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip } from "@/components/ui/tooltip";
-import { getRuntimeTrpcClient } from "@/runtime/trpc-client";
+import { CLEAR_PRIMARY_PENDING_KEY, useTaskPullRequestActions } from "@/hooks/use-task-pull-request-actions";
 import type { RuntimeTaskPullRequest } from "@/runtime/types";
-import {
-	formatPullRequestLabel,
-	getLinkedRefreshMessages,
-	getPullRequestKey,
-	getPullRequestRefreshMessage,
-	validatePullRequestUrlShape,
-} from "@/utils/task-pull-requests";
+import { formatPullRequestLabel, getPullRequestKey, validatePullRequestUrlShape } from "@/utils/task-pull-requests";
 
-// Sentinel pending key for the "use automatic display order" (clear) action.
-const CLEAR_PRIMARY_PENDING_KEY = "__clear-primary__";
 const MAKE_PRIMARY_TOOLTIP =
 	"Make primary for display. The Automation PR is selected separately in PR tracking settings.";
 const CLEAR_PRIMARY_TOOLTIP = "Use automatic display order";
@@ -63,24 +62,17 @@ export function TaskPullRequestManagerPopover({
 }: TaskPullRequestManagerPopoverProps) {
 	const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
 	const [url, setUrl] = useState("");
-	const [submitting, setSubmitting] = useState(false);
-	const [formError, setFormError] = useState<string | null>(null);
-	const [removingKey, setRemovingKey] = useState<string | null>(null);
-	// PRLINK-6: pending display-primary actions (server response is authoritative).
-	const [primaryPendingKey, setPrimaryPendingKey] = useState<string | null>(null);
-	const [refreshing, setRefreshing] = useState(false);
-	// PRLINK-9: per-row provider metadata refresh pending keys.
-	const [refreshingKey, setRefreshingKey] = useState<string | null>(null);
+	const actions = useTaskPullRequestActions({ workspaceId, taskId, pullRequests });
 	const isOpen = open ?? uncontrolledOpen;
 	const validationError = url.trim() ? validatePullRequestUrlShape(url) : null;
-	const canSubmit = validationError === null && !submitting;
+	const canSubmit = validationError === null && !actions.adding;
 	// PRLINK-6: display order — the primary winner first, the rest in recorded order.
 	const orderedPullRequests = getOrderedTaskPullRequests(pullRequests);
 	const winnerPullRequest = orderedPullRequests[0];
 	const actionButtonClass = mobile ? "min-h-11 min-w-11 shrink-0 p-0" : "h-6 w-6 shrink-0 px-0";
 
 	const handleOpenChange = (nextOpen: boolean): void => {
-		if (submitting) {
+		if (actions.adding) {
 			return;
 		}
 		if (open === undefined) {
@@ -89,172 +81,17 @@ export function TaskPullRequestManagerPopover({
 		onOpenChange?.(nextOpen);
 	};
 
+	// PRLINK-10: the add mutation is orchestrated by the shared hook; the
+	// popover only owns the URL text and the open state.
 	const handleAdd = async (): Promise<void> => {
 		if (!canSubmit) {
 			return;
 		}
-		setSubmitting(true);
-		setFormError(null);
-		try {
-			const response = await getRuntimeTrpcClient(workspaceId).workspace.addTaskPullRequest.mutate({
-				taskId,
-				url: url.trim(),
-			});
-			if (response.ok) {
-				setUrl("");
-				setFormError(null);
-				// Close optimistically; the authoritative entry arrives via the broadcast.
-				handleOpenChange(false);
-				return;
-			}
-			const message = response.error || "Could not add the pull request.";
-			setFormError(message);
-			showAppToast({ intent: "danger", message });
-		} catch (error) {
-			const message = error instanceof Error ? error.message : "Could not add the pull request.";
-			setFormError(message);
-			showAppToast({ intent: "danger", message });
-		} finally {
-			setSubmitting(false);
-		}
-	};
-
-	const handleRemove = async (pullRequest: RuntimeTaskPullRequest): Promise<void> => {
-		const key = getPullRequestKey(pullRequest);
-		setRemovingKey(key);
-		try {
-			const response = await getRuntimeTrpcClient(workspaceId).workspace.removeTaskPullRequest.mutate({
-				taskId,
-				url: pullRequest.url,
-			});
-			if (!response.ok) {
-				showAppToast({
-					intent: "danger",
-					message: response.error || "Could not remove the pull request.",
-				});
-			}
-		} catch (error) {
-			showAppToast({
-				intent: "danger",
-				message: error instanceof Error ? error.message : "Could not remove the pull request.",
-			});
-		} finally {
-			setRemovingKey(null);
-		}
-	};
-
-	// PRLINK-6: make this link the display-only primary. The server response is
-	// authoritative; the board refreshes via the state broadcast.
-	const handleMakePrimary = async (pullRequest: RuntimeTaskPullRequest): Promise<void> => {
-		const key = getPullRequestKey(pullRequest);
-		setPrimaryPendingKey(key);
-		try {
-			const response = await getRuntimeTrpcClient(workspaceId).workspace.setPrimaryTaskPullRequest.mutate({
-				taskId,
-				url: pullRequest.url,
-			});
-			if (!response.ok) {
-				showAppToast({
-					intent: "danger",
-					message: response.error || "Could not update the display primary.",
-				});
-			}
-		} catch (error) {
-			showAppToast({
-				intent: "danger",
-				message: error instanceof Error ? error.message : "Could not update the display primary.",
-			});
-		} finally {
-			setPrimaryPendingKey(null);
-		}
-	};
-
-	// PRLINK-6: clear every explicit primary and fall back to the automatic order.
-	const handleClearPrimary = async (): Promise<void> => {
-		setPrimaryPendingKey(CLEAR_PRIMARY_PENDING_KEY);
-		try {
-			const response = await getRuntimeTrpcClient(workspaceId).workspace.setPrimaryTaskPullRequest.mutate({
-				taskId,
-				url: null,
-			});
-			if (!response.ok) {
-				showAppToast({
-					intent: "danger",
-					message: response.error || "Could not update the display primary.",
-				});
-			}
-		} catch (error) {
-			showAppToast({
-				intent: "danger",
-				message: error instanceof Error ? error.message : "Could not update the display primary.",
-			});
-		} finally {
-			setPrimaryPendingKey(null);
-		}
-	};
-
-	const handleRefresh = async (): Promise<void> => {
-		if (refreshing) {
-			return;
-		}
-		setRefreshing(true);
-		try {
-			const client = getRuntimeTrpcClient(workspaceId);
-			const response = await client.workspace.refreshTaskPullRequests.mutate({ taskId });
-			if (!response.ok) {
-				showAppToast({ intent: "warning", message: response.error || "Refresh failed." });
-				return;
-			}
-			// The lookup reason is only consumed by this explicit action; the
-			// board already reflects updated/unchanged outcomes via broadcast.
-			const message = getPullRequestRefreshMessage(response.reason);
-			if (message) {
-				showAppToast({ intent: "primary", message });
-			}
-			// PRLINK-9: also refresh the stored links' metadata via the
-			// provider (works for Done tasks and other branches/repos).
-			if (pullRequests.length > 0) {
-				const linked = await client.workspace.refreshLinkedTaskPullRequests.mutate({ taskId });
-				for (const linkedMessage of getLinkedRefreshMessages(linked.updated, linked.outcomes)) {
-					showAppToast({ intent: "primary", message: linkedMessage });
-				}
-			}
-		} catch (error) {
-			showAppToast({
-				intent: "warning",
-				message: error instanceof Error ? error.message : "Refresh failed.",
-			});
-		} finally {
-			setRefreshing(false);
-		}
-	};
-
-	// PRLINK-9: refresh ONE stored link's metadata via the provider.
-	const handleRefreshLinked = async (pullRequest: RuntimeTaskPullRequest): Promise<void> => {
-		const key = getPullRequestKey(pullRequest);
-		setRefreshingKey(key);
-		try {
-			const response = await getRuntimeTrpcClient(workspaceId).workspace.refreshTaskPullRequestEntry.mutate({
-				taskId,
-				url: pullRequest.url,
-			});
-			if (!response.ok) {
-				showAppToast({
-					intent: "warning",
-					message: response.error || "Could not refresh the pull request.",
-				});
-				return;
-			}
-			for (const message of getLinkedRefreshMessages(response.updated, response.outcomes)) {
-				showAppToast({ intent: "primary", message });
-			}
-		} catch (error) {
-			showAppToast({
-				intent: "warning",
-				message: error instanceof Error ? error.message : "Could not refresh the pull request.",
-			});
-		} finally {
-			setRefreshingKey(null);
+		const added = await actions.addPullRequest(url.trim());
+		if (added) {
+			setUrl("");
+			// Close optimistically; the authoritative entry arrives via the broadcast.
+			handleOpenChange(false);
 		}
 	};
 
@@ -283,7 +120,7 @@ export function TaskPullRequestManagerPopover({
 							value={url}
 							onChange={(event) => {
 								setUrl(event.target.value);
-								setFormError(null);
+								actions.clearAddError();
 							}}
 							placeholder="https://github.com/owner/repo/pull/123"
 							aria-label="Pull request URL"
@@ -295,16 +132,16 @@ export function TaskPullRequestManagerPopover({
 								{validationError}
 							</p>
 						) : null}
-						{formError ? (
+						{actions.addError ? (
 							<p className="m-0 text-[11px] text-status-red" data-testid="task-pr-form-error">
-								{formError}
+								{actions.addError}
 							</p>
 						) : null}
 						<Button
 							variant="primary"
 							size="sm"
 							type="submit"
-							icon={submitting ? <Spinner size={10} /> : <Plus size={12} />}
+							icon={actions.adding ? <Spinner size={10} /> : <Plus size={12} />}
 							disabled={!canSubmit}
 							data-testid="task-pr-add-button"
 						>
@@ -321,12 +158,12 @@ export function TaskPullRequestManagerPopover({
 						) : (
 							orderedPullRequests.map((pullRequest) => {
 								const key = getPullRequestKey(pullRequest);
-								const isRemoving = removingKey === key;
+								const isRemoving = actions.removingKey === key;
 								const isWinner = winnerPullRequest !== undefined && pullRequest === winnerPullRequest;
 								const isExplicitPrimary = isWinner && pullRequest.isPrimary === true;
-								const isPrimaryPending = primaryPendingKey === key;
-								const isClearPrimaryPending = primaryPendingKey === CLEAR_PRIMARY_PENDING_KEY;
-								const isRefreshingLinked = refreshingKey === key;
+								const isPrimaryPending = actions.primaryPendingKey === key;
+								const isClearPrimaryPending = actions.primaryPendingKey === CLEAR_PRIMARY_PENDING_KEY;
+								const isRefreshingLinked = actions.refreshingKey === key;
 								// PRLINK-7: on mobile the repository, state, and winner label are
 								// visible in the row instead of living in a hover tooltip.
 								const rowMetaParts = [pullRequest.repository, pullRequest.state ?? "state unknown"];
@@ -368,7 +205,7 @@ export function TaskPullRequestManagerPopover({
 													aria-label={CLEAR_PRIMARY_TOOLTIP}
 													icon={isClearPrimaryPending ? <Spinner size={10} /> : <StarOff size={12} />}
 													disabled={isClearPrimaryPending}
-													onClick={() => void handleClearPrimary()}
+													onClick={() => void actions.clearPrimary()}
 													className={actionButtonClass}
 													data-testid="task-pr-use-automatic-order"
 												/>
@@ -381,7 +218,7 @@ export function TaskPullRequestManagerPopover({
 													aria-label="Make primary for display"
 													icon={isPrimaryPending ? <Spinner size={10} /> : <Star size={12} />}
 													disabled={isPrimaryPending}
-													onClick={() => void handleMakePrimary(pullRequest)}
+													onClick={() => void actions.makePrimary(pullRequest)}
 													className={actionButtonClass}
 													data-testid={`task-pr-make-primary-${pullRequest.number}`}
 												/>
@@ -394,8 +231,8 @@ export function TaskPullRequestManagerPopover({
 													size="sm"
 													aria-label={REFRESH_LINKED_TOOLTIP}
 													icon={isRefreshingLinked ? <Spinner size={10} /> : <RefreshCw size={12} />}
-													disabled={isRefreshingLinked || refreshing}
-													onClick={() => void handleRefreshLinked(pullRequest)}
+													disabled={isRefreshingLinked || actions.refreshAllPending}
+													onClick={() => void actions.refreshEntry(pullRequest)}
 													className={actionButtonClass}
 													data-testid={`task-pr-refresh-linked-${pullRequest.number}`}
 												/>
@@ -406,8 +243,8 @@ export function TaskPullRequestManagerPopover({
 												size="sm"
 												aria-label={`Refresh ${formatPullRequestLabel(pullRequest, "full")}`}
 												icon={isRefreshingLinked ? <Spinner size={10} /> : <RefreshCw size={12} />}
-												disabled={isRefreshingLinked || refreshing}
-												onClick={() => void handleRefreshLinked(pullRequest)}
+												disabled={isRefreshingLinked || actions.refreshAllPending}
+												onClick={() => void actions.refreshEntry(pullRequest)}
 												className={actionButtonClass}
 												data-testid={`task-pr-refresh-linked-${pullRequest.number}`}
 											/>
@@ -418,7 +255,7 @@ export function TaskPullRequestManagerPopover({
 											aria-label={`Remove ${formatPullRequestLabel(pullRequest, "full")}`}
 											icon={isRemoving ? <Spinner size={10} /> : <X size={12} />}
 											disabled={isRemoving}
-											onClick={() => void handleRemove(pullRequest)}
+											onClick={() => void actions.removePullRequest(pullRequest)}
 											className={actionButtonClass}
 											data-testid={`task-pr-remove-${pullRequest.number}`}
 										/>
@@ -431,13 +268,13 @@ export function TaskPullRequestManagerPopover({
 					<Button
 						variant="ghost"
 						size="sm"
-						icon={refreshing ? <Spinner size={12} /> : <RefreshCw size={12} />}
-						disabled={refreshing}
-						onClick={() => void handleRefresh()}
+						icon={actions.refreshAllPending ? <Spinner size={12} /> : <RefreshCw size={12} />}
+						disabled={actions.refreshAllPending}
+						onClick={() => void actions.refreshAll()}
 						className={cn(mobile && "min-h-11")}
 						data-testid="task-pr-refresh-button"
 					>
-						{refreshing ? "Refreshing" : "Refresh"}
+						{actions.refreshAllPending ? "Refreshing" : "Refresh"}
 					</Button>
 					<div className="h-px bg-border" />
 					<TaskPrCommentHandlingPanel workspaceId={workspaceId} taskId={taskId} pullRequests={pullRequests} />

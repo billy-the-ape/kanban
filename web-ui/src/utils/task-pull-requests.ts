@@ -4,6 +4,7 @@ import type {
 	RuntimeTaskPullRequest,
 	RuntimeTaskPullRequestRefreshOutcome,
 	RuntimeTaskPullRequestRefreshReason,
+	RuntimeTaskPullRequestSource,
 } from "@/runtime/types";
 
 const MINUTE_MS = 60 * 1000;
@@ -89,9 +90,32 @@ export function formatPullRequestLabel(pullRequest: RuntimeTaskPullRequest, vari
 }
 
 /**
+ * "owner/repo#123" (GitLab: "group/repo!123") — the identity shown in
+ * linked-PR rows (PRLINK-10).
+ */
+export function formatPullRequestIdentity(pullRequest: RuntimeTaskPullRequest): string {
+	const prefix = pullRequest.provider === "gitlab" ? "!" : "#";
+	return `${pullRequest.repository}${prefix}${pullRequest.number}`;
+}
+
+/** Human label for how a link was recorded (PRLINK-10). */
+export function formatPullRequestSource(source: RuntimeTaskPullRequestSource): string {
+	switch (source) {
+		case "agent_tool":
+			return "agent";
+		case "delivery":
+			return "delivery";
+		case "manual":
+			return "manual";
+		case "branch_lookup":
+			return "branch lookup";
+	}
+}
+
+/**
  * Approximate, network-free age label for a timestamp, e.g. "2h ago".
  */
-function formatApproximateAge(timestamp: number, now: number = Date.now()): string {
+export function formatApproximateAge(timestamp: number, now: number = Date.now()): string {
 	const ageMs = Math.max(0, now - timestamp);
 	if (ageMs < MINUTE_MS) {
 		return "just now";

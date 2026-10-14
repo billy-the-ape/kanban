@@ -20,8 +20,16 @@ export function useRuntimeWorkspaceChanges(
 	pollIntervalMs: number | null = null,
 	viewKey: string | null = null,
 	clearOnViewTransition = true,
+	// PRLINK-10: gate ALL detail-diff reads behind a visible changes view —
+	// the initial query, state-version refetches, explicit refresh, and the
+	// poll interval. Setting pollIntervalMs to null alone is not sufficient.
+	// In-flight reads are invalidated by useTrpcQuery when the gate turns off.
+	enabled = true,
 ): UseRuntimeWorkspaceChangesResult {
 	const hasWorkspaceScope = taskId !== null && workspaceId !== null && baseRef !== null;
+	// PRLINK-10: the changes view is only active when scoped AND visible;
+	// every read below is gated on this, not just the poll interval.
+	const isChangesViewActive = hasWorkspaceScope && enabled;
 	const normalizedViewKey = viewKey ?? "__default__";
 	const requestKey = `${workspaceId ?? "__none__"}:${taskId ?? "__none__"}:${baseRef ?? "__none__"}:${mode}:${normalizedViewKey}`;
 	const previousRequestKeyRef = useRef(requestKey);
@@ -39,17 +47,17 @@ export function useRuntimeWorkspaceChanges(
 		});
 	}, [baseRef, mode, normalizedViewKey, taskId, workspaceId]);
 	const { refetch, setData, data, isError } = useTrpcQuery<RuntimeWorkspaceChangesResponse>({
-		enabled: hasWorkspaceScope,
+		enabled: isChangesViewActive,
 		queryFn,
 		noLoading: true,
 	});
 
 	const refresh = useCallback(async () => {
-		if (!hasWorkspaceScope) {
+		if (!isChangesViewActive) {
 			return;
 		}
 		await refetch();
-	}, [refetch, hasWorkspaceScope]);
+	}, [refetch, isChangesViewActive]);
 	const previousStateVersionRef = useRef(stateVersion);
 
 	useEffect(() => {
@@ -72,11 +80,16 @@ export function useRuntimeWorkspaceChanges(
 			return;
 		}
 		previousStateVersionRef.current = stateVersion;
+		// PRLINK-10: a hidden changes view must not schedule refetches; the
+		// next visible mount re-runs the initial query with fresh data.
+		if (!enabled) {
+			return;
+		}
 		void refetch();
-	}, [refetch, hasWorkspaceScope, requestKey, stateVersion]);
+	}, [refetch, hasWorkspaceScope, requestKey, stateVersion, enabled]);
 
 	useEffect(() => {
-		if (!hasWorkspaceScope || pollIntervalMs == null) {
+		if (!isChangesViewActive || pollIntervalMs == null) {
 			return;
 		}
 		const interval = window.setInterval(() => {
@@ -85,7 +98,7 @@ export function useRuntimeWorkspaceChanges(
 		return () => {
 			window.clearInterval(interval);
 		};
-	}, [refetch, hasWorkspaceScope, pollIntervalMs]);
+	}, [refetch, isChangesViewActive, pollIntervalMs]);
 
 	if (!taskId) {
 		return {

@@ -1,6 +1,8 @@
 # PRLINK-10 — Pull requests view in task detail
 
-**Status: PARTIALLY IMPLEMENTED ON MAIN; remaining work depends on PRLINK-6, PRLINK-7 and PRLINK-9.**
+**Status: IMPLEMENTED** on branch `feat/prlink-10-prs-view` (base `611bba2`, main at the merge of
+PRLINK-9). All requirements below were delivered in that branch; see the final-state notes at the
+bottom of this file.
 Master plan: [v1](../complete/pr-linking/PR_LINKING_PLAN.md). Shared context: [follow-ups](PRLINK-FOLLOWUPS.md).
 Deliver the remaining work as one task-detail UI PR using the settled metadata/mutation routes.
 
@@ -120,3 +122,54 @@ support in this view. **Remove link** removes association only, never closes the
 
 A user can inspect/manage all linked PRs in one view while Chat and git changes retain their behavior.
 Follow the shared verification/deployment rules in PRLINK-FOLLOWUPS.md.
+
+## Final state (implemented 2026-10-14)
+
+Both owned TODOs are resolved; no server diff enum or contract changes were needed.
+
+- `web-ui/src/components/card-detail-view.tsx` — new local `detailView: "changes" | "pull_requests"`
+  state alongside the existing `diffMode` (RuntimeWorkspaceChangesMode). Both toolbar call sites
+  (desktop right panel, mobile Diff tab) are no longer gated on `isRuntimeAvailable`: they render
+  `DiffToolbar` with `prCount` = the selected card's stored-link count, and `mode`/`onModeChange`
+  route through `handleToolbarModeChange`. Selecting PRs only flips the view (diff mode retained);
+  All Changes / Last Turn set the mode and return to the changes view. Task/workspace change resets
+  to All Changes (and mobile Chat). The diff hook receives a computed
+  `changesViewVisible`-driven `enabled` flag and `pollIntervalMs: null` while hidden, trashed,
+  document-hidden, in the PRs view, or on the mobile Chat tab, so none of the initial query,
+  state-version, view-key, explicit-refresh or interval paths start work.
+- `web-ui/src/runtime/use-runtime-workspace-changes.ts` — the hook exposes `enabled` (default
+  `true` so existing callers are unchanged) and gates every effect/refetch/poll path with it;
+  in-flight responses keep their existing late-response guards.
+- `web-ui/src/components/detail-panels/task-pr-tracking-panel.tsx` — now the PRs view itself:
+  renders the stored-link list (ordered via `getOrderedTaskPullRequests`) and empty state
+  unconditionally; the footer (Link PR by URL, Refresh linked PRs, Find PRs for branch) and row
+  actions require workspace scope; without a workspace it shows stored information/anchors only.
+  A required `visible` prop gates the reused (pre-existing) 5s tracking-state timer and its
+  `useTrpcQuery` read (`workspaceId && consumersInstalled && visible`); the tracking queryFn is
+  memoized so the query effect does not re-fire per render. The tracking settings/status section is
+  extracted into `task-pr-tracking-settings.tsx` (unchanged behavior) and rendered once inside the
+  view.
+- `web-ui/src/components/detail-panels/task-pull-request-row.tsx` (new) — the shared row used by
+  the PRs view: repo + number, optional title, state / State checked age, source, First recorded,
+  Last observed; Primary for display / Shown by default / Automation PR badges; external Open link;
+  per-row make-primary (or clear), remove, and refresh (disabled with a visible note for
+  unsupported provider hosts via the `@runtime-pr-provider-capabilities` alias, added to
+  `web-ui/tsconfig.json`, `web-ui/vite.config.ts` and `web-ui/vitest.config.ts`).
+- `web-ui/src/hooks/use-task-pull-request-actions.ts` (new) — shared orchestration for
+  add/remove/set-primary/clear-primary/refresh-entry/refresh-linked, with per-action/identity
+  pending state, task-scoped staleness guards, and toast errors that never drop stored rows.
+- `web-ui/src/components/task-pull-request-manager.tsx` — slimmed to presentation (trigger, URL
+  input, compact rows, open state); all mutation orchestration now uses the shared hook, so the
+  desktop popover, mobile controls and PRs view share one behavior. `task-pr-tracking-panel.tsx`
+  no longer duplicates that state.
+- `web-ui/src/utils/task-pull-requests.ts` — new shared `getPullRequestMetaParts` (also adopted by
+  the manager rows) so the PRs view and manager render identical metadata.
+
+Verification: `npm --prefix web-ui run typecheck`, `npm run lint`, `npm run typecheck`, and the
+full web-ui suite (`web-ui` 76 files / 633 tests) pass. New coverage in
+`web-ui/src/components/card-detail-view.test.tsx`: PRs count rendering, switching into/out of the
+PRs view without touching the diff mode, task-switch reset, document-hidden/trash and mobile-tab
+poll gating (asserted on the hook's `enabled`/poll arguments), and a dedicated
+`TaskPrTrackingPanel` suite (empty state, stored rows/order/metadata, no-workspace degradation,
+URL validation and server errors, add-success clearing, unsupported-host refresh note, and
+tracking-state query gating by visibility/consumers).
