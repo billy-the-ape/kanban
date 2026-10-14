@@ -41,6 +41,13 @@ export interface CreateRuntimeStateHubDependencies {
 export interface RuntimeStateHub {
 	trackTerminalManager: (workspaceId: string, manager: TerminalSessionManager) => void;
 	trackClineTaskSessionService: (workspaceId: string, workspacePath: string, service: ClineTaskSessionService) => void;
+	/**
+	 * Read the live summaries of the Cline task session service already
+	 * registered for a workspace. Returns an empty list for untracked or
+	 * disposed workspaces; never instantiates a service or hydrates
+	 * transcripts.
+	 */
+	listClineTaskSessionSummaries: (workspaceId: string) => RuntimeTaskSessionSummary[];
 	broadcastTaskChatMessage: (workspaceId: string, taskId: string, message: ClineTaskMessage) => void;
 	broadcastTaskChatCleared: (workspaceId: string, taskId: string) => void;
 	handleUpgrade: (
@@ -64,6 +71,7 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 	const terminalSummaryUnsubscribeByWorkspaceId = new Map<string, () => void>();
 	const clineSummaryUnsubscribeByWorkspaceId = new Map<string, () => void>();
 	const clineMessageUnsubscribeByWorkspaceId = new Map<string, () => void>();
+	const clineServicesByWorkspaceId = new Map<string, ClineTaskSessionService>();
 	const clinePreviousSummaryByWorkspaceId = new Map<string, Map<string, RuntimeTaskSessionSummary>>();
 	const pendingTaskSessionSummariesByWorkspaceId = new Map<string, Map<string, RuntimeTaskSessionSummary>>();
 	const taskSessionBroadcastTimersByWorkspaceId = new Map<string, NodeJS.Timeout>();
@@ -267,6 +275,7 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 			}
 		}
 		clineMessageUnsubscribeByWorkspaceId.delete(workspaceId);
+		clineServicesByWorkspaceId.delete(workspaceId);
 		disposeTaskSessionSummaryBroadcast(workspaceId);
 		workspaceMetadataMonitor.disposeWorkspace(workspaceId);
 
@@ -494,6 +503,7 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 			if (clineSummaryUnsubscribeByWorkspaceId.has(workspaceId)) {
 				return;
 			}
+			clineServicesByWorkspaceId.set(workspaceId, service);
 			const previousSummariesByTaskId = new Map<string, RuntimeTaskSessionSummary>();
 			clinePreviousSummaryByWorkspaceId.set(workspaceId, previousSummariesByTaskId);
 			for (const summary of service.listSummaries()) {
@@ -527,6 +537,8 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 			});
 			clineMessageUnsubscribeByWorkspaceId.set(workspaceId, unsubscribeMessage);
 		},
+		listClineTaskSessionSummaries: (workspaceId) =>
+			clineServicesByWorkspaceId.get(workspaceId)?.listSummaries() ?? [],
 		broadcastTaskChatMessage,
 		broadcastTaskChatCleared,
 		handleUpgrade: (request, socket, head, context) => {
@@ -571,6 +583,7 @@ export function createRuntimeStateHub(deps: CreateRuntimeStateHubDependencies): 
 				}
 			}
 			clineMessageUnsubscribeByWorkspaceId.clear();
+			clineServicesByWorkspaceId.clear();
 			workspaceMetadataMonitor.close();
 			for (const client of runtimeStateClients) {
 				try {

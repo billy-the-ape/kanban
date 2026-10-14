@@ -114,9 +114,6 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 	const getScopedTerminalManager = async (scope: RuntimeTrpcWorkspaceScope): Promise<TerminalSessionManager> =>
 		await deps.ensureTerminalManagerForWorkspace(scope.workspaceId, scope.workspacePath);
 	const clineTaskSessionServiceByWorkspaceId = new Map<string, ClineTaskSessionService>();
-	deps.workspaceRegistry.setClineSessionSummaryProvider?.(
-		(workspaceId) => clineTaskSessionServiceByWorkspaceId.get(workspaceId)?.listSummaries() ?? [],
-	);
 	const clineWatcherRegistry = createClineWatcherRegistry();
 	// B-2.8: one provider service per runtime server so the model-capacity
 	// cache is shared across all session starts/restarts in this process.
@@ -622,6 +619,8 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			workspaceApi: createWorkspaceApi({
 				ensureTerminalManagerForWorkspace: deps.ensureTerminalManagerForWorkspace,
 				getScopedClineTaskSessionService,
+				getClineTaskSessionSummaries: (workspaceId) =>
+					deps.runtimeStateHub.listClineTaskSessionSummaries(workspaceId),
 				broadcastRuntimeWorkspaceStateUpdated: broadcastRuntimeWorkspaceStateUpdatedWithReconcile,
 				broadcastRuntimeProjectsUpdated: deps.runtimeStateHub.broadcastRuntimeProjectsUpdated,
 				buildWorkspaceStateSnapshot: deps.workspaceRegistry.buildWorkspaceStateSnapshot,

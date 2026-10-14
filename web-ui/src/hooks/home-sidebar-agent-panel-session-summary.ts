@@ -1,3 +1,4 @@
+import { pickNewerSessionSummary } from "@runtime-task-display-state";
 import type { RuntimeTaskSessionSummary } from "@/runtime/types";
 
 export function selectNewestTaskSessionSummary(
@@ -10,5 +11,7 @@ export function selectNewestTaskSessionSummary(
 	if (!right) {
 		return left;
 	}
-	return left.updatedAt >= right.updatedAt ? left : right;
+	// pickNewerSessionSummary(current, candidate) keeps `current` on ties,
+	// preserving the existing keep-left behavior.
+	return pickNewerSessionSummary(left, right);
 }

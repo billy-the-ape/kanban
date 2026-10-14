@@ -1,4 +1,5 @@
 import type { RuntimeTaskSessionSummary } from "./api-contract";
+import { isPlaceholderSessionSummary } from "./task-display-state";
 
 interface TerminalSessionSource {
 	listSummaries(): RuntimeTaskSessionSummary[];
@@ -28,7 +29,24 @@ export function resolveWorkspaceSessionSummaries(
 	const sessions = { ...persisted };
 	for (const summary of terminal.listSummaries()) {
 		const existing = sessions[summary.taskId];
-		if (terminal.hasActiveProcess(summary.taskId) || !existing || summary.updatedAt > existing.updatedAt) {
+		if (terminal.hasActiveProcess(summary.taskId)) {
+			sessions[summary.taskId] = summary;
+			continue;
+		}
+		if (!existing) {
+			sessions[summary.taskId] = summary;
+			continue;
+		}
+		// A real summary always beats a placeholder, regardless of timestamp.
+		const summaryIsPlaceholder = isPlaceholderSessionSummary(summary);
+		const existingIsPlaceholder = isPlaceholderSessionSummary(existing);
+		if (summaryIsPlaceholder !== existingIsPlaceholder) {
+			if (!summaryIsPlaceholder) {
+				sessions[summary.taskId] = summary;
+			}
+			continue;
+		}
+		if (summary.updatedAt > existing.updatedAt) {
 			sessions[summary.taskId] = summary;
 		}
 	}

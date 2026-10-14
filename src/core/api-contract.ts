@@ -761,6 +761,7 @@ export type RuntimeWorkspaceStateNotifyResponse = z.infer<typeof runtimeWorkspac
 export const runtimeProjectTaskCountsSchema = z.object({
 	backlog: z.number(),
 	in_progress: z.number(),
+	paused: z.number(),
 	review: z.number(),
 	done: z.number(),
 	trash: z.number(),

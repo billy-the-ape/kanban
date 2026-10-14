@@ -413,6 +413,7 @@ async function startServer(): Promise<{
 		loadRuntimeConfig,
 		hasGitRepository,
 		pathIsDirectory,
+		getClineTaskSessionSummaries: (workspaceId) => runtimeStateHub?.listClineTaskSessionSummaries(workspaceId) ?? [],
 		onTerminalManagerReady: (workspaceId, manager) => {
 			runtimeStateHub?.trackTerminalManager(workspaceId, manager);
 		},

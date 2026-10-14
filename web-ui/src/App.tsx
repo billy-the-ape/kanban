@@ -264,6 +264,7 @@ export default function App(): ReactElement {
 		shouldUseNavigationPath,
 	} = useProjectUiState({
 		board,
+		sessions,
 		canPersistWorkspaceState,
 		currentProjectId,
 		projects,
