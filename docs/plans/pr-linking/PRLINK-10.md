@@ -134,9 +134,12 @@ Both owned TODOs are resolved; no server diff enum or contract changes were need
   route through `handleToolbarModeChange`. Selecting PRs only flips the view (diff mode retained);
   All Changes / Last Turn set the mode and return to the changes view. Task/workspace change resets
   to All Changes (and mobile Chat). The diff hook receives a computed
-  `changesViewVisible`-driven `enabled` flag and `pollIntervalMs: null` while hidden, trashed,
-  document-hidden, in the PRs view, or on the mobile Chat tab, so none of the initial query,
-  state-version, view-key, explicit-refresh or interval paths start work.
+  `changesViewVisible`-driven `enabled` flag: the mobile Files tab always loads the changes data
+  (it renders the shared file tree), while Chat and the PRs view never schedule reads;
+  document-hidden, git-history, and the PRs view disable the read entirely. Trashed tasks keep the
+  one-time initial read (so the changes view resolves instead of showing a pending panel forever)
+  but get `pollIntervalMs: null`. Selecting a file on the mobile Files tab calls
+  `setDetailView("changes")` so the Diff tab returns to the changes view.
 - `web-ui/src/runtime/use-runtime-workspace-changes.ts` — the hook exposes `enabled` (default
   `true` so existing callers are unchanged) and gates every effect/refetch/poll path with it;
   in-flight responses keep their existing late-response guards.

@@ -51,12 +51,14 @@ const {
 	mockAgentTerminalPanel,
 	mockClineAgentChatPanel,
 	mockDiffViewerPanel,
+	mockFileTreePanel,
 	mockClineAppendToDraft,
 	mockClineSendText,
 } = vi.hoisted(() => ({
 	mockAgentTerminalPanel: vi.fn((_props: { panelBackgroundColor?: string; terminalBackgroundColor?: string }) => null),
 	mockClineAgentChatPanel: vi.fn((..._args: unknown[]) => null),
 	mockDiffViewerPanel: vi.fn((..._args: unknown[]) => null),
+	mockFileTreePanel: vi.fn((..._args: unknown[]) => null),
 	mockClineAppendToDraft: vi.fn(),
 	mockClineSendText: vi.fn(async () => {}),
 }));
@@ -99,7 +101,10 @@ vi.mock("@/components/detail-panels/diff-viewer-panel", () => ({
 }));
 
 vi.mock("@/components/detail-panels/file-tree-panel", () => ({
-	FileTreePanel: () => <div data-testid="file-tree-panel" />,
+	FileTreePanel: (props: unknown) => {
+		mockFileTreePanel(props);
+		return <div data-testid="file-tree-panel" />;
+	},
 }));
 
 vi.mock("@/resize/resizable-bottom-pane", () => ({
@@ -245,6 +250,7 @@ describe("CardDetailView", () => {
 		mockAgentTerminalPanel.mockClear();
 		mockClineAgentChatPanel.mockClear();
 		mockDiffViewerPanel.mockClear();
+		mockFileTreePanel.mockClear();
 		mockClineAppendToDraft.mockClear();
 		mockClineSendText.mockClear();
 		mockUseRuntimeWorkspaceChanges.mockReturnValue({
@@ -272,6 +278,7 @@ describe("CardDetailView", () => {
 		mockAgentTerminalPanel.mockClear();
 		mockClineAgentChatPanel.mockClear();
 		mockDiffViewerPanel.mockClear();
+		mockFileTreePanel.mockClear();
 		mockClineAppendToDraft.mockClear();
 		mockClineSendText.mockClear();
 		vi.restoreAllMocks();
@@ -1242,18 +1249,24 @@ describe("CardDetailView", () => {
 		expect(call[8]).toBe(true);
 	});
 
-	it("does not schedule diff reads when the document is hidden or the task is trashed", async () => {
+	it("does not schedule diff reads when the document is hidden, and keeps the one-time read for trashed tasks", async () => {
 		await act(async () => {
 			renderDesktopDetail(createSelection(), { isDocumentVisible: false });
 		});
-		expect(lastDiffHookCall()[8]).toBe(false);
+		const hiddenCall = lastDiffHookCall();
+		expect(hiddenCall[5]).toBeNull();
+		expect(hiddenCall[8]).toBe(false);
 
+		// Trashed tasks keep the one-time initial read (so the changes view
+		// resolves instead of showing a pending panel forever) but never poll.
 		const trashedSelection = createSelection();
 		trashedSelection.column = { ...trashedSelection.column, id: "trash" };
 		await act(async () => {
 			renderDesktopDetail(trashedSelection);
 		});
-		expect(lastDiffHookCall()[8]).toBe(false);
+		const trashedCall = lastDiffHookCall();
+		expect(trashedCall[5]).toBeNull();
+		expect(trashedCall[8]).toBe(true);
 	});
 
 	it("gates the PRs view diff reads on the active mobile tab", async () => {
@@ -1275,10 +1288,44 @@ describe("CardDetailView", () => {
 		expect(lastDiffHookCall()[8]).toBe(false);
 
 		await clickElement(findToolbarButton("Files"));
-		// The Files tab renders the shared file tree for the changes view, but
-		// the active view is still PRs, so no diff reads.
+		// The Files tab always loads the changes data (it renders the shared
+		// file tree), even while the active view is still PRs.
 		expect(container.querySelector('[data-testid="task-pr-view"]')).not.toBeNull();
+		expect(lastDiffHookCall()[8]).toBe(true);
+
+		// Back on the Diff tab, the PRs view is still active: no diff reads.
+		await clickElement(findToolbarButton("Diff"));
 		expect(lastDiffHookCall()[8]).toBe(false);
+	});
+
+	it("selecting a file on the mobile Files tab returns the Diff tab to the changes view", async () => {
+		const selection = createSelection();
+		selection.card.pullRequests = [createTaskPullRequest(12, true)];
+
+		await act(async () => {
+			renderMobileDetail(selection);
+		});
+
+		await clickElement(findToolbarButton("Diff"));
+		await clickElement(findToolbarButton("PRs (1)"));
+		await clickElement(findToolbarButton("Files"));
+
+		const lastFileTreeProps = mockFileTreePanel.mock.calls.at(-1)?.[0] as
+			| { onSelectPath?: (path: string) => void }
+			| undefined;
+		expect(lastFileTreeProps?.onSelectPath).toBeTypeOf("function");
+
+		await act(async () => {
+			lastFileTreeProps?.onSelectPath?.("src/example.ts");
+		});
+
+		// The Diff tab is active again and shows the changes view, not the
+		// PRs view; diff reads are enabled.
+		expect(container.querySelector('[data-testid="task-pr-view"]')).toBeNull();
+		expect(container.querySelector('[data-testid="file-tree-panel"]')).not.toBeNull();
+		const call = lastDiffHookCall();
+		expect(call[3]).toBe("working_copy");
+		expect(call[8]).toBe(true);
 	});
 });
 
@@ -1405,7 +1452,7 @@ describe("TaskPrTrackingPanel (PRs view)", () => {
 		expect(rowMerged).not.toBeNull();
 		// The display primary (winner) sorts first even though it was recorded
 		// second.
-		expect(rowPrimary!.compareDocumentPosition(rowMerged!)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+		expect(rowPrimary?.compareDocumentPosition(rowMerged as Node)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
 
 		expect(container.querySelector('[data-testid="task-pr-view-primary-label"]')).not.toBeNull();
 		const anchor = container.querySelector('[data-testid="task-pr-view-open-12"]') as HTMLAnchorElement | null;
@@ -1496,6 +1543,36 @@ describe("TaskPrTrackingPanel (PRs view)", () => {
 			url: "https://github.com/cline/kanban/pull/66",
 		});
 		expect((container.querySelector("[data-testid='task-pr-view-url-input']") as HTMLInputElement).value).toBe("");
+	});
+
+	it("refreshes the linked PR metadata when Refresh linked PRs is clicked", async () => {
+		trpcClientMocks.refreshLinkedTaskPullRequests.mockResolvedValue({ ok: true, updated: 0, outcomes: [] });
+
+		await act(async () => {
+			renderPanel({ pullRequests: [createTaskPullRequest(12)] });
+		});
+
+		const button = container.querySelector("[data-testid='task-pr-view-refresh-linked-button']") as HTMLButtonElement;
+		await act(async () => {
+			button.click();
+		});
+
+		expect(trpcClientMocks.refreshLinkedTaskPullRequests).toHaveBeenCalledWith({ taskId: "task-1" });
+	});
+
+	it("runs the branch lookup when Find PRs for branch is clicked", async () => {
+		trpcClientMocks.refreshTaskPullRequests.mockResolvedValue({ ok: true, updated: 0, reason: "unchanged" });
+
+		await act(async () => {
+			renderPanel({ pullRequests: [] });
+		});
+
+		const button = container.querySelector("[data-testid='task-pr-view-find-branch-button']") as HTMLButtonElement;
+		await act(async () => {
+			button.click();
+		});
+
+		expect(trpcClientMocks.refreshTaskPullRequests).toHaveBeenCalledWith({ taskId: "task-1" });
 	});
 
 	it("disables the row refresh for unsupported provider hosts with a visible reason", async () => {

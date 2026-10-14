@@ -581,15 +581,18 @@ export function CardDetailView({
 				].join(":")
 			: null;
 	// PRLINK-10: detail-diff reads run only for a visible changes view.
-	// Desktop: the changes view minus trash/git-history/document-hidden views.
-	// Mobile: the Diff tab showing changes, or the Files tab (which renders the
-	// shared file tree); Chat and the PRs view never schedule diff reads.
+	// Desktop: the changes view minus git-history/document-hidden views.
+	// Mobile: the Files tab (which renders the shared file tree) or the
+	// Diff tab showing changes; Chat and the PRs view never schedule diff
+	// reads. Trashed tasks keep the one-time initial read (so the changes
+	// view resolves instead of showing a pending panel forever) but never
+	// poll.
 	const changesViewVisible =
 		isDocumentVisible &&
-		detailView === "changes" &&
 		!gitHistoryPanel &&
-		selection.column.id !== "trash" &&
-		(isMobile ? mobileTab === "diff" || mobileTab === "files" : true);
+		(isMobile
+			? mobileTab === "files" || (mobileTab === "diff" && detailView === "changes")
+			: detailView === "changes");
 	const prViewVisible = detailView === "pull_requests" && (isMobile ? mobileTab === "diff" : true);
 	const { changes: workspaceChanges, isRuntimeAvailable } = useRuntimeWorkspaceChanges(
 		selection.card.id,
@@ -597,7 +600,7 @@ export function CardDetailView({
 		selection.card.baseRef,
 		diffMode,
 		taskWorkspaceStateVersion,
-		changesViewVisible ? DETAIL_DIFF_POLL_INTERVAL_MS : null,
+		changesViewVisible && selection.column.id !== "trash" ? DETAIL_DIFF_POLL_INTERVAL_MS : null,
 		lastTurnViewKey,
 		true,
 		changesViewVisible,
@@ -915,6 +918,9 @@ export function CardDetailView({
 								workspaceFiles={isRuntimeAvailable ? runtimeFiles : null}
 								selectedPath={selectedPath}
 								onSelectPath={(path: string) => {
+									// Return the Diff tab to the changes view: a file
+									// selection is about the diff, not the PRs view.
+									setDetailView("changes");
 									setSelectedPath(path);
 									setMobileTab("diff");
 								}}

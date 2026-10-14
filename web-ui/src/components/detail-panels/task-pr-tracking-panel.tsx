@@ -199,6 +199,7 @@ export function TaskPrTrackingPanel({
 						disabled={workspaceId === null || links.length === 0 || actions.linkedRefreshing}
 						className={mobile ? "min-h-11" : undefined}
 						aria-label="Refresh linked pull requests from the provider"
+						onClick={() => void actions.refreshLinked()}
 						data-testid="task-pr-view-refresh-linked-button"
 					>
 						{actions.linkedRefreshing ? "Refreshing" : "Refresh linked PRs"}
@@ -210,6 +211,7 @@ export function TaskPrTrackingPanel({
 						disabled={workspaceId === null || actions.branchLookupPending}
 						className={mobile ? "min-h-11" : undefined}
 						aria-label="Find pull requests for the task's current branch"
+						onClick={() => void actions.findBranchPullRequests()}
 						data-testid="task-pr-view-find-branch-button"
 					>
 						{actions.branchLookupPending ? "Searching" : "Find PRs for branch"}
