@@ -200,6 +200,23 @@ export interface CreateInMemoryClineTaskSessionServiceOptions {
 	 * writes (e.g. PR recording from Cline tool calls).
 	 */
 	broadcastWorkspaceStateUpdated?: (workspacePath: string) => void;
+	/**
+	 * COMMENT-0: implementation-session publication capture. Only task
+	 * session services install this observer (review sessions never do),
+	 * which is what keeps reviewer output from being attributed as
+	 * implementation output. The observer must not block, deny, or fail the
+	 * tool; it only records publication attribution.
+	 */
+	recordPrPublicationToolEvent?: (input: {
+		workspacePath: string;
+		taskId: string;
+		phase: "started" | "finished";
+		toolCallId: string | null;
+		toolName: string | null;
+		commands: string[];
+		output: string | null;
+		error: string | null;
+	}) => Promise<void>;
 }
 
 function toErrorMessage(error: unknown): string {
@@ -1515,6 +1532,43 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		return lease.setup;
 	}
 
+	/**
+	 * COMMENT-0: forwards one tool event to the publication-capture callback
+	 * (implementation sessions only). The callback owns all state work; this
+	 * wrapper guarantees the observer can never block, deny, or fail the
+	 * observed tool.
+	 */
+	private capturePrPublicationToolEvent(
+		taskId: string,
+		phase: "started" | "finished",
+		tool: {
+			toolCallId: string | null;
+			toolName: string | null;
+			commands: string[];
+			output: string | null;
+			error: string | null;
+		},
+	): void {
+		const callback = this.options.recordPrPublicationToolEvent;
+		const workspacePath = this.options.workspacePath;
+		if (!callback || !workspacePath) {
+			return;
+		}
+		void callback({
+			workspacePath,
+			taskId,
+			phase,
+			toolCallId: tool.toolCallId,
+			toolName: tool.toolName,
+			commands: tool.commands,
+			output: tool.output,
+			error: tool.error,
+		}).catch(() => {
+			// Best-effort capture by contract; a failure pauses automation
+			// inside the callback, never against the tool.
+		});
+	}
+
 	private handleTaskEvent(taskId: string, event: unknown): void {
 		const entry = this.messageRepository.getTaskEntry(taskId);
 		if (!entry) {
@@ -1538,6 +1592,22 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			// PRLINK-1: PR-creation capture for Cline tool calls. Detection is a
 			// pure string scan, so this gate is cheap for every tool; only
 			// PR-creating commands produce links to record.
+			onToolStarted: (tool) => {
+				// COMMENT-0: capture-pending state is established before
+				// execution so automatic dispatch can coordinate with
+				// in-flight publications.
+				const commands = extractCommandStrings(tool.toolInput);
+				if (commands.length === 0) {
+					return;
+				}
+				void this.capturePrPublicationToolEvent(taskId, "started", {
+					toolCallId: tool.toolCallId,
+					toolName: tool.toolName,
+					commands,
+					output: null,
+					error: null,
+				});
+			},
 			onToolFinished: (tool) => {
 				const links = detectCreatedPullRequests({
 					toolName: tool.toolName,
@@ -1546,6 +1616,20 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					// create` prints the "already exists" PR URL to stderr.
 					output: [tool.output, tool.error].filter((part): part is string => Boolean(part)).join("\n") || null,
 				});
+				// COMMENT-0: publication capture for this implementation session
+				// (review sessions never install this observer). Best-effort; a
+				// storage failure pauses automation inside the callback, never
+				// here and never against the tool.
+				const commands = extractCommandStrings(tool.toolInput);
+				if (commands.length > 0) {
+					void this.capturePrPublicationToolEvent(taskId, "finished", {
+						toolCallId: tool.toolCallId,
+						toolName: tool.toolName,
+						commands,
+						output: tool.output,
+						error: tool.error,
+					});
+				}
 				if (links.length === 0) {
 					return;
 				}

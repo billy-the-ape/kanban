@@ -499,4 +499,3 @@ store, never clobbered.
   testability; production defaults match the fixed decisions above.
 - No baseline drift found against 49a2ca05c6c2927da2194aaec8bd1e45e6fa2928; the PR-linking
   identity helpers were already landed.
-

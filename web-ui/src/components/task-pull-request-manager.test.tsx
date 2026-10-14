@@ -27,7 +27,7 @@ vi.mock("@/components/app-toaster", () => ({
 	notifyError: vi.fn(),
 }));
 
-import { TaskPullRequestManager } from "@/components/task-pull-request-manager";
+import { TaskPullRequestManager, TaskPullRequestManagerPopover } from "@/components/task-pull-request-manager";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { RuntimeTaskPullRequest } from "@/runtime/types";
 
@@ -288,5 +288,137 @@ describe("TaskPullRequestManager", () => {
 		await clickElement(refreshButton as Element);
 
 		expect(appToasterMocks.showAppToast).not.toHaveBeenCalled();
+	});
+});
+
+describe("TaskPullRequestManagerPopover (mobile)", () => {
+	let container: HTMLDivElement;
+	let root: Root;
+	let previousActEnvironment: boolean | undefined;
+
+	beforeEach(() => {
+		trpcClientMocks.addTaskPullRequest.mockReset();
+		trpcClientMocks.removeTaskPullRequest.mockReset();
+		trpcClientMocks.refreshTaskPullRequests.mockReset();
+		appToasterMocks.showAppToast.mockReset();
+		previousActEnvironment = (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
+			.IS_REACT_ACT_ENVIRONMENT;
+		(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+		container = document.createElement("div");
+		document.body.appendChild(container);
+		root = createRoot(container);
+	});
+
+	afterEach(() => {
+		act(() => {
+			root.unmount();
+		});
+		container.remove();
+		if (previousActEnvironment === undefined) {
+			delete (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT;
+		} else {
+			(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT =
+				previousActEnvironment;
+		}
+	});
+
+	function renderMobileManager(open: boolean, pullRequests: RuntimeTaskPullRequest[]): void {
+		root.render(
+			<TooltipProvider>
+				<TaskPullRequestManagerPopover
+					open={open}
+					onOpenChange={() => {}}
+					workspaceId="workspace-1"
+					taskId="task-1"
+					pullRequests={pullRequests}
+					mobile
+					trigger={
+						<button type="button" data-testid="mobile-pr-trigger">
+							manage
+						</button>
+					}
+				/>
+			</TooltipProvider>,
+		);
+	}
+
+	it("shows visible repository/state information and 44px row actions on mobile", async () => {
+		const pullRequest = createTaskPullRequest(12);
+		pullRequest.state = "open";
+		pullRequest.isPrimary = true;
+
+		await act(async () => {
+			renderMobileManager(true, [pullRequest]);
+		});
+
+		const meta = document.body.querySelector("[data-testid='task-pr-row-meta-12']");
+		expect(meta?.textContent).toContain("cline/kanban");
+		expect(meta?.textContent).toContain("open");
+		// PRLINK-6: the winner label moves into the visible row meta on mobile.
+		expect(meta?.textContent).toContain("primary for display");
+
+		const removeButton = document.body.querySelector("[data-testid='task-pr-remove-12']") as HTMLButtonElement | null;
+		expect(removeButton?.className).toContain("min-h-11");
+		expect(removeButton?.className).toContain("min-w-11");
+		const makePrimaryButton = document.body.querySelector(
+			"[data-testid='task-pr-use-automatic-order']",
+		) as HTMLButtonElement | null;
+		expect(makePrimaryButton?.className).toContain("min-h-11");
+		const refreshButton = document.body.querySelector(
+			"[data-testid='task-pr-refresh-button']",
+		) as HTMLButtonElement | null;
+		expect(refreshButton?.className).toContain("min-h-11");
+	});
+
+	it("keeps desktop row actions at their original size when mobile is not set", async () => {
+		await act(async () => {
+			root.render(
+				<TooltipProvider>
+					<TaskPullRequestManager
+						workspaceId="workspace-1"
+						taskId="task-1"
+						pullRequests={[createTaskPullRequest(12)]}
+					/>
+				</TooltipProvider>,
+			);
+		});
+
+		await openPopover(container);
+		const removeButton = document.body.querySelector("[data-testid='task-pr-remove-12']") as HTMLButtonElement | null;
+		expect(removeButton?.className).not.toContain("min-h-11");
+	});
+
+	it("honors a controlled open state without mutating it internally", async () => {
+		const onOpenChange = vi.fn();
+
+		await act(async () => {
+			root.render(
+				<TooltipProvider>
+					<TaskPullRequestManagerPopover
+						open={false}
+						onOpenChange={onOpenChange}
+						workspaceId="workspace-1"
+						taskId="task-1"
+						pullRequests={[createTaskPullRequest(12)]}
+						mobile
+						trigger={
+							<button type="button" data-testid="mobile-pr-trigger">
+								manage
+							</button>
+						}
+					/>
+				</TooltipProvider>,
+			);
+		});
+
+		// Closed while open={false} even though the trigger is mounted.
+		expect(document.body.querySelector("[data-testid='task-pr-url-input']")).toBeNull();
+
+		const trigger = container.querySelector("[data-testid='mobile-pr-trigger']") as Element;
+		await clickElement(trigger);
+
+		// The popover stays closed (open is controlled) but reports the intent.
+		expect(document.body.querySelector("[data-testid='task-pr-url-input']")).toBeNull();
+		expect(onOpenChange).toHaveBeenCalledWith(true);
 	});
 });

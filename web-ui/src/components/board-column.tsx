@@ -1,10 +1,11 @@
 import { Droppable } from "@hello-pangea/dnd";
-import { Play, Plus, Trash2 } from "lucide-react";
+import { FoldHorizontal, Play, Plus, Trash2, UnfoldHorizontal } from "lucide-react";
 import type { MouseEvent as ReactMouseEvent, ReactNode } from "react";
-
+import { useLocalStorage } from "react-use";
 import { BoardCard } from "@/components/board-card";
 import { Button } from "@/components/ui/button";
 import { ColumnIndicator } from "@/components/ui/column-indicator";
+import { useIsMobile } from "@/hooks/use-is-mobile";
 import type { RuntimeTaskInitialStartStage, RuntimeTaskPhaseSummary, RuntimeTaskSessionSummary } from "@/runtime/types";
 import {
 	canReturnQueuedTaskToBacklog,
@@ -12,7 +13,10 @@ import {
 	isTaskSessionRunning,
 	type ProgrammaticCardMoveInFlight,
 } from "@/state/drag-rules";
+import { LocalStorageKey } from "@/storage/local-storage-store";
 import type { BoardCard as BoardCardModel, BoardColumnId, BoardColumn as BoardColumnModel } from "@/types";
+import { cn } from "./ui/cn";
+import { Tooltip } from "./ui/tooltip";
 
 export function BoardColumn({
 	column,
@@ -87,6 +91,7 @@ export function BoardColumn({
 	/** UPD-1.3: live initial-start preparation stages per task while a start is in flight. */
 	initialStartStageByTaskId?: Record<string, RuntimeTaskInitialStartStage>;
 }): React.ReactElement {
+	const isMobile = useIsMobile();
 	const canCreate = column.id === "backlog" && onCreateTask;
 	const canStartAllTasks = column.id === "backlog" && onStartAllTasks;
 	const canClearTrash = column.id === "trash" && onClearTrash;
@@ -110,130 +115,166 @@ export function BoardColumn({
 		</span>
 	);
 
+	const [isCollapsed, setIsCollapsed] = useLocalStorage(
+		LocalStorageKey.BoardColumnCollapsed.replace("{project}", workspacePath || "unknown").replace(
+			"{columnid}",
+			column.id,
+		),
+		false,
+		{
+			raw: false,
+			serializer(val) {
+				return String(val);
+			},
+			deserializer(val) {
+				return val === "true";
+			},
+		},
+	);
+
 	return (
 		<section
 			data-column-id={column.id}
-			className="flex flex-col min-w-0 min-h-0 bg-surface-1 rounded-lg overflow-hidden border border-border"
+			className={cn(
+				"flex flex-col min-w-0 min-h-0 bg-surface-1 rounded-lg overflow-hidden border border-border",
+				isCollapsed && "max-w-10",
+			)}
 			style={{
 				flex: "1 1 0",
 			}}
 		>
 			<div className="flex flex-col min-h-0" style={{ flex: "1 1 0" }}>
-				<div
-					className="flex items-center justify-between"
-					style={{
-						height: 40,
-						padding: "0 12px",
-					}}
-				>
-					<div className="flex items-center gap-2">
-						<ColumnIndicator columnId={column.id} />
-						<span className="font-semibold text-sm">{column.title}</span>
-						<span className="text-text-secondary text-xs">{column.cards.length}</span>
-					</div>
-					{canStartAllTasks ? (
-						<Button
-							icon={<Play size={14} />}
-							variant="ghost"
-							size="sm"
-							onClick={onStartAllTasks}
-							disabled={column.cards.length === 0}
-							aria-label="Start all backlog tasks"
-							title={column.cards.length > 0 ? "Start all backlog tasks" : "Backlog is empty"}
-						/>
-					) : null}
-					{canClearTrash ? (
-						<Button
-							icon={<Trash2 size={14} />}
-							variant="ghost"
-							size="sm"
-							className="text-status-red hover:text-status-red"
-							onClick={onClearTrash}
-							disabled={column.cards.length === 0}
-							aria-label="Clear trash"
-							title={column.cards.length > 0 ? "Clear trash items permanently" : "Trash is empty"}
-						/>
-					) : null}
-				</div>
-
-				<Droppable droppableId={column.id} type={cardDropType} isDropDisabled={isDropDisabled}>
-					{(cardProvided) => (
-						<div ref={cardProvided.innerRef} {...cardProvided.droppableProps} className="kb-column-cards">
-							{canCreate ? (
+				<Tooltip content={isCollapsed ? `${column.title} - ${column.cards.length} cards` : null}>
+					<div
+						className={cn(
+							"flex items-center justify-between gap-2",
+							isCollapsed ? "flex-col-reverse pt-3.5" : "h-10 px-3",
+						)}
+					>
+						<div className={cn("flex items-center gap-2", isCollapsed && "flex-col")}>
+							<ColumnIndicator columnId={column.id} />
+							{!isCollapsed && <span className="font-semibold text-sm">{column.title}</span>}
+							<span className="text-text-secondary text-xs">{column.cards.length}</span>
+						</div>
+						<div className="flex">
+							{canStartAllTasks && !isCollapsed ? (
 								<Button
-									icon={<Plus size={14} />}
-									aria-label="Create task"
-									fill
-									onClick={onCreateTask}
-									style={{ marginBottom: 6, flexShrink: 0 }}
-								>
-									{createTaskButtonText}
-								</Button>
+									icon={<Play size={14} />}
+									variant="ghost"
+									size="sm"
+									onClick={onStartAllTasks}
+									disabled={column.cards.length === 0}
+									aria-label="Start all backlog tasks"
+									title={column.cards.length > 0 ? "Start all backlog tasks" : "Backlog is empty"}
+								/>
+							) : null}
+							{canClearTrash && !isCollapsed ? (
+								<Button
+									icon={<Trash2 size={14} />}
+									variant="ghost"
+									size="sm"
+									className="text-status-red hover:text-status-red"
+									onClick={onClearTrash}
+									disabled={column.cards.length === 0}
+									aria-label="Clear trash"
+									title={column.cards.length > 0 ? "Clear trash items permanently" : "Trash is empty"}
+								/>
 							) : null}
 
-							{(() => {
-								const items: ReactNode[] = [];
-								let draggableIndex = 0;
-								for (const card of column.cards) {
-									if (column.id === "backlog" && editingTaskId === card.id) {
-										items.push(
-											<div
-												key={card.id}
-												data-task-id={card.id}
-												data-column-id={column.id}
-												style={{ marginBottom: 6 }}
-											>
-												{inlineTaskEditor}
-											</div>,
-										);
-										continue;
-									}
-									items.push(
-										<BoardCard
-											key={card.id}
-											card={card}
-											index={draggableIndex}
-											columnId={column.id}
-											sessionSummary={taskSessions[card.id]}
-											phaseSummary={taskPhases?.[card.id]}
-											initialStartStage={initialStartStageByTaskId?.[card.id]}
-											onStart={onStartTask}
-											onMoveToTrash={onMoveToTrashTask}
-											onComplete={onCompleteTask}
-											onRestoreFromTrash={onRestoreFromTrashTask}
-											onCommit={onCommitTask}
-											onOpenPr={onOpenPrTask}
-											onCancelAutomaticAction={onCancelAutomaticTaskAction}
-											isCommitLoading={commitTaskLoadingById?.[card.id] ?? false}
-											isOpenPrLoading={openPrTaskLoadingById?.[card.id] ?? false}
-											isMoveToTrashLoading={moveToTrashLoadingById?.[card.id] ?? false}
-											isCompleteLoading={completeTaskLoadingById?.[card.id] ?? false}
-											cleanupBlockedReason={cleanupBlockedReasonByTaskId?.[card.id] ?? null}
-											onDependencyPointerDown={onDependencyPointerDown}
-											onDependencyPointerEnter={onDependencyPointerEnter}
-											isDependencySource={dependencySourceTaskId === card.id}
-											isDependencyTarget={dependencyTargetTaskId === card.id}
-											isDependencyLinking={isDependencyLinking}
-											workspacePath={workspacePath}
-											defaultClineModelId={defaultClineModelId}
-											onSaveTitle={onSaveTitle}
-											onClick={() => {
-												if (column.id === "backlog") {
-													onEditTask?.(card);
-													return;
-												}
-												onCardClick?.(card);
-											}}
-										/>,
-									);
-									draggableIndex += 1;
-								}
-								return items;
-							})()}
-							{cardProvided.placeholder}
+							{!isMobile && (
+								<Tooltip content={isCollapsed ? null : `Collapse ${column.title}`}>
+									<button
+										type="button"
+										className="cursor-pointer"
+										onClick={() => setIsCollapsed(!isCollapsed)}
+									>
+										{!isCollapsed ? <FoldHorizontal size={12} /> : <UnfoldHorizontal size={12} />}
+									</button>
+								</Tooltip>
+							)}
 						</div>
-					)}
-				</Droppable>
+					</div>
+				</Tooltip>
+				{!isCollapsed && (
+					<Droppable droppableId={column.id} type={cardDropType} isDropDisabled={isDropDisabled}>
+						{(cardProvided) => (
+							<div ref={cardProvided.innerRef} {...cardProvided.droppableProps} className="kb-column-cards">
+								{canCreate ? (
+									<Button
+										icon={<Plus size={14} />}
+										aria-label="Create task"
+										fill
+										onClick={onCreateTask}
+										style={{ marginBottom: 6, flexShrink: 0 }}
+									>
+										{createTaskButtonText}
+									</Button>
+								) : null}
+
+								{(() => {
+									const items: ReactNode[] = [];
+									let draggableIndex = 0;
+									for (const card of column.cards) {
+										if (column.id === "backlog" && editingTaskId === card.id) {
+											items.push(
+												<div
+													key={card.id}
+													data-task-id={card.id}
+													data-column-id={column.id}
+													style={{ marginBottom: 6 }}
+												>
+													{inlineTaskEditor}
+												</div>,
+											);
+											continue;
+										}
+										items.push(
+											<BoardCard
+												key={card.id}
+												card={card}
+												index={draggableIndex}
+												columnId={column.id}
+												sessionSummary={taskSessions[card.id]}
+												phaseSummary={taskPhases?.[card.id]}
+												initialStartStage={initialStartStageByTaskId?.[card.id]}
+												onStart={onStartTask}
+												onMoveToTrash={onMoveToTrashTask}
+												onComplete={onCompleteTask}
+												onRestoreFromTrash={onRestoreFromTrashTask}
+												onCommit={onCommitTask}
+												onOpenPr={onOpenPrTask}
+												onCancelAutomaticAction={onCancelAutomaticTaskAction}
+												isCommitLoading={commitTaskLoadingById?.[card.id] ?? false}
+												isOpenPrLoading={openPrTaskLoadingById?.[card.id] ?? false}
+												isMoveToTrashLoading={moveToTrashLoadingById?.[card.id] ?? false}
+												isCompleteLoading={completeTaskLoadingById?.[card.id] ?? false}
+												cleanupBlockedReason={cleanupBlockedReasonByTaskId?.[card.id] ?? null}
+												onDependencyPointerDown={onDependencyPointerDown}
+												onDependencyPointerEnter={onDependencyPointerEnter}
+												isDependencySource={dependencySourceTaskId === card.id}
+												isDependencyTarget={dependencyTargetTaskId === card.id}
+												isDependencyLinking={isDependencyLinking}
+												workspacePath={workspacePath}
+												defaultClineModelId={defaultClineModelId}
+												onSaveTitle={onSaveTitle}
+												onClick={() => {
+													if (column.id === "backlog") {
+														onEditTask?.(card);
+														return;
+													}
+													onCardClick?.(card);
+												}}
+											/>,
+										);
+										draggableIndex += 1;
+									}
+									return items;
+								})()}
+								{cardProvided.placeholder}
+							</div>
+						)}
+					</Droppable>
+				)}
 			</div>
 		</section>
 	);

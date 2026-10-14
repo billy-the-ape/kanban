@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { RuntimeTaskPullRequest } from "../../../src/core/api-contract";
 import type { ParsedPullRequestLink } from "../../../src/core/pull-request-links";
 import {
+	classifyTaskChatMessageForPrLink,
 	extractPullRequestLinks,
 	getOrderedTaskPullRequests,
 	getPrimaryPullRequest,
@@ -101,6 +102,14 @@ describe("extractPullRequestLinks", () => {
 		const links = extractPullRequestLinks("Created the PR: See https://github.com/o/r/pull/12). Let me know.");
 		expect(links).toHaveLength(1);
 		expect(links[0]?.url).toBe("https://github.com/o/r/pull/12");
+	});
+
+	it("unwraps markdown links, angle brackets, and code fences", () => {
+		const bare = "https://github.com/o/r/pull/12";
+		for (const text of [`[${bare}](${bare})`, `<${bare}>`, `\`\`\`${bare}\`\`\``, `\`${bare}\``]) {
+			const links = extractPullRequestLinks(text);
+			expect(links.map((link) => link.url)).toEqual([bare]);
+		}
 	});
 
 	it("dedupes by identity (case-insensitive host/repo) keeping first-appearance order", () => {
@@ -255,5 +264,114 @@ describe("getOrderedTaskPullRequests", () => {
 	it("keeps a single-entry list unchanged in order", () => {
 		const only = createPullRequest();
 		expect(getOrderedTaskPullRequests([only])).toEqual([only]);
+	});
+});
+
+describe("classifyTaskChatMessageForPrLink", () => {
+	const bareUrl = "https://github.com/owner/repo/pull/12";
+
+	it("auto-links a trimmed message that is exactly one bare PR URL", () => {
+		for (const text of [bareUrl, `  ${bareUrl}  `, `${bareUrl}/files`, `${bareUrl}#discussion_r1`]) {
+			const candidate = classifyTaskChatMessageForPrLink(text, false);
+			expect(candidate).toEqual({
+				kind: "auto_link",
+				link: {
+					provider: "github",
+					host: "github.com",
+					repository: "owner/repo",
+					number: 12,
+					url: bareUrl,
+				},
+			});
+		}
+	});
+
+	it("auto-links gitlab and bitbucket bare URLs", () => {
+		expect(classifyTaskChatMessageForPrLink("https://gitlab.com/g/r/-/merge_requests/7", false)).toMatchObject({
+			kind: "auto_link",
+			link: { provider: "gitlab", number: 7 },
+		});
+		expect(classifyTaskChatMessageForPrLink("https://bitbucket.org/ws/repo/pull-requests/9", false)).toMatchObject({
+			kind: "auto_link",
+			link: { provider: "bitbucket", number: 9 },
+		});
+	});
+
+	it("never auto-links a whitespace message, even when the lazy GitLab pattern spans it", () => {
+		const text =
+			"https://gitlab.com/g/r/-/merge_requests/7 please compare with https://gitlab.com/g/r/-/merge_requests/8";
+		const candidate = classifyTaskChatMessageForPrLink(text, false);
+		expect(candidate.kind).toBe("suggestions");
+		if (candidate.kind === "suggestions") {
+			expect(
+				candidate.links.map((link) => ({ repository: link.repository, number: link.number, url: link.url })),
+			).toEqual([
+				{
+					repository: "g/r",
+					number: 7,
+					url: "https://gitlab.com/g/r/-/merge_requests/7",
+				},
+				{
+					repository: "g/r",
+					number: 8,
+					url: "https://gitlab.com/g/r/-/merge_requests/8",
+				},
+			]);
+		}
+	});
+
+	it("falls back to suggestions when the bare URL has attached images", () => {
+		const candidate = classifyTaskChatMessageForPrLink(bareUrl, true);
+		expect(candidate).toEqual({ kind: "suggestions", links: [expect.objectContaining({ number: 12 })] });
+	});
+
+	it("uses the suggestion path for prose mentions and wrappers", () => {
+		const proseCases = [
+			"Please review https://github.com/owner/repo/pull/12 when you get a chance.",
+			`[${bareUrl}](${bareUrl})`, // markdown link
+			`<${bareUrl}>`, // angle-bracket wrapper
+			`\`\`${bareUrl}\`\``, // code fence
+			`${bareUrl}.`, // trailing punctuation
+		];
+		for (const text of proseCases) {
+			const candidate = classifyTaskChatMessageForPrLink(text, false);
+			expect(candidate.kind).toBe("suggestions");
+			if (candidate.kind === "suggestions") {
+				expect(candidate.links).toEqual([expect.objectContaining({ number: 12, url: bareUrl })]);
+			}
+		}
+	});
+
+	it("dedupes repeated URLs and caps suggestions at three", () => {
+		const text = [
+			"https://github.com/owner/repo/pull/1",
+			"https://github.com/owner/repo/pull/1/files",
+			"https://github.com/owner/repo/pull/2",
+			"https://github.com/owner/repo/pull/3",
+			"https://github.com/owner/repo/pull/4",
+		].join(" ");
+		const candidate = classifyTaskChatMessageForPrLink(text, false);
+		expect(candidate.kind).toBe("suggestions");
+		if (candidate.kind === "suggestions") {
+			expect(candidate.links.map((link) => link.number)).toEqual([1, 2, 3]);
+		}
+	});
+
+	it("ignores rejected shapes and returns none", () => {
+		expect(classifyTaskChatMessageForPrLink("https://github.com/owner/repo/pull/new/feature-branch", false)).toEqual({
+			kind: "none",
+		});
+		expect(classifyTaskChatMessageForPrLink("https://github.com/owner/repo/compare/main...head", false)).toEqual({
+			kind: "none",
+		});
+		expect(classifyTaskChatMessageForPrLink("https://github.com/owner/repo/issues/12", false)).toEqual({
+			kind: "none",
+		});
+	});
+
+	it("returns none for empty and URL-free messages", () => {
+		expect(classifyTaskChatMessageForPrLink("", false)).toEqual({ kind: "none" });
+		expect(classifyTaskChatMessageForPrLink("   ", true)).toEqual({ kind: "none" });
+		expect(classifyTaskChatMessageForPrLink("No links here", false)).toEqual({ kind: "none" });
 	});
 });

@@ -1,6 +1,6 @@
 # PRLINK-7 — Mobile PR access and management
 
-**Status: READY FOR IMPLEMENTATION. Depends on v1 and PRLINK-6.**
+**Status: IMPLEMENTED (this PR). Depends on v1 and PRLINK-6.**
 Master plan: [v1](../complete/pr-linking/PR_LINKING_PLAN.md). Shared context: [follow-ups](PRLINK-FOLLOWUPS.md).
 Deliver as one UI PR; no new server route or mobile navigation architecture.
 
@@ -53,3 +53,36 @@ open task selection or begin dragging. Desktop remains unchanged.
 A user can open the displayed PR directly and manage all links from either mobile panel,
 without changing the title layout or losing Chat/Diff access.
 Follow the shared verification/deployment rules in PRLINK-FOLLOWUPS.md.
+
+## Final state (implemented)
+
+- `TaskPullRequestManagerPopover` (exported from `web-ui/src/components/task-pull-request-manager.tsx`)
+  owns all shared state and mutation logic. Its trigger, open state, and presentation are
+  configurable: `trigger` (ReactNode), optional controlled `open`/`onOpenChange`, and a
+  `mobile` flag. Mobile presentation: 44px (`min-h-11`) touch targets for every row action and
+  the refresh button, a scrollable viewport-bounded list (`max-h-[60vh]`), and a visible
+  repository/state/winner label line in each row so nothing depends on a hover tooltip.
+- `TaskPullRequestManager` (unchanged export, desktop top bar) renders the popover with the
+  original "+"/"Link PR" trigger and an uncontrolled open state.
+- `TaskPullRequestLink` gained optional `ariaLabel` and `dataTestId`; it still wraps the anchor
+  in the shared Tooltip and keeps `target="_blank"`/`rel="noopener noreferrer"`.
+- `MobileDetailTabBar` (in `card-detail-view.tsx`) renders the trailing controls from the
+  selected card's `pullRequests`: the display-order primary anchor (compact, external, never
+  changes meaning) plus the management button. Zero links + workspaceId shows **Link PR** as
+  the management trigger; no workspaceId shows only the readable anchors. `MobileDetailTabBar`
+  is keyed by workspace+task at its call site (and the popover is keyed inside it), so the
+  popover and its open state are dropped with the task — a late response from task A cannot
+  update or close task B's manager.
+- Tests: desktop regressions in `task-pull-request-manager.test.tsx`/`top-bar.test.tsx`, mobile
+  popover behavior (visible row meta, 44px targets, controlled open) in
+  `task-pull-request-manager.test.tsx`, and mobile tab-bar behavior (zero/one/multiple links,
+  no workspaceId, anchor click does not switch tabs, task-switch reset, and a late add response
+  from task A cannot close task B's manager) in `card-detail-view.test.tsx`.
+
+## Deployment / rollback
+
+No new environment variables, dependencies, migrations, or settings. Rollback restores the
+previous UI components; no persisted format changed. Manual test: on a mobile-width viewport
+(open a task detail), tap the PR anchor to open the provider page in a new tab and the
+GitPullRequest button to open the shared manager (Add/Remove/Make primary/Refresh); with no
+links, **Link PR** opens the same manager.

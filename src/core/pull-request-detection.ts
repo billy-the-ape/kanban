@@ -24,21 +24,79 @@ const ENV_ASSIGNMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*=/;
 const MAX_STRUCTURED_OUTPUT_DEPTH = 4;
 
 /** Splits a command line at unquoted-ish shell operators and newlines. */
-function splitCommandFragments(command: string): string[] {
+export function splitCommandFragments(command: string): string[] {
 	return command
 		.split(COMMAND_FRAGMENT_SPLIT_PATTERN)
 		.map((fragment) => fragment.trim())
 		.filter(Boolean);
 }
 
-/** Tokenizes a fragment, skipping leading env assignments (`FOO=bar cmd`). */
-function tokenizeCommandFragment(fragment: string): string[] {
-	const tokens = fragment.split(/\s+/).filter(Boolean);
+/**
+ * Tokenizes a fragment quote-aware (single and double quotes collapse their
+ * contents into one token, so quoted numbers/bodies are never mistaken for
+ * positionals), backslash-escape-aware (an escaped quote is a literal
+ * character and never opens or closes a quoted region), skipping leading env
+ * assignments (`FOO=bar cmd`).
+ */
+export function tokenizeCommandFragment(fragment: string): string[] {
+	const rawTokens: string[] = [];
+	let current = "";
+	let inSingle = false;
+	let inDouble = false;
 	let index = 0;
-	while (index < tokens.length && ENV_ASSIGNMENT_PATTERN.test(tokens[index] ?? "")) {
+	while (index < fragment.length) {
+		const char = fragment[index] ?? "";
+		const next = index + 1 < fragment.length ? (fragment[index + 1] ?? "") : "";
+		if (inSingle) {
+			// POSIX: backslashes are literal inside single quotes.
+			if (char === "'") {
+				inSingle = false;
+			} else {
+				current += char;
+			}
+			index += 1;
+		} else if (inDouble) {
+			if (char === "\\" && next !== "") {
+				// An escaped character inside double quotes is literal.
+				current += next;
+				index += 2;
+			} else if (char === '"') {
+				inDouble = false;
+				index += 1;
+			} else {
+				current += char;
+				index += 1;
+			}
+		} else if (char === "\\" && next !== "") {
+			// An escaped character outside quotes is literal (an escaped
+			// quote does not open a quoted region).
+			current += next;
+			index += 2;
+		} else if (char === "'") {
+			inSingle = true;
+			index += 1;
+		} else if (char === '"') {
+			inDouble = true;
+			index += 1;
+		} else if (/\s/.test(char)) {
+			if (current.length > 0) {
+				rawTokens.push(current);
+				current = "";
+			}
+			index += 1;
+		} else {
+			current += char;
+			index += 1;
+		}
+	}
+	if (current.length > 0) {
+		rawTokens.push(current);
+	}
+	index = 0;
+	while (index < rawTokens.length && ENV_ASSIGNMENT_PATTERN.test(rawTokens[index] ?? "")) {
 		index += 1;
 	}
-	return tokens.slice(index);
+	return rawTokens.slice(index);
 }
 
 function firstNonFlagToken(tokens: string[], fromIndex: number): string | null {

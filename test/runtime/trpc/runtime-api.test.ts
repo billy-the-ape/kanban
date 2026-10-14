@@ -76,6 +76,10 @@ const browserMocks = vi.hoisted(() => ({
 	openInBrowser: vi.fn(),
 }));
 
+const taskChatPrLinkingMocks = vi.hoisted(() => ({
+	resolveTaskChatPrLinking: vi.fn(async (_input: unknown): Promise<unknown> => undefined),
+}));
+
 vi.mock("../../../src/terminal/agent-registry.js", () => ({
 	resolveAgentCommand: agentRegistryMocks.resolveAgentCommand,
 	buildRuntimeConfigResponse: agentRegistryMocks.buildRuntimeConfigResponse,
@@ -146,6 +150,10 @@ vi.mock("@clinebot/core", () => ({
 
 vi.mock("../../../src/server/browser.js", () => ({
 	openInBrowser: browserMocks.openInBrowser,
+}));
+
+vi.mock("../../../src/workspace/task-chat-pr-linking.js", () => ({
+	resolveTaskChatPrLinking: taskChatPrLinkingMocks.resolveTaskChatPrLinking,
 }));
 
 import { buildClineCompactionConfig } from "../../../src/cline-sdk/cline-compaction-config";
@@ -1594,6 +1602,120 @@ describe("createRuntimeApi startTaskSession", () => {
 		);
 		expect(cancelResponse.ok).toBe(true);
 		expect(clineTaskSessionService.cancelTaskTurn).toHaveBeenCalledWith("task-1");
+	});
+
+	it("attaches resolved PR linking to successful native chat sends only", async () => {
+		const summary = createSummary({ agentId: "cline", pid: null });
+		const clineTaskSessionService = createClineTaskSessionServiceMock();
+		clineTaskSessionService.sendTaskSessionInput.mockResolvedValue(summary);
+		clineTaskSessionService.getSummary.mockReturnValue(summary);
+		const linking = {
+			status: "linked" as const,
+			links: [
+				{
+					provider: "github" as const,
+					host: "github.com",
+					repository: "owner/repo",
+					number: 12,
+					url: "https://github.com/owner/repo/pull/12",
+					alreadyLinked: false,
+				},
+			],
+		};
+		taskChatPrLinkingMocks.resolveTaskChatPrLinking.mockResolvedValue(linking);
+
+		const api = createTestRuntimeApi({
+			getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+			loadScopedRuntimeConfig: vi.fn(async () => createRuntimeConfigState()),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: vi.fn(async () => ({}) as never),
+			getScopedClineTaskSessionService: vi.fn(async () => clineTaskSessionService as never),
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+			broadcastRuntimeWorkspaceStateUpdated: vi.fn(),
+		});
+
+		const response = await api.sendTaskChatMessage(
+			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+			{ taskId: "task-1", text: "https://github.com/owner/repo/pull/12" },
+		);
+		expect(response.ok).toBe(true);
+		expect(response.pullRequestLinking).toEqual(linking);
+		expect(taskChatPrLinkingMocks.resolveTaskChatPrLinking).toHaveBeenCalledWith({
+			workspaceId: "workspace-1",
+			workspacePath: "/tmp/repo",
+			taskId: "task-1",
+			text: "https://github.com/owner/repo/pull/12",
+			hasImages: false,
+			broadcast: expect.any(Function),
+		});
+		taskChatPrLinkingMocks.resolveTaskChatPrLinking.mockClear();
+	});
+
+	it("omits the PR linking field for candidate-free and rejected sends", async () => {
+		const summary = createSummary({ agentId: "cline", pid: null });
+		const clineTaskSessionService = createClineTaskSessionServiceMock();
+		clineTaskSessionService.sendTaskSessionInput.mockResolvedValue(summary);
+		clineTaskSessionService.getSummary.mockReturnValue(summary);
+		taskChatPrLinkingMocks.resolveTaskChatPrLinking.mockResolvedValue(undefined);
+
+		const api = createTestRuntimeApi({
+			getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+			loadScopedRuntimeConfig: vi.fn(async () => createRuntimeConfigState()),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: vi.fn(async () => ({}) as never),
+			getScopedClineTaskSessionService: vi.fn(async () => clineTaskSessionService as never),
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+		});
+
+		const plain = await api.sendTaskChatMessage(
+			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+			{ taskId: "task-1", text: "No URLs here" },
+		);
+		expect(plain.ok).toBe(true);
+		expect(plain.pullRequestLinking).toBeUndefined();
+
+		// A rejected send must not resolve PR linking at all.
+		taskChatPrLinkingMocks.resolveTaskChatPrLinking.mockClear();
+		clineTaskSessionService.sendTaskSessionInput.mockRejectedValue(new Error("boom"));
+		const failed = await api.sendTaskChatMessage(
+			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+			{ taskId: "task-1", text: "https://github.com/owner/repo/pull/12" },
+		);
+		expect(failed.ok).toBe(false);
+		expect(failed.pullRequestLinking).toBeUndefined();
+		expect(taskChatPrLinkingMocks.resolveTaskChatPrLinking).not.toHaveBeenCalled();
+		clineTaskSessionService.sendTaskSessionInput.mockResolvedValue(summary);
+	});
+
+	it("never resolves PR linking for home-agent chat sends", async () => {
+		const summary = createSummary({ agentId: "cline", pid: null });
+		const clineTaskSessionService = createClineTaskSessionServiceMock();
+		clineTaskSessionService.sendTaskSessionInput.mockResolvedValue(summary);
+		clineTaskSessionService.getSummary.mockReturnValue(summary);
+		taskChatPrLinkingMocks.resolveTaskChatPrLinking.mockResolvedValue({
+			status: "suggestions" as const,
+			links: [],
+		});
+
+		const api = createTestRuntimeApi({
+			getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+			loadScopedRuntimeConfig: vi.fn(async () => createRuntimeConfigState()),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: vi.fn(async () => ({}) as never),
+			getScopedClineTaskSessionService: vi.fn(async () => clineTaskSessionService as never),
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+		});
+
+		const response = await api.sendTaskChatMessage(
+			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+			{ taskId: "__home_agent__:workspace-1", text: "https://github.com/owner/repo/pull/12" },
+		);
+		expect(response.ok).toBe(true);
+		expect(response.pullRequestLinking).toBeUndefined();
+		expect(taskChatPrLinkingMocks.resolveTaskChatPrLinking).not.toHaveBeenCalled();
 	});
 
 	it("handles clear slash commands without sending them to the model", async () => {
@@ -3480,5 +3602,55 @@ describe("createRuntimeApi buildTaskDiagnosticsExportPlan (DIAG-3)", () => {
 		expect(plan.diagnostics.ok).toBe(true);
 		expect(plan.sessions).toEqual([]);
 		expect(plan.completeness.status).toBe("unavailable");
+	});
+});
+
+describe("createRuntimeApi loadConfig", () => {
+	it("returns the awaited config fields alongside the installed PR consumers", async () => {
+		agentRegistryMocks.buildRuntimeConfigResponse.mockReturnValue({
+			selectedAgentId: "claude",
+			commitPromptTemplate: "commit",
+		});
+		const api = createTestRuntimeApi({
+			getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+			loadScopedRuntimeConfig: vi.fn(async () => createRuntimeConfigState()),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: vi.fn(async () => ({}) as never),
+			getScopedClineTaskSessionService: vi.fn(async () => createClineTaskSessionServiceMock() as never),
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+			getInstalledPrConsumers: vi.fn(() => []),
+		});
+
+		const response = await api.loadConfig({ workspaceId: "workspace-1", workspacePath: "/tmp/repo" });
+
+		// Regression: a dropped `await` spread a Promise, so the response held
+		// only `installedPrConsumers` and lost every config field.
+		expect(response.selectedAgentId).toBe("claude");
+		expect(response.commitPromptTemplate).toBe("commit");
+		expect(response.installedPrConsumers).toEqual([]);
+	});
+});
+
+describe("createRuntimeApi sendTaskChatMessage input validation", () => {
+	it("returns ok:false for invalid input instead of throwing", async () => {
+		const api = createTestRuntimeApi({
+			getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+			loadScopedRuntimeConfig: vi.fn(async () => createRuntimeConfigState()),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: vi.fn(async () => ({}) as never),
+			getScopedClineTaskSessionService: vi.fn(async () => createClineTaskSessionServiceMock() as never),
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+		});
+
+		const response = await api.sendTaskChatMessage({ workspaceId: "workspace-1", workspacePath: "/tmp/repo" }, {
+			taskId: "",
+			text: "",
+		} as never);
+
+		expect(response.ok).toBe(false);
+		expect(response.summary).toBeNull();
+		expect(typeof response.error).toBe("string");
 	});
 });

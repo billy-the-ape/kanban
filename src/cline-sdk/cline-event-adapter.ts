@@ -42,10 +42,18 @@ function toPreviewText(value: string | null | undefined, maxLength = 160): strin
 }
 
 export interface ClineToolFinishedInfo {
+	toolCallId: string | null;
 	toolName: string | null;
 	toolInput: unknown;
 	output: string | null;
 	error: string | null;
+}
+
+/** Tool call start (observed before execution; never blocks the tool). */
+export interface ClineToolStartedInfo {
+	toolCallId: string | null;
+	toolName: string | null;
+	toolInput: unknown;
 }
 
 export interface ApplyClineSessionEventInput {
@@ -58,6 +66,8 @@ export interface ApplyClineSessionEventInput {
 	emitMessage: (taskId: string, message: ClineTaskMessage) => void;
 	/** Optional observer for finished tool calls (detection only; the adapter does no I/O). */
 	onToolFinished?: (tool: ClineToolFinishedInfo) => void;
+	/** Optional observer for tool call starts (pending-state establishment only). */
+	onToolStarted?: (tool: ClineToolStartedInfo) => void;
 }
 
 type ClineSdkChunkEvent = Extract<ClineSdkSessionEvent, { type: "chunk" }>;
@@ -614,6 +624,9 @@ export function applyClineSessionEvent(input: ApplyClineSessionEventInput): void
 			summaryPatch.reviewReason = null;
 		}
 		emitSummary(input, summaryPatch);
+		// COMMENT-0: surface the started tool to observers (publication
+		// capture establishes pending state before execution).
+		input.onToolStarted?.({ toolCallId, toolName, toolInput });
 		return;
 	}
 
@@ -653,9 +666,16 @@ export function applyClineSessionEvent(input: ApplyClineSessionEventInput): void
 			summaryPatch.reviewReason = null;
 		}
 		emitSummary(input, summaryPatch);
-		// PRLINK-1: surface the finished tool to observers (PR-creation
-		// detection). The adapter stays pure; the observer does the I/O.
-		notifyToolFinished(input, { toolName, toolInput, output: toToolOutputText(toolOutput), error: toolError });
+		// PRLINK-1 / COMMENT-0: surface the finished tool to observers
+		// (PR-creation detection and publication capture). The adapter
+		// stays pure; the observer does the I/O.
+		notifyToolFinished(input, {
+			toolCallId,
+			toolName,
+			toolInput,
+			output: toToolOutputText(toolOutput),
+			error: toolError,
+		});
 		return;
 	}
 
@@ -694,6 +714,9 @@ export function applyClineSessionEvent(input: ApplyClineSessionEventInput): void
 			summaryPatch.reviewReason = null;
 		}
 		emitSummary(input, summaryPatch);
+		// COMMENT-0: surface the started tool to observers (publication
+		// capture establishes pending state before execution).
+		input.onToolStarted?.({ toolCallId, toolName, toolInput });
 		return;
 	}
 
@@ -734,7 +757,16 @@ export function applyClineSessionEvent(input: ApplyClineSessionEventInput): void
 			summaryPatch.reviewReason = null;
 		}
 		emitSummary(input, summaryPatch);
-		notifyToolFinished(input, { toolName, toolInput, output: toToolOutputText(toolOutput), error: toolError });
+		// PRLINK-1 / COMMENT-0: surface the finished tool to observers
+		// (PR-creation detection and publication capture). The adapter
+		// stays pure; the observer does the I/O.
+		notifyToolFinished(input, {
+			toolCallId,
+			toolName,
+			toolInput,
+			output: toToolOutputText(toolOutput),
+			error: toolError,
+		});
 		return;
 	}
 
