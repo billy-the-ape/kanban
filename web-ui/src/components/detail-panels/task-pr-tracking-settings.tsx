@@ -17,6 +17,7 @@ import type {
 } from "@/runtime/types";
 import type { BoardCard } from "@/types";
 import { toCanonicalPrKeyForLink } from "@/utils/pr-tracking";
+import { TaskPrCommentHandlingPanel } from "../task-pr-comment-handling-panel";
 
 function prLabel(link: RuntimeTaskPullRequest): string {
 	return `${link.repository}#${link.number}`;
@@ -197,24 +198,9 @@ export function TaskPrTrackingSettings({
 			</div>
 
 			<div className="flex flex-col gap-1.5">
-				<PrTrackingCheckbox
-					label="Auto address PR review comments"
-					hint={
-						!commentsInstalled
-							? "Feature unavailable"
-							: !tracking.commentsSupportedForTask
-								? "Comment follow-up requires a native Cline task"
-								: null
-					}
-					checked={tracking.autoAddressComments}
-					disabled={!commentsInstalled || !tracking.commentsSupportedForTask}
-					acting={acting}
-					onChange={(next) =>
-						void runMutation(() =>
-							client.workspace.prTracking.setTaskPrSettings.mutate({ taskId, autoAddressComments: next }),
-						)
-					}
-				/>
+				{workspaceId !== null ? (
+					<TaskPrCommentHandlingPanel workspaceId={workspaceId} taskId={taskId} pullRequests={links} />
+				) : null}
 				<PrTrackingCheckbox
 					label="Auto complete when the PR merges"
 					hint={mergeInstalled ? null : "Feature unavailable"}
