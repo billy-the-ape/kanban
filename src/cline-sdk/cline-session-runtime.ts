@@ -71,7 +71,7 @@ interface ClineSessionHostBoundary {
 	delete(sessionId: string): Promise<boolean>;
 	dispose(reason?: string): Promise<void>;
 	get(sessionId: string): Promise<ClineSdkSessionRecord | undefined>;
-	list(limit?: number): Promise<ClineSdkSessionRecord[]>;
+	list: ClineSdkSessionHost["list"];
 	update?(
 		sessionId: string,
 		updates: {
@@ -701,7 +701,10 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		const sessionHost = await this.ensureSessionHost();
 		const prefix = options.sessionIdPrefix ?? buildSessionIdPrefix(taskId);
 		const ownerPaths = (options.ownerPaths ?? []).map((path) => path.trim()).filter((path) => path.length > 0);
-		const listed = await sessionHost.list(InMemoryClineSessionRuntime.EXPORT_SESSION_LIST_LIMIT);
+		// SDK history hydration reads every listed transcript concurrently to infer
+		// display metadata (including cost, often absent for local models). Disable
+		// it before filtering: only this task's transcripts belong in the snapshot.
+		const listed = await sessionHost.list(InMemoryClineSessionRuntime.EXPORT_SESSION_LIST_LIMIT, { hydrate: false });
 		const listingTruncated = listed.length === InMemoryClineSessionRuntime.EXPORT_SESSION_LIST_LIMIT;
 		const matches = listed.filter(
 			(record) =>
@@ -973,7 +976,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 	private async abortSupersededTaskSessions(taskId: string): Promise<void> {
 		const sessionHost = await this.ensureSessionHost();
 		const prefix = buildSessionIdPrefix(taskId);
-		const records = await sessionHost.list();
+		const records = await sessionHost.list(undefined, { hydrate: false });
 		for (const record of records) {
 			if (!record.sessionId.startsWith(prefix) || record.status !== "running") {
 				continue;
@@ -1060,7 +1063,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		this.cancelPendingTaskTurns(taskId);
 		const sessionHost = await this.ensureSessionHost();
 		const sessionIdPrefix = buildSessionIdPrefix(taskId);
-		const records = await sessionHost.list();
+		const records = await sessionHost.list(undefined, { hydrate: false });
 		const matchingSessionIds = new Set(
 			records.filter((record) => record.sessionId.startsWith(sessionIdPrefix)).map((record) => record.sessionId),
 		);
@@ -1183,7 +1186,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		}
 
 		const sessionIdPrefix = buildSessionIdPrefix(taskId);
-		const records: ClineSdkSessionRecord[] = await sessionHost.list();
+		const records: ClineSdkSessionRecord[] = await sessionHost.list(undefined, { hydrate: false });
 		const matchingRecord = records
 			.filter((record: ClineSdkSessionRecord) => record.sessionId.startsWith(sessionIdPrefix))
 			.sort((left: ClineSdkSessionRecord, right: ClineSdkSessionRecord) => {
