@@ -2007,6 +2007,16 @@ describe("InMemoryClineTaskSessionService", () => {
 			options: {
 				broadcastWorkspaceStateUpdated?: (workspacePath: string) => void;
 				workspacePath?: string | null;
+				recordPrPublicationToolEvent?: (input: {
+					workspacePath: string;
+					taskId: string;
+					phase: "started" | "finished";
+					toolCallId: string | null;
+					toolName: string | null;
+					commands: string[];
+					output: string | null;
+					error: string | null;
+				}) => Promise<void>;
 			} = {},
 		): Promise<{ service: ClineTaskSessionService; runtime: FakeClineSessionRuntimeController; sessionId: string }> {
 			const runtime = createFakeClineSessionRuntime();
@@ -2019,6 +2029,7 @@ describe("InMemoryClineTaskSessionService", () => {
 				// a linked task worktree. An explicit null disables PR capture.
 				workspacePath: options.workspacePath === undefined ? "/tmp/workspace-root" : options.workspacePath,
 				broadcastWorkspaceStateUpdated: options.broadcastWorkspaceStateUpdated,
+				recordPrPublicationToolEvent: options.recordPrPublicationToolEvent,
 			});
 			services.push(service);
 			await service.startTaskSession({
@@ -2104,6 +2115,38 @@ describe("InMemoryClineTaskSessionService", () => {
 
 			emitFinishedToolCall(runtime, sessionId, "run_commands", { commands: ["gh pr create"] }, PR_URL);
 
+			expect(taskPullRequestMocks.recordTaskPullRequests).not.toHaveBeenCalled();
+		});
+		it("captures a gh pr comment publication even though no PR link is created", async () => {
+			// Regression: the publication capture must not ride the PR-link
+			// detection gate — a task that never created a PR link can still
+			// reply to review comments, and that reply must be captured.
+			const publicationEvents: Array<{
+				phase: "started" | "finished";
+				commands: string[];
+				output: string | null;
+			}> = [];
+			const { runtime, sessionId } = await startSessionWithService({
+				recordPrPublicationToolEvent: (input) => {
+					publicationEvents.push(input);
+					return Promise.resolve();
+				},
+			});
+
+			emitFinishedToolCall(
+				runtime,
+				sessionId,
+				"run_commands",
+				{ commands: ["gh pr comment -b 'addressing the review'"] },
+				"https://github.com/owner/repo/pull/12#issuecomment-99",
+			);
+
+			await vi.waitFor(() => {
+				expect(publicationEvents.map((event) => event.phase)).toEqual(["started", "finished"]);
+			});
+			expect(publicationEvents[1]?.commands).toEqual(["gh pr comment -b 'addressing the review'"]);
+			expect(publicationEvents[1]?.output).toBe("https://github.com/owner/repo/pull/12#issuecomment-99");
+			// No PR was created, so the PR-link path stays untouched.
 			expect(taskPullRequestMocks.recordTaskPullRequests).not.toHaveBeenCalled();
 		});
 	});

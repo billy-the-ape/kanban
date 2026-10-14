@@ -1,6 +1,6 @@
 # PR comment handling — master plan
 
-Updated: 2026-10-06. Status: proposed; documentation only. Repository: `billy-the-ape/kanban`.
+Updated: 2026-10-13. Status: COMMENT-0 implemented, plus the second-, third-, and fourth-round review fixes (see "Implementation status" below). Repository: `billy-the-ape/kanban`.
 
 ## Goal and dependencies
 
@@ -34,6 +34,8 @@ creates a task-sidecar comment ledger.
 | debounceDeadline / firstPendingAt | Two-minute quiet time and ten-minute maximum wait |
 | lastDispatchedFeedbackFingerprint | Suppress dispatch of the same feedback after polling, toggle or restart |
 | dispatch | queued/running/completed/failed status, dispatched fingerprint, existing session/turn reference, ownership revision and concise error |
+| publication | Deduplicated exact identities of comments/reviews published by implementation work (plus the minimal pending/uncertain capture state) |
+| autoSendAttempts / autoSendPaused | Bounded safety cap: five automatic send attempts per canonical PR in a rolling 60-minute window and its durable pause state |
 
 Record status describes instruction execution, not proof that every comment was fixed.
 GitHub and the existing task transcript/check/delivery history hold the substantive outcome.
@@ -106,7 +108,7 @@ Use this template, substituting the validated selected PR URL:
 
 > Address comments on the linked PR: {url}. Check the feedback against the current code and
 > original task requirements. Fix valid issues, explain any disagreements, and update the
-> same PR. Explain changes and disagreements in task chat; do not post PR comments.
+> same PR. Explain changes and disagreements in PR comments and within task chat.
 
 Send this as a normal task follow-up. Reuse the existing conversation/session, original task
 context, repository instructions, model/provider settings, tool permissions and compaction.
@@ -184,6 +186,232 @@ queued intent → dispatch through normal chat continuation → record turn acce
 wire task detail diagnostics/resume → run the tests below. No task breakout documents are
 created here; the user's agent will create them using this boundary.
 
+## Implementation status (COMMENT-0)
+
+Implemented in this repository, all green under `vitest run`, `tsc --noEmit` (root and web-ui)
+and Biome checks:
+
+- `src/pr-tracking/feedback-fingerprint.ts` — normalizes eligible feedback events and computes
+  the deterministic aggregate (SHA-256 digest, newest-watermark ms, sorted provider-id token
+  set). A dispatch watermark removes its own token set from later aggregates, so deletion or
+  resolution of already-dispatched feedback never requeues it.
+- `src/pr-tracking/github-pr-client.ts` — read-only `gh` client: PR metadata plus complete
+  pagination (`per_page=100`, capped at 20 pages per source) of reviews, inline review comments
+  and PR conversation comments, plus GraphQL resolved-thread filtering. Eligibility applies the
+  fixed policy: published, non-empty, unresolved, non-bot conversation chatter. Per-source
+  pagination failure marks the snapshot incomplete (dispatch waits); non-`github.com` hosts and
+  missing/failed credential resolution surface visible errors without partial dispatch.
+- `src/pr-tracking/pr-record-store.ts` — durable PR tracking records under
+  `~/.cline/kanban/pr-tracking/prs/<sha256(canonicalKey)>.json` with atomic writes, load-time
+  identity validation, exactly-one revision advancement per accepted update and no-op writes
+  that never touch the file.
+- `src/pr-tracking/comment-automation-service.ts` — `applyPrPollOutcome` (task bindings,
+  owner selection/blocking, 120s quiet deadline capped at 600s, pending tracking,
+  queued-intent creation on the first pending observation, sticky failed dispatch,
+  queued-intent cancellation on disable/terminal observation while in-flight and
+  failed dispatches survive), `getTaskPrTrackingState` (neutral / enabled / blocked /
+  unsupported), `resumeCommentHandling` (one-shot resume of a failed dispatch; clears the
+  failure without sending when no eligible feedback remains), and dispatch through the normal
+  backend `sendTaskChatMessage` in `act` mode with the exact fixed instruction.
+  `reconcileRestartedDispatches` runs at service startup and resolves recorded in-flight
+  dispatches from their normal turn reference without re-running the prompt.
+  `runTick` awaits polls before settles so settle always sees the freshest record, and
+  per-subscription in-flight flags keep overlapping ticks from double-polling or
+  double-sending; `settleDispatch` treats `null`/`completed` dispatches with a due
+  deadline as dispatchable in addition to queued intents, and returns early when no
+  deadline is scheduled (no pending feedback) so idle subscriptions never trigger gh
+  API fetches from the settle path. `refreshWorkspace` cancels the pending schedule
+  and provably-unsent queued intent only when a PR loses its last remaining
+  candidate; while any candidate remains, the next `applyPrPollOutcome` re-derives
+  bindings and ownership instead of resetting the quiet window.
+  `recordPrPublicationToolEvent` observes implementation-task tool events through
+  the same adapter path as PR-link capture (restricted to implementation task
+  sessions, never reviewer sessions) and persists captured publication
+  identities in the `commentAutomation.publication` block. Recorded identities
+  are excluded before every eligibility computation (fingerprint, counts, quiet
+  deadline, dispatched watermark), and recording a reply removes any pending
+  scheduling caused solely by that reply while a reviewer's existing quiet-time
+  deadline survives. Settle waits while a capture is unresolved and pauses with
+  a visible blocker when an identity is unknowable (resume requires explicit
+  acknowledgment); `reconcilePublicationCaptures` recovers interrupted captures
+  at startup from the exact existing tool result in the task transcript
+  (read-only, never a replayed publication). A bounded safety cap allows at
+  most five automatic send attempts per canonical PR in a rolling 60-minute
+  window: the sixth attempt durably pauses automation (no auto-resume when the
+  window expires), and an explicit Resume resets the attempt history without
+  bypassing an unresolved capture blocker. A dispatch whose `attemptedAt` was
+  recorded is never re-sent automatically after a later record-write failure.
+- `src/pr-tracking/pr-publication-attribution.ts` — pure publication-attribution
+  logic: recognizes terminal publication commands (`gh pr comment` including
+  `--edit-last --create-if-none`, `gh pr review --comment`, and `gh api` writes
+  for PR conversation comments, inline comment replies, and review
+  submissions), resolves the target against the task's linked PRs (explicit
+  repository/selector arguments respected; implicit selectors resolved only
+  when safe), and extracts exact identities — namespaced `conversation`,
+  `inline`, and `review` — from attributable API responses or returned
+  comment/review URLs (URL fragment anchors accepted only under their own
+  kind and always validated against the canonical PR). Command text, quoted
+  bodies, read-only output, and arbitrary URLs never contribute identities;
+  ambiguous output becomes explicit uncertainty, never a guess.
+- Contract and mutations: `autoAddressComments` (optional, default false) on
+  `runtimeTaskCardSchema`; `runtimeTaskPullRequestSchema` with `lastSyncedAt`/`stateCheckedAt`;
+  `RuntimePrTrackingRecord`, `RuntimePrCommentAutomation`, `RuntimePrCommentDispatch`,
+  `RuntimePrFeedbackFingerprint`, `RuntimeTaskPrTrackingState` and
+  `RuntimePrCommentDispatchResult`. `validateTaskCardMutation` and
+  `applyTaskBoardMutation` preserve the flag and PR links.
+- Server: `workspaceStateCache.getTaskPrTrackingState`,
+  `workspaceStateMutations.setTaskAutoAddressComments` (triggers a 30s post-commit PR poll),
+  `workspaceStateMutations.resumePrCommentHandling`; runtime TRPC endpoints
+  `getTaskPrTrackingState`, `setTaskAutoAddressComments`, `resumePrCommentHandling`; the
+  runtime server injects the service with an `updateTaskRecord` hook that persists card
+  changes, syncs the board and refreshes the PR record after every accepted poll outcome.
+- UI: `web-ui/src/hooks/use-task-pr-tracking-state.ts` (polls state, exposes toggle/resume
+  actions) and `web-ui/src/components/task-pr-comment-handling-panel.tsx` (toggle with
+  enabled/neutral/blocked/unsupported state, pending count and quiet-time countdown, dispatch
+  status, failed state with the concise error, Resume button, incomplete-snapshot and auth
+  blockers), wired into the task detail's PR manager.
+- Tests: `test/runtime/pr-tracking/` — `feedback-fingerprint.test.ts`,
+  `pr-record-store.test.ts`, `comment-automation-service.test.ts`
+  (`applyPrPollOutcome` semantics plus service state/resume/dispatch behavior with injected
+  dependencies) and `github-pr-client.test.ts` (eligibility, completeness, pagination and
+  access-scope errors via an injected command runner).
+
+Review fixes applied (second review round, same PR):
+
+- Effective-agent gate: subscription (`refreshWorkspace`/`syncWorkspaceSubscriptions`) and the
+  detail surface (`getTaskPrTrackingState`) now require the task's *effective* agent to be the
+  native Cline agent — the live session's agent when one exists, else the workspace's selected
+  agent — via a new optional `getEffectiveTaskAgentId` dependency on the service (injected in
+  the runtime server with the same precedence as task start). A card with an unset `agentId`
+  no longer counts as Cline when the workspace selects another agent.
+- Publication capture no longer rides the PR-link gate: the session-service tool observer runs
+  the COMMENT-0 capture before the `links.length === 0` early return, so `gh pr comment`
+  publications are recorded for tasks that never created a PR link.
+- Ambiguous captures pause visibly: an unresolvable write target (no/ambiguous selector with
+  several linked PRs) now records an *uncertain* capture on every linked PR
+  (`markAmbiguousCapture`), pausing automation with a visible reason instead of silently
+  dropping it; only an explicit selector that demonstrably targets a non-linked PR
+  (`explicitUnlinked`) stays ignored.
+- Turn outcome via live evidence: settling a running dispatch resolves the session through the
+  live owners (`resolveWorkspaceSessionSummaries` over terminal + Cline summaries) and accepts
+  the outcome only when `lastOutputAt` postdates `dispatch.attemptedAt`; stale persisted
+  pre-dispatch state never completes or fails the dispatch, and restart reconciliation applies
+  the same evidence rule (completed when post-dispatch output is proven, otherwise failed with
+  the visible Resume requirement).
+- `tokenizeCommandFragment` is now quote-aware: quoted numbers/bodies collapse into single
+  tokens and can never be mistaken for PR-number positionals in detection or attribution.
+- Review feedback events use `submitted_at` (falling back to `updated_at`), matching the real
+  review object shape from `GET /pulls/{n}/reviews`.
+
+Review fixes applied (third review round, same PR):
+
+- Resume stays reachable while feedback is pending: the panel renders the blocker/resume branch
+  before the pending-countdown branch, so a rate-limit pause, capture uncertainty, or capture
+  persistence failure keeps both the visible reason and the Resume button while feedback is
+  still queued (a new web-ui component test pins both orderings).
+- Startup reconciliation no longer fails work that is not yet loaded: the service resolves the
+  repair owner's (and pending captures') workspace through a new optional
+  `resolveWorkspacePathById` dependency (injected from the durable workspace index via
+  `loadWorkspaceContextById`), covering workspaces that are indexed but have no terminal
+  manager yet. A queued dispatch for such a workspace is left as-is at startup (re-validated
+  when it loads) instead of being permanently failed, a running dispatch keeps its
+  unknown-outcome semantics only when the workspace is genuinely unresolvable, and pending
+  captures resolve from the transcript through the index-resolved scope.
+- `gh api` publication writes: `parseApiWriteEndpoint` normalizes leading slashes and matches
+  in-thread inline reply writes (`.../pulls/N/comments/<id>/replies`), and a submitted review
+  is recognized from the real response shape (`state` + `pull_request_url` + id) without
+  requiring a `comments` array (extracted when present).
+- Repository identity is case-insensitive everywhere it is compared (`matchLinked`,
+  `sameTarget`, API-response `hasTarget`, and returned-URL validation), matching
+  `getPullRequestIdentityKey` semantics, so a case-differing `-R` selector or URL still
+  attributes to the linked PR instead of becoming an uncertain capture.
+
+Review fixes applied (fourth review round, same PR):
+
+- `gh api` value flags: `-q` (short `--jq`) and `-p`/`--preview` take a value and are now in
+  the value-consumption flag set, so their values can no longer be mistaken for the endpoint
+  (the valueless-flag branch comment is corrected to match).
+- Unparseable `gh api` write endpoints: a write-looking `gh api` call whose endpoint does not
+  match a known PR-feedback shape is no longer silently dropped. It is recognized as an
+  operation with `kind: null`, and `analyzePrPublication` returns an explicit uncertainty
+  (never `none`) so the capture pauses visibly instead of vanishing.
+- Identities tied to the write invocation: operations now carry the command fragment that
+  produced them, and `resolvePublicationOutput` reduces a Cline structured per-fragment
+  result (`{query, result, success}` entries) to the write fragment's own result(s) before
+  scanning for identities, so a read fragment in the same tool call can never register
+  identities. Cap: when the write's evidence contains more than one identity-bearing JSON
+  object (a listing mixed into the output), nothing is registered and the capture is
+  explicitly uncertain; the URL fallback is skipped for multi-object output.
+- Stale pending captures: a start-phase capture whose tool result never arrived (turn
+  cancelled, host interrupted, ...) is marked an explicit uncertainty after 10 minutes,
+  persisted on settle and surfaced through the existing visible
+  `blocker`/`resumable`/`resumeRequiresAcknowledgment` flow, cleared only by an explicit
+  acknowledged Resume. It no longer blocks settle silently until a restart reconciles it.
+
+Tests: new `test/runtime/pr-tracking/pr-publication-attribution.test.ts` (14 cases covering
+the flag fixes, unparseable-endpoint uncertainty, write-fragment scoping, and the
+multi-object guard) plus four new cases in `comment-automation-service.test.ts` (`-q`
+end-to-end capture, unparseable-endpoint pause, structured multi-fragment scoping, and the
+stale-capture blocker/acknowledged-resume cycle). These fixes postdate v0.2.31 and ship
+with the next release; the restart caveat for already-recorded captures still applies.
+
+Review fixes applied (fifth review round, same PR):
+
+- `gh api graphql`: a read-only `graphql` call (reading/resolving review
+  threads with `-f query=...` is the normal flow during a comment-handling
+  turn) no longer surfaces as an unattributable write. A `graphql` call is
+  recognized as a publication only when its inline query carries a
+  comment-creating mutation (`addComment`, `addPullRequestReview`,
+  `addPullRequestReviewComment`, `addCommentsToDraftReview`) or the query is
+  not present in the command text (e.g. an `--input` file) and cannot be
+  ruled out; in both cases it is a `kind: null` operation that yields an
+  explicit uncertain capture, since a GraphQL response cannot attribute a
+  REST comment identity. Inline reads stay ignored.
+- Non-feedback REST write endpoints (labels, requested_reviewers, ...): the
+  fourth-round `kind: null` fallback for unknown endpoints is reverted. A
+  write to an endpoint that cannot create PR feedback is not a publication
+  and stays ignored; the `kind: null` uncertain path remains only for
+  `graphql` writes.
+- Restart reconciliation watermark: when a restart reconcile settles an
+  attempted dispatch (`queued` with a recorded `attemptedAt`) as `completed`
+  from post-attempt session output, it now also advances
+  `lastDispatchedFeedbackFingerprint` to the dispatch's captured fingerprint
+  and clears the pending-tracking fields (as the post-send upsert does), so
+  the same feedback batch cannot be requeued and re-sent after restart. A
+  `failed` reconcile outcome does not advance the watermark (no evidence the
+  prompt was accepted), so an explicit Resume can still re-send it.
+- Inline comments inside a published review: the client now carries
+  `pull_request_review_id` on inline feedback events, and
+  `excludePublishedEvents` additionally excludes inline events whose review
+  id is in the record's published set. A review submitted with inline
+  `comments[]` through a payload no longer re-triggers a follow-up on its
+  own inline comments.
+- Command tokenizer and PR-number selection: `tokenizeCommandFragment` now
+  honours backslash escapes (an escaped quote is a literal character and
+  never opens or closes a quoted region), and `readPrSelection` accepts a
+  bare number only directly after the action or as the sole positional, as
+  its doc comment describes. A number inside a quoted body with escaped
+  quotes is no longer read as an explicit PR selection.
+
+Tests: new graphql, non-feedback-endpoint, and selection-strictness cases in
+`pr-publication-attribution.test.ts` (22 cases total), plus additions to
+`comment-automation-service.test.ts` (graphql-mutation pause, graphql-read
+ignore, non-feedback write ignore, the restart watermark advance for an
+attempted dispatch, and inline exclusion under a published review) and
+`github-pr-client.test.ts` (`pullRequestReviewId` carried on inline events).
+
+Documented v1 deviations: a terminal PR observation cancels queued dispatch but keeps the owner
+held until its candidate is no longer enabled; dispatch waits for conflicting writers before
+sending (the normal send path provides model-queue admission) but does not yet gate on
+repository-wide merge quiescence (merge consumer is a separate plan); restart reconciliation
+covers recorded running dispatches via their turn reference, and unknown outcomes stay failed
+with the visible Resume requirement. Publication capture is terminal-observation based and
+cannot exhaustively attribute opaque scripts (wrapped commands or suppressed output) while
+preserving unrestricted terminal access; such output is treated as uncertain capture and
+pauses automation with a visible reason and an explicit resume rather than guessing. The
+five-attempts-per-60-minute safety cap deliberately bounds legitimate rapid review cycles
+too: it is a safety stop, not a claim that every repeated turn is a loop.
+
 ## Verification and rollout
 
 - Multiple new/edited comments reset quiet time; duplicate polls do not; max wait and partial
@@ -199,6 +427,12 @@ created here; the user's agent will create them using this boundary.
 - Disposable pilot: leave several comments within two minutes, observe one ordinary follow-up,
   same-PR update and normal explanation. New comments during that turn wait for the next batch.
   Restart with an ambiguous interrupted turn and verify a visible resume requirement.
+- Publication-capture manual test on a fresh disposable task/PR: (1) enable Auto address
+  comments and publish reviewer feedback; (2) verify one implementation follow-up posts
+  replies and its published identities are recorded in the COMMENT-0 record; (3) verify those
+  replies do not trigger another follow-up; (4) publish feedback from another reviewer using
+  the same account and verify it remains eligible; (5) verify capture uncertainty and the
+  five-attempt rate-limit pause automation while manual terminal work still functions.
 
 Use focused backend/UI tests, typechecks and repository Biome checks for supported files.
 Isolate HOME/USERPROFILE and Git subprocess environments. Planning changes no runtime settings,
@@ -206,5 +440,28 @@ environment variables or deployment. Proposed timing stays 120/600 seconds; only
 gains this minimal comment block. Document actual storage/schema changes and auth read/push
 permissions in implementation PRs; pilot one task before expanding.
 
+Deployment requirements for the publication-capture change: none. The new
+`commentAutomation.publication` and `autoSendAttempts`/`autoSendPaused` fields are optional
+additions to the existing COMMENT-0 record (old records load with empty attribution state),
+no environment variables, settings, or manual migration are required, and no publication
+command is ever run by the observer.
+
 After actual service/device changes, update `billy-the-ape/homelab-documentation` through a
 Ready for Review PR with deployed configuration, storage, permissions and rollback.
+
+
+## PR 71 conflict reconciliation
+
+PR 71 originally branched before PRTRACK-0, PRTRACK-1, and MERGE-1 reached
+`main`. Its independently implemented COMMENT-0 record schema is incompatible
+with the shared tracking foundation record. This conflict resolution preserves
+both implementations: shared records remain in `pr-tracking/prs`, while COMMENT-0
+records use `pr-tracking/comments` through `pr-comment-record-store.ts`. Neither
+consumer may overwrite the other's record for the same canonical PR identity.
+The COMMENT-0 settings endpoint delegates to the shared PR settings mutation,
+including its revision; board-change broadcasts refresh both subscription paths.
+
+This is coexistence, not migration to a single coordinator: COMMENT-0 retains its
+existing observer and detail panel. Integrating that observer with the shared
+consumer registry, record schema, and reservation lifecycle remains separate work.
+No new environment variables or manual data migration are required for this PR.
