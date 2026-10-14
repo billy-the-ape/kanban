@@ -892,12 +892,15 @@ export function resolvePublicationOutput(input: {
 
 /**
  * Analyzes one implementation tool call for PR-feedback publications.
- * `output` null = started phase (recognized write, execution not yet
- * complete): establishes capture-pending without any identity claim.
+ * The started phase (recognized write, execution not yet complete)
+ * establishes capture-pending without any identity claim. Without an
+ * explicit `phase`, a null `output` means started; a finished call with no
+ * output is still resolved (its error can prove a failure).
  */
 export function analyzePrPublication(input: {
 	toolName: string | null;
 	commands: string[];
+	phase?: "started" | "finished";
 	output: string | null;
 	error: string | null;
 	linkedPullRequests: PrPublicationTarget[];
@@ -948,7 +951,7 @@ export function analyzePrPublication(input: {
 				"The gh api write targeted an endpoint that cannot be attributed to a PR comment, review, or inline reply.",
 		};
 	}
-	if (input.output === null) {
+	if (input.phase === "started" || (input.phase === undefined && input.output === null)) {
 		return {
 			status: "pending",
 			target,

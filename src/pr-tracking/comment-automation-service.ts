@@ -1235,6 +1235,7 @@ export class PrCommentAutomationService {
 		const observation = analyzePrPublication({
 			toolName: input.toolName,
 			commands: input.commands,
+			phase: input.phase,
 			output: input.phase === "started" ? null : input.output,
 			error: input.error,
 			linkedPullRequests: targets,
@@ -1286,29 +1287,25 @@ export class PrCommentAutomationService {
 					uncertain: false,
 					uncertainReason: null,
 				});
-				return;
-			}
-			if (observation.status === "failed") {
+			} else if (observation.status === "failed") {
 				// The write clearly failed: nothing was published; drop any
 				// start-phase pending entry.
 				await this.upsertCapturePending(key, identity, null, captureId);
-				return;
-			}
-			if (observation.status === "published") {
+			} else if (observation.status === "published") {
 				await this.applyPublishedIdentities(key, identity, observation.identities, captureId);
-				return;
+			} else {
+				// uncertain: visible pause until reconciled or explicitly resumed.
+				await this.upsertCapturePending(key, identity, {
+					captureId,
+					taskId: input.taskId,
+					workspaceId: input.workspaceId,
+					operation: observation.operation ?? "pr publication",
+					kind: observation.kind ?? "conversation",
+					target: observation.target,
+					uncertain: true,
+					uncertainReason: observation.reason ?? "The publication identity could not be confirmed.",
+				});
 			}
-			// uncertain: visible pause until reconciled or explicitly resumed.
-			await this.upsertCapturePending(key, identity, {
-				captureId,
-				taskId: input.taskId,
-				workspaceId: input.workspaceId,
-				operation: observation.operation ?? "pr publication",
-				kind: observation.kind ?? "conversation",
-				target: observation.target,
-				uncertain: true,
-				uncertainReason: observation.reason ?? "The publication identity could not be confirmed.",
-			});
 		} catch (error) {
 			// Storage failure: pause in memory; settle must not race a
 			// capture that could not be recorded.

@@ -2163,6 +2163,46 @@ describe("COMMENT-0 publication capture", () => {
 		expect(state.state.blocker).toBeNull();
 		expect(state.state.resumable).toBe(false);
 	});
+
+	it("clears an unpersisted capture pause once a later capture for the PR is persisted", async () => {
+		await seedOwner();
+		let scopeAvailable = false;
+		const harness = makeService({
+			workspaceStates: cardState(),
+			getGitHubAccessScopeId: async () => {
+				if (!scopeAvailable) {
+					throw new Error("gh auth unavailable");
+				}
+				return "scope-1";
+			},
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.recordPrPublicationToolEvent(toolEvent({ phase: "started", toolCallId: "call-1" }));
+		let state = await harness.service.getTaskPrTrackingState(scope, "t1");
+		if (!state.ok) {
+			throw new Error("unreachable");
+		}
+		expect(state.state.blocker).toContain("could not be persisted");
+
+		// A later reply's capture persists (published): the in-memory pause lifts.
+		scopeAvailable = true;
+		await harness.service.recordPrPublicationToolEvent(
+			toolEvent({
+				phase: "finished",
+				toolCallId: "call-2",
+				output: JSON.stringify({
+					id: 9,
+					issue_url: "https://github.com/octo/repo/issues/42",
+					html_url: "https://github.com/octo/repo/pull/42#issuecomment-9",
+				}),
+			}),
+		);
+		state = await harness.service.getTaskPrTrackingState(scope, "t1");
+		if (!state.ok) {
+			throw new Error("unreachable");
+		}
+		expect(state.state.blocker).toBeNull();
+	});
 });
 
 // Regression: refreshes, ticks, and the startup reconcile are fire-and-forget

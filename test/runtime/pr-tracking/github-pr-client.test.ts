@@ -139,6 +139,36 @@ describe("github pr client", () => {
 		expect(snapshot.events.find((event) => event.providerId === "inline-10")?.pullRequestReviewId).toBe(5);
 	});
 
+	it("marks the snapshot incomplete when a resolved thread has more comments than one page", async () => {
+		const routes = baseRoutes().map((route) =>
+			route.graphql
+				? {
+						...route,
+						respond: () =>
+							jsonResponse({
+								data: {
+									repository: {
+										pullRequest: {
+											reviewThreads: {
+												pageInfo: { hasNextPage: false, endCursor: null },
+												nodes: [
+													{
+														isResolved: true,
+														comments: { pageInfo: { hasNextPage: true }, nodes: [{ databaseId: 11 }] },
+													},
+												],
+											},
+										},
+									},
+								},
+							}),
+					}
+				: route,
+		);
+		const snapshot = await clientWith(makeRunner(routes)).fetchSnapshot(PR, "/repo", "scope");
+		expect(snapshot.complete).toBe(false);
+	});
+
 	it("sends the GraphQL PR number as a plain typed -F variable", async () => {
 		const graphqlCalls: string[][] = [];
 		const base = makeRunner(baseRoutes());

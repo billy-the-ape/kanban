@@ -170,7 +170,7 @@ async function fetchResolvedInlineCommentIds(
 		"        pageInfo { hasNextPage endCursor }",
 		"        nodes {",
 		"          isResolved",
-		"          comments(first: 30) { nodes { databaseId } }",
+		"          comments(first: 100) { pageInfo { hasNextPage } nodes { databaseId } }",
 		"        }",
 		"      }",
 		"    }",
@@ -218,7 +218,10 @@ async function fetchResolvedInlineCommentIds(
 							pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
 							nodes?: Array<{
 								isResolved?: boolean;
-								comments?: { nodes?: Array<{ databaseId?: number }> } | null;
+								comments?: {
+									pageInfo?: { hasNextPage?: boolean };
+									nodes?: Array<{ databaseId?: number }>;
+								} | null;
 							} | null>;
 						} | null;
 					} | null;
@@ -230,6 +233,11 @@ async function fetchResolvedInlineCommentIds(
 			if (!thread?.isResolved) {
 				continue;
 			}
+			// A resolved thread longer than one page would leave its later
+			// comments looking unresolved: never report that as complete.
+			if (thread.comments?.pageInfo?.hasNextPage) {
+				complete = false;
+			}
 			for (const comment of thread.comments?.nodes ?? []) {
 				if (typeof comment?.databaseId === "number") {
 					ids.add(comment.databaseId);
@@ -238,11 +246,12 @@ async function fetchResolvedInlineCommentIds(
 		}
 		const pageInfo = data?.data?.repository?.pullRequest?.reviewThreads?.pageInfo;
 		if (!pageInfo?.hasNextPage || !pageInfo.endCursor) {
-			break;
+			return { ids, complete };
 		}
 		cursor = pageInfo.endCursor;
 	}
-	return { ids, complete };
+	// Loop exited on a failure, or the page cap was hit with more threads.
+	return { ids, complete: false };
 }
 
 function mapReviews(entries: ReviewEntry[]): PrFeedbackEvent[] {

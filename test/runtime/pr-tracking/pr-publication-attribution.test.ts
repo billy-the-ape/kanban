@@ -541,3 +541,29 @@ describe("resolvePublicationOutput never reads the echoed command text", () => {
 		expect(resolution.identities).toEqual([{ kind: "conversation", id: 222 }]);
 	});
 });
+
+describe("analyzePrPublication finished phase without output", () => {
+	it("classifies a finished write with no output and a gh error as failed, not pending", () => {
+		const observation = analyzePrPublication({
+			toolName: "run_command",
+			commands: ["gh pr comment 42 -b 'addressing'"],
+			phase: "finished",
+			output: null,
+			error: "gh: HTTP 404: Not Found",
+			linkedPullRequests: [TARGET],
+		});
+		expect(observation.status).toBe("failed");
+	});
+
+	it("keeps the started phase pending", () => {
+		const observation = analyzePrPublication({
+			toolName: "run_command",
+			commands: ["gh pr comment 42 -b 'addressing'"],
+			phase: "started",
+			output: null,
+			error: null,
+			linkedPullRequests: [TARGET],
+		});
+		expect(observation.status).toBe("pending");
+	});
+});
