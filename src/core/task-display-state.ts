@@ -3,14 +3,19 @@
 // (open-project counts, stream merges), so both sides agree on a card's
 // display state for identical board and session inputs.
 import type {
+	RuntimeBoardCard,
 	RuntimeBoardColumnId,
 	RuntimeBoardData,
 	RuntimeProjectTaskCounts,
+	RuntimeProjectTaskListItem,
+	RuntimeTaskDisplayState,
 	RuntimeTaskSessionState,
 	RuntimeTaskSessionSummary,
 } from "./api-contract";
 
-export type RuntimeTaskDisplayState = "backlog" | "in_progress" | "paused" | "review" | "done" | "trash";
+// The display state union is owned by the API contract; re-export it so all
+// consumers can import the type through this module.
+export type { RuntimeTaskDisplayState } from "./api-contract";
 
 /** Session states where the agent is not working, so an In Progress card displays as Paused. */
 export const PAUSED_TASK_SESSION_STATES: ReadonlySet<RuntimeTaskSessionState> = new Set([
@@ -132,4 +137,65 @@ export function mergeSessionSummaries(
 		}
 	}
 	return merged;
+}
+
+/**
+ * Last activity timestamp for a card: the newest of the card and the real
+ * session summary's timestamps. Without a summary, or with a terminal
+ * placeholder (which describes no session), only the card's own `updatedAt`
+ * counts, so attaching a terminal must not reorder an untouched task.
+ */
+export function resolveTaskLastActivityAt(
+	card: RuntimeBoardCard,
+	summary: RuntimeTaskSessionSummary | null | undefined,
+): number {
+	if (!summary || isPlaceholderSessionSummary(summary)) {
+		return card.updatedAt;
+	}
+	return Math.max(card.updatedAt, summary.updatedAt, summary.lastOutputAt ?? 0, summary.lastHookAt ?? 0);
+}
+
+/** One list item per card in every column; unsorted. */
+export function buildProjectTaskListItems(
+	project: { id: string; name: string },
+	board: RuntimeBoardData,
+	sessionsByTaskId: Readonly<Record<string, RuntimeTaskSessionSummary>>,
+): RuntimeProjectTaskListItem[] {
+	const items: RuntimeProjectTaskListItem[] = [];
+	for (const column of board.columns) {
+		for (const card of column.cards) {
+			const summary = sessionsByTaskId[card.id] ?? undefined;
+			items.push({
+				projectId: project.id,
+				projectName: project.name,
+				taskId: card.id,
+				title: card.title,
+				displayState: resolveTaskDisplayState(column.id, summary),
+				lastActivityAt: resolveTaskLastActivityAt(card, summary),
+			});
+		}
+	}
+	return items;
+}
+
+/**
+ * Cross-project task ordering: newest activity first, then title, taskId and
+ * projectId ascending. Used by both the server and the browser so both sides
+ * produce identical orderings.
+ */
+export function compareProjectTaskListItems(a: RuntimeProjectTaskListItem, b: RuntimeProjectTaskListItem): number {
+	if (a.lastActivityAt !== b.lastActivityAt) {
+		return b.lastActivityAt - a.lastActivityAt;
+	}
+	const titleComparison = a.title.localeCompare(b.title);
+	if (titleComparison !== 0) {
+		return titleComparison;
+	}
+	if (a.taskId !== b.taskId) {
+		return a.taskId < b.taskId ? -1 : 1;
+	}
+	if (a.projectId !== b.projectId) {
+		return a.projectId < b.projectId ? -1 : 1;
+	}
+	return 0;
 }

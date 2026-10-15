@@ -15,6 +15,7 @@ import { GitHistoryView } from "@/components/git-history-view";
 import { KanbanBoard } from "@/components/kanban-board";
 import { ProjectNavigationPanel } from "@/components/project-navigation-panel";
 import { RuntimeSettingsDialog, type RuntimeSettingsSection } from "@/components/runtime-settings-dialog";
+import { SidebarTasksPanel } from "@/components/sidebar-tasks/sidebar-tasks-panel";
 import { StartupOnboardingDialog } from "@/components/startup-onboarding-dialog";
 import { TaskCreateDialog } from "@/components/task-create-dialog";
 import { TaskInlineCreateCard } from "@/components/task-inline-create-card";
@@ -37,6 +38,7 @@ import { RuntimeDisconnectedFallback } from "@/hooks/runtime-disconnected-fallba
 import { useAppHotkeys } from "@/hooks/use-app-hotkeys";
 import { useBlockedTaskCleanups } from "@/hooks/use-blocked-task-cleanups";
 import { useBoardInteractions } from "@/hooks/use-board-interactions";
+import { useCrossProjectTasks } from "@/hooks/use-cross-project-tasks";
 import { useDebugTools } from "@/hooks/use-debug-tools";
 import { useDetailTaskNavigation } from "@/hooks/use-detail-task-navigation";
 import { useDocumentVisibility } from "@/hooks/use-document-visibility";
@@ -45,6 +47,7 @@ import { useGitActions } from "@/hooks/use-git-actions";
 import { useHomeSidebarAgentPanel } from "@/hooks/use-home-sidebar-agent-panel";
 import { useKanbanAccessGate } from "@/hooks/use-kanban-access-gate";
 import { useOpenWorkspace } from "@/hooks/use-open-workspace";
+import { usePendingTaskOpen } from "@/hooks/use-pending-task-open";
 import { parseRemovedProjectPathFromStreamError, useProjectNavigation } from "@/hooks/use-project-navigation";
 import { useProjectUiState } from "@/hooks/use-project-ui-state";
 import { useReviewReadyNotifications } from "@/hooks/use-review-ready-notifications";
@@ -88,7 +91,7 @@ export default function App(): ReactElement {
 	const [canPersistWorkspaceState, setCanPersistWorkspaceState] = useState(false);
 	const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 	const [settingsInitialSection, setSettingsInitialSection] = useState<RuntimeSettingsSection | null>(null);
-	const [homeSidebarSection, setHomeSidebarSection] = useState<"projects" | "agent">("projects");
+	const [homeSidebarSection, setHomeSidebarSection] = useState<"projects" | "tasks" | "agent">("projects");
 	const [isClearTrashDialogOpen, setIsClearTrashDialogOpen] = useState(false);
 	const [isGitHistoryOpen, setIsGitHistoryOpen] = useState(false);
 	const [pendingTaskStartAfterEditId, setPendingTaskStartAfterEditId] = useState<string | null>(null);
@@ -114,6 +117,7 @@ export default function App(): ReactElement {
 		isRuntimeDisconnected,
 		hasReceivedSnapshot,
 		navigationCurrentProjectId,
+		requestedProjectId,
 		removingProjectId,
 		hasNoProjects,
 		isProjectSwitching,
@@ -731,6 +735,40 @@ export default function App(): ReactElement {
 	const handleToggleSidebar = useCallback(() => {
 		sidebarLayout.setSidebarCollapsed(!sidebarLayout.isCollapsed);
 	}, [sidebarLayout]);
+	const isSidebarTaskListVisible =
+		!selectedCard && homeSidebarSection === "tasks" && !sidebarLayout.isCollapsed && isDocumentVisible;
+	const {
+		tasks: sidebarTaskListTasks,
+		isLoading: isSidebarTaskListLoading,
+		error: sidebarTaskListError,
+		unavailableProjectIds: sidebarUnavailableProjectIds,
+		retry: retrySidebarTaskList,
+	} = useCrossProjectTasks({
+		enabled: isSidebarTaskListVisible,
+		projects,
+		hasReceivedSnapshot,
+		currentProjectId,
+		canPersistWorkspaceState,
+		board,
+		sessions,
+	});
+	const { openTask: handleOpenSidebarTask } = usePendingTaskOpen({
+		currentProjectId,
+		requestedProjectId,
+		projects,
+		hasReceivedSnapshot,
+		board,
+		canPersistWorkspaceState,
+		isInitialRuntimeLoad,
+		isProjectSwitching,
+		isAwaitingWorkspaceSnapshot,
+		isWorkspaceMetadataPending,
+		streamError,
+		handleSelectProject: (projectId: string) => {
+			void handleSelectProject(projectId);
+		},
+		setSelectedTaskId,
+	});
 
 	const navbarWorkspacePath = hasNoProjects ? undefined : activeWorkspacePath;
 	const navbarWorkspaceHint = hasNoProjects ? undefined : activeWorkspaceHint;
@@ -865,6 +903,23 @@ export default function App(): ReactElement {
 						removingProjectId={removingProjectId}
 						activeSection={homeSidebarSection}
 						onActiveSectionChange={setHomeSidebarSection}
+						renderTasksSection={({ closeOnMobile }) => (
+							<SidebarTasksPanel
+								tasks={sidebarTaskListTasks}
+								isLoading={isSidebarTaskListLoading}
+								error={sidebarTaskListError}
+								unavailableProjectIds={sidebarUnavailableProjectIds}
+								isVisible={isSidebarTaskListVisible}
+								onRetry={() => {
+									retrySidebarTaskList();
+									closeOnMobile();
+								}}
+								onSelectTask={(item) => {
+									handleOpenSidebarTask(item.projectId, item.taskId);
+									closeOnMobile();
+								}}
+							/>
+						)}
 						canShowAgentSection={!hasNoProjects && Boolean(currentProjectId)}
 						agentSectionContent={homeSidebarAgentPanel}
 						selectedAgentId={settingsRuntimeProjectConfig?.selectedAgentId ?? null}

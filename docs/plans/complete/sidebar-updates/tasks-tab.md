@@ -1,6 +1,6 @@
 # Sidebar Tasks tab: cross-project task list
 
-Status: implementation-ready plan. Target: `billy-the-ape/kanban` `main`. Source baseline: `879a3a1`.
+Status: implemented on this branch. Target: `billy-the-ape/kanban` `main`. Source baseline: `879a3a1`.
 
 Order: **2 of 2** in `docs/plans/complete/sidebar-updates/`. It **depends on `paused-pill.md`**, which must be merged first. That plan provides `src/core/task-display-state.ts` (`RuntimeTaskDisplayState`, `resolveTaskDisplayState`, `mergeSessionSummaries`), the `@runtime-task-display-state` alias, `loadProjectTaskSnapshot` in the workspace registry, and `web-ui/src/components/project-task-count-badges.ts` (`TASK_DISPLAY_STATE_ORDER`, `TASK_DISPLAY_STATE_BADGE_META`). One implementation PR / one squash commit. Desktop collapse is being handled separately by the user.
 
@@ -200,6 +200,19 @@ Run the integration/router suite containing the new unscoped-query test as well;
 No new environment variables or configuration. Merge the paused-pill implementation first. Rebuild runtime and web UI together (`npm run build`), restart the normal Kanban service, and reload browser tabs so the query contract and UI match. No device changes are part of this implementation PR.
 
 The implementation PR description must list behavior changes, validation results and manual acceptance steps, with these deployment actions prominently stated. Mark it ready for review after checks pass. Report blocked or failing checks accurately. Keep this as one implementation PR; do not split its numbered sections into additional cards/PRs.
+
+## Implementation status
+
+Implemented as described, with these concrete outcomes:
+
+- `src/core/task-display-state.ts` gained `resolveTaskLastActivityAt`, `buildProjectTaskListItems` and `compareProjectTaskListItems` (shared by server and browser).
+- `src/core/api-contract.ts` gained `runtimeTaskDisplayStateSchema`, `runtimeProjectTaskListItemSchema` and `runtimeProjectTasksResponseSchema` with inferred type exports; the shared display-state union is now a type-only re-export of the inferred type.
+- `WorkspaceRegistry.buildProjectTasksPayload` processes index snapshots with a 4-worker loop over `loadProjectTaskSnapshot`; failed projects land in `unavailableProjectIds`; the index read failure rejects the query. `deriveProjectName` is shared with `toProjectSummary`.
+- `projects.listTasks` is wired through `createProjectsApi` (`buildProjectTasksPayload` dependency), `runtime-server.ts` and the `projects` router with the output schema; the unscoped client is exercised by the integration test.
+- Web UI: `useSidebarTasksFilter` (localStorage `kanban.sidebar-tasks-filter`), `useCrossProjectTasks` (single-flight, 1,000 ms automatic budget, coalesced trailing refreshes, stale-generation guard, open-project overlay, snapshot-filtered stale rows), `usePendingTaskOpen` (pending cross-project selection with readiness wait, cancellation on requested-project change, project removal or new stream error), the three `sidebar-tasks/` components, the three-way `Projects | Tasks | Kanban Agent` segmented control (with `renderTasksSection` and `aria-pressed`), and the `App.tsx` wiring (`homeSidebarSection`, `areSidebarTasksVisible`, `openTask` with mobile close).
+- `useProjectNavigation.handleSelectProject` now no-ops against `navigationCurrentProjectId`, so selecting the loaded project during an in-flight switch resets `requestedProjectId` instead of being ignored.
+- `formatApproximateAge` moved to `web-ui/src/utils/format-approximate-age.ts` and is reused by `task-pull-requests.ts`.
+- Tests added per the Tests section: shared builder/comparator/last-activity units, registry payload units (merge, empty index, partial failure, index failure, 4-way concurrency, no terminal-manager initialization), projects API delegation, the integration `projects.listTasks` assertion, the three web UI hook suites (controllable promises + fake timers), the panel component suite, and the panel three-tab suite.
 
 ## Out of scope
 

@@ -682,6 +682,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				},
 				warn: deps.warn,
 				buildProjectsPayload: deps.workspaceRegistry.buildProjectsPayload,
+				buildProjectTasksPayload: deps.workspaceRegistry.buildProjectTasksPayload,
 				pickDirectoryPathFromSystemDialog: deps.pickDirectoryPathFromSystemDialog,
 				serverCwd: process.cwd(),
 			}),

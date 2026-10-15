@@ -16,6 +16,7 @@ import type {
 	RuntimeProjectAddResponse,
 	RuntimeProjectRemoveResponse,
 	RuntimeProjectsResponse,
+	RuntimeProjectTasksResponse,
 	RuntimeShellSessionStartResponse,
 	RuntimeStateStreamMessage,
 	RuntimeStateStreamProjectsMessage,
@@ -802,6 +803,21 @@ describe.sequential("runtime state stream integration", () => {
 			expect(projectsAfterUpdate.status).toBe(200);
 			const projectB = projectsAfterUpdate.payload.projects.find((project) => project.id === workspaceBId) ?? null;
 			expect(projectB?.taskCounts.backlog).toBe(1);
+
+			const projectTasksAfterUpdate = await requestJson<RuntimeProjectTasksResponse>({
+				baseUrl: `http://127.0.0.1:${port}`,
+				procedure: "projects.listTasks",
+				type: "query",
+				workspaceId: workspaceAId,
+			});
+			expect(projectTasksAfterUpdate.status).toBe(200);
+			expect(projectTasksAfterUpdate.payload.unavailableProjectIds).toEqual([]);
+			const projectBTask =
+				projectTasksAfterUpdate.payload.tasks.find(
+					(task) => task.projectId === workspaceBId && task.title === "Realtime Task",
+				) ?? null;
+			expect(projectBTask?.displayState).toBe("backlog");
+			expect(projectTasksAfterUpdate.payload.tasks.map((task) => task.projectId)).toEqual([workspaceBId]);
 		} finally {
 			if (streamA) {
 				await streamA.close();

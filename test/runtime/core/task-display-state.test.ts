@@ -4,16 +4,19 @@ import type {
 	RuntimeBoardCard,
 	RuntimeBoardColumnId,
 	RuntimeBoardData,
-	RuntimeTaskSessionState,
+	RuntimeProjectTaskListItem,
 	RuntimeTaskSessionSummary,
 } from "../../../src/core/api-contract";
 import {
+	buildProjectTaskListItems,
+	compareProjectTaskListItems,
 	countTasksByDisplayState,
 	createEmptyTaskCounts,
 	isPlaceholderSessionSummary,
 	mergeSessionSummaries,
 	pickNewerSessionSummary,
 	resolveTaskDisplayState,
+	resolveTaskLastActivityAt,
 } from "../../../src/core/task-display-state";
 
 function createSummary(overrides: Partial<RuntimeTaskSessionSummary> = {}): RuntimeTaskSessionSummary {
@@ -202,5 +205,168 @@ describe("mergeSessionSummaries", () => {
 		const disk = createSummary({ taskId: "a", state: "idle", updatedAt: 100 });
 		const merged = mergeSessionSummaries([disk], []);
 		expect(merged["a"]).toBe(disk);
+	});
+});
+
+describe("resolveTaskLastActivityAt", () => {
+	function createCard(updatedAt: number): RuntimeBoardCard {
+		return {
+			id: "task",
+			title: "task",
+			prompt: "",
+			startInPlanMode: false,
+			baseRef: "main",
+			createdAt: 100,
+			updatedAt,
+		};
+	}
+
+	it("uses the card timestamp without a summary", () => {
+		expect(resolveTaskLastActivityAt(createCard(120), null)).toBe(120);
+	});
+
+	it("uses the newest of card and summary timestamps", () => {
+		const summary = createSummary({ updatedAt: 300, lastOutputAt: 250, lastHookAt: 400 });
+		expect(resolveTaskLastActivityAt(createCard(100), summary)).toBe(400);
+	});
+
+	it("ignores null output and hook timestamps", () => {
+		const summary = createSummary({ updatedAt: 300, lastOutputAt: null, lastHookAt: null });
+		expect(resolveTaskLastActivityAt(createCard(500), summary)).toBe(500);
+	});
+
+	it("does not let a newer placeholder change the activity", () => {
+		const placeholder = createSummary({ state: "idle", agentId: null, startedAt: null, updatedAt: 900 });
+		expect(resolveTaskLastActivityAt(createCard(100), placeholder)).toBe(100);
+	});
+});
+
+describe("buildProjectTaskListItems", () => {
+	it("emits one item per card in every column with column-derived display states", () => {
+		const board: RuntimeBoardData = {
+			columns: [
+				{
+					id: "backlog",
+					title: "Backlog",
+					cards: [
+						{
+							id: "backlog-task",
+							title: "Backlog task",
+							prompt: "",
+							startInPlanMode: false,
+							baseRef: "main",
+							createdAt: 100,
+							updatedAt: 100,
+						},
+					],
+				},
+				{
+					id: "in_progress",
+					title: "In Progress",
+					cards: [
+						{
+							id: "running-task",
+							title: "Running task",
+							prompt: "",
+							startInPlanMode: false,
+							baseRef: "main",
+							createdAt: 100,
+							updatedAt: 200,
+						},
+						{
+							id: "paused-task",
+							title: "Paused task",
+							prompt: "",
+							startInPlanMode: false,
+							baseRef: "main",
+							createdAt: 100,
+							updatedAt: 150,
+						},
+					],
+				},
+				{
+					id: "trash",
+					title: "Trash",
+					cards: [
+						{
+							id: "trashed-task",
+							title: "Trashed task",
+							prompt: "",
+							startInPlanMode: false,
+							baseRef: "main",
+							createdAt: 100,
+							updatedAt: 50,
+						},
+					],
+				},
+			],
+			dependencies: [],
+		};
+		const pausedSummary = createSummary({
+			taskId: "paused-task",
+			state: "running",
+			updatedAt: 150,
+			latestHookActivity: {
+				canReturnToBacklog: false,
+				activityText: "Waiting for a slot",
+				toolName: null,
+				toolInputSummary: null,
+				finalMessage: null,
+				hookEventName: "concurrency_waiting",
+				notificationType: null,
+				source: null,
+			},
+		});
+		const items = buildProjectTaskListItems({ id: "project", name: "Project" }, board, {
+			"paused-task": pausedSummary,
+		});
+		expect(items.map((item) => item.taskId).sort()).toEqual([
+			"backlog-task",
+			"paused-task",
+			"running-task",
+			"trashed-task",
+		]);
+		expect(items.find((item) => item.taskId === "paused-task")?.displayState).toBe("paused");
+		expect(items.find((item) => item.taskId === "running-task")?.displayState).toBe("in_progress");
+		expect(items.find((item) => item.taskId === "trashed-task")?.displayState).toBe("trash");
+		expect(items.find((item) => item.taskId === "trashed-task")?.lastActivityAt).toBe(50);
+		expect(items.every((item) => item.projectId === "project" && item.projectName === "Project")).toBe(true);
+	});
+});
+
+describe("compareProjectTaskListItems", () => {
+	function createItem(overrides: Partial<RuntimeProjectTaskListItem> = {}): RuntimeProjectTaskListItem {
+		return {
+			projectId: "a",
+			projectName: "A",
+			taskId: "t1",
+			title: "Task",
+			displayState: "in_progress",
+			lastActivityAt: 100,
+			...overrides,
+		};
+	}
+
+	it("orders by last activity, newest first", () => {
+		const older = createItem({ lastActivityAt: 50 });
+		const newer = createItem({ lastActivityAt: 200 });
+		expect(compareProjectTaskListItems(older, newer)).toBeGreaterThan(0);
+		expect(compareProjectTaskListItems(newer, older)).toBeLessThan(0);
+	});
+
+	it("then by title ascending", () => {
+		expect(compareProjectTaskListItems(createItem({ title: "B" }), createItem({ title: "A" }))).toBeGreaterThan(0);
+	});
+
+	it("then by task id ascending", () => {
+		expect(compareProjectTaskListItems(createItem({ taskId: "b" }), createItem({ taskId: "a" }))).toBeGreaterThan(0);
+	});
+
+	it("then by project id ascending for duplicate task ids", () => {
+		const fromA = createItem({ projectId: "a" });
+		const fromB = createItem({ projectId: "b" });
+		expect(compareProjectTaskListItems(fromB, fromA)).toBeGreaterThan(0);
+		expect(compareProjectTaskListItems(fromA, fromB)).toBeLessThan(0);
+		expect(compareProjectTaskListItems(fromA, createItem({ projectId: "a" }))).toBe(0);
 	});
 });

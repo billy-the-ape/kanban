@@ -99,13 +99,17 @@ export function useProjectNavigation({ onProjectSwitchStart }: UseProjectNavigat
 
 	const handleSelectProject = useCallback(
 		(projectId: string) => {
-			if (!projectId || projectId === currentProjectId) {
+			// Selecting the loaded current project is not a switch request and
+			// must not cancel an in-flight A→B switch (e.g. a pending task
+			// selection in A). navigationCurrentProjectId covers the in-flight
+			// requested project as well.
+			if (!projectId || projectId === navigationCurrentProjectId) {
 				return;
 			}
 			onProjectSwitchStart();
 			setRequestedProjectId(projectId);
 		},
-		[currentProjectId, onProjectSwitchStart],
+		[navigationCurrentProjectId, onProjectSwitchStart],
 	);
 
 	const handleAddProjectSuccess = useCallback(

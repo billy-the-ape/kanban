@@ -21,6 +21,7 @@ export enum LocalStorageKey {
 	TabVisibilityPresence = "kanban.tab-visibility-presence.v1",
 	Theme = "kanban.theme",
 	BoardColumnCollapsed = "kanban.{project}-{columnid}-collapsed",
+	SidebarTasksFilter = "kanban.sidebar-tasks-filter",
 }
 
 export const LAYOUT_CUSTOMIZATION_LOCAL_STORAGE_KEYS = [

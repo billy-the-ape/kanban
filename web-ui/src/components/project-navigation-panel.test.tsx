@@ -137,6 +137,7 @@ describe("ProjectNavigationPanel width persistence", () => {
 					removingProjectId={null}
 					activeSection="projects"
 					onActiveSectionChange={() => {}}
+					renderTasksSection={() => <div>tasks-section-content</div>}
 					canShowAgentSection
 					selectedAgentId={null}
 					clineProviderSettings={null}
@@ -291,5 +292,28 @@ describe("ProjectNavigationPanel width persistence", () => {
 			(candidate) => candidate.getAttribute("title") === "Paused",
 		);
 		expect(pausedBadge).toBeUndefined();
+	});
+
+	it("renders the three section tabs in order and reports Tasks selection", () => {
+		const onActiveSectionChange = vi.fn();
+		renderPanel({ onActiveSectionChange });
+		const sectionButtons = Array.from(container.querySelectorAll("button")).filter((button) =>
+			["Projects", "Tasks", "Kanban Agent"].includes(button.textContent ?? ""),
+		);
+		expect(sectionButtons.map((button) => button.textContent)).toEqual(["Projects", "Tasks", "Kanban Agent"]);
+		const tasksButton = sectionButtons.find((button) => button.textContent === "Tasks");
+		if (!tasksButton) {
+			throw new Error("Tasks section button was not rendered");
+		}
+		act(() => {
+			tasksButton.click();
+		});
+		expect(onActiveSectionChange).toHaveBeenCalledWith("tasks");
+	});
+
+	it("renders the tasks section content and hides the projects footer on the Tasks tab", () => {
+		renderPanel({ activeSection: "tasks" });
+		expect(container.textContent).toContain("tasks-section-content");
+		expect(container.textContent).not.toContain("Kanban is in beta. Help us improve by sharing your experience.");
 	});
 });
