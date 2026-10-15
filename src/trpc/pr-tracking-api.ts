@@ -19,7 +19,6 @@ import type {
 	RuntimePrAuthorizedSnapshotRequest,
 	RuntimePrAuthorizedSnapshotResponse,
 	RuntimePrCommentDispatchUpdateRequest,
-	RuntimePrInstalledConsumer,
 	RuntimePrOperationReleaseRequest,
 	RuntimePrOperationReservationRequest,
 	RuntimePrOperationReservationResponse,
@@ -45,7 +44,7 @@ import type {
 	RuntimeTaskTrackingStateResponse,
 } from "../core/api-contract";
 import { setTaskSelectedAutomationPr, updateTaskPrSettings } from "../core/task-board-mutations";
-import type { PrConsumerRegistry, PrInstalledConsumers } from "../pr-tracking/pr-consumer-registry";
+import type { PrInstalledConsumers } from "../pr-tracking/pr-consumer-registry";
 import { evaluatePrLifecycleGate } from "../pr-tracking/pr-lifecycle-gate";
 import {
 	assignRepairOwner,
@@ -66,7 +65,6 @@ import type { RuntimeTrpcWorkspaceScope } from "./app-router";
 export interface CreatePrTrackingApiDependencies {
 	getPrTrackingCoordinator: () => PrTrackingCoordinator | null;
 	getPrTrackingStore: () => PrRecordStoreBase;
-	getPrConsumerRegistry: () => PrConsumerRegistry;
 	listManagedWorkspaceBoards: () => Promise<PrBoardSnapshot[]>;
 	broadcastRuntimeWorkspaceStateUpdated: (scope: RuntimeTrpcWorkspaceScope) => void | Promise<void>;
 	/** B-5.5-style writer liveness probe (drain precondition for repair-owner transfer). */
@@ -89,20 +87,6 @@ export interface CreatePrTrackingApiDependencies {
 	) => Promise<RuntimeAgentId | null> | (RuntimeAgentId | null);
 	/** Audited operator actions (force releases) are reported here. */
 	warn?: (message: string) => void;
-}
-
-function installedConsumersOf(registry: PrConsumerRegistry): RuntimePrInstalledConsumer[] {
-	return registry.listInstalled().map((registration) => ({
-		kind: registration.kind,
-		requiredReadSources: registration.requiredReadSources,
-	}));
-}
-
-function toInstalledConsumerFlags(registry: PrConsumerRegistry): PrInstalledConsumers {
-	return {
-		comments: registry.isInstalled("comments"),
-		mergeCompletion: registry.isInstalled("mergeCompletion"),
-	};
 }
 
 /** Human-facing mapping for coordinator subscription blockers. */
@@ -176,7 +160,9 @@ function toReservationView(record: GitHubPrTrackingRecord | null): RuntimePrRese
 export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 	const source = {
 		listBoards: () => deps.listManagedWorkspaceBoards(),
-		installedConsumers: () => toInstalledConsumerFlags(deps.getPrConsumerRegistry()),
+		// Both PR tracking consumers (comment follow-up and merge completion)
+		// are always installed.
+		installedConsumers: () => ({ comments: true, mergeCompletion: true }),
 	};
 
 	/** Reconcile live task-derived subscriptions after a board change. */
@@ -416,9 +402,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		scope: RuntimeTrpcWorkspaceScope,
 		input: RuntimeTaskTrackingStateRequest,
 	): Promise<RuntimeTaskTrackingStateResponse> => {
-		const registry = deps.getPrConsumerRegistry();
 		const coordinator = deps.getPrTrackingCoordinator();
-		const installedFlags = toInstalledConsumerFlags(registry);
 		const found = await loadScopedCard(scope, input.taskId);
 		if (!found) {
 			return {
@@ -432,8 +416,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 				eligible: false,
 				legacyCompletionGated: false,
 				mergeFinishesInReview: false,
-				blockers: [{ kind: "feature_unavailable", message: "Task not found" }],
-				installedConsumers: installedConsumersOf(registry),
+				blockers: [{ kind: "needs_human", message: "Task not found" }],
 				commentsSupportedForTask: false,
 				owner: null,
 				ownerLabel: null,
@@ -447,12 +430,13 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		const card = found.card;
 		const settingsRevision = card.settingsRevision ?? 0;
 		const resolved = resolveCardAutomationPrKey(card);
-		const gate = evaluatePrLifecycleGate({ card, installed: installedFlags });
+		// Both PR tracking consumers (comment follow-up and merge completion)
+		// are always installed, so the shared lifecycle gate keys off the
+		// task's own PR automation settings.
+		const installed: PrInstalledConsumers = { comments: true, mergeCompletion: true };
+		const gate = evaluatePrLifecycleGate({ card, installed });
 		const blockers: Array<{ kind: RuntimeTaskTrackingStateResponse["blockers"][number]["kind"]; message: string }> =
 			[];
-		// Zero-consumer short-circuit: no consumer installed means no demand
-		// can ever exist, so no board enumeration (or owner scan) is needed.
-		const noConsumers = !installedFlags.comments && !installedFlags.mergeCompletion;
 		// Per-task agent support: comment follow-up is native-Cline only;
 		// merge completion is provider-independent. An UNSET card agentId
 		// means "use the workspace's selected agent", not Cline — resolve
@@ -470,7 +454,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			effectiveAgentId = "cline";
 		}
 		const nativeClineTask = effectiveAgentId === "cline";
-		const commentsSupportedForTask = installedFlags.comments && nativeClineTask;
+		const commentsSupportedForTask = nativeClineTask;
 		const coordinatorState = coordinator ? coordinator.getState() : null;
 		if (coordinatorState?.authBlocker) {
 			blockers.push({ kind: "auth", message: coordinatorState.authBlocker });
@@ -502,26 +486,13 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		if (!resolved.key) {
 			blockers.push({ kind: "waiting_for_linked_pr", message: "No PR link is recorded for this task yet." });
 		}
-		if (card.autoAddressComments === true && !installedFlags.comments) {
-			// Consumer not installed: "Feature unavailable" (distinct from the
-			// per-task agent-support blocker below).
-			blockers.push({
-				kind: "feature_unavailable",
-				message: "Comment follow-up automation is not installed in this runtime.",
-			});
-		} else if (card.autoAddressComments === true && !nativeClineTask) {
+		if (card.autoAddressComments === true && !nativeClineTask) {
 			blockers.push({
 				kind: "comments_unsupported",
 				message: "Comment follow-up automation requires a native Cline task.",
 			});
 		}
-		if (card.autoFinishOnMerge === true && !installedFlags.mergeCompletion) {
-			blockers.push({
-				kind: "feature_unavailable",
-				message: "Merge completion automation is not installed in this runtime.",
-			});
-		}
-		const eligible = !noConsumers && active && resolved.key !== null && gate.legacyCompletionGated;
+		const eligible = active && resolved.key !== null && gate.legacyCompletionGated;
 		let record: GitHubPrTrackingRecord | null = null;
 		let binding: GitHubPrTaskBinding | null = null;
 		if (resolved.key) {
@@ -534,16 +505,10 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 					) ?? null;
 			}
 		}
-		const boards = noConsumers ? [] : await deps.listManagedWorkspaceBoards();
-		const candidates = resolved.key && !noConsumers ? listRepairOwnerCandidates(resolved.key, boards) : [];
+		const boards = await deps.listManagedWorkspaceBoards();
+		const candidates = resolved.key ? listRepairOwnerCandidates(resolved.key, boards) : [];
 		const owner = resolved.key && record ? record.commentAutomation.repairOwner : null;
-		// With zero consumers no board scan happened, so "not found on a
-		// board" is indeterminate here and must not surface as a deletion.
-		const rawOwnerView = toOwnerView(owner, candidates, boards);
-		const ownerView =
-			noConsumers && rawOwnerView?.state === "deleted"
-				? { ...rawOwnerView, state: "active" as const }
-				: rawOwnerView;
+		const ownerView = toOwnerView(owner, candidates, boards);
 		if (owner && ownerView?.state === "deleted") {
 			blockers.push({ kind: "owner_deleted", message: "The repair owner task was deleted; reassign to continue." });
 		}
@@ -576,7 +541,6 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			legacyCompletionGated: gate.legacyCompletionGated,
 			mergeFinishesInReview: gate.mergeFinishesInReview,
 			blockers,
-			installedConsumers: installedConsumersOf(registry),
 			commentsSupportedForTask,
 			owner: ownerView,
 			ownerLabel: owner && owner.workspaceId !== scope.workspaceId ? (ownerView?.label ?? null) : null,

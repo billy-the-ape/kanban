@@ -2,6 +2,14 @@
 
 Updated: 2026-10-07. Status: implemented — PRTRACK-0 (PR #64) and PRTRACK-1 (PR #66) are merged. Repository: `billy-the-ape/kanban`.
 
+> **Subsequent change:** the installed-consumer configuration was removed. Both consumers
+> (comment follow-up and merge completion) are now always installed and available:
+> `RuntimeConfigResponse.installedPrConsumers` no longer exists, the `feature_unavailable`
+> blocker and "Feature unavailable" checkbox disabling are gone, and both automation
+> checkboxes default to true for new tasks. The native-Cline `comments_unsupported`
+> requirement is unchanged. Where this plan describes consumer installation gating, the
+> behavior is unconditional.
+
 ## Delivery order and scope
 
 Build this shared foundation first, after landed

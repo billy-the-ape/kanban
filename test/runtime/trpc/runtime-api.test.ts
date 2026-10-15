@@ -3775,7 +3775,7 @@ describe("createRuntimeApi buildTaskDiagnosticsExportPlan (DIAG-3)", () => {
 });
 
 describe("createRuntimeApi loadConfig", () => {
-	it("returns the awaited config fields alongside the installed PR consumers", async () => {
+	it("returns the awaited config fields", async () => {
 		agentRegistryMocks.buildRuntimeConfigResponse.mockReturnValue({
 			selectedAgentId: "claude",
 			commitPromptTemplate: "commit",
@@ -3788,16 +3788,14 @@ describe("createRuntimeApi loadConfig", () => {
 			getScopedClineTaskSessionService: vi.fn(async () => createClineTaskSessionServiceMock() as never),
 			resolveInteractiveShellCommand: vi.fn(),
 			runCommand: vi.fn(),
-			getInstalledPrConsumers: vi.fn(() => []),
 		});
 
 		const response = await api.loadConfig({ workspaceId: "workspace-1", workspacePath: "/tmp/repo" });
 
-		// Regression: a dropped `await` spread a Promise, so the response held
-		// only `installedPrConsumers` and lost every config field.
+		// Regression: a dropped `await` spread a Promise, so the response lost
+		// every config field.
 		expect(response.selectedAgentId).toBe("claude");
 		expect(response.commitPromptTemplate).toBe("commit");
-		expect(response.installedPrConsumers).toEqual([]);
 	});
 });
 

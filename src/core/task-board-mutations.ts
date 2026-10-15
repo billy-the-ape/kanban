@@ -26,9 +26,9 @@ export interface RuntimeCreateTaskInput {
 	baseRef: string;
 	/** UPD-0: missing values normalize to true; an explicit false is persisted as false. */
 	updateBaseRefBeforeStart?: boolean;
-	/** PRTRACK-1: "Auto address comments"; default false, not persisted when omitted. */
+	/** PRTRACK-1: "Auto address comments"; defaults to true when omitted. */
 	autoAddressComments?: boolean;
-	/** PRTRACK-1: "Auto complete task when PR is merged"; default false, not persisted when omitted. */
+	/** PRTRACK-1: "Auto complete task when PR is merged"; defaults to true when omitted. */
 	autoFinishOnMerge?: boolean;
 }
 
@@ -339,9 +339,10 @@ export function addTaskToColumn(
 		baseRef,
 		// UPD-0: missing normalizes to true; explicit false survives.
 		updateBaseRefBeforeStart: input.updateBaseRefBeforeStart !== false,
-		// PRTRACK-1: persist explicit preferences only; omitted reads as false.
-		...(input.autoAddressComments !== undefined ? { autoAddressComments: input.autoAddressComments } : {}),
-		...(input.autoFinishOnMerge !== undefined ? { autoFinishOnMerge: input.autoFinishOnMerge } : {}),
+		// PRTRACK-1: both PR automation consumers are always installed, so
+		// omitted preferences default to true; an explicit false is kept.
+		autoAddressComments: input.autoAddressComments !== false,
+		autoFinishOnMerge: input.autoFinishOnMerge !== false,
 		createdAt: now,
 		updatedAt: now,
 	};

@@ -24,7 +24,6 @@ import type {
 	RuntimeBoardData,
 } from "../../../src/core/api-contract";
 import { InMemoryPrRecordStore } from "../../../src/pr-tracking/in-memory-pr-record-store";
-import { PrConsumerRegistry } from "../../../src/pr-tracking/pr-consumer-registry";
 import { assignRepairOwner } from "../../../src/pr-tracking/pr-owner-selection";
 import { releasePrOperation, reservePrOperation } from "../../../src/pr-tracking/pr-reservations";
 import { createPrTrackingCoordinator } from "../../../src/pr-tracking/pr-tracking-coordinator";
@@ -88,7 +87,6 @@ function makeBoard(card: RuntimeBoardCard, columnId: RuntimeBoardColumnId = "in_
 
 interface ApiHarness {
 	store: InMemoryPrRecordStore;
-	registry: PrConsumerRegistry;
 	warnings: string[];
 	api: ReturnType<typeof createPrTrackingApi>;
 }
@@ -98,13 +96,11 @@ function createHarness(
 	options: { writerActive?: boolean; effectiveAgentId?: RuntimeAgentId | null } = {},
 ): ApiHarness {
 	const store = new InMemoryPrRecordStore();
-	const registry = new PrConsumerRegistry();
 	const coordinator = createPrTrackingCoordinator({ store });
 	const warnings: string[] = [];
 	const api = createPrTrackingApi({
 		getPrTrackingCoordinator: () => coordinator,
 		getPrTrackingStore: () => store,
-		getPrConsumerRegistry: () => registry,
 		listManagedWorkspaceBoards: async () => [{ workspaceId: WORKSPACE_ID, board }],
 		broadcastRuntimeWorkspaceStateUpdated: () => undefined,
 		isTaskWriterActive: () => options.writerActive === true,
@@ -114,7 +110,7 @@ function createHarness(
 			warnings.push(message);
 		},
 	});
-	return { store, registry, warnings, api };
+	return { store, warnings, api };
 }
 
 /** Mocks the workspace-state module around an in-memory board. */
@@ -146,11 +142,10 @@ describe("pr-tracking api: tracking-state diagnostics", () => {
 		workspaceStateMocks.mutateWorkspaceState.mockReset();
 	});
 
-	it("reports comments_unsupported (not feature_unavailable) for a non-Cline task when the consumer is installed", async () => {
+	it("reports comments_unsupported for a non-Cline task", async () => {
 		const board = makeBoard(makeCard({ autoAddressComments: true, agentId: "codex" }));
 		mockWorkspaceState(board);
 		const harness = createHarness(board);
-		harness.registry.registerConsumer("comments");
 
 		const state = await harness.api.getTaskTrackingState(SCOPE, { taskId: OPERATOR_TASK_ID });
 		expect(state.commentsSupportedForTask).toBe(false);
@@ -160,42 +155,22 @@ describe("pr-tracking api: tracking-state diagnostics", () => {
 		});
 	});
 
-	it("reports feature_unavailable when the comments consumer is not installed (merge only)", async () => {
-		const board = makeBoard(makeCard({ autoAddressComments: true }));
-		mockWorkspaceState(board);
-		const harness = createHarness(board);
-		harness.registry.registerConsumer("mergeCompletion");
-
-		const state = await harness.api.getTaskTrackingState(SCOPE, { taskId: OPERATOR_TASK_ID });
-		expect(state.blockers).toContainEqual({
-			kind: "feature_unavailable",
-			message: "Comment follow-up automation is not installed in this runtime.",
-		});
-		expect(state.blockers.some((blocker) => blocker.kind === "comments_unsupported")).toBe(false);
-	});
-
-	it("supports comments for an explicitly Cline-assigned task with the consumer installed", async () => {
+	it("supports comments for an explicitly Cline-assigned task", async () => {
 		const board = makeBoard(makeCard({ autoAddressComments: true, agentId: "cline" }));
 		mockWorkspaceState(board);
 		const harness = createHarness(board);
-		harness.registry.registerConsumer("comments");
 
 		const state = await harness.api.getTaskTrackingState(SCOPE, { taskId: OPERATOR_TASK_ID });
 		expect(state.commentsSupportedForTask).toBe(true);
-		expect(
-			state.blockers.some(
-				(blocker) => blocker.kind === "comments_unsupported" || blocker.kind === "feature_unavailable",
-			),
-		).toBe(false);
+		expect(state.blockers.some((blocker) => blocker.kind === "comments_unsupported")).toBe(false);
 	});
 
-	it("treats an unset agentId as the workspace's selected agent (non-Cline) when the consumer is installed", async () => {
+	it("treats an unset agentId as the workspace's selected agent (non-Cline)", async () => {
 		// No per-card agentId: the effective agent is the workspace's selected
 		// agent, which here is non-Cline.
 		const board = makeBoard(makeCard({ autoAddressComments: true }));
 		mockWorkspaceState(board);
 		const harness = createHarness(board, { effectiveAgentId: "claude" });
-		harness.registry.registerConsumer("comments");
 
 		const state = await harness.api.getTaskTrackingState(SCOPE, { taskId: OPERATOR_TASK_ID });
 		expect(state.commentsSupportedForTask).toBe(false);
@@ -209,18 +184,15 @@ describe("pr-tracking api: tracking-state diagnostics", () => {
 		const board = makeBoard(makeCard({ autoAddressComments: true }));
 		mockWorkspaceState(board);
 		const harness = createHarness(board, { effectiveAgentId: "cline" });
-		harness.registry.registerConsumer("comments");
 
 		const state = await harness.api.getTaskTrackingState(SCOPE, { taskId: OPERATOR_TASK_ID });
 		expect(state.commentsSupportedForTask).toBe(true);
 	});
 
-	it("does not report the repair owner as deleted on the zero-consumer short-circuit", async () => {
+	it("reports the repair owner as active while it is still on a board", async () => {
 		const board = makeBoard(makeCard({ autoAddressComments: true }));
 		mockWorkspaceState(board);
 		const harness = createHarness(board);
-		// No consumers installed: the read path must short-circuit without a
-		// board scan, and an existing owner must not surface as deleted.
 		await seedRecord(harness.store);
 		await assignRepairOwner(harness.store, PR_KEY, [{ workspaceId: WORKSPACE_ID, board }], {
 			workspaceId: WORKSPACE_ID,

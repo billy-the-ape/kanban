@@ -97,6 +97,25 @@ describe("deleteTasksFromBoard", () => {
 	});
 });
 
+describe("PR automation creation defaults", () => {
+	it("defaults both settings to true when omitted", () => {
+		const created = addTaskToColumn(createBoard(), "backlog", { prompt: "Task", baseRef: "main" }, () => "aaaaa111");
+		expect(created.task.autoAddressComments).toBe(true);
+		expect(created.task.autoFinishOnMerge).toBe(true);
+	});
+
+	it("keeps an explicit false for both settings", () => {
+		const created = addTaskToColumn(
+			createBoard(),
+			"backlog",
+			{ prompt: "Task", baseRef: "main", autoAddressComments: false, autoFinishOnMerge: false },
+			() => "aaaaa111",
+		);
+		expect(created.task.autoAddressComments).toBe(false);
+		expect(created.task.autoFinishOnMerge).toBe(false);
+	});
+});
+
 describe("task images", () => {
 	it("preserves images when creating and updating tasks", () => {
 		const created = addTaskToColumn(

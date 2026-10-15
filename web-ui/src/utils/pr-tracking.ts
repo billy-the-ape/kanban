@@ -31,38 +31,26 @@ export function cardHasResolvableAutomationPr(card: BoardCard): boolean {
 	return links.length === 1;
 }
 
-export interface PrInstalledConsumerFlags {
-	comments: boolean;
-	mergeCompletion: boolean;
-}
-
 /**
  * True when an installed enabled consumer owns this card's linked PR
  * workflow: legacy automatic completion (browser auto-actions, CLI,
- * deterministic delivery) must not move the card to Done.
+ * deterministic delivery) must not move the card to Done. Both consumers
+ * (comment follow-up and merge completion) are always installed, so the
+ * gate keys off the card's own automation checkboxes.
  */
-export function isPrLifecycleGated(card: BoardCard, installed: PrInstalledConsumerFlags): boolean {
+export function isPrLifecycleGated(card: BoardCard): boolean {
 	if (!cardHasResolvableAutomationPr(card)) {
 		return false;
 	}
-	return (
-		(card.autoAddressComments === true && installed.comments) ||
-		(card.autoFinishOnMerge === true && installed.mergeCompletion)
-	);
+	return card.autoAddressComments === true || card.autoFinishOnMerge === true;
 }
 
-/** The task ids whose legacy completion is gated by installed PR consumers. */
-export function computePrLifecycleGatedTaskIds(
-	board: BoardData,
-	installed: PrInstalledConsumerFlags,
-): ReadonlySet<string> {
+/** The task ids whose legacy completion is gated by the installed PR consumers. */
+export function computePrLifecycleGatedTaskIds(board: BoardData): ReadonlySet<string> {
 	const ids = new Set<string>();
-	if (!installed.comments && !installed.mergeCompletion) {
-		return ids;
-	}
 	for (const column of board.columns) {
 		for (const card of column.cards) {
-			if (isPrLifecycleGated(card, installed)) {
+			if (isPrLifecycleGated(card)) {
 				ids.add(card.id);
 			}
 		}

@@ -127,7 +127,6 @@ function createRuntimeConfig(selectedAgentId: RuntimeConfigResponse["selectedAge
 			dispatchEnabled: false,
 			workerLimit: 1,
 		},
-		installedPrConsumers: [],
 	};
 }
 

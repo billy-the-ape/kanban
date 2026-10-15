@@ -2,9 +2,8 @@
 //
 // Subscription demand is ALWAYS derived from current task state (column,
 // PR link, selection, checkboxes) intersected with the installed-consumer
-// registry. An enabled checkbox against an uninstalled consumer never
-// produces demand (and renders "Feature unavailable"). Reconciling on every
-// real task change and at startup removes demand when tasks become
+// registry (both consumers are always installed in production). Reconciling
+// on every real task change and at startup removes demand when tasks become
 // ineligible; consumers are not sticky in-memory objects.
 import type { RuntimeBoardColumnId, RuntimePrConsumerKind } from "../core/api-contract";
 import type { PrInstalledConsumers } from "./pr-consumer-registry";

@@ -26,7 +26,6 @@ import type {
 	RuntimeCommandRunResponse,
 	RuntimeEffectiveContextWindow,
 	RuntimeGitDeliveryReceipt,
-	RuntimePrInstalledConsumer,
 	RuntimeRunUpdateResponse,
 	RuntimeTaskChatPrLinking,
 	RuntimeTaskChatSendRequest,
@@ -159,13 +158,6 @@ export interface CreateRuntimeApiDependencies {
 	warnTaskDispatchError?: (error: unknown) => void;
 	/** COMMENT-0: the runtime-wide comment-handling observer (optional in partial harnesses). */
 	getPrCommentAutomationService?: () => PrCommentAutomationService | null;
-	/**
-	 * PRTRACK-1: the installed PR tracking consumers. Surfaced in the runtime
-	 * config response as the browser's installed-consumer signal (checkbox
-	 * availability, lifecycle-gate display). Optional so test harnesses that
-	 * never register consumers keep working.
-	 */
-	getInstalledPrConsumers?: () => RuntimePrInstalledConsumer[];
 	/**
 	 * PRTRACK-1: shared lifecycle gate for deterministic delivery — reports
 	 * whether another task's PR operation currently holds a reservation on the
@@ -1045,11 +1037,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				throw new Error("No active runtime config provider is available.");
 			}
 			const configResponse = await buildConfigResponse(scopedRuntimeConfig);
-			return {
-				...configResponse,
-				// PRTRACK-1: the installed-consumer signal for the browser.
-				installedPrConsumers: deps.getInstalledPrConsumers?.() ?? [],
-			};
+			return configResponse;
 		},
 		saveConfig: async (workspaceScope, input) => {
 			const parsed = parseRuntimeConfigSaveRequest(input);
@@ -1873,7 +1861,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		setTaskPrAutomationSettings: async (workspaceScope, input) => {
 			const body = parseTaskPrAutomationSettingsRequest(input);
 			const board = await loadWorkspaceBoardById(workspaceScope.workspaceId).catch(() => null);
-			if (!board || !board.columns.flatMap((column) => column.cards).some((card) => card.id === body.taskId)) {
+			if (!board?.columns.flatMap((column) => column.cards).some((card) => card.id === body.taskId)) {
 				return { ok: false, error: `Task "${body.taskId}" not found.` };
 			}
 			await mutateWorkspaceState(workspaceScope.workspacePath, (state) => {
