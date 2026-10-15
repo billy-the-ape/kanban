@@ -20,6 +20,7 @@ import {
 } from "../core/api-contract";
 import { createGitProcessEnv } from "../core/git-process-env";
 import { updateTaskDependencies } from "../core/task-board-mutations";
+import { mergeSessionSummaries } from "../core/task-display-state";
 import { type LockRequest, lockedFileSystem } from "../fs/locked-file-system";
 
 const RUNTIME_HOME_PARENT_DIR = ".cline";
@@ -342,6 +343,12 @@ async function readWorkspaceBoard(workspaceId: string): Promise<RuntimeBoardData
 
 export async function loadWorkspaceBoardById(workspaceId: string): Promise<RuntimeBoardData> {
 	return await readWorkspaceBoard(workspaceId);
+}
+
+export async function loadWorkspaceSessionsById(
+	workspaceId: string,
+): Promise<Record<string, RuntimeTaskSessionSummary>> {
+	return await readWorkspaceSessions(workspaceId);
 }
 
 async function readWorkspaceSessions(workspaceId: string): Promise<Record<string, RuntimeTaskSessionSummary>> {
@@ -889,6 +896,35 @@ export function applyManualReopenMarkers(
 	};
 }
 
+/**
+ * Merge the supplied sessions with the currently persisted sessions (read by
+ * the caller inside the workspace directory lock) so a save can never restore
+ * an older real summary. Tie order is disk -> supplied, so supplied sources
+ * win ties. A disk-only summary (its task id absent from the supplied record)
+ * is kept only when that task id is still a card on the board being saved;
+ * ids present in the supplied record are always kept.
+ */
+async function mergeSessionsForSave(
+	suppliedSessions: Record<string, RuntimeTaskSessionSummary>,
+	board: RuntimeBoardData,
+	workspaceId: string,
+): Promise<Record<string, RuntimeTaskSessionSummary>> {
+	const persistedSessions = await readWorkspaceSessions(workspaceId);
+	const merged = mergeSessionSummaries(Object.values(persistedSessions), Object.values(suppliedSessions));
+	const boardTaskIds = new Set<string>();
+	for (const column of board.columns) {
+		for (const card of column.cards) {
+			boardTaskIds.add(card.id);
+		}
+	}
+	for (const taskId of Object.keys(merged)) {
+		if (!(taskId in suppliedSessions) && !boardTaskIds.has(taskId)) {
+			delete merged[taskId];
+		}
+	}
+	return merged;
+}
+
 export async function saveWorkspaceState(
 	cwd: string,
 	payload: RuntimeWorkspaceStateSaveRequest,
@@ -919,7 +955,7 @@ export async function saveWorkspaceState(
 			persistedBoard,
 			Date.now(),
 		);
-		const sessions = parsedPayload.sessions;
+		const sessions = await mergeSessionsForSave(parsedPayload.sessions, board, context.workspaceId);
 		const nextRevision = currentMeta.revision + 1;
 		const nextMeta: WorkspaceStateMeta = {
 			revision: nextRevision,

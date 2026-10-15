@@ -1,5 +1,5 @@
+import { pickNewerSessionSummary } from "@runtime-task-display-state";
 import { useEffect, useReducer } from "react";
-
 import type {
 	RuntimeClineMcpServerAuthStatus,
 	RuntimeProjectSummary,
@@ -29,10 +29,7 @@ function mergeTaskSessionSummaries(
 	}
 	const nextSessions = { ...currentSessions };
 	for (const summary of summaries) {
-		const existing = nextSessions[summary.taskId];
-		if (!existing || existing.updatedAt <= summary.updatedAt) {
-			nextSessions[summary.taskId] = summary;
-		}
+		nextSessions[summary.taskId] = pickNewerSessionSummary(nextSessions[summary.taskId], summary);
 	}
 	return nextSessions;
 }

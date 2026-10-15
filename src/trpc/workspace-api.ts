@@ -75,6 +75,8 @@ export interface CreateWorkspaceApiDependencies {
 		workspaceId: string;
 		workspacePath: string;
 	}) => Promise<ClineTaskSessionService>;
+	/** Read live Cline task session summaries for tracked services only (no service creation). */
+	getClineTaskSessionSummaries?: (workspaceId: string) => RuntimeTaskSessionSummary[];
 	broadcastRuntimeWorkspaceStateUpdated: (workspaceId: string, workspacePath: string) => Promise<void> | void;
 	broadcastRuntimeProjectsUpdated: (preferredCurrentProjectId: string | null) => Promise<void> | void;
 	buildWorkspaceStateSnapshot: (workspaceId: string, workspacePath: string) => Promise<RuntimeWorkspaceStateResponse>;
@@ -442,19 +444,23 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 					workspaceScope.workspaceId,
 					workspaceScope.workspacePath,
 				);
-				const clineService = await deps.getScopedClineTaskSessionService(workspaceScope);
-				input = {
-					...input,
-					sessions: resolveWorkspaceSessionSummaries(
-						input.sessions,
-						terminalManager,
-						clineService.listSummaries(),
-					),
-				};
+				// Live-owner merge: the browser's sessions, the terminal
+				// manager's summaries (orphaned running entries are reconciled
+				// to interrupted), and the tracked live Cline summaries. A
+				// copied object is passed to saveWorkspaceState, so the request
+				// is never mutated.
+				const mergedSessions = resolveWorkspaceSessionSummaries(
+					input.sessions,
+					terminalManager,
+					deps.getClineTaskSessionSummaries?.(workspaceScope.workspaceId) ?? [],
+				);
 				// PRLINK-5: capture the pre-save board so we can detect cards that
 				// just moved into Review without PRs (best-effort lookup trigger).
 				const previousBoard = await loadWorkspaceBoardById(workspaceScope.workspaceId);
-				const response = await saveWorkspaceState(workspaceScope.workspacePath, input);
+				const response = await saveWorkspaceState(workspaceScope.workspacePath, {
+					...input,
+					sessions: mergedSessions,
+				});
 				void deps.broadcastRuntimeWorkspaceStateUpdated(workspaceScope.workspaceId, workspaceScope.workspacePath);
 				void deps.broadcastRuntimeProjectsUpdated(workspaceScope.workspaceId);
 				// B-9.2: a board save is the trigger that moves a card to Done;

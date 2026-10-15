@@ -311,6 +311,106 @@ describe("useWorkspaceSync", () => {
 		expect(rerenderedSnapshot.sessions["task-1"]?.updatedAt).toBe(2000);
 		expect(rerenderedSnapshot.sessions["task-1"]?.state).toBe("running");
 	});
+	it("lets an incoming streamed summary win an equal-timestamp tie", async () => {
+		const existingRunningSummary = createSessionSummary("task-1", 1000, null);
+		const incomingReviewSummary = createSessionSummary("task-1", 1000, "Tie output");
+
+		let latestSnapshot: HookSnapshot | null = null;
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					streamedWorkspaceState={createWorkspaceStateWithSessions("persisted-task", 1, {
+						"task-1": existingRunningSummary,
+					})}
+					onSnapshot={(snapshot) => {
+						latestSnapshot = snapshot;
+					}}
+				/>,
+			);
+		});
+
+		if (latestSnapshot === null) {
+			throw new Error("Expected an initial hook snapshot.");
+		}
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					streamedWorkspaceState={createWorkspaceStateWithSessions("persisted-task", 2, {
+						"task-1": incomingReviewSummary,
+					})}
+					onSnapshot={(snapshot) => {
+						latestSnapshot = snapshot;
+					}}
+				/>,
+			);
+		});
+
+		if (latestSnapshot === null) {
+			throw new Error("Expected a hook snapshot after rerender.");
+		}
+		const rerenderedSnapshot: HookSnapshot = latestSnapshot;
+		expect(rerenderedSnapshot.sessions["task-1"]?.latestHookActivity?.finalMessage).toBe("Tie output");
+	});
+
+	it("does not let a newer placeholder summary replace a real one during hydration", async () => {
+		const realSummary = createSessionSummary("task-1", 1000, null);
+		const placeholderSummary: RuntimeTaskSessionSummary = {
+			taskId: "task-1",
+			state: "idle",
+			agentId: null,
+			workspacePath: null,
+			pid: null,
+			startedAt: null,
+			updatedAt: 5000,
+			lastOutputAt: null,
+			reviewReason: null,
+			exitCode: null,
+			lastHookAt: null,
+			latestHookActivity: null,
+			latestTurnCheckpoint: null,
+			previousTurnCheckpoint: null,
+		};
+
+		let latestSnapshot: HookSnapshot | null = null;
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					streamedWorkspaceState={createWorkspaceStateWithSessions("persisted-task", 1, {
+						"task-1": realSummary,
+					})}
+					onSnapshot={(snapshot) => {
+						latestSnapshot = snapshot;
+					}}
+				/>,
+			);
+		});
+
+		if (latestSnapshot === null) {
+			throw new Error("Expected an initial hook snapshot.");
+		}
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					streamedWorkspaceState={createWorkspaceStateWithSessions("persisted-task", 2, {
+						"task-1": placeholderSummary,
+					})}
+					onSnapshot={(snapshot) => {
+						latestSnapshot = snapshot;
+					}}
+				/>,
+			);
+		});
+
+		if (latestSnapshot === null) {
+			throw new Error("Expected a hook snapshot after rerender.");
+		}
+		const rerenderedSnapshot: HookSnapshot = latestSnapshot;
+		expect(rerenderedSnapshot.sessions["task-1"]).toBe(realSummary);
+	});
 
 	it("does not refresh workspace state before the initial runtime snapshot resolves", async () => {
 		let latestSnapshot: HookSnapshot | null = null;

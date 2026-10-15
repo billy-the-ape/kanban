@@ -1,8 +1,9 @@
-import { act, useEffect } from "react";
+import { act, useEffect, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useTaskSessions } from "@/hooks/use-task-sessions";
+import type { RuntimeTaskSessionSummary } from "@/runtime/types";
 import type { BoardCard } from "@/types";
 
 const startTaskSessionMutateMock = vi.hoisted(() => vi.fn());
@@ -63,6 +64,63 @@ function HookHarness({ onSnapshot }: { onSnapshot: (snapshot: HookSnapshot) => v
 			ensureTaskWorkspace: sessions.ensureTaskWorkspace,
 		});
 	}, [onSnapshot, sessions.startTaskSession, sessions.ensureTaskWorkspace]);
+
+	return null;
+}
+
+function createSessionSummary(
+	taskId: string,
+	updatedAt: number,
+	finalMessage: string | null,
+): RuntimeTaskSessionSummary {
+	return {
+		taskId,
+		state: finalMessage ? "awaiting_review" : "running",
+		agentId: "cline",
+		workspacePath: "/tmp/task-1",
+		pid: null,
+		startedAt: updatedAt - 100,
+		updatedAt,
+		lastOutputAt: updatedAt,
+		reviewReason: finalMessage ? "hook" : null,
+		exitCode: null,
+		lastHookAt: updatedAt,
+		latestHookActivity: finalMessage
+			? {
+					activityText: `Final: ${finalMessage}`,
+					toolName: null,
+					toolInputSummary: null,
+					finalMessage,
+					hookEventName: "agent_end",
+					notificationType: null,
+					source: "cline-sdk",
+				}
+			: null,
+		latestTurnCheckpoint: null,
+		previousTurnCheckpoint: null,
+	};
+}
+
+function StatefulSessionHarness({
+	onSessions,
+	onUpsert,
+}: {
+	onSessions: (sessions: Record<string, RuntimeTaskSessionSummary>) => void;
+	onUpsert: (upsertSession: (summary: RuntimeTaskSessionSummary) => void) => void;
+}): null {
+	const [sessions, setSessions] = useState<Record<string, RuntimeTaskSessionSummary>>({});
+	const hook = useTaskSessions({
+		currentProjectId: "project-1",
+		setSessions,
+	});
+
+	useEffect(() => {
+		onSessions(sessions);
+	}, [onSessions, sessions]);
+
+	useEffect(() => {
+		onUpsert(hook.upsertSession);
+	}, [hook.upsertSession, onUpsert]);
 
 	return null;
 }
@@ -416,5 +474,86 @@ describe("useTaskSessions", () => {
 				},
 			}),
 		);
+	});
+
+	it("lets an incoming summary win an equal-timestamp tie on upsert", () => {
+		let latestSessions: Record<string, RuntimeTaskSessionSummary> = {};
+		const upsertRef: { current: ((summary: RuntimeTaskSessionSummary) => void) | null } = { current: null };
+
+		act(() => {
+			root.render(
+				<StatefulSessionHarness
+					onSessions={(sessions) => {
+						latestSessions = sessions;
+					}}
+					onUpsert={(upsertSession) => {
+						upsertRef.current = upsertSession;
+					}}
+				/>,
+			);
+		});
+
+		const upsertSession =
+			upsertRef.current ??
+			(() => {
+				throw new Error("Expected an upsertSession callback.");
+			});
+
+		const existing = createSessionSummary("task-1", 1000, null);
+		const incoming = createSessionSummary("task-1", 1000, "Tie output");
+		act(() => {
+			upsertSession(existing);
+			upsertSession(incoming);
+		});
+
+		expect(latestSessions["task-1"]).toBe(incoming);
+	});
+
+	it("does not let a placeholder summary replace a newer real one on upsert", () => {
+		let latestSessions: Record<string, RuntimeTaskSessionSummary> = {};
+		const upsertRef: { current: ((summary: RuntimeTaskSessionSummary) => void) | null } = { current: null };
+
+		act(() => {
+			root.render(
+				<StatefulSessionHarness
+					onSessions={(sessions) => {
+						latestSessions = sessions;
+					}}
+					onUpsert={(upsertSession) => {
+						upsertRef.current = upsertSession;
+					}}
+				/>,
+			);
+		});
+
+		const upsertSession =
+			upsertRef.current ??
+			(() => {
+				throw new Error("Expected an upsertSession callback.");
+			});
+
+		const real = createSessionSummary("task-1", 1000, null);
+		const placeholder: RuntimeTaskSessionSummary = {
+			taskId: "task-1",
+			state: "idle",
+			agentId: null,
+			workspacePath: null,
+			pid: null,
+			startedAt: null,
+			updatedAt: 5000,
+			lastOutputAt: null,
+			reviewReason: null,
+			exitCode: null,
+			lastHookAt: null,
+			latestHookActivity: null,
+			latestTurnCheckpoint: null,
+			previousTurnCheckpoint: null,
+		};
+		act(() => {
+			upsertSession(real);
+			upsertSession(placeholder);
+		});
+
+		expect(latestSessions["task-1"]).toBe(real);
 	});
 });

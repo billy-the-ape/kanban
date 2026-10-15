@@ -1,6 +1,6 @@
 # Sidebar project pills: Paused state and the stale Review count fix
 
-Status: implementation-ready plan. Target: `billy-the-ape/kanban` `main`. Source baseline: `879a3a1`.
+Status: implemented. Target: `billy-the-ape/kanban` `main`. Source baseline: `879a3a1`.
 
 Order: **1 of 2** in `docs/plans/complete/sidebar-updates/`. Implement `paused-pill.md` before `tasks-tab.md`. This plan has no dependencies. `tasks-tab.md` depends on the shared module and the registry refactor introduced here. One implementation PR / one squash commit. Desktop collapse is being handled separately by the user.
 
@@ -162,6 +162,15 @@ Do not use `clinePreviousSummaryByWorkspaceId` as the read source: it is an even
   - `buildProjectTaskCountBadges(counts: RuntimeProjectTaskCounts): TaskCountBadge[]`. It maps `TASK_DISPLAY_STATE_ORDER` through the meta, takes `count` from `counts[state]`, and drops zero counts. The `TaskCountBadge` interface moves here.
   - `ProjectRow` calls `buildProjectTaskCountBadges(project.taskCounts)`. `tasks-tab.md` reuses the order and meta.
 - Removal dialog total (`project-navigation-panel.tsx:96-103`): add `taskCounts.paused` to the sum.
+
+## Final implementation notes (deviations from this plan)
+
+- The landed live-owner resolver `resolveWorkspaceSessionSummaries` (`src/core/workspace-session-summaries.ts`) is the single server-side merge used by `summarizeProjectTaskCounts`, `buildWorkspaceStateSnapshot`, and `saveState`, instead of calling `mergeSessionSummaries` directly. It preserves the landed behaviors: a live terminal process always wins for its task, orphaned `running` summaries (no active process) are reconciled to `interrupted`, and tracked live Cline summaries always win (they own the runtime).
+- The decision 4 real-beats-placeholder rule was added to that helper, so placeholder handling is identical across counts, snapshots, saves, and browser merges.
+- The helper's persisted-vs-terminal timestamp comparison was tightened from strict `>` to `>=` so equal-`updatedAt` ties follow decision 5's "later-listed source wins" rule (the live terminal copy wins). The strict `>` was pre-existing, but it was the one server-side spot where the unified tie rule did not hold.
+- `saveWorkspaceState` performs the disk merge (`mergeSessionsForSave`) inside the existing workspace directory lock: disk -> supplied, with the board-card retention rule from section 6.
+- Consequence of the landed reconciliation: a persisted `running` summary with no live process classifies as Paused (interrupted), so the placeholder regression test exercises the live-process case for `in_progress` and the no-process case for `paused`.
+- The navigation-panel pill tone assertion uses a non-current project, because the selected project row intentionally overrides badge tones with `bg-accent-fg/20 text-accent-fg` (decision 3).
 
 ## Tests
 

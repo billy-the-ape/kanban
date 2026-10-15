@@ -777,6 +777,7 @@ describe("createWorkspaceApi PR linking (PRLINK-5)", () => {
 				async () => ({ listSummaries: () => [old], hasActiveProcess: () => false }) as never,
 			),
 			getScopedClineTaskSessionService: vi.fn(async () => ({ listSummaries: () => [completed] }) as never),
+			getClineTaskSessionSummaries: () => [completed],
 			broadcastRuntimeWorkspaceStateUpdated: vi.fn(),
 			broadcastRuntimeProjectsUpdated: vi.fn(),
 			buildWorkspaceStateSnapshot: vi.fn(),
