@@ -1,6 +1,6 @@
 # GitHub PR tracking foundation — master plan
 
-Updated: 2026-10-06. Status: proposed; documentation only. Repository: `billy-the-ape/kanban`.
+Updated: 2026-10-07. Status: implemented — PRTRACK-0 (PR #64) and PRTRACK-1 (PR #66) are merged. Repository: `billy-the-ape/kanban`.
 
 ## Delivery order and scope
 

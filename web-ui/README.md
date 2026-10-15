@@ -5,8 +5,10 @@ This package contains the Kanban frontend served by the runtime.
 ## Stack
 
 - React + TypeScript + Vite
-- Palantir Blueprint v6 (`@blueprintjs/core`, `@blueprintjs/icons`, `@blueprintjs/select`)
-- Atlassian pragmatic drag-and-drop
+- Tailwind CSS v4 with the design tokens in `src/globals.css`
+- Radix UI primitives and Lucide icons
+- `@hello-pangea/dnd` for board and card drag-and-drop
+- tRPC client for the runtime API, xterm for the terminal panel
 - Vitest
 - Playwright
 

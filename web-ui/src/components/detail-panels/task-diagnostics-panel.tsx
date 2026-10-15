@@ -15,6 +15,11 @@ import { Tooltip } from "@/components/ui/tooltip";
 import { useTaskDiagnostics } from "@/hooks/use-task-diagnostics";
 import { openFileOnHost } from "@/runtime/runtime-config-query";
 import type { RuntimeTaskDiagnosticsActionName, RuntimeTaskDiagnosticsResponse } from "@/runtime/types";
+import {
+	formatDiagnosticsDuration,
+	formatDiagnosticsTimestamp,
+	getDiagnosticsSessionTiming,
+} from "@/utils/task-diagnostics-summary";
 
 function DiagnosticsValue({ label, value }: { label: string; value: string | null | undefined }) {
 	const text = value?.trim();
@@ -82,6 +87,28 @@ function PhaseSection({ response }: { response: RuntimeTaskDiagnosticsResponse }
 					<span className="min-w-0 text-[12px] break-words text-text-primary">{response.blockedReason}</span>
 				</div>
 			) : null}
+		</DiagnosticsSection>
+	);
+}
+
+function SessionSection({ response }: { response: RuntimeTaskDiagnosticsResponse }): React.ReactElement {
+	const summary = response.session.summary;
+	const timing = getDiagnosticsSessionTiming(summary);
+	return (
+		<DiagnosticsSection title="Latest session">
+			<DiagnosticsValue label="Agent" value={summary?.agentId} />
+			<DiagnosticsValue
+				label="State"
+				value={summary ? `${summary.state.replaceAll("_", " ")}${response.session.active ? " (live)" : ""}` : null}
+			/>
+			<DiagnosticsValue label="Session start" value={formatDiagnosticsTimestamp(summary?.startedAt)} />
+			<DiagnosticsValue label="Last activity" value={formatDiagnosticsTimestamp(timing.lastActivityAt)} />
+			<DiagnosticsValue label="Recorded span" value={formatDiagnosticsDuration(timing.recordedSpanMs)} />
+			<p className="m-0 text-[11px] leading-snug text-text-tertiary">
+				{summary
+					? "Start to last recorded output/hook activity, including waits. May reflect restored session metadata; excludes earlier sessions. Total agent runtime is not available in this summary."
+					: "No session summary is available. Recorded history may still be present in the diagnostics export."}
+			</p>
 		</DiagnosticsSection>
 	);
 }
@@ -224,6 +251,10 @@ function ContextUsageSection({ response }: { response: RuntimeTaskDiagnosticsRes
 					) : null}
 				</>
 			)}
+			<p className="m-0 text-[11px] leading-snug text-text-tertiary">
+				Context is a snapshot estimate, not cumulative token usage. Reported input/output and cache tokens are not
+				included in this summary.
+			</p>
 		</DiagnosticsSection>
 	);
 }
@@ -363,9 +394,10 @@ export function TaskDiagnosticsPanel({
 					{diagnostics ? (
 						<div className="max-h-72 overflow-y-auto border-t border-divider">
 							<PhaseSection response={diagnostics} />
+							<SessionSection response={diagnostics} />
+							<ContextUsageSection response={diagnostics} />
 							<GitSection response={diagnostics} onOpenPath={handleOpenPath} />
 							<PreservedWorkSection response={diagnostics} />
-							<ContextUsageSection response={diagnostics} />
 							<ActionsSection
 								response={diagnostics}
 								pendingAction={pendingAction}

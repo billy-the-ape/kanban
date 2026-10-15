@@ -2,7 +2,7 @@
 
 Status: implemented. Target: `billy-the-ape/kanban` `main`. Source baseline: `879a3a1`.
 
-Order: **1 of 2** in `docs/plans/sidebar-updates/`. Implement `paused-pill.md` before `tasks-tab.md`. This plan has no dependencies. `tasks-tab.md` depends on the shared module and the registry refactor introduced here. One implementation PR / one squash commit. Desktop collapse is being handled separately by the user.
+Order: **1 of 2** in `docs/plans/complete/sidebar-updates/`. Implement `paused-pill.md` before `tasks-tab.md`. This plan has no dependencies. `tasks-tab.md` depends on the shared module and the registry refactor introduced here. One implementation PR / one squash commit. Desktop collapse is being handled separately by the user.
 
 The behavior and boundaries are defined below. Symbol names are the navigation anchors; line numbers describe the source baseline and may shift. Before coding, read `AGENTS.md` and inspect these symbols on the implementation branch. Preserve changes that have landed since the baseline. If current behavior conflicts with a decision here, report that specific conflict before changing scope.
 

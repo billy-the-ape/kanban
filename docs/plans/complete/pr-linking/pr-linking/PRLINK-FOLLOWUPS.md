@@ -2,7 +2,7 @@
 
 Updated: 2026-10-13. **This revision changes plans only; implementation progress is recorded below.**
 These five documents are implementation-ready specifications, one PR each. Preserve their IDs.
-The landed v1 plans now live in [complete/pr-linking](../complete/pr-linking/PR_LINKING_PLAN.md);
+The landed v1 plans now live in [complete/pr-linking](../PR_LINKING_PLAN.md);
 the old PL numbering in that historical master plan does not create another card series.
 
 ## Execution order
@@ -15,15 +15,8 @@ the old PL numbering in that historical master plan does not create another card
 | [PRLINK-9](PRLINK-9.md) | Pure provider boundaries and identity-based explicit refresh | v1 + 6 + existing tracking foundation |
 | [PRLINK-10](PRLINK-10.md) | Complete existing PRs view with linked-PR management and tracking settings | 6 + 7 + 9 |
 
-PRLINK-7 is implemented (mobile primary anchor and shared manager); its plan document records
-the final state.
-
-PRLINK-10 is partially implemented on main: the PRs segment and tracking-panel relocation landed
-manually on 2026-10-13. Keep that placement. The count, linked-PR list/actions, remembered diff mode
-and request/visibility guards remain implementation work; the tab shell does not complete the task.
-Both TODOs in card-detail-view and task-pr-tracking-panel belong to PRLINK-10: count every stored
-link, and interpret "MAIN" selection as **Primary for display**, separate from **Automation PR**.
-Its revised task document is the authority for this remaining work.
+All five follow-ups are implemented and merged on main: PRLINK-6 (PR #72), PRLINK-7
+(PR #77), PRLINK-8 (PR #79), PRLINK-9 (PR #81) and PRLINK-10 (PR #85).
 
 Recommended sequence: 6 → 7 → 8 → 9 → 10. Each task includes decisions, integration points,
 error/concurrency behavior and acceptance. Do not add a preliminary planning PR or expand into
@@ -59,9 +52,9 @@ the earlier "do not move tracking settings" instruction is superseded by PRLINK-
 Reinspect the current implementation before each task; historical line numbers and status labels
 in older master plans are not proof of current behavior.
 
-Read the [tracking foundation](../github-pr-tracking/github-pr-tracking-master-plan.md),
-[merge tracking](../pr-merge-tracking/pr-merge-tracking-master-plan.md) and
-[comment handling](../pr-comment-handling/pr-comment-handling-master-plan.md) contracts.
+Read the [tracking foundation](../../github-pr-tracking/github-pr-tracking-master-plan.md),
+[merge tracking](../../pr-merge-tracking/pr-merge-tracking-master-plan.md) and
+[comment handling](../../pr-comment-handling/pr-comment-handling-master-plan.md) contracts.
 They own settings, Automation PR validation, auth scopes, subscriptions, polling, repair ownership,
 operation gates, terminal/reopen markers and completion. Reuse them; these follow-ups add no second
 automation selection, poller or task lifecycle. A linked reference PR is not a completion signal.

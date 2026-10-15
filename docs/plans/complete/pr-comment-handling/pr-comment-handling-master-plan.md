@@ -1,6 +1,6 @@
 # PR comment handling — master plan
 
-Updated: 2026-10-13. Status: COMMENT-0 implemented, plus the second-, third-, and fourth-round review fixes (see "Implementation status" below). Repository: `billy-the-ape/kanban`.
+Updated: 2026-10-13. Status: COMMENT-0 implemented (PR #70), plus the second- through fifth-round review fixes (PR #74, #79, #84 and commit d1133c6); the remaining design below is proposed. Repository: `billy-the-ape/kanban`.
 
 ## Goal and dependencies
 

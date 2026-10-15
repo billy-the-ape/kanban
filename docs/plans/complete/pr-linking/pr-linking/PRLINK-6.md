@@ -1,7 +1,7 @@
 # PRLINK-6 — Observation timestamps and a primary display PR
 
 **Status: IMPLEMENTED in this worktree.**
-Master plan: [v1](../complete/pr-linking/PR_LINKING_PLAN.md). Shared context: [follow-ups](PRLINK-FOLLOWUPS.md).
+Master plan: [v1](../PR_LINKING_PLAN.md). Shared context: [follow-ups](PRLINK-FOLLOWUPS.md).
 Deliver as one implementation PR. No higher-level product decisions remain open.
 
 ## Final-state implementation notes

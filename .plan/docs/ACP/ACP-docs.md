@@ -119,7 +119,7 @@ The protocol provides built-in mechanisms for adding custom functionality while 
 
 > How all Agent Client Protocol connections begin
 
-The Initialization phase allows [Clients](./overview#client) and [Agents](./overview#agent) to negotiate protocol versions, capabilities, and authentication methods.
+The Initialization phase allows [Clients](https://agentclientprotocol.com/protocol/overview#client) and [Agents](https://agentclientprotocol.com/protocol/overview#agent) to negotiate protocol versions, capabilities, and authentication methods.
 
 ```mermaid
 sequenceDiagram
@@ -218,7 +218,7 @@ Capabilities are high-level and are not attached to a specific base protocol con
 
 Capabilities may specify the availability of protocol methods, notifications, or a subset of their parameters. They may also signal behaviors of the Agent or Client implementation.
 
-Implementations can also [advertise custom capabilities](./extensibility#advertising-custom-capabilities) using the `_meta` field to indicate support for protocol extensions.
+Implementations can also [advertise custom capabilities](https://agentclientprotocol.com/protocol/extensibility#advertising-custom-capabilities) using the `_meta` field to indicate support for protocol extensions.
 
 ### Client Capabilities
 
@@ -240,15 +240,15 @@ The Client SHOULD specify whether it supports the following capabilities:
 
 The Agent SHOULD specify whether it supports the following capabilities:
 
-  The [`session/load`](./session-setup#loading-sessions) method is available.
-  Object indicating the different types of [content](./content) that may be
+  The [`session/load`](https://agentclientprotocol.com/protocol/session-setup#loading-sessions) method is available.
+  Object indicating the different types of [content](https://agentclientprotocol.com/protocol/content) that may be
   included in `session/prompt` requests.
 
 #### Prompt capabilities
 
 As a baseline, all Agents MUST support `ContentBlock::Text` and `ContentBlock::ResourceLink` in `session/prompt` requests.
 
-Optionally, they MAY support richer types of [content](./content) by specifying the following capabilities:
+Optionally, they MAY support richer types of [content](https://agentclientprotocol.com/protocol/content) by specifying the following capabilities:
 
   The prompt may include `ContentBlock::Image`
   The prompt may include `ContentBlock::Audio`
@@ -283,15 +283,15 @@ Both Clients and Agents SHOULD provide information about their implementation in
 
 ---
 
-Once the connection is initialized, you're ready to [create a session](./session-setup) and begin the conversation with the Agent.
+Once the connection is initialized, you're ready to [create a session](https://agentclientprotocol.com/protocol/session-setup) and begin the conversation with the Agent.
 
 # Session Setup
 
 > Creating and loading sessions
 
-Sessions represent a specific conversation or thread between the [Client](./overview#client) and [Agent](./overview#agent). Each session maintains its own context, conversation history, and state, allowing multiple independent interactions with the same Agent.
+Sessions represent a specific conversation or thread between the [Client](https://agentclientprotocol.com/protocol/overview#client) and [Agent](https://agentclientprotocol.com/protocol/overview#agent). Each session maintains its own context, conversation history, and state, allowing multiple independent interactions with the same Agent.
 
-Before creating a session, Clients MUST first complete the [initialization](./initialization) phase to establish protocol compatibility and capabilities.
+Before creating a session, Clients MUST first complete the [initialization](https://agentclientprotocol.com/protocol/initialization) phase to establish protocol compatibility and capabilities.
 
 ```mermaid
 sequenceDiagram
@@ -594,9 +594,9 @@ Clients MAY use this ability to provide tools directly to the underlying languag
 
 > Understanding the core conversation flow
 
-A prompt turn represents a complete interaction cycle between the [Client](./overview#client) and [Agent](./overview#agent), starting with a user message and continuing until the Agent completes its response. This may involve multiple exchanges with the language model and tool invocations.
+A prompt turn represents a complete interaction cycle between the [Client](https://agentclientprotocol.com/protocol/overview#client) and [Agent](https://agentclientprotocol.com/protocol/overview#agent), starting with a user message and continuing until the Agent completes its response. This may involve multiple exchanges with the language model and tool invocations.
 
-Before sending prompts, Clients MUST first complete the [initialization](./initialization) phase and [session setup](./session-setup).
+Before sending prompts, Clients MUST first complete the [initialization](https://agentclientprotocol.com/protocol/initialization) phase and [session setup](https://agentclientprotocol.com/protocol/session-setup).
 
 ## The Prompt Turn Lifecycle
 
@@ -670,9 +670,9 @@ The turn begins when the Client sends a `session/prompt`:
   }
 }
 ```
-  The [ID](./session-setup#session-id) of the session to send this message to.
+  The [ID](https://agentclientprotocol.com/protocol/session-setup#session-id) of the session to send this message to.
   The contents of the user message, e.g. text, images, files, etc.
-  Clients MUST restrict types of content according to the [Prompt Capabilities](./initialization#prompt-capabilities) established during [initialization](./initialization).
+  Clients MUST restrict types of content according to the [Prompt Capabilities](https://agentclientprotocol.com/protocol/initialization#prompt-capabilities) established during [initialization](https://agentclientprotocol.com/protocol/initialization).
     Learn more about Content
   
 ### 2. Agent Processing
@@ -880,9 +880,9 @@ Content blocks represent displayable information that flows through the Agent Cl
 
 Content blocks appear in:
 
-* User prompts sent via [`session/prompt`](./prompt-turn#1-user-message)
-* Language model output streamed through [`session/update`](./prompt-turn#3-agent-reports-output) notifications
-* Progress updates and results from [tool calls](./tool-calls)
+* User prompts sent via [`session/prompt`](https://agentclientprotocol.com/protocol/prompt-turn#1-user-message)
+* Language model output streamed through [`session/update`](https://agentclientprotocol.com/protocol/prompt-turn#3-agent-reports-output) notifications
+* Progress updates and results from [tool calls](https://agentclientprotocol.com/protocol/tool-calls)
 
 ## Content Types
 
@@ -918,7 +918,7 @@ Images can be included for visual context or analysis.
 }
 ```
  Requires the `image` [prompt
-capability](./initialization#prompt-capabilities) when included in prompts.
+capability](https://agentclientprotocol.com/protocol/initialization#prompt-capabilities) when included in prompts.
 
   Base64-encoded image data
   The MIME type of the image (e.g., "image/png", "image/jpeg")
@@ -938,7 +938,7 @@ Audio data for transcription or analysis.
 }
 ```
  Requires the `audio` [prompt
-capability](./initialization#prompt-capabilities) when included in prompts.
+capability](https://agentclientprotocol.com/protocol/initialization#prompt-capabilities) when included in prompts.
 
   Base64-encoded audio data
   The MIME type of the audio (e.g., "audio/wav", "audio/mp3")
@@ -964,7 +964,7 @@ This is the preferred way to include context in prompts, such as when using @-me
 By embedding the content directly in the request, Clients can include context from sources that the Agent may not have direct access to.
 
  Requires the `embeddedContext` [prompt
-capability](./initialization#prompt-capabilities) when included in prompts.
+capability](https://agentclientprotocol.com/protocol/initialization#prompt-capabilities) when included in prompts.
 
   The embedded resource contents, which can be either:
       The URI identifying the resource
@@ -1002,11 +1002,11 @@ References to resources that the Agent can access.
 
 > How Agents report tool call execution
 
-Tool calls represent actions that language models request Agents to perform during a [prompt turn](./prompt-turn). When an LLM determines it needs to interact with external systems-like reading files, running code, or fetching data-it generates tool calls that the Agent executes on its behalf.
+Tool calls represent actions that language models request Agents to perform during a [prompt turn](https://agentclientprotocol.com/protocol/prompt-turn). When an LLM determines it needs to interact with external systems-like reading files, running code, or fetching data-it generates tool calls that the Agent executes on its behalf.
 
-Agents report tool calls through [`session/update`](./prompt-turn#3-agent-reports-output) notifications, allowing Clients to display real-time progress and results to users.
+Agents report tool calls through [`session/update`](https://agentclientprotocol.com/protocol/prompt-turn#3-agent-reports-output) notifications, allowing Clients to display real-time progress and results to users.
 
-While Agents handle the actual execution, they may leverage Client capabilities like [permission requests](#requesting-permission) or [file system access](./file-system) to provide a richer, more integrated experience.
+While Agents handle the actual execution, they may leverage Client capabilities like [permission requests](#requesting-permission) or [file system access](https://agentclientprotocol.com/protocol/file-system) to provide a richer, more integrated experience.
 
 ## Creating
 
@@ -1124,7 +1124,7 @@ The Client responds with the user's decision:
 ```
 Clients MAY automatically allow or reject permission requests according to the user settings.
 
-If the current prompt turn gets [cancelled](./prompt-turn#cancellation), the Client MUST respond with the `"cancelled"` outcome:
+If the current prompt turn gets [cancelled](https://agentclientprotocol.com/protocol/prompt-turn#cancellation), the Client MUST respond with the `"cancelled"` outcome:
 
 ```json
 {
@@ -1138,7 +1138,7 @@ If the current prompt turn gets [cancelled](./prompt-turn#cancellation), the Cli
 }
 ```
   The user's decision, either: - `cancelled` - The [prompt turn was
-  cancelled](./prompt-turn#cancellation) - `selected` with an `optionId` - The
+  cancelled](https://agentclientprotocol.com/protocol/prompt-turn#cancellation) - `selected` with an `optionId` - The
   ID of the selected permission option
 
 ### Permission Options
@@ -1170,7 +1170,7 @@ Tool calls can produce different types of content:
 
 ### Regular Content
 
-Standard [content blocks](./content) like text, images, or resources:
+Standard [content blocks](https://agentclientprotocol.com/protocol/content) like text, images, or resources:
 
 ```json
 {
@@ -1234,7 +1234,7 @@ The filesystem methods allow Agents to read and write text files within the Clie
 
 ## Checking Support
 
-Before attempting to use filesystem methods, Agents MUST verify that the Client supports these capabilities by checking the [Client Capabilities](./initialization#client-capabilities) field in the `initialize` response:
+Before attempting to use filesystem methods, Agents MUST verify that the Client supports these capabilities by checking the [Client Capabilities](https://agentclientprotocol.com/protocol/initialization#client-capabilities) field in the `initialize` response:
 
 ```json
 {
@@ -1270,7 +1270,7 @@ The `fs/read_text_file` method allows Agents to read text file contents from the
   }
 }
 ```
-  The [Session ID](./session-setup#session-id) for this request
+  The [Session ID](https://agentclientprotocol.com/protocol/session-setup#session-id) for this request
   Absolute path to the file to read
   Optional line number to start reading from (1-based)
   Optional maximum number of lines to read
@@ -1302,7 +1302,7 @@ The `fs/write_text_file` method allows Agents to write or update text files in t
   }
 }
 ```
-  The [Session ID](./session-setup#session-id) for this request
+  The [Session ID](https://agentclientprotocol.com/protocol/session-setup#session-id) for this request
   Absolute path to the file to write.
   The Client MUST create the file if it doesn't exist.
   The text content to write to the file
@@ -1324,7 +1324,7 @@ The terminal methods allow Agents to execute shell commands within the Client's 
 
 ## Checking Support
 
-Before attempting to use terminal methods, Agents MUST verify that the Client supports this capability by checking the [Client Capabilities](./initialization#client-capabilities) field in the `initialize` response:
+Before attempting to use terminal methods, Agents MUST verify that the Client supports this capability by checking the [Client Capabilities](https://agentclientprotocol.com/protocol/initialization#client-capabilities) field in the `initialize` response:
 
 ```json
 {
@@ -1364,7 +1364,7 @@ The `terminal/create` method starts a command in a new terminal:
   }
 }
 ```
-  The [Session ID](./session-setup#session-id) for this request
+  The [Session ID](https://agentclientprotocol.com/protocol/session-setup#session-id) for this request
   The command to execute
   Array of command arguments
   Environment variables for the command.
@@ -1400,7 +1400,7 @@ After creating the terminal, the Agent can use the `terminal/wait_for_exit` meth
 
 ## Embedding in Tool Calls
 
-Terminals can be embedded directly in [tool calls](./tool-calls) to provide real-time output to users:
+Terminals can be embedded directly in [tool calls](https://agentclientprotocol.com/protocol/tool-calls) to provide real-time output to users:
 
 ```json
 {
@@ -1553,7 +1553,7 @@ If the terminal was added to a tool call, the client SHOULD continue to display 
 
 Plans are execution strategies for complex tasks that require multiple steps.
 
-Agents may share plans with Clients through [`session/update`](./prompt-turn#3-agent-reports-output) notifications, providing real-time visibility into their thinking and progress.
+Agents may share plans with Clients through [`session/update`](https://agentclientprotocol.com/protocol/prompt-turn#3-agent-reports-output) notifications, providing real-time visibility into their thinking and progress.
 
 ## Creating Plans
 
@@ -1619,7 +1619,7 @@ Plans can evolve during execution. The Agent MAY add, remove, or modify plan ent
 
 > Switch between different agent operating modes
 
-  You can now use [Session Config Options](./session-config-options). Dedicated
+  You can now use [Session Config Options](https://agentclientprotocol.com/protocol/session-config-options). Dedicated
   session mode methods will be removed in a future version of the protocol.
   Until then, you can offer both to clients for backwards compatibility.
 
@@ -1627,7 +1627,7 @@ Agents can provide a set of modes they can operate in. Modes often affect the sy
 
 ## Initial state
 
-During [Session Setup](./session-setup) the Agent MAY return a list of modes it can operate in and the currently active mode:
+During [Session Setup](https://agentclientprotocol.com/protocol/session-setup) the Agent MAY return a list of modes it can operate in and the currently active mode:
 
 ```json
 {
@@ -1677,7 +1677,7 @@ The current mode can be changed at any point during a session, whether the Agent
 
 ### From the Client
 
-Typically, Clients display the available modes to the user and allow them to change the current one, which they can do by calling the [`session/set_mode`](./schema#session%2Fset-mode) method.
+Typically, Clients display the available modes to the user and allow them to change the current one, which they can do by calling the [`session/set_mode`](https://agentclientprotocol.com/protocol/schema#session%2Fset-mode) method.
 
 ```json
 {
@@ -1768,12 +1768,12 @@ Agents can provide an arbitrary list of configuration options for a session, all
 
   Session Config Options are the preferred way to expose session-level
   configuration. If an Agent provides `configOptions`, Clients SHOULD use
-  them instead of the [`modes`](./session-modes) field. Modes will be removed in
+  them instead of the [`modes`](https://agentclientprotocol.com/protocol/session-modes) field. Modes will be removed in
   a future version of the protocol.
 
 ## Initial State
 
-During [Session Setup](./session-setup) the Agent MAY return a list of configuration options and their current values:
+During [Session Setup](https://agentclientprotocol.com/protocol/session-setup) the Agent MAY return a list of configuration options and their current values:
 
 ```json
 {
@@ -1979,7 +1979,7 @@ This notification also contains the complete configuration state. Common reasons
 
 ## Relationship to Session Modes
 
-Session Config Options supersede the older [Session Modes](./session-modes) API. However, during the transition period, Agents that provide mode-like configuration SHOULD send both:
+Session Config Options supersede the older [Session Modes](https://agentclientprotocol.com/protocol/session-modes) API. However, during the transition period, Agents that provide mode-like configuration SHOULD send both:
 
 * `configOptions` with a `category: "mode"` option for Clients that support config options
 * `modes` for Clients that only support the older API
@@ -1996,7 +1996,7 @@ If an Agent provides both `configOptions` and `modes` in the session response:
 
 > Advertise available slash commands to clients
 
-Agents can advertise a set of slash commands that users can invoke. These commands provide quick access to specific agent capabilities and workflows. Commands are run as part of regular [prompt](./prompt-turn) requests where the Client includes the command text in the prompt.
+Agents can advertise a set of slash commands that users can invoke. These commands provide quick access to specific agent capabilities and workflows. Commands are run as part of regular [prompt](https://agentclientprotocol.com/protocol/prompt-turn) requests where the Client includes the command text in the prompt.
 
 ## Advertising commands
 

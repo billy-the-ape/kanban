@@ -2049,7 +2049,19 @@ export const runtimeConfigResponseSchema = z.object({
 	 * MERGE-1 register theirs). Optional so uncast legacy mocks keep working;
 	 * absent reads as "none installed" (legacy behavior).
 	 */
-	installedPrConsumers: z.array(runtimePrInstalledConsumerSchema).optional(),
+	installedPrConsumers: z
+		.array(runtimePrInstalledConsumerSchema)
+		.optional()
+		.default([
+			{
+				kind: "comments",
+				requiredReadSources: ["reviews", "metadata", "conversationComments", "inlineComments", "threads"],
+			},
+			{
+				kind: "mergeCompletion",
+				requiredReadSources: ["metadata"],
+			},
+		]),
 	effectiveCommand: z.string().nullable(),
 	globalConfigPath: z.string(),
 	projectConfigPath: z.string().nullable(),

@@ -1,7 +1,7 @@
 # PRLINK-9 — Provider boundaries and explicit linked-PR refresh
 
 **Status: IMPLEMENTED (this PR). Depends on v1 and PRLINK-6.**
-Master plan: [v1](../complete/pr-linking/PR_LINKING_PLAN.md). Shared context: [follow-ups](PRLINK-FOLLOWUPS.md).
+Master plan: [v1](../PR_LINKING_PLAN.md). Shared context: [follow-ups](PRLINK-FOLLOWUPS.md).
 Deliver as one provider/read-path PR. This replaces the draft's unbounded multi-provider rollout.
 
 ## Fixed scope
