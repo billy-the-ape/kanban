@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { RuntimeBoardCard, RuntimeBoardColumnId } from "../../../src/core/api-contract";
+import type { RuntimeAgentId, RuntimeBoardCard, RuntimeBoardColumnId } from "../../../src/core/api-contract";
 import { InMemoryPrRecordStore } from "../../../src/pr-tracking/in-memory-pr-record-store";
 import {
 	PR_CONSUMER_READ_SOURCES,
@@ -172,6 +172,54 @@ describe("pr-track1 task-derived subscription demand", () => {
 		const boards = [makeBoard("ws-1", [{ columnId: "review", card }])];
 		expect(computeTaskSubscriptionDemand(boards, { comments: false, mergeCompletion: false })).toEqual([]);
 		expect(computeTaskSubscriptionDemand(boards, { comments: true, mergeCompletion: false })).toEqual([]);
+	});
+
+	it("scopes comment demand to natively servable (Cline) tasks", () => {
+		const unsetCard = makeCard({ id: "t-unset", autoAddressComments: true, pullRequests: [LINK] });
+		const codexCard = makeCard({ id: "t-codex", autoAddressComments: true, agentId: "codex", pullRequests: [LINK] });
+		const boards = [
+			makeBoard("ws-codex", [
+				{ columnId: "in_progress", card: unsetCard },
+				{ columnId: "in_progress", card: codexCard },
+			]),
+			makeBoard("ws-cline", [
+				{
+					columnId: "in_progress",
+					card: makeCard({ id: "t-cline", autoAddressComments: true, pullRequests: [LINK] }),
+				},
+			]),
+		];
+		const commentsAgents = new Map<string, RuntimeAgentId | null>([
+			["ws-codex", "claude"],
+			["ws-cline", "cline"],
+		]);
+
+		// Only the native-Cline card yields comment demand: the unset card
+		// falls back to its workspace's non-Cline selected agent, and the
+		// explicit codex card is never servable.
+		const demands = computeTaskSubscriptionDemand(boards, bothInstalled, commentsAgents);
+		expect(demands).toHaveLength(1);
+		expect(demands[0]).toMatchObject({
+			workspaceId: "ws-cline",
+			taskId: "t-cline",
+			consumers: { comments: true, mergeCompletion: false },
+		});
+
+		// An explicit per-card Cline counts even in a non-Cline workspace.
+		const explicitCline = makeCard({
+			id: "t-explicit",
+			autoAddressComments: true,
+			agentId: "cline",
+			pullRequests: [LINK],
+		});
+		const explicitBoards = [makeBoard("ws-codex", [{ columnId: "in_progress", card: explicitCline }])];
+		expect(computeTaskSubscriptionDemand(explicitBoards, bothInstalled, commentsAgents)).toHaveLength(1);
+	});
+
+	it("keeps the checkbox-alone rule when no agent info is available", () => {
+		const card = makeCard({ id: "t-unset", autoAddressComments: true, pullRequests: [LINK] });
+		const boards = [makeBoard("ws-1", [{ columnId: "in_progress", card }])];
+		expect(computeTaskSubscriptionDemand(boards, bothInstalled)).toHaveLength(1);
 	});
 
 	it("reconciles additions, updates, and prunes when tasks become ineligible", async () => {

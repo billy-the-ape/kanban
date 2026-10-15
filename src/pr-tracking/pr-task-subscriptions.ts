@@ -5,7 +5,7 @@
 // registry (both consumers are always installed in production). Reconciling
 // on every real task change and at startup removes demand when tasks become
 // ineligible; consumers are not sticky in-memory objects.
-import type { RuntimeBoardColumnId, RuntimePrConsumerKind } from "../core/api-contract";
+import type { RuntimeAgentId, RuntimeBoardColumnId, RuntimePrConsumerKind } from "../core/api-contract";
 import type { PrInstalledConsumers } from "./pr-consumer-registry";
 import { PR_OWNER_ACTIVE_COLUMNS, type PrBoardSnapshot, resolveCardAutomationPrKey } from "./pr-owner-selection";
 import type { PrTrackingSubscriptionDescriptor, SubscriptionAddResult } from "./pr-tracking-coordinator";
@@ -21,6 +21,12 @@ export interface PrTaskSubscriptionSource {
 	 */
 	listBoard?: (workspaceId: string) => Promise<PrBoardSnapshot | null>;
 	installedConsumers(): PrInstalledConsumers;
+	/**
+	 * Optional: the workspace's selected agent id, used to resolve an unset
+	 * card agentId for comment demand (comment follow-up only serves
+	 * native-Cline tasks, matching the comment automation service).
+	 */
+	getSelectedAgentId?: (workspaceId: string) => Promise<RuntimeAgentId | null>;
 }
 
 /** The coordinator surface needed to reconcile task-derived subscriptions. */
@@ -55,11 +61,14 @@ function sameConsumers(a: Record<RuntimePrConsumerKind, boolean>, b: Record<Runt
 /**
  * Compute the desired subscription set: cards in in_progress/review whose
  * automation PR is resolvable (explicit selection or sole link) and whose
- * checkboxes are enabled against INSTALLED consumers.
+ * checkboxes are enabled against INSTALLED consumers. The comments half
+ * additionally requires the task to be natively servable (a Cline card, or
+ * an unset card agentId in a Cline-selected workspace).
  */
 export function computeTaskSubscriptionDemand(
 	boards: PrBoardSnapshot[],
 	installed: PrInstalledConsumers,
+	commentsAgentByWorkspace?: ReadonlyMap<string, RuntimeAgentId | null>,
 ): PrTaskSubscriptionDemand[] {
 	const demands: PrTaskSubscriptionDemand[] = [];
 	for (const { workspaceId, board } of boards) {
@@ -72,8 +81,17 @@ export function computeTaskSubscriptionDemand(
 				if (!resolved.key) {
 					continue;
 				}
+				// Comment follow-up only serves native-Cline tasks. When no
+				// agent info is known at all (no per-card agentId and no
+				// workspace resolver), the checkbox alone decides (legacy
+				// harnesses); otherwise the effective agent must be cline.
+				let commentsServable = true;
+				if (commentsAgentByWorkspace !== undefined || card.agentId !== undefined) {
+					const commentsAgentId = card.agentId ?? commentsAgentByWorkspace?.get(workspaceId) ?? null;
+					commentsServable = commentsAgentId === "cline";
+				}
 				const consumers: Record<RuntimePrConsumerKind, boolean> = {
-					comments: card.autoAddressComments === true && installed.comments,
+					comments: card.autoAddressComments === true && installed.comments && commentsServable,
 					mergeCompletion: card.autoFinishOnMerge === true && installed.mergeCompletion,
 				};
 				if (!consumers.comments && !consumers.mergeCompletion) {
@@ -110,6 +128,24 @@ export interface PrTaskReconcileOptions {
 	onlyPr?: string;
 }
 
+async function resolveCommentsAgents(
+	source: PrTaskSubscriptionSource,
+	workspaceIds: Iterable<string>,
+): Promise<ReadonlyMap<string, RuntimeAgentId | null> | null> {
+	if (!source.getSelectedAgentId) {
+		return null;
+	}
+	const resolved = new Map<string, RuntimeAgentId | null>();
+	for (const workspaceId of new Set(workspaceIds)) {
+		try {
+			resolved.set(workspaceId, await source.getSelectedAgentId(workspaceId));
+		} catch {
+			resolved.set(workspaceId, null);
+		}
+	}
+	return resolved;
+}
+
 export async function reconcileTaskSubscriptions(
 	controller: PrSubscriptionController,
 	source: PrTaskSubscriptionSource,
@@ -121,10 +157,16 @@ export async function reconcileTaskSubscriptions(
 		const removed: string[] = [];
 		const updated: string[] = [];
 		const subs = controller.listSubscriptions().filter((sub) => sub.canonicalPrKey === options.onlyPr);
+		const commentsAgents = await resolveCommentsAgents(
+			source,
+			subs.map((sub) => sub.workspaceId),
+		);
 		for (const sub of subs) {
 			const snapshot = source.listBoard ? await source.listBoard(sub.workspaceId) : null;
 			const demand = snapshot
-				? computeTaskSubscriptionDemand([snapshot], installed).find((d) => d.taskId === sub.taskId)
+				? computeTaskSubscriptionDemand([snapshot], installed, commentsAgents ?? undefined).find(
+						(d) => d.taskId === sub.taskId,
+					)
 				: undefined;
 			if (!demand || demand.canonicalPrKey !== sub.canonicalPrKey) {
 				await controller.removeSubscription(sub.workspaceId, sub.taskId);
@@ -148,7 +190,11 @@ export async function reconcileTaskSubscriptions(
 		demands = [];
 	} else {
 		const boards = await source.listBoards();
-		demands = computeTaskSubscriptionDemand(boards, installed);
+		const commentsAgents = await resolveCommentsAgents(
+			source,
+			boards.map((snapshot) => snapshot.workspaceId),
+		);
+		demands = computeTaskSubscriptionDemand(boards, installed, commentsAgents ?? undefined);
 	}
 	const desiredByTask = new Map(demands.map((d) => [subscriptionKey(d.workspaceId, d.taskId), d]));
 	const current = controller.listSubscriptions();

@@ -430,13 +430,6 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		const card = found.card;
 		const settingsRevision = card.settingsRevision ?? 0;
 		const resolved = resolveCardAutomationPrKey(card);
-		// Both PR tracking consumers (comment follow-up and merge completion)
-		// are always installed, so the shared lifecycle gate keys off the
-		// task's own PR automation settings.
-		const installed: PrInstalledConsumers = { comments: true, mergeCompletion: true };
-		const gate = evaluatePrLifecycleGate({ card, installed });
-		const blockers: Array<{ kind: RuntimeTaskTrackingStateResponse["blockers"][number]["kind"]; message: string }> =
-			[];
 		// Per-task agent support: comment follow-up is native-Cline only;
 		// merge completion is provider-independent. An UNSET card agentId
 		// means "use the workspace's selected agent", not Cline — resolve
@@ -454,6 +447,14 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			effectiveAgentId = "cline";
 		}
 		const nativeClineTask = effectiveAgentId === "cline";
+		// Both PR tracking consumers are always installed, so the shared
+		// lifecycle gate keys off the task's own PR automation settings —
+		// except the comments half, which only owns tasks the comment
+		// automation can actually serve (native Cline).
+		const installed: PrInstalledConsumers = { comments: nativeClineTask, mergeCompletion: true };
+		const gate = evaluatePrLifecycleGate({ card, installed });
+		const blockers: Array<{ kind: RuntimeTaskTrackingStateResponse["blockers"][number]["kind"]; message: string }> =
+			[];
 		const commentsSupportedForTask = nativeClineTask;
 		const coordinatorState = coordinator ? coordinator.getState() : null;
 		if (coordinatorState?.authBlocker) {

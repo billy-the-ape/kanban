@@ -630,6 +630,7 @@ export default function App(): ReactElement {
 		runAutoReviewGitAction,
 		deterministicDeliveryEnabled: runtimeProjectConfig?.gitDeliveryPolicy?.enabled === true,
 		backendTaskDispatchEnabled: runtimeProjectConfig?.taskDispatchPolicy?.enabled === true,
+		selectedAgentId: runtimeProjectConfig?.selectedAgentId ?? null,
 	});
 	const cleanupBlockedReasonByTaskId = useBlockedTaskCleanups(currentProjectId, board);
 

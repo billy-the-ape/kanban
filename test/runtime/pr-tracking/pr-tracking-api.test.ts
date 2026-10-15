@@ -189,6 +189,39 @@ describe("pr-tracking api: tracking-state diagnostics", () => {
 		expect(state.commentsSupportedForTask).toBe(true);
 	});
 
+	it("does not gate legacy completion for a non-Cline task even with the comments checkbox on", async () => {
+		// The comments half of the lifecycle gate only owns native-Cline
+		// tasks: a codex task with auto-finish-off must stay completable.
+		const board = makeBoard(makeCard({ autoAddressComments: true, autoFinishOnMerge: false, agentId: "codex" }));
+		mockWorkspaceState(board);
+		const harness = createHarness(board);
+
+		const state = await harness.api.getTaskTrackingState(SCOPE, { taskId: OPERATOR_TASK_ID });
+		expect(state.legacyCompletionGated).toBe(false);
+		expect(state.mergeFinishesInReview).toBe(false);
+	});
+
+	it("still gates legacy completion for a non-Cline task when auto-finish-on-merge is on", async () => {
+		// The merge consumer is provider-independent.
+		const board = makeBoard(makeCard({ autoAddressComments: true, autoFinishOnMerge: true, agentId: "codex" }));
+		mockWorkspaceState(board);
+		const harness = createHarness(board);
+
+		const state = await harness.api.getTaskTrackingState(SCOPE, { taskId: OPERATOR_TASK_ID });
+		expect(state.legacyCompletionGated).toBe(true);
+		expect(state.mergeFinishesInReview).toBe(true);
+	});
+
+	it("lets the comments half gate legacy completion for a native Cline task", async () => {
+		const board = makeBoard(makeCard({ autoAddressComments: true, autoFinishOnMerge: false }));
+		mockWorkspaceState(board);
+		const harness = createHarness(board, { effectiveAgentId: "cline" });
+
+		const state = await harness.api.getTaskTrackingState(SCOPE, { taskId: OPERATOR_TASK_ID });
+		expect(state.legacyCompletionGated).toBe(true);
+		expect(state.mergeFinishesInReview).toBe(false);
+	});
+
 	it("reports the repair owner as active while it is still on a board", async () => {
 		const board = makeBoard(makeCard({ autoAddressComments: true }));
 		mockWorkspaceState(board);

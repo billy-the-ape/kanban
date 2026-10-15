@@ -5,7 +5,9 @@ Part of the **GitHub PR tracking foundation** feature. The master plan lives in
 self-contained execution brief for the second implementation PR (slice **FOUNDATION-1**). It
 represents a single PR. See the master plan's "Subsequent change" note: the installed-consumer
 configuration was removed, both consumers are always installed and available, and the new-task
-automation checkboxes default to true.
+automation checkboxes default to true. The comments half of the lifecycle gate and the
+coordinator's comment subscription demand only apply to native-Cline tasks; the merge half
+is provider-independent.
 
 | Field | Value |
 | --- | --- |

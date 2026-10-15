@@ -2,7 +2,7 @@
 // The server (getTaskTrackingState) remains the authoritative source; these
 // helpers only decide the lifecycle gate and simple local states.
 
-import type { RuntimeTaskPullRequest } from "@/runtime/types";
+import type { RuntimeAgentId, RuntimeTaskPullRequest } from "@/runtime/types";
 import type { BoardCard, BoardData } from "@/types";
 
 /**
@@ -36,21 +36,31 @@ export function cardHasResolvableAutomationPr(card: BoardCard): boolean {
  * workflow: legacy automatic completion (browser auto-actions, CLI,
  * deterministic delivery) must not move the card to Done. Both consumers
  * (comment follow-up and merge completion) are always installed, so the
- * gate keys off the card's own automation checkboxes.
+ * gate keys off the card's own automation checkboxes — except the comments
+ * half, which only owns tasks the comment automation can serve (native
+ * Cline; an unset card agentId falls back to the workspace's selected
+ * agent).
  */
-export function isPrLifecycleGated(card: BoardCard): boolean {
+export function isPrLifecycleGated(card: BoardCard, workspaceAgentId: RuntimeAgentId | null): boolean {
 	if (!cardHasResolvableAutomationPr(card)) {
 		return false;
 	}
-	return card.autoAddressComments === true || card.autoFinishOnMerge === true;
+	if (card.autoFinishOnMerge === true) {
+		return true;
+	}
+	const effectiveAgentId = card.agentId ?? workspaceAgentId;
+	return card.autoAddressComments === true && effectiveAgentId === "cline";
 }
 
 /** The task ids whose legacy completion is gated by the installed PR consumers. */
-export function computePrLifecycleGatedTaskIds(board: BoardData): ReadonlySet<string> {
+export function computePrLifecycleGatedTaskIds(
+	board: BoardData,
+	workspaceAgentId: RuntimeAgentId | null,
+): ReadonlySet<string> {
 	const ids = new Set<string>();
 	for (const column of board.columns) {
 		for (const card of column.cards) {
-			if (isPrLifecycleGated(card)) {
+			if (isPrLifecycleGated(card, workspaceAgentId)) {
 				ids.add(card.id);
 			}
 		}

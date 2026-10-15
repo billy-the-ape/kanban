@@ -11,6 +11,7 @@ import type { UseTaskSessionsResult } from "@/hooks/use-task-sessions";
 import { fetchTaskDependentsUnlock, requestTaskWorkspaceMaintenance } from "@/runtime/task-delivery";
 import { returnQueuedTaskToBacklog } from "@/runtime/task-queue";
 import type {
+	RuntimeAgentId,
 	RuntimeTaskDependentsUnlock,
 	RuntimeTaskInitialStartStage,
 	RuntimeTaskSessionSummary,
@@ -95,6 +96,11 @@ interface UseBoardInteractionsInput {
 	deterministicDeliveryEnabled?: boolean;
 	/** B-9.5: backend task dispatch is enabled, so completed tasks queue their dependents for the backend queue. */
 	backendTaskDispatchEnabled?: boolean;
+	/**
+	 * The workspace's selected agent: resolves an unset card agentId for the
+	 * PR lifecycle gate (the comments half only serves native-Cline tasks).
+	 */
+	selectedAgentId?: RuntimeAgentId | null;
 }
 
 export interface UseBoardInteractionsResult {
@@ -147,6 +153,7 @@ export function useBoardInteractions({
 	runAutoReviewGitAction,
 	deterministicDeliveryEnabled = false,
 	backendTaskDispatchEnabled = false,
+	selectedAgentId = null,
 }: UseBoardInteractionsInput): UseBoardInteractionsResult {
 	const previousSessionsRef = useRef<Record<string, RuntimeTaskSessionSummary>>({});
 	const notificationPermissionPromptInFlightRef = useRef(false);
@@ -678,8 +685,12 @@ export function useBoardInteractions({
 
 	// PRTRACK-1: the shared lifecycle gate — legacy automatic completion is
 	// skipped for tasks whose linked PR workflow is owned by an installed
-	// enabled consumer (both consumers are always installed).
-	const prCompletionGatedTaskIds = useMemo(() => computePrLifecycleGatedTaskIds(board), [board]);
+	// enabled consumer (both consumers are always installed; the comments
+	// half only owns native-Cline tasks).
+	const prCompletionGatedTaskIds = useMemo(
+		() => computePrLifecycleGatedTaskIds(board, selectedAgentId),
+		[board, selectedAgentId],
+	);
 
 	useReviewAutoActions({
 		board,

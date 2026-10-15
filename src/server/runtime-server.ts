@@ -337,8 +337,24 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 					listBoard: (workspaceId) =>
 						loadWorkspaceBoardById(workspaceId).then((board) => ({ workspaceId, board })),
 					// Both PR tracking consumers (comment follow-up and merge
-					// completion) are always installed.
+					// completion) are always installed; the comments half is
+					// further scoped to native-Cline tasks via getSelectedAgentId.
 					installedConsumers: () => ({ comments: true, mergeCompletion: true }),
+					getSelectedAgentId: async (workspaceId) => {
+						const workspacePath = deps.workspaceRegistry.getWorkspacePathById(workspaceId);
+						if (!workspacePath) {
+							return null;
+						}
+						try {
+							const config = await deps.workspaceRegistry.loadScopedRuntimeConfig({
+								workspaceId,
+								workspacePath,
+							});
+							return config.selectedAgentId;
+						} catch {
+							return null;
+						}
+					},
 				},
 				(error) =>
 					deps.warn(
