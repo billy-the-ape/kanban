@@ -276,9 +276,7 @@ export function BoardColumn({
 										});
 										draggableIndex += 1;
 									}
-									return items
-										.sort((a, b) => (a.paused === b.paused ? 0 : a.paused ? 1 : b.paused ? -1 : 0))
-										.map(({ node }) => node);
+									return items.map(({ node }) => node);
 								})()}
 								{cardProvided.placeholder}
 							</div>
