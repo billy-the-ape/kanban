@@ -3,7 +3,7 @@
 **Status: IMPLEMENTED** on branch `feat/prlink-10-prs-view` (base `611bba2`, main at the merge of
 PRLINK-9). All requirements below were delivered in that branch; see the final-state notes at the
 bottom of this file.
-Master plan: [v1](../complete/pr-linking/PR_LINKING_PLAN.md). Shared context: [follow-ups](PRLINK-FOLLOWUPS.md).
+Master plan: [v1](../PR_LINKING_PLAN.md). Shared context: [follow-ups](PRLINK-FOLLOWUPS.md).
 Deliver the remaining work as one task-detail UI PR using the settled metadata/mutation routes.
 
 ## Landed baseline and remaining scope

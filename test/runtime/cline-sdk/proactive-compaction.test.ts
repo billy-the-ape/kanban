@@ -39,6 +39,7 @@ import {
 	type ClineTaskSessionService,
 	createInMemoryClineTaskSessionService,
 } from "../../../src/cline-sdk/cline-task-session-service";
+import type * as WorkspaceState from "../../../src/state/workspace-state";
 import { createFakeMcpRuntimeService, createFakeRuntimeSetup } from "../../utilities/cline-session-service-harness";
 
 const turnCheckpointMocks = vi.hoisted(() => ({
@@ -56,7 +57,7 @@ const workspaceStateMocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../../../src/state/workspace-state.js", async (importOriginal) => {
-	const original = await importOriginal<typeof import("../../../src/state/workspace-state")>();
+	const original = await importOriginal<typeof WorkspaceState>();
 	return {
 		...original,
 		getTaskWorktreesHomePath: workspaceStateMocks.getTaskWorktreesHomePath,

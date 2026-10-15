@@ -1,6 +1,7 @@
 // PRTRACK-1: trpc consumer API — diagnostics, settings writes, and operator
 // force-release authorization.
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type * as WorkspaceState from "../../../src/state/workspace-state";
 
 const workspaceStateMocks = vi.hoisted(() => ({
 	loadWorkspaceBoardById: vi.fn(),
@@ -8,7 +9,7 @@ const workspaceStateMocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../../../src/state/workspace-state.js", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("../../../src/state/workspace-state")>();
+	const actual = await importOriginal<typeof WorkspaceState>();
 	return {
 		...actual,
 		loadWorkspaceBoardById: workspaceStateMocks.loadWorkspaceBoardById,

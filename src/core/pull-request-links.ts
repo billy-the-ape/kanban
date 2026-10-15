@@ -56,8 +56,9 @@ export function classifyTaskChatMessageForPrLink(text: string, hasImages: boolea
 // --- PRLINK-6: primary display selection --------------------------------------
 
 /**
- * Compares two entries as "newest first-recorded": later `createdAt` wins;
- * for equal timestamps the later original array index wins.
+ * Whether `candidate` was first recorded strictly after `best` (later
+ * `createdAt` wins). Tie-breaking for equal timestamps lives in
+ * `pickNewestFirstRecorded`.
  */
 function isNewerFirstRecorded(candidate: RuntimeTaskPullRequest, best: RuntimeTaskPullRequest): boolean {
 	return candidate.createdAt > best.createdAt;

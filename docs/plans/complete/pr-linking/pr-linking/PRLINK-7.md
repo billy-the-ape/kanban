@@ -1,7 +1,7 @@
 # PRLINK-7 — Mobile PR access and management
 
 **Status: IMPLEMENTED (this PR). Depends on v1 and PRLINK-6.**
-Master plan: [v1](../complete/pr-linking/PR_LINKING_PLAN.md). Shared context: [follow-ups](PRLINK-FOLLOWUPS.md).
+Master plan: [v1](../PR_LINKING_PLAN.md). Shared context: [follow-ups](PRLINK-FOLLOWUPS.md).
 Deliver as one UI PR; no new server route or mobile navigation architecture.
 
 ## Fixed layout and interaction

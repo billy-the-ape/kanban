@@ -21,6 +21,7 @@ import type { ClineTaskSessionService } from "../../../src/cline-sdk/cline-task-
 import { createInMemoryClineTaskSessionService } from "../../../src/cline-sdk/cline-task-session-service";
 import { createClineWatcherRegistry } from "../../../src/cline-sdk/cline-watcher-registry";
 import type { RuntimeTaskImage, RuntimeTaskSessionMode } from "../../../src/core/api-contract";
+import type * as WorkspaceState from "../../../src/state/workspace-state";
 
 const originalArgv = [...process.argv];
 const originalExecArgv = [...process.execArgv];
@@ -41,7 +42,7 @@ const workspaceStateMocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../../../src/state/workspace-state.js", async (importOriginal) => {
-	const original = await importOriginal<typeof import("../../../src/state/workspace-state")>();
+	const original = await importOriginal<typeof WorkspaceState>();
 	return {
 		...original,
 		getTaskWorktreesHomePath: workspaceStateMocks.getTaskWorktreesHomePath,

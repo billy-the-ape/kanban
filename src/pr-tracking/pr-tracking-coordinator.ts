@@ -226,7 +226,7 @@ export class PrTrackingCoordinator {
 	private readonly subscriptions = new Map<string, TrackedSubscription>();
 	private readonly polls = new Map<string, PrPollState>();
 	private readonly scopes = new Map<string, AccessScope>();
-	private oneShotInFlight = new Map<string, Promise<OneShotMetadataRefreshResult>>();
+	private readonly oneShotInFlight = new Map<string, Promise<OneShotMetadataRefreshResult>>();
 	private scopeCache: AccessScope | null = null;
 	private scopeFailure: GhAdapterFailure | null = null;
 	private schedulerLockRelease: (() => Promise<void>) | null = null;

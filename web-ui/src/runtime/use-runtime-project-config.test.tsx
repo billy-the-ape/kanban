@@ -84,6 +84,7 @@ function createRuntimeConfigResponse(
 			dispatchEnabled: false,
 			workerLimit: 1,
 		},
+		installedPrConsumers: [],
 	};
 }
 

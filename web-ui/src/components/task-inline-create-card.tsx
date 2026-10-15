@@ -351,20 +351,15 @@ export function TaskInlineCreateCard({
 				</div>
 				{prAutoAddressComments || prAutoFinishOnMerge ? (
 					<div className="flex items-center gap-4 flex-wrap">
-						{prAutoAddressComments ? (
+						{prAutoAddressComments?.featureAvailable ? (
 							<label
 								htmlFor={prAutoAddressCommentsId}
-								className={`flex items-center gap-2 text-[12px] select-none ${
-									prAutoAddressComments.featureAvailable
-										? "text-text-primary cursor-pointer"
-										: "text-text-tertiary cursor-not-allowed"
-								}`}
+								className={`flex items-center gap-2 text-[12px] select-none text-text-primary cursor-pointer`}
 							>
 								<RadixCheckbox.Root
 									id={prAutoAddressCommentsId}
 									aria-label="Auto address PR review comments"
 									checked={prAutoAddressComments.checked}
-									disabled={!prAutoAddressComments.featureAvailable}
 									onCheckedChange={(checked) => prAutoAddressComments.onChange(checked === true)}
 									className="flex h-3.5 w-3.5 items-center justify-center rounded-sm border border-border-bright bg-surface-3 data-[state=checked]:bg-accent data-[state=checked]:border-accent data-[disabled]:cursor-not-allowed data-[disabled]:opacity-50"
 								>
@@ -372,25 +367,18 @@ export function TaskInlineCreateCard({
 										<Check size={10} className="text-white" />
 									</RadixCheckbox.Indicator>
 								</RadixCheckbox.Root>
-								{prAutoAddressComments.featureAvailable
-									? "Auto address PR review comments"
-									: "Auto address PR review comments (feature unavailable)"}
+								Auto address PR review comments
 							</label>
 						) : null}
-						{prAutoFinishOnMerge ? (
+						{prAutoFinishOnMerge?.featureAvailable ? (
 							<label
 								htmlFor={prAutoFinishOnMergeId}
-								className={`flex items-center gap-2 text-[12px] select-none ${
-									prAutoFinishOnMerge.featureAvailable
-										? "text-text-primary cursor-pointer"
-										: "text-text-tertiary cursor-not-allowed"
-								}`}
+								className="flex items-center gap-2 text-[12px] select-none text-text-primary cursor-pointer"
 							>
 								<RadixCheckbox.Root
 									id={prAutoFinishOnMergeId}
 									aria-label="Auto complete when the PR merges"
 									checked={prAutoFinishOnMerge.checked}
-									disabled={!prAutoFinishOnMerge.featureAvailable}
 									onCheckedChange={(checked) => prAutoFinishOnMerge.onChange(checked === true)}
 									className="flex h-3.5 w-3.5 items-center justify-center rounded-sm border border-border-bright bg-surface-3 data-[state=checked]:bg-accent data-[state=checked]:border-accent data-[disabled]:cursor-not-allowed data-[disabled]:opacity-50"
 								>
@@ -398,9 +386,7 @@ export function TaskInlineCreateCard({
 										<Check size={10} className="text-white" />
 									</RadixCheckbox.Indicator>
 								</RadixCheckbox.Root>
-								{prAutoFinishOnMerge.featureAvailable
-									? "Auto complete when the PR merges"
-									: "Auto complete on merge (feature unavailable)"}
+								Auto complete when the PR merges
 							</label>
 						) : null}
 					</div>

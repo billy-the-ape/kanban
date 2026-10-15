@@ -47,6 +47,7 @@ import {
 	withoutFailedResend,
 } from "../../../src/cline-sdk/cline-context-recovery";
 import type { ClineSdkPersistedMessage } from "../../../src/cline-sdk/sdk-runtime-boundary";
+import type * as WorkspaceState from "../../../src/state/workspace-state";
 import {
 	createTaskSessionServiceHarness,
 	type TaskSessionServiceHarness,
@@ -67,7 +68,7 @@ const workspaceStateMocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../../../src/state/workspace-state.js", async (importOriginal) => {
-	const original = await importOriginal<typeof import("../../../src/state/workspace-state")>();
+	const original = await importOriginal<typeof WorkspaceState>();
 	return {
 		...original,
 		getTaskWorktreesHomePath: workspaceStateMocks.getTaskWorktreesHomePath,
