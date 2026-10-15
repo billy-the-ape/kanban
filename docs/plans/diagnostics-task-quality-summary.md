@@ -1,6 +1,7 @@
 # Task quality diagnostics summary
 
-Status: ready for implementation; one follow-up PR into main.
+Status: implemented; final state in "Implementation outcome" below. One follow-up PR
+into main.
 
 ## Goal and scope
 
@@ -175,3 +176,58 @@ reducer/API/UI tests. One Ready for Review PR; prominently document deployment
 requirements (expected: ordinary rebuild/redeploy, no environment variables or
 server settings), added fields and semantics, limitations, and how to test each
 feature. Do not merge or deploy. No device/server settings change is required.
+
+## Implementation outcome
+
+Final state of this plan (implemented in one branch/PR):
+
+- `src/core/task-quality-summary.ts` — pure versioned reducer
+  (`TASK_QUALITY_SUMMARY_VERSION = 1`) over a minimal structural input
+  (session kinds, headers, messages, origins), plus thin adapters for
+  `ClineTaskExportSnapshot` and schemaVersion 3 exported JSON, and the
+  `buildTaskQualitySummaryResponse`/`buildUnavailableTaskQualitySummaryResponse`
+  assemblers. Deduplication (sessions, messages, canonical-argument tool calls,
+  seeded/compacted copies), identity-reuse ambiguities, deterministic V1
+  classification (confirmed failures vs heuristic tags vs unmatched calls),
+  unchanged-failed-retry detection, interval union with open/invalid/missing
+  segments kept explicit, per-usage-counter coverage (zero stays zero, missing
+  stays unknown), mixed-model detection, live-tail exclusion, and compact
+  evidence records (session/message/part/tool references — never full text).
+- API: `runtimeTaskQualitySummaryResponseSchema` in `src/core/api-contract.ts`,
+  request validation in `src/core/api-validation.ts`, and the read-only
+  `runtime.getTaskQualitySummary` query in `src/trpc/app-router.ts`.
+  `src/trpc/runtime-api.ts` implements it target-scoped: only the task's export
+  snapshot (working + review/repair lineage) plus the task's own session lookup —
+  never the board, unrelated SDK history, or other tasks, and never starts or
+  mutates a session. Identical `(workspace, task)` requests share one in-flight
+  promise (the handler is deliberately not `async` so callers receive the exact
+  shared promise); different tasks in one workspace run serially. Snapshot-class
+  failures degrade to explicit coverage reasons, never crashes.
+- Web UI: `web-ui/src/runtime/task-quality-summary.ts` (trpc fetcher returning
+  `null` on transport error), `web-ui/src/hooks/use-task-quality-summary.ts`
+  (on-demand load/refresh; resets and invalidates pending requests on
+  workspace/task change; `isRefreshing` distinguishes refresh from initial load),
+  and `web-ui/src/components/detail-panels/task-quality-summary-section.tsx`
+  (plus shared `task-diagnostics-primitives.tsx`), wired into the diagnostics
+  panel above the git details section. Coverage badge, capture time, snapshot
+  labeling for running tasks, explicit gap/evidence disclosure, and the
+  terminal-vs-native source warning are all surfaced; gaps are never silent
+  zeros.
+- Tests: `test/runtime/core/task-quality-summary.test.ts` (reducer + response
+  assembly: inherited restart copies, id collisions, canonical argument
+  equality, nested `run_commands` failures, nonzero exit vs negative probes vs
+  masked pipelines, zero/missing counters, unmatched/truncated results, mixed
+  models, interval union, live tails, unchanged failed retries, complete/partial/
+  unavailable coverage), `test/runtime/trpc/runtime-api.test.ts`
+  ("createRuntimeApi getTaskQualitySummary (DIAG-PANEL)" block: target-only
+  snapshot reads, in-flight promise deduplication, workspace isolation, per-
+  workspace serialization, graceful source failure, terminal/native separation),
+  and `web-ui/src/hooks/use-task-quality-summary.test.tsx` (on-demand load,
+  transport failure, stale-response ignore on task switch, refresh in place,
+  workspace reset).
+- Validation: Biome `check --write --unsafe` clean; backend and web-ui `tsc
+  --noEmit` clean; reducer/API/UI suites green (96 targeted tests, full web-ui
+  suite green). The PRLINK-10 baseline cross-check remains operator-supplied:
+  the plan's numbers are cross-checks, not hardcoded fixtures.
+- Deployment: ordinary rebuild/redeploy. No environment variables, server
+  settings, schema migrations, or storage changes.
