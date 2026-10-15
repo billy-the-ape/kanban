@@ -577,6 +577,54 @@ describe("analyzeTaskQualitySummary", () => {
 			expect.objectContaining({ toolCallId: "e3", priorReference: expect.objectContaining({ toolCallId: "e2" }) }),
 		);
 	});
+
+	it("does not count a later identical call as a failed retry when the prior call was unmatched", () => {
+		const seg = session({
+			kind: "task",
+			sessionId: "s",
+			provider: "p",
+			model: "m",
+			messages: [
+				// No tool_result recorded for a1 (e.g. the session was cut off).
+				message({
+					role: "assistant",
+					contentKey: "a1",
+					toolParts: [
+						toolUsePart({
+							index: 0,
+							toolCallId: "a1",
+							toolName: "run_commands",
+							arguments: { commands: ["make"] },
+						}),
+					],
+				}),
+				// Identical call with a later id succeeds.
+				message({
+					role: "assistant",
+					contentKey: "a2",
+					toolParts: [
+						toolUsePart({
+							index: 1,
+							toolCallId: "a2",
+							toolName: "run_commands",
+							arguments: { commands: ["make"] },
+						}),
+					],
+				}),
+				message({
+					role: "user",
+					contentKey: "r2",
+					toolParts: [toolResultPart({ index: 1, toolCallId: "a2", resultText: "build ok" })],
+				}),
+			],
+		});
+		const result = run([seg]);
+		expect(result.reportedToolFailures).toBe(0);
+		expect(result.unmatchedToolCalls).toBe(1);
+		// An unmatched prior call is not a reported failure: no retry evidence.
+		expect(result.unchangedFailedRetries).toBe(0);
+		expect(result.evidence.filter((entry) => entry.ruleId === "unchanged_failed_retry")).toHaveLength(0);
+	});
 });
 
 describe("buildTaskQualitySummaryResponse", () => {

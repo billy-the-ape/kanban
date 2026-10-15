@@ -674,7 +674,7 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 				},
 			});
 		}
-		lastCallByKey.set(key, { call, failed: call.classified?.confirmedRule !== null });
+		lastCallByKey.set(key, { call, failed: call.classified !== null && call.classified.confirmedRule !== null });
 	}
 
 	/** Recorded session timing (never active runtime). */
