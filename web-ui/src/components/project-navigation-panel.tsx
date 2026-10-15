@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { type MouseEvent as ReactMouseEvent, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import { canShowFeaturebaseFeedbackButton } from "@/components/featurebase-feedback-button";
+import { buildProjectTaskCountBadges } from "@/components/project-task-count-badges";
 import { Button } from "@/components/ui/button";
 import { ClineIcon } from "@/components/ui/cline-icon";
 import { cn } from "@/components/ui/cn";
@@ -47,14 +48,6 @@ const SIDEBAR_MIN_EXPANDED_WIDTH = 200;
 const SIDEBAR_MAX_EXPANDED_WIDTH = 600;
 const GITHUB_ISSUES_URL = "https://github.com/cline/kanban/issues";
 
-interface TaskCountBadge {
-	id: string;
-	title: string;
-	shortLabel: string;
-	toneClassName: string;
-	count: number;
-}
-
 export function ProjectNavigationPanel({
 	projects,
 	isLoadingProjects = false,
@@ -62,6 +55,7 @@ export function ProjectNavigationPanel({
 	removingProjectId,
 	activeSection,
 	onActiveSectionChange,
+	renderTasksSection,
 	canShowAgentSection,
 	agentSectionContent,
 	selectedAgentId,
@@ -79,8 +73,11 @@ export function ProjectNavigationPanel({
 	isLoadingProjects?: boolean;
 	currentProjectId: string | null;
 	removingProjectId: string | null;
-	activeSection: "projects" | "agent";
-	onActiveSectionChange: (section: "projects" | "agent") => void;
+	activeSection: "projects" | "tasks" | "agent";
+	onActiveSectionChange: (section: "projects" | "tasks" | "agent") => void;
+	/** Renders the Tasks section; the panel provides the same mobile-collapse
+	 * behavior as project selection through `closeOnMobile`. */
+	renderTasksSection: (options: { closeOnMobile: () => void }) => ReactNode;
 	canShowAgentSection: boolean;
 	agentSectionContent?: ReactNode;
 	selectedAgentId?: RuntimeAgentId | null;
@@ -106,6 +103,7 @@ export function ProjectNavigationPanel({
 	const pendingProjectTaskCount = pendingProjectRemoval
 		? pendingProjectRemoval.taskCounts.backlog +
 			pendingProjectRemoval.taskCounts.in_progress +
+			pendingProjectRemoval.taskCounts.paused +
 			pendingProjectRemoval.taskCounts.review +
 			pendingProjectRemoval.taskCounts.done +
 			pendingProjectRemoval.taskCounts.trash
@@ -137,6 +135,12 @@ export function ProjectNavigationPanel({
 		setIsMobileClosing(false);
 		setSidebarCollapsed(true, false);
 	}, [setSidebarCollapsed]);
+
+	const closeOnMobile = useCallback(() => {
+		if (isMobile) {
+			setCollapsed(true);
+		}
+	}, [isMobile, setCollapsed]);
 
 	const [isDragging, setIsDragging] = useState(false);
 	const dragRef = useRef<{ startX: number; startWidth: number } | null>(null);
@@ -331,7 +335,7 @@ export function ProjectNavigationPanel({
 					/>
 				</div>
 				<div className="mt-2 rounded-md bg-surface-2 border border-border p-1">
-					<div className="grid grid-cols-2 gap-1">
+					<div className="grid grid-cols-3 gap-1">
 						<button
 							type="button"
 							onClick={() => onActiveSectionChange("projects")}
@@ -343,6 +347,18 @@ export function ProjectNavigationPanel({
 							)}
 						>
 							Projects
+						</button>
+						<button
+							type="button"
+							onClick={() => onActiveSectionChange("tasks")}
+							className={cn(
+								"cursor-pointer rounded-sm px-2 py-1 text-xs font-medium",
+								activeSection === "tasks"
+									? "bg-surface-4 text-text-primary border border-border"
+									: "text-text-secondary hover:text-text-primary border border-transparent",
+							)}
+						>
+							Tasks
 						</button>
 						<button
 							type="button"
@@ -417,6 +433,8 @@ export function ProjectNavigationPanel({
 						featurebaseFeedbackState={featurebaseFeedbackState}
 					/>
 				</>
+			) : activeSection === "tasks" ? (
+				<div className="flex flex-1 min-h-0 flex-col">{renderTasksSection({ closeOnMobile })}</div>
 			) : (
 				<div className="flex flex-1 min-h-0 flex-col">
 					{selectedAgentId && selectedAgentId !== "cline" ? <TerminalAgentHints /> : null}
@@ -721,43 +739,7 @@ function ProjectRow({
 	const isRemovingProject = removingProjectId === project.id;
 	const hasAnyProjectRemoval = removingProjectId !== null;
 	const [isMenuOpen, setIsMenuOpen] = useState(false);
-	const taskCountBadges: TaskCountBadge[] = [
-		{
-			id: "backlog",
-			title: "Backlog",
-			shortLabel: "B",
-			toneClassName: "bg-text-primary/15 text-text-primary",
-			count: project.taskCounts.backlog,
-		},
-		{
-			id: "in_progress",
-			title: "In Progress",
-			shortLabel: "IP",
-			toneClassName: "bg-accent/20 text-accent",
-			count: project.taskCounts.in_progress,
-		},
-		{
-			id: "review",
-			title: "Review",
-			shortLabel: "R",
-			toneClassName: "bg-accent-2/20 text-accent-2",
-			count: project.taskCounts.review,
-		},
-		{
-			id: "done",
-			title: "Done",
-			shortLabel: "D",
-			toneClassName: "bg-status-green/20 text-status-green",
-			count: project.taskCounts.done,
-		},
-		{
-			id: "trash",
-			title: "Trash",
-			shortLabel: "T",
-			toneClassName: "bg-status-red/20 text-status-red",
-			count: project.taskCounts.trash,
-		},
-	].filter((item) => item.count > 0);
+	const taskCountBadges = buildProjectTaskCountBadges(project.taskCounts);
 
 	return (
 		<div

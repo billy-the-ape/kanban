@@ -6,7 +6,6 @@ import { CardDetailView } from "@/components/card-detail-view";
 import { TaskPrTrackingPanel } from "@/components/detail-panels/task-pr-tracking-panel";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type {
-	RuntimePrInstalledConsumer,
 	RuntimeTaskPullRequest,
 	RuntimeTaskSessionSummary,
 	RuntimeTaskTrackingStateResponse,
@@ -1347,7 +1346,6 @@ describe("TaskPrTrackingPanel (PRs view)", () => {
 			legacyCompletionGated: false,
 			mergeFinishesInReview: false,
 			blockers: [],
-			installedConsumers: [{ kind: "mergeCompletion", requiredReadSources: [] }],
 			commentsSupportedForTask: false,
 			owner: null,
 			ownerLabel: null,
@@ -1363,7 +1361,6 @@ describe("TaskPrTrackingPanel (PRs view)", () => {
 		options: {
 			workspaceId?: string | null;
 			pullRequests?: RuntimeTaskPullRequest[];
-			installedConsumers?: RuntimePrInstalledConsumer[];
 			visible?: boolean;
 			mobile?: boolean;
 		} = {},
@@ -1374,7 +1371,6 @@ describe("TaskPrTrackingPanel (PRs view)", () => {
 					workspaceId={options.workspaceId === undefined ? "workspace-1" : options.workspaceId}
 					taskId="task-1"
 					card={{ ...createCard("task-1"), pullRequests: options.pullRequests ?? [] }}
-					installedConsumers={options.installedConsumers ?? []}
 					visible={options.visible ?? true}
 					mobile={options.mobile ?? false}
 				/>
@@ -1411,7 +1407,9 @@ describe("TaskPrTrackingPanel (PRs view)", () => {
 		}
 	});
 
-	it("renders the empty state, footer actions, and the disabled settings pair without consumers", async () => {
+	it("renders the empty state and footer actions, reading tracking state for the settings", async () => {
+		trpcClientMocks.getTaskTrackingState.mockResolvedValue(createTrackingState());
+
 		await act(async () => {
 			renderPanel({ pullRequests: [] });
 		});
@@ -1428,11 +1426,10 @@ describe("TaskPrTrackingPanel (PRs view)", () => {
 		expect(refreshLinkedButton?.disabled).toBe(true);
 		expect(container.querySelector('[data-testid="task-pr-view-find-branch-button"]')).not.toBeNull();
 
-		// Zero installed consumers: the settings section degrades to the
-		// disabled checkbox pair and never reads tracking state.
+		// Consumers are always installed, so a visible view with workspace
+		// scope reads the tracking state and renders the settings block.
 		expect(container.querySelector('[data-testid="task-pr-view-settings-title"]')).not.toBeNull();
-		expect(document.body.textContent).toContain("Feature unavailable");
-		expect(trpcClientMocks.getTaskTrackingState).not.toHaveBeenCalled();
+		expect(trpcClientMocks.getTaskTrackingState).toHaveBeenCalledWith({ taskId: "task-1" });
 	});
 
 	it("renders stored links with metadata and order, without a provider round-trip", async () => {
@@ -1596,12 +1593,11 @@ describe("TaskPrTrackingPanel (PRs view)", () => {
 		expect(container.querySelector('[data-testid="task-pr-view-refresh-note-34"]')).not.toBeNull();
 	});
 
-	it("queries the tracking state only for a visible view with installed consumers", async () => {
+	it("queries the tracking state for a visible view", async () => {
 		trpcClientMocks.getTaskTrackingState.mockResolvedValue(createTrackingState());
 
 		await act(async () => {
 			renderPanel({
-				installedConsumers: [{ kind: "mergeCompletion", requiredReadSources: [] }],
 				pullRequests: [],
 			});
 		});
@@ -1615,7 +1611,6 @@ describe("TaskPrTrackingPanel (PRs view)", () => {
 		await act(async () => {
 			renderPanel({
 				visible: false,
-				installedConsumers: [{ kind: "mergeCompletion", requiredReadSources: [] }],
 				pullRequests: [],
 			});
 		});

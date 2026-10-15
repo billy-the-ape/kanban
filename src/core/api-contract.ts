@@ -295,10 +295,12 @@ export const runtimePrFeedbackFingerprintSchema = z.object({
 	digest: z.string(),
 	watermark: z.number().int().nonnegative(),
 	watermarkTokens: z.array(z.string()),
+	/** All current event versions; detects edits older than the timestamp watermark. */
+	eventTokens: z.array(z.string()).optional(),
 });
 export type RuntimePrFeedbackFingerprint = z.infer<typeof runtimePrFeedbackFingerprintSchema>;
 
-export const runtimePrCommentDispatchStatusSchema = z.enum(["queued", "running", "completed", "failed"]);
+export const runtimePrCommentDispatchStatusSchema = z.enum(["queued", "waiting", "running", "completed", "failed"]);
 export type RuntimePrCommentDispatchStatus = z.infer<typeof runtimePrCommentDispatchStatusSchema>;
 
 /**
@@ -310,11 +312,15 @@ export const runtimePrCommentDispatchSchema = z.object({
 	dispatchId: z.string(),
 	/** Epoch ms when the send was provably attempted; null while unsent. */
 	attemptedAt: z.number().nullable(),
-	/** Eligible feedback aggregate captured at instruction submission. */
+	/** Eligible feedback aggregate captured at execution; provisional while queued. */
 	fingerprint: runtimePrFeedbackFingerprintSchema,
+	/** Restore on an unsuccessful admitted turn so explicit Resume can retry its batch. */
+	previousFeedbackFingerprint: runtimePrFeedbackFingerprintSchema.nullable().optional(),
 	/** Ownership revision the instruction was dispatched under. */
 	ownerRevision: z.number().int().nonnegative(),
 	status: runtimePrCommentDispatchStatusSchema,
+	/** Explicit pre-execution blocker, recoverable through Resume. */
+	errorCode: z.enum(["git_refresh_blocked", "preparation_failed"]).optional(),
 	/** Normal session/turn reference (the accepted chat message id). */
 	turnRef: z.string().nullable(),
 	error: z.string().nullable(),
@@ -761,6 +767,7 @@ export type RuntimeWorkspaceStateNotifyResponse = z.infer<typeof runtimeWorkspac
 export const runtimeProjectTaskCountsSchema = z.object({
 	backlog: z.number(),
 	in_progress: z.number(),
+	paused: z.number(),
 	review: z.number(),
 	done: z.number(),
 	trash: z.number(),
@@ -911,6 +918,25 @@ export const runtimeProjectsResponseSchema = z.object({
 	projects: z.array(runtimeProjectSummarySchema),
 });
 export type RuntimeProjectsResponse = z.infer<typeof runtimeProjectsResponseSchema>;
+
+export const runtimeTaskDisplayStateSchema = z.enum(["backlog", "in_progress", "paused", "review", "done", "trash"]);
+export type RuntimeTaskDisplayState = z.infer<typeof runtimeTaskDisplayStateSchema>;
+
+export const runtimeProjectTaskListItemSchema = z.object({
+	projectId: z.string(),
+	projectName: z.string(),
+	taskId: z.string(),
+	title: z.string(),
+	displayState: runtimeTaskDisplayStateSchema,
+	lastActivityAt: z.number(),
+});
+export type RuntimeProjectTaskListItem = z.infer<typeof runtimeProjectTaskListItemSchema>;
+
+export const runtimeProjectTasksResponseSchema = z.object({
+	tasks: z.array(runtimeProjectTaskListItemSchema),
+	unavailableProjectIds: z.array(z.string()),
+});
+export type RuntimeProjectTasksResponse = z.infer<typeof runtimeProjectTasksResponseSchema>;
 
 export const runtimeProjectAddRequestSchema = z
 	.object({
@@ -2032,35 +2058,11 @@ export const runtimePrConsumerReadSourceSchema = z.enum([
 	"threads",
 ]);
 export type RuntimePrConsumerReadSource = z.infer<typeof runtimePrConsumerReadSourceSchema>;
-
-export const runtimePrInstalledConsumerSchema = z.object({
-	kind: runtimePrConsumerKindSchema,
-	requiredReadSources: z.array(runtimePrConsumerReadSourceSchema),
-});
-export type RuntimePrInstalledConsumer = z.infer<typeof runtimePrInstalledConsumerSchema>;
 export const runtimeConfigResponseSchema = z.object({
 	selectedAgentId: runtimeAgentIdSchema,
 	selectedShortcutLabel: z.string().nullable(),
 	agentAutonomousModeEnabled: z.boolean(),
 	debugModeEnabled: z.boolean().optional(),
-	/**
-	 * PRTRACK-1: the installed PR tracking consumers (empty until COMMENT-0 /
-	 * MERGE-1 register theirs). Optional so uncast legacy mocks keep working;
-	 * absent reads as "none installed" (legacy behavior).
-	 */
-	installedPrConsumers: z
-		.array(runtimePrInstalledConsumerSchema)
-		.optional()
-		.default([
-			{
-				kind: "comments",
-				requiredReadSources: ["reviews", "metadata", "conversationComments", "inlineComments", "threads"],
-			},
-			{
-				kind: "mergeCompletion",
-				requiredReadSources: ["metadata"],
-			},
-		]),
 	effectiveCommand: z.string().nullable(),
 	globalConfigPath: z.string(),
 	projectConfigPath: z.string().nullable(),
@@ -2838,6 +2840,135 @@ export const runtimeTaskDiagnosticsActionResponseSchema = z.object({
 });
 export type RuntimeTaskDiagnosticsActionResponse = z.infer<typeof runtimeTaskDiagnosticsActionResponseSchema>;
 
+// DIAG-PANEL: recorded quality summary for the diagnostics panel.
+// Read-only, on-demand point-in-time analysis of the task's recorded native
+// sessions (working + review + verification-repair lineage). It never
+// re-reads the whole board, never hydrates unrelated SDK history, and never
+// starts or mutates a session.
+
+export const runtimeTaskQualitySummaryRequestSchema = z.object({
+	taskId: z.string().min(1),
+});
+export type RuntimeTaskQualitySummaryRequest = z.infer<typeof runtimeTaskQualitySummaryRequestSchema>;
+
+/** Per-usage-counter coverage: which fraction of distinct responses report it. */
+export const runtimeTaskQualitySummaryUsageCounterSchema = z.object({
+	/** null when no distinct response reports this counter (zero stays zero). */
+	total: z.number().int().min(0).nullable(),
+	coverage: z.number().min(0).max(1),
+});
+
+/** Compact evidence reference (session/message/part) — never full text. */
+export const runtimeTaskQualitySummaryEvidenceSchema = z.object({
+	sessionId: z.string(),
+	kind: z.enum(["task", "review", "verification-repair"]),
+	messageIndex: z.number().int().min(0),
+	partIndex: z.number().int().min(0),
+	toolCallId: z.string(),
+	timestamp: z.number().nullable(),
+	ruleId: z.string(),
+	classification: z.enum(["confirmed_failure", "unmatched_call", "unchanged_retry", "heuristic_tag"]),
+	/** The prior identical failed call for unchanged-retry evidence. */
+	priorReference: z
+		.object({
+			sessionId: z.string(),
+			messageIndex: z.number().int().min(0),
+			partIndex: z.number().int().min(0),
+			toolCallId: z.string(),
+		})
+		.nullable(),
+});
+
+export const runtimeTaskQualitySummaryResponseSchema = z.object({
+	ok: z.boolean(),
+	taskId: z.string(),
+	capturedAt: z.number().int(),
+	/** Version of the analysis semantics that produced this response. */
+	reducerVersion: z.number().int().min(1),
+	coverage: z.object({
+		status: z.enum(["complete", "partial", "unavailable"]),
+		/** Reasons that drive partial/unavailable (never a silent gap). */
+		reasons: z.array(z.string()),
+		/** Informational gaps (live tail, truncated results). */
+		warnings: z.array(z.string()),
+	}),
+	timing: z.object({
+		/** Earliest valid recorded session start; null when unknown. Not card creation. */
+		firstRecordedStart: z.number().nullable(),
+		/** Latest valid recorded session end; null when unknown. Not merge time. */
+		lastRecordedEnd: z.number().nullable(),
+		/** Segments with no valid recorded end (incomplete/open). */
+		openSegmentCount: z.number().int().min(0),
+		/** Segments whose end is valid but whose start is missing/invalid/reversed. */
+		invalidIntervalCount: z.number().int().min(0),
+		/**
+		 * Union of valid closed start/end intervals across all included
+		 * session classes. Includes waits inside sessions; excludes gaps
+		 * between sessions. Never active runtime.
+		 */
+		recordedSessionSpanMs: z.number().int().min(0).nullable(),
+		coveredSegmentCount: z.number().int().min(0),
+		totalSegmentCount: z.number().int().min(0),
+	}),
+	/** Restarts are multiple recorded working sessions, not automatically crashes. */
+	sessionCounts: z.object({
+		working: z.number().int().min(0),
+		review: z.number().int().min(0),
+		verificationRepair: z.number().int().min(0),
+		distinctSessions: z.number().int().min(0),
+	}),
+	/** Identity-reuse / duplicate-record ambiguities (reported, never merged silently). */
+	ambiguities: z.array(z.object({ ruleId: z.string(), detail: z.string() })),
+	models: z.object({
+		pairs: z.array(z.object({ provider: z.string(), model: z.string() })),
+		/** True when more than one provider/model pair is recorded. */
+		mixedModels: z.boolean(),
+	}),
+	responses: z.object({
+		/** Distinct assistant responses (inherited copies counted once). */
+		assistantResponses: z.number().int().min(0),
+		/** Responses reporting at least one usage metric. */
+		withReportedMetrics: z.number().int().min(0),
+		/** Maximum observed per-response input metric; not a context estimate. */
+		peakReportedInput: z.number().int().min(0).nullable(),
+	}),
+	usage: z.object({
+		inputTokens: runtimeTaskQualitySummaryUsageCounterSchema,
+		outputTokens: runtimeTaskQualitySummaryUsageCounterSchema,
+		cacheReadTokens: runtimeTaskQualitySummaryUsageCounterSchema,
+		cacheWriteTokens: runtimeTaskQualitySummaryUsageCounterSchema,
+	}),
+	tools: z.object({
+		/** Distinct tool calls (deduplicated across restarts). */
+		totalCalls: z.number().int().min(0),
+		byName: z.record(z.string(), z.number().int().min(0)),
+		/** Calls whose matched result explicitly reports failure (once per call). */
+		reportedFailures: z.number().int().min(0),
+		/** Calls with no observed result (separate from confirmed failures). */
+		unmatchedCalls: z.number().int().min(0),
+		/** Matched results stored as truncated excerpts (full outputs not loaded). */
+		truncatedResults: z.number().int().min(0),
+	}),
+	retries: z.object({
+		/** Later identical calls after the prior identical call reported failure. */
+		unchangedFailedRetries: z.number().int().min(0),
+	}),
+	/** Heuristic evidence tags (never confirmed failures, never a score). */
+	heuristicTags: z.record(z.string(), z.number().int().min(0)),
+	/** True when the capture has a live display tail (excluded from totals). */
+	liveTailExcluded: z.boolean(),
+	/** Compact evidence references for failed/unmatched calls, retries, tags. */
+	evidence: z.array(runtimeTaskQualitySummaryEvidenceSchema),
+	/** Source of the task's current session (separate from native transcript availability). */
+	sessionSource: z.enum(["cline", "terminal"]).nullable(),
+	terminalSummaryAvailable: z.boolean(),
+	/** Set when the current session is terminal and native totals are historical. */
+	sourceWarning: z.string().nullable(),
+	/** Non-null only when the summary could not be built at all. */
+	error: z.string().nullable(),
+});
+export type RuntimeTaskQualitySummaryResponse = z.infer<typeof runtimeTaskQualitySummaryResponseSchema>;
+
 // B-10.1: batched phase summaries for board chips.
 
 export const runtimeTaskPhasesRequestSchema = z.object({
@@ -3302,7 +3433,6 @@ export const runtimeTaskTrackingStateResponseSchema = z.object({
 				"unsupported_host",
 				"ambiguous_selection",
 				"waiting_for_linked_pr",
-				"feature_unavailable",
 				"comments_unsupported",
 				"choose_repair_owner",
 				"owner_deleted",
@@ -3314,7 +3444,6 @@ export const runtimeTaskTrackingStateResponseSchema = z.object({
 			message: z.string(),
 		}),
 	),
-	installedConsumers: z.array(runtimePrInstalledConsumerSchema),
 	/** Per-task agent support: comments are native-Cline only; merge is provider-independent. */
 	commentsSupportedForTask: z.boolean(),
 	owner: runtimePrTaskOwnerSchema.nullable(),

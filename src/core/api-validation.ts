@@ -37,6 +37,7 @@ import {
 	type RuntimeTaskPullRequestPrimaryRequest,
 	type RuntimeTaskPullRequestSingleRefreshRequest,
 	type RuntimeTaskPullRequestsRefreshRequest,
+	type RuntimeTaskQualitySummaryRequest,
 	type RuntimeTaskReviewInfoRequest,
 	type RuntimeTaskReviewStartRequest,
 	type RuntimeTaskSessionInputRequest,
@@ -85,6 +86,7 @@ import {
 	runtimeTaskPullRequestPrimaryRequestSchema,
 	runtimeTaskPullRequestSingleRefreshRequestSchema,
 	runtimeTaskPullRequestsRefreshRequestSchema,
+	runtimeTaskQualitySummaryRequestSchema,
 	runtimeTaskReviewInfoRequestSchema,
 	runtimeTaskReviewStartRequestSchema,
 	runtimeTaskSessionInputRequestSchema,
@@ -380,6 +382,18 @@ export function parseTaskDiagnosticsActionRequest(value: unknown): RuntimeTaskDi
 	return {
 		taskId,
 		action: parsed.action,
+	};
+}
+
+/** DIAG-PANEL: validate the recorded quality summary request. */
+export function parseTaskQualitySummaryRequest(value: unknown): RuntimeTaskQualitySummaryRequest {
+	const parsed = parseWithSchema(runtimeTaskQualitySummaryRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Task quality summary taskId cannot be empty.");
+	}
+	return {
+		taskId,
 	};
 }
 

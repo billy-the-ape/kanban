@@ -4,7 +4,7 @@
 // workspace scope — with per-row actions and the footer actions (link by
 // URL, refresh linked PRs, find PRs for branch), plus the single tracking
 // settings/status section. Tracking reads run only for a visible view with
-// workspace scope and installed consumers; CSS-hidden panels never poll.
+// workspace scope; CSS-hidden panels never poll.
 
 import { getOrderedTaskPullRequests } from "@runtime-pull-request-links";
 import { Plus, RefreshCw, Search } from "lucide-react";
@@ -16,7 +16,7 @@ import { cn } from "@/components/ui/cn";
 import { Spinner } from "@/components/ui/spinner";
 import { useTaskPullRequestActions } from "@/hooks/use-task-pull-request-actions";
 import { getRuntimeTrpcClient } from "@/runtime/trpc-client";
-import type { RuntimePrInstalledConsumer, RuntimeTaskTrackingStateResponse } from "@/runtime/types";
+import type { RuntimeTaskTrackingStateResponse } from "@/runtime/types";
 import { useTrpcQuery } from "@/runtime/use-trpc-query";
 import type { BoardCard } from "@/types";
 import { toCanonicalPrKeyForLink } from "@/utils/pr-tracking";
@@ -34,14 +34,12 @@ export function TaskPrTrackingPanel({
 	workspaceId,
 	taskId,
 	card,
-	installedConsumers,
 	visible,
 	mobile,
 }: {
 	workspaceId: string | null;
 	taskId: string;
 	card: BoardCard;
-	installedConsumers: RuntimePrInstalledConsumer[];
 	/**
 	 * PRLINK-10: true only when this view is actually visible (desktop
 	 * right panel, or the mobile Diff tab with the PRs segment active).
@@ -50,14 +48,11 @@ export function TaskPrTrackingPanel({
 	visible: boolean;
 	mobile: boolean;
 }): React.ReactElement {
-	const commentsInstalled = installedConsumers.some((consumer) => consumer.kind === "comments");
-	const mergeInstalled = installedConsumers.some((consumer) => consumer.kind === "mergeCompletion");
-	const consumersInstalled = commentsInstalled || mergeInstalled;
 	// PRLINK-10: tracking reads only for a visible PRs view with workspace
-	// scope and installed consumers; no second poller is created for the
-	// stored-link list (it renders from board state). The queryFn is memoized
-	// so useTrpcQuery's effect does not re-fire on every render.
-	const trackingQueryEnabled = workspaceId !== null && consumersInstalled && visible;
+	// scope; no second poller is created for the stored-link list (it
+	// renders from board state). The queryFn is memoized so useTrpcQuery's
+	// effect does not re-fire on every render.
+	const trackingQueryEnabled = workspaceId !== null && visible;
 	const trackingQueryFn = useCallback(
 		() => getRuntimeTrpcClient(workspaceId).workspace.prTracking.getTaskTrackingState.query({ taskId }),
 		[workspaceId, taskId],
@@ -223,8 +218,7 @@ export function TaskPrTrackingPanel({
 				workspaceId={workspaceId}
 				taskId={taskId}
 				card={card}
-				installedConsumers={installedConsumers}
-				tracking={tracking}
+				tracking={tracking ?? null}
 				refetch={refetch}
 			/>
 		</div>

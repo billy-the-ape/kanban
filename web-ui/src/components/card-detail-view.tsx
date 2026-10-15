@@ -883,7 +883,6 @@ export function CardDetailView({
 										workspaceId={currentProjectId}
 										taskId={selection.card.id}
 										card={selection.card}
-										installedConsumers={runtimeConfig?.installedPrConsumers ?? []}
 										visible={prViewVisible}
 										mobile={isMobile}
 									/>
@@ -1040,7 +1039,6 @@ export function CardDetailView({
 											workspaceId={currentProjectId}
 											taskId={selection.card.id}
 											card={selection.card}
-											installedConsumers={runtimeConfig?.installedPrConsumers ?? []}
 											visible={prViewVisible}
 											mobile={isMobile}
 										/>

@@ -20,13 +20,13 @@ import type { ClineReviewSessionService } from "../cline-sdk/cline-review-sessio
 import { isClineClearSlashCommand } from "../cline-sdk/cline-slash-commands";
 import type { ClineTaskExportSnapshot } from "../cline-sdk/cline-task-export-snapshot";
 import type { ClineTaskSessionService } from "../cline-sdk/cline-task-session-service";
+import type { ClineTurnPreparation } from "../cline-sdk/cline-turn-preparation";
 import type { RuntimeConfigState } from "../config/runtime-config";
 import { updateGlobalRuntimeConfig, updateRuntimeConfig } from "../config/runtime-config";
 import type {
 	RuntimeCommandRunResponse,
 	RuntimeEffectiveContextWindow,
 	RuntimeGitDeliveryReceipt,
-	RuntimePrInstalledConsumer,
 	RuntimeRunUpdateResponse,
 	RuntimeTaskChatPrLinking,
 	RuntimeTaskChatSendRequest,
@@ -41,6 +41,7 @@ import type {
 	RuntimeTaskPhasesResponse,
 	RuntimeTaskPreservationInfoResponse,
 	RuntimeTaskPreservationRecord,
+	RuntimeTaskQualitySummaryResponse,
 	RuntimeTaskReviewInfoResponse,
 	RuntimeTaskSessionStartRequest,
 	RuntimeTaskSessionSummary,
@@ -73,6 +74,7 @@ import {
 	parseTaskPrAutomationSettingsRequest,
 	parseTaskPrCommentResumeRequest,
 	parseTaskPrTrackingStateRequest,
+	parseTaskQualitySummaryRequest,
 	parseTaskReviewInfoRequest,
 	parseTaskReviewStartRequest,
 	parseTaskSessionInputRequest,
@@ -83,6 +85,10 @@ import { isHomeAgentSessionId } from "../core/home-agent-session";
 import { getTaskColumnId, moveTaskToColumn, setTaskAutoAddressComments } from "../core/task-board-mutations";
 import { computeTaskPhase, isDeliveryResumable, type TaskPhaseInput } from "../core/task-diagnostics";
 import { buildTaskDiagnosticsExportV3, type TaskDiagnosticsExportV3Plan } from "../core/task-diagnostics-export-v3";
+import {
+	buildTaskQualitySummaryResponse,
+	buildUnavailableTaskQualitySummaryResponse,
+} from "../core/task-quality-summary";
 import { resolveTaskTitle } from "../core/task-title.js";
 import { reconcileOrphanedSessionSummary, resolveWorkspaceSessionSummaries } from "../core/workspace-session-summaries";
 import type { PrCommentAutomationService } from "../pr-tracking/comment-automation-service";
@@ -160,13 +166,6 @@ export interface CreateRuntimeApiDependencies {
 	/** COMMENT-0: the runtime-wide comment-handling observer (optional in partial harnesses). */
 	getPrCommentAutomationService?: () => PrCommentAutomationService | null;
 	/**
-	 * PRTRACK-1: the installed PR tracking consumers. Surfaced in the runtime
-	 * config response as the browser's installed-consumer signal (checkbox
-	 * availability, lifecycle-gate display). Optional so test harnesses that
-	 * never register consumers keep working.
-	 */
-	getInstalledPrConsumers?: () => RuntimePrInstalledConsumer[];
-	/**
 	 * PRTRACK-1: shared lifecycle gate for deterministic delivery — reports
 	 * whether another task's PR operation currently holds a reservation on the
 	 * task's automation PR (busy → delivery must not race it).
@@ -209,8 +208,12 @@ export function createTaskChatMessageSender(deps: {
 		scope: RuntimeTrpcWorkspaceScope,
 		body: RuntimeTaskChatSendRequest,
 	) => Promise<RuntimeTaskChatPrLinking | undefined>;
-}): (scope: RuntimeTrpcWorkspaceScope, body: RuntimeTaskChatSendRequest) => Promise<RuntimeTaskChatSendResponse> {
-	return async (workspaceScope, body) => {
+}): (
+	scope: RuntimeTrpcWorkspaceScope,
+	body: RuntimeTaskChatSendRequest,
+	preparePrompt?: ClineTurnPreparation,
+) => Promise<RuntimeTaskChatSendResponse> {
+	return async (workspaceScope, body, preparePrompt) => {
 		try {
 			const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
 			if (isClineClearSlashCommand(body.text)) {
@@ -228,6 +231,7 @@ export function createTaskChatMessageSender(deps: {
 				body.text,
 				requestedMode,
 				body.images,
+				...(preparePrompt ? ([preparePrompt] as const) : ([] as const)),
 			);
 			if (!summary) {
 				if (!isHomeAgentSessionId(body.taskId)) {
@@ -238,6 +242,7 @@ export function createTaskChatMessageSender(deps: {
 							body.text,
 							requestedMode,
 							body.images,
+							...(preparePrompt ? ([preparePrompt] as const) : ([] as const)),
 						);
 					}
 					if (!summary) {
@@ -1030,6 +1035,13 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 	// callers join the same run and all see its outcome.
 	const taskDiagnosticsActionInFlight = new Map<string, Promise<RuntimeTaskDiagnosticsActionResponse>>();
 
+	// DIAG-PANEL: in-flight dedup for recorded quality summaries, keyed by
+	// workspace:task. Identical requests share one promise; the per-workspace
+	// chain serializes analyses so at most one task summary per workspace is
+	// built at a time (on-demand, operator-driven — never a board-wide scan).
+	const taskQualitySummaryInFlight = new Map<string, Promise<RuntimeTaskQualitySummaryResponse>>();
+	const taskQualitySummaryWorkspaceChains = new Map<string, Promise<unknown>>();
+
 	const runtimeApi: RuntimeTrpcContext["runtimeApi"] = {
 		loadConfig: async (workspaceScope) => {
 			const activeRuntimeConfig = deps.getActiveRuntimeConfig?.();
@@ -1045,11 +1057,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				throw new Error("No active runtime config provider is available.");
 			}
 			const configResponse = await buildConfigResponse(scopedRuntimeConfig);
-			return {
-				...configResponse,
-				// PRTRACK-1: the installed-consumer signal for the browser.
-				installedPrConsumers: deps.getInstalledPrConsumers?.() ?? [],
-			};
+			return configResponse;
 		},
 		saveConfig: async (workspaceScope, input) => {
 			const parsed = parseRuntimeConfigSaveRequest(input);
@@ -1506,6 +1514,70 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				exportedAt: new Date().toISOString(),
 			});
 		},
+		// DIAG-PANEL: on-demand recorded quality summary for the diagnostics
+		// panel. Read-only and target-scoped: it reads only this task's
+		// export snapshot (working + review/repair lineage) plus the task's
+		// own session lookup — never the board, unrelated SDK history, or any
+		// other task — and never starts or mutates a session. Identical
+		// requests share one in-flight analysis; different tasks in the same
+		// workspace run serially. The handler is intentionally not async:
+		// callers must receive the exact shared promise, not a wrapper.
+		getTaskQualitySummary: (workspaceScope, input): Promise<RuntimeTaskQualitySummaryResponse> => {
+			const body = parseTaskQualitySummaryRequest(input);
+			const workspaceId = workspaceScope.workspaceId;
+			const dedupKey = `${workspaceId}:${body.taskId}`;
+			const existing = taskQualitySummaryInFlight.get(dedupKey);
+			if (existing) {
+				return existing;
+			}
+			const run = async (): Promise<RuntimeTaskQualitySummaryResponse> => {
+				try {
+					const { taskSnapshot, taskSnapshotError, reviewSnapshot, reviewSnapshotError } = await deps
+						.getTaskExportSnapshot(workspaceScope, body.taskId)
+						.catch((error) => {
+							// Decision 5 equivalent: a snapshot class that failed
+							// to read is a gap the summary carries, not a crash.
+							const message = error instanceof Error ? error.message : String(error);
+							return {
+								taskSnapshot: null,
+								taskSnapshotError: message,
+								reviewSnapshot: null,
+								reviewSnapshotError: message,
+							};
+						});
+					// The task's own current-session lookup (never other
+					// tasks' summaries) separates terminal summary
+					// availability from native transcript availability.
+					const lookupSession = await createTaskSessionLookup(workspaceScope);
+					const session = lookupSession(body.taskId);
+					return buildTaskQualitySummaryResponse({
+						taskId: body.taskId,
+						capturedAt: Date.now(),
+						taskSnapshot,
+						taskSnapshotError,
+						reviewSnapshot,
+						reviewSnapshotError,
+						sessionSource: session.source,
+						terminalSummaryAvailable: session.summary !== null,
+					});
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					return buildUnavailableTaskQualitySummaryResponse(body.taskId, message);
+				} finally {
+					if (taskQualitySummaryInFlight.get(dedupKey) === sharedQualitySummary) {
+						taskQualitySummaryInFlight.delete(dedupKey);
+					}
+				}
+			};
+			const previousChain = taskQualitySummaryWorkspaceChains.get(workspaceId) ?? Promise.resolve();
+			const sharedQualitySummary = previousChain.then(run);
+			taskQualitySummaryWorkspaceChains.set(
+				workspaceId,
+				sharedQualitySummary.catch(() => undefined),
+			);
+			taskQualitySummaryInFlight.set(dedupKey, sharedQualitySummary);
+			return sharedQualitySummary;
+		},
 		returnQueuedTaskToBacklog: async (workspaceScope, input) => {
 			const body = parseTaskSessionStopRequest(input);
 			if (returningTaskIds.has(body.taskId))
@@ -1873,7 +1945,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		setTaskPrAutomationSettings: async (workspaceScope, input) => {
 			const body = parseTaskPrAutomationSettingsRequest(input);
 			const board = await loadWorkspaceBoardById(workspaceScope.workspaceId).catch(() => null);
-			if (!board || !board.columns.flatMap((column) => column.cards).some((card) => card.id === body.taskId)) {
+			if (!board?.columns.flatMap((column) => column.cards).some((card) => card.id === body.taskId)) {
 				return { ok: false, error: `Task "${body.taskId}" not found.` };
 			}
 			await mutateWorkspaceState(workspaceScope.workspacePath, (state) => {

@@ -120,7 +120,13 @@ export function TaskPrCommentHandlingPanel({ workspaceId, taskId, pullRequests }
 	) : null;
 
 	let statusLine: ReactNode = null;
-	if (dispatch?.status === "running") {
+	if (dispatch?.status === "waiting") {
+		statusLine = (
+			<span className="text-[11px] text-text-secondary" data-testid="task-pr-comment-status-waiting">
+				Queued for execution; feedback refreshes when a model slot is available.
+			</span>
+		);
+	} else if (dispatch?.status === "running") {
 		statusLine = (
 			<span
 				className="flex items-center gap-1.5 text-[11px] text-status-blue"
@@ -137,6 +143,7 @@ export function TaskPrCommentHandlingPanel({ workspaceId, taskId, pullRequests }
 				data-testid="task-pr-comment-status-failed"
 			>
 				{dispatch.error ?? "Comment handling failed."}
+				{dispatch.errorCode === "git_refresh_blocked" ? <span>Reconcile the task branch, then Resume.</span> : null}
 				{resumeButton}
 			</span>
 		);

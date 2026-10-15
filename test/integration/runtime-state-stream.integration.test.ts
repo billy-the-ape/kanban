@@ -9,23 +9,26 @@ import { pathToFileURL } from "node:url";
 
 import { describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
-
+import type { ClineTaskSessionService } from "../../src/cline-sdk/cline-task-session-service";
 import type {
 	RuntimeBoardData,
 	RuntimeHookIngestResponse,
 	RuntimeProjectAddResponse,
 	RuntimeProjectRemoveResponse,
 	RuntimeProjectsResponse,
+	RuntimeProjectTasksResponse,
 	RuntimeShellSessionStartResponse,
 	RuntimeStateStreamMessage,
 	RuntimeStateStreamProjectsMessage,
 	RuntimeStateStreamSnapshotMessage,
 	RuntimeStateStreamTaskReadyForReviewMessage,
 	RuntimeStateStreamWorkspaceStateMessage,
+	RuntimeTaskSessionSummary,
 	RuntimeTaskWorkspaceInfoResponse,
 	RuntimeWorkspaceStateResponse,
 	RuntimeWorktreeEnsureResponse,
 } from "../../src/core/api-contract";
+import { createRuntimeStateHub } from "../../src/server/runtime-state-hub";
 import { prepareInitialTaskWorktree } from "../../src/workspace/task-worktree";
 import { createGitTestEnv } from "../utilities/git-env";
 import { createTempDir } from "../utilities/temp-dir";
@@ -800,6 +803,21 @@ describe.sequential("runtime state stream integration", () => {
 			expect(projectsAfterUpdate.status).toBe(200);
 			const projectB = projectsAfterUpdate.payload.projects.find((project) => project.id === workspaceBId) ?? null;
 			expect(projectB?.taskCounts.backlog).toBe(1);
+
+			const projectTasksAfterUpdate = await requestJson<RuntimeProjectTasksResponse>({
+				baseUrl: `http://127.0.0.1:${port}`,
+				procedure: "projects.listTasks",
+				type: "query",
+				workspaceId: workspaceAId,
+			});
+			expect(projectTasksAfterUpdate.status).toBe(200);
+			expect(projectTasksAfterUpdate.payload.unavailableProjectIds).toEqual([]);
+			const projectBTask =
+				projectTasksAfterUpdate.payload.tasks.find(
+					(task) => task.projectId === workspaceBId && task.title === "Realtime Task",
+				) ?? null;
+			expect(projectBTask?.displayState).toBe("backlog");
+			expect(projectTasksAfterUpdate.payload.tasks.map((task) => task.projectId)).toEqual([workspaceBId]);
 		} finally {
 			if (streamA) {
 				await streamA.close();
@@ -1503,4 +1521,73 @@ describe.sequential("runtime state stream integration", () => {
 			cleanupHome();
 		}
 	}, 30_000);
+});
+
+describe("runtime state hub Cline summary accessor", () => {
+	it("exposes registered service summaries without events and returns [] for untracked or disposed workspaces", async () => {
+		const initialSummary: RuntimeTaskSessionSummary = {
+			taskId: "task-1",
+			state: "running",
+			agentId: "cline",
+			workspacePath: "/tmp/workspace-a",
+			pid: null,
+			startedAt: 1,
+			updatedAt: 100,
+			lastOutputAt: 100,
+			reviewReason: null,
+			exitCode: null,
+			lastHookAt: null,
+			latestHookActivity: null,
+		};
+		const updatedSummary: RuntimeTaskSessionSummary = {
+			...initialSummary,
+			state: "idle",
+			updatedAt: 200,
+		};
+		let liveSummaries: RuntimeTaskSessionSummary[] = [initialSummary];
+		const summaryListeners: Array<(summary: RuntimeTaskSessionSummary) => void> = [];
+		// Only the methods the hub reads are implemented.
+		const service = {
+			listSummaries: () => liveSummaries,
+			onSummary: (listener: (summary: RuntimeTaskSessionSummary) => void) => {
+				summaryListeners.push(listener);
+				return () => {};
+			},
+			onMessage: () => () => {},
+		} as unknown as ClineTaskSessionService;
+
+		const hub = createRuntimeStateHub({
+			workspaceRegistry: {
+				resolveWorkspaceForStream: async () => {
+					throw new Error("resolveWorkspaceForStream should not run in this test");
+				},
+				buildProjectsPayload: async () => {
+					throw new Error("buildProjectsPayload should not run in this test");
+				},
+				buildWorkspaceStateSnapshot: async () => {
+					throw new Error("buildWorkspaceStateSnapshot should not run in this test");
+				},
+			},
+		});
+		try {
+			expect(hub.listClineTaskSessionSummaries("workspace-a")).toEqual([]);
+
+			hub.trackClineTaskSessionService("workspace-a", "/tmp/workspace-a", service);
+			expect(hub.listClineTaskSessionSummaries("workspace-a")).toEqual([initialSummary]);
+
+			// A change in the registered service is visible through the accessor
+			// without any onSummary event firing.
+			liveSummaries = [updatedSummary];
+			expect(summaryListeners).toHaveLength(1);
+			expect(hub.listClineTaskSessionSummaries("workspace-a")).toEqual([updatedSummary]);
+
+			// The accessor never instantiates a service for untracked workspaces.
+			expect(hub.listClineTaskSessionSummaries("workspace-b")).toEqual([]);
+
+			hub.disposeWorkspace("workspace-a");
+			expect(hub.listClineTaskSessionSummaries("workspace-a")).toEqual([]);
+		} finally {
+			await hub.close();
+		}
+	});
 });

@@ -928,3 +928,99 @@ describe("InMemoryClineSessionRuntime", () => {
 		expect(runtime.getTaskSessionId("task-1")).toBeNull();
 	});
 });
+
+describe("execution-time prompt preparation", () => {
+	function setup() {
+		const host = {
+			start: vi.fn(async (input: { config?: { sessionId?: string } }) => ({
+				sessionId: input.config?.sessionId ?? "session",
+				result: {},
+			})),
+			send: vi.fn(async (_input: { sessionId: string; prompt: string }) => undefined),
+			stop: vi.fn(async () => {}),
+			abort: vi.fn(async () => {}),
+			delete: vi.fn(async () => true),
+			dispose: vi.fn(async () => {}),
+			get: vi.fn(async () => undefined),
+			list: vi.fn(async () => []),
+			readMessages: vi.fn(async () => []),
+			subscribe: vi.fn(() => () => {}),
+		};
+		const scheduler = new ClineTurnScheduler(async () => 1);
+		const queued = createDeferred<void>();
+		const runtime = createInMemoryClineSessionRuntime({
+			turnScheduler: scheduler,
+			createSessionHost: async () => host,
+			createMcpRuntimeService: createNoopMcpRuntimeService,
+			onTaskEvent: (_taskId, event) => {
+				if (
+					event &&
+					typeof event === "object" &&
+					"type" in event &&
+					event.type === "kanban_concurrency" &&
+					"queued" in event &&
+					event.queued
+				)
+					queued.resolve();
+			},
+		});
+		const request = {
+			taskId: "repair",
+			cwd: "/tmp/worktree",
+			prompt: "",
+			providerId: "anthropic",
+			modelId: "test",
+			systemPrompt: "system",
+		};
+		return { host, scheduler, runtime, queued, request };
+	}
+
+	it("prepares after admission and delivers refreshed content instead of the queued placeholder", async () => {
+		const { host, scheduler, runtime, queued, request } = setup();
+		await runtime.startTaskSession(request);
+		const held = createDeferred<void>();
+		const admitted = createDeferred<void>();
+		const busy = scheduler.run(Symbol(), "busy", request, async () => {
+			admitted.resolve();
+			await held.promise;
+		});
+		await admitted.promise;
+		const prepare = vi.fn(async () => "fresh feedback");
+		const sending = runtime.sendTaskSessionInput("repair", "placeholder", undefined, undefined, undefined, prepare);
+		await queued.promise;
+		expect(prepare).not.toHaveBeenCalled();
+		expect(host.send).not.toHaveBeenCalled();
+		held.resolve();
+		await Promise.all([busy, sending]);
+		expect(prepare).toHaveBeenCalledWith({ cwd: "/tmp/worktree", signal: expect.any(AbortSignal) });
+		expect(host.send).toHaveBeenCalledWith(expect.objectContaining({ prompt: "fresh feedback" }));
+		await runtime.dispose();
+	});
+
+	it("skips an obsolete repair without calling the SDK and releases capacity after preparation failures", async () => {
+		const { host, runtime, request } = setup();
+		await runtime.startTaskSession(request);
+		await runtime.sendTaskSessionInput("repair", "obsolete", undefined, undefined, undefined, async () => null);
+		expect(host.send).not.toHaveBeenCalled();
+		await expect(
+			runtime.sendTaskSessionInput("repair", "unsafe", undefined, undefined, undefined, async () => {
+				throw new Error("Git blocked");
+			}),
+		).rejects.toThrow("Git blocked");
+		expect(host.send).not.toHaveBeenCalled();
+		await runtime.sendTaskSessionInput("repair", "ordinary chat");
+		expect(host.send).toHaveBeenCalledWith(expect.objectContaining({ prompt: "ordinary chat" }));
+		await runtime.dispose();
+	});
+
+	it("also prepares restarted sessions after admission without persisting the callback into subsequent turns", async () => {
+		const { host, runtime, request } = setup();
+		await runtime.startTaskSession(request);
+		const prepare = vi.fn(async () => "fresh restart");
+		await runtime.restartTaskSession({ taskId: "repair", prompt: "old", preparePrompt: prepare });
+		expect(host.send).toHaveBeenLastCalledWith(expect.objectContaining({ prompt: "fresh restart" }));
+		await runtime.sendTaskSessionInput("repair", "next manual turn");
+		expect(prepare).toHaveBeenCalledOnce();
+		await runtime.dispose();
+	});
+});

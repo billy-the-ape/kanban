@@ -34,6 +34,7 @@ const PROJECTS: RuntimeProjectSummary[] = [
 		taskCounts: {
 			backlog: 0,
 			in_progress: 0,
+			paused: 0,
 			review: 0,
 			done: 0,
 			trash: 0,
@@ -136,6 +137,7 @@ describe("ProjectNavigationPanel width persistence", () => {
 					removingProjectId={null}
 					activeSection="projects"
 					onActiveSectionChange={() => {}}
+					renderTasksSection={() => <div>tasks-section-content</div>}
 					canShowAgentSection
 					selectedAgentId={null}
 					clineProviderSettings={null}
@@ -235,5 +237,83 @@ describe("ProjectNavigationPanel width persistence", () => {
 
 		expect(container.textContent).toContain("Tips");
 		expect(localStorage.getItem(LocalStorageKey.AgentTipsDismissed)).toBeNull();
+	});
+	it("renders the paused pill between in-progress and review counts", () => {
+		renderPanel({
+			projects: [
+				{
+					id: "project-1",
+					name: "Kanban",
+					path: "/tmp/kanban",
+					taskCounts: {
+						backlog: 0,
+						in_progress: 0,
+						paused: 0,
+						review: 0,
+						done: 0,
+						trash: 0,
+					},
+				},
+				{
+					id: "project-2",
+					name: "Other",
+					path: "/tmp/other",
+					taskCounts: {
+						backlog: 0,
+						in_progress: 3,
+						paused: 2,
+						review: 1,
+						done: 0,
+						trash: 0,
+					},
+				},
+			],
+		});
+
+		const badges = Array.from(container.querySelectorAll("span[title]")).filter(
+			(candidate) =>
+				candidate.getAttribute("title") === "In Progress" ||
+				candidate.getAttribute("title") === "Paused" ||
+				candidate.getAttribute("title") === "Review",
+		);
+		expect(badges.map((badge) => badge.getAttribute("title"))).toEqual(["In Progress", "Paused", "Review"]);
+		const pausedBadge = badges.find((badge) => badge.getAttribute("title") === "Paused");
+		if (!pausedBadge) {
+			throw new Error("Paused badge was not rendered");
+		}
+		expect(pausedBadge.textContent).toContain("P");
+		expect(pausedBadge.textContent).toContain("2");
+		expect(pausedBadge.className).toContain("text-status-gold");
+	});
+
+	it("omits the paused pill when the paused count is zero", () => {
+		renderPanel();
+		const pausedBadge = Array.from(container.querySelectorAll("span[title]")).find(
+			(candidate) => candidate.getAttribute("title") === "Paused",
+		);
+		expect(pausedBadge).toBeUndefined();
+	});
+
+	it("renders the three section tabs in order and reports Tasks selection", () => {
+		const onActiveSectionChange = vi.fn();
+		renderPanel({ onActiveSectionChange });
+		const sectionButtons = Array.from(container.querySelectorAll("button")).filter((button) =>
+			["Projects", "Tasks", "Kanban Agent"].includes(button.textContent ?? ""),
+		);
+		expect(sectionButtons.map((button) => button.textContent)).toEqual(["Projects", "Tasks", "Kanban Agent"]);
+		const tasksButton = sectionButtons.find((button) => button.textContent === "Tasks");
+		if (!tasksButton) {
+			throw new Error("Tasks section button was not rendered");
+		}
+		act(() => {
+			tasksButton.click();
+		});
+		expect(onActiveSectionChange).toHaveBeenCalledWith("tasks");
+	});
+
+	it("renders the tasks section content and hides the projects footer on the Tasks tab", () => {
+		renderPanel({ activeSection: "tasks" });
+		expect(container.textContent).toContain("tasks-section-content");
+		expect(container.textContent).not.toContain("Kanban is in beta. Help us improve by sharing your experience.");
 	});
 });

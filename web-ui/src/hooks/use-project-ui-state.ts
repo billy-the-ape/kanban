@@ -1,13 +1,17 @@
+import { countTasksByDisplayState } from "@runtime-task-display-state";
 import type { ComponentProps } from "react";
 import { useMemo } from "react";
 import type { ProjectNavigationPanel } from "@/components/project-navigation-panel";
-import { countTasksByColumn } from "@/hooks/app-utils";
+import type { RuntimeTaskSessionSummary } from "@/runtime/types";
 import type { BoardData } from "@/types";
 
 type ProjectSummaries = ComponentProps<typeof ProjectNavigationPanel>["projects"];
+type TaskSessionSummaries = Record<string, RuntimeTaskSessionSummary>;
 
 interface UseProjectUiStateInput {
 	board: BoardData;
+	/** Effective session summaries for the open project (merged live + hydrated). */
+	sessions: TaskSessionSummaries;
 	canPersistWorkspaceState: boolean;
 	currentProjectId: string | null;
 	projects: ProjectSummaries;
@@ -31,6 +35,7 @@ interface UseProjectUiStateResult {
 
 export function useProjectUiState({
 	board,
+	sessions,
 	canPersistWorkspaceState,
 	currentProjectId,
 	projects,
@@ -47,7 +52,7 @@ export function useProjectUiState({
 		if (!canPersistWorkspaceState || !currentProjectId) {
 			return projects;
 		}
-		const localCounts = countTasksByColumn(board);
+		const localCounts = countTasksByDisplayState(board, sessions);
 		return projects.map((project) =>
 			project.id === currentProjectId
 				? {
@@ -56,7 +61,7 @@ export function useProjectUiState({
 					}
 				: project,
 		);
-	}, [board, canPersistWorkspaceState, currentProjectId, projects]);
+	}, [board, canPersistWorkspaceState, currentProjectId, projects, sessions]);
 
 	const navigationProjectPath = useMemo(() => {
 		if (!navigationCurrentProjectId) {

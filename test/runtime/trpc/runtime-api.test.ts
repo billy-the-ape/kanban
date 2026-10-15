@@ -3774,8 +3774,199 @@ describe("createRuntimeApi buildTaskDiagnosticsExportPlan (DIAG-3)", () => {
 	});
 });
 
+describe("createRuntimeApi getTaskQualitySummary (DIAG-PANEL)", () => {
+	const scope = {
+		workspaceId: "workspace-1",
+		workspacePath: "/tmp/repo",
+	};
+
+	type SnapshotSource = {
+		taskSnapshot: unknown;
+		taskSnapshotError: string | null;
+		reviewSnapshot: unknown;
+		reviewSnapshotError: string | null;
+	};
+
+	function createQualitySnapshot(kind: "task" | "review", sessionId: string) {
+		return {
+			kind,
+			taskId: kind === "review" ? "task-1::review" : "task-1",
+			capturedAt: 1760246400000,
+			enumerationErrors: [],
+			listingTruncated: false,
+			segments: [
+				{
+					header: {
+						sessionId,
+						kind,
+						source: "core",
+						status: "completed",
+						startedAt: "2026-10-12T09:00:00.000Z",
+						endedAt: "2026-10-12T09:30:00.000Z",
+						updatedAt: "2026-10-12T09:30:00.000Z",
+						provider: "anthropic",
+						model: "claude-sonnet-4.6",
+						cwd: "/tmp/worktree",
+						workspaceRoot: "/tmp/worktree",
+						exitCode: 0,
+					},
+					artifactTaskId: kind === "review" ? "task-1::review" : "task-1",
+					launchConfig: { mode: "act", systemPrompt: "", reasoningEffort: null },
+					transcript: { status: "complete", reason: null },
+					messages: [
+						{
+							role: "assistant",
+							content: "Done.",
+							ts: 1760246400001,
+							metrics: { inputTokens: 100, outputTokens: 25, cacheReadTokens: 0, cacheWriteTokens: 0 },
+							sessionId,
+						},
+					],
+					liveTail: null,
+					readError: null,
+					toolOrigins: [],
+				},
+			],
+		};
+	}
+
+	function createQualityApi(snapshotSource: (scope: unknown, taskId: string) => Promise<SnapshotSource>) {
+		return createTestRuntimeApi({
+			getActiveWorkspaceId: () => "workspace-1",
+			loadScopedRuntimeConfig: async () => createRuntimeConfigState(),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: async () => ({ getSummary: () => null }) as never,
+			getScopedClineTaskSessionService: async () => createClineTaskSessionServiceMock() as never,
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+			getTaskExportSnapshot: snapshotSource as never,
+		});
+	}
+
+	it("summarizes only the requested task's snapshots (target-only, no board read)", async () => {
+		const snapshotSource = vi.fn(
+			async (_scope: unknown, taskId: string): Promise<SnapshotSource> => ({
+				taskSnapshot: taskId === "task-1" ? createQualitySnapshot("task", "s-task") : null,
+				taskSnapshotError: null,
+				reviewSnapshot: taskId === "task-1" ? createQualitySnapshot("review", "s-review") : null,
+				reviewSnapshotError: null,
+			}),
+		);
+		const api = createQualityApi(snapshotSource);
+		const response = await api.getTaskQualitySummary(scope, { taskId: "task-1" });
+		expect(snapshotSource).toHaveBeenCalledTimes(1);
+		expect(snapshotSource).toHaveBeenCalledWith(scope, "task-1");
+		expect(response.ok).toBe(true);
+		expect(response.taskId).toBe("task-1");
+		expect(response.coverage.status).toBe("complete");
+		expect(response.sessionCounts).toEqual({ working: 1, review: 1, verificationRepair: 0, distinctSessions: 2 });
+		expect(response.usage.outputTokens).toEqual({ total: 25, coverage: 1 });
+		expect(response.sourceWarning).toBeNull();
+	});
+
+	it("shares one in-flight analysis for identical requests and isolates by workspace", async () => {
+		const snapshotSource = vi.fn(
+			async (_scope: unknown, _taskId: string): Promise<SnapshotSource> => ({
+				taskSnapshot: createQualitySnapshot("task", "s-task"),
+				taskSnapshotError: null,
+				reviewSnapshot: null,
+				reviewSnapshotError: null,
+			}),
+		);
+		const api = createQualityApi(snapshotSource);
+		const first = api.getTaskQualitySummary(scope, { taskId: "task-1" });
+		const second = api.getTaskQualitySummary(scope, { taskId: "task-1" });
+		expect(second).toBe(first);
+		// A different workspace scope is a different request even for the same task.
+		const other = api.getTaskQualitySummary(
+			{ workspaceId: "workspace-2", workspacePath: "/tmp/other" },
+			{ taskId: "task-1" },
+		);
+		const [firstResponse, otherResponse] = await Promise.all([first, other]);
+		expect(snapshotSource).toHaveBeenCalledTimes(2);
+		expect(snapshotSource.mock.calls[0]).toEqual([scope, "task-1"]);
+		expect(snapshotSource.mock.calls[1]).toEqual([
+			{ workspaceId: "workspace-2", workspacePath: "/tmp/other" },
+			"task-1",
+		]);
+		expect(firstResponse.taskId).toBe("task-1");
+		expect(otherResponse.taskId).toBe("task-1");
+	});
+
+	it("serializes different tasks within one workspace", async () => {
+		const order: string[] = [];
+		let releaseFirst: () => void = () => {};
+		const firstGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const snapshotSource = vi.fn(async (_scope: unknown, taskId: string): Promise<SnapshotSource> => {
+			order.push(taskId);
+			if (taskId === "task-1") {
+				await firstGate;
+			}
+			return { taskSnapshot: null, taskSnapshotError: null, reviewSnapshot: null, reviewSnapshotError: null };
+		});
+		const api = createQualityApi(snapshotSource);
+		const first = api.getTaskQualitySummary(scope, { taskId: "task-1" });
+		const second = api.getTaskQualitySummary(scope, { taskId: "task-2" });
+		// Let the first analysis start (the chain defers execution to a microtask).
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		// The second analysis waits for the first (bounded concurrency).
+		expect(order).toEqual(["task-1"]);
+		releaseFirst();
+		const [_firstResponse, secondResponse] = await Promise.all([first, second]);
+		expect(order).toEqual(["task-1", "task-2"]);
+		expect(secondResponse.taskId).toBe("task-2");
+	});
+
+	it("carries a snapshot failure as explicit unavailable coverage, not a crash", async () => {
+		const api = createQualityApi(async () => {
+			throw new Error("session host unavailable");
+		});
+		const response = await api.getTaskQualitySummary(scope, { taskId: "task-1" });
+		expect(response.ok).toBe(true);
+		expect(response.coverage.status).toBe("unavailable");
+		expect(response.coverage.reasons).toEqual([
+			"session class task snapshot failed: session host unavailable",
+			"session class review snapshot failed: session host unavailable",
+			"no Cline session transcript is recorded for this task",
+		]);
+	});
+
+	it("keeps terminal session availability separate from native transcript coverage", async () => {
+		const terminalSummary = createSummary({ agentId: "codex" });
+		const api = createTestRuntimeApi({
+			getActiveWorkspaceId: () => "workspace-1",
+			loadScopedRuntimeConfig: async () => createRuntimeConfigState(),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: async () =>
+				({
+					getSummary: (taskId: string) => (taskId === "task-1" ? terminalSummary : null),
+					hasActiveProcess: () => false,
+				}) as never,
+			getScopedClineTaskSessionService: async () => createClineTaskSessionServiceMock() as never,
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+			getTaskExportSnapshot: (async (): Promise<SnapshotSource> => ({
+				taskSnapshot: createQualitySnapshot("task", "s-task"),
+				taskSnapshotError: null,
+				reviewSnapshot: null,
+				reviewSnapshotError: null,
+			})) as never,
+		});
+		const response = await api.getTaskQualitySummary(scope, { taskId: "task-1" });
+		expect(response.ok).toBe(true);
+		expect(response.coverage.status).toBe("partial");
+		expect(response.sessionSource).toBe("terminal");
+		expect(response.terminalSummaryAvailable).toBe(true);
+		expect(response.sourceWarning).toContain("terminal agent session");
+		// The recorded native totals survive alongside the terminal warning.
+		expect(response.responses.assistantResponses).toBe(1);
+	});
+});
+
 describe("createRuntimeApi loadConfig", () => {
-	it("returns the awaited config fields alongside the installed PR consumers", async () => {
+	it("returns the awaited config fields", async () => {
 		agentRegistryMocks.buildRuntimeConfigResponse.mockReturnValue({
 			selectedAgentId: "claude",
 			commitPromptTemplate: "commit",
@@ -3788,16 +3979,14 @@ describe("createRuntimeApi loadConfig", () => {
 			getScopedClineTaskSessionService: vi.fn(async () => createClineTaskSessionServiceMock() as never),
 			resolveInteractiveShellCommand: vi.fn(),
 			runCommand: vi.fn(),
-			getInstalledPrConsumers: vi.fn(() => []),
 		});
 
 		const response = await api.loadConfig({ workspaceId: "workspace-1", workspacePath: "/tmp/repo" });
 
-		// Regression: a dropped `await` spread a Promise, so the response held
-		// only `installedPrConsumers` and lost every config field.
+		// Regression: a dropped `await` spread a Promise, so the response lost
+		// every config field.
 		expect(response.selectedAgentId).toBe("claude");
 		expect(response.commitPromptTemplate).toBe("commit");
-		expect(response.installedPrConsumers).toEqual([]);
 	});
 });
 

@@ -65,7 +65,6 @@ function createRuntimeConfigResponse(selectedAgentId: RuntimeConfigResponse["sel
 			dispatchEnabled: false,
 			workerLimit: 1,
 		},
-		installedPrConsumers: [],
 	};
 }
 

@@ -69,6 +69,7 @@ import type {
 	RuntimeProjectRemoveRequest,
 	RuntimeProjectRemoveResponse,
 	RuntimeProjectsResponse,
+	RuntimeProjectTasksResponse,
 	RuntimePrRecordMutationResponse,
 	RuntimePrRepairOwnerResponse,
 	RuntimePrRepairOwnerSelectRequest,
@@ -129,6 +130,8 @@ import type {
 	RuntimeTaskPullRequestSingleRefreshRequest,
 	RuntimeTaskPullRequestsRefreshRequest,
 	RuntimeTaskPullRequestsRefreshResponse,
+	RuntimeTaskQualitySummaryRequest,
+	RuntimeTaskQualitySummaryResponse,
 	RuntimeTaskReviewInfoRequest,
 	RuntimeTaskReviewInfoResponse,
 	RuntimeTaskReviewStartRequest,
@@ -222,6 +225,7 @@ import {
 	runtimeProjectRemoveRequestSchema,
 	runtimeProjectRemoveResponseSchema,
 	runtimeProjectsResponseSchema,
+	runtimeProjectTasksResponseSchema,
 	runtimePrRecordMutationResponseSchema,
 	runtimePrRepairOwnerResponseSchema,
 	runtimePrRepairOwnerSelectRequestSchema,
@@ -282,6 +286,8 @@ import {
 	runtimeTaskPullRequestSingleRefreshRequestSchema,
 	runtimeTaskPullRequestsRefreshRequestSchema,
 	runtimeTaskPullRequestsRefreshResponseSchema,
+	runtimeTaskQualitySummaryRequestSchema,
+	runtimeTaskQualitySummaryResponseSchema,
 	runtimeTaskReviewInfoRequestSchema,
 	runtimeTaskReviewInfoResponseSchema,
 	runtimeTaskReviewStartRequestSchema,
@@ -388,6 +394,15 @@ export interface RuntimeTrpcContext {
 			scope: RuntimeTrpcWorkspaceScope,
 			taskId: string,
 		) => Promise<TaskDiagnosticsExportV3Plan>;
+		/**
+		 * DIAG-PANEL: on-demand recorded quality summary (session spans,
+		 * reported usage, tool evidence, retries). Read-only and
+		 * target-scoped; on-demand only — never a board-wide scan.
+		 */
+		getTaskQualitySummary: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskQualitySummaryRequest,
+		) => Promise<RuntimeTaskQualitySummaryResponse>;
 		/** B-9: backend-owned sequential task dispatch — run one queue pass for this workspace. */
 		dispatchReadyTasks: (scope: RuntimeTrpcWorkspaceScope) => Promise<RuntimeTaskDispatchRunResponse>;
 		/** B-9: read-only queue status (ready/blocked tasks, active worker, dispatch records). */
@@ -586,6 +601,7 @@ export interface RuntimeTrpcContext {
 	};
 	projectsApi: {
 		listProjects: (preferredWorkspaceId: string | null) => Promise<RuntimeProjectsResponse>;
+		listTasks: () => Promise<RuntimeProjectTasksResponse>;
 		addProject: (
 			preferredWorkspaceId: string | null,
 			input: RuntimeProjectAddRequest,
@@ -803,6 +819,13 @@ export const runtimeAppRouter = t.router({
 			.output(runtimeTaskPhasesResponseSchema)
 			.query(async ({ ctx, input }) => {
 				return await ctx.runtimeApi.getTaskPhases(ctx.workspaceScope, input);
+			}),
+		// DIAG-PANEL: on-demand recorded quality summary for the diagnostics panel.
+		getTaskQualitySummary: workspaceProcedure
+			.input(runtimeTaskQualitySummaryRequestSchema)
+			.output(runtimeTaskQualitySummaryResponseSchema)
+			.query(async ({ ctx, input }) => {
+				return await ctx.runtimeApi.getTaskQualitySummary(ctx.workspaceScope, input);
 			}),
 		// B-9: backend-owned sequential task dispatch ("reliable queue").
 		dispatchReadyTasks: workspaceProcedure.output(runtimeTaskDispatchRunResponseSchema).mutation(async ({ ctx }) => {
@@ -1221,6 +1244,9 @@ export const runtimeAppRouter = t.router({
 	projects: t.router({
 		list: t.procedure.output(runtimeProjectsResponseSchema).query(async ({ ctx }) => {
 			return await ctx.projectsApi.listProjects(ctx.requestedWorkspaceId);
+		}),
+		listTasks: t.procedure.output(runtimeProjectTasksResponseSchema).query(async ({ ctx }) => {
+			return await ctx.projectsApi.listTasks();
 		}),
 		add: t.procedure
 			.input(runtimeProjectAddRequestSchema)

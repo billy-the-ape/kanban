@@ -11,7 +11,7 @@ import type { UseTaskSessionsResult } from "@/hooks/use-task-sessions";
 import { fetchTaskDependentsUnlock, requestTaskWorkspaceMaintenance } from "@/runtime/task-delivery";
 import { returnQueuedTaskToBacklog } from "@/runtime/task-queue";
 import type {
-	RuntimePrInstalledConsumer,
+	RuntimeAgentId,
 	RuntimeTaskDependentsUnlock,
 	RuntimeTaskInitialStartStage,
 	RuntimeTaskSessionSummary,
@@ -97,11 +97,10 @@ interface UseBoardInteractionsInput {
 	/** B-9.5: backend task dispatch is enabled, so completed tasks queue their dependents for the backend queue. */
 	backendTaskDispatchEnabled?: boolean;
 	/**
-	 * PRTRACK-1: installed PR tracking consumers (from the runtime config).
-	 * Drives the lifecycle gate: tasks whose linked PR workflow is owned by an
-	 * installed enabled consumer skip legacy automatic completion.
+	 * The workspace's selected agent: resolves an unset card agentId for the
+	 * PR lifecycle gate (the comments half only serves native-Cline tasks).
 	 */
-	installedPrConsumers?: RuntimePrInstalledConsumer[];
+	selectedAgentId?: RuntimeAgentId | null;
 }
 
 export interface UseBoardInteractionsResult {
@@ -154,7 +153,7 @@ export function useBoardInteractions({
 	runAutoReviewGitAction,
 	deterministicDeliveryEnabled = false,
 	backendTaskDispatchEnabled = false,
-	installedPrConsumers,
+	selectedAgentId = null,
 }: UseBoardInteractionsInput): UseBoardInteractionsResult {
 	const previousSessionsRef = useRef<Record<string, RuntimeTaskSessionSummary>>({});
 	const notificationPermissionPromptInFlightRef = useRef(false);
@@ -686,14 +685,11 @@ export function useBoardInteractions({
 
 	// PRTRACK-1: the shared lifecycle gate — legacy automatic completion is
 	// skipped for tasks whose linked PR workflow is owned by an installed
-	// enabled consumer.
+	// enabled consumer (both consumers are always installed; the comments
+	// half only owns native-Cline tasks).
 	const prCompletionGatedTaskIds = useMemo(
-		() =>
-			computePrLifecycleGatedTaskIds(board, {
-				comments: (installedPrConsumers ?? []).some((consumer) => consumer.kind === "comments"),
-				mergeCompletion: (installedPrConsumers ?? []).some((consumer) => consumer.kind === "mergeCompletion"),
-			}),
-		[board, installedPrConsumers],
+		() => computePrLifecycleGatedTaskIds(board, selectedAgentId),
+		[board, selectedAgentId],
 	);
 
 	useReviewAutoActions({

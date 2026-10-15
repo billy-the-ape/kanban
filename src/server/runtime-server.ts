@@ -114,9 +114,6 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 	const getScopedTerminalManager = async (scope: RuntimeTrpcWorkspaceScope): Promise<TerminalSessionManager> =>
 		await deps.ensureTerminalManagerForWorkspace(scope.workspaceId, scope.workspacePath);
 	const clineTaskSessionServiceByWorkspaceId = new Map<string, ClineTaskSessionService>();
-	deps.workspaceRegistry.setClineSessionSummaryProvider?.(
-		(workspaceId) => clineTaskSessionServiceByWorkspaceId.get(workspaceId)?.listSummaries() ?? [],
-	);
 	const clineWatcherRegistry = createClineWatcherRegistry();
 	// B-2.8: one provider service per runtime server so the model-capacity
 	// cache is shared across all session starts/restarts in this process.
@@ -336,10 +333,25 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 					// enumerating every workspace.
 					listBoard: (workspaceId) =>
 						loadWorkspaceBoardById(workspaceId).then((board) => ({ workspaceId, board })),
-					installedConsumers: () => ({
-						comments: state.registry.isInstalled("comments"),
-						mergeCompletion: state.registry.isInstalled("mergeCompletion"),
-					}),
+					// Both PR tracking consumers (comment follow-up and merge
+					// completion) are always installed; the comments half is
+					// further scoped to native-Cline tasks via getSelectedAgentId.
+					installedConsumers: () => ({ comments: true, mergeCompletion: true }),
+					getSelectedAgentId: async (workspaceId) => {
+						const workspacePath = deps.workspaceRegistry.getWorkspacePathById(workspaceId);
+						if (!workspacePath) {
+							return null;
+						}
+						try {
+							const config = await deps.workspaceRegistry.loadScopedRuntimeConfig({
+								workspaceId,
+								workspacePath,
+							});
+							return config.selectedAgentId;
+						} catch {
+							return null;
+						}
+					},
 				},
 				(error) =>
 					deps.warn(
@@ -570,15 +582,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			warnTaskDispatchError: (error) => {
 				deps.warn(`[task-dispatch] Queue pass failed: ${error instanceof Error ? error.message : String(error)}`);
 			},
-			// PRTRACK-1: installed-consumer signal + shared lifecycle gate for
-			// deterministic delivery.
-			getInstalledPrConsumers: () =>
-				getPrTrackingState()
-					.registry.listInstalled()
-					.map((registration) => ({
-						kind: registration.kind,
-						requiredReadSources: registration.requiredReadSources,
-					})),
+			// PRTRACK-1: shared lifecycle gate for deterministic delivery.
 			checkPrDeliveryReservation: async (scope, taskId) => {
 				const board = await loadWorkspaceBoardById(scope.workspaceId).catch(() => null);
 				if (!board) {
@@ -622,6 +626,8 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			workspaceApi: createWorkspaceApi({
 				ensureTerminalManagerForWorkspace: deps.ensureTerminalManagerForWorkspace,
 				getScopedClineTaskSessionService,
+				getClineTaskSessionSummaries: (workspaceId) =>
+					deps.runtimeStateHub.listClineTaskSessionSummaries(workspaceId),
 				broadcastRuntimeWorkspaceStateUpdated: broadcastRuntimeWorkspaceStateUpdatedWithReconcile,
 				broadcastRuntimeProjectsUpdated: deps.runtimeStateHub.broadcastRuntimeProjectsUpdated,
 				buildWorkspaceStateSnapshot: deps.workspaceRegistry.buildWorkspaceStateSnapshot,
@@ -683,6 +689,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				},
 				warn: deps.warn,
 				buildProjectsPayload: deps.workspaceRegistry.buildProjectsPayload,
+				buildProjectTasksPayload: deps.workspaceRegistry.buildProjectTasksPayload,
 				pickDirectoryPathFromSystemDialog: deps.pickDirectoryPathFromSystemDialog,
 				serverCwd: process.cwd(),
 			}),
@@ -695,7 +702,6 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			prTrackingApi: createPrTrackingApi({
 				getPrTrackingCoordinator: () => getPrTrackingState().coordinator,
 				getPrTrackingStore: () => getPrTrackingState().store,
-				getPrConsumerRegistry: () => getPrTrackingState().registry,
 				listManagedWorkspaceBoards,
 				broadcastRuntimeWorkspaceStateUpdated: (scope) =>
 					broadcastRuntimeWorkspaceStateUpdatedWithReconcile(scope.workspaceId, scope.workspacePath),

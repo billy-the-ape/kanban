@@ -24,7 +24,8 @@
       "@runtime-task-id": ["../src/core/task-id.ts"],
       "@runtime-task-title": ["../src/core/task-title.ts"],
       "@runtime-task-worktree-path": ["../src/workspace/task-worktree-path.ts"],
-      "@runtime-task-state": ["../src/core/task-board-mutations.ts"]
+      "@runtime-task-state": ["../src/core/task-board-mutations.ts"],
+      "@runtime-task-display-state": ["../src/core/task-display-state.ts"]
     },
     "types": ["vitest/globals"]
   },

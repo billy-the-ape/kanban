@@ -15,6 +15,8 @@ If you are new to the codebase, read these in order:
 
 Runtime topic references:
 
+- [`runtime/pr-comment-execution.md`](./runtime/pr-comment-execution.md) — approval filtering, execution-time refresh, Git blockers, and bounded feedback batches
+
 - [`runtime/cline-concurrency.md`](./runtime/cline-concurrency.md) — model-aware Cline task concurrency limits and admission
 - [`runtime/diagnostics-export.md`](./runtime/diagnostics-export.md) — the task diagnostics download: what the bundle contains, completeness semantics, and the browser/CLI transport
 - [`runtime/editor-recovery.md`](./runtime/editor-recovery.md) — editor tool failure recovery and file state handling

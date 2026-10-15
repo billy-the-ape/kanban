@@ -2,6 +2,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClineTaskSessionService } from "../../../src/cline-sdk/cline-task-session-service";
+import type { ClineTurnPreparation } from "../../../src/cline-sdk/cline-turn-preparation";
 import type {
 	RuntimeAgentId,
 	RuntimeBoardData,
@@ -19,6 +20,7 @@ import {
 	buildCommentHandlingInstruction,
 	createPrCommentAutomationService,
 } from "../../../src/pr-tracking/comment-automation-service";
+import type { refreshCommentWorktree } from "../../../src/pr-tracking/comment-git-refresh";
 import type { PrFeedbackEvent } from "../../../src/pr-tracking/feedback-fingerprint";
 import { computePrFeedbackFingerprint } from "../../../src/pr-tracking/feedback-fingerprint";
 import type { GitHubPrSnapshot } from "../../../src/pr-tracking/github-pr-client";
@@ -154,6 +156,8 @@ async function upsertSeed(
 
 function makeService(
 	overrides: {
+		deferPreparation?: boolean;
+		refreshGit?: typeof refreshCommentWorktree;
 		workspaces?: Array<{ workspaceId: string; workspacePath: string }>;
 		workspaceStates?: Map<string, RuntimeWorkspaceStateResponse>;
 		loadWorkspaceState?: (workspacePath: string) => Promise<RuntimeWorkspaceStateResponse>;
@@ -179,6 +183,7 @@ function makeService(
 	const workspaceStates = overrides.workspaceStates ?? new Map<string, RuntimeWorkspaceStateResponse>();
 	const sent: Array<{ scope: { workspaceId: string; workspacePath: string }; body: RuntimeTaskChatSendRequest }> = [];
 	const snapshotCalls: string[] = [];
+	const preparations: ClineTurnPreparation[] = [];
 	const service = createPrCommentAutomationService({
 		listManagedWorkspaces: () => workspaces,
 		loadWorkspaceState:
@@ -193,7 +198,15 @@ function makeService(
 		getClineTaskSessionService: overrides.getClineTaskSessionService ?? (async () => idleCline),
 		getTerminalManager: async () => idleTerminal,
 		resolveWorkspacePathById: overrides.resolveWorkspacePathById,
-		sendTaskChatMessage: async (scope, body) => {
+		refreshGit: overrides.refreshGit ?? (async () => "abc"),
+		sendTaskChatMessage: async (scope, body, prepare) => {
+			if (prepare) {
+				preparations.push(prepare);
+				if (!overrides.deferPreparation && !overrides.send) {
+					const text = await prepare({ cwd: "/task-worktree", signal: new AbortController().signal });
+					if (text !== null) body = { ...body, text };
+				}
+			}
 			sent.push({ scope, body });
 			return overrides.send
 				? overrides.send(scope, body)
@@ -220,7 +233,7 @@ function makeService(
 		now: overrides.now ?? (() => NOW),
 		warn: () => undefined,
 	});
-	return { service, sent, workspaces, workspaceStates, snapshotCalls };
+	return { service, sent, workspaces, workspaceStates, snapshotCalls, preparations };
 }
 
 describe("applyPrPollOutcome", () => {
@@ -630,7 +643,7 @@ describe("PrCommentAutomationService", () => {
 		expect(harness.sent[0]?.scope).toMatchObject(scope);
 		expect(harness.sent[0]?.body.taskId).toBe("t1");
 		expect(harness.sent[0]?.body.mode).toBe("act");
-		expect(harness.sent[0]?.body.text).toBe(buildCommentHandlingInstruction(PR.url));
+		expect(harness.sent[0]?.body.text).toContain(buildCommentHandlingInstruction(PR.url));
 
 		const loaded = await loadPrTrackingRecord(KEY);
 		expect(loaded.status).toBe("ok");
@@ -943,7 +956,7 @@ describe("PrCommentAutomationService", () => {
 		expect(harness.sent[0]?.scope).toMatchObject(scope);
 		expect(harness.sent[0]?.body.taskId).toBe("t1");
 		expect(harness.sent[0]?.body.mode).toBe("act");
-		expect(harness.sent[0]?.body.text).toBe(buildCommentHandlingInstruction(PR.url));
+		expect(harness.sent[0]?.body.text).toContain(buildCommentHandlingInstruction(PR.url));
 
 		const loaded = await loadPrTrackingRecord(KEY);
 		expect(loaded.status).toBe("ok");
@@ -2316,5 +2329,158 @@ describe("PrCommentAutomationService dispose", () => {
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+});
+
+describe("PR repair execution freshness", () => {
+	const scope = { workspaceId: "w1", workspacePath: "/w1" };
+	const first = makeEvent({ providerId: "conversation-1", body: "Fix first", updatedAt: NOW - 180_000 });
+	const states = () =>
+		new Map([["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })])]]);
+	const context = () => ({ cwd: "/task-worktree", signal: new AbortController().signal });
+	async function record() {
+		const loaded = await loadPrTrackingRecord(KEY);
+		if (loaded.status !== "ok") throw new Error("missing tracking record");
+		return loaded.record.commentAutomation;
+	}
+
+	it("defers capture until admission, refreshes after 30s, and absorbs edits/new feedback into one prompt", async () => {
+		let clock = NOW;
+		const snapshot = { events: [first] };
+		const refreshGit = vi.fn(async () => "abc");
+		const harness = makeService({
+			deferPreparation: true,
+			workspaceStates: states(),
+			snapshot,
+			now: () => clock,
+			refreshGit,
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		expect((await record()).dispatch?.status).toBe("waiting");
+		expect((await record()).lastDispatchedFeedbackFingerprint).toBeNull();
+		expect(refreshGit).not.toHaveBeenCalled();
+		const calls = harness.snapshotCalls.length;
+		clock += 30_001;
+		snapshot.events = [
+			{ ...first, body: "Edited first", bodyDigest: "edited" },
+			makeEvent({ providerId: "inline-2", body: "New feedback", updatedAt: clock }),
+		];
+		const prompt = await harness.preparations[0]?.(context());
+		expect(prompt).toContain("Edited first");
+		expect(prompt).toContain("New feedback");
+		expect(prompt).not.toContain("Fix first");
+		expect(harness.snapshotCalls).toHaveLength(calls + 1);
+		expect(refreshGit).toHaveBeenCalledWith("/task-worktree", expect.anything(), expect.any(AbortSignal));
+		expect((await record()).lastDispatchedFeedbackFingerprint).toEqual(fingerprintOf(snapshot.events));
+	});
+
+	it("reuses a complete fresh snapshot and still verifies Git", async () => {
+		const refreshGit = vi.fn(async () => "abc");
+		const harness = makeService({
+			deferPreparation: true,
+			workspaceStates: states(),
+			snapshot: { events: [first] },
+			refreshGit,
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		const calls = harness.snapshotCalls.length;
+		await harness.preparations[0]?.(context());
+		expect(harness.snapshotCalls).toHaveLength(calls);
+		expect(refreshGit).toHaveBeenCalledOnce();
+	});
+
+	it.each(["approved with no eligible feedback", "merged"])(
+		"skips a queued turn that became %s without Git or watermark advancement",
+		async (reason) => {
+			let clock = NOW;
+			const snapshot: Partial<GitHubPrSnapshot> = { events: [first] };
+			const refreshGit = vi.fn(async () => "abc");
+			const harness = makeService({
+				deferPreparation: true,
+				workspaceStates: states(),
+				snapshot,
+				now: () => clock,
+				refreshGit,
+			});
+			await harness.service.refreshWorkspace(scope);
+			await harness.service.runTick();
+			clock += 60_000;
+			snapshot.events = [];
+			if (reason === "merged") snapshot.prState = "merged";
+			expect(await harness.preparations[0]?.(context())).toBeNull();
+			expect(refreshGit).not.toHaveBeenCalled();
+			expect((await record()).dispatch?.status).toBe("completed");
+			expect((await record()).lastDispatchedFeedbackFingerprint).toBeNull();
+		},
+	);
+
+	it("persists a Git blocker and preserves undispatched feedback for explicit Resume", async () => {
+		const harness = makeService({
+			deferPreparation: true,
+			workspaceStates: states(),
+			snapshot: { events: [first] },
+			refreshGit: async () => {
+				throw new Error("Dirty worktree");
+			},
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		await expect(harness.preparations[0]?.(context())).rejects.toThrow("Git refresh blocked: Dirty worktree");
+		expect((await record()).dispatch).toMatchObject({ status: "failed", errorCode: "git_refresh_blocked" });
+		expect((await record()).lastDispatchedFeedbackFingerprint).toBeNull();
+		expect((await harness.service.getTaskPrTrackingState(scope, "t1")).state.resumable).toBe(true);
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(1);
+	});
+
+	it("keeps later feedback pending while running without injecting more messages", async () => {
+		let clock = NOW;
+		const snapshot = { events: [first] };
+		const harness = makeService({ deferPreparation: true, workspaceStates: states(), snapshot, now: () => clock });
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		await harness.preparations[0]?.(context());
+		clock += 70_000;
+		const later = makeEvent({ providerId: "conversation-2", body: "Later", updatedAt: clock });
+		snapshot.events = [first, later];
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(1);
+		expect((await record()).pendingFeedbackFingerprint).toEqual(fingerprintOf([later]));
+		expect((await record()).lastDispatchedFeedbackFingerprint).toEqual(fingerprintOf([first]));
+	});
+	it("restores the pre-turn boundary after an admitted failure so Resume can retry the captured batch", async () => {
+		let live = makeSummary({ state: "idle" });
+		const sessions = { getSummary: () => live, listSummaries: () => [live] } as unknown as ClineTaskSessionService;
+		const harness = makeService({
+			deferPreparation: true,
+			workspaceStates: states(),
+			snapshot: { events: [first] },
+			getClineTaskSessionService: async () => sessions,
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		await harness.preparations[0]?.(context());
+		expect((await record()).lastDispatchedFeedbackFingerprint).not.toBeNull();
+		live = { ...makeSummary({ state: "awaiting_review", lastOutputAt: NOW + 10 }), reviewReason: "error" };
+		await harness.service.runTick();
+		expect((await record()).dispatch?.status).toBe("failed");
+		expect((await record()).lastDispatchedFeedbackFingerprint).toBeNull();
+		expect(await harness.service.resumeCommentHandling(scope, "t1")).toEqual({ ok: true, dispatched: true });
+		expect(await harness.preparations[1]?.(context())).toContain("Fix first");
+	});
+
+	it("never replays an accepted capacity-waiting repair after restart", async () => {
+		const harness = makeService({ deferPreparation: true, workspaceStates: states(), snapshot: { events: [first] } });
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		expect((await record()).dispatch?.status).toBe("waiting");
+		const restarted = makeService({ workspaceStates: states(), snapshot: { events: [first] } });
+		await restarted.service.start();
+		expect(restarted.sent).toHaveLength(0);
+		expect((await record()).dispatch?.status).toBe("failed");
+		expect((await record()).lastDispatchedFeedbackFingerprint).toBeNull();
+		await restarted.service.dispose();
 	});
 });

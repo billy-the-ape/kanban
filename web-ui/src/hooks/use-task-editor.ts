@@ -153,8 +153,8 @@ export function useTaskEditor({
 		"commit",
 		normalizeStoredTaskAutoReviewMode,
 	);
-	const [newTaskPrAutoAddressComments, setNewTaskPrAutoAddressComments] = useState(false);
-	const [newTaskPrAutoFinishOnMerge, setNewTaskPrAutoFinishOnMerge] = useState(false);
+	const [newTaskPrAutoAddressComments, setNewTaskPrAutoAddressComments] = useState(true);
+	const [newTaskPrAutoFinishOnMerge, setNewTaskPrAutoFinishOnMerge] = useState(true);
 	const isNewTaskStartInPlanModeDisabled = false;
 	const [newTaskBranchRef, setNewTaskBranchRef] = useState("");
 	const [lastCreatedTaskBranchByProjectId, setLastCreatedTaskBranchByProjectId] = useState<Record<string, string>>({});

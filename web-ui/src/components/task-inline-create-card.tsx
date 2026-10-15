@@ -102,8 +102,8 @@ export function TaskInlineCreateCard({
 	 * PRTRACK-1: PR automation preferences. The checkbox renders disabled with
 	 * "feature unavailable" when no consumer of that kind is installed.
 	 */
-	prAutoAddressComments?: { checked: boolean; onChange: (value: boolean) => void; featureAvailable: boolean };
-	prAutoFinishOnMerge?: { checked: boolean; onChange: (value: boolean) => void; featureAvailable: boolean };
+	prAutoAddressComments?: { checked: boolean; onChange: (value: boolean) => void };
+	prAutoFinishOnMerge?: { checked: boolean; onChange: (value: boolean) => void };
 	startInPlanModeDisabled?: boolean;
 	workspaceId: string | null;
 	branchRef: string;
@@ -351,7 +351,7 @@ export function TaskInlineCreateCard({
 				</div>
 				{prAutoAddressComments || prAutoFinishOnMerge ? (
 					<div className="flex items-center gap-4 flex-wrap">
-						{prAutoAddressComments?.featureAvailable ? (
+						{prAutoAddressComments ? (
 							<label
 								htmlFor={prAutoAddressCommentsId}
 								className={`flex items-center gap-2 text-[12px] select-none text-text-primary cursor-pointer`}
@@ -370,7 +370,7 @@ export function TaskInlineCreateCard({
 								Auto address PR review comments
 							</label>
 						) : null}
-						{prAutoFinishOnMerge?.featureAvailable ? (
+						{prAutoFinishOnMerge ? (
 							<label
 								htmlFor={prAutoFinishOnMergeId}
 								className="flex items-center gap-2 text-[12px] select-none text-text-primary cursor-pointer"

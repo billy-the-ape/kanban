@@ -1,17 +1,24 @@
 import { type RuntimeConfigState, toGlobalRuntimeConfigState } from "../config/runtime-config";
 import type {
-	RuntimeBoardColumnId,
 	RuntimeBoardData,
 	RuntimeProjectSummary,
 	RuntimeProjectTaskCounts,
+	RuntimeProjectTasksResponse,
 	RuntimeTaskSessionSummary,
 	RuntimeWorkspaceStateResponse,
 } from "../core/api-contract";
+import {
+	buildProjectTaskListItems,
+	compareProjectTaskListItems,
+	countTasksByDisplayState,
+	createEmptyTaskCounts,
+} from "../core/task-display-state";
 import { resolveWorkspaceSessionSummaries } from "../core/workspace-session-summaries";
 import {
 	listWorkspaceIndexEntries,
 	loadWorkspaceBoardById,
 	loadWorkspaceContext,
+	loadWorkspaceSessionsById,
 	loadWorkspaceState,
 	type RuntimeWorkspaceIndexEntry,
 } from "../state/workspace-state";
@@ -28,6 +35,8 @@ export interface CreateWorkspaceRegistryDependencies {
 	loadRuntimeConfig: (cwd: string) => Promise<RuntimeConfigState>;
 	hasGitRepository: (path: string) => boolean;
 	pathIsDirectory: (path: string) => Promise<boolean>;
+	/** Read live Cline task session summaries for tracked services only. */
+	getClineTaskSessionSummaries?: (workspaceId: string) => RuntimeTaskSessionSummary[];
 	onTerminalManagerReady?: (workspaceId: string, manager: TerminalSessionManager) => void;
 }
 
@@ -42,7 +51,6 @@ export interface ResolvedWorkspaceStreamTarget {
 }
 
 export interface WorkspaceRegistry {
-	setClineSessionSummaryProvider?: (provider: (workspaceId: string) => RuntimeTaskSessionSummary[]) => void;
 	getActiveWorkspaceId: () => string | null;
 	getActiveWorkspacePath: () => string | null;
 	getWorkspacePathById: (workspaceId: string) => string | null;
@@ -72,47 +80,13 @@ export interface WorkspaceRegistry {
 		currentProjectId: string | null;
 		projects: RuntimeProjectSummary[];
 	}>;
+	buildProjectTasksPayload: () => Promise<RuntimeProjectTasksResponse>;
 	resolveWorkspaceForStream: (requestedWorkspaceId: string | null) => Promise<ResolvedWorkspaceStreamTarget>;
 	listManagedWorkspaces: () => Array<{
 		workspaceId: string;
 		workspacePath: string | null;
 		terminalManager: TerminalSessionManager;
 	}>;
-}
-
-function createEmptyProjectTaskCounts(): RuntimeProjectTaskCounts {
-	return {
-		backlog: 0,
-		in_progress: 0,
-		review: 0,
-		done: 0,
-		trash: 0,
-	};
-}
-
-function countTasksByColumn(board: RuntimeBoardData): RuntimeProjectTaskCounts {
-	const counts = createEmptyProjectTaskCounts();
-	for (const column of board.columns) {
-		const count = column.cards.length;
-		switch (column.id) {
-			case "backlog":
-				counts.backlog += count;
-				break;
-			case "in_progress":
-				counts.in_progress += count;
-				break;
-			case "review":
-				counts.review += count;
-				break;
-			case "done":
-				counts.done += count;
-				break;
-			case "trash":
-				counts.trash += count;
-				break;
-		}
-	}
-	return counts;
 }
 
 export function collectProjectWorktreeTaskIdsForRemoval(board: RuntimeBoardData): Set<string> {
@@ -128,34 +102,11 @@ export function collectProjectWorktreeTaskIdsForRemoval(board: RuntimeBoardData)
 	return taskIds;
 }
 
-function applyLiveSessionStateToProjectTaskCounts(
-	counts: RuntimeProjectTaskCounts,
-	board: RuntimeBoardData,
-	sessionSummaries: RuntimeWorkspaceStateResponse["sessions"],
-): RuntimeProjectTaskCounts {
-	const taskColumnById = new Map<string, RuntimeBoardColumnId>();
-	for (const column of board.columns) {
-		for (const card of column.cards) {
-			taskColumnById.set(card.id, column.id);
-		}
-	}
-	const next = {
-		...counts,
-	};
-	for (const summary of Object.values(sessionSummaries)) {
-		const columnId = taskColumnById.get(summary.taskId);
-		if (!columnId) {
-			continue;
-		}
-		if (summary.state === "awaiting_review" && columnId === "in_progress") {
-			next.in_progress = Math.max(0, next.in_progress - 1);
-			next.review += 1;
-		}
-		// B-5: interrupted cards stay in their current column (work is
-		// preserved, not discarded), so the persisted board already reflects
-		// the correct counts.
-	}
-	return next;
+/** Display name for a project: the last non-empty segment of its repo path. */
+function deriveProjectName(repoPath: string): string {
+	const normalized = repoPath.replaceAll("\\", "/").replace(/\/+$/g, "");
+	const segments = normalized.split("/").filter((segment) => segment.length > 0);
+	return segments[segments.length - 1] ?? normalized;
 }
 
 function toProjectSummary(project: {
@@ -163,13 +114,10 @@ function toProjectSummary(project: {
 	repoPath: string;
 	taskCounts: RuntimeProjectTaskCounts;
 }): RuntimeProjectSummary {
-	const normalized = project.repoPath.replaceAll("\\", "/").replace(/\/+$/g, "");
-	const segments = normalized.split("/").filter((segment) => segment.length > 0);
-	const name = segments[segments.length - 1] ?? normalized;
 	return {
 		id: project.workspaceId,
 		path: project.repoPath,
-		name,
+		name: deriveProjectName(project.repoPath),
 		taskCounts: project.taskCounts,
 	};
 }
@@ -195,7 +143,6 @@ export async function createWorkspaceRegistry(deps: CreateWorkspaceRegistryDepen
 	const projectTaskCountsByWorkspaceId = new Map<string, RuntimeProjectTaskCounts>();
 	const terminalManagersByWorkspaceId = new Map<string, TerminalSessionManager>();
 	const terminalManagerLoadPromises = new Map<string, Promise<TerminalSessionManager>>();
-	let getClineSessionSummaries: (workspaceId: string) => RuntimeTaskSessionSummary[] = () => [];
 
 	const rememberWorkspace = (workspaceId: string, repoPath: string): void => {
 		workspacePathsById.set(workspaceId, repoPath);
@@ -280,28 +227,43 @@ export async function createWorkspaceRegistry(deps: CreateWorkspaceRegistryDepen
 		};
 	};
 
+	// Read-only merge of persisted sessions, the tracked terminal manager's
+	// live summaries, and registered live Cline summaries. Reuses the landed
+	// live-owner resolution so untracked projects stay untracked (never
+	// instantiates a manager or Cline service).
+	const loadEffectiveTaskSessions = (
+		workspaceId: string,
+		persistedSessions: Record<string, RuntimeTaskSessionSummary>,
+	): Record<string, RuntimeTaskSessionSummary> => {
+		const terminalManager = getTerminalManagerForWorkspace(workspaceId);
+		return resolveWorkspaceSessionSummaries(
+			persistedSessions,
+			terminalManager ?? { listSummaries: () => [], hasActiveProcess: () => false },
+			deps.getClineTaskSessionSummaries?.(workspaceId) ?? [],
+		);
+	};
+
+	const loadProjectTaskSnapshot = async (
+		workspaceId: string,
+	): Promise<{ board: RuntimeBoardData; sessions: Record<string, RuntimeTaskSessionSummary> }> => {
+		const [board, persistedSessions] = await Promise.all([
+			loadWorkspaceBoardById(workspaceId),
+			loadWorkspaceSessionsById(workspaceId),
+		]);
+		return { board, sessions: loadEffectiveTaskSessions(workspaceId, persistedSessions) };
+	};
+
 	const summarizeProjectTaskCounts = async (
 		workspaceId: string,
 		_repoPath: string,
 	): Promise<RuntimeProjectTaskCounts> => {
 		try {
-			const board = await loadWorkspaceBoardById(workspaceId);
-			const persistedCounts = countTasksByColumn(board);
-			const terminalManager = getTerminalManagerForWorkspace(workspaceId);
-			if (!terminalManager) {
-				projectTaskCountsByWorkspaceId.set(workspaceId, persistedCounts);
-				return persistedCounts;
-			}
-			const liveSessionsByTaskId = resolveWorkspaceSessionSummaries(
-				{},
-				terminalManager,
-				getClineSessionSummaries(workspaceId),
-			);
-			const nextCounts = applyLiveSessionStateToProjectTaskCounts(persistedCounts, board, liveSessionsByTaskId);
+			const snapshot = await loadProjectTaskSnapshot(workspaceId);
+			const nextCounts = countTasksByDisplayState(snapshot.board, snapshot.sessions);
 			projectTaskCountsByWorkspaceId.set(workspaceId, nextCounts);
 			return nextCounts;
 		} catch {
-			return projectTaskCountsByWorkspaceId.get(workspaceId) ?? createEmptyProjectTaskCounts();
+			return projectTaskCountsByWorkspaceId.get(workspaceId) ?? createEmptyTaskCounts();
 		}
 	};
 
@@ -310,12 +272,9 @@ export async function createWorkspaceRegistry(deps: CreateWorkspaceRegistryDepen
 		workspacePath: string,
 	): Promise<RuntimeWorkspaceStateResponse> => {
 		const response = await loadWorkspaceState(workspacePath);
-		const terminalManager = await ensureTerminalManagerForWorkspace(workspaceId, workspacePath);
-		response.sessions = resolveWorkspaceSessionSummaries(
-			response.sessions,
-			terminalManager,
-			getClineSessionSummaries(workspaceId),
-		);
+		// Keep the existing manager initialization; only summaries are merged.
+		await ensureTerminalManagerForWorkspace(workspaceId, workspacePath);
+		response.sessions = loadEffectiveTaskSessions(workspaceId, response.sessions);
 		return response;
 	};
 
@@ -344,6 +303,44 @@ export async function createWorkspaceRegistry(deps: CreateWorkspaceRegistryDepen
 			currentProjectId: resolvedCurrentProjectId,
 			projects: projectSummaries,
 		};
+	};
+
+	// The sidebar task list loads every project's board+sessions with a
+	// bounded worker pool so a large project list never fans out unbounded I/O.
+	const PROJECT_TASKS_SNAPSHOT_CONCURRENCY = 4;
+
+	const buildProjectTasksPayload = async (): Promise<RuntimeProjectTasksResponse> => {
+		const entries = await listWorkspaceIndexEntries();
+		const tasks: ReturnType<typeof buildProjectTaskListItems> = [];
+		const unavailableProjectIds: string[] = [];
+		const queuedEntries = entries.slice();
+		let cursor = 0;
+		const workerCount = Math.min(PROJECT_TASKS_SNAPSHOT_CONCURRENCY, queuedEntries.length);
+		const workers = Array.from({ length: workerCount }, async () => {
+			while (true) {
+				const entry = queuedEntries[cursor];
+				cursor += 1;
+				if (!entry) {
+					return;
+				}
+				try {
+					const snapshot = await loadProjectTaskSnapshot(entry.workspaceId);
+					tasks.push(
+						...buildProjectTaskListItems(
+							{ id: entry.workspaceId, name: deriveProjectName(entry.repoPath) },
+							snapshot.board,
+							snapshot.sessions,
+						),
+					);
+				} catch {
+					unavailableProjectIds.push(entry.workspaceId);
+				}
+			}
+		});
+		await Promise.all(workers);
+		tasks.sort(compareProjectTaskListItems);
+		unavailableProjectIds.sort();
+		return { tasks, unavailableProjectIds };
 	};
 
 	const resolveWorkspaceForStream = async (
@@ -451,10 +448,8 @@ export async function createWorkspaceRegistry(deps: CreateWorkspaceRegistryDepen
 		summarizeProjectTaskCounts,
 		createProjectSummary: toProjectSummary,
 		buildWorkspaceStateSnapshot,
-		setClineSessionSummaryProvider: (provider) => {
-			getClineSessionSummaries = provider;
-		},
 		buildProjectsPayload,
+		buildProjectTasksPayload,
 		resolveWorkspaceForStream,
 		listManagedWorkspaces: () => {
 			return Array.from(terminalManagersByWorkspaceId.entries()).map(([workspaceId, terminalManager]) => ({

@@ -20,21 +20,8 @@ import {
 	formatDiagnosticsTimestamp,
 	getDiagnosticsSessionTiming,
 } from "@/utils/task-diagnostics-summary";
-
-function DiagnosticsValue({ label, value }: { label: string; value: string | null | undefined }) {
-	const text = value?.trim();
-	return (
-		<div className="flex items-baseline gap-2">
-			<span className="w-28 shrink-0 text-text-secondary">{label}</span>
-			<span
-				className={cn("min-w-0 flex-1 truncate font-mono", text ? "text-text-primary" : "text-text-tertiary")}
-				title={text ?? undefined}
-			>
-				{text ?? "—"}
-			</span>
-		</div>
-	);
-}
+import { DiagnosticsSection, DiagnosticsValue } from "./task-diagnostics-primitives";
+import { TaskQualitySummarySection } from "./task-quality-summary-section";
 
 function CopyButton({ value, label }: { value: string; label: string }): React.ReactElement {
 	return (
@@ -52,15 +39,6 @@ function CopyButton({ value, label }: { value: string; label: string }): React.R
 				<Copy size={12} />
 			</button>
 		</Tooltip>
-	);
-}
-
-function DiagnosticsSection({ title, children }: { title: string; children: React.ReactNode }) {
-	return (
-		<div className="border-b border-divider px-3 py-2 last:border-b-0">
-			<h4 className="mb-1.5 text-[11px] font-semibold tracking-wider text-text-secondary uppercase m-0">{title}</h4>
-			<div className="space-y-1">{children}</div>
-		</div>
 	);
 }
 
@@ -395,6 +373,11 @@ export function TaskDiagnosticsPanel({
 						<div className="max-h-72 overflow-y-auto border-t border-divider">
 							<PhaseSection response={diagnostics} />
 							<SessionSection response={diagnostics} />
+							<TaskQualitySummarySection
+								workspaceId={workspaceId}
+								taskId={taskId}
+								sessionActive={diagnostics.session.active}
+							/>
 							<ContextUsageSection response={diagnostics} />
 							<GitSection response={diagnostics} onOpenPath={handleOpenPath} />
 							<PreservedWorkSection response={diagnostics} />
