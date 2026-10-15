@@ -263,7 +263,7 @@ export async function createWorkspaceRegistry(deps: CreateWorkspaceRegistryDepen
 		const response = await loadWorkspaceState(workspacePath);
 		// Keep the existing manager initialization; only summaries are merged.
 		await ensureTerminalManagerForWorkspace(workspaceId, workspacePath);
-		response.sessions = await loadEffectiveTaskSessions(workspaceId, response.sessions);
+		response.sessions = loadEffectiveTaskSessions(workspaceId, response.sessions);
 		return response;
 	};
 
