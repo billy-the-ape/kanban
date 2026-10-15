@@ -46,7 +46,9 @@ export function resolveWorkspaceSessionSummaries(
 			}
 			continue;
 		}
-		if (summary.updatedAt > existing.updatedAt) {
+		// Unified tie rule (plan decision 4): on equal updatedAt the
+		// later-listed source wins, so the live terminal copy wins here.
+		if (summary.updatedAt >= existing.updatedAt) {
 			sessions[summary.taskId] = summary;
 		}
 	}

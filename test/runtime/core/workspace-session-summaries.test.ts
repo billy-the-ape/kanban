@@ -64,4 +64,36 @@ describe("workspace session reconciliation", () => {
 		const oldCline = summary({ state: "idle" });
 		expect(resolveWorkspaceSessionSummaries({}, terminal, [oldCline])[active.taskId]).toBe(active);
 	});
+	it("lets the live terminal copy win an equal-timestamp tie over the persisted record", () => {
+		const persisted = summary({ state: "interrupted", updatedAt: 500, exitCode: 1 });
+		const terminalCopy = summary({ state: "interrupted", updatedAt: 500, exitCode: 0 });
+		const terminal = { listSummaries: () => [terminalCopy], hasActiveProcess: () => false };
+		expect(resolveWorkspaceSessionSummaries({ [persisted.taskId]: persisted }, terminal, [])[persisted.taskId]).toBe(
+			terminalCopy,
+		);
+	});
+
+	it("lets the live terminal placeholder win an equal-timestamp tie over a persisted placeholder", () => {
+		const persisted = summary({
+			state: "idle",
+			agentId: null,
+			startedAt: null,
+			updatedAt: 500,
+			lastOutputAt: null,
+			lastHookAt: null,
+		});
+		const terminalCopy = summary({
+			state: "idle",
+			agentId: null,
+			startedAt: null,
+			updatedAt: 500,
+			lastOutputAt: null,
+			lastHookAt: null,
+			workspacePath: "/elsewhere",
+		});
+		const terminal = { listSummaries: () => [terminalCopy], hasActiveProcess: () => false };
+		expect(resolveWorkspaceSessionSummaries({ [persisted.taskId]: persisted }, terminal, [])[persisted.taskId]).toBe(
+			terminalCopy,
+		);
+	});
 });
