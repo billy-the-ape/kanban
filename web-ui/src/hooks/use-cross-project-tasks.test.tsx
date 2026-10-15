@@ -166,6 +166,33 @@ describe("useCrossProjectTasks", () => {
 		expect(queryMock.mock.calls.length).toBe(1);
 	});
 
+	it("schedules a trailing refresh when task counts change with unchanged project ids", async () => {
+		const first = mockNextQuery();
+		await act(async () => {
+			root.render(<HookHarness {...BASE_INPUT} enabled={true} projects={[createProject("a")]} />);
+		});
+		await act(async () => {
+			first.resolve({ tasks: [createTaskRow("a", "t1", 100)], unavailableProjectIds: [] });
+		});
+		// Same project id, updated counts — the stream's projects_updated shape.
+		const updatedProject = {
+			...createProject("a"),
+			taskCounts: { backlog: 0, in_progress: 1, paused: 0, review: 0, done: 0, trash: 0 },
+		};
+		await act(async () => {
+			root.render(<HookHarness {...BASE_INPUT} enabled={true} projects={[updatedProject]} />);
+		});
+		expect(queryMock.mock.calls.length).toBe(1);
+		const second = mockNextQuery();
+		await act(async () => {
+			vi.advanceTimersByTime(1000);
+		});
+		expect(queryMock.mock.calls.length).toBe(2);
+		await act(async () => {
+			second.resolve({ tasks: [], unavailableProjectIds: [] });
+		});
+	});
+
 	it("coalesces rapid project changes into a single trailing refresh", async () => {
 		const first = mockNextQuery();
 		await act(async () => {

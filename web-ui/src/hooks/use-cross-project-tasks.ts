@@ -202,8 +202,11 @@ export function useCrossProjectTasks({
 	}, [enabled, clearTrailingTimeout, startRequest, scheduler]);
 
 	// Raw stream project changes mark the data dirty (except the initial
-	// appearance, which would duplicate the enable request).
-	const projectsSignature = projects.map((project) => project.id).join("|");
+	// appearance, which would duplicate the enable request). The signature
+	// must cover taskCounts: the stream emits new project objects with
+	// updated counts on every projects_updated event, while the ids stay
+	// stable, and counts drive both the rows and the chip totals.
+	const projectsSignature = projects.map((project) => `${project.id}:${JSON.stringify(project.taskCounts)}`).join("|");
 	const hasSeenProjectsRef = useRef(false);
 	useEffect(() => {
 		if (!hasSeenProjectsRef.current) {
