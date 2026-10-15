@@ -162,5 +162,6 @@ export function buildRuntimeConfigResponse(
 		taskDispatchPolicy: runtimeConfig.taskDispatchPolicy ?? null,
 		reliableCompletion: deriveReliableCompletionStatus(runtimeConfig),
 		effectiveContextWindow: extra.effectiveContextWindow ?? null,
+		installedPrConsumers: [],
 	};
 }
