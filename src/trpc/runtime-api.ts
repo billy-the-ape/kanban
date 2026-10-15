@@ -20,6 +20,7 @@ import type { ClineReviewSessionService } from "../cline-sdk/cline-review-sessio
 import { isClineClearSlashCommand } from "../cline-sdk/cline-slash-commands";
 import type { ClineTaskExportSnapshot } from "../cline-sdk/cline-task-export-snapshot";
 import type { ClineTaskSessionService } from "../cline-sdk/cline-task-session-service";
+import type { ClineTurnPreparation } from "../cline-sdk/cline-turn-preparation";
 import type { RuntimeConfigState } from "../config/runtime-config";
 import { updateGlobalRuntimeConfig, updateRuntimeConfig } from "../config/runtime-config";
 import type {
@@ -207,8 +208,12 @@ export function createTaskChatMessageSender(deps: {
 		scope: RuntimeTrpcWorkspaceScope,
 		body: RuntimeTaskChatSendRequest,
 	) => Promise<RuntimeTaskChatPrLinking | undefined>;
-}): (scope: RuntimeTrpcWorkspaceScope, body: RuntimeTaskChatSendRequest) => Promise<RuntimeTaskChatSendResponse> {
-	return async (workspaceScope, body) => {
+}): (
+	scope: RuntimeTrpcWorkspaceScope,
+	body: RuntimeTaskChatSendRequest,
+	preparePrompt?: ClineTurnPreparation,
+) => Promise<RuntimeTaskChatSendResponse> {
+	return async (workspaceScope, body, preparePrompt) => {
 		try {
 			const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
 			if (isClineClearSlashCommand(body.text)) {
@@ -226,6 +231,7 @@ export function createTaskChatMessageSender(deps: {
 				body.text,
 				requestedMode,
 				body.images,
+				...(preparePrompt ? ([preparePrompt] as const) : ([] as const)),
 			);
 			if (!summary) {
 				if (!isHomeAgentSessionId(body.taskId)) {
@@ -236,6 +242,7 @@ export function createTaskChatMessageSender(deps: {
 							body.text,
 							requestedMode,
 							body.images,
+							...(preparePrompt ? ([preparePrompt] as const) : ([] as const)),
 						);
 					}
 					if (!summary) {

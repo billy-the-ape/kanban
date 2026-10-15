@@ -1,3 +1,5 @@
+> Historical plan: execution-time freshness, approval filtering, bounded feedback prompts, and version-token deduplication now follow [the runtime reference](../../../runtime/pr-comment-execution.md).
+
 # PR comment handling — master plan
 
 Updated: 2026-10-13. Status: COMMENT-0 implemented (PR #70), plus the second- through fifth-round review fixes (PR #74, #79, #84 and commit d1133c6); the remaining design below is proposed. Repository: `billy-the-ape/kanban`.

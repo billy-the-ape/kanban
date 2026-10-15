@@ -21,14 +21,17 @@
 // deadline, and captured dispatch aggregate. A rolling safety cap allows at
 // most five automatic send attempts per PR in 60 minutes; a sixth pauses
 // automation until an explicit Resume.
+
 import { randomUUID } from "node:crypto";
 import type { ClineTaskSessionService } from "../cline-sdk/cline-task-session-service";
+import type { ClineTurnPreparation } from "../cline-sdk/cline-turn-preparation";
 import type {
 	RuntimeAgentId,
 	RuntimeBoardCard,
 	RuntimeGitHubPrTrackingRecord,
 	RuntimePrCommentAutomation,
 	RuntimePrCommentOwner,
+	RuntimePrFeedbackFingerprint,
 	RuntimePrPublicationPending,
 	RuntimeTaskChatSendRequest,
 	RuntimeTaskChatSendResponse,
@@ -43,6 +46,8 @@ import { getPullRequestIdentityKey } from "../core/pull-request-links";
 import { resolveWorkspaceSessionSummaries } from "../core/workspace-session-summaries";
 import { isTaskWriterActive } from "../server/task-writer-activity";
 import type { TerminalSessionManager } from "../terminal/session-manager";
+import { refreshCommentWorktree } from "./comment-git-refresh";
+import { buildCommentHandlingInstruction } from "./comment-handling-prompt";
 import type { PrFeedbackEvent } from "./feedback-fingerprint";
 import { computePrFeedbackFingerprint, findPrFeedbackPendingEvents } from "./feedback-fingerprint";
 import type { GitHubPrClient, GitHubPrSnapshot } from "./github-pr-client";
@@ -54,6 +59,8 @@ import {
 	prPublishedIdentityKey,
 	resolvePublicationOutput,
 } from "./pr-publication-attribution";
+
+export { buildCommentHandlingInstruction } from "./comment-handling-prompt";
 
 export interface PrCommentAutomationWorkspaceScope {
 	workspaceId: string;
@@ -113,17 +120,6 @@ function backoffMs(consecutiveFailures: number): number {
 	return BACKOFF_SCHEDULE_MS[Math.min(Math.max(consecutiveFailures, 1) - 1, BACKOFF_SCHEDULE_MS.length - 1)];
 }
 
-/** The fixed follow-up instruction (the same text is never re-sent for a
- * previously dispatched fingerprint). */
-export function buildCommentHandlingInstruction(prUrl: string): string {
-	return [
-		`Address comments on the linked PR: ${prUrl}.`,
-		"Check the feedback against the current code and original task requirements.",
-		"Fix valid issues, explain any disagreements, and update the same PR.",
-		"Explain changes and disagreements in PR comments and within task chat.",
-	].join(" ");
-}
-
 export interface PrCommentAutomationServiceDependencies {
 	listManagedWorkspaces: () => Array<PrCommentAutomationWorkspaceScope>;
 	loadWorkspaceState: (workspacePath: string) => Promise<RuntimeWorkspaceStateResponse>;
@@ -141,6 +137,7 @@ export interface PrCommentAutomationServiceDependencies {
 	sendTaskChatMessage: (
 		scope: PrCommentAutomationWorkspaceScope,
 		body: RuntimeTaskChatSendRequest,
+		preparePrompt?: ClineTurnPreparation,
 	) => Promise<RuntimeTaskChatSendResponse>;
 	/**
 	 * Effective agent for a card — a live session's agent when one exists,
@@ -154,6 +151,7 @@ export interface PrCommentAutomationServiceDependencies {
 	) => Promise<RuntimeAgentId | null>;
 	getGitHubAccessScopeId: () => Promise<string>;
 	ghClient: GitHubPrClient;
+	refreshGit?: typeof refreshCommentWorktree;
 	now?: () => number;
 	warn?: (message: string) => void;
 }
@@ -268,8 +266,12 @@ export function applyPrPollOutcome(
 	if (
 		ownerChanged &&
 		sentDispatch !== null &&
-		(sentDispatch.status === "running" || (sentDispatch.status === "queued" && sentDispatch.attemptedAt !== null))
+		(sentDispatch.status === "running" ||
+			sentDispatch.status === "waiting" ||
+			(sentDispatch.status === "queued" && sentDispatch.attemptedAt !== null))
 	) {
+		if (sentDispatch.previousFeedbackFingerprint !== undefined)
+			nextAutomation.lastDispatchedFeedbackFingerprint = sentDispatch.previousFeedbackFingerprint;
 		nextAutomation.dispatch = {
 			...sentDispatch,
 			status: "failed",
@@ -295,7 +297,9 @@ export function applyPrPollOutcome(
 		const events = excludePublishedEvents(input.snapshot.events, automation.publication.published);
 		const pending = findPrFeedbackPendingEvents(events, automation.lastDispatchedFeedbackFingerprint);
 		const dispatch = automation.dispatch;
-		const inFlight = dispatch !== null && (dispatch.status === "queued" || dispatch.status === "running");
+		const inFlight =
+			dispatch !== null &&
+			(dispatch.status === "queued" || dispatch.status === "waiting" || dispatch.status === "running");
 		const failed = dispatch !== null && dispatch.status === "failed";
 		if (pending.length === 0) {
 			nextAutomation.pendingFeedbackFingerprint = null;
@@ -758,6 +762,14 @@ export class PrCommentAutomationService {
 		const dispatch = automation.dispatch;
 		const owner = automation.repairOwner;
 
+		if (dispatch?.status === "waiting") {
+			const candidate = owner ? sub.candidates.get(`${owner.workspaceId}/${owner.taskId}`) : undefined;
+			const session = candidate ? await this.resolveLiveSessionSummary(candidate, candidate.taskId) : null;
+			if (!candidate || (session && session.state !== "running")) {
+				await this.setDispatchFailed(sub, "The queued PR repair was canceled before execution; Resume to retry.");
+			}
+			return;
+		}
 		if (dispatch !== null && dispatch.status === "running") {
 			if (!owner) {
 				await this.setDispatchFailed(sub, `The repair owner is unavailable; resume manually.`);
@@ -784,7 +796,7 @@ export class PrCommentAutomationService {
 				sub.dispatchRetryAt = nowMs + DISPATCH_RETRY_MS;
 				return;
 			}
-			if (session.state === "failed" || session.state === "interrupted") {
+			if (session.state === "failed" || session.state === "interrupted" || session.reviewReason === "error") {
 				await this.setDispatchFailed(sub, `The comment-handling turn ended without completion.`);
 				return;
 			}
@@ -908,7 +920,7 @@ export class PrCommentAutomationService {
 			sub.dispatchRetryAt = nowMs + DISPATCH_RETRY_MS;
 			return;
 		}
-		await this.executeDispatch(sub, owner, candidate, accessScopeId, snapshot.events);
+		await this.executeDispatch(sub, owner, candidate, accessScopeId, snapshot, nowMs);
 	}
 
 	/**
@@ -921,7 +933,8 @@ export class PrCommentAutomationService {
 		owner: RuntimePrCommentOwner,
 		scope: PrCommentAutomationWorkspaceScope,
 		accessScopeId: string,
-		events: PrFeedbackEvent[],
+		snapshot: GitHubPrSnapshot,
+		capturedAt: number,
 	): Promise<DispatchOutcome> {
 		// One send per PR at a time: a concurrent settle or Resume (two tabs)
 		// must never deliver the instruction twice.
@@ -930,7 +943,7 @@ export class PrCommentAutomationService {
 		}
 		this.sendsInFlight.add(sub.key);
 		try {
-			return await this.sendDispatch(sub, owner, scope, accessScopeId, events);
+			return await this.sendDispatch(sub, owner, scope, accessScopeId, snapshot, capturedAt);
 		} finally {
 			this.sendsInFlight.delete(sub.key);
 		}
@@ -941,7 +954,8 @@ export class PrCommentAutomationService {
 		owner: RuntimePrCommentOwner,
 		scope: PrCommentAutomationWorkspaceScope,
 		accessScopeId: string,
-		events: PrFeedbackEvent[],
+		snapshot: GitHubPrSnapshot,
+		capturedAt: number,
 	): Promise<DispatchOutcome> {
 		const identity = { accessScopeId, pr: sub.pr };
 		const nowMs = this.nowMs();
@@ -967,6 +981,7 @@ export class PrCommentAutomationService {
 		if (
 			currentDispatch !== null &&
 			(currentDispatch.status === "running" ||
+				currentDispatch.status === "waiting" ||
 				(currentDispatch.status === "queued" && currentDispatch.attemptedAt !== null))
 		) {
 			// Another send (e.g. a second Resume) already went out.
@@ -990,7 +1005,7 @@ export class PrCommentAutomationService {
 		}
 		const dispatchId = randomUUID();
 		const captured = computePrFeedbackFingerprint(
-			excludePublishedEvents(events, preAutomation.publication.published),
+			excludePublishedEvents(snapshot.events, preAutomation.publication.published),
 		);
 		if (captured === null) {
 			await this.cancelPendingRecord(sub);
@@ -1005,6 +1020,7 @@ export class PrCommentAutomationService {
 					dispatchId,
 					attemptedAt: null,
 					fingerprint: captured,
+					previousFeedbackFingerprint: preAutomation.lastDispatchedFeedbackFingerprint,
 					ownerRevision: record.commentAutomation.repairOwner?.revision ?? 0,
 					status: "queued",
 					turnRef: null,
@@ -1029,7 +1045,7 @@ export class PrCommentAutomationService {
 						...pruneAutoSendAttempts(record.commentAutomation.autoSendAttempts, nowMs),
 						{ dispatchId, attemptedAt: nowMs },
 					],
-					dispatch: { ...dispatch, attemptedAt: nowMs },
+					dispatch: { ...dispatch, attemptedAt: nowMs, status: "waiting" },
 				},
 			};
 		});
@@ -1038,33 +1054,37 @@ export class PrCommentAutomationService {
 		if (attempted.commentAutomation.dispatch?.dispatchId !== dispatchId) {
 			return { status: "nothing-pending" };
 		}
-		const response = await this.deps.sendTaskChatMessage(scope, {
-			taskId: owner.taskId,
-			text: buildCommentHandlingInstruction(sub.pr.url),
-			mode: "act",
-		});
+		const prepare: ClineTurnPreparation = (context) =>
+			this.prepareDispatch({
+				sub,
+				owner,
+				scope,
+				accessScopeId,
+				snapshot,
+				capturedAt,
+				dispatchId,
+				baseline: preAutomation.lastDispatchedFeedbackFingerprint,
+				...context,
+			});
+		const response = await this.deps.sendTaskChatMessage(
+			scope,
+			{
+				taskId: owner.taskId,
+				text: `Queued automatic PR repair for ${sub.pr.url}. Feedback will be captured when execution begins.`,
+				mode: "act",
+			},
+			prepare,
+		);
 		if (response.ok) {
 			await upsertPrTrackingRecord(sub.key, identity, (record) => {
 				const dispatch = record.commentAutomation.dispatch;
-				if (dispatch === null || dispatch.dispatchId !== dispatchId) {
-					return record;
-				}
+				if (dispatch?.dispatchId !== dispatchId) return record;
 				return {
 					...record,
 					revision: record.revision + 1,
 					commentAutomation: {
 						...record.commentAutomation,
-						pendingFeedbackFingerprint: null,
-						pendingCount: null,
-						debounceDeadline: null,
-						firstPendingAt: null,
-						lastDispatchedFeedbackFingerprint: captured,
-						dispatch: {
-							...dispatch,
-							status: "running",
-							turnRef: response.message?.id ?? null,
-							error: null,
-						},
+						dispatch: { ...dispatch, turnRef: response.message?.id ?? null },
 					},
 				};
 			});
@@ -1086,6 +1106,153 @@ export class PrCommentAutomationService {
 			};
 		});
 		return { status: "held", reason: error };
+	}
+
+	/** Executes inside model admission, after both the task queue and capacity queue. */
+	private async prepareDispatch(input: {
+		sub: PrSubscriptionState;
+		owner: RuntimePrCommentOwner;
+		scope: PrCommentAutomationWorkspaceScope;
+		accessScopeId: string;
+		snapshot: GitHubPrSnapshot;
+		capturedAt: number;
+		dispatchId: string;
+		baseline: RuntimePrFeedbackFingerprint | null;
+		cwd: string;
+		signal: AbortSignal;
+	}): Promise<string | null> {
+		const { sub, scope, owner, dispatchId, signal } = input;
+		const identity = { accessScopeId: input.accessScopeId, pr: sub.pr };
+		let errorCode: "preparation_failed" | "git_refresh_blocked" = "preparation_failed";
+		const update = async (mutate: (automation: RuntimePrCommentAutomation) => RuntimePrCommentAutomation) => {
+			await upsertPrTrackingRecord(sub.key, identity, (record) => {
+				if (record.commentAutomation.dispatch?.dispatchId !== dispatchId) return record;
+				return { ...record, revision: record.revision + 1, commentAutomation: mutate(record.commentAutomation) };
+			});
+		};
+		const skip = async () => {
+			await update((automation) => ({
+				...automation,
+				pendingFeedbackFingerprint: null,
+				pendingCount: null,
+				debounceDeadline: null,
+				firstPendingAt: null,
+				dispatch: automation.dispatch ? { ...automation.dispatch, status: "completed", error: null } : null,
+			}));
+			return null;
+		};
+		try {
+			signal.throwIfAborted();
+			if (this.disposed) throw new Error("Comment handling stopped before execution; Resume after restart.");
+			const state = await this.deps.loadWorkspaceState(scope.workspacePath);
+			const card = state.board.columns
+				.filter((column) => ACTIVE_COLUMN_IDS.has(column.id))
+				.flatMap((column) => column.cards)
+				.find((card) => card.id === owner.taskId);
+			const prs = (card?.pullRequests ?? []).filter((pr) => pr.host === "github.com" && pr.provider === "github");
+			if (
+				!card?.autoAddressComments ||
+				prs.length !== 1 ||
+				getPullRequestIdentityKey(prs[0]) !== sub.key ||
+				!(await this.isClineAgentTask(scope, card))
+			)
+				return skip();
+			const loaded = await loadPrTrackingRecord(sub.key);
+			if (loaded.status !== "ok") throw new Error("The PR tracking record is unavailable.");
+			const automation = loaded.record.commentAutomation;
+			if (
+				automation.dispatch?.dispatchId !== dispatchId ||
+				automation.repairOwner?.revision !== owner.revision ||
+				automation.repairOwner.taskId !== owner.taskId ||
+				automation.repairOwner.workspaceId !== owner.workspaceId
+			)
+				return null;
+			if (automation.publication.pending.length || this.captureBlocked.has(sub.key))
+				throw new Error("Publication capture is unresolved; Resume after it is reconciled.");
+			if ((await this.deps.getGitHubAccessScopeId()) !== input.accessScopeId)
+				throw new Error("GitHub authentication changed while queued; Resume to revalidate.");
+			const reuseSnapshot = this.nowMs() - input.capturedAt < 30_000;
+			const snapshot = reuseSnapshot
+				? input.snapshot
+				: await this.deps.ghClient.fetchSnapshot(
+						{ host: sub.pr.host, repository: sub.pr.repository, number: sub.pr.number },
+						scope.workspacePath,
+						input.accessScopeId,
+					);
+			const capturedAt = reuseSnapshot ? input.capturedAt : this.nowMs();
+			if (!snapshot.complete)
+				throw new Error(
+					snapshot.authError ?? "Cannot refresh complete PR feedback; Resume when GitHub is reachable.",
+				);
+			if (snapshot.prState !== "open") return skip();
+			const events = excludePublishedEvents(snapshot.events, automation.publication.published);
+			const pending = findPrFeedbackPendingEvents(events, input.baseline);
+			if (pending.length === 0) return skip();
+			// Build before touching Git so oversized feedback never mutates the worktree.
+			const prompt = buildCommentHandlingInstruction(sub.pr.url, {
+				events: pending,
+				capturedAt,
+				headSha: snapshot.headSha ?? "unknown",
+			});
+			errorCode = "git_refresh_blocked";
+			await (this.deps.refreshGit ?? refreshCommentWorktree)(input.cwd, snapshot, signal);
+			errorCode = "preparation_failed";
+			signal.throwIfAborted();
+			const finalState = await this.deps.loadWorkspaceState(scope.workspacePath);
+			const finalCard = finalState.board.columns
+				.filter((column) => ACTIVE_COLUMN_IDS.has(column.id))
+				.flatMap((column) => column.cards)
+				.find((card) => card.id === owner.taskId);
+			const finalPrs = (finalCard?.pullRequests ?? []).filter(
+				(pr) => pr.host === "github.com" && pr.provider === "github",
+			);
+			if (
+				!finalCard?.autoAddressComments ||
+				finalPrs.length !== 1 ||
+				getPullRequestIdentityKey(finalPrs[0]) !== sub.key
+			)
+				return skip();
+			let authorized = false;
+			await update((current) => {
+				if (
+					current.repairOwner?.revision !== owner.revision ||
+					current.repairOwner.taskId !== owner.taskId ||
+					current.repairOwner.workspaceId !== owner.workspaceId
+				)
+					return current;
+				if (current.dispatch?.status !== "waiting" && current.dispatch?.status !== "running") return current;
+				if (current.publication.pending.length || this.captureBlocked.has(sub.key))
+					throw new Error("Publication capture changed during preparation.");
+				authorized = true;
+				return {
+					...current,
+					pendingFeedbackFingerprint: null,
+					pendingCount: null,
+					debounceDeadline: null,
+					firstPendingAt: null,
+					lastDispatchedFeedbackFingerprint: computePrFeedbackFingerprint(events),
+					dispatch: current.dispatch
+						? {
+								...current.dispatch,
+								status: "running",
+								fingerprint: computePrFeedbackFingerprint(events) ?? current.dispatch.fingerprint,
+								error: null,
+							}
+						: null,
+				};
+			});
+			return authorized ? prompt : null;
+		} catch (error) {
+			const message = `${errorCode === "git_refresh_blocked" ? "Git refresh blocked" : "PR repair preparation failed"}: ${error instanceof Error ? error.message : String(error)}`;
+			await update((automation) => ({
+				...automation,
+				lastDispatchedFeedbackFingerprint: input.baseline,
+				dispatch: automation.dispatch
+					? { ...automation.dispatch, status: "failed", errorCode, error: message }
+					: null,
+			}));
+			throw new Error(message);
+		}
 	}
 
 	private async setDispatchCompleted(sub: PrSubscriptionState): Promise<void> {
@@ -1125,7 +1292,10 @@ export class PrCommentAutomationService {
 		}
 		const record = loaded.record;
 		const dispatch = record.commentAutomation.dispatch;
-		if (dispatch === null || (dispatch.status !== "running" && dispatch.status !== "queued")) {
+		if (
+			dispatch === null ||
+			(dispatch.status !== "running" && dispatch.status !== "waiting" && dispatch.status !== "queued")
+		) {
 			return;
 		}
 		await upsertPrTrackingRecord(sub.key, { accessScopeId: record.accessScopeId, pr: record.pr }, (current) => {
@@ -1143,6 +1313,10 @@ export class PrCommentAutomationService {
 					pendingCount: null,
 					debounceDeadline: null,
 					firstPendingAt: null,
+					lastDispatchedFeedbackFingerprint:
+						currentDispatch.previousFeedbackFingerprint !== undefined
+							? currentDispatch.previousFeedbackFingerprint
+							: current.commentAutomation.lastDispatchedFeedbackFingerprint,
 					dispatch: { ...currentDispatch, status: "failed", error },
 				},
 			};
@@ -1662,7 +1836,10 @@ export class PrCommentAutomationService {
 				return;
 			}
 			const dispatch = record.commentAutomation.dispatch;
-			if (dispatch === null || (dispatch.status !== "queued" && dispatch.status !== "running")) {
+			if (
+				dispatch === null ||
+				(dispatch.status !== "queued" && dispatch.status !== "waiting" && dispatch.status !== "running")
+			) {
 				continue;
 			}
 
@@ -1733,12 +1910,13 @@ export class PrCommentAutomationService {
 				// Otherwise: keep queued; the deadline pass re-validates.
 				continue;
 			}
-			if (sessionState === "running") {
+			if (sessionState === "running" && dispatch.status !== "waiting") {
 				continue; // The turn may still be our turn; settle it live.
 			}
 			// Live post-dispatch evidence settles the dispatch as it actually
 			// ended; without it the outcome is unknown.
 			const completed =
+				dispatch.status !== "waiting" &&
 				dispatch.attemptedAt !== null &&
 				sessionLastOutputAt !== null &&
 				sessionLastOutputAt >= dispatch.attemptedAt &&
@@ -1761,6 +1939,9 @@ export class PrCommentAutomationService {
 							// watermark (and clear the pending-tracking fields,
 							// as the post-send upsert does) so the same
 							// feedback cannot be requeued after restart.
+							...(!completed && currentDispatch.previousFeedbackFingerprint !== undefined
+								? { lastDispatchedFeedbackFingerprint: currentDispatch.previousFeedbackFingerprint }
+								: {}),
 							...(completed
 								? {
 										pendingFeedbackFingerprint: null,
@@ -2088,7 +2269,7 @@ export class PrCommentAutomationService {
 		if (!owner) {
 			return { ok: false, error: `The repair owner is unavailable.`, dispatched: false };
 		}
-		const outcome = await this.executeDispatch(sub, owner, candidate, record.accessScopeId, snapshot.events);
+		const outcome = await this.executeDispatch(sub, owner, candidate, record.accessScopeId, snapshot, nowMs);
 		if (outcome.status === "held") {
 			return { ok: false, error: outcome.reason, dispatched: false };
 		}

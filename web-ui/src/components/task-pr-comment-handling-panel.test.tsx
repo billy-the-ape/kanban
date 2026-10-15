@@ -152,4 +152,34 @@ describe("TaskPrCommentHandlingPanel", () => {
 		expect(pending?.textContent).toContain("Waiting to address 2 new comments");
 		expect(document.querySelector('[data-testid="task-pr-comment-status-blocked"]')).toBeNull();
 	});
+	it("distinguishes queued execution from a Git refresh blocker and exposes Resume", () => {
+		const dispatch = {
+			dispatchId: "repair",
+			attemptedAt: 1,
+			fingerprint: { digest: "d", watermark: 1, watermarkTokens: [] },
+			ownerRevision: 1,
+			status: "waiting" as const,
+			turnRef: null,
+			error: null,
+		};
+		render(makeState({ dispatch }));
+		expect(document.querySelector('[data-testid="task-pr-comment-status-waiting"]')?.textContent).toContain(
+			"feedback refreshes",
+		);
+		render(
+			makeState({
+				dispatch: {
+					...dispatch,
+					status: "failed",
+					errorCode: "git_refresh_blocked",
+					error: "Git refresh blocked: dirty worktree",
+				},
+				resumable: true,
+			}),
+		);
+		expect(document.querySelector('[data-testid="task-pr-comment-status-failed"]')?.textContent).toContain(
+			"Reconcile the task branch",
+		);
+		expect(document.querySelector('[data-testid="task-pr-comment-resume-button"]')).not.toBeNull();
+	});
 });

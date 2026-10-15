@@ -298,3 +298,75 @@ describe("github pr client", () => {
 		await expect(resolveGitHubAccessScopeId(good)).resolves.toBe("octocat");
 	});
 });
+
+describe("approval filtering and captured feedback context", () => {
+	it("ignores nonempty approvals and superseded requests, retaining other reviewers and unresolved inline comments", async () => {
+		const snapshot = await clientWith(
+			makeRunner(
+				baseRoutes({
+					reviews: [
+						{
+							id: 1,
+							state: "CHANGES_REQUESTED",
+							body: "Earlier request",
+							submitted_at: "2026-10-01T00:00:00Z",
+							user: { login: "alice" },
+						},
+						{
+							id: 2,
+							state: "APPROVED",
+							body: "Looks good!",
+							submitted_at: "2026-10-02T00:00:00Z",
+							user: { login: "alice" },
+						},
+						{
+							id: 3,
+							state: "CHANGES_REQUESTED",
+							body: "Still needs work",
+							submitted_at: "2026-10-01T00:00:00Z",
+							user: { login: "bob" },
+						},
+					],
+					inline: [
+						{
+							id: 4,
+							body: "Unresolved inline",
+							updated_at: "2026-10-01T00:00:00Z",
+							path: "src/example.ts",
+							line: 12,
+							diff_hunk: "@@ example @@",
+							html_url: "https://github.com/octo/repo/pull/42#discussion_r4",
+							user: { login: "alice" },
+						},
+					],
+				}),
+			),
+		).fetchSnapshot(PR, "/repo", "scope");
+		expect(snapshot.events.map((event) => event.providerId)).toEqual(["review-3", "inline-4"]);
+		expect(snapshot.events[1]).toMatchObject({
+			path: "src/example.ts",
+			line: 12,
+			diffHunk: "@@ example @@",
+			author: "alice",
+			url: "https://github.com/octo/repo/pull/42#discussion_r4",
+		});
+	});
+	it("produces no eligible feedback for approval alone, even with a body", async () => {
+		const snapshot = await clientWith(
+			makeRunner(
+				baseRoutes({
+					reviews: [
+						{
+							id: 1,
+							state: "APPROVED",
+							body: "All issues fixed; ready to merge",
+							submitted_at: "2026-10-01T00:00:00Z",
+						},
+					],
+				}),
+			),
+		).fetchSnapshot(PR, "/repo", "scope");
+		expect(snapshot.complete).toBe(true);
+		expect(snapshot.events).toEqual([]);
+	});
+});

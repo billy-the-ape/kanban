@@ -35,8 +35,10 @@ export interface GitHubPrSnapshot {
 	authError: string | null;
 	prState: "open" | "closed" | "merged" | null;
 	headSha: string | null;
+	headRef?: string | null;
+	headRepository?: string | null;
 	htmlUrl: string | null;
-	/** Eligible feedback events (transient; bodies never persisted). */
+	/** Eligible feedback events (not persisted in workflow records; may enter task chat). */
 	events: PrFeedbackEvent[];
 }
 
@@ -84,7 +86,18 @@ function toEpochMs(raw: unknown): number {
 	return Number.isFinite(parsed) ? parsed : 0;
 }
 
-interface ReviewEntry {
+interface FeedbackMetadata {
+	html_url?: unknown;
+	user?: { login?: unknown; type?: unknown } | null;
+}
+function feedbackMetadata(entry: FeedbackMetadata) {
+	return {
+		url: typeof entry.html_url === "string" ? entry.html_url : undefined,
+		author: typeof entry.user?.login === "string" ? entry.user.login : undefined,
+	};
+}
+
+interface ReviewEntry extends FeedbackMetadata {
 	id: unknown;
 	state: unknown;
 	body: unknown;
@@ -93,23 +106,28 @@ interface ReviewEntry {
 	updated_at: unknown;
 }
 
-interface InlineCommentEntry {
+interface InlineCommentEntry extends FeedbackMetadata {
+	path?: unknown;
+	line?: unknown;
+	original_line?: unknown;
+	diff_hunk?: unknown;
 	id: unknown;
 	body: unknown;
 	updated_at: unknown;
 	pull_request_review_id: unknown;
 }
 
-interface ConversationCommentEntry {
+interface ConversationCommentEntry extends FeedbackMetadata {
 	id: unknown;
 	body: unknown;
 	updated_at: unknown;
-	user: { type?: unknown } | null | undefined;
+	user: { type?: unknown; login?: unknown } | null | undefined;
 }
 
 interface PullMetadataEntry {
 	state: unknown;
-	head: { sha?: unknown } | null | undefined;
+	head: { sha?: unknown; ref?: unknown; repo?: { full_name?: unknown } | null } | null | undefined;
+	merged?: unknown;
 	html_url: unknown;
 }
 
@@ -228,7 +246,9 @@ async function fetchResolvedInlineCommentIds(
 				} | null;
 			} | null;
 		};
-		const threads = data?.data?.repository?.pullRequest?.reviewThreads?.nodes ?? [];
+		const reviewThreads = data?.data?.repository?.pullRequest?.reviewThreads;
+		if (!reviewThreads?.pageInfo) return { ids, complete: false };
+		const threads = reviewThreads.nodes ?? [];
 		for (const thread of threads) {
 			if (!thread?.isResolved) {
 				continue;
@@ -256,7 +276,19 @@ async function fetchResolvedInlineCommentIds(
 
 function mapReviews(entries: ReviewEntry[]): PrFeedbackEvent[] {
 	const events: PrFeedbackEvent[] = [];
+	// A later approval supersedes that reviewer's earlier change-request body,
+	// never another reviewer's requests or unresolved inline threads.
+	const decisions = new Map<string, ReviewEntry>();
 	for (const entry of entries) {
+		const author = entry.user?.login;
+		if (typeof author !== "string" || (entry.state !== "APPROVED" && entry.state !== "CHANGES_REQUESTED")) continue;
+		const previous = decisions.get(author);
+		if (!previous || toEpochMs(entry.submitted_at) >= toEpochMs(previous.submitted_at)) decisions.set(author, entry);
+	}
+	for (const entry of entries) {
+		const decision = typeof entry.user?.login === "string" ? decisions.get(entry.user.login) : undefined;
+		if (entry.state === "APPROVED" || (entry.state === "CHANGES_REQUESTED" && decision?.state === "APPROVED"))
+			continue;
 		// PENDING (unpublished) and DISMISSED reviews are never eligible;
 		// empty bodies (including approval-only events) are ignored.
 		if (typeof entry.state !== "string" || entry.state === "PENDING" || entry.state === "DISMISSED") {
@@ -267,13 +299,14 @@ function mapReviews(entries: ReviewEntry[]): PrFeedbackEvent[] {
 			continue;
 		}
 		// Real review objects carry submitted_at; updated_at only exists
-		// after the review itself is edited, so it is a fallback.
-		const updatedAt = toEpochMs(entry.submitted_at) || toEpochMs(entry.updated_at);
+		// on some responses after editing; prefer it when present.
+		const updatedAt = toEpochMs(entry.updated_at) || toEpochMs(entry.submitted_at);
 		if (updatedAt === 0) {
 			continue;
 		}
 		events.push({
 			kind: "review",
+			...feedbackMetadata(entry),
 			providerId: `review-${entry.id}`,
 			updatedAt,
 			bodyDigest: sha256Hex(body),
@@ -319,6 +352,15 @@ function mapInlineComments(
 		}
 		events.push({
 			kind: "inline",
+			...feedbackMetadata(entry),
+			path: typeof entry.path === "string" ? entry.path : undefined,
+			line:
+				typeof entry.line === "number"
+					? entry.line
+					: typeof entry.original_line === "number"
+						? entry.original_line
+						: undefined,
+			diffHunk: typeof entry.diff_hunk === "string" ? entry.diff_hunk : undefined,
 			providerId: `inline-${entry.id}`,
 			updatedAt,
 			bodyDigest: sha256Hex(body),
@@ -348,6 +390,7 @@ function mapConversationComments(entries: ConversationCommentEntry[]): PrFeedbac
 		}
 		events.push({
 			kind: "conversation",
+			...feedbackMetadata(entry),
 			providerId: `conversation-${entry.id}`,
 			updatedAt,
 			bodyDigest: sha256Hex(body),
@@ -425,13 +468,15 @@ export function createGitHubPrClient(
 			}
 			const normalizedState = typeof metadata.state === "string" ? metadata.state.toUpperCase() : "";
 			const prState =
-				normalizedState === "OPEN"
-					? "open"
-					: normalizedState === "MERGED"
-						? "merged"
-						: normalizedState === "CLOSED"
-							? "closed"
-							: null;
+				metadata.merged === true
+					? "merged"
+					: normalizedState === "OPEN"
+						? "open"
+						: normalizedState === "MERGED"
+							? "merged"
+							: normalizedState === "CLOSED"
+								? "closed"
+								: null;
 
 			// Sources are read in parallel, but each source paginates one page
 			// at a time, so at most four reads are in flight at once — within
@@ -448,6 +493,8 @@ export function createGitHubPrClient(
 				authError: null,
 				prState,
 				headSha: typeof metadata.head?.sha === "string" ? metadata.head.sha : null,
+				headRef: typeof metadata.head?.ref === "string" ? metadata.head.ref : null,
+				headRepository: typeof metadata.head?.repo?.full_name === "string" ? metadata.head.repo.full_name : null,
 				htmlUrl: typeof metadata.html_url === "string" ? metadata.html_url : null,
 				events: [
 					...mapReviews(reviews.items),

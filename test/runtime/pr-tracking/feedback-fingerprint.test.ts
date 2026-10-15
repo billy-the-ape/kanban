@@ -113,4 +113,11 @@ describe("pr feedback fingerprint", () => {
 		const other = computePrFeedbackFingerprint([base, extra]);
 		expect(isSamePrFeedbackFingerprint(fp, other)).toBe(false);
 	});
+	it("detects body edits on an older review even when its submission timestamp did not advance", () => {
+		const older = makeEvent({ kind: "review", providerId: "review-1", updatedAt: 100, bodyDigest: "old" });
+		const latest = makeEvent({ providerId: "conversation-2", updatedAt: 300, bodyDigest: "newer" });
+		const sent = computePrFeedbackFingerprint([older, latest]);
+		const edited = { ...older, bodyDigest: "edited" };
+		expect(findPrFeedbackPendingEvents([edited, latest], sent)).toEqual([edited]);
+	});
 });

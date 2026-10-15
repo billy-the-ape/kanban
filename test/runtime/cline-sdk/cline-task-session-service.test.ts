@@ -19,6 +19,7 @@ import {
 } from "../../../src/cline-sdk/cline-task-export-snapshot";
 import type { ClineTaskSessionService } from "../../../src/cline-sdk/cline-task-session-service";
 import { createInMemoryClineTaskSessionService } from "../../../src/cline-sdk/cline-task-session-service";
+import { CLINE_TURN_SKIPPED, type ClineTurnPreparation } from "../../../src/cline-sdk/cline-turn-preparation";
 import { createClineWatcherRegistry } from "../../../src/cline-sdk/cline-watcher-registry";
 import type { RuntimeTaskImage, RuntimeTaskSessionMode } from "../../../src/core/api-contract";
 import type * as WorkspaceState from "../../../src/state/workspace-state";
@@ -220,7 +221,16 @@ function createFakeClineSessionRuntime(): FakeClineSessionRuntimeController {
 				mode?: RuntimeTaskSessionMode,
 				images?: RuntimeTaskImage[],
 				delivery?: "queue" | "steer",
+				preparePrompt?: ClineTurnPreparation,
 			): Promise<unknown> {
+				if (preparePrompt) {
+					const prepared = await preparePrompt({
+						cwd: lastStartRequestByTaskId.get(taskId)?.cwd ?? "/tmp/worktree",
+						signal: new AbortController().signal,
+					});
+					if (prepared === null) return CLINE_TURN_SKIPPED;
+					prompt = prepared;
+				}
 				if (mode) {
 					const lastStartRequest = lastStartRequestByTaskId.get(taskId);
 					if (lastStartRequest) {
@@ -937,6 +947,34 @@ describe("InMemoryClineTaskSessionService", () => {
 		expect(service.listMessages("task-1").some((message) => message.content.includes("Cline SDK send failed"))).toBe(
 			false,
 		);
+	});
+
+	it("replaces the queued chat placeholder with the prepared batch and skips obsolete turns cleanly", async () => {
+		const { service, runtime } = createTrackedService();
+		await service.startTaskSession({ taskId: "task-1", cwd: "/tmp/worktree", prompt: "Start" });
+		await vi.waitFor(() => expect(runtime.startTaskSessionMock).toHaveBeenCalledOnce());
+		await service.sendTaskSessionInput(
+			"task-1",
+			"Queued placeholder",
+			"act",
+			undefined,
+			async () => "Captured feedback",
+		);
+		await vi.waitFor(() =>
+			expect(runtime.sendTaskSessionInputMock).toHaveBeenCalledWith(
+				"task-1",
+				"resolved:Captured feedback",
+				"act",
+				undefined,
+				"queue",
+			),
+		);
+		expect(service.listMessages("task-1").some((message) => message.content === "Captured feedback")).toBe(true);
+		expect(service.listMessages("task-1").some((message) => message.content === "Queued placeholder")).toBe(false);
+		runtime.sendTaskSessionInputMock.mockClear();
+		await service.sendTaskSessionInput("task-1", "Obsolete repair", "act", undefined, async () => null);
+		await vi.waitFor(() => expect(service.getSummary("task-1")?.state).toBe("idle"));
+		expect(runtime.sendTaskSessionInputMock).not.toHaveBeenCalled();
 	});
 
 	it("reuses the current task mode when follow-up input does not provide a mode override", async () => {
