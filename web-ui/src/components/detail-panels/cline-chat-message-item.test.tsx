@@ -201,4 +201,28 @@ describe("ClineChatMessageItem tool messages", () => {
 		expect(container.textContent).toContain("Output (excerpt)");
 		expect(container.textContent).toContain("full output: /tmp/context-artifacts/abc123.txt");
 	});
+
+	it("labels excerpted structured tool results as excerpts", async () => {
+		const output = JSON.stringify({
+			query: "npm test",
+			result: [
+				"test output head",
+				"... [truncated 400 lines; full output: /tmp/context-artifacts/abc123.txt]",
+				"test output tail",
+			].join("\n"),
+			success: true,
+			error: "error head [truncated 20 lines; full output: /tmp/context-artifacts/err123.txt]",
+		});
+		const message = toolMessage(
+			"tool-1",
+			`Tool: run_commands\nInput:\n${JSON.stringify({ commands: ["npm test"] })}\nOutput:\n${output}`,
+		);
+
+		await renderMessage(message);
+		await expandTool(container, "run_commands");
+
+		expect(container.textContent).toContain("Output (excerpt)");
+		expect(container.textContent).toContain("Error (excerpt)");
+		expect(container.textContent).toContain("full output: /tmp/context-artifacts/err123.txt");
+	});
 });

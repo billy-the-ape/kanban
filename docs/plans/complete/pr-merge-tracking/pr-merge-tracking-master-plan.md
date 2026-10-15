@@ -1,6 +1,6 @@
 # PR merge tracking — master plan
 
-Updated: 2026-10-09. Status: MERGE-1 implemented (branch `feat/merge-tracking`, pending review); documentation + implementation. Repository: `billy-the-ape/kanban`.
+Updated: 2026-10-13. Status: implemented — MERGE-0 through MERGE-4 merged (PR #69), plus the second-, third- and fourth-round review fixes (PR #73, #75, #83). Repository: `billy-the-ape/kanban`.
 
 ## Goal and independent feature boundary
 
@@ -20,9 +20,9 @@ consume foundation snapshots/gates and existing completion/dispatch services onl
   [PR #49](https://github.com/billy-the-ape/kanban/pull/49): durable server-owned `pullRequests`
   identities, capture and manual correction. Require the implemented contracts and mutation
   paths, not merely approval of its plan. Resolve PRLINK milestone naming against current code.
-- [B-9 dispatcher](../B-9.md): durable launch ownership, dependency checks and verified baselines.
+- [B-9 dispatcher](../b/B-9.md): durable launch ownership, dependency checks and verified baselines.
 - [Base refresh](../update-base-ref-before-start/PLAN.md): safe preparation and repository locks.
-- [Model capacity queue](../../runtime/cline-concurrency.md): endpoint/model FIFO admission,
+- [Model capacity queue](../../../runtime/cline-concurrency.md): endpoint/model FIFO admission,
   automatic slot discovery, cancellation and `q #N` badges.
 - [PR #21](https://github.com/billy-the-ape/kanban/pull/21) contains an older unmerged
   feedback/repair proposal. These three plans supersede its overlapping monitoring, repair and

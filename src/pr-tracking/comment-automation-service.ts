@@ -1907,6 +1907,47 @@ export class PrCommentAutomationService {
 	}
 
 	/**
+	 * Clears the state an explicit Resume acknowledges: uncertain/stale
+	 * capture entries and the rate-limit history (attempts + pause). Called
+	 * only after every validation that can fail has passed, so a resume that
+	 * fails never clears the pause it was asked to resolve.
+	 */
+	private async clearResumedCommentAutomation(
+		key: string,
+		record: RuntimeGitHubPrTrackingRecord,
+		nowMs: number,
+	): Promise<void> {
+		await upsertPrTrackingRecord(key, { accessScopeId: record.accessScopeId, pr: record.pr }, (current) => {
+			const currentAutomation = current.commentAutomation;
+			if (
+				!currentAutomation.autoSendPaused &&
+				currentAutomation.autoSendAttempts.length === 0 &&
+				!currentAutomation.publication.pending.some(
+					(entry) => entry.uncertain || this.isCapturePendingStale(entry, nowMs),
+				)
+			) {
+				return current;
+			}
+			return {
+				...current,
+				revision: current.revision + 1,
+				commentAutomation: {
+					...currentAutomation,
+					publication: {
+						...currentAutomation.publication,
+						pending: currentAutomation.publication.pending.filter(
+							(entry) => !(entry.uncertain || this.isCapturePendingStale(entry, nowMs)),
+						),
+					},
+					autoSendAttempts: [],
+					autoSendPaused: false,
+				},
+			};
+		});
+		this.captureBlocked.delete(key);
+	}
+
+	/**
 	 * Explicit "Resume comment handling": allowed for a failed dispatch, a
 	 * tripped safety-cap pause, or an unresolved capture uncertainty (the
 	 * last two require nothing else; an uncertain capture additionally
@@ -1965,47 +2006,18 @@ export class PrCommentAutomationService {
 				dispatched: false,
 			};
 		}
-		// Explicit user Resume: clear the acknowledged capture uncertainty and
-		// reset the rate-limit history, so a failed-dispatch Resume is not
-		// immediately re-paused by the cap. This is the explicit
-		// acknowledgment itself, never a silent bypass.
-		await upsertPrTrackingRecord(key, { accessScopeId: record.accessScopeId, pr: record.pr }, (current) => {
-			const currentAutomation = current.commentAutomation;
-			if (
-				!currentAutomation.autoSendPaused &&
-				currentAutomation.autoSendAttempts.length === 0 &&
-				!currentAutomation.publication.pending.some(
-					(entry) => entry.uncertain || this.isCapturePendingStale(entry, nowMs),
-				)
-			) {
-				return current;
-			}
-			return {
-				...current,
-				revision: current.revision + 1,
-				commentAutomation: {
-					...currentAutomation,
-					publication: {
-						...currentAutomation.publication,
-						pending: currentAutomation.publication.pending.filter(
-							(entry) => !(entry.uncertain || this.isCapturePendingStale(entry, nowMs)),
-						),
-					},
-					autoSendAttempts: [],
-					autoSendPaused: false,
-				},
-			};
-		});
-		this.captureBlocked.delete(key);
 		if (!hasFailedDispatch) {
-			// Only a pause was resolved; normal scheduling continues from the
-			// next poll once feedback is pending.
+			// A pause-only resume resolves the acknowledged pause; normal
+			// scheduling continues from the next poll once feedback is pending.
+			await this.clearResumedCommentAutomation(key, record, nowMs);
 			return { ok: true, dispatched: false };
 		}
+		// Re-check the PR and GitHub reachability BEFORE clearing the pause a
+		// failed-dispatch Resume resolves: a resume that cannot proceed must
+		// leave the pause intact.
 		if (automation.repairOwner?.taskId !== taskId) {
 			return { ok: false, error: `This task is not the current repair owner.`, dispatched: false };
 		}
-		// Re-check PR/scope before resuming.
 		let accessScopeId: string;
 		try {
 			accessScopeId = await this.deps.getGitHubAccessScopeId();
@@ -2027,6 +2039,11 @@ export class PrCommentAutomationService {
 			excludePublishedEvents(snapshot.events, automation.publication.published),
 			automation.lastDispatchedFeedbackFingerprint,
 		);
+		// Explicit user Resume: clear the acknowledged capture uncertainty and
+		// reset the rate-limit history, so a failed-dispatch Resume is not
+		// immediately re-paused by the cap. This is the explicit
+		// acknowledgment itself, never a silent bypass.
+		await this.clearResumedCommentAutomation(key, record, nowMs);
 		if (pending.length === 0) {
 			// Nothing left to address: close the failure, keep the history.
 			const identity = { accessScopeId: record.accessScopeId, pr: record.pr };

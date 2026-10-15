@@ -93,26 +93,39 @@ function ToolMessageBlock({ message }: { message: ClineChatMessage }): ReactElem
 
 					{/* Parsed ToolOperationResult output */}
 					{toolOutput ? (
-						toolOutput.results.map((result, i) => (
-							<div key={i}>
-								{toolOutput.results.length > 1 ? (
-									<div className="mb-0.5 truncate text-xs text-text-tertiary">{result.query}</div>
-								) : null}
-								{result.error ? (
-									<div>
-										<div className="mb-0.5 text-xs text-status-red">Error</div>
-										<pre className="max-h-60 overflow-auto rounded bg-status-red/5 px-2 py-1.5 text-xs leading-relaxed whitespace-pre-wrap break-all text-status-red">
-											{result.error}
-										</pre>
-									</div>
-								) : null}
-								{result.content ? (
-									<pre className="max-h-60 overflow-auto rounded bg-surface-0 px-2 py-1.5 text-xs leading-relaxed whitespace-pre-wrap break-all text-text-primary">
-										{result.content}
-									</pre>
-								) : null}
-							</div>
-						))
+						toolOutput.results.map((result, i) => {
+							const errorExcerptSuffix =
+								result.error !== null && isExcerptedToolText(result.error) ? " (excerpt)" : "";
+							const contentExcerptSuffix =
+								result.content !== "" && isExcerptedToolText(result.content) ? " (excerpt)" : "";
+							return (
+								<div key={i}>
+									{toolOutput.results.length > 1 ? (
+										<div className="mb-0.5 truncate text-xs text-text-tertiary">{result.query}</div>
+									) : null}
+									{result.error ? (
+										<div>
+											<div className="mb-0.5 text-xs text-status-red">Error{errorExcerptSuffix}</div>
+											<pre className="max-h-60 overflow-auto rounded bg-status-red/5 px-2 py-1.5 text-xs leading-relaxed whitespace-pre-wrap break-all text-status-red">
+												{result.error}
+											</pre>
+										</div>
+									) : null}
+									{result.content ? (
+										<div>
+											{contentExcerptSuffix !== "" ? (
+												<div className="mb-0.5 text-xs text-text-tertiary">
+													Output{contentExcerptSuffix}
+												</div>
+											) : null}
+											<pre className="max-h-60 overflow-auto rounded bg-surface-0 px-2 py-1.5 text-xs leading-relaxed whitespace-pre-wrap break-all text-text-primary">
+												{result.content}
+											</pre>
+										</div>
+									) : null}
+								</div>
+							);
+						})
 					) : parsed.output ? (
 						/* Fallback for non-ToolOperationResult output (skills, ask_question, MCP tools) */
 						<div>

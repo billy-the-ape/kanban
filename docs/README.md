@@ -15,7 +15,12 @@ If you are new to the codebase, read these in order:
 
 Runtime topic references:
 
-- [`runtime/diagnostics-export.md`](./runtime/diagnostics-export.md) — the task diagnostics download: what the bundle contains, completeness semantics, and the browser/CLI transport.
+- [`runtime/cline-concurrency.md`](./runtime/cline-concurrency.md) — model-aware Cline task concurrency limits and admission
+- [`runtime/diagnostics-export.md`](./runtime/diagnostics-export.md) — the task diagnostics download: what the bundle contains, completeness semantics, and the browser/CLI transport
+- [`runtime/editor-recovery.md`](./runtime/editor-recovery.md) — editor tool failure recovery and file state handling
+- [`runtime/editor-trace.md`](./runtime/editor-trace.md) — editor trace event contract and consumer behavior
+
+Completed plan archives live in [`plans/complete/`](./plans/complete/) and are preserved for history.
 
 This `docs/` folder should stand on its own for normal onboarding. Active plans and handoffs may still exist in `.plan/docs`, but a new engineer should not need those to understand the current architecture.
 

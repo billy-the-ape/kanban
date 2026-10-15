@@ -2,7 +2,6 @@
 // branch-discovery context resolver. Pure modules: no I/O.
 import { describe, expect, it } from "vitest";
 
-import type { RuntimeTaskPullRequest } from "../../../src/core/api-contract";
 import {
 	getPullRequestProviderCapabilities,
 	PULL_REQUEST_PROVIDER_CAPABILITIES,
@@ -56,19 +55,6 @@ describe("provider capabilities", () => {
 		expect(supportsPrMetadataRefresh({ provider: "bitbucket", host: "bitbucket.org" })).toBe(false);
 	});
 });
-
-function _entry(overrides: Partial<RuntimeTaskPullRequest>): RuntimeTaskPullRequest {
-	return {
-		provider: "github",
-		host: "github.com",
-		repository: "owner/repo",
-		number: 12,
-		url: "https://github.com/owner/repo/pull/12",
-		source: "manual",
-		createdAt: 0,
-		...overrides,
-	};
-}
 
 describe("PR-creation command gate", () => {
 	it("recognizes the creating commands and rejects reads", () => {

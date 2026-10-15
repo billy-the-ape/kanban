@@ -9,15 +9,15 @@ represents a single PR.
 | --- | --- |
 | Document revision | 3 |
 | Prepared | 2026-10-06 |
-| Status | Implemented — PR opened targeting `feat/pr-tracking-base` |
+| Status | Implemented — merged to main via PR #64 |
 | Source baseline | 49a2ca05c6c2927da2194aaec8bd1e45e6fa2928 (main) |
 | Fork | https://github.com/billy-the-ape/kanban |
-| Prerequisites | PR #49 (still open) supplies the landed PR-linking contracts (`docs/plans/pr-linking/`); verify `getPullRequestIdentityKey` exists before starting. This plan (with the comment and merge plans) supersedes overlapping scope in unmerged PR #21 — do not run both task series |
+| Prerequisites | PR #49 (still open) supplies the landed PR-linking contracts (`docs/plans/complete/pr-linking/`); verify `getPullRequestIdentityKey` exists before starting. This plan (with the comment and merge plans) supersedes overlapping scope in unmerged PR #21 — do not run both task series |
 | Follow-on | PRTRACK-1 (FOUNDATION-1), then COMMENT-0 and MERGE-1 in parallel from their own plan folders |
 
 The foundation totals two implementation PRs in this folder. The master plan's "total of four
 implementation PRs" counts these two foundation PRs plus COMMENT-0 and MERGE-1, the latter two
-living in `docs/plans/pr-comment-handling/` and `docs/plans/pr-merge-tracking/`. Both
+living in `docs/plans/complete/pr-comment-handling/` and `docs/plans/complete/pr-merge-tracking/`. Both
 foundation PRs must land before either feature series starts.
 
 ## Purpose

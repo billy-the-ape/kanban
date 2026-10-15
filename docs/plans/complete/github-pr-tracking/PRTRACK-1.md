@@ -9,7 +9,7 @@ represents a single PR.
 | --- | --- |
 | Document revision | 6 |
 | Prepared | 2026-10-06 |
-| Status | implemented in this worktree (branch targets `feat/pr-tracking-base`) |
+| Status | Implemented — merged to main via PR #66 |
 | Source baseline | 49a2ca05c6c2927da2194aaec8bd1e45e6fa2928 (main) |
 | Fork | https://github.com/billy-the-ape/kanban |
 | Prerequisites | PRTRACK-0 (FOUNDATION-0) landed: record store, gh adapter, read-only coordinator; PR #49 PR-linking contracts landed (through PRTRACK-0's prerequisite) |

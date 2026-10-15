@@ -2,7 +2,7 @@
 
 Status: implementation-ready plan. Target: `billy-the-ape/kanban` `main`. Source baseline: `879a3a1`.
 
-Order: **2 of 2** in `docs/plans/sidebar-updates/`. It **depends on `paused-pill.md`**, which must be merged first. That plan provides `src/core/task-display-state.ts` (`RuntimeTaskDisplayState`, `resolveTaskDisplayState`, `mergeSessionSummaries`), the `@runtime-task-display-state` alias, `loadProjectTaskSnapshot` in the workspace registry, and `web-ui/src/components/project-task-count-badges.ts` (`TASK_DISPLAY_STATE_ORDER`, `TASK_DISPLAY_STATE_BADGE_META`). One implementation PR / one squash commit. Desktop collapse is being handled separately by the user.
+Order: **2 of 2** in `docs/plans/complete/sidebar-updates/`. It **depends on `paused-pill.md`**, which must be merged first. That plan provides `src/core/task-display-state.ts` (`RuntimeTaskDisplayState`, `resolveTaskDisplayState`, `mergeSessionSummaries`), the `@runtime-task-display-state` alias, `loadProjectTaskSnapshot` in the workspace registry, and `web-ui/src/components/project-task-count-badges.ts` (`TASK_DISPLAY_STATE_ORDER`, `TASK_DISPLAY_STATE_BADGE_META`). One implementation PR / one squash commit. Desktop collapse is being handled separately by the user.
 
 The behavior and boundaries are defined below. Before coding, read `AGENTS.md` and the merged paused-pill implementation. Use symbols as navigation anchors; baseline line numbers may shift. Preserve later changes on the implementation branch. If current behavior conflicts with a decision here, report that specific conflict before changing scope.
 

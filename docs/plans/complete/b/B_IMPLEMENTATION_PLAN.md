@@ -526,7 +526,7 @@ Users can understand, resume, and recover work without searching hidden director
 - [ ] B-10.5 Add CLI/JSON equivalents for status, receipts, queue control, and recovery. Keep scripting output stable and human errors actionable.
 - [ ] B-10.6 Add explicit settings for reliable completion, required review/checks, push requirement, and worker capacity. Document how legacy custom prompts behave.
 - [ ] B-10.7 Export redacted diagnostic bundles only through an explicit user action. Exclude API keys, prompts, private code, and raw environment by default.
-  - Superseded (2026-10, DIAG-3): diagnostics export is now a full-fidelity browser download that includes prompts and private code; provider credentials and raw environment dumps remain excluded. See `docs/plans/complete-diagnostics-download/PLAN.md`.
+  - Superseded (2026-10, DIAG-3): diagnostics export is now a full-fidelity browser download that includes prompts and private code; provider credentials and raw environment dumps remain excluded. See `docs/plans/complete/complete-diagnostics-download/PLAN.md`.
 
 ### Acceptance and tests
 
