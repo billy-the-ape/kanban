@@ -428,10 +428,10 @@ export function ProjectNavigationPanel({
 						) : null}
 					</div>
 					<ShortcutsCard />
-					<ProjectSupportFooter
+					{/* <ProjectSupportFooter
 						shouldShowFeaturebaseFeedback={shouldShowFeaturebaseFeedback}
 						featurebaseFeedbackState={featurebaseFeedbackState}
-					/>
+					/> */}
 				</>
 			) : activeSection === "tasks" ? (
 				<div className="flex flex-1 min-h-0 flex-col">{renderTasksSection({ closeOnMobile })}</div>
