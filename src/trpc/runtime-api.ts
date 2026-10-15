@@ -40,6 +40,7 @@ import type {
 	RuntimeTaskPhasesResponse,
 	RuntimeTaskPreservationInfoResponse,
 	RuntimeTaskPreservationRecord,
+	RuntimeTaskQualitySummaryResponse,
 	RuntimeTaskReviewInfoResponse,
 	RuntimeTaskSessionStartRequest,
 	RuntimeTaskSessionSummary,
@@ -72,6 +73,7 @@ import {
 	parseTaskPrAutomationSettingsRequest,
 	parseTaskPrCommentResumeRequest,
 	parseTaskPrTrackingStateRequest,
+	parseTaskQualitySummaryRequest,
 	parseTaskReviewInfoRequest,
 	parseTaskReviewStartRequest,
 	parseTaskSessionInputRequest,
@@ -82,6 +84,10 @@ import { isHomeAgentSessionId } from "../core/home-agent-session";
 import { getTaskColumnId, moveTaskToColumn, setTaskAutoAddressComments } from "../core/task-board-mutations";
 import { computeTaskPhase, isDeliveryResumable, type TaskPhaseInput } from "../core/task-diagnostics";
 import { buildTaskDiagnosticsExportV3, type TaskDiagnosticsExportV3Plan } from "../core/task-diagnostics-export-v3";
+import {
+	buildTaskQualitySummaryResponse,
+	buildUnavailableTaskQualitySummaryResponse,
+} from "../core/task-quality-summary";
 import { resolveTaskTitle } from "../core/task-title.js";
 import { reconcileOrphanedSessionSummary, resolveWorkspaceSessionSummaries } from "../core/workspace-session-summaries";
 import type { PrCommentAutomationService } from "../pr-tracking/comment-automation-service";
@@ -1022,6 +1028,13 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 	// callers join the same run and all see its outcome.
 	const taskDiagnosticsActionInFlight = new Map<string, Promise<RuntimeTaskDiagnosticsActionResponse>>();
 
+	// DIAG-PANEL: in-flight dedup for recorded quality summaries, keyed by
+	// workspace:task. Identical requests share one promise; the per-workspace
+	// chain serializes analyses so at most one task summary per workspace is
+	// built at a time (on-demand, operator-driven — never a board-wide scan).
+	const taskQualitySummaryInFlight = new Map<string, Promise<RuntimeTaskQualitySummaryResponse>>();
+	const taskQualitySummaryWorkspaceChains = new Map<string, Promise<unknown>>();
+
 	const runtimeApi: RuntimeTrpcContext["runtimeApi"] = {
 		loadConfig: async (workspaceScope) => {
 			const activeRuntimeConfig = deps.getActiveRuntimeConfig?.();
@@ -1493,6 +1506,70 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				capturedAt: Date.now(),
 				exportedAt: new Date().toISOString(),
 			});
+		},
+		// DIAG-PANEL: on-demand recorded quality summary for the diagnostics
+		// panel. Read-only and target-scoped: it reads only this task's
+		// export snapshot (working + review/repair lineage) plus the task's
+		// own session lookup — never the board, unrelated SDK history, or any
+		// other task — and never starts or mutates a session. Identical
+		// requests share one in-flight analysis; different tasks in the same
+		// workspace run serially. The handler is intentionally not async:
+		// callers must receive the exact shared promise, not a wrapper.
+		getTaskQualitySummary: (workspaceScope, input): Promise<RuntimeTaskQualitySummaryResponse> => {
+			const body = parseTaskQualitySummaryRequest(input);
+			const workspaceId = workspaceScope.workspaceId;
+			const dedupKey = `${workspaceId}:${body.taskId}`;
+			const existing = taskQualitySummaryInFlight.get(dedupKey);
+			if (existing) {
+				return existing;
+			}
+			const run = async (): Promise<RuntimeTaskQualitySummaryResponse> => {
+				try {
+					const { taskSnapshot, taskSnapshotError, reviewSnapshot, reviewSnapshotError } = await deps
+						.getTaskExportSnapshot(workspaceScope, body.taskId)
+						.catch((error) => {
+							// Decision 5 equivalent: a snapshot class that failed
+							// to read is a gap the summary carries, not a crash.
+							const message = error instanceof Error ? error.message : String(error);
+							return {
+								taskSnapshot: null,
+								taskSnapshotError: message,
+								reviewSnapshot: null,
+								reviewSnapshotError: message,
+							};
+						});
+					// The task's own current-session lookup (never other
+					// tasks' summaries) separates terminal summary
+					// availability from native transcript availability.
+					const lookupSession = await createTaskSessionLookup(workspaceScope);
+					const session = lookupSession(body.taskId);
+					return buildTaskQualitySummaryResponse({
+						taskId: body.taskId,
+						capturedAt: Date.now(),
+						taskSnapshot,
+						taskSnapshotError,
+						reviewSnapshot,
+						reviewSnapshotError,
+						sessionSource: session.source,
+						terminalSummaryAvailable: session.summary !== null,
+					});
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					return buildUnavailableTaskQualitySummaryResponse(body.taskId, message);
+				} finally {
+					if (taskQualitySummaryInFlight.get(dedupKey) === sharedQualitySummary) {
+						taskQualitySummaryInFlight.delete(dedupKey);
+					}
+				}
+			};
+			const previousChain = taskQualitySummaryWorkspaceChains.get(workspaceId) ?? Promise.resolve();
+			const sharedQualitySummary = previousChain.then(run);
+			taskQualitySummaryWorkspaceChains.set(
+				workspaceId,
+				sharedQualitySummary.catch(() => undefined),
+			);
+			taskQualitySummaryInFlight.set(dedupKey, sharedQualitySummary);
+			return sharedQualitySummary;
 		},
 		returnQueuedTaskToBacklog: async (workspaceScope, input) => {
 			const body = parseTaskSessionStopRequest(input);
