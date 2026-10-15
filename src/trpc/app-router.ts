@@ -69,6 +69,7 @@ import type {
 	RuntimeProjectRemoveRequest,
 	RuntimeProjectRemoveResponse,
 	RuntimeProjectsResponse,
+	RuntimeProjectTasksResponse,
 	RuntimePrRecordMutationResponse,
 	RuntimePrRepairOwnerResponse,
 	RuntimePrRepairOwnerSelectRequest,
@@ -224,6 +225,7 @@ import {
 	runtimeProjectRemoveRequestSchema,
 	runtimeProjectRemoveResponseSchema,
 	runtimeProjectsResponseSchema,
+	runtimeProjectTasksResponseSchema,
 	runtimePrRecordMutationResponseSchema,
 	runtimePrRepairOwnerResponseSchema,
 	runtimePrRepairOwnerSelectRequestSchema,
@@ -599,6 +601,7 @@ export interface RuntimeTrpcContext {
 	};
 	projectsApi: {
 		listProjects: (preferredWorkspaceId: string | null) => Promise<RuntimeProjectsResponse>;
+		listTasks: () => Promise<RuntimeProjectTasksResponse>;
 		addProject: (
 			preferredWorkspaceId: string | null,
 			input: RuntimeProjectAddRequest,
@@ -1241,6 +1244,9 @@ export const runtimeAppRouter = t.router({
 	projects: t.router({
 		list: t.procedure.output(runtimeProjectsResponseSchema).query(async ({ ctx }) => {
 			return await ctx.projectsApi.listProjects(ctx.requestedWorkspaceId);
+		}),
+		listTasks: t.procedure.output(runtimeProjectTasksResponseSchema).query(async ({ ctx }) => {
+			return await ctx.projectsApi.listTasks();
 		}),
 		add: t.procedure
 			.input(runtimeProjectAddRequestSchema)

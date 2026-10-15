@@ -3,10 +3,16 @@ import type {
 	RuntimeBoardData,
 	RuntimeProjectSummary,
 	RuntimeProjectTaskCounts,
+	RuntimeProjectTasksResponse,
 	RuntimeTaskSessionSummary,
 	RuntimeWorkspaceStateResponse,
 } from "../core/api-contract";
-import { countTasksByDisplayState, createEmptyTaskCounts } from "../core/task-display-state";
+import {
+	buildProjectTaskListItems,
+	compareProjectTaskListItems,
+	countTasksByDisplayState,
+	createEmptyTaskCounts,
+} from "../core/task-display-state";
 import { resolveWorkspaceSessionSummaries } from "../core/workspace-session-summaries";
 import {
 	listWorkspaceIndexEntries,
@@ -74,6 +80,7 @@ export interface WorkspaceRegistry {
 		currentProjectId: string | null;
 		projects: RuntimeProjectSummary[];
 	}>;
+	buildProjectTasksPayload: () => Promise<RuntimeProjectTasksResponse>;
 	resolveWorkspaceForStream: (requestedWorkspaceId: string | null) => Promise<ResolvedWorkspaceStreamTarget>;
 	listManagedWorkspaces: () => Array<{
 		workspaceId: string;
@@ -95,18 +102,22 @@ export function collectProjectWorktreeTaskIdsForRemoval(board: RuntimeBoardData)
 	return taskIds;
 }
 
+/** Display name for a project: the last non-empty segment of its repo path. */
+function deriveProjectName(repoPath: string): string {
+	const normalized = repoPath.replaceAll("\\", "/").replace(/\/+$/g, "");
+	const segments = normalized.split("/").filter((segment) => segment.length > 0);
+	return segments[segments.length - 1] ?? normalized;
+}
+
 function toProjectSummary(project: {
 	workspaceId: string;
 	repoPath: string;
 	taskCounts: RuntimeProjectTaskCounts;
 }): RuntimeProjectSummary {
-	const normalized = project.repoPath.replaceAll("\\", "/").replace(/\/+$/g, "");
-	const segments = normalized.split("/").filter((segment) => segment.length > 0);
-	const name = segments[segments.length - 1] ?? normalized;
 	return {
 		id: project.workspaceId,
 		path: project.repoPath,
-		name,
+		name: deriveProjectName(project.repoPath),
 		taskCounts: project.taskCounts,
 	};
 }
@@ -294,6 +305,44 @@ export async function createWorkspaceRegistry(deps: CreateWorkspaceRegistryDepen
 		};
 	};
 
+	// The sidebar task list loads every project's board+sessions with a
+	// bounded worker pool so a large project list never fans out unbounded I/O.
+	const PROJECT_TASKS_SNAPSHOT_CONCURRENCY = 4;
+
+	const buildProjectTasksPayload = async (): Promise<RuntimeProjectTasksResponse> => {
+		const entries = await listWorkspaceIndexEntries();
+		const tasks: ReturnType<typeof buildProjectTaskListItems> = [];
+		const unavailableProjectIds: string[] = [];
+		const queuedEntries = entries.slice();
+		let cursor = 0;
+		const workerCount = Math.min(PROJECT_TASKS_SNAPSHOT_CONCURRENCY, queuedEntries.length);
+		const workers = Array.from({ length: workerCount }, async () => {
+			while (true) {
+				const entry = queuedEntries[cursor];
+				cursor += 1;
+				if (!entry) {
+					return;
+				}
+				try {
+					const snapshot = await loadProjectTaskSnapshot(entry.workspaceId);
+					tasks.push(
+						...buildProjectTaskListItems(
+							{ id: entry.workspaceId, name: deriveProjectName(entry.repoPath) },
+							snapshot.board,
+							snapshot.sessions,
+						),
+					);
+				} catch {
+					unavailableProjectIds.push(entry.workspaceId);
+				}
+			}
+		});
+		await Promise.all(workers);
+		tasks.sort(compareProjectTaskListItems);
+		unavailableProjectIds.sort();
+		return { tasks, unavailableProjectIds };
+	};
+
 	const resolveWorkspaceForStream = async (
 		requestedWorkspaceId: string | null,
 	): Promise<ResolvedWorkspaceStreamTarget> => {
@@ -400,6 +449,7 @@ export async function createWorkspaceRegistry(deps: CreateWorkspaceRegistryDepen
 		createProjectSummary: toProjectSummary,
 		buildWorkspaceStateSnapshot,
 		buildProjectsPayload,
+		buildProjectTasksPayload,
 		resolveWorkspaceForStream,
 		listManagedWorkspaces: () => {
 			return Array.from(terminalManagersByWorkspaceId.entries()).map(([workspaceId, terminalManager]) => ({

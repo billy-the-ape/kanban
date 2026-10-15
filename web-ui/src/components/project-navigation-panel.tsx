@@ -55,6 +55,7 @@ export function ProjectNavigationPanel({
 	removingProjectId,
 	activeSection,
 	onActiveSectionChange,
+	renderTasksSection,
 	canShowAgentSection,
 	agentSectionContent,
 	selectedAgentId,
@@ -72,8 +73,11 @@ export function ProjectNavigationPanel({
 	isLoadingProjects?: boolean;
 	currentProjectId: string | null;
 	removingProjectId: string | null;
-	activeSection: "projects" | "agent";
-	onActiveSectionChange: (section: "projects" | "agent") => void;
+	activeSection: "projects" | "tasks" | "agent";
+	onActiveSectionChange: (section: "projects" | "tasks" | "agent") => void;
+	/** Renders the Tasks section; the panel provides the same mobile-collapse
+	 * behavior as project selection through `closeOnMobile`. */
+	renderTasksSection: (options: { closeOnMobile: () => void }) => ReactNode;
 	canShowAgentSection: boolean;
 	agentSectionContent?: ReactNode;
 	selectedAgentId?: RuntimeAgentId | null;
@@ -131,6 +135,12 @@ export function ProjectNavigationPanel({
 		setIsMobileClosing(false);
 		setSidebarCollapsed(true, false);
 	}, [setSidebarCollapsed]);
+
+	const closeOnMobile = useCallback(() => {
+		if (isMobile) {
+			setCollapsed(true);
+		}
+	}, [isMobile, setCollapsed]);
 
 	const [isDragging, setIsDragging] = useState(false);
 	const dragRef = useRef<{ startX: number; startWidth: number } | null>(null);
@@ -325,7 +335,7 @@ export function ProjectNavigationPanel({
 					/>
 				</div>
 				<div className="mt-2 rounded-md bg-surface-2 border border-border p-1">
-					<div className="grid grid-cols-2 gap-1">
+					<div className="grid grid-cols-3 gap-1">
 						<button
 							type="button"
 							onClick={() => onActiveSectionChange("projects")}
@@ -337,6 +347,18 @@ export function ProjectNavigationPanel({
 							)}
 						>
 							Projects
+						</button>
+						<button
+							type="button"
+							onClick={() => onActiveSectionChange("tasks")}
+							className={cn(
+								"cursor-pointer rounded-sm px-2 py-1 text-xs font-medium",
+								activeSection === "tasks"
+									? "bg-surface-4 text-text-primary border border-border"
+									: "text-text-secondary hover:text-text-primary border border-transparent",
+							)}
+						>
+							Tasks
 						</button>
 						<button
 							type="button"
@@ -411,6 +433,8 @@ export function ProjectNavigationPanel({
 						featurebaseFeedbackState={featurebaseFeedbackState}
 					/>
 				</>
+			) : activeSection === "tasks" ? (
+				<div className="flex flex-1 min-h-0 flex-col">{renderTasksSection({ closeOnMobile })}</div>
 			) : (
 				<div className="flex flex-1 min-h-0 flex-col">
 					{selectedAgentId && selectedAgentId !== "cline" ? <TerminalAgentHints /> : null}

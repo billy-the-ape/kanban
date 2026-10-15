@@ -383,3 +383,115 @@ describe("project task counts from effective sessions", () => {
 		expect(registry.getTerminalManagerForWorkspace("project")).toBeNull();
 	});
 });
+describe("buildProjectTasksPayload", () => {
+	function createBoardFor(projectId: string, updatedAt: number): RuntimeBoardData {
+		return {
+			columns: [
+				{
+					id: "in_progress",
+					title: "In Progress",
+					cards: [
+						{
+							id: "task",
+							title: `${projectId} task`,
+							prompt: "",
+							startInPlanMode: false,
+							baseRef: "main",
+							createdAt: 100,
+							updatedAt,
+						},
+					],
+				},
+			],
+			dependencies: [],
+		};
+	}
+
+	async function createRegistry(): Promise<ReturnType<typeof createWorkspaceRegistry>> {
+		return createWorkspaceRegistry({
+			cwd: "/launcher",
+			loadGlobalRuntimeConfig: async () => ({}) as RuntimeConfigState,
+			loadRuntimeConfig: async () => ({}) as RuntimeConfigState,
+			hasGitRepository: () => false,
+			pathIsDirectory: async () => true,
+			getClineTaskSessionSummaries: () => [],
+		});
+	}
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		vi.mocked(workspaceStateModule.listWorkspaceIndexEntries).mockResolvedValue([]);
+		vi.mocked(workspaceStateModule.loadWorkspaceBoardById).mockResolvedValue(createBoardFor("project", 100));
+		vi.mocked(workspaceStateModule.loadWorkspaceSessionsById).mockResolvedValue({});
+	});
+
+	it("merges sorted items over multiple projects without creating terminal managers", async () => {
+		vi.mocked(workspaceStateModule.listWorkspaceIndexEntries).mockResolvedValue([
+			{ workspaceId: "a", repoPath: "/repos/a" },
+			{ workspaceId: "b", repoPath: "/repos/b" },
+		]);
+		vi.mocked(workspaceStateModule.loadWorkspaceBoardById).mockImplementation(async (workspaceId) =>
+			createBoardFor(workspaceId, workspaceId === "a" ? 150 : 100),
+		);
+		const registry = await createRegistry();
+
+		const payload = await registry.buildProjectTasksPayload();
+		expect(payload.tasks.map((task) => task.projectId)).toEqual(["a", "b"]);
+		expect(payload.tasks[0]?.title).toBe("a task");
+		expect(payload.unavailableProjectIds).toEqual([]);
+		expect(fixtures.manager.hydrateFromRecord).not.toHaveBeenCalled();
+		expect(registry.getTerminalManagerForWorkspace("a")).toBeNull();
+	});
+
+	it("returns empty arrays for an empty index", async () => {
+		const registry = await createRegistry();
+		expect(await registry.buildProjectTasksPayload()).toEqual({ tasks: [], unavailableProjectIds: [] });
+	});
+
+	it("includes only the failed project id on partial failure", async () => {
+		vi.mocked(workspaceStateModule.listWorkspaceIndexEntries).mockResolvedValue([
+			{ workspaceId: "a", repoPath: "/repos/a" },
+			{ workspaceId: "broken", repoPath: "/repos/broken" },
+			{ workspaceId: "b", repoPath: "/repos/b" },
+		]);
+		vi.mocked(workspaceStateModule.loadWorkspaceBoardById).mockImplementation(async (workspaceId) => {
+			if (workspaceId === "broken") {
+				throw new Error("missing state");
+			}
+			return createBoardFor(workspaceId, 100);
+		});
+		const registry = await createRegistry();
+
+		const payload = await registry.buildProjectTasksPayload();
+		expect(payload.tasks.map((task) => task.projectId).sort()).toEqual(["a", "b"]);
+		expect(payload.unavailableProjectIds).toEqual(["broken"]);
+	});
+
+	it("fails the query when the index read fails", async () => {
+		const registry = await createRegistry();
+		vi.mocked(workspaceStateModule.listWorkspaceIndexEntries).mockRejectedValue(new Error("index down"));
+		await expect(registry.buildProjectTasksPayload()).rejects.toThrow("index down");
+	});
+
+	it("loads at most four project snapshots concurrently", async () => {
+		const projectIds = Array.from({ length: 8 }, (_, index) => `p${index}`);
+		vi.mocked(workspaceStateModule.listWorkspaceIndexEntries).mockResolvedValue(
+			projectIds.map((workspaceId) => ({ workspaceId, repoPath: `/repos/${workspaceId}` })),
+		);
+		let inFlight = 0;
+		let maxInFlight = 0;
+		vi.mocked(workspaceStateModule.loadWorkspaceBoardById).mockImplementation(async (workspaceId) => {
+			inFlight += 1;
+			maxInFlight = Math.max(maxInFlight, inFlight);
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			inFlight -= 1;
+			return createBoardFor(workspaceId, 100);
+		});
+		const registry = await createRegistry();
+
+		const payload = await registry.buildProjectTasksPayload();
+		expect(payload.tasks).toHaveLength(8);
+		expect(maxInFlight).toBeGreaterThan(1);
+		expect(maxInFlight).toBeLessThanOrEqual(4);
+	});
+});

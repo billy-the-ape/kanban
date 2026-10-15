@@ -913,6 +913,25 @@ export const runtimeProjectsResponseSchema = z.object({
 });
 export type RuntimeProjectsResponse = z.infer<typeof runtimeProjectsResponseSchema>;
 
+export const runtimeTaskDisplayStateSchema = z.enum(["backlog", "in_progress", "paused", "review", "done", "trash"]);
+export type RuntimeTaskDisplayState = z.infer<typeof runtimeTaskDisplayStateSchema>;
+
+export const runtimeProjectTaskListItemSchema = z.object({
+	projectId: z.string(),
+	projectName: z.string(),
+	taskId: z.string(),
+	title: z.string(),
+	displayState: runtimeTaskDisplayStateSchema,
+	lastActivityAt: z.number(),
+});
+export type RuntimeProjectTaskListItem = z.infer<typeof runtimeProjectTaskListItemSchema>;
+
+export const runtimeProjectTasksResponseSchema = z.object({
+	tasks: z.array(runtimeProjectTaskListItemSchema),
+	unavailableProjectIds: z.array(z.string()),
+});
+export type RuntimeProjectTasksResponse = z.infer<typeof runtimeProjectTasksResponseSchema>;
+
 export const runtimeProjectAddRequestSchema = z
 	.object({
 		path: z.string().optional(),
