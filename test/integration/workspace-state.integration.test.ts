@@ -4,7 +4,12 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import type { RuntimeBoardData, RuntimeTaskPullRequest, RuntimeTaskSessionSummary } from "../../src/core/api-contract";
+import type {
+	RuntimeBoardData,
+	RuntimeTaskPullRequest,
+	RuntimeTaskSessionState,
+	RuntimeTaskSessionSummary,
+} from "../../src/core/api-contract";
 import { getPullRequestIdentityKey } from "../../src/core/pull-request-links";
 import {
 	addTaskPullRequests,
@@ -90,6 +95,27 @@ async function withTemporaryHome<T>(run: () => Promise<T>): Promise<T> {
 		}
 		cleanup();
 	}
+}
+
+function createRealSessionSummary(
+	taskId: string,
+	state: RuntimeTaskSessionState,
+	updatedAt: number,
+): RuntimeTaskSessionSummary {
+	return {
+		taskId,
+		state,
+		agentId: "cline",
+		workspacePath: null,
+		pid: null,
+		startedAt: updatedAt - 100,
+		updatedAt,
+		lastOutputAt: updatedAt,
+		reviewReason: null,
+		exitCode: null,
+		lastHookAt: null,
+		latestHookActivity: null,
+	};
 }
 
 function initGitRepository(path: string): void {
@@ -751,6 +777,78 @@ describe.sequential("workspace-state integration", () => {
 					expectedRevision: primaryLoad.revision,
 				});
 				expect(forgedSave.board.columns[0]?.cards[0]?.pullRequests).toEqual([primaryLink]);
+			} finally {
+				cleanup();
+			}
+		});
+	});
+
+	it("merges supplied sessions with newer disk state and prunes stale disk-only summaries", async () => {
+		await withTemporaryHome(async () => {
+			const { path: sandboxRoot, cleanup } = createTempDir("kanban-session-merge-");
+			try {
+				const workspacePath = join(sandboxRoot, "project-merge");
+				mkdirSync(workspacePath, { recursive: true });
+				initGitRepository(workspacePath);
+
+				const board = createBoard("Task One");
+				const initial = await loadWorkspaceState(workspacePath);
+
+				// Seed the disk: a real summary for the board card, a disk-only
+				// id that is not a board card, and a supplied non-card terminal id.
+				const firstSave = await saveWorkspaceState(workspacePath, {
+					board,
+					sessions: {
+						"task-1": createRealSessionSummary("task-1", "running", 1000),
+						"task-2": createRealSessionSummary("task-2", "running", 500),
+						"home-terminal": createSessionSummary("home-terminal"),
+					},
+					expectedRevision: initial.revision,
+				});
+
+				// An older supplied summary must not regress newer disk state;
+				// the disk-only id (not supplied and not a board card) is pruned;
+				// the supplied non-card id is kept.
+				const secondSave = await saveWorkspaceState(workspacePath, {
+					board,
+					sessions: {
+						"task-1": createRealSessionSummary("task-1", "interrupted", 500),
+						"home-terminal": createSessionSummary("home-terminal"),
+					},
+					expectedRevision: firstSave.revision,
+				});
+				expect(secondSave.sessions["task-1"]?.state).toBe("running");
+				expect(secondSave.sessions["task-1"]?.updatedAt).toBe(1000);
+				expect(secondSave.sessions["task-2"]).toBeUndefined();
+				expect(secondSave.sessions["home-terminal"]).toBeDefined();
+
+				// A newer supplied summary wins.
+				const thirdSave = await saveWorkspaceState(workspacePath, {
+					board,
+					sessions: {
+						"task-1": createRealSessionSummary("task-1", "awaiting_review", 2000),
+					},
+					expectedRevision: secondSave.revision,
+				});
+				expect(thirdSave.sessions["task-1"]?.state).toBe("awaiting_review");
+				// The non-card id was not supplied and is not a board card: pruned.
+				expect(thirdSave.sessions["home-terminal"]).toBeUndefined();
+
+				// A conflicting-revision save is rejected without writing.
+				await expect(
+					saveWorkspaceState(workspacePath, {
+						board,
+						sessions: {},
+						expectedRevision: firstSave.revision,
+					}),
+				).rejects.toMatchObject({
+					name: "WorkspaceStateConflictError",
+					currentRevision: thirdSave.revision,
+				} satisfies Partial<WorkspaceStateConflictError>);
+
+				const finalState = await loadWorkspaceState(workspacePath);
+				expect(finalState.revision).toBe(thirdSave.revision);
+				expect(finalState.sessions["task-1"]?.state).toBe("awaiting_review");
 			} finally {
 				cleanup();
 			}
