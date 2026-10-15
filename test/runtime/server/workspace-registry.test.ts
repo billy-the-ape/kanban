@@ -275,7 +275,7 @@ describe("project task counts from effective sessions", () => {
 			paused: 1,
 		});
 		expect(
-			(await registry.buildWorkspaceStateSnapshot("project", "/repos/project")).sessions["task"]?.latestHookActivity
+			(await registry.buildWorkspaceStateSnapshot("project", "/repos/project")).sessions.task?.latestHookActivity
 				?.hookEventName,
 		).toBe("concurrency_waiting");
 
@@ -294,7 +294,7 @@ describe("project task counts from effective sessions", () => {
 			paused: 0,
 		});
 		expect(
-			(await secondRegistry.buildWorkspaceStateSnapshot("project", "/repos/project")).sessions["task"]
+			(await secondRegistry.buildWorkspaceStateSnapshot("project", "/repos/project")).sessions.task
 				?.latestHookActivity?.hookEventName,
 		).toBe("post_tool_use");
 	});
@@ -350,7 +350,7 @@ describe("project task counts from effective sessions", () => {
 		const registry = await createRegistry();
 		await registry.ensureTerminalManagerForWorkspace("project", "/repos/project");
 
-		expect((await registry.buildWorkspaceStateSnapshot("project", "/repos/project")).sessions["task"]?.state).toBe(
+		expect((await registry.buildWorkspaceStateSnapshot("project", "/repos/project")).sessions.task?.state).toBe(
 			"awaiting_review",
 		);
 		expect(await registry.summarizeProjectTaskCounts("project", "/repos/project")).toMatchObject({
@@ -359,7 +359,7 @@ describe("project task counts from effective sessions", () => {
 		});
 
 		clineSummaries = [createSummary({ state: "running", updatedAt: 300 })];
-		expect((await registry.buildWorkspaceStateSnapshot("project", "/repos/project")).sessions["task"]?.state).toBe(
+		expect((await registry.buildWorkspaceStateSnapshot("project", "/repos/project")).sessions.task?.state).toBe(
 			"running",
 		);
 		// Fresh registry: counts are cached per registry on success.

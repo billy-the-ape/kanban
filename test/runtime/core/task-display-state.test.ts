@@ -197,14 +197,14 @@ describe("mergeSessionSummaries", () => {
 		);
 		// Tie between disk and browser: browser (later source) wins, then the
 		// Cline summary beats the placeholder and the older browser copy.
-		expect(merged["a"]).toBe(cline);
-		expect(merged["b"]).toBeDefined();
+		expect(merged.a).toBe(cline);
+		expect(merged.b).toBeDefined();
 	});
 
 	it("keeps disk-only summaries that no later source mentions", () => {
 		const disk = createSummary({ taskId: "a", state: "idle", updatedAt: 100 });
 		const merged = mergeSessionSummaries([disk], []);
-		expect(merged["a"]).toBe(disk);
+		expect(merged.a).toBe(disk);
 	});
 });
 
