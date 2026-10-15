@@ -43,6 +43,7 @@ import {
 } from "./cline-task-launch-config";
 import { createClineToolFailureRecoveryHooks } from "./cline-tool-failure-recovery";
 import { createClineToolResultBoundingHook } from "./cline-tool-result-bounding-hook";
+import { CLINE_TURN_SKIPPED, type ClineTurnPreparation } from "./cline-turn-preparation";
 import { type ClineTurnScheduler, sharedClineTurnScheduler } from "./cline-turn-scheduler";
 import { CLINE_MODEL_CATALOG_DEFAULTS, SDK_DEFAULT_MODEL_ID, SDK_DEFAULT_PROVIDER_ID } from "./sdk-provider-boundary";
 import {
@@ -120,6 +121,7 @@ function resolveSessionStartLogHost(baseUrl?: string | null): string | null {
 }
 
 export interface StartClineSessionRuntimeRequest {
+	preparePrompt?: ClineTurnPreparation;
 	taskId: string;
 	cwd: string;
 	prompt: string;
@@ -175,6 +177,7 @@ export interface ClineSessionRuntime {
 		images?: RuntimeTaskImage[];
 		mode?: RuntimeTaskSessionMode;
 		contextWindowCapTokens?: number;
+		preparePrompt?: ClineTurnPreparation;
 	}): Promise<StartClineSessionRuntimeResult>;
 	sendTaskSessionInput(
 		taskId: string,
@@ -182,6 +185,7 @@ export interface ClineSessionRuntime {
 		mode?: RuntimeTaskSessionMode,
 		images?: RuntimeTaskImage[],
 		delivery?: "queue" | "steer",
+		preparePrompt?: ClineTurnPreparation,
 	): Promise<unknown>;
 	resumeTaskSession(taskId: string): Promise<ClinePersistedTaskSessionSnapshot | null>;
 	cancelQueuedUnstartedTask(taskId: string): boolean;
@@ -311,7 +315,14 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			this.schedulerOwner,
 			request.taskId,
 			request,
-			(signal) => this.startAdmittedTaskSession(request, signal),
+			async (signal) => {
+				const prompt = request.preparePrompt
+					? await request.preparePrompt({ cwd: request.cwd, signal })
+					: request.prompt;
+				signal.throwIfAborted();
+				if (prompt === null) return { sessionId: "", result: CLINE_TURN_SKIPPED };
+				return this.startAdmittedTaskSession({ ...request, prompt }, signal);
+			},
 			(queued, position) =>
 				this.emitConcurrencyState(
 					request.taskId,
@@ -639,6 +650,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		images?: RuntimeTaskImage[];
 		mode?: RuntimeTaskSessionMode;
 		contextWindowCapTokens?: number;
+		preparePrompt?: ClineTurnPreparation;
 	}): Promise<StartClineSessionRuntimeResult> {
 		const generation = this.turnGenerationByTaskId.get(input.taskId) ?? 0;
 		const restartRequest = await this.resolveRestartStartRequest(input.taskId);
@@ -667,6 +679,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 					}
 				: {}),
 			prompt: input.prompt,
+			preparePrompt: input.preparePrompt,
 			initialMessages: input.initialMessages,
 			images: input.images,
 			mode: input.mode ?? restartRequest.mode,
@@ -912,6 +925,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		mode?: RuntimeTaskSessionMode,
 		images?: RuntimeTaskImage[],
 		delivery?: "queue" | "steer",
+		preparePrompt?: ClineTurnPreparation,
 	): Promise<unknown> {
 		const generation = this.turnGenerationByTaskId.get(taskId) ?? 0;
 		const sessionId = this.sessionIdByTaskId.get(taskId);
@@ -948,9 +962,14 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			turnTarget,
 			async (signal) => {
 				signal.throwIfAborted();
+				const cwd = target?.cwd ?? record?.cwd;
+				if (preparePrompt && !cwd) throw new Error("Cannot prepare a turn without its task worktree.");
+				const prepared = preparePrompt && cwd ? await preparePrompt({ cwd, signal }) : prompt;
+				signal.throwIfAborted();
+				if (prepared === null) return CLINE_TURN_SKIPPED;
 				return sessionHost.send({
 					sessionId,
-					prompt,
+					prompt: prepared,
 					userImages: toSdkUserImages(images),
 					...(delivery ? { delivery } : {}),
 				});

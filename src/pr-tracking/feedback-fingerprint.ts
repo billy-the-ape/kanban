@@ -20,6 +20,11 @@ export type PrFeedbackKind = "review" | "inline" | "conversation";
  */
 export interface PrFeedbackEvent {
 	kind: PrFeedbackKind;
+	url?: string;
+	author?: string;
+	path?: string;
+	line?: number;
+	diffHunk?: string;
 	/** Provider identifier of the feedback item (GitHub database id). */
 	providerId: string;
 	/** Latest update timestamp in epoch ms; GitHub edits advance versions. */
@@ -83,6 +88,7 @@ export function computePrFeedbackFingerprint(events: readonly PrFeedbackEvent[])
 	const watermarkTokens = tokens.filter((token) => token.split(TOKEN_SEPARATOR)[2] === String(watermark));
 	return {
 		digest: sha256Hex(tokens.join("\n")),
+		eventTokens: tokens,
 		watermark,
 		watermarkTokens,
 	};
@@ -100,6 +106,10 @@ export function findPrFeedbackPendingEvents(
 ): PrFeedbackEvent[] {
 	if (dispatched === null) {
 		return [...events];
+	}
+	if (dispatched.eventTokens) {
+		const sent = new Set(dispatched.eventTokens);
+		return sortPrFeedbackEvents(events).filter((event) => !sent.has(buildPrFeedbackEventToken(event)));
 	}
 	const boundary = new Set(dispatched.watermarkTokens);
 	return sortPrFeedbackEvents(events).filter((event) => {

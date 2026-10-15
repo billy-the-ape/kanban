@@ -295,10 +295,12 @@ export const runtimePrFeedbackFingerprintSchema = z.object({
 	digest: z.string(),
 	watermark: z.number().int().nonnegative(),
 	watermarkTokens: z.array(z.string()),
+	/** All current event versions; detects edits older than the timestamp watermark. */
+	eventTokens: z.array(z.string()).optional(),
 });
 export type RuntimePrFeedbackFingerprint = z.infer<typeof runtimePrFeedbackFingerprintSchema>;
 
-export const runtimePrCommentDispatchStatusSchema = z.enum(["queued", "running", "completed", "failed"]);
+export const runtimePrCommentDispatchStatusSchema = z.enum(["queued", "waiting", "running", "completed", "failed"]);
 export type RuntimePrCommentDispatchStatus = z.infer<typeof runtimePrCommentDispatchStatusSchema>;
 
 /**
@@ -310,11 +312,15 @@ export const runtimePrCommentDispatchSchema = z.object({
 	dispatchId: z.string(),
 	/** Epoch ms when the send was provably attempted; null while unsent. */
 	attemptedAt: z.number().nullable(),
-	/** Eligible feedback aggregate captured at instruction submission. */
+	/** Eligible feedback aggregate captured at execution; provisional while queued. */
 	fingerprint: runtimePrFeedbackFingerprintSchema,
+	/** Restore on an unsuccessful admitted turn so explicit Resume can retry its batch. */
+	previousFeedbackFingerprint: runtimePrFeedbackFingerprintSchema.nullable().optional(),
 	/** Ownership revision the instruction was dispatched under. */
 	ownerRevision: z.number().int().nonnegative(),
 	status: runtimePrCommentDispatchStatusSchema,
+	/** Explicit pre-execution blocker, recoverable through Resume. */
+	errorCode: z.enum(["git_refresh_blocked", "preparation_failed"]).optional(),
 	/** Normal session/turn reference (the accepted chat message id). */
 	turnRef: z.string().nullable(),
 	error: z.string().nullable(),

@@ -66,6 +66,7 @@ import {
 	type ClineTaskExportSnapshot,
 	type ClineTaskExportSnapshotOptions,
 } from "./cline-task-export-snapshot";
+import { CLINE_TURN_SKIPPED, type ClineTurnPreparation } from "./cline-turn-preparation";
 import {
 	type ClineRuntimeSetupLease,
 	type ClineWatcherRegistry,
@@ -137,6 +138,7 @@ export interface ClineTaskSessionService {
 		text: string,
 		mode?: RuntimeTaskSessionMode,
 		images?: RuntimeTaskImage[],
+		preparePrompt?: ClineTurnPreparation,
 	): Promise<RuntimeTaskSessionSummary | null>;
 	reloadTaskSession(taskId: string): Promise<RuntimeTaskSessionSummary | null>;
 	clearTaskSession(taskId: string): Promise<RuntimeTaskSessionSummary | null>;
@@ -515,6 +517,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		mode?: RuntimeTaskSessionMode;
 		images?: RuntimeTaskImage[];
 		delivery?: "queue" | "steer";
+		preparePrompt?: ClineTurnPreparation;
 	}): Promise<{
 		result: unknown;
 		warnings?: string[];
@@ -528,6 +531,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 						input.mode,
 						input.images,
 						input.delivery,
+						input.preparePrompt,
 					),
 				};
 			} catch (error) {
@@ -551,6 +555,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			prompt: input.prompt,
 			mode: input.mode,
 			images: input.images,
+			preparePrompt: input.preparePrompt,
 			initialMessages: persistedSnapshot ? withoutFailedResend(persistedSnapshot.messages, input.prompt) : undefined,
 		});
 		return {
@@ -1077,6 +1082,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		text: string,
 		mode?: RuntimeTaskSessionMode,
 		images?: RuntimeTaskImage[],
+		preparePrompt?: ClineTurnPreparation,
 	): Promise<RuntimeTaskSessionSummary | null> {
 		if (this.resettingTaskIds.has(taskId)) throw new Error("Task is returning to Backlog.");
 		const entry = this.messageRepository.getTaskEntry(taskId);
@@ -1150,7 +1156,18 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 							}),
 						);
 						assistantCountBeforeSend = entry.messages.filter((message) => message.role === "assistant").length;
-						const resolvedPrompt = runtimeSetup.resolvePrompt(normalized);
+						let resolvedPrompt = runtimeSetup.resolvePrompt(normalized);
+						const prepare: ClineTurnPreparation | undefined = preparePrompt
+							? async (context) => {
+									const text = await preparePrompt(context);
+									message.content =
+										text ?? "Automatic PR repair skipped before execution: its prerequisites changed.";
+									this.emitMessage(taskId, message);
+									if (text === null) return null;
+									resolvedPrompt = runtimeSetup.resolvePrompt(text);
+									return resolvedPrompt;
+								}
+							: undefined;
 						try {
 							let result: { result: unknown; warnings?: string[] };
 							try {
@@ -1160,6 +1177,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 									mode: effectiveMode,
 									images,
 									delivery: queueDelivery ? "queue" : undefined,
+									preparePrompt: prepare,
 								});
 								const returnedOverflow = returnedContextOverflow(result.result);
 								if (returnedOverflow) {
@@ -1201,6 +1219,10 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					})
 					.then(({ result, warnings }) => {
 						if ((this.turnGenerationByTaskId.get(taskId) ?? 0) !== turnGeneration) {
+							return;
+						}
+						if (result === CLINE_TURN_SKIPPED) {
+							this.emitSummary(updateSummary(entry, { state: "idle", reviewReason: null, lastOutputAt: now() }));
 							return;
 						}
 						if (this.emitReturnedTaskFailure(taskId, entry, "send", result)) return;
