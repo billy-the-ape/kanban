@@ -11,7 +11,7 @@ export function selectNewestTaskSessionSummary(
 	if (!right) {
 		return left;
 	}
-	// pickNewerSessionSummary(current, candidate) keeps `current` on ties,
-	// preserving the existing keep-left behavior.
+	// pickNewerSessionSummary(current, candidate) returns `candidate` on
+	// `updatedAt` ties, so an incoming summary (right) always wins here.
 	return pickNewerSessionSummary(left, right);
 }
