@@ -11,7 +11,6 @@ import type {
 	RuntimeBoardColumnId,
 	RuntimeBoardDependency,
 	RuntimeClineReasoningEffort,
-	RuntimePrInstalledConsumer,
 	RuntimeTaskClineSettings,
 	RuntimeTaskDispatchRunResponse,
 	RuntimeWorkspaceStateResponse,
@@ -703,7 +702,7 @@ async function startTask(input: { cwd: string; taskId: string; projectPath?: str
 	}
 
 	const existingSession = runtimeState.sessions[task.id] ?? null;
-	const shouldStartSession = !existingSession || existingSession.state !== "running";
+	const shouldStartSession = existingSession?.state !== "running";
 
 	if (shouldStartSession) {
 		const ensured = await runtimeClient.workspace.ensureWorktree.mutate({
@@ -830,16 +829,17 @@ async function completeTaskById(input: {
 }): Promise<CompleteTaskExecutionResult> {
 	// PRTRACK-1: shared lifecycle gate — legacy CLI completion must not
 	// complete a task whose linked PR workflow is owned by an installed
-	// enabled consumer. The installed-consumer list comes from the runtime
-	// server (with zero consumers installed the gate never activates).
-	const installedPrConsumers = await input.runtimeClient.runtime.getConfig
-		.query()
-		.then((config) => config.installedPrConsumers ?? [])
-		.catch((): RuntimePrInstalledConsumer[] => []);
-	const prGateInstalled: PrInstalledConsumers = {
-		comments: installedPrConsumers.some((consumer) => consumer.kind === "comments"),
-		mergeCompletion: installedPrConsumers.some((consumer) => consumer.kind === "mergeCompletion"),
-	};
+	// enabled consumer. Both consumers are always installed, so the gate
+	// keys off the task's own PR automation settings — except the comments
+	// half, which only owns tasks the comment automation can serve (native
+	// Cline). Resolve the effective agent the same way task start does: an
+	// unset card agentId falls back to the workspace's selected agent.
+	let selectedAgentId: RuntimeAgentId | null = null;
+	try {
+		selectedAgentId = (await input.runtimeClient.runtime.getConfig.query()).selectedAgentId;
+	} catch {
+		selectedAgentId = null;
+	}
 	const mutation = await mutateWorkspaceState<CompleteTaskMutationValue>(input.workspaceRepoPath, (latestState) => {
 		const latestRecord = findTaskRecord(latestState, input.taskId);
 		if (!latestRecord) {
@@ -858,6 +858,10 @@ async function completeTaskById(input: {
 			};
 		}
 
+		const prGateInstalled: PrInstalledConsumers = {
+			comments: (latestRecord.task.agentId ?? selectedAgentId) === "cline",
+			mergeCompletion: true,
+		};
 		const prLifecycleGate = evaluatePrLifecycleGate({ card: latestRecord.task, installed: prGateInstalled });
 		if (prLifecycleGate.legacyCompletionGated) {
 			throw new Error(

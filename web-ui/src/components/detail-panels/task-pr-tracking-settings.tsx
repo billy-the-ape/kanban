@@ -10,11 +10,7 @@ import { AlertTriangle, RefreshCw } from "lucide-react";
 import { useMemo, useState } from "react";
 import { cn } from "@/components/ui/cn";
 import { getRuntimeTrpcClient } from "@/runtime/trpc-client";
-import type {
-	RuntimePrInstalledConsumer,
-	RuntimeTaskPullRequest,
-	RuntimeTaskTrackingStateResponse,
-} from "@/runtime/types";
+import type { RuntimeTaskPullRequest, RuntimeTaskTrackingStateResponse } from "@/runtime/types";
 import type { BoardCard } from "@/types";
 import { toCanonicalPrKeyForLink } from "@/utils/pr-tracking";
 import { TaskPrCommentHandlingPanel } from "../task-pr-comment-handling-panel";
@@ -80,21 +76,16 @@ export function TaskPrTrackingSettings({
 	workspaceId,
 	taskId,
 	card,
-	installedConsumers,
 	tracking,
 	refetch,
 }: {
 	workspaceId: string | null;
 	taskId: string;
 	card: BoardCard;
-	installedConsumers: RuntimePrInstalledConsumer[];
 	tracking: RuntimeTaskTrackingStateResponse | null;
 	refetch: () => Promise<RuntimeTaskTrackingStateResponse | null>;
 }): React.ReactElement | null {
 	const client = getRuntimeTrpcClient(workspaceId);
-	const commentsInstalled = installedConsumers.some((consumer) => consumer.kind === "comments");
-	const mergeInstalled = installedConsumers.some((consumer) => consumer.kind === "mergeCompletion");
-	const consumersInstalled = commentsInstalled || mergeInstalled;
 	const [acting, setActing] = useState(false);
 
 	const links = card.pullRequests ?? [];
@@ -106,40 +97,9 @@ export function TaskPrTrackingSettings({
 		[links],
 	);
 
+	// The tracking state is still loading or the read failed: render nothing
+	// here (the stored PR list above is unaffected).
 	if (tracking === null) {
-		// Zero installed consumers: no tracking state to read; show only the
-		// disabled checkbox pair (card values, no polling). With consumers
-		// installed, the tracking state is still loading or failed: render
-		// nothing here (the stored PR list above is unaffected).
-		if (!consumersInstalled) {
-			return (
-				<div className="border-b border-divider px-0 py-2">
-					<div className="mb-1.5">
-						<span className="text-xs font-medium text-text-primary" data-testid="task-pr-view-settings-title">
-							PR tracking
-						</span>
-					</div>
-					<div className="flex flex-col gap-1.5">
-						<PrTrackingCheckbox
-							label="Auto address PR review comments"
-							hint="Feature unavailable"
-							checked={card.autoAddressComments === true}
-							disabled
-							acting={false}
-							onChange={() => undefined}
-						/>
-						<PrTrackingCheckbox
-							label="Auto complete when the PR merges"
-							hint="Feature unavailable"
-							checked={card.autoFinishOnMerge === true}
-							disabled
-							acting={false}
-							onChange={() => undefined}
-						/>
-					</div>
-				</div>
-			);
-		}
 		return null;
 	}
 
@@ -203,9 +163,9 @@ export function TaskPrTrackingSettings({
 				) : null}
 				<PrTrackingCheckbox
 					label="Auto complete when the PR merges"
-					hint={mergeInstalled ? null : "Feature unavailable"}
+					hint={null}
 					checked={tracking.autoFinishOnMerge}
-					disabled={!mergeInstalled}
+					disabled={false}
 					acting={acting}
 					onChange={(next) =>
 						void runMutation(() =>

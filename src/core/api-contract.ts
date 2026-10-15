@@ -2033,35 +2033,11 @@ export const runtimePrConsumerReadSourceSchema = z.enum([
 	"threads",
 ]);
 export type RuntimePrConsumerReadSource = z.infer<typeof runtimePrConsumerReadSourceSchema>;
-
-export const runtimePrInstalledConsumerSchema = z.object({
-	kind: runtimePrConsumerKindSchema,
-	requiredReadSources: z.array(runtimePrConsumerReadSourceSchema),
-});
-export type RuntimePrInstalledConsumer = z.infer<typeof runtimePrInstalledConsumerSchema>;
 export const runtimeConfigResponseSchema = z.object({
 	selectedAgentId: runtimeAgentIdSchema,
 	selectedShortcutLabel: z.string().nullable(),
 	agentAutonomousModeEnabled: z.boolean(),
 	debugModeEnabled: z.boolean().optional(),
-	/**
-	 * PRTRACK-1: the installed PR tracking consumers (empty until COMMENT-0 /
-	 * MERGE-1 register theirs). Optional so uncast legacy mocks keep working;
-	 * absent reads as "none installed" (legacy behavior).
-	 */
-	installedPrConsumers: z
-		.array(runtimePrInstalledConsumerSchema)
-		.optional()
-		.default([
-			{
-				kind: "comments",
-				requiredReadSources: ["reviews", "metadata", "conversationComments", "inlineComments", "threads"],
-			},
-			{
-				kind: "mergeCompletion",
-				requiredReadSources: ["metadata"],
-			},
-		]),
 	effectiveCommand: z.string().nullable(),
 	globalConfigPath: z.string(),
 	projectConfigPath: z.string().nullable(),
@@ -3303,7 +3279,6 @@ export const runtimeTaskTrackingStateResponseSchema = z.object({
 				"unsupported_host",
 				"ambiguous_selection",
 				"waiting_for_linked_pr",
-				"feature_unavailable",
 				"comments_unsupported",
 				"choose_repair_owner",
 				"owner_deleted",
@@ -3315,7 +3290,6 @@ export const runtimeTaskTrackingStateResponseSchema = z.object({
 			message: z.string(),
 		}),
 	),
-	installedConsumers: z.array(runtimePrInstalledConsumerSchema),
 	/** Per-task agent support: comments are native-Cline only; merge is provider-independent. */
 	commentsSupportedForTask: z.boolean(),
 	owner: runtimePrTaskOwnerSchema.nullable(),

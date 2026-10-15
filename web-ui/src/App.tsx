@@ -181,10 +181,6 @@ export default function App(): ReactElement {
 		prepareWaitForConnection: prepareWaitForTerminalConnectionReady,
 	} = useTerminalConnectionReady();
 	const readyForReviewNotificationsEnabled = runtimeProjectConfig?.readyForReviewNotificationsEnabled ?? true;
-	// PRTRACK-1: installed PR consumers drive the automation checkbox availability.
-	const installedPrConsumers = runtimeProjectConfig?.installedPrConsumers ?? [];
-	const prCommentsConsumerEnabled = installedPrConsumers.some((consumer) => consumer.kind === "comments");
-	const prMergeConsumerEnabled = installedPrConsumers.some((consumer) => consumer.kind === "mergeCompletion");
 	const shortcuts = runtimeProjectConfig?.shortcuts ?? [];
 	const selectedShortcutLabel = useMemo(() => {
 		if (shortcuts.length === 0) {
@@ -635,7 +631,7 @@ export default function App(): ReactElement {
 		runAutoReviewGitAction,
 		deterministicDeliveryEnabled: runtimeProjectConfig?.gitDeliveryPolicy?.enabled === true,
 		backendTaskDispatchEnabled: runtimeProjectConfig?.taskDispatchPolicy?.enabled === true,
-		installedPrConsumers: runtimeProjectConfig?.installedPrConsumers ?? [],
+		selectedAgentId: runtimeProjectConfig?.selectedAgentId ?? null,
 	});
 	const cleanupBlockedReasonByTaskId = useBlockedTaskCleanups(currentProjectId, board);
 
@@ -820,12 +816,10 @@ export default function App(): ReactElement {
 			prAutoAddressComments={{
 				checked: editTaskPrAutoAddressComments,
 				onChange: setEditTaskPrAutoAddressComments,
-				featureAvailable: prCommentsConsumerEnabled,
 			}}
 			prAutoFinishOnMerge={{
 				checked: editTaskPrAutoFinishOnMerge,
 				onChange: setEditTaskPrAutoFinishOnMerge,
-				featureAvailable: prMergeConsumerEnabled,
 			}}
 			workspaceId={currentProjectId}
 			branchRef={editTaskBranchRef}
@@ -1192,12 +1186,10 @@ export default function App(): ReactElement {
 					prAutoAddressComments={{
 						checked: newTaskPrAutoAddressComments,
 						onChange: setNewTaskPrAutoAddressComments,
-						featureAvailable: prCommentsConsumerEnabled,
 					}}
 					prAutoFinishOnMerge={{
 						checked: newTaskPrAutoFinishOnMerge,
 						onChange: setNewTaskPrAutoFinishOnMerge,
-						featureAvailable: prMergeConsumerEnabled,
 					}}
 					workspaceId={currentProjectId}
 					branchRef={newTaskBranchRef}

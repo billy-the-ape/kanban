@@ -1,9 +1,9 @@
 // PRTRACK-1: explicit consumer registry (the "installed consumers" signal).
 //
-// Registration is explicit at runtime — production registers the merge
-// completion consumer (MERGE-1); tests register fake consumers. An enabled
-// checkbox against an unregistered consumer never produces API demand and
-// renders as "Feature unavailable" in the UI.
+// Both real consumers (comment follow-up and merge completion) are always
+// installed in production; the registry tracks which of them is registered so
+// coordinator reads deliver observations to their observers (tests register
+// fake consumers). Demand and lifecycle-gate callers treat both as installed.
 //
 // Consumers observe the coordinator's reads: the coordinator delivers one
 // observation per active task subscription after every successful read
