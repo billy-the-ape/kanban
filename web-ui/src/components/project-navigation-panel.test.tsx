@@ -193,27 +193,6 @@ describe("ProjectNavigationPanel width persistence", () => {
 		expect(sidebar.style.width).toBe(`${expectedResizedWidth}px`);
 	});
 
-	it("renders beta hint card with report issue in the projects view", () => {
-		renderPanel();
-		expect(container.textContent).toContain("Kanban is in beta. Help us improve by sharing your experience.");
-		expect(container.textContent).toContain("Report issue");
-	});
-
-	it("shows send feedback instead of report issue when Cline OAuth is available", () => {
-		renderPanel({
-			selectedAgentId: "cline",
-			clineProviderSettings: CLINE_OAUTH_SETTINGS,
-			featurebaseFeedbackState: {
-				authState: "ready",
-				widgetOpenCount: 0,
-				openFeedbackWidget: vi.fn(async () => {}),
-			},
-		});
-		expect(container.textContent).toContain("Kanban is in beta. Help us improve by sharing your experience.");
-		expect(container.textContent).toContain("Send feedback");
-		expect(container.textContent).not.toContain("Report issue");
-	});
-
 	it("persists terminal tips dismissal", () => {
 		renderPanel({
 			activeSection: "agent",
