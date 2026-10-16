@@ -1,5 +1,4 @@
-import * as RadixCheckbox from "@radix-ui/react-checkbox";
-import { Check, MessageSquare, Play } from "lucide-react";
+import { Play } from "lucide-react";
 import type { ReactNode } from "react";
 import { useState } from "react";
 
@@ -16,6 +15,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { useTaskPrTrackingState } from "@/hooks/use-task-pr-tracking-state";
 import { getRuntimeTrpcClient } from "@/runtime/trpc-client";
 import type { RuntimeTaskPullRequest } from "@/runtime/types";
+import { TaskPrTrackingCheckbox } from "./detail-panels/task-pr-tracking-checkbox";
 
 interface TaskPrCommentHandlingPanelProps {
 	workspaceId: string;
@@ -175,30 +175,17 @@ export function TaskPrCommentHandlingPanel({ workspaceId, taskId, pullRequests }
 
 	return (
 		<div className="flex flex-col gap-1" data-testid="task-pr-comment-handling">
-			<div className="flex items-center justify-between gap-2">
-				<span className="flex min-w-0 items-center gap-1.5">
-					<MessageSquare size={12} className="shrink-0 text-text-tertiary" />
-					<span className="truncate text-xs text-text-secondary">Handle PR comments</span>
-				</span>
-				<RadixCheckbox.Root
-					checked={enabled}
-					onCheckedChange={(checked) => {
-						if (typeof checked === "boolean") {
-							void handleToggle(checked);
-						}
-					}}
-					// Only enabling is gated: an enabled task can always be
-					// turned off, even after its PR set stops being eligible.
-					disabled={(!enabled && (!hasEligiblePr || !supported)) || toggling}
-					aria-label="Handle pull request comments"
-					data-testid="task-pr-comment-toggle"
-					className="h-3.5 w-3.5 shrink-0 cursor-pointer rounded-sm border border-border bg-surface-0 data-[state=checked]:border-accent data-[state=checked]:bg-accent focus-visible:outline-2 focus-visible:outline-accent disabled:cursor-default disabled:opacity-50"
-				>
-					<RadixCheckbox.Indicator>
-						<Check size={10} className="text-surface-0" />
-					</RadixCheckbox.Indicator>
-				</RadixCheckbox.Root>
-			</div>
+			<TaskPrTrackingCheckbox
+				label="Handle PR Comments"
+				hint={null}
+				checked={enabled}
+				disabled={false}
+				acting={false}
+				onChange={(checked: boolean): void => {
+					void handleToggle(checked);
+				}}
+				data-testid="task-pr-comment-toggle"
+			/>
 			{statusLine ?? null}
 			{!enabled && hasEligiblePr && !supported ? (
 				<span className="text-[11px] text-text-tertiary" data-testid="task-pr-comment-unsupported">
