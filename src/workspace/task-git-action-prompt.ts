@@ -21,7 +21,7 @@ import { findTaskLocation } from "../core/task-board-mutations";
 import { mutateWorkspaceState } from "../state/workspace-state";
 import { logWorkspaceEvent } from "./workspace-logger";
 
-export type TaskGitActionPromptAcquireStatus = "acquired" | "already_sent" | "no_task" | "not_in_review";
+export type TaskGitActionPromptAcquireStatus = "acquired" | "already_sent" | "no_task" | "not_in_review" | "error";
 
 const REVIEW_COLUMN_ID = "review";
 
@@ -88,9 +88,10 @@ export function releaseTaskGitActionPromptOnBoard(
 
 /**
  * Acquires (or re-records) the auto git-action prompt record under the
- * workspace lock. Best-effort by contract: never throws; failures log and
- * report `no_task` so callers degrade to sending the prompt (the pre-AUTOGIT
- * behavior) instead of blocking.
+ * workspace lock. Best-effort by contract: never throws; caught failures
+ * (lock timeout, I/O failure) report `error` so callers degrade to sending
+ * the prompt (the pre-AUTOGIT behavior) instead of blocking. `no_task` is
+ * only the legitimate "card not found" result.
  */
 export async function acquireTaskGitActionPrompt(input: {
 	workspacePath: string;
@@ -120,7 +121,7 @@ export async function acquireTaskGitActionPrompt(input: {
 				error instanceof Error ? error.message : String(error)
 			}`,
 		);
-		return "no_task";
+		return "error";
 	}
 }
 

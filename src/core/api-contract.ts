@@ -520,7 +520,7 @@ export type RuntimeTaskGitActionPromptRequest = z.infer<typeof runtimeTaskGitAct
 
 export const runtimeTaskGitActionPromptResponseSchema = z.object({
 	ok: z.boolean(),
-	status: z.enum(["acquired", "already_sent", "no_task", "not_in_review"]),
+	status: z.enum(["acquired", "already_sent", "no_task", "not_in_review", "error"]),
 });
 export type RuntimeTaskGitActionPromptResponse = z.infer<typeof runtimeTaskGitActionPromptResponseSchema>;
 

@@ -2,6 +2,7 @@
 // Isolated from the real ~/.cline by redirecting HOME (AGENTS.md).
 import { spawnSync } from "node:child_process";
 import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -279,6 +280,25 @@ describe("task git action prompt records", () => {
 					intent: "auto",
 				}),
 			).toBe("acquired");
+		} finally {
+			workspace.cleanup();
+		}
+	});
+
+	it("reports a distinct error status when the workspace state cannot be read", async () => {
+		const workspace = createTempDir("kanban-git-action-prompt-ws-");
+		try {
+			await initWorkspace(workspace.path, createBoard(["task-1"], []));
+			// A path that is not a workspace makes loadWorkspaceContext throw;
+			// the acquire must swallow it and report `error` (not `no_task`)
+			// so clients degrade to sending the prompt.
+			const status = await acquireTaskGitActionPrompt({
+				workspacePath: join(workspace.path, "no-such-workspace"),
+				taskId: "task-1",
+				action: "pr",
+				intent: "auto",
+			});
+			expect(status).toBe("error");
 		} finally {
 			workspace.cleanup();
 		}

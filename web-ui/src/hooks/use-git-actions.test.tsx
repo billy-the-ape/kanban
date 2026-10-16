@@ -10,7 +10,12 @@ import type { BoardData } from "@/types";
 const showAppToastMock = vi.hoisted(() => vi.fn());
 const useGitHistoryDataMock = vi.hoisted(() => vi.fn());
 const acquireGitActionPromptMock = vi.hoisted(() =>
-	vi.fn(async (): Promise<{ ok: boolean; status: "acquired" | "already_sent" }> => ({ ok: true, status: "acquired" })),
+	vi.fn(
+		async (): Promise<{
+			ok: boolean;
+			status: "acquired" | "already_sent" | "no_task" | "not_in_review" | "error";
+		}> => ({ ok: true, status: "acquired" }),
+	),
 );
 const releaseGitActionPromptMock = vi.hoisted(() => vi.fn(async () => ({ ok: true })));
 
@@ -313,6 +318,19 @@ describe("useGitActions", () => {
 			});
 			expect(triggered).toBe(false);
 			expect(sendTaskChatMessage).not.toHaveBeenCalled();
+			expect(releaseGitActionPromptMock).not.toHaveBeenCalled();
+		});
+
+		it("sends the auto prompt when the server acquire degrades to no_task", async () => {
+			const sendTaskChatMessage = vi.fn(async () => ({ ok: true }));
+			acquireGitActionPromptMock.mockResolvedValueOnce({ ok: true, status: "no_task" });
+			const snapshot = await renderWithHooks(sendTaskChatMessage);
+			let triggered: boolean | undefined;
+			await act(async () => {
+				triggered = await snapshot.runAutoReviewGitAction("task-1", "commit");
+			});
+			expect(triggered).toBe(true);
+			expect(sendTaskChatMessage).toHaveBeenCalledTimes(1);
 			expect(releaseGitActionPromptMock).not.toHaveBeenCalled();
 		});
 

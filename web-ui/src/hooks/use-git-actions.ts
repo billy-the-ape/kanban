@@ -231,8 +231,10 @@ export function useGitActions({
 	);
 
 	// AUTOGIT: best-effort coordination with the server-owned per-review-episode
-	// record. Acquisition failures degrade to the pre-AUTOGIT behavior (send);
-	// release failures leave the record in place until the episode ends.
+	// record. Only `already_sent` suppresses the send; `no_task`,
+	// `not_in_review`, a caught server `error`, and transport failures all
+	// degrade to the pre-AUTOGIT behavior (send). Release failures leave the
+	// record in place until the episode ends.
 	const acquireTaskGitActionPromptRecord = useCallback(
 		async (taskId: string, action: TaskGitAction, intent: TaskGitActionDedupeIntent): Promise<boolean> => {
 			if (!currentProjectId) {
@@ -245,7 +247,7 @@ export function useGitActions({
 					action,
 					intent,
 				});
-				return response.status === "acquired";
+				return response.status !== "already_sent";
 			} catch {
 				return true;
 			}
