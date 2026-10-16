@@ -35,9 +35,10 @@ export async function refreshCommentWorktree(
 	});
 	signal.throwIfAborted();
 	if (!symbolicRef.ok) {
-		// runGit normalizes timeouts and spawn failures to exitCode -1; only a real
-		// non-zero git exit here means HEAD is not a branch ref (detached).
-		if (symbolicRef.exitCode !== -1) {
+		// symbolic-ref exits 1 exactly when HEAD is not a symbolic ref (detached);
+		// fatal git errors (128), timeouts and spawn failures (normalized to -1
+		// by runGit) keep the generic retry message.
+		if (symbolicRef.exitCode === 1) {
 			throw new Error(`Task worktree is on a detached HEAD; expected PR branch ${headRef}.`);
 		}
 		throw new Error(`Git refresh failed (symbolic-ref). Check repository access and retry.`);

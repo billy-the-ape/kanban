@@ -89,12 +89,20 @@ describe("safe PR repair Git refresh", () => {
 		await git(task, "checkout", "--detach");
 		await expect(refreshCommentWorktree(task, snapshot, signal(), runner)).rejects.toThrow("detached HEAD");
 	});
-	it("keeps the generic retry message when symbolic-ref times out or fails to spawn", async () => {
-		const failing: CommentGitRunner = (cwd, args, options) =>
+	const failingSymbolicRef =
+		(exitCode: number): CommentGitRunner =>
+		(cwd, args, options) =>
 			args[0] === "symbolic-ref"
-				? Promise.resolve({ ok: false, stdout: "", stderr: "", output: "", error: "git timed out", exitCode: -1 })
+				? Promise.resolve({ ok: false, stdout: "", stderr: "", output: "", error: "git failed", exitCode })
 				: runGit(cwd, args, options);
-		await expect(refreshCommentWorktree(task, snapshot, signal(), failing)).rejects.toThrow(
+
+	it("keeps the generic retry message when symbolic-ref times out or fails to spawn", async () => {
+		await expect(refreshCommentWorktree(task, snapshot, signal(), failingSymbolicRef(-1))).rejects.toThrow(
+			"Git refresh failed (symbolic-ref)",
+		);
+	});
+	it("keeps the generic retry message on a fatal symbolic-ref error", async () => {
+		await expect(refreshCommentWorktree(task, snapshot, signal(), failingSymbolicRef(128))).rejects.toThrow(
 			"Git refresh failed (symbolic-ref)",
 		);
 	});
