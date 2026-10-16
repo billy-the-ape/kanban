@@ -9,6 +9,10 @@ import type { BoardData } from "@/types";
 
 const showAppToastMock = vi.hoisted(() => vi.fn());
 const useGitHistoryDataMock = vi.hoisted(() => vi.fn());
+const acquireGitActionPromptMock = vi.hoisted(() =>
+	vi.fn(async (): Promise<{ ok: boolean; status: "acquired" | "already_sent" }> => ({ ok: true, status: "acquired" })),
+);
+const releaseGitActionPromptMock = vi.hoisted(() => vi.fn(async () => ({ ok: true })));
 
 vi.mock("@/components/app-toaster", () => ({
 	showAppToast: showAppToastMock,
@@ -18,8 +22,18 @@ vi.mock("@/components/git-history/use-git-history-data", () => ({
 	useGitHistoryData: useGitHistoryDataMock,
 }));
 
+vi.mock("@/runtime/trpc-client", () => ({
+	getRuntimeTrpcClient: () => ({
+		workspace: {
+			acquireTaskGitActionPrompt: { mutate: acquireGitActionPromptMock },
+			releaseTaskGitActionPrompt: { mutate: releaseGitActionPromptMock },
+		},
+	}),
+}));
+
 interface HookSnapshot {
 	handleAgentCommitTask: UseGitActionsResult["handleAgentCommitTask"];
+	runAutoReviewGitAction: UseGitActionsResult["runAutoReviewGitAction"];
 }
 
 function createGitHistoryResult(): UseGitActionsResult["gitHistory"] {
@@ -166,8 +180,9 @@ function HookHarness({
 	useEffect(() => {
 		onSnapshot({
 			handleAgentCommitTask: gitActions.handleAgentCommitTask,
+			runAutoReviewGitAction: gitActions.runAutoReviewGitAction,
 		});
-	}, [gitActions.handleAgentCommitTask, onSnapshot]);
+	}, [gitActions.handleAgentCommitTask, gitActions.runAutoReviewGitAction, onSnapshot]);
 
 	return null;
 }
@@ -181,6 +196,10 @@ describe("useGitActions", () => {
 		showAppToastMock.mockReset();
 		useGitHistoryDataMock.mockReset();
 		useGitHistoryDataMock.mockReturnValue(createGitHistoryResult());
+		acquireGitActionPromptMock.mockReset();
+		acquireGitActionPromptMock.mockResolvedValue({ ok: true, status: "acquired" });
+		releaseGitActionPromptMock.mockReset();
+		releaseGitActionPromptMock.mockResolvedValue({ ok: true });
 		clearTaskWorkspaceInfo("task-1");
 		clearTaskWorkspaceSnapshot("task-1");
 		previousActEnvironment = (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
@@ -243,5 +262,74 @@ describe("useGitActions", () => {
 		});
 		expect(sendTaskSessionInput).not.toHaveBeenCalled();
 		expect(showAppToastMock).not.toHaveBeenCalled();
+	});
+
+	describe("AUTOGIT: git-action prompt dedupe", () => {
+		async function renderWithHooks(
+			sendTaskChatMessage: Parameters<typeof useGitActions>[0]["sendTaskChatMessage"],
+		): Promise<HookSnapshot> {
+			const sendTaskSessionInput = vi.fn(async () => ({ ok: true }));
+			let snapshot: HookSnapshot | null = null;
+			await act(async () => {
+				root.render(
+					<HookHarness
+						sendTaskSessionInput={sendTaskSessionInput}
+						sendTaskChatMessage={sendTaskChatMessage}
+						onSnapshot={(next) => {
+							snapshot = next;
+						}}
+					/>,
+				);
+				await Promise.resolve();
+			});
+			if (snapshot === null) {
+				throw new Error("Expected a hook snapshot.");
+			}
+			return snapshot;
+		}
+
+		it("records a manual commit send through the server-owned record", async () => {
+			const snapshot = await renderWithHooks(vi.fn(async () => ({ ok: true })));
+			await act(async () => {
+				snapshot.handleAgentCommitTask("task-1");
+				for (let i = 0; i < 5; i += 1) {
+					await Promise.resolve();
+				}
+			});
+			expect(acquireGitActionPromptMock).toHaveBeenCalledWith({
+				taskId: "task-1",
+				action: "commit",
+				intent: "manual",
+			});
+		});
+
+		it("suppresses the auto prompt when the episode already has a record", async () => {
+			const sendTaskChatMessage = vi.fn(async () => ({ ok: true }));
+			acquireGitActionPromptMock.mockResolvedValueOnce({ ok: true, status: "already_sent" });
+			const snapshot = await renderWithHooks(sendTaskChatMessage);
+			let triggered: boolean | undefined;
+			await act(async () => {
+				triggered = await snapshot.runAutoReviewGitAction("task-1", "commit");
+			});
+			expect(triggered).toBe(false);
+			expect(sendTaskChatMessage).not.toHaveBeenCalled();
+			expect(releaseGitActionPromptMock).not.toHaveBeenCalled();
+		});
+
+		it("releases the record when an auto prompt send fails", async () => {
+			const sendTaskChatMessage = vi.fn(async () => ({ ok: false, message: "boom" }));
+			const snapshot = await renderWithHooks(sendTaskChatMessage);
+			let triggered: boolean | undefined;
+			await act(async () => {
+				triggered = await snapshot.runAutoReviewGitAction("task-1", "commit");
+			});
+			expect(triggered).toBe(false);
+			expect(acquireGitActionPromptMock).toHaveBeenCalledWith({
+				taskId: "task-1",
+				action: "commit",
+				intent: "auto",
+			});
+			expect(releaseGitActionPromptMock).toHaveBeenCalledWith({ taskId: "task-1", action: "commit" });
+		});
 	});
 });

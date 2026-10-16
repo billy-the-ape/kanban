@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef } from "react";
 
 import type { TaskGitAction } from "@/git-actions/build-task-git-action-prompt";
+import type { RuntimeTaskSessionSummary } from "@/runtime/types";
 import { findCardSelection } from "@/state/board-state";
 import { getTaskWorkspaceSnapshot, subscribeToAnyTaskMetadata } from "@/stores/workspace-metadata-store";
 import type { BoardCard, BoardColumnId, BoardData, TaskAutoReviewMode } from "@/types";
@@ -80,6 +81,12 @@ interface UseReviewAutoActionsOptions {
 	 */
 	prCompletionGatedTaskIds?: ReadonlySet<string>;
 	resetKey?: string | null;
+	/**
+	 * AUTOGIT: live session summaries. While a task's session is actively
+	 * `running`, the generated prompt is deferred (not injected mid-turn);
+	 * the evaluation re-runs when the session state changes.
+	 */
+	taskSessions?: Record<string, RuntimeTaskSessionSummary>;
 }
 
 export function useReviewAutoActions({
@@ -90,6 +97,7 @@ export function useReviewAutoActions({
 	completeOnGitActionSuccess = false,
 	prCompletionGatedTaskIds,
 	resetKey,
+	taskSessions,
 }: UseReviewAutoActionsOptions): void {
 	const boardRef = useRef<BoardData>(board);
 	const runAutoReviewGitActionRef = useRef(runAutoReviewGitAction);
@@ -291,6 +299,14 @@ export function useReviewAutoActions({
 					(changedFiles ?? 0) <= 0 ||
 					isGitActionInFlight ||
 					hasSentAutoReviewPrompt(promptKey) ||
+					// AUTOGIT: server-owned record — the same prompt was already
+					// delivered during this review episode (manual or auto).
+					reviewTask.sentGitActionPrompt?.action === autoReviewMode ||
+					// AUTOGIT: do not inject the "when you are done, commit/PR"
+					// instruction mid-turn; re-evaluate once the session stops.
+					// Deterministic delivery is unaffected (it operates on the
+					// worktree, not the session).
+					(!completeOnGitActionSuccess && taskSessions?.[reviewTask.id]?.state === "running") ||
 					suppressAutoPr
 				) {
 					clearAutoReviewTimer(reviewTask.id);
@@ -315,6 +331,12 @@ export function useReviewAutoActions({
 						return;
 					}
 					if (!completeOnGitActionSuccessRef.current && hasSentAutoReviewPrompt(promptKey)) {
+						return;
+					}
+					// AUTOGIT: a server-owned same-episode record appeared while
+					// the timer was pending (e.g. a manual click); the server
+					// acquire would reject it, so skip here too.
+					if (latestSelection.card.sentGitActionPrompt?.action === latestMode) {
 						return;
 					}
 					awaitingCleanActionByTaskIdRef.current[reviewTask.id] = latestMode;
@@ -348,6 +370,7 @@ export function useReviewAutoActions({
 			resetKey,
 			scheduleAutoReviewAction,
 			taskGitActionLoadingByTaskId,
+			taskSessions,
 		],
 	);
 

@@ -3,7 +3,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TaskGitAction } from "@/git-actions/build-task-git-action-prompt";
 import { useReviewAutoActions } from "@/hooks/use-review-auto-actions";
-import type { RuntimeTaskPullRequest } from "@/runtime/types";
+import type { RuntimeTaskPullRequest, RuntimeTaskSessionSummary } from "@/runtime/types";
 import { resetWorkspaceMetadataStore, setTaskWorkspaceSnapshot } from "@/stores/workspace-metadata-store";
 import type { BoardColumnId, BoardData, ReviewTaskWorkspaceSnapshot } from "@/types";
 
@@ -73,16 +73,39 @@ function createBoardWithPrMode(pullRequests?: RuntimeTaskPullRequest[]): BoardDa
 	return board;
 }
 
+function createTaskSessionSummary(
+	taskId: string,
+	state: RuntimeTaskSessionSummary["state"],
+): RuntimeTaskSessionSummary {
+	return {
+		taskId,
+		state,
+		mode: "act",
+		agentId: null,
+		workspacePath: null,
+		pid: null,
+		startedAt: null,
+		updatedAt: 1,
+		lastOutputAt: null,
+		reviewReason: null,
+		exitCode: null,
+		lastHookAt: null,
+		latestHookActivity: null,
+	};
+}
+
 function HookHarness({
 	board,
 	runAutoReviewGitAction,
 	requestCompleteTask,
 	completeOnGitActionSuccess,
+	taskSessions,
 }: {
 	board: BoardData;
 	runAutoReviewGitAction: (taskId: string, action: TaskGitAction) => Promise<boolean>;
 	requestCompleteTask: (taskId: string, fromColumnId: BoardColumnId) => Promise<void>;
 	completeOnGitActionSuccess?: boolean;
+	taskSessions?: Record<string, RuntimeTaskSessionSummary>;
 }): null {
 	setTaskWorkspaceSnapshot(workspaceSnapshots["task-1"] ?? null);
 	useReviewAutoActions({
@@ -91,6 +114,7 @@ function HookHarness({
 		runAutoReviewGitAction,
 		requestCompleteTask,
 		completeOnGitActionSuccess,
+		taskSessions,
 	});
 	return null;
 }
@@ -484,5 +508,74 @@ describe("useReviewAutoActions", () => {
 
 		expect(runAutoReviewGitAction).toHaveBeenCalledTimes(1);
 		expect(runAutoReviewGitAction).toHaveBeenCalledWith("task-1", "pr");
+	});
+
+	it("does not resend when the server-owned episode record already exists", async () => {
+		const runAutoReviewGitAction = vi.fn(async () => true);
+		const requestCompleteTask = vi.fn(async () => {});
+		const board = createBoard(true);
+		const reviewColumn = board.columns.find((column) => column.id === "review");
+		const task = reviewColumn?.cards[0];
+		if (!reviewColumn || !task) {
+			throw new Error("Missing test card or column");
+		}
+		// The server record says the auto-commit prompt was already delivered
+		// this review episode (manual or auto), so this client must not resend.
+		task.sentGitActionPrompt = { action: "commit", sentAt: 1 };
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					board={board}
+					runAutoReviewGitAction={runAutoReviewGitAction}
+					requestCompleteTask={requestCompleteTask}
+				/>,
+			);
+		});
+		await act(async () => {
+			vi.advanceTimersByTime(1000);
+		});
+
+		expect(runAutoReviewGitAction).not.toHaveBeenCalled();
+		expect(requestCompleteTask).not.toHaveBeenCalled();
+	});
+
+	it("defers the auto prompt while the session is running and sends once it stops", async () => {
+		const runAutoReviewGitAction = vi.fn(async () => true);
+		const requestCompleteTask = vi.fn(async () => {});
+
+		// Session is actively running: the prompt is deferred (no mid-turn
+		// injection).
+		await act(async () => {
+			root.render(
+				<HookHarness
+					board={createBoard(true)}
+					runAutoReviewGitAction={runAutoReviewGitAction}
+					requestCompleteTask={requestCompleteTask}
+					taskSessions={{ "task-1": createTaskSessionSummary("task-1", "running") }}
+				/>,
+			);
+		});
+		await act(async () => {
+			vi.advanceTimersByTime(1000);
+		});
+		expect(runAutoReviewGitAction).not.toHaveBeenCalled();
+
+		// The session stops; the re-evaluation fires the prompt.
+		await act(async () => {
+			root.render(
+				<HookHarness
+					board={createBoard(true)}
+					runAutoReviewGitAction={runAutoReviewGitAction}
+					requestCompleteTask={requestCompleteTask}
+					taskSessions={{ "task-1": createTaskSessionSummary("task-1", "idle") }}
+				/>,
+			);
+		});
+		await act(async () => {
+			vi.advanceTimersByTime(1000);
+		});
+		expect(runAutoReviewGitAction).toHaveBeenCalledTimes(1);
+		expect(runAutoReviewGitAction).toHaveBeenCalledWith("task-1", "commit");
 	});
 });

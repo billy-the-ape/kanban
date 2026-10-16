@@ -43,7 +43,7 @@ describe("buildTaskGitActionPrompt", () => {
 		).toContain("Handle this pull request action using the provided git context.");
 	});
 
-	it("requires Markdown and a body file even with a custom PR template", () => {
+	it("uses the custom PR template verbatim without appended instructions", () => {
 		const prompt = buildTaskGitActionPrompt({
 			action: "pr",
 			workspaceInfo: {
@@ -57,9 +57,6 @@ describe("buildTaskGitActionPrompt", () => {
 			},
 			templates: { openPrPromptTemplate: "Open a PR against {{base_ref}}." },
 		});
-		expect(prompt).toContain("Open a PR against main.");
-		expect(prompt).toContain("Summary, Changes, Testing, and Deployment and follow-up");
-		expect(prompt).toContain("gh pr create --body-file <path>");
-		expect(prompt).toContain("Check the created PR description on GitHub");
+		expect(prompt).toBe("Open a PR against main.");
 	});
 });

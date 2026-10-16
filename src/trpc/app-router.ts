@@ -105,6 +105,10 @@ import type {
 	RuntimeTaskDispatchReconcileResponse,
 	RuntimeTaskDispatchRunResponse,
 	RuntimeTaskDispatchStatusResponse,
+	RuntimeTaskGitActionPromptReleaseRequest,
+	RuntimeTaskGitActionPromptReleaseResponse,
+	RuntimeTaskGitActionPromptRequest,
+	RuntimeTaskGitActionPromptResponse,
 	RuntimeTaskInitialStartStatusRequest,
 	RuntimeTaskInitialStartStatusResponse,
 	RuntimeTaskMergeBindingUpdateRequest,
@@ -261,6 +265,10 @@ import {
 	runtimeTaskDispatchReconcileResponseSchema,
 	runtimeTaskDispatchRunResponseSchema,
 	runtimeTaskDispatchStatusResponseSchema,
+	runtimeTaskGitActionPromptReleaseRequestSchema,
+	runtimeTaskGitActionPromptReleaseResponseSchema,
+	runtimeTaskGitActionPromptRequestSchema,
+	runtimeTaskGitActionPromptResponseSchema,
 	runtimeTaskInitialStartStatusRequestSchema,
 	runtimeTaskInitialStartStatusResponseSchema,
 	runtimeTaskMergeBindingUpdateRequestSchema,
@@ -558,6 +566,16 @@ export interface RuntimeTrpcContext {
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeWorkspaceStateSaveRequest,
 		) => Promise<RuntimeWorkspaceStateResponse>;
+		// AUTOGIT: server-owned dedupe record for generated auto commit/PR
+		// prompts (src/workspace/task-git-action-prompt.ts).
+		acquireTaskGitActionPrompt: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskGitActionPromptRequest,
+		) => Promise<RuntimeTaskGitActionPromptResponse>;
+		releaseTaskGitActionPrompt: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskGitActionPromptReleaseRequest,
+		) => Promise<RuntimeTaskGitActionPromptReleaseResponse>;
 		loadWorkspaceChanges: (scope: RuntimeTrpcWorkspaceScope) => Promise<RuntimeWorkspaceChangesResponse>;
 		loadGitLog: (scope: RuntimeTrpcWorkspaceScope, input: RuntimeGitLogRequest) => Promise<RuntimeGitLogResponse>;
 		loadGitRefs: (
@@ -1092,6 +1110,20 @@ export const runtimeAppRouter = t.router({
 			.output(runtimeWorkspaceStateResponseSchema)
 			.mutation(async ({ ctx, input }) => {
 				return await ctx.workspaceApi.saveState(ctx.workspaceScope, input);
+			}),
+		// AUTOGIT: server-owned dedupe record for generated auto commit/PR
+		// prompts (see src/workspace/task-git-action-prompt.ts).
+		acquireTaskGitActionPrompt: workspaceProcedure
+			.input(runtimeTaskGitActionPromptRequestSchema)
+			.output(runtimeTaskGitActionPromptResponseSchema)
+			.mutation(async ({ ctx, input }) => {
+				return await ctx.workspaceApi.acquireTaskGitActionPrompt(ctx.workspaceScope, input);
+			}),
+		releaseTaskGitActionPrompt: workspaceProcedure
+			.input(runtimeTaskGitActionPromptReleaseRequestSchema)
+			.output(runtimeTaskGitActionPromptReleaseResponseSchema)
+			.mutation(async ({ ctx, input }) => {
+				return await ctx.workspaceApi.releaseTaskGitActionPrompt(ctx.workspaceScope, input);
 			}),
 		// PRLINK-5: manual PR link management (add/remove/refresh).
 		addTaskPullRequest: workspaceProcedure
