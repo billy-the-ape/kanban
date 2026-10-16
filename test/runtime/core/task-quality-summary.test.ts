@@ -440,6 +440,33 @@ describe("analyzeTaskQualitySummary", () => {
 		]);
 	});
 
+	it("never matches an empty-id call to an empty-id result", () => {
+		const seg = session({
+			kind: "task",
+			sessionId: "s",
+			provider: "p",
+			model: "m",
+			messages: [
+				message({
+					role: "assistant",
+					contentKey: "a",
+					toolParts: [toolUsePart({ toolCallId: "", toolName: "read_files", arguments: { path: "/tmp/a" } })],
+				}),
+				message({
+					role: "user",
+					contentKey: "r",
+					toolParts: [toolResultPart({ toolCallId: "", resultText: "ok" })],
+				}),
+			],
+		});
+		const result = run([seg]);
+		expect(result.unmatchedToolCalls).toBe(1);
+		expect(result.reportedToolFailures).toBe(0);
+		expect(result.evidence).toEqual([
+			expect.objectContaining({ ruleId: "unmatched_tool_call", classification: "unmatched_call", toolCallId: "" }),
+		]);
+	});
+
 	it("flags mixed models from headers and assistant metadata without inference", () => {
 		const segA = session({
 			kind: "task",

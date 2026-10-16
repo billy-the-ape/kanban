@@ -87,7 +87,7 @@ describe("safe PR repair Git refresh", () => {
 		await git(task, "switch", "-c", "other");
 		await expect(refreshCommentWorktree(task, snapshot, signal(), runner)).rejects.toThrow("Expected PR branch");
 		await git(task, "checkout", "--detach");
-		await expect(refreshCommentWorktree(task, snapshot, signal(), runner)).rejects.toThrow("Git refresh failed");
+		await expect(refreshCommentWorktree(task, snapshot, signal(), runner)).rejects.toThrow("detached HEAD");
 	});
 	it("blocks a racing remote update and a mismatched remote repository", async () => {
 		const old = snapshot.headSha;

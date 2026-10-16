@@ -150,8 +150,8 @@ export function TaskCreateDialog({
 	autoReviewMode: TaskAutoReviewMode;
 	onAutoReviewModeChange: (value: TaskAutoReviewMode) => void;
 	/**
-	 * PRTRACK-1: PR automation preferences. The checkbox renders disabled with
-	 * "feature unavailable" when no consumer of that kind is installed.
+	 * PRTRACK-1: PR automation preferences. Each checkbox renders only when its
+	 * corresponding prop is supplied.
 	 */
 	prAutoAddressComments?: { checked: boolean; onChange: (value: boolean) => void };
 	prAutoFinishOnMerge?: { checked: boolean; onChange: (value: boolean) => void };

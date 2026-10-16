@@ -28,7 +28,14 @@ export async function refreshCommentWorktree(
 		return result.stdout;
 	};
 	await git(["check-ref-format", `refs/heads/${headRef}`]);
-	const branch = await git(["symbolic-ref", "--quiet", "--short", "HEAD"]);
+	signal.throwIfAborted();
+	const symbolicRef = await runner(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"], {
+		timeoutMs: 30_000,
+		env: createGitProcessEnv({ GIT_TERMINAL_PROMPT: "0" }),
+	});
+	signal.throwIfAborted();
+	if (!symbolicRef.ok) throw new Error(`Task worktree is on a detached HEAD; expected PR branch ${headRef}.`);
+	const branch = symbolicRef.stdout;
 	if (branch !== headRef) throw new Error(`Expected PR branch ${headRef}; task is on ${branch}.`);
 	for (const marker of [
 		"MERGE_HEAD",
