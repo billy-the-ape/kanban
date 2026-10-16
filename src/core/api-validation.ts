@@ -389,7 +389,7 @@ export function parseTaskDiagnosticsActionRequest(value: unknown): RuntimeTaskDi
 	};
 }
 
-/** DIAG-PANEL: validate the recorded quality summary request. */
+/** AUTOGIT: validate the git action prompt acquire request. */
 export function parseTaskGitActionPromptRequest(value: unknown): RuntimeTaskGitActionPromptRequest {
 	const parsed = parseWithSchema(runtimeTaskGitActionPromptRequestSchema, value);
 	const taskId = parsed.taskId.trim();
@@ -402,6 +402,7 @@ export function parseTaskGitActionPromptRequest(value: unknown): RuntimeTaskGitA
 	};
 }
 
+/** AUTOGIT: validate the git action prompt release request. */
 export function parseTaskGitActionPromptReleaseRequest(value: unknown): RuntimeTaskGitActionPromptReleaseRequest {
 	const parsed = parseWithSchema(runtimeTaskGitActionPromptReleaseRequestSchema, value);
 	const taskId = parsed.taskId.trim();
@@ -414,6 +415,7 @@ export function parseTaskGitActionPromptReleaseRequest(value: unknown): RuntimeT
 	};
 }
 
+/** DIAG-PANEL: validate the recorded quality summary request. */
 export function parseTaskQualitySummaryRequest(value: unknown): RuntimeTaskQualitySummaryRequest {
 	const parsed = parseWithSchema(runtimeTaskQualitySummaryRequestSchema, value);
 	const taskId = parsed.taskId.trim();
