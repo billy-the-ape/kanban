@@ -7,6 +7,7 @@ interface TaskPrTrackingCheckboxProps {
 	disabled: boolean;
 	acting: boolean;
 	onChange: (next: boolean) => void;
+	testId?: string;
 }
 
 export function TaskPrTrackingCheckbox({
@@ -16,6 +17,7 @@ export function TaskPrTrackingCheckbox({
 	disabled,
 	acting,
 	onChange,
+	testId,
 }: TaskPrTrackingCheckboxProps): React.ReactElement {
 	return (
 		<label
@@ -31,6 +33,8 @@ export function TaskPrTrackingCheckbox({
 				onChange={(event) => onChange(event.target.checked)}
 				className="mt-0.5 h-3.5 w-3.5 accent-(--color-accent)"
 				aria-label={label}
+				data-state={checked ? "checked" : "unchecked"}
+				{...(testId && { "data-testid": testId })}
 			/>
 			<span className="leading-tight">
 				{label}

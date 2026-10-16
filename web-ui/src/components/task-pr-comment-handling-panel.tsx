@@ -179,12 +179,12 @@ export function TaskPrCommentHandlingPanel({ workspaceId, taskId, pullRequests }
 				label="Handle PR Comments"
 				hint={null}
 				checked={enabled}
-				disabled={false}
+				disabled={(!enabled && (!hasEligiblePr || !supported)) || toggling}
 				acting={false}
 				onChange={(checked: boolean): void => {
 					void handleToggle(checked);
 				}}
-				data-testid="task-pr-comment-toggle"
+				testId="task-pr-comment-toggle"
 			/>
 			{statusLine ?? null}
 			{!enabled && hasEligiblePr && !supported ? (
