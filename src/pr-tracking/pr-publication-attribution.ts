@@ -570,15 +570,13 @@ function detectGhOperation(
 			// can be published, so the write is not a publication.
 			return;
 		}
-		if (parsed.edit) {
-			// An edit of existing feedback (…/issues/comments/C,
-			// …/pulls/comments/C, …/pulls/N/reviews/R): the item already
-			// exists, so the write creates no new feedback identity and
-			// must not open a new-publication capture. It is still recorded
-			// as an edit-only activity so restart reconciliation can clear
-			// spurious pre-fix captures for it. Its output (the updated
-			// object or a filtered field) never registers.
-		}
+		// Edits of existing feedback (…/issues/comments/C, …/pulls/comments/C,
+		// …/pulls/N/reviews/R) create no new identity and must not open a
+		// new-publication capture. They are pushed with `edit: true` so
+		// restart reconciliation can detect edit-only activity and clear
+		// spurious pre-fix captures; `detectPublicationOperations` filters
+		// them out of publications, and their output (the updated object or
+		// a filtered field) never registers.
 		push({
 			operation: "gh api",
 			kind: parsed.kind,
