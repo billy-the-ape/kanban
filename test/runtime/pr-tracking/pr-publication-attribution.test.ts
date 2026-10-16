@@ -770,6 +770,14 @@ describe("resolvePublicationOutput bare numeric id support", () => {
 		expect(resolution.identities).toEqual([]);
 		expect(resolution.reason).toContain("bare numeric output");
 	});
+	it("classifies a bare-id write with an empty failed result as failed, not uncertain", () => {
+		const fragment = "gh api repos/octo/repo/issues/42/comments -f body='addressed' --jq '.id'";
+		const operations = detectPublicationOperations([fragment]);
+		const output = JSON.stringify([{ query: fragment, result: "", success: false }]);
+		const resolution = resolvePublicationOutput({ operations, target: TARGET, output, error: null });
+		expect(resolution.status).toBe("failed");
+		expect(resolution.identities).toEqual([]);
+	});
 
 	it("keeps bare ids scoped away from an unrelated read result", () => {
 		const operations = detectPublicationOperations([verifiedCommand]);

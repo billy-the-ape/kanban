@@ -1025,7 +1025,10 @@ export function resolvePublicationOutput(input: {
 		if (bareIdScope.length === scopedOperations.length) {
 			const kinds = new Set(bareIdScope.map((operation) => operation.kind));
 			const bareIds = collectBareIdLines(candidateTexts);
-			if (bareIds !== null) {
+			if (bareIds !== null && bareIds.length === 0) {
+				// No evidence lines at all: nothing to attribute; fall through
+				// so the failure classification below still applies.
+			} else if (bareIds !== null) {
 				if (kinds.size === 1 && bareIds.length === bareIdScope.length) {
 					const kind = bareIdScope[0]?.kind ?? null;
 					if (kind !== null) {
@@ -1047,9 +1050,9 @@ export function resolvePublicationOutput(input: {
 				// — never guess, leave it visible.
 				return { status: "uncertain", identities: [], reason: BARE_ID_UNCERTAINTY_REASON };
 			}
-			// bareIds === null with a single kind: the lines carry extra
-			// (possibly failure) text; fall through to the URL fallback and
-			// failure checks below.
+			// bareIds is null (the lines carry extra, possibly failure text)
+			// or empty (no evidence lines): fall through to the URL fallback
+			// and failure checks below.
 		}
 	}
 	if (collected.length === 0) {
