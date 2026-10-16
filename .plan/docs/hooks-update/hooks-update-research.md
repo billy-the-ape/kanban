@@ -1,5 +1,5 @@
 
-# Hooks Research For Kanban Agent Status
+# Hooks Research For Kanbani Status
 
 We want a reliable way to move tasks from `In Progress` to `Review` when an agent needs user attention, and back from `Review` to `In Progress` when the user responds to agent.
 

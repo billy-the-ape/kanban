@@ -277,9 +277,9 @@ describe("ProjectNavigationPanel width persistence", () => {
 		const onActiveSectionChange = vi.fn();
 		renderPanel({ onActiveSectionChange });
 		const sectionButtons = Array.from(container.querySelectorAll("button")).filter((button) =>
-			["Projects", "Tasks", "Kanban Agent"].includes(button.textContent ?? ""),
+			["Projects", "Tasks", "Kanbani"].includes(button.textContent ?? ""),
 		);
-		expect(sectionButtons.map((button) => button.textContent)).toEqual(["Projects", "Tasks", "Kanban Agent"]);
+		expect(sectionButtons.map((button) => button.textContent)).toEqual(["Projects", "Tasks", "Kanbani"]);
 		const tasksButton = sectionButtons.find((button) => button.textContent === "Tasks");
 		if (!tasksButton) {
 			throw new Error("Tasks section button was not rendered");

@@ -87,9 +87,9 @@ describe("TaskPrCommentHandlingPanel", () => {
 		});
 	}
 
-	function toggle(): HTMLButtonElement {
+	function toggle(): HTMLInputElement {
 		const element = document.querySelector('[data-testid="task-pr-comment-toggle"]');
-		if (!(element instanceof HTMLButtonElement)) {
+		if (!(element instanceof HTMLInputElement)) {
 			throw new Error("toggle not rendered");
 		}
 		return element;

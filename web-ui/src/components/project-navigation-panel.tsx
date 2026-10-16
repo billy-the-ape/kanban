@@ -372,7 +372,7 @@ export function ProjectNavigationPanel({
 								!canShowAgentSection ? "cursor-not-allowed opacity-50" : null,
 							)}
 						>
-							Kanban Agent
+							Kanbani
 						</button>
 					</div>
 				</div>
