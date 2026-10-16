@@ -1084,10 +1084,14 @@ body.kb-dependency-link-mode {
 	50% { opacity: 0.7; }
 }
 
-.kb-skeleton {
-	animation: kb-skeleton 1.5s ease-in-out infinite;
-	background: var(--color-surface-3);
-	border-radius: var(--radius-sm);
+/* Layered as a component so Tailwind utilities (e.g. rounded-full) can
+   override its border-radius; unlayered CSS would beat the utilities layer. */
+@layer components {
+	.kb-skeleton {
+		animation: kb-skeleton 1.5s ease-in-out infinite;
+		background: var(--color-surface-3);
+		border-radius: var(--radius-sm);
+	}
 }
 
 /* -- Chat markdown -- */
