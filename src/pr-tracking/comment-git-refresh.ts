@@ -34,7 +34,14 @@ export async function refreshCommentWorktree(
 		env: createGitProcessEnv({ GIT_TERMINAL_PROMPT: "0" }),
 	});
 	signal.throwIfAborted();
-	if (!symbolicRef.ok) throw new Error(`Task worktree is on a detached HEAD; expected PR branch ${headRef}.`);
+	if (!symbolicRef.ok) {
+		// runGit normalizes timeouts and spawn failures to exitCode -1; only a real
+		// non-zero git exit here means HEAD is not a branch ref (detached).
+		if (symbolicRef.exitCode !== -1) {
+			throw new Error(`Task worktree is on a detached HEAD; expected PR branch ${headRef}.`);
+		}
+		throw new Error(`Git refresh failed (symbolic-ref). Check repository access and retry.`);
+	}
 	const branch = symbolicRef.stdout;
 	if (branch !== headRef) throw new Error(`Expected PR branch ${headRef}; task is on ${branch}.`);
 	for (const marker of [
