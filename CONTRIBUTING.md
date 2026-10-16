@@ -82,7 +82,7 @@ If you'd like to add support for a new CLI agent, open an issue first to discuss
 - Terminal integration and hook support
 - Tests covering the above
 
-Look at the existing agent implementations in `src/` for reference. The agent list lives in `src/cli.ts` and the runtime abstractions are nearby.
+Look at the existing agent implementations in `src/` for reference. The agent catalog lives in `src/core/agent-catalog.ts`, and the runtime abstractions are in `src/terminal/`.
 
 ## Philosophy
 
