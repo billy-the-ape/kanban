@@ -25,6 +25,7 @@
 import { randomUUID } from "node:crypto";
 import type { ClineTaskSessionService } from "../cline-sdk/cline-task-session-service";
 import type { ClineTurnPreparation } from "../cline-sdk/cline-turn-preparation";
+import { extractCommandStrings } from "../cline-sdk/review-tool-policy";
 import type {
 	RuntimeAgentId,
 	RuntimeBoardCard,
@@ -54,6 +55,8 @@ import type { GitHubPrClient, GitHubPrSnapshot } from "./github-pr-client";
 import { listPrTrackingRecords, loadPrTrackingRecord, upsertPrTrackingRecord } from "./pr-comment-record-store";
 import {
 	analyzePrPublication,
+	detectPublicationOperations,
+	isEditOnlyPublicationActivity,
 	type PrPublicationObservation,
 	type PrPublishedIdentity,
 	prPublishedIdentityKey,
@@ -154,6 +157,59 @@ export interface PrCommentAutomationServiceDependencies {
 	refreshGit?: typeof refreshCommentWorktree;
 	now?: () => number;
 	warn?: (message: string) => void;
+}
+
+/**
+ * The original input/output/error of one transcript `tool_call_end` message.
+ * The message content is the `Tool:`/`Input:`/`Output:`/`Error:`/`Duration:`
+ * text produced by the session-state tool-call formatter (see
+ * `buildToolCallContent` in cline-session-state.ts); a message without that
+ * wrapper (plain content) does not parse and yields null.
+ */
+function parseTranscriptToolCall(content: string): {
+	input: unknown;
+	output: string | null;
+	error: string | null;
+} | null {
+	const lines = content.split("\n");
+	if (!lines[0]?.startsWith("Tool: ")) {
+		return null;
+	}
+	const sections = new Map<string, string[]>();
+	let current: string | null = null;
+	for (const line of lines.slice(1)) {
+		if (line === "Input:" || line === "Output:" || line === "Error:") {
+			current = line.slice(0, -1);
+			sections.set(current, []);
+			continue;
+		}
+		if (/^Duration: \d+ms$/.test(line)) {
+			current = null;
+			continue;
+		}
+		if (current !== null) {
+			sections.get(current)?.push(line);
+		}
+	}
+	const read = (name: string): string | null => {
+		const section = sections.get(name);
+		if (section === undefined) {
+			return null;
+		}
+		const text = section.join("\n");
+		return text.length > 0 ? text : null;
+	};
+	const inputRaw = read("Input");
+	let input: unknown = null;
+	if (inputRaw !== null) {
+		try {
+			input = JSON.parse(inputRaw);
+		} catch {
+			// Unparseable input: the fallback plain-text scan still applies.
+			input = null;
+		}
+	}
+	return { input, output: read("Output"), error: read("Error") };
 }
 
 /**
@@ -1723,6 +1779,7 @@ export class PrCommentAutomationService {
 			const uncertainties = new Map<string, string>();
 			for (const entry of pending) {
 				let resolution: ReturnType<typeof resolvePublicationOutput> | null = null;
+				let spuriousEdit = false;
 				const scope = await this.resolveWorkspaceScope(entry.workspaceId);
 				if (scope) {
 					try {
@@ -1733,29 +1790,60 @@ export class PrCommentAutomationService {
 								message.meta?.toolCallId === entry.captureId && message.meta?.hookEventName === "tool_call_end",
 						);
 						if (toolResult) {
-							resolution = resolvePublicationOutput({
-								operations: [
-									{
-										operation: entry.operation,
-										kind: entry.kind,
-										explicitRepository: null,
-										explicitNumber: null,
-										// Restart recovery has the transcript content but not
-										// the original fragment: plain-text scan with the
-										// multi-object guard.
-										fragment: "",
-									},
-								],
-								target: entry.target,
-								output: toolResult.content,
-								error: null,
-							});
+							// Restart recovery: re-run the same resolution against the
+							// transcript. The `tool_call_end` message content carries the
+							// original tool input and result, so the original commands
+							// (endpoint, kind, `--jq` filter) are evidence scoped to this
+							// capture's own tool call — never a wider transcript scan.
+							const transcript = parseTranscriptToolCall(toolResult.content);
+							const operations = transcript
+								? detectPublicationOperations(extractCommandStrings(transcript.input))
+								: [];
+							if (transcript !== null && operations.length > 0) {
+								resolution = resolvePublicationOutput({
+									operations,
+									target: entry.target,
+									output: transcript.output,
+									error: transcript.error,
+								});
+							} else if (
+								transcript !== null &&
+								isEditOnlyPublicationActivity(extractCommandStrings(transcript.input))
+							) {
+								// The original command only edited existing feedback:
+								// it created no new feedback identity, so a pre-fix
+								// capture for it is spurious. Clear it without
+								// registering any identity (the edited item is never
+								// claimed as implementation-published).
+								spuriousEdit = true;
+							} else {
+								// Older records, or a transcript that does not carry the
+								// original command: plain-text scan with the multi-object
+								// guard.
+								resolution = resolvePublicationOutput({
+									operations: [
+										{
+											operation: entry.operation,
+											kind: entry.kind,
+											explicitRepository: null,
+											explicitNumber: null,
+											fragment: "",
+											bareIdOutput: false,
+										},
+									],
+									target: entry.target,
+									output: toolResult.content,
+									error: null,
+								});
+							}
 						}
 					} catch {
 						// Transcript unavailable: fall through to uncertainty.
 					}
 				}
-				if (resolution?.status === "published") {
+				if (spuriousEdit) {
+					dropped.add(entry.captureId);
+				} else if (resolution?.status === "published") {
 					newIdentities.push(...resolution.identities);
 					dropped.add(entry.captureId);
 				} else if (resolution?.status === "failed") {

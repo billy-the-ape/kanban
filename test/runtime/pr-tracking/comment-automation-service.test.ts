@@ -486,6 +486,7 @@ describe("PrCommentAutomationService", () => {
 				`Address comments on the linked PR: ${PR.url}.`,
 				"Check the feedback against the current code and original task requirements.",
 				"Fix valid issues, explain any disagreements, and update the same PR.",
+				"When you post a PR comment, review, or reply, keep its API response (full JSON) or returned comment/review URL visible in the tool result — do not filter it to just `.id`/`.body`, suppress it, or mix it with unrelated output; post one publication per tool result where practical.",
 				"Explain changes and disagreements in PR comments and within task chat.",
 			].join(" "),
 		);
@@ -1916,6 +1917,217 @@ describe("COMMENT-0 publication capture", () => {
 		const record = await load();
 		expect(record.commentAutomation.publication.pending).toHaveLength(0);
 		expect(record.commentAutomation.publication.published).toEqual([{ kind: "conversation", id: 77 }]);
+	});
+
+	it("captures both bare reply ids from a compound run_command result", async () => {
+		const command = [
+			"gh api repos/octo/repo/pulls/42/comments/77/replies -f \"body=Addressed.\" --jq '.id'",
+			"gh api repos/octo/repo/pulls/42/comments/78/replies -f \"body=Addressed.\" --jq '.id'",
+		].join("\n");
+		const harness = makeService({ workspaceStates: cardState() });
+		await harness.service.recordPrPublicationToolEvent(
+			toolEvent({
+				commands: [command],
+				output: JSON.stringify([{ query: command, result: "4289427635\n4289427764", success: true }]),
+			}),
+		);
+		const record = await load();
+		expect(record.commentAutomation.publication.published).toEqual([
+			{ kind: "inline", id: 4289427635 },
+			{ kind: "inline", id: 4289427764 },
+		]);
+		expect(record.commentAutomation.publication.pending).toHaveLength(0);
+	});
+
+	it("does not capture an edit of an already posted reply, keeping its recorded identity", async () => {
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			commentAutomation: {
+				...record.commentAutomation,
+				publication: { ...record.commentAutomation.publication, published: [{ kind: "inline", id: 99 }] },
+			},
+		}));
+		const harness = makeService({ workspaceStates: cardState() });
+		await harness.service.recordPrPublicationToolEvent(
+			toolEvent({
+				commands: ["gh api --method PATCH repos/octo/repo/pulls/comments/99 -f 'body=addressed' --jq '.body'"],
+				output: "Addressed, no longer an issue.",
+			}),
+		);
+		const record = await load();
+		// The recorded identity survives and the edit opened no capture.
+		expect(record.commentAutomation.publication.published).toEqual([{ kind: "inline", id: 99 }]);
+		expect(record.commentAutomation.publication.pending).toHaveLength(0);
+	});
+
+	it("recovers a bare-id capture from the transcript on restart and keeps the ids excluded", async () => {
+		const command = [
+			"gh api repos/octo/repo/pulls/42/comments/77/replies -f \"body=Addressed.\" --jq '.id'",
+			"gh api repos/octo/repo/pulls/42/comments/78/replies -f \"body=Addressed.\" --jq '.id'",
+		].join("\n");
+		const unresolvedCommand = "gh pr comment -R octo/repo 42 -b 'addressing other feedback'";
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			commentAutomation: {
+				...record.commentAutomation,
+				publication: {
+					published: [],
+					pending: [
+						{
+							captureId: "call-bare",
+							taskId: "t1",
+							workspaceId: "w1",
+							operation: "gh api",
+							kind: "inline",
+							target: { host: "github.com", repository: "octo/repo", number: 42 },
+							startedAt: NOW - 5_000,
+							uncertain: false,
+							uncertainReason: null,
+						},
+						{
+							captureId: "call-uncertain",
+							taskId: "t1",
+							workspaceId: "w1",
+							operation: "gh pr comment",
+							kind: "conversation",
+							target: { host: "github.com", repository: "octo/repo", number: 42 },
+							startedAt: NOW - 5_000,
+							uncertain: false,
+							uncertainReason: null,
+						},
+					],
+				},
+			},
+		}));
+		const messages = [
+			{
+				id: "m-bare",
+				role: "tool",
+				content: [
+					"Tool: run_command",
+					"Input:",
+					JSON.stringify({ commands: [command] }),
+					"Output:",
+					JSON.stringify([{ query: command, result: "4289427635\n4289427764", success: true }]),
+					"Duration: 1200ms",
+				].join("\n"),
+				createdAt: NOW,
+				meta: { toolName: "run_command", hookEventName: "tool_call_end", toolCallId: "call-bare" },
+			},
+			{
+				id: "m-uncertain",
+				role: "tool",
+				content: [
+					"Tool: run_command",
+					"Input:",
+					JSON.stringify({ commands: [unresolvedCommand] }),
+					"Output:",
+					"posted.",
+					"Duration: 300ms",
+				].join("\n"),
+				createdAt: NOW,
+				meta: { toolName: "run_command", hookEventName: "tool_call_end", toolCallId: "call-uncertain" },
+			},
+		];
+		const harness = makeService({
+			workspaceStates: cardState(),
+			getClineTaskSessionService: async () =>
+				({
+					loadTaskSessionMessages: async () => messages,
+				}) as unknown as ClineTaskSessionService,
+		});
+		await harness.service.start();
+		const record = await load();
+		// The bare-id capture is recovered; the unrelated uncertain capture is
+		// NOT cleared merely because the session completed.
+		expect(record.commentAutomation.publication.pending).toHaveLength(1);
+		expect(record.commentAutomation.publication.pending[0]?.captureId).toBe("call-uncertain");
+		expect(record.commentAutomation.publication.published).toEqual([
+			{ kind: "inline", id: 4289427635 },
+			{ kind: "inline", id: 4289427764 },
+		]);
+		// The recovered ids stay excluded from pending feedback: a later poll
+		// seeing those inline replies sends nothing.
+		const replied = [
+			makeEvent({ kind: "inline", providerId: "inline-4289427635", updatedAt: NOW - 1_000 }),
+			makeEvent({ kind: "inline", providerId: "inline-4289427764", updatedAt: NOW - 1_000 }),
+		];
+		await upsertSeed((current) => ({
+			...current,
+			revision: current.revision + 1,
+			commentAutomation: {
+				...current.commentAutomation,
+				repairOwner: { workspaceId: "w1", taskId: "t1", revision: 1 },
+			},
+		}));
+		const snapshotService = makeService({
+			workspaceStates: cardState(),
+			snapshot: { events: replied },
+			getClineTaskSessionService: async () =>
+				({
+					loadTaskSessionMessages: async () => messages,
+				}) as unknown as ClineTaskSessionService,
+		});
+		await snapshotService.service.refreshWorkspace(scope);
+		await snapshotService.service.runTick();
+		expect(snapshotService.sent).toHaveLength(0);
+	});
+
+	it("clears a pre-fix capture for an edit command on restart without claiming the edited id", async () => {
+		const editCommand = "gh api --method PATCH repos/octo/repo/pulls/comments/99 -f 'body=addressed' --jq '.body'";
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			commentAutomation: {
+				...record.commentAutomation,
+				publication: {
+					published: [],
+					pending: [
+						{
+							captureId: "call-edit",
+							taskId: "t1",
+							workspaceId: "w1",
+							operation: "gh api",
+							kind: "inline",
+							target: { host: "github.com", repository: "octo/repo", number: 42 },
+							startedAt: NOW - 5_000,
+							uncertain: false,
+							uncertainReason: null,
+						},
+					],
+				},
+			},
+		}));
+		const harness = makeService({
+			workspaceStates: cardState(),
+			getClineTaskSessionService: async () =>
+				({
+					loadTaskSessionMessages: async () => [
+						{
+							id: "m1",
+							role: "tool",
+							content: [
+								"Tool: run_command",
+								"Input:",
+								JSON.stringify({ commands: [editCommand] }),
+								"Output:",
+								"Addressed, no longer an issue.",
+								"Duration: 900ms",
+							].join("\n"),
+							createdAt: NOW,
+							meta: { toolName: "run_command", hookEventName: "tool_call_end", toolCallId: "call-edit" },
+						},
+					],
+				}) as unknown as ClineTaskSessionService,
+		});
+		await harness.service.start();
+		const record = await load();
+		// The spurious capture is cleared and the edited reviewer's item is
+		// NOT claimed as implementation-published.
+		expect(record.commentAutomation.publication.pending).toHaveLength(0);
+		expect(record.commentAutomation.publication.published).toEqual([]);
 	});
 
 	it("captures a gh api in-thread inline reply write (…/comments/<id>/replies)", async () => {
