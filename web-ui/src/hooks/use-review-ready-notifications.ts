@@ -24,6 +24,7 @@ interface UseReviewReadyNotificationsOptions {
 	latestTaskReadyForReview: RuntimeStateStreamTaskReadyForReviewMessage | null;
 	taskSessions: Record<string, RuntimeTaskSessionSummary>;
 	readyForReviewNotificationsEnabled: boolean;
+	selectedTaskTitle: string | null;
 	workspacePath: string | null;
 }
 
@@ -78,6 +79,7 @@ export function useReviewReadyNotifications({
 	latestTaskReadyForReview,
 	taskSessions,
 	readyForReviewNotificationsEnabled,
+	selectedTaskTitle,
 	workspacePath,
 }: UseReviewReadyNotificationsOptions): void {
 	const notificationPresenceTabIdRef = useRef<string>(createTabPresenceId());
@@ -232,7 +234,8 @@ export function useReviewReadyNotifications({
 	}, [activeWorkspaceId]);
 
 	const baseTitle = workspaceTitle || "Kanban";
+	const titleBody = selectedTaskTitle ? `${selectedTaskTitle} • ${baseTitle}` : baseTitle;
 	const documentTitle =
-		pendingReviewReadyNotificationCount > 0 ? `(${pendingReviewReadyNotificationCount}) ${baseTitle}` : baseTitle;
+		pendingReviewReadyNotificationCount > 0 ? `(${pendingReviewReadyNotificationCount}) ${titleBody}` : titleBody;
 	useDocumentTitle(documentTitle);
 }
