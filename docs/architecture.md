@@ -326,7 +326,7 @@ The current behavior is:
 - when the selected sidebar agent is Cline, the sidebar renders native chat
 - when the selected sidebar agent is another provider, the sidebar renders a terminal panel
 - the home session is keyed to the current workspace and relevant agent descriptor
-- switching between Projects and Agent in the sidebar should not restart the session
+- switching between the sidebar sections (Projects, Tasks, Kanbani) should not restart the session
 - switching to a different project or materially different agent configuration should rotate the session
 
 This is one of the places where the architecture still has a little intentional weirdness. It is not a first-class workspace-native session type yet, but it is now documented and contained.

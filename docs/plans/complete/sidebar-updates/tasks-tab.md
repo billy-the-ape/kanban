@@ -38,7 +38,7 @@ Today the sidebar has two tabs, **Projects** and **Kanbani**. There is no way to
     - Chips selected but nothing matches: `No matching tasks.`
     - All messages: `text-xs text-text-secondary px-2 py-3`.
 11. **Ages refresh** once a minute while the tab and document are visible (`useInterval` from `@/utils/react-use`, 60_000 ms, `null` otherwise). This ticker only updates labels; it never fetches data or resorts the list.
-12. **Footer:** the Projects tab footer (`ShortcutsCard` and `ProjectSupportFooter`) is not shown on the Tasks tab, matching the Kanbani tab.
+12. **Footer:** the Projects tab footer (`ShortcutsCard` and `ProjectSupportFooter`) is not shown on the Tasks tab, matching the Kanbani tab. (`ProjectSupportFooter` was later hidden by a follow-up commit; the Projects tab footer is now `ShortcutsCard` only.)
 
 ## Existing implementation map
 
