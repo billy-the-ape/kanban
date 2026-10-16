@@ -861,10 +861,16 @@ export function mergeServerOwnedSentGitActionPrompt(
 	board: RuntimeBoardData,
 	persistedBoard: RuntimeBoardData,
 ): RuntimeBoardData {
+	// Only records from persisted cards that were still in Review continue the
+	// episode. Server-side moves that bypass this merge (auto-completion via
+	// mutateWorkspaceState, CLI done/trash paths) spread the card and keep the
+	// field on the Done/Trash card; restoring from any column would resurrect
+	// that stale record when the card next lands in Review and suppress the
+	// new episode's prompt.
 	const persistedByTaskId = new Map<string, RuntimeBoardCard["sentGitActionPrompt"]>();
 	for (const column of persistedBoard.columns) {
 		for (const card of column.cards) {
-			if (card.sentGitActionPrompt !== undefined) {
+			if (column.id === "review" && card.sentGitActionPrompt !== undefined) {
 				persistedByTaskId.set(card.id, card.sentGitActionPrompt);
 			}
 		}

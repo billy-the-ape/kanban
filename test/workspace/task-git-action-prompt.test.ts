@@ -6,7 +6,8 @@ import { mkdirSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { RuntimeBoardCard, RuntimeBoardData } from "../../src/core/api-contract";
-import { loadWorkspaceState, saveWorkspaceState } from "../../src/state/workspace-state";
+import { completeTaskAndGetReadyLinkedTaskIds } from "../../src/core/task-board-mutations";
+import { loadWorkspaceState, mutateWorkspaceState, saveWorkspaceState } from "../../src/state/workspace-state";
 import { acquireTaskGitActionPrompt, releaseTaskGitActionPrompt } from "../../src/workspace/task-git-action-prompt";
 import { createGitTestEnv } from "../utilities/git-env";
 import { createTempDir } from "../utilities/temp-dir";
@@ -238,6 +239,46 @@ describe("task git action prompt records", () => {
 			await saveWorkspaceState(workspace.path, { board: createBoard(["task-1"], []), sessions: {} });
 			const state = await loadWorkspaceState(workspace.path);
 			expect(findCard(state.board, "task-1")?.sentGitActionPrompt?.action).toBe("pr");
+		} finally {
+			workspace.cleanup();
+		}
+	});
+	it("does not resurrect a stale record after a server-side move out of Review", async () => {
+		const workspace = createTempDir("kanban-git-action-prompt-ws-");
+		try {
+			await initWorkspace(workspace.path, createBoard(["task-1"], []));
+			expect(
+				await acquireTaskGitActionPrompt({
+					workspacePath: workspace.path,
+					taskId: "task-1",
+					action: "pr",
+					intent: "auto",
+				}),
+			).toBe("acquired");
+			// Server-side completion (runtime-server auto-complete, CLI done)
+			// moves the card through mutateWorkspaceState, bypassing the
+			// saveWorkspaceState merge; moveTaskToColumn spreads the card and
+			// keeps the record on the Done card.
+			await mutateWorkspaceState<void>(workspace.path, (state) => {
+				const result = completeTaskAndGetReadyLinkedTaskIds(state.board, "task-1");
+				return { board: result.board, value: undefined, save: result.moved };
+			});
+			const afterMove = await loadWorkspaceState(workspace.path);
+			expect(findCard(afterMove.board, "task-1")?.sentGitActionPrompt).toBeDefined();
+			// The first client save after the move puts the card back in
+			// Review: that is a new episode, so the stale record must not be
+			// restored and the prompt must not be suppressed.
+			await saveWorkspaceState(workspace.path, { board: createBoard(["task-1"], []), sessions: {} });
+			const reopened = await loadWorkspaceState(workspace.path);
+			expect(findCard(reopened.board, "task-1")?.sentGitActionPrompt).toBeUndefined();
+			expect(
+				await acquireTaskGitActionPrompt({
+					workspacePath: workspace.path,
+					taskId: "task-1",
+					action: "pr",
+					intent: "auto",
+				}),
+			).toBe("acquired");
 		} finally {
 			workspace.cleanup();
 		}
