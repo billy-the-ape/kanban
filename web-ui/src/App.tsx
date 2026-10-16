@@ -83,6 +83,7 @@ import {
 } from "@/stores/workspace-metadata-store";
 import { useTerminalThemeColors } from "@/terminal/theme-colors";
 import type { BoardData } from "@/types";
+import { normalizePromptForDisplay, truncateTaskPromptLabel } from "@/utils/task-prompt";
 
 export default function App(): ReactElement {
 	const terminalThemeColors = useTerminalThemeColors();
@@ -278,6 +279,13 @@ export default function App(): ReactElement {
 		hasReceivedSnapshot,
 	});
 
+	const selectedTaskTitle = useMemo(() => {
+		if (!selectedCard) {
+			return null;
+		}
+		return normalizePromptForDisplay(selectedCard.card.title) || truncateTaskPromptLabel(selectedCard.card.prompt);
+	}, [selectedCard]);
+
 	useReviewReadyNotifications({
 		activeWorkspaceId: activeNotificationWorkspaceId,
 		board,
@@ -285,6 +293,7 @@ export default function App(): ReactElement {
 		latestTaskReadyForReview,
 		taskSessions: sessions,
 		readyForReviewNotificationsEnabled,
+		selectedTaskTitle,
 		workspacePath,
 	});
 
