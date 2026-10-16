@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
 	analyzePrPublication,
 	detectPublicationOperations,
+	isEditOnlyPublicationActivity,
 	type PrPublicationOperation,
 	type PrPublicationTarget,
 	resolvePublicationOutput,
@@ -19,6 +20,7 @@ describe("detectPublicationOperations gh api value flags", () => {
 				explicitRepository: "octo/repo",
 				explicitNumber: 5,
 				fragment,
+				bareIdOutput: false,
 			},
 		]);
 	});
@@ -32,6 +34,7 @@ describe("detectPublicationOperations gh api value flags", () => {
 				explicitRepository: "octo/repo",
 				explicitNumber: 7,
 				fragment,
+				bareIdOutput: false,
 			},
 		]);
 	});
@@ -74,6 +77,7 @@ describe("detectPublicationOperations graphql", () => {
 				explicitRepository: null,
 				explicitNumber: null,
 				fragment,
+				bareIdOutput: false,
 			},
 		]);
 	});
@@ -87,6 +91,7 @@ describe("detectPublicationOperations graphql", () => {
 				explicitRepository: null,
 				explicitNumber: null,
 				fragment,
+				bareIdOutput: false,
 			},
 		]);
 	});
@@ -128,6 +133,7 @@ describe("readPrSelection positional number strictness", () => {
 				explicitRepository: null,
 				explicitNumber: 42,
 				fragment: "gh pr comment 42 -b 'x'",
+				bareIdOutput: false,
 			},
 		]);
 	});
@@ -140,6 +146,7 @@ describe("readPrSelection positional number strictness", () => {
 				explicitRepository: null,
 				explicitNumber: 42,
 				fragment: "gh pr comment -b 'x' 42",
+				bareIdOutput: false,
 			},
 		]);
 	});
@@ -152,6 +159,7 @@ describe("readPrSelection positional number strictness", () => {
 				explicitRepository: null,
 				explicitNumber: null,
 				fragment: "gh pr comment -b 'x' 12 34",
+				bareIdOutput: false,
 			},
 		]);
 	});
@@ -164,6 +172,7 @@ describe("readPrSelection positional number strictness", () => {
 				explicitRepository: "octo/repo",
 				explicitNumber: 43,
 				fragment: "gh pr comment -R octo/repo 43",
+				bareIdOutput: false,
 			},
 		]);
 	});
@@ -179,6 +188,7 @@ describe("readPrSelection positional number strictness", () => {
 				explicitRepository: null,
 				explicitNumber: null,
 				fragment,
+				bareIdOutput: false,
 			},
 		]);
 	});
@@ -191,6 +201,7 @@ describe("resolvePublicationOutput write-fragment scoping", () => {
 		explicitRepository: null,
 		explicitNumber: null,
 		fragment: "gh pr comment -b 'addressing'",
+		bareIdOutput: false,
 	};
 
 	it("registers only the write fragment's identity from a structured multi-fragment result", () => {
@@ -240,6 +251,7 @@ describe("resolvePublicationOutput write-fragment scoping", () => {
 					explicitRepository: "octo/repo",
 					explicitNumber: 5,
 					fragment: "gh api repos/octo/repo/issues/5/comments -f body=x",
+					bareIdOutput: false,
 				},
 			],
 			target: TARGET,
@@ -276,6 +288,7 @@ describe("resolvePublicationOutput multi-object guard", () => {
 		explicitRepository: null,
 		explicitNumber: null,
 		fragment: "gh pr comment -b 'addressing'",
+		bareIdOutput: false,
 	};
 
 	it("treats a listing mixed into the write's own output as uncertain", () => {
@@ -340,7 +353,14 @@ describe("detectPublicationOperations gh pr review forms", () => {
 		"gh pr review 42 --approve --body='looks good'",
 	])("recognizes %s as a review publication", (fragment) => {
 		expect(detectPublicationOperations([fragment])).toEqual([
-			{ operation: "gh pr review", kind: "review", explicitRepository: null, explicitNumber: 42, fragment },
+			{
+				operation: "gh pr review",
+				kind: "review",
+				explicitRepository: null,
+				explicitNumber: 42,
+				fragment,
+				bareIdOutput: false,
+			},
 		]);
 	});
 
@@ -355,7 +375,14 @@ describe("detectPublicationOperations gh api repo placeholders", () => {
 		"gh api repos/:owner/:repo/issues/42/comments -f body='addressing'",
 	])("treats %s as an implicit repository selector", (fragment) => {
 		expect(detectPublicationOperations([fragment])).toEqual([
-			{ operation: "gh api", kind: "conversation", explicitRepository: null, explicitNumber: 42, fragment },
+			{
+				operation: "gh api",
+				kind: "conversation",
+				explicitRepository: null,
+				explicitNumber: 42,
+				fragment,
+				bareIdOutput: false,
+			},
 		]);
 	});
 
@@ -385,7 +412,14 @@ describe("detectPublicationOperations wrapped gh invocations", () => {
 		"/usr/bin/gh pr comment 42 -b 'addressed'",
 	])("detects %s", (fragment) => {
 		expect(detectPublicationOperations([fragment])).toEqual([
-			{ operation: "gh pr comment", kind: "conversation", explicitRepository: null, explicitNumber: 42, fragment },
+			{
+				operation: "gh pr comment",
+				kind: "conversation",
+				explicitRepository: null,
+				explicitNumber: 42,
+				fragment,
+				bareIdOutput: false,
+			},
 		]);
 	});
 
@@ -418,7 +452,14 @@ describe("detectPublicationOperations gh api attached payload forms", () => {
 		["gh api repos/octo/repo/pulls/5/reviews --input=review.json", "review"],
 	])("treats %s as a write", (fragment, kind) => {
 		expect(detectPublicationOperations([fragment])).toEqual([
-			{ operation: "gh api", kind, explicitRepository: "octo/repo", explicitNumber: 5, fragment },
+			{
+				operation: "gh api",
+				kind,
+				explicitRepository: "octo/repo",
+				explicitNumber: 5,
+				fragment,
+				bareIdOutput: false,
+			},
 		]);
 	});
 
@@ -441,7 +482,14 @@ describe("detectPublicationOperations graphql feedback mutations", () => {
 		"gh api graphql -F query=@reply.graphql",
 	])("treats %s as an unattributable publication", (fragment) => {
 		expect(detectPublicationOperations([fragment])).toEqual([
-			{ operation: "gh api graphql", kind: null, explicitRepository: null, explicitNumber: null, fragment },
+			{
+				operation: "gh api graphql",
+				kind: null,
+				explicitRepository: null,
+				explicitNumber: null,
+				fragment,
+				bareIdOutput: false,
+			},
 		]);
 	});
 });
@@ -456,6 +504,7 @@ describe("detectPublicationOperations multi-line commands", () => {
 				explicitRepository: "octo/repo",
 				explicitNumber: 5,
 				fragment: command,
+				bareIdOutput: false,
 			},
 		]);
 	});
@@ -495,6 +544,7 @@ describe("resolvePublicationOutput never reads the echoed command text", () => {
 		explicitRepository: null,
 		explicitNumber: 42,
 		fragment: "gh pr review 42 --comment --body 'fixed the GraphQL query'",
+		bareIdOutput: false,
 	};
 
 	it("does not classify a successful write as failed because its body mentions GraphQL", () => {
@@ -565,5 +615,198 @@ describe("analyzePrPublication finished phase without output", () => {
 			linkedPullRequests: [TARGET],
 		});
 		expect(observation.status).toBe("pending");
+	});
+});
+
+describe("detectPublicationOperations edit endpoints", () => {
+	it.each([
+		"gh api --method PATCH repos/octo/repo/pulls/comments/4289424243 -f 'body=addressed' --jq '.body'",
+		"gh api --method PATCH repos/octo/repo/issues/comments/4289424243 -f 'body=addressed'",
+		"gh api --method PATCH repos/octo/repo/pulls/42/reviews/7 -f 'body=addressed'",
+	])("does not treat %s as a new publication", (fragment) => {
+		expect(detectPublicationOperations([fragment])).toEqual([]);
+	});
+
+	it("keeps create/reply endpoints as publications and marks bare-id output", () => {
+		const fragment = "gh api repos/octo/repo/pulls/42/comments/9/replies -f body='addressed' --jq '.id'";
+		expect(detectPublicationOperations([fragment])).toEqual([
+			{
+				operation: "gh api",
+				kind: "inline",
+				explicitRepository: "octo/repo",
+				explicitNumber: 42,
+				fragment,
+				bareIdOutput: true,
+			},
+		]);
+	});
+
+	it.each([
+		"gh api repos/octo/repo/issues/5/comments -f body='addressed' -q '.id'",
+		"gh api repos/octo/repo/issues/5/comments --field=body=addressed --jq='.id'",
+	])("treats %s as a bare-id output write", (fragment) => {
+		expect(detectPublicationOperations([fragment])).toMatchObject([
+			{ kind: "conversation", explicitNumber: 5, bareIdOutput: true },
+		]);
+	});
+
+	it("does not mark other jq filters as bare-id output", () => {
+		const fragment = "gh api repos/octo/repo/issues/5/comments -f body='addressed' --jq '.html_url'";
+		expect(detectPublicationOperations([fragment])).toMatchObject([{ kind: "conversation", bareIdOutput: false }]);
+	});
+
+	it("reports edit-only activity when every write edits existing feedback", () => {
+		expect(
+			isEditOnlyPublicationActivity([
+				"gh api --method PATCH repos/octo/repo/pulls/comments/4289424243 -f 'body=x' --jq '.body'",
+				"gh api --method PATCH repos/octo/repo/pulls/42/reviews/7 -f 'body=y'",
+			]),
+		).toBe(true);
+	});
+
+	it("does not report edit-only activity when a create is present", () => {
+		expect(
+			isEditOnlyPublicationActivity([
+				"gh api --method PATCH repos/octo/repo/pulls/comments/4289424243 -f 'body=x'",
+				"gh pr comment 42 -b 'addressed'",
+			]),
+		).toBe(false);
+	});
+
+	it("does not report edit-only activity for reads or empty commands", () => {
+		expect(isEditOnlyPublicationActivity(["gh api repos/octo/repo/pulls/42/comments"])).toBe(false);
+		expect(isEditOnlyPublicationActivity([])).toBe(false);
+	});
+});
+
+describe("resolvePublicationOutput bare numeric id support", () => {
+	const verifiedTarget: PrPublicationTarget = {
+		host: "github.com",
+		repository: "billy-the-ape/ai-gateway",
+		number: 229,
+	};
+	const verifiedCommand = [
+		"gh api repos/billy-the-ape/ai-gateway/pulls/229/comments/4288990294/replies -f \"body=Addressed.\" --jq '.id'",
+		"gh api repos/billy-the-ape/ai-gateway/pulls/229/comments/4288990316/replies -f \"body=Addressed.\" --jq '.id'",
+	].join("\n");
+
+	it("registers both bare reply ids from the verified compound-command result", () => {
+		const operations = detectPublicationOperations([verifiedCommand]);
+		expect(operations).toHaveLength(2);
+		const output = JSON.stringify([{ query: verifiedCommand, result: "4289427635\n4289427764", success: true }]);
+		const resolution = resolvePublicationOutput({ operations, target: verifiedTarget, output, error: null });
+		expect(resolution.status).toBe("published");
+		expect(resolution.identities).toEqual([
+			{ kind: "inline", id: 4289427635 },
+			{ kind: "inline", id: 4289427764 },
+		]);
+	});
+
+	it("publishes the verified transcript end to end through analyzePrPublication", () => {
+		const observation = analyzePrPublication({
+			toolName: "run_command",
+			commands: [verifiedCommand],
+			phase: "finished",
+			output: JSON.stringify([{ query: verifiedCommand, result: "4289427635\n4289427764", success: true }]),
+			error: null,
+			linkedPullRequests: [verifiedTarget],
+		});
+		expect(observation.status).toBe("published");
+		expect(observation.target).toEqual(verifiedTarget);
+		expect(observation.identities).toEqual([
+			{ kind: "inline", id: 4289427635 },
+			{ kind: "inline", id: 4289427764 },
+		]);
+	});
+
+	it("registers a single bare id from a supported numeric response", () => {
+		const fragment =
+			"gh api repos/billy-the-ape/ai-gateway/pulls/229/comments/4288990294/replies -f \"body=Addressed.\" --jq '.id'";
+		const operations = detectPublicationOperations([fragment]);
+		const output = JSON.stringify([{ query: fragment, result: "4289427635", success: true }]);
+		const resolution = resolvePublicationOutput({ operations, target: verifiedTarget, output, error: null });
+		expect(resolution.status).toBe("published");
+		expect(resolution.identities).toEqual([{ kind: "inline", id: 4289427635 }]);
+	});
+
+	it("never registers bare numbers from a write without a bare-id filter", () => {
+		const fragment =
+			'gh api repos/billy-the-ape/ai-gateway/pulls/229/comments/4288990294/replies -f "body=Addressed."';
+		const operations = detectPublicationOperations([fragment]);
+		const output = JSON.stringify([{ query: fragment, result: "4289427635", success: true }]);
+		const resolution = resolvePublicationOutput({ operations, target: verifiedTarget, output, error: null });
+		expect(resolution.status).toBe("uncertain");
+		expect(resolution.identities).toEqual([]);
+	});
+
+	it("treats a bare-id count mismatch as uncertain", () => {
+		const operations = detectPublicationOperations([verifiedCommand]);
+		const output = JSON.stringify([{ query: verifiedCommand, result: "4289427635", success: true }]);
+		const resolution = resolvePublicationOutput({ operations, target: verifiedTarget, output, error: null });
+		expect(resolution.status).toBe("uncertain");
+		expect(resolution.identities).toEqual([]);
+		expect(resolution.reason).toContain("bare numeric output");
+	});
+
+	it("treats mixed evidence with extra output lines as uncertain", () => {
+		const operations = detectPublicationOperations([verifiedCommand]);
+		const output = JSON.stringify([
+			{ query: verifiedCommand, result: "4289427635\n4289427764\ndone", success: true },
+		]);
+		const resolution = resolvePublicationOutput({ operations, target: verifiedTarget, output, error: null });
+		expect(resolution.status).toBe("uncertain");
+		expect(resolution.identities).toEqual([]);
+	});
+
+	it("treats a partial failure across the scoped writes as uncertain", () => {
+		const operations = detectPublicationOperations([verifiedCommand]);
+		const [first, second] = verifiedCommand.split("\n");
+		const output = JSON.stringify([
+			{ query: first, result: "4289427635", success: true },
+			{ query: second, result: "gh: HTTP 422: Unprocessable Entity", success: false },
+		]);
+		const resolution = resolvePublicationOutput({ operations, target: verifiedTarget, output, error: null });
+		expect(resolution.status).toBe("uncertain");
+		expect(resolution.identities).toEqual([]);
+		expect(resolution.reason).toContain("bare numeric output");
+	});
+	it("classifies a bare-id write with an empty failed result as failed, not uncertain", () => {
+		const fragment = "gh api repos/octo/repo/issues/42/comments -f body='addressed' --jq '.id'";
+		const operations = detectPublicationOperations([fragment]);
+		const output = JSON.stringify([{ query: fragment, result: "", success: false }]);
+		const resolution = resolvePublicationOutput({ operations, target: TARGET, output, error: null });
+		expect(resolution.status).toBe("failed");
+		expect(resolution.identities).toEqual([]);
+	});
+
+	it("keeps bare ids scoped away from an unrelated read result", () => {
+		const operations = detectPublicationOperations([verifiedCommand]);
+		const output = JSON.stringify([
+			{ query: verifiedCommand, result: "4289427635\n4289427764", success: true },
+			{
+				query: "gh api repos/billy-the-ape/ai-gateway/pulls/229/comments",
+				result: "1234567890",
+				success: true,
+			},
+		]);
+		const resolution = resolvePublicationOutput({ operations, target: verifiedTarget, output, error: null });
+		expect(resolution.status).toBe("published");
+		expect(resolution.identities).toEqual([
+			{ kind: "inline", id: 4289427635 },
+			{ kind: "inline", id: 4289427764 },
+		]);
+	});
+
+	it("rejects mixed kinds among bare-id writes", () => {
+		const command = [
+			"gh api repos/octo/repo/pulls/42/comments/9/replies -f body='addressed' --jq '.id'",
+			"gh api repos/octo/repo/issues/42/comments -f body='addressed' --jq '.id'",
+		].join("\n");
+		const operations = detectPublicationOperations([command]);
+		const output = JSON.stringify([{ query: command, result: "111\n222", success: true }]);
+		const resolution = resolvePublicationOutput({ operations, target: TARGET, output, error: null });
+		expect(resolution.status).toBe("uncertain");
+		expect(resolution.identities).toEqual([]);
+		expect(resolution.reason).toContain("bare numeric output");
 	});
 });

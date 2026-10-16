@@ -51,7 +51,16 @@ export interface PrPublicationOperation {
 	explicitNumber: number | null;
 	/** The command fragment that produced this operation (ties output to the write). */
 	fragment: string;
+	/**
+	 * True when a `gh api` REST write explicitly filters its output to the
+	 * created item's database id (`--jq '.id'` / `-q '.id'`), so the result
+	 * lines are bare positive integers attributable to this write.
+	 */
+	bareIdOutput: boolean;
 }
+
+/** A detected write, including edits that never surface as publications. */
+type RawPublicationOperation = PrPublicationOperation & { edit: boolean };
 
 export type PrPublicationStatus = "none" | "pending" | "published" | "failed" | "uncertain";
 
@@ -141,6 +150,25 @@ const GH_API_VALUE_FLAGS = new Set([
 const GH_API_PAYLOAD_FLAGS = new Set(["-f", "-F", "--field", "--raw-field", "--input"]);
 /** Shells whose `-c '<script>'` argument is scanned for wrapped `gh` writes. */
 const SHELL_COMMANDS = new Set(["bash", "sh", "zsh", "dash"]);
+
+/**
+ * Strips one pair of matching surrounding quotes from an attached
+ * `--flag='value'` token (the tokenizer does not strip quotes inside
+ * attached values), so `--jq='.id'` compares equal to `-q .id`.
+ */
+function stripMatchingQuotes(value: string | null): string | null {
+	if (value === null) {
+		return null;
+	}
+	if (value.length >= 2) {
+		const first = value[0];
+		const last = value[value.length - 1];
+		if ((first === "'" && last === "'") || (first === '"' && last === '"')) {
+			return value.slice(1, -1);
+		}
+	}
+	return value;
+}
 const MAX_SHELL_WRAP_DEPTH = 3;
 /**
  * GraphQL mutations that create PR feedback items — the only `gh api graphql`
@@ -196,21 +224,40 @@ function readPrSelection(tokens: string[], from: number): { repository: string |
 	return { repository, number };
 }
 
-function parseApiWriteEndpoint(endpoint: string): { kind: PrPublishedIdentityKind } | null {
-	// REST write endpoints for PR feedback:
-	//   repos/O/R/issues/N/comments[?/C]   conversation comment create/edit
-	//   repos/O/R/pulls/N/comments[?/C]     inline (review) comment create/edit
-	//   repos/O/R/pulls/N/reviews           review submission (may carry inlines)
-	// `gh api` accepts a leading slash, so normalize before matching.
+/**
+ * The feedback kind a `gh api` write endpoint produces, and whether the
+ * endpoint EDITS existing feedback instead of creating new items:
+ *   repos/O/R/issues/N/comments[?/C]       conversation comment create
+ *   repos/O/R/pulls/N/comments[?/C]        inline (review) comment create
+ *   repos/O/R/pulls/N/reviews              review submission (may carry inlines)
+ *   repos/O/R/issues/comments/C            edit an existing issue comment
+ *   repos/O/R/pulls/comments/C             edit an existing review comment
+ *   repos/O/R/pulls/N/reviews/R            edit an existing review
+ * Edits are recognized so they can be deliberately excluded: the endpoint
+ * names an item that already exists, so the write publishes no new feedback
+ * identity and must not open a new-publication capture (and the edited
+ * item's id must never be claimed as implementation-published just because
+ * it appears in the endpoint). `gh api` accepts a leading slash, so
+ * normalize before matching.
+ */
+function parseApiWriteEndpoint(endpoint: string): { kind: PrPublishedIdentityKind; edit: boolean } | null {
 	const normalized = endpoint.replace(/^\/+/, "");
 	// In-thread replies use `.../comments/<id>/replies` (still inline kind).
 	const match = /^repos\/([^/]+)\/([^/]+)\/(issues|pulls)\/(\d+)\/comments(?:\/\d+(?:\/replies)?)?$/.exec(normalized);
 	if (match) {
-		return { kind: match[3] === "issues" ? "conversation" : "inline" };
+		return { kind: match[3] === "issues" ? "conversation" : "inline", edit: false };
+	}
+	const editComment = /^repos\/([^/]+)\/([^/]+)\/(issues|pulls)\/comments\/\d+$/.exec(normalized);
+	if (editComment) {
+		return { kind: editComment[3] === "issues" ? "conversation" : "inline", edit: true };
 	}
 	const reviews = /^repos\/([^/]+)\/([^/]+)\/(pulls)\/(\d+)\/(reviews)$/.exec(normalized);
 	if (reviews) {
-		return { kind: "review" };
+		return { kind: "review", edit: false };
+	}
+	const editReview = /^repos\/([^/]+)\/([^/]+)\/(pulls)\/(\d+)\/(reviews)\/\d+$/.exec(normalized);
+	if (editReview) {
+		return { kind: "review", edit: true };
 	}
 	return null;
 }
@@ -220,11 +267,37 @@ function parseApiWriteEndpoint(endpoint: string): { kind: PrPublishedIdentityKin
  * Pure string scan (cheap enough to run for every tool call); returns
  * operations in first-appearance order, deduplicated by shape. `--web`
  * variants open a browser instead of an API write and are not publications.
+ * Edits of existing feedback are detected internally (they create no new
+ * identity) but never appear in the returned publications.
  */
 export function detectPublicationOperations(commands: string[]): PrPublicationOperation[] {
-	const operations: PrPublicationOperation[] = [];
+	return detectPublicationOperationsInternal(commands)
+		.filter((operation) => !operation.edit)
+		.map((operation) => ({
+			operation: operation.operation,
+			kind: operation.kind,
+			explicitRepository: operation.explicitRepository,
+			explicitNumber: operation.explicitNumber,
+			fragment: operation.fragment,
+			bareIdOutput: operation.bareIdOutput,
+		}));
+}
+
+/**
+ * True when every detected feedback write in the commands edits existing
+ * feedback — so no new feedback identity could have been created. Used by
+ * restart reconciliation to clear spurious new-publication captures recorded
+ * by pre-fix observers for edit commands.
+ */
+export function isEditOnlyPublicationActivity(commands: string[]): boolean {
+	const operations = detectPublicationOperationsInternal(commands);
+	return operations.length > 0 && operations.every((operation) => operation.edit);
+}
+
+function detectPublicationOperationsInternal(commands: string[]): RawPublicationOperation[] {
+	const operations: RawPublicationOperation[] = [];
 	const seen = new Set<string>();
-	const push = (operation: PrPublicationOperation): void => {
+	const push = (operation: RawPublicationOperation): void => {
 		const shape = `${operation.operation}|${operation.kind}|${operation.explicitRepository}|${operation.explicitNumber}|${operation.fragment}`;
 		if (seen.has(shape)) {
 			return;
@@ -354,7 +427,7 @@ function commandBasename(token: string): string {
 function detectGhOperation(
 	tokens: string[],
 	fragment: string,
-	push: (operation: PrPublicationOperation) => void,
+	push: (operation: RawPublicationOperation) => void,
 ): void {
 	const group = tokens[1] ?? "";
 	if (group === "pr") {
@@ -370,6 +443,8 @@ function detectGhOperation(
 				explicitRepository: selection.repository,
 				explicitNumber: selection.number,
 				fragment,
+				bareIdOutput: false,
+				edit: false,
 			});
 		} else if (action === "review" && isPublishingReview(tokens.slice(3))) {
 			if (tokens.slice(3).includes("--web")) {
@@ -382,6 +457,8 @@ function detectGhOperation(
 				explicitRepository: selection.repository,
 				explicitNumber: selection.number,
 				fragment,
+				bareIdOutput: false,
+				edit: false,
 			});
 		}
 	} else if (group === "api") {
@@ -389,6 +466,8 @@ function detectGhOperation(
 		let method: string | null = null;
 		let hasPayload = false;
 		let endpoint: string | null = null;
+		/** The `--jq`/`-q` filter expression, when present. */
+		let jqExpression: string | null = null;
 		// `gh api [METHOD] ENDPOINT [flags]`: real gh takes the method
 		// via flags, so scan from the token after "api".
 		while (i < tokens.length) {
@@ -400,6 +479,8 @@ function detectGhOperation(
 					method = token.slice("--method=".length).toUpperCase();
 				} else if (GH_API_PAYLOAD_FLAGS.has(flag)) {
 					hasPayload = true;
+				} else if (flag === "--jq") {
+					jqExpression = stripMatchingQuotes(token.slice(token.indexOf("=") + 1));
 				}
 				i += 1;
 				continue;
@@ -423,6 +504,9 @@ function detectGhOperation(
 			if (GH_API_VALUE_FLAGS.has(token)) {
 				if (GH_API_PAYLOAD_FLAGS.has(token)) {
 					hasPayload = true;
+				}
+				if (token === "--jq" || token === "-q") {
+					jqExpression = stripMatchingQuotes(tokens[i + 1] ?? null);
 				}
 				i += 2;
 				continue;
@@ -465,6 +549,8 @@ function detectGhOperation(
 					explicitRepository: repoFlag !== -1 ? (tokens[repoFlag + 1] ?? null) : null,
 					explicitNumber: null,
 					fragment,
+					bareIdOutput: false,
+					edit: false,
 				});
 			}
 			return;
@@ -484,12 +570,23 @@ function detectGhOperation(
 			// can be published, so the write is not a publication.
 			return;
 		}
+		// Edits of existing feedback (…/issues/comments/C, …/pulls/comments/C,
+		// …/pulls/N/reviews/R) create no new identity and must not open a
+		// new-publication capture. They are pushed with `edit: true` so
+		// restart reconciliation can detect edit-only activity and clear
+		// spurious pre-fix captures; `detectPublicationOperations` filters
+		// them out of publications, and their output (the updated object or
+		// a filtered field) never registers.
 		push({
 			operation: "gh api",
 			kind: parsed.kind,
 			explicitRepository,
 			explicitNumber: numberMatch ? Number.parseInt(numberMatch[1], 10) : null,
 			fragment,
+			// Only the exact `--jq '.id'`/`-q '.id'` filter makes the result
+			// lines bare database ids attributable to this write.
+			bareIdOutput: jqExpression === ".id",
+			edit: parsed.edit,
 		});
 	}
 }
@@ -775,8 +872,65 @@ function isCommandResultEntry(object: Record<string, unknown>): boolean {
 	return typeof object.query === "string" && typeof object.success === "boolean" && "result" in object;
 }
 
+/**
+ * The write operations inside the matched evidence scope. When structured
+ * entries matched, only operations whose fragment appears in a matched
+ * entry's query count; otherwise (plain output, or the restart-recovery
+ * path with no fragment) every operation counts.
+ */
+function scopedWriteOperations(
+	operations: PrPublicationOperation[],
+	matched: Array<Record<string, unknown>>,
+	writeFragments: string[],
+): PrPublicationOperation[] {
+	if (writeFragments.length === 0) {
+		return operations;
+	}
+	const scopeFragments =
+		matched.length > 0
+			? writeFragments.filter((fragment) =>
+					matched.some((entry) => typeof entry.query === "string" && entry.query.includes(fragment)),
+				)
+			: writeFragments;
+	return operations.filter((operation) => scopeFragments.includes(operation.fragment));
+}
+
+/**
+ * The bare positive safe-integer lines of the evidence — exactly what
+ * `--jq '.id'`-filtered writes print (one line per successful write).
+ * Returns null when the evidence carries any other non-empty line, so
+ * mixed output can never be mistaken for a bare id list.
+ */
+function collectBareIdLines(texts: string[]): number[] | null {
+	const ids: number[] = [];
+	for (const text of texts) {
+		for (const line of text.split(/\r?\n/)) {
+			const trimmed = line.trim();
+			if (trimmed.length === 0) {
+				continue;
+			}
+			if (!/^\d+$/.test(trimmed)) {
+				return null;
+			}
+			const id = Number.parseInt(trimmed, 10);
+			if (!Number.isSafeInteger(id) || id <= 0) {
+				return null;
+			}
+			ids.push(id);
+		}
+	}
+	return ids;
+}
+
 const MULTI_OBJECT_UNCERTAINTY_REASON =
 	"The output contained several GitHub objects; the published identity could not be confirmed.";
+/**
+ * The evidence lines are bare numerics that do not line up with the
+ * publication writes (count mismatch, mixed kinds, partial failure): never
+ * guess which id belongs to which write.
+ */
+const BARE_ID_UNCERTAINTY_REASON =
+	"The bare numeric output does not match the publication writes; the published identity could not be confirmed.";
 
 /**
  * Resolves a recognized write's tool output to exact published identities.
@@ -853,6 +1007,51 @@ export function resolvePublicationOutput(input: {
 	}
 	if (identityObjects > 1) {
 		return { status: "uncertain", identities: [], reason: MULTI_OBJECT_UNCERTAINTY_REASON };
+	}
+	// Bare numeric ids: a `gh api` write that explicitly filters its output
+	// to the created item's database id (`--jq '.id'` / `-q '.id'`) prints
+	// exactly one bare positive integer line per successful write. When
+	// every scoped write does that and nothing else is in the evidence,
+	// the line set is attributable exactly once per write; a mismatch is
+	// explicit uncertainty, never a guess.
+	const scopedOperations = scopedWriteOperations(input.operations, matched, writeFragments);
+	if (input.target !== null && totalObjects === 0 && scopedOperations.length > 0) {
+		const bareIdScope = scopedOperations.filter(
+			(operation): operation is PrPublicationOperation & { kind: PrPublishedIdentityKind } =>
+				operation.bareIdOutput && operation.kind !== null,
+		);
+		if (bareIdScope.length === scopedOperations.length) {
+			const kinds = new Set(bareIdScope.map((operation) => operation.kind));
+			const bareIds = collectBareIdLines(candidateTexts);
+			if (bareIds !== null && bareIds.length === 0) {
+				// No evidence lines at all: nothing to attribute; fall through
+				// so the failure classification below still applies.
+			} else if (bareIds !== null) {
+				if (kinds.size === 1 && bareIds.length === bareIdScope.length) {
+					const kind = bareIdScope[0]?.kind ?? null;
+					if (kind !== null) {
+						collected.push(...bareIds.map((id) => ({ kind, id })));
+					}
+				} else {
+					// Count mismatch or mixed kinds among bare-numeric lines.
+					return { status: "uncertain", identities: [], reason: BARE_ID_UNCERTAINTY_REASON };
+				}
+			} else if (kinds.size > 1) {
+				// Mixed kinds: a bare id cannot be attributed to a kind.
+				return { status: "uncertain", identities: [], reason: BARE_ID_UNCERTAINTY_REASON };
+			} else if (
+				matched.some((entry) => entry.success === true) &&
+				matched.some((entry) => entry.success === false)
+			) {
+				// Partial failure across the scoped writes: some bare ids were
+				// expected, but the evidence cannot show which writes published
+				// — never guess, leave it visible.
+				return { status: "uncertain", identities: [], reason: BARE_ID_UNCERTAINTY_REASON };
+			}
+			// bareIds is null (the lines carry extra, possibly failure text)
+			// or empty (no evidence lines): fall through to the URL fallback
+			// and failure checks below.
+		}
 	}
 	if (collected.length === 0) {
 		// A multi-object output that yielded no identities is not safe for
