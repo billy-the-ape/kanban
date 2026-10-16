@@ -8,11 +8,11 @@ The behavior and boundaries are defined below. Before coding, read `AGENTS.md` a
 
 ## Problem and required outcome
 
-Today the sidebar has two tabs, **Projects** and **Kanban Agent**. There is no way to see what is happening across all projects without opening each one. Add a **Tasks** tab that shows a vertical list of task cards from every project. The list can be filtered by display state and is sorted by last activity, newest first. By default it shows only In Progress tasks, so it answers "what is running right now".
+Today the sidebar has two tabs, **Projects** and **Kanbani**. There is no way to see what is happening across all projects without opening each one. Add a **Tasks** tab that shows a vertical list of task cards from every project. The list can be filtered by display state and is sorted by last activity, newest first. By default it shows only In Progress tasks, so it answers "what is running right now".
 
 ## Decisions
 
-1. **Tab order:** `Projects | Tasks | Kanban Agent`. The segmented control becomes `grid-cols-3`. Tasks is always enabled, including when there are no projects (it then shows the empty state). The selected tab is not persisted, matching today's behavior (`App.tsx:91`, default `"projects"`).
+1. **Tab order:** `Projects | Tasks | Kanbani`. The segmented control becomes `grid-cols-3`. Tasks is always enabled, including when there are no projects (it then shows the empty state). The selected tab is not persisted, matching today's behavior (`App.tsx:91`, default `"projects"`).
 2. **States and filter:** the six display states from `paused-pill.md`: Backlog, In Progress, Paused, Review, Done, Trash. The filter is a row of **multi-select** chips. Each chip toggles on its own. The default selection is `["in_progress"]`. The selection is stored in localStorage under the new key `LocalStorageKey.SidebarTasksFilter = "kanban.sidebar-tasks-filter"` as a JSON array of state ids. On read, unknown ids are dropped. A missing, unparsable or non-array value falls back to the default. An empty array is a valid stored value (the user turned everything off). The key is **not** added to `LAYOUT_CUSTOMIZATION_LOCAL_STORAGE_KEYS`.
 3. **Chip content:** the full title from `TASK_DISPLAY_STATE_BADGE_META` (e.g. `In Progress`) and the count of tasks in that state across all projects, rendered `In Progress · 3`. Selected chips use the state's `toneClassName` plus `border border-transparent`. Unselected chips use `border border-border bg-transparent text-text-tertiary hover:text-text-secondary`. Every chip has `rounded-full px-2 py-0.5 text-[11px] font-medium cursor-pointer`. The chips wrap (`flex flex-wrap gap-1`).
 4. **Sort and identity:** `lastActivityAt` descending, then `title` ascending (`localeCompare`), then `taskId` ascending, then `projectId` ascending. Use `(projectId, taskId)` as item identity and React key, because task ids need not be globally unique. Use the same comparator on server and browser.
@@ -38,7 +38,7 @@ Today the sidebar has two tabs, **Projects** and **Kanban Agent**. There is no w
     - Chips selected but nothing matches: `No matching tasks.`
     - All messages: `text-xs text-text-secondary px-2 py-3`.
 11. **Ages refresh** once a minute while the tab and document are visible (`useInterval` from `@/utils/react-use`, 60_000 ms, `null` otherwise). This ticker only updates labels; it never fetches data or resorts the list.
-12. **Footer:** the Projects tab footer (`ShortcutsCard` and `ProjectSupportFooter`) is not shown on the Tasks tab, matching the Kanban Agent tab.
+12. **Footer:** the Projects tab footer (`ShortcutsCard` and `ProjectSupportFooter`) is not shown on the Tasks tab, matching the Kanbani tab.
 
 ## Existing implementation map
 
@@ -188,7 +188,7 @@ Run the integration/router suite containing the new unscoped-query test as well;
 
 ## Acceptance criteria
 
-- The sidebar shows `Projects | Tasks | Kanban Agent`. Opening Tasks defaults to display-state `in_progress` across successfully loaded projects, newest activity first. Queued tasks appear under Paused. Cards without a real session summary retain the optimistic `in_progress` fallback defined in `paused-pill.md`; it is not an active-process monitor.
+- The sidebar shows `Projects | Tasks | Kanbani`. Opening Tasks defaults to display-state `in_progress` across successfully loaded projects, newest activity first. Queued tasks appear under Paused. Cards without a real session summary retain the optimistic `in_progress` fallback defined in `paused-pill.md`; it is not an active-process monitor.
 - Pausing a task removes it from the default list after the next projects event and coalesced refresh: once any existing request settles, at most 1,000 ms scheduling delay plus the next request's latency while visible. Selecting Paused shows it. Local hydrated-board changes appear through the overlay immediately.
 - The filter selection survives a reload.
 - Clicking a task in another project switches to that project and opens the task. Clicking one in the open project opens it immediately. On mobile the sidebar closes.
@@ -209,7 +209,7 @@ Implemented as described, with these concrete outcomes:
 - `src/core/api-contract.ts` gained `runtimeTaskDisplayStateSchema`, `runtimeProjectTaskListItemSchema` and `runtimeProjectTasksResponseSchema` with inferred type exports; the shared display-state union is now a type-only re-export of the inferred type.
 - `WorkspaceRegistry.buildProjectTasksPayload` processes index snapshots with a 4-worker loop over `loadProjectTaskSnapshot`; failed projects land in `unavailableProjectIds`; the index read failure rejects the query. `deriveProjectName` is shared with `toProjectSummary`.
 - `projects.listTasks` is wired through `createProjectsApi` (`buildProjectTasksPayload` dependency), `runtime-server.ts` and the `projects` router with the output schema; the unscoped client is exercised by the integration test.
-- Web UI: `useSidebarTasksFilter` (localStorage `kanban.sidebar-tasks-filter`), `useCrossProjectTasks` (single-flight, 1,000 ms automatic budget, coalesced trailing refreshes, stale-generation guard, open-project overlay, snapshot-filtered stale rows), `usePendingTaskOpen` (pending cross-project selection with readiness wait, cancellation on requested-project change, project removal or new stream error), the three `sidebar-tasks/` components, the three-way `Projects | Tasks | Kanban Agent` segmented control (with `renderTasksSection` and `aria-pressed`), and the `App.tsx` wiring (`homeSidebarSection`, `areSidebarTasksVisible`, `openTask` with mobile close).
+- Web UI: `useSidebarTasksFilter` (localStorage `kanban.sidebar-tasks-filter`), `useCrossProjectTasks` (single-flight, 1,000 ms automatic budget, coalesced trailing refreshes, stale-generation guard, open-project overlay, snapshot-filtered stale rows), `usePendingTaskOpen` (pending cross-project selection with readiness wait, cancellation on requested-project change, project removal or new stream error), the three `sidebar-tasks/` components, the three-way `Projects | Tasks | Kanbani` segmented control (with `renderTasksSection` and `aria-pressed`), and the `App.tsx` wiring (`homeSidebarSection`, `areSidebarTasksVisible`, `openTask` with mobile close).
 - `useProjectNavigation.handleSelectProject` now no-ops against `navigationCurrentProjectId`, so selecting the loaded project during an in-flight switch resets `requestedProjectId` instead of being ignored.
 - `formatApproximateAge` moved to `web-ui/src/utils/format-approximate-age.ts` and is reused by `task-pull-requests.ts`.
 - Tests added per the Tests section: shared builder/comparator/last-activity units, registry payload units (merge, empty index, partial failure, index failure, 4-way concurrency, no terminal-manager initialization), projects API delegation, the integration `projects.listTasks` assertion, the three web UI hook suites (controllable promises + fake timers), the panel component suite, and the panel three-tab suite.
