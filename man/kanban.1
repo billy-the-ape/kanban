@@ -1,21 +1,11 @@
-.TH KANBAN 1 "March 2026" "kanban 0.1.10" "User Commands"
+.TH KANBAN 1 "October 2026" "kanban 0.1.70" "User Commands"
 .SH NAME
 kanban \- local orchestration board for coding agents
 .SH SYNOPSIS
 .B kanban
 .RI [ --port " " number|auto ]
 .RI [ --no-open ]
-.RI [ command ]
-.br
-.B kanban task
-.RI " " list|create|update|link|unlink|start
-.RI " " [ options ]
-.br
-.B kanban hooks
-.RI " " ingest|notify|gemini-hook|codex-wrapper
-.RI " " [ options ]
-.br
-.B kanban mcp
+.RI [ task | hooks | update | mcp ]
 .SH DESCRIPTION
 .B kanban
 starts the local Kanban runtime server and serves the web UI.
@@ -24,11 +14,29 @@ When launched inside a git repository, it opens that repository's indexed worksp
 When launched outside git, it starts with no active workspace or falls back to the first indexed project.
 .SH OPTIONS
 .TP
+.B --host <ip>
+Host IP to bind the server to (default: 127.0.0.1).
+.TP
 .B --port <number|auto>
-Bind to a specific local port or pick the first available port starting at 3484.
+Runtime port (1-65535) or pick the first available port starting at 3484.
 .TP
 .B --no-open
 Do not open the browser automatically.
+.TP
+.B --skip-shutdown-cleanup
+Do not move sessions to done or delete task worktrees on shutdown.
+.TP
+.B --https
+Enable HTTPS. Requires both --cert and --key.
+.TP
+.B --cert <path>, --key <path>
+TLS certificate and private key PEM files. Both are required to serve HTTPS.
+.TP
+.B --update
+Update Kanban to the latest published version and exit.
+.TP
+.B --no-passcode
+Disable auto-generated passcode for remote access (for advanced users behind a reverse proxy).
 .TP
 .B --help, -h
 Show help text and exit.
@@ -40,51 +48,75 @@ Show version and exit.
 .B task|tasks
 Manage Kanban board tasks from the CLI.
 
-Subcommands:
-.br
-.B list
-.RI [ --project-path " " path ]
-.RI [ --column " " backlog|in_progress|review ]
-.br
-.B create
-.B --prompt
-.RI " " text
-.RI [ --project-path " " path ]
-.RI [ --base-ref " " branch ]
-.RI [ --start-in-plan-mode " " true|false ]
-.RI [ --auto-review-enabled " " true|false ]
-.RI [ --auto-review-mode " " commit|pr|move_to_trash ]
-.br
-.B update
-.B --task-id
-.RI " " id
-.RI [ --prompt " " text ]
-.RI [ --project-path " " path ]
-.RI [ --base-ref " " branch ]
-.RI [ --start-in-plan-mode " " true|false ]
-.RI [ --auto-review-enabled " " true|false ]
-.RI [ --auto-review-mode " " commit|pr|move_to_trash ]
-.br
-.B link
-.B --task-id
-.RI " " id
-.B --linked-task-id
-.RI " " id
-.RI [ --project-path " " path ]
-.br
-.B unlink
-.B --dependency-id
-.RI " " id
-.RI [ --project-path " " path ]
-.br
-.B start
-.B --task-id
-.RI " " id
-.RI [ --project-path " " path ]
-
-All task commands return JSON.
-
-Use kebab-case flags only.
+All task commands return JSON and use kebab-case flags only. Unless
+noted, each accepts
+.B --project-path <path>
+(workspace path; defaults to the current directory workspace).
+.P
+.TP
+.BI task list " [--column <backlog|in_progress|review|done|trash>]"
+List the tasks for a workspace.
+.TP
+.BI task create --prompt " " text
+Create a task in backlog. Optional:
+.BR --title ,
+.BR --base-ref ,
+.BR --start-in-plan-mode ,
+.BR --auto-review-enabled ,
+.BI --auto-review-mode " " commit|pr ,
+.BR --agent-id ,
+.BR --cline-provider ,
+.BR --cline-model ,
+.BR --cline-reasoning-effort .
+.TP
+.BI task update --task-id " " id
+Replace a task's fields. Optional fields are the same as for create.
+.TP
+.BI task trash " (--task-id <id> | --column <column>)"
+Discard a task or an entire column: move to trash, stop sessions, and clean up task workspaces (preservation-gated).
+.TP
+.BI task complete|done " (--task-id <id> | --column <column>)"
+Move a task or an entire column to done and stop its task session. Work is preserved and never deleted.
+.TP
+.BI task locate --task-id " " id
+Show where a task's worktree and preserved work state live.
+.TP
+.BI task review --task-id " " id
+Review a task in a fresh bounded session (and run the verification gate when configured); records a tree-bound verdict.
+.TP
+.BI task deliver --task-id " " id
+Deterministically commit, integrate, push, and verify a task's work (requires gitDeliveryPolicy.enabled). Optional:
+.B --commit-message .
+.TP
+.BI task delivery --task-id " " id
+Show a task's delivery receipt and whether its linked tasks may start.
+.TP
+.BI task cleanup
+Retry blocked worktree cleanups, remove delivered Done worktrees, and prune preserved work past retention.
+.TP
+.BI task recover --task-id " " id
+Restore a removed task worktree from its preserved work state.
+.TP
+.BI task status --task-id " " id
+Show aggregated task diagnostics: pipeline phase, delivery/review/dispatch state, preserved work, and context usage.
+.TP
+.BI task queue
+Show every task's reliable-completion phase (board chip data).
+.TP
+.BI task export-diag --task-id " " id --output " " file
+Download the task's full-fidelity diagnostics bundle (schemaVersion 3 JSON).
+.TP
+.BI task delete " (--task-id <id> | --column <column>)"
+Permanently delete a task or every task in a column.
+.TP
+.BI task link --task-id " " id --linked-task-id " " id
+Link two tasks so one task waits on another.
+.TP
+.BI task unlink --dependency-id " " id
+Remove an existing dependency link.
+.TP
+.BI task start --task-id " " id
+Start a task session and move task to in_progress.
 
 .TP
 .B hooks
@@ -109,6 +141,13 @@ same options as
 .BR ingest ,
 but best-effort.
 .br
+.B codex-hook
+.RI [ payload ]
+Codex hook entrypoint (same
+.B --event
+options as
+.BR ingest ).
+.br
 .B gemini-hook
 .br
 .B codex-wrapper
@@ -116,6 +155,9 @@ but best-effort.
 .RI " " path
 .RI [ agentArgs... ]
 
+.TP
+.B update
+Update Kanban to the latest published version.
 .TP
 .B mcp
 Deprecated compatibility command. Prints a deprecation warning and exits.
