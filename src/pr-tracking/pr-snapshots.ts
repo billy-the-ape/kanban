@@ -72,6 +72,30 @@ function authorInfo(value: unknown): { login: string; kind: "human" | "bot" } {
 	};
 }
 
+/** Non-negative integer count from a REST field; null when absent/invalid. */
+function asCount(value: unknown): number | null {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+/**
+ * String list from a REST field of objects with `name`/`login` (labels,
+ * requested reviewers). Null for anything that is not a list.
+ */
+function asStringList(value: unknown): string[] | null {
+	if (!Array.isArray(value)) {
+		return null;
+	}
+	const items: string[] = [];
+	for (const item of value) {
+		const obj = typeof item === "object" && item !== null ? (item as RawObject) : null;
+		const name = asString(obj?.name) ?? asString(obj?.login);
+		if (name !== null) {
+			items.push(name);
+		}
+	}
+	return items;
+}
+
 /** Map a raw REST PR object to the durable, access-scoped metadata snapshot. */
 export function normalizePrMetadata(raw: unknown, accessScopeId: string, checkedAt: number): GitHubPrMetadataSnapshot {
 	const pr = typeof raw === "object" && raw !== null ? (raw as RawObject) : {};
@@ -92,6 +116,7 @@ export function normalizePrMetadata(raw: unknown, accessScopeId: string, checked
 				: "open";
 	// PRLINK-9: optional display title projected from the same read.
 	const title = asString(pr.title);
+	// PRLINK-9: display details projected from the same read (no second fetch).
 	return {
 		accessScopeId,
 		checkedAt,
@@ -104,6 +129,17 @@ export function normalizePrMetadata(raw: unknown, accessScopeId: string, checked
 		mergedAt: merged ? (asIsoMs(pr.merged_at) ?? checkedAt) : null,
 		mergeCommitSha: merged ? (asString(pr.merge_commit_sha) ?? null) : null,
 		...(title !== null ? { title } : {}),
+		additions: asCount(pr.additions),
+		deletions: asCount(pr.deletions),
+		changedFiles: asCount(pr.changed_files),
+		commits: asCount(pr.commits),
+		comments: asCount(pr.comments),
+		reviewComments: asCount(pr.review_comments),
+		openedAt: asIsoMs(pr.created_at),
+		updatedAt: asIsoMs(pr.updated_at),
+		labels: asStringList(pr.labels),
+		mergeableState: asString(pr.mergeable_state),
+		requestedReviewers: asStringList(pr.requested_reviewers),
 	};
 }
 

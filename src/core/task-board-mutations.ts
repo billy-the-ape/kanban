@@ -739,6 +739,22 @@ export interface RuntimeTaskPullRequestSnapshotUpdate {
 	stateCheckedAt?: number;
 	/** PRLINK-6: explicit observation time (caller already applied the throttle). */
 	lastSeenAt?: number;
+	/**
+	 * PRLINK-9: provider detail projected from a metadata refresh (same read
+	 * as title/state). Only provided fields are set.
+	 */
+	headSha?: string;
+	additions?: number;
+	deletions?: number;
+	changedFiles?: number;
+	commits?: number;
+	comments?: number;
+	reviewComments?: number;
+	openedAt?: number;
+	updatedAt?: number;
+	labels?: string[];
+	mergeableState?: string;
+	requestedReviewers?: string[];
 }
 
 export interface RuntimeAddTaskPullRequestsResult {
@@ -957,7 +973,8 @@ export function removeTaskPullRequest(
  * stamp is set to `now`. PRLINK-6: a successful observation write also
  * advances `lastSeenAt` — an explicit `snapshot.lastSeenAt` is applied as
  * given, otherwise the write carries `now` along — and the observation
- * time never moves backward.
+ * time never moves backward. PRLINK-9: provider detail fields (head SHA,
+ * change counts, comment counts, labels, ...) are applied when provided.
  */
 export function updateTaskPullRequestSnapshot(
 	board: RuntimeBoardData,
@@ -973,17 +990,34 @@ export function updateTaskPullRequestSnapshot(
 	}
 	const task = found.task;
 	const existing = task.pullRequests;
+	const hasDetailWrite =
+		snapshot.headSha !== undefined ||
+		snapshot.additions !== undefined ||
+		snapshot.deletions !== undefined ||
+		snapshot.changedFiles !== undefined ||
+		snapshot.commits !== undefined ||
+		snapshot.comments !== undefined ||
+		snapshot.reviewComments !== undefined ||
+		snapshot.openedAt !== undefined ||
+		snapshot.updatedAt !== undefined ||
+		snapshot.labels !== undefined ||
+		snapshot.mergeableState !== undefined ||
+		snapshot.requestedReviewers !== undefined;
 	if (
 		!existing ||
 		(snapshot.title === undefined &&
 			snapshot.state === undefined &&
 			snapshot.stateCheckedAt === undefined &&
-			snapshot.lastSeenAt === undefined)
+			snapshot.lastSeenAt === undefined &&
+			!hasDetailWrite)
 	) {
 		return { board, task, updated: false };
 	}
 	const observationWrite =
-		snapshot.title !== undefined || snapshot.state !== undefined || snapshot.stateCheckedAt !== undefined;
+		snapshot.title !== undefined ||
+		snapshot.state !== undefined ||
+		snapshot.stateCheckedAt !== undefined ||
+		hasDetailWrite;
 	let foundMatch = false;
 	const nextPullRequests = existing.map((pullRequest) => {
 		if (getPullRequestIdentityKey(pullRequest) !== identityKey) {
@@ -1001,6 +1035,42 @@ export function updateTaskPullRequestSnapshot(
 			next.stateCheckedAt = snapshot.stateCheckedAt;
 		} else if (snapshot.title !== undefined || snapshot.state !== undefined) {
 			next.stateCheckedAt = now;
+		}
+		if (snapshot.headSha !== undefined) {
+			next.headSha = snapshot.headSha;
+		}
+		if (snapshot.additions !== undefined) {
+			next.additions = snapshot.additions;
+		}
+		if (snapshot.deletions !== undefined) {
+			next.deletions = snapshot.deletions;
+		}
+		if (snapshot.changedFiles !== undefined) {
+			next.changedFiles = snapshot.changedFiles;
+		}
+		if (snapshot.commits !== undefined) {
+			next.commits = snapshot.commits;
+		}
+		if (snapshot.comments !== undefined) {
+			next.comments = snapshot.comments;
+		}
+		if (snapshot.reviewComments !== undefined) {
+			next.reviewComments = snapshot.reviewComments;
+		}
+		if (snapshot.openedAt !== undefined) {
+			next.openedAt = snapshot.openedAt;
+		}
+		if (snapshot.updatedAt !== undefined) {
+			next.updatedAt = snapshot.updatedAt;
+		}
+		if (snapshot.labels !== undefined) {
+			next.labels = snapshot.labels;
+		}
+		if (snapshot.mergeableState !== undefined) {
+			next.mergeableState = snapshot.mergeableState;
+		}
+		if (snapshot.requestedReviewers !== undefined) {
+			next.requestedReviewers = snapshot.requestedReviewers;
 		}
 		const lastSeen = next.lastSeenAt ?? next.createdAt;
 		if (snapshot.lastSeenAt !== undefined) {

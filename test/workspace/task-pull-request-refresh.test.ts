@@ -275,6 +275,103 @@ describe("refreshTaskPullRequestEntry", () => {
 		}
 	});
 
+	it("applies provider detail fields from the same read", async () => {
+		const { path: sandboxRoot, cleanup } = createTempDir("kanban-task-pr-refresh-ws-");
+		try {
+			const entry = createEntry();
+			const workspacePath = await seedWorkspace(sandboxRoot, "task-done", "trash", [entry]);
+			const details = {
+				headSha: "abc1234567890",
+				additions: 120,
+				deletions: 34,
+				changedFiles: 12,
+				commits: 7,
+				comments: 3,
+				reviewComments: 5,
+				openedAt: 1_700_000_000_000,
+				updatedAt: 1_700_000_600_000,
+				labels: ["bug"],
+				mergeableState: "dirty",
+				requestedReviewers: ["reviewer-a"],
+			};
+			const harness = makeRefreshHarness(workspacePath, () => refreshedResult({ metadata: metadata(details) }));
+
+			const result = await refreshTaskPullRequestEntry({
+				workspacePath,
+				taskId: "task-done",
+				url: entry.url,
+				refresh: harness.refresh,
+			});
+
+			expect(result.updated).toBe(1);
+			const stored = await loadWorkspaceState(workspacePath);
+			const pr = findCardPullRequests(stored, "task-done")?.[0];
+			expect(pr?.headSha).toBe("abc1234567890");
+			expect(pr?.additions).toBe(120);
+			expect(pr?.deletions).toBe(34);
+			expect(pr?.changedFiles).toBe(12);
+			expect(pr?.commits).toBe(7);
+			expect(pr?.comments).toBe(3);
+			expect(pr?.reviewComments).toBe(5);
+			expect(pr?.openedAt).toBe(1_700_000_000_000);
+			expect(pr?.updatedAt).toBe(1_700_000_600_000);
+			expect(pr?.labels).toEqual(["bug"]);
+			expect(pr?.mergeableState).toBe("dirty");
+			expect(pr?.requestedReviewers).toEqual(["reviewer-a"]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("counts a detail-only change as updated and no-ops on an identical detail snapshot", async () => {
+		const { path: sandboxRoot, cleanup } = createTempDir("kanban-task-pr-refresh-ws-");
+		try {
+			const entry = createEntry();
+			const workspacePath = await seedWorkspace(sandboxRoot, "task-detail", "trash", [entry]);
+			const details = { additions: 10, deletions: 2, headSha: "abc12345" };
+			let checkedAt = 2000;
+			const harness = makeRefreshHarness(workspacePath, () =>
+				refreshedResult({ metadata: metadata({ state: "open", checkedAt, ...details }) }),
+			);
+
+			// First pass introduces the details: a real write.
+			const first = await refreshLinkedTaskPullRequests({
+				workspacePath,
+				taskId: "task-detail",
+				refresh: harness.refresh,
+			});
+			expect(first.updated).toBe(1);
+			const revisionAfterFirst = (await loadWorkspaceState(workspacePath)).revision;
+
+			// Identical details with only a newer check: no write, no bump.
+			checkedAt = 3000;
+			const second = await refreshLinkedTaskPullRequests({
+				workspacePath,
+				taskId: "task-detail",
+				refresh: harness.refresh,
+			});
+			expect(second.updated).toBe(0);
+			let recorded = await loadWorkspaceState(workspacePath);
+			expect(recorded.revision).toBe(revisionAfterFirst);
+			expect(findCardPullRequests(recorded, "task-detail")?.[0]?.stateCheckedAt).toBe(2000);
+
+			// A changed detail value is a real write again.
+			details.additions = 11;
+			checkedAt = 4000;
+			const third = await refreshLinkedTaskPullRequests({
+				workspacePath,
+				taskId: "task-detail",
+				refresh: harness.refresh,
+			});
+			expect(third.updated).toBe(1);
+			recorded = await loadWorkspaceState(workspacePath);
+			expect(findCardPullRequests(recorded, "task-detail")?.[0]?.additions).toBe(11);
+			expect(findCardPullRequests(recorded, "task-detail")?.[0]?.stateCheckedAt).toBe(4000);
+		} finally {
+			cleanup();
+		}
+	});
+
 	it("reports unlinked identity when the URL is not recorded on the task", async () => {
 		const { path: sandboxRoot, cleanup } = createTempDir("kanban-task-pr-refresh-ws-");
 		try {
