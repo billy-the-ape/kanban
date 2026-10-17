@@ -74,7 +74,7 @@ function authorInfo(value: unknown): { login: string; kind: "human" | "bot" } {
 
 /** Non-negative integer count from a REST field; null when absent/invalid. */
 function asCount(value: unknown): number | null {
-	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+	return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
 }
 
 /**

@@ -111,6 +111,7 @@ describe("pr-snapshots", () => {
 				state: "open",
 				head: { sha: "abc123" },
 				additions: -1,
+				deletions: 2.5,
 				comments: "not-a-number",
 				mergeable_state: null,
 			},
