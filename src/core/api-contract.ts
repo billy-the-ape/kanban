@@ -173,6 +173,25 @@ export const runtimeTaskPullRequestSchema = z.object({
 	 * clears the extras.
 	 */
 	isPrimary: z.boolean().optional(),
+	/**
+	 * PRLINK-9: provider detail projected from a metadata refresh (same read
+	 * as title/state — no extra fetch). Optional so older cards keep
+	 * validating and the UI hides anything absent.
+	 */
+	headSha: z.string().optional(),
+	additions: z.number().int().nonnegative().optional(),
+	deletions: z.number().int().nonnegative().optional(),
+	changedFiles: z.number().int().nonnegative().optional(),
+	commits: z.number().int().nonnegative().optional(),
+	comments: z.number().int().nonnegative().optional(),
+	reviewComments: z.number().int().nonnegative().optional(),
+	/** Provider-side PR creation time (epoch ms). */
+	openedAt: z.number().nonnegative().optional(),
+	/** Provider-side PR last-update time (epoch ms). */
+	updatedAt: z.number().nonnegative().optional(),
+	labels: z.array(z.string()).optional(),
+	mergeableState: z.string().optional(),
+	requestedReviewers: z.array(z.string()).optional(),
 });
 export type RuntimeTaskPullRequest = z.infer<typeof runtimeTaskPullRequestSchema>;
 
@@ -3073,6 +3092,23 @@ export const githubPrMetadataSnapshotSchema = z
 		 * (no second fetch). Optional so older snapshots keep validating.
 		 */
 		title: z.string().optional(),
+		/**
+		 * PRLINK-9: optional provider details projected from the same read
+		 * (no second fetch). Nullable so older snapshots keep validating.
+		 */
+		additions: z.number().int().nonnegative().nullable().optional(),
+		deletions: z.number().int().nonnegative().nullable().optional(),
+		changedFiles: z.number().int().nonnegative().nullable().optional(),
+		commits: z.number().int().nonnegative().nullable().optional(),
+		comments: z.number().int().nonnegative().nullable().optional(),
+		reviewComments: z.number().int().nonnegative().nullable().optional(),
+		/** Provider-side PR creation time (epoch ms). */
+		openedAt: z.number().nullable().optional(),
+		/** Provider-side PR last-update time (epoch ms). */
+		updatedAt: z.number().nullable().optional(),
+		labels: z.array(z.string()).nullable().optional(),
+		mergeableState: z.string().nullable().optional(),
+		requestedReviewers: z.array(z.string()).nullable().optional(),
 	})
 	.passthrough();
 export type GitHubPrMetadataSnapshot = z.infer<typeof githubPrMetadataSnapshotSchema>;

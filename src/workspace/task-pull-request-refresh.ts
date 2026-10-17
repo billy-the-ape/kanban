@@ -95,13 +95,112 @@ function outcomeFor(
 	};
 }
 
+const PR_SNAPSHOT_COUNT_FIELDS = [
+	"additions",
+	"deletions",
+	"changedFiles",
+	"commits",
+	"comments",
+	"reviewComments",
+] as const;
+
+function sameStringArray(a: string[] | undefined, b: string[] | undefined): boolean {
+	if (a === undefined || b === undefined) {
+		return a === b;
+	}
+	if (a.length !== b.length) {
+		return false;
+	}
+	return a.every((value, index) => value === b[index]);
+}
+
+/**
+ * True only when the fresh read supplies a value (not null/undefined) that
+ * differs from the stored one.
+ */
+function detailValueDiffers<T>(next: T | null | undefined, stored: T | undefined): boolean {
+	if (next === null || next === undefined) {
+		return false;
+	}
+	return stored !== next;
+}
+
+/**
+ * True when the fresh metadata read differs from the stored card snapshot in
+ * any displayed field. Detail fields compare only when the read supplies a
+ * value (null means "not provided"), so a read that omits them neither wipes
+ * stored values nor counts as a change.
+ */
+function pullRequestSnapshotChanged(existing: RuntimeTaskPullRequest, metadata: GitHubPrMetadataSnapshot): boolean {
+	if (existing.state !== metadata.state) {
+		return true;
+	}
+	if (metadata.title !== undefined && existing.title !== metadata.title) {
+		return true;
+	}
+	if (detailValueDiffers(metadata.headSha, existing.headSha)) {
+		return true;
+	}
+	for (const field of PR_SNAPSHOT_COUNT_FIELDS) {
+		if (detailValueDiffers(metadata[field], existing[field])) {
+			return true;
+		}
+	}
+	if (detailValueDiffers(metadata.openedAt, existing.openedAt)) {
+		return true;
+	}
+	if (detailValueDiffers(metadata.updatedAt, existing.updatedAt)) {
+		return true;
+	}
+	if (detailValueDiffers(metadata.mergeableState, existing.mergeableState)) {
+		return true;
+	}
+	if (
+		metadata.labels !== null &&
+		metadata.labels !== undefined &&
+		!sameStringArray(existing.labels, metadata.labels)
+	) {
+		return true;
+	}
+	if (
+		metadata.requestedReviewers !== null &&
+		metadata.requestedReviewers !== undefined &&
+		!sameStringArray(existing.requestedReviewers, metadata.requestedReviewers)
+	) {
+		return true;
+	}
+	return false;
+}
+
+/** Project the displayable fields of a metadata snapshot onto a card entry. */
+function snapshotUpdateFor(metadata: GitHubPrMetadataSnapshot) {
+	return {
+		state: metadata.state,
+		stateCheckedAt: metadata.checkedAt,
+		...(metadata.title !== undefined ? { title: metadata.title } : {}),
+		...(metadata.headSha !== null ? { headSha: metadata.headSha } : {}),
+		...(metadata.additions !== null ? { additions: metadata.additions } : {}),
+		...(metadata.deletions !== null ? { deletions: metadata.deletions } : {}),
+		...(metadata.changedFiles !== null ? { changedFiles: metadata.changedFiles } : {}),
+		...(metadata.commits !== null ? { commits: metadata.commits } : {}),
+		...(metadata.comments !== null ? { comments: metadata.comments } : {}),
+		...(metadata.reviewComments !== null ? { reviewComments: metadata.reviewComments } : {}),
+		...(metadata.openedAt !== null ? { openedAt: metadata.openedAt } : {}),
+		...(metadata.updatedAt !== null ? { updatedAt: metadata.updatedAt } : {}),
+		...(metadata.labels !== null ? { labels: metadata.labels } : {}),
+		...(metadata.mergeableState !== null ? { mergeableState: metadata.mergeableState } : {}),
+		...(metadata.requestedReviewers !== null ? { requestedReviewers: metadata.requestedReviewers } : {}),
+	};
+}
+
 /**
  * Applies refreshed snapshots under the workspace lock. Re-validates every
  * link against the CURRENT board (never resurrects a removed/replaced link,
  * applies nothing when the task is gone), ignores results that are not
  * newer than the stored `stateCheckedAt` (a concurrent write won), and skips
- * writes whose state and title are unchanged (a successful re-read must not
- * bump the revision, the card `updatedAt`, or count as `updated`).
+ * writes whose stored snapshot fields are all unchanged (a successful
+ * re-read must not bump the revision, the card `updatedAt`, or count as
+ * `updated`).
  */
 async function applyRefreshedSnapshots(
 	workspacePath: string,
@@ -132,16 +231,16 @@ async function applyRefreshedSnapshots(
 				// Stale result: a newer observation already won.
 				continue;
 			}
-			const titleChanged = item.metadata.title !== undefined && existing.title !== item.metadata.title;
-			if (existing.state === item.metadata.state && !titleChanged) {
+			if (!pullRequestSnapshotChanged(existing, item.metadata)) {
 				// Unchanged snapshot: no write, no revision bump, not counted.
 				continue;
 			}
-			const updated = updateTaskPullRequestSnapshot(board, taskId, item.canonicalPrKey, {
-				state: item.metadata.state,
-				stateCheckedAt: item.metadata.checkedAt,
-				...(item.metadata.title !== undefined ? { title: item.metadata.title } : {}),
-			});
+			const updated = updateTaskPullRequestSnapshot(
+				board,
+				taskId,
+				item.canonicalPrKey,
+				snapshotUpdateFor(item.metadata),
+			);
 			if (updated.updated) {
 				board = updated.board;
 				changed += 1;
