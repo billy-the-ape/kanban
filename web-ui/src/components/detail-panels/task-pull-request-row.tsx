@@ -128,7 +128,6 @@ export function TaskPullRequestRow({
 					))}
 				</div>
 			) : null}
-
 			<div
 				className="flex min-w-0 flex-wrap gap-x-2 gap-y-0.5 text-[11px] text-text-tertiary"
 				data-testid={`task-pr-view-meta-${pullRequest.number}`}
