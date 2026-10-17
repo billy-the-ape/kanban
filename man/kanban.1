@@ -26,8 +26,11 @@ Do not open the browser automatically.
 .B --skip-shutdown-cleanup
 Do not move sessions to done or delete task worktrees on shutdown.
 .TP
+.B --https
+Enable HTTPS. Requires both --cert and --key.
+.TP
 .B --cert <path>, --key <path>
-TLS certificate and private key PEM files. Either one enables HTTPS.
+TLS certificate and private key PEM files. Both are required to serve HTTPS.
 .TP
 .B --update
 Update Kanban to the latest published version and exit.
