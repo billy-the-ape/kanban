@@ -21,6 +21,18 @@ import type { BoardCard, BoardData, CardSelection } from "@/types";
 
 type TaskGitActionSource = "card" | "agent";
 
+export type TaskGitActionDedupeIntent = "manual" | "auto";
+
+interface TaskGitActionOptions {
+	/**
+	 * AUTOGIT: coordinate the generated prompt against the server-owned
+	 * per-review-episode record. "auto" is set-if-absent (a same-episode
+	 * record suppresses the send); "manual" records the send after success
+	 * so the auto path does not re-send it.
+	 */
+	gitActionDedupe?: TaskGitActionDedupeIntent;
+}
+
 interface TaskGitActionLoadingState {
 	commitSource: TaskGitActionSource | null;
 	prSource: TaskGitActionSource | null;
@@ -218,8 +230,48 @@ export function useGitActions({
 		runtimeProjectConfig?.selectedAgentId ?? null,
 	);
 
+	// AUTOGIT: best-effort coordination with the server-owned per-review-episode
+	// record. Only `already_sent` suppresses the send; `no_task`,
+	// `not_in_review`, a caught server `error`, and transport failures all
+	// degrade to the pre-AUTOGIT behavior (send). Release failures leave the
+	// record in place until the episode ends.
+	const acquireTaskGitActionPromptRecord = useCallback(
+		async (taskId: string, action: TaskGitAction, intent: TaskGitActionDedupeIntent): Promise<boolean> => {
+			if (!currentProjectId) {
+				return true;
+			}
+			try {
+				const trpcClient = getRuntimeTrpcClient(currentProjectId);
+				const response = await trpcClient.workspace.acquireTaskGitActionPrompt.mutate({
+					taskId,
+					action,
+					intent,
+				});
+				return response.status !== "already_sent";
+			} catch {
+				return true;
+			}
+		},
+		[currentProjectId],
+	);
+
+	const releaseTaskGitActionPromptRecord = useCallback(
+		async (taskId: string, action: TaskGitAction): Promise<void> => {
+			if (!currentProjectId) {
+				return;
+			}
+			try {
+				const trpcClient = getRuntimeTrpcClient(currentProjectId);
+				await trpcClient.workspace.releaseTaskGitActionPrompt.mutate({ taskId, action });
+			} catch {
+				// Best-effort: the record self-clears when the card leaves Review.
+			}
+		},
+		[currentProjectId],
+	);
+
 	const runTaskGitAction = useCallback(
-		async (taskId: string, action: TaskGitAction, source: TaskGitActionSource) => {
+		async (taskId: string, action: TaskGitAction, source: TaskGitActionSource, options?: TaskGitActionOptions) => {
 			const taskLoadingState = taskGitActionLoadingByTaskId[taskId];
 			const actionInFlightSource = action === "commit" ? taskLoadingState?.commitSource : taskLoadingState?.prSource;
 			if (actionInFlightSource !== null && actionInFlightSource !== undefined) {
@@ -329,6 +381,19 @@ export function useGitActions({
 				}
 				setTaskWorkspaceInfo(workspaceInfo);
 
+				const dedupeIntent = options?.gitActionDedupe ?? null;
+				// AUTOGIT: for the auto path, claim the per-review-episode
+				// record before sending. A same-episode record means the
+				// prompt was already delivered (by another client or a manual
+				// click), so this caller must not send it again.
+				let autoAcquired = false;
+				if (dedupeIntent === "auto") {
+					autoAcquired = await acquireTaskGitActionPromptRecord(taskId, action, "auto");
+					if (!autoAcquired) {
+						return false;
+					}
+				}
+
 				const prompt = buildTaskGitActionPrompt({
 					action,
 					workspaceInfo,
@@ -353,7 +418,14 @@ export function useGitActions({
 							message: sent.message ?? "Could not send instructions to the task chat session.",
 							timeout: 7000,
 						});
+						// AUTOGIT: the prompt never went out; let the auto path retry.
+						if (autoAcquired) {
+							await releaseTaskGitActionPromptRecord(taskId, action);
+						}
 						return false;
+					}
+					if (dedupeIntent === "manual") {
+						await acquireTaskGitActionPromptRecord(taskId, action, "manual");
 					}
 					return true;
 				}
@@ -365,6 +437,9 @@ export function useGitActions({
 						message: typed.message ?? "Could not send instructions to the task session.",
 						timeout: 7000,
 					});
+					if (autoAcquired) {
+						await releaseTaskGitActionPromptRecord(taskId, action);
+					}
 					return false;
 				}
 				await new Promise<void>((resolve) => {
@@ -378,7 +453,13 @@ export function useGitActions({
 						message: submitted.message ?? "Could not submit instructions to the task session.",
 						timeout: 7000,
 					});
+					if (autoAcquired) {
+						await releaseTaskGitActionPromptRecord(taskId, action);
+					}
 					return false;
+				}
+				if (dedupeIntent === "manual") {
+					await acquireTaskGitActionPromptRecord(taskId, action, "manual");
 				}
 				return true;
 			} finally {
@@ -386,11 +467,13 @@ export function useGitActions({
 			}
 		},
 		[
+			acquireTaskGitActionPromptRecord,
 			board,
 			currentProjectId,
 			fetchTaskWorkspaceInfo,
 			refreshGitHistory,
 			refreshWorkspaceState,
+			releaseTaskGitActionPromptRecord,
 			runtimeProjectConfig,
 			sendTaskChatMessage,
 			sendTaskSessionInput,
@@ -402,28 +485,28 @@ export function useGitActions({
 
 	const handleCommitTask = useCallback(
 		(taskId: string) => {
-			void runTaskGitAction(taskId, "commit", "card");
+			void runTaskGitAction(taskId, "commit", "card", { gitActionDedupe: "manual" });
 		},
 		[runTaskGitAction],
 	);
 
 	const handleOpenPrTask = useCallback(
 		(taskId: string) => {
-			void runTaskGitAction(taskId, "pr", "card");
+			void runTaskGitAction(taskId, "pr", "card", { gitActionDedupe: "manual" });
 		},
 		[runTaskGitAction],
 	);
 
 	const handleAgentCommitTask = useCallback(
 		(taskId: string) => {
-			void runTaskGitAction(taskId, "commit", "agent");
+			void runTaskGitAction(taskId, "commit", "agent", { gitActionDedupe: "manual" });
 		},
 		[runTaskGitAction],
 	);
 
 	const handleAgentOpenPrTask = useCallback(
 		(taskId: string) => {
-			void runTaskGitAction(taskId, "pr", "agent");
+			void runTaskGitAction(taskId, "pr", "agent", { gitActionDedupe: "manual" });
 		},
 		[runTaskGitAction],
 	);
@@ -561,7 +644,9 @@ export function useGitActions({
 
 	const runAutoReviewGitAction = useCallback(
 		async (taskId: string, action: TaskGitAction) => {
-			return await runTaskGitAction(taskId, action, "card");
+			// AUTOGIT: the auto path is the dedupe-critical caller; the server
+			// record decides whether this episode has already been prompted.
+			return await runTaskGitAction(taskId, action, "card", { gitActionDedupe: "auto" });
 		},
 		[runTaskGitAction],
 	);

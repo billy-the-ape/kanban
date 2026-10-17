@@ -503,6 +503,39 @@ export const runtimeTaskPrCommentResumeResponseSchema = z.object({
 });
 export type RuntimeTaskPrCommentResumeResponse = z.infer<typeof runtimeTaskPrCommentResumeResponseSchema>;
 
+/** AUTOGIT: the generated git action kinds that can be prompted to an agent. */
+export type RuntimeTaskGitActionPromptAction = "commit" | "pr";
+
+/**
+ * AUTOGIT: client request to record (or re-record, for manual intent) that a
+ * generated auto git-action prompt was sent to the task's session.
+ */
+export const runtimeTaskGitActionPromptRequestSchema = z.object({
+	taskId: z.string(),
+	action: z.enum(["commit", "pr"]),
+	/** "auto" is set-if-absent (dedupe); "manual" always records the send. */
+	intent: z.enum(["manual", "auto"]),
+});
+export type RuntimeTaskGitActionPromptRequest = z.infer<typeof runtimeTaskGitActionPromptRequestSchema>;
+
+export const runtimeTaskGitActionPromptResponseSchema = z.object({
+	ok: z.boolean(),
+	status: z.enum(["acquired", "already_sent", "no_task", "not_in_review", "error"]),
+});
+export type RuntimeTaskGitActionPromptResponse = z.infer<typeof runtimeTaskGitActionPromptResponseSchema>;
+
+/** AUTOGIT: client request to clear a recorded auto git-action prompt (failed send). */
+export const runtimeTaskGitActionPromptReleaseRequestSchema = z.object({
+	taskId: z.string(),
+	action: z.enum(["commit", "pr"]),
+});
+export type RuntimeTaskGitActionPromptReleaseRequest = z.infer<typeof runtimeTaskGitActionPromptReleaseRequestSchema>;
+
+export const runtimeTaskGitActionPromptReleaseResponseSchema = z.object({
+	ok: z.boolean(),
+});
+export type RuntimeTaskGitActionPromptReleaseResponse = z.infer<typeof runtimeTaskGitActionPromptReleaseResponseSchema>;
+
 export const runtimeBoardCardSchema = z
 	.object({
 		id: z.string(),
@@ -579,6 +612,21 @@ export const runtimeBoardCardSchema = z
 		 * overwrites a newer one, regardless of async completion order).
 		 */
 		lastPromptAt: z.number().int().nonnegative().optional(),
+		/**
+		 * AUTOGIT: server-owned dedupe record — a generated auto git-action
+		 * prompt (commit or PR) was already delivered to this task's session
+		 * during the current review episode. Written only through the
+		 * acquire/release mutations under the workspace lock; restored over
+		 * any client-supplied value by `saveWorkspaceState` while the card
+		 * stays in Review, and cleared automatically once the card leaves
+		 * Review (a new episode may prompt again).
+		 */
+		sentGitActionPrompt: z
+			.object({
+				action: z.enum(["commit", "pr"]),
+				sentAt: z.number().int().nonnegative(),
+			})
+			.optional(),
 		createdAt: z.number(),
 		updatedAt: z.number(),
 	})

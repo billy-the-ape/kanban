@@ -715,6 +715,66 @@ describe("board dependency state", () => {
 		);
 	});
 
+	it("carries the server-owned git action prompt record through normalization", () => {
+		const normalized = normalizeBoardData({
+			columns: [
+				{
+					id: "backlog",
+					cards: [
+						{
+							id: "b",
+							prompt: "Task B",
+							startInPlanMode: false,
+							baseRef: "main",
+							sentGitActionPrompt: { action: "pr", sentAt: 1234 },
+						},
+						{
+							id: "c",
+							prompt: "Task C",
+							startInPlanMode: false,
+							baseRef: "main",
+							sentGitActionPrompt: { action: "merge", sentAt: "nope" },
+						},
+					],
+				},
+				{ id: "in_progress", cards: [] },
+				{ id: "review", cards: [] },
+				{ id: "trash", cards: [] },
+			],
+			dependencies: [],
+		});
+		if (!normalized) {
+			throw new Error("Expected board to normalize");
+		}
+		const cards = normalized.columns.flatMap((column) => column.cards);
+		// Valid server-owned values carry through hydration.
+		expect(cards.find((card) => card.id === "b")?.sentGitActionPrompt).toEqual({ action: "pr", sentAt: 1234 });
+		// Invalid values are dropped.
+		expect(cards.find((card) => card.id === "c")?.sentGitActionPrompt).toBeUndefined();
+
+		// Card edit operations retain the server-owned record.
+		const updated = updateTask(normalized, "b", {
+			title: "Task B",
+			prompt: "Task B",
+			startInPlanMode: false,
+			autoReviewEnabled: false,
+			autoReviewMode: "commit",
+			images: [],
+			baseRef: "main",
+		});
+		expect(updated.updated).toBe(true);
+		const updatedCard = updated.board.columns.flatMap((column) => column.cards).find((card) => card.id === "b");
+		expect(updatedCard?.sentGitActionPrompt).toEqual({ action: "pr", sentAt: 1234 });
+
+		// Moving the card retains the record.
+		const moved = moveTaskToColumn(updated.board, "b", "in_progress");
+		expect(moved.moved).toBe(true);
+		expect(moved.board.columns.find((column) => column.id === "in_progress")?.cards[0]?.sentGitActionPrompt).toEqual({
+			action: "pr",
+			sentAt: 1234,
+		});
+	});
+
 	it("updates only the task title", () => {
 		let board = createInitialBoardData();
 		board = addTaskToColumn(board, "backlog", {

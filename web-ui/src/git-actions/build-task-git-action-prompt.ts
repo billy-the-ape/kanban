@@ -62,15 +62,10 @@ export function buildTaskGitActionPrompt(input: BuildTaskGitActionPromptInput): 
 	const variables: Record<string, string> = {
 		[TASK_GIT_BASE_REF_PROMPT_VARIABLE.key]: input.workspaceInfo.baseRef,
 	};
+	// AUTOGIT: the template is the single source of truth for the prompt.
+	// Previously a hard-coded PR description block was appended after the
+	// template, so a custom open-PR template that already covers the PR
+	// description received the guidance twice in one message.
 	const template = resolveTemplate(input.action, input.templates);
-	const prompt = interpolateTemplate(template, variables);
-	if (input.action !== "pr") {
-		return prompt;
-	}
-	return `${prompt}
-
-PR description requirements:
-- Write a readable Markdown body with Summary, Changes, Testing, and Deployment and follow-up sections. Include required environment variables, settings, manual actions, and how to test each feature; say "None" when no deployment action is needed.
-- Preserve real newlines, headings, and list markers. If using gh CLI, write the body as UTF-8 to a file in the task worktree and use gh pr create --body-file <path>. Do not pass a long quoted --body argument with literal backslash-n sequences.
-- Check the created PR description on GitHub and correct it if the line breaks or Markdown formatting did not survive.`;
+	return interpolateTemplate(template, variables);
 }
