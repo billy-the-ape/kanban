@@ -13,9 +13,11 @@ import type {
 	RuntimeTaskSessionSummary,
 } from "./api-contract";
 
-// The display state union is owned by the API contract; re-export it so all
-// consumers can import the type through this module.
 export type { RuntimeTaskDisplayState } from "./api-contract";
+// The display state union is owned by the API contract; re-export the type
+// and its schema so all consumers (server and web UI) derive the state list
+// from the single source of truth.
+export { runtimeTaskDisplayStateSchema } from "./api-contract";
 
 /** Session states where the agent is not working, so an In Progress card displays as Paused. */
 export const PAUSED_TASK_SESSION_STATES: ReadonlySet<RuntimeTaskSessionState> = new Set([

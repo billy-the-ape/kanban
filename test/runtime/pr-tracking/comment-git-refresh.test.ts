@@ -87,7 +87,24 @@ describe("safe PR repair Git refresh", () => {
 		await git(task, "switch", "-c", "other");
 		await expect(refreshCommentWorktree(task, snapshot, signal(), runner)).rejects.toThrow("Expected PR branch");
 		await git(task, "checkout", "--detach");
-		await expect(refreshCommentWorktree(task, snapshot, signal(), runner)).rejects.toThrow("Git refresh failed");
+		await expect(refreshCommentWorktree(task, snapshot, signal(), runner)).rejects.toThrow("detached HEAD");
+	});
+	const failingSymbolicRef =
+		(exitCode: number): CommentGitRunner =>
+		(cwd, args, options) =>
+			args[0] === "symbolic-ref"
+				? Promise.resolve({ ok: false, stdout: "", stderr: "", output: "", error: "git failed", exitCode })
+				: runGit(cwd, args, options);
+
+	it("keeps the generic retry message when symbolic-ref times out or fails to spawn", async () => {
+		await expect(refreshCommentWorktree(task, snapshot, signal(), failingSymbolicRef(-1))).rejects.toThrow(
+			"Git refresh failed (symbolic-ref)",
+		);
+	});
+	it("keeps the generic retry message on a fatal symbolic-ref error", async () => {
+		await expect(refreshCommentWorktree(task, snapshot, signal(), failingSymbolicRef(128))).rejects.toThrow(
+			"Git refresh failed (symbolic-ref)",
+		);
 	});
 	it("blocks a racing remote update and a mismatched remote repository", async () => {
 		const old = snapshot.headSha;

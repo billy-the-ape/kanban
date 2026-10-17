@@ -587,7 +587,9 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 	}
 
 	for (const call of calls) {
-		const result = firstResultById.get(call.id);
+		// An empty id carries no matchable identity; skip the lookup so an
+		// empty-id tool_result can never satisfy it.
+		const result = call.id === "" ? undefined : firstResultById.get(call.id);
 		if (result !== undefined) {
 			call.result = result;
 		}

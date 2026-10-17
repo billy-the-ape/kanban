@@ -1,4 +1,4 @@
-import type { RuntimeTaskDisplayState } from "@runtime-task-display-state";
+import { createEmptyTaskCounts } from "@runtime-task-display-state";
 import { useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { useSidebarTasksFilter } from "@/hooks/use-sidebar-tasks-filter";
@@ -29,11 +29,11 @@ function FirstLoadSkeleton() {
 		<div className="flex flex-col gap-1 px-3 py-1">
 			{Array.from({ length: FIRST_LOAD_SKELETON_ROW_COUNT }, (_, index) => (
 				<div key={index} className="rounded-md px-2 py-1.5">
-					<div className="kb-skeleton mb-1.5" style={{ width: "70%", height: 14 }} />
+					<div className="kb-skeleton mb-1.5 h-3.5 w-[70%]" />
 					<div className="flex items-center gap-1.5">
-						<div className="kb-skeleton" style={{ width: 28, height: 14, borderRadius: 999 }} />
-						<div className="kb-skeleton" style={{ width: "40%", height: 12 }} />
-						<div className="kb-skeleton" style={{ width: 44, height: 12 }} />
+						<div className="kb-skeleton h-3.5 w-7 rounded-full" />
+						<div className="kb-skeleton h-3 w-[40%]" />
+						<div className="kb-skeleton h-3 w-11" />
 					</div>
 				</div>
 			))}
@@ -74,14 +74,7 @@ export function SidebarTasksPanel({
 	useInterval(() => setNow(Date.now()), isVisible ? AGE_TICKER_INTERVAL_MS : null);
 
 	const counts = useMemo(() => {
-		const base: Record<RuntimeTaskDisplayState, number> = {
-			backlog: 0,
-			in_progress: 0,
-			paused: 0,
-			review: 0,
-			done: 0,
-			trash: 0,
-		};
+		const base = createEmptyTaskCounts();
 		for (const task of tasks ?? []) {
 			base[task.displayState] += 1;
 		}

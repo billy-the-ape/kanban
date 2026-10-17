@@ -28,7 +28,22 @@ export async function refreshCommentWorktree(
 		return result.stdout;
 	};
 	await git(["check-ref-format", `refs/heads/${headRef}`]);
-	const branch = await git(["symbolic-ref", "--quiet", "--short", "HEAD"]);
+	signal.throwIfAborted();
+	const symbolicRef = await runner(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"], {
+		timeoutMs: 30_000,
+		env: createGitProcessEnv({ GIT_TERMINAL_PROMPT: "0" }),
+	});
+	signal.throwIfAborted();
+	if (!symbolicRef.ok) {
+		// Exit code 1 means HEAD is not a branch ref (detached HEAD); fatal git
+		// errors (128), timeouts and spawn failures (normalized to -1 by
+		// runGit) keep the generic retry message.
+		if (symbolicRef.exitCode === 1) {
+			throw new Error(`Task worktree is on a detached HEAD; expected PR branch ${headRef}.`);
+		}
+		throw new Error(`Git refresh failed (symbolic-ref). Check repository access and retry.`);
+	}
+	const branch = symbolicRef.stdout;
 	if (branch !== headRef) throw new Error(`Expected PR branch ${headRef}; task is on ${branch}.`);
 	for (const marker of [
 		"MERGE_HEAD",
