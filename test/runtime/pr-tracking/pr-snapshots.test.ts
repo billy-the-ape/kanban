@@ -72,6 +72,65 @@ describe("pr-snapshots", () => {
 		expect(metadata.mergeCommitSha).toBe("m1");
 	});
 
+	it("projects provider detail fields from the same read", () => {
+		const metadata = normalizePrMetadata(
+			{
+				state: "open",
+				head: { sha: "abc123" },
+				additions: 120,
+				deletions: 34,
+				changed_files: 12,
+				commits: 7,
+				comments: 3,
+				review_comments: 5,
+				created_at: "2026-10-05T00:00:00Z",
+				updated_at: "2026-10-06T00:00:00Z",
+				labels: [{ name: "bug" }, { name: "tracking" }],
+				mergeable_state: "dirty",
+				requested_reviewers: [{ login: "reviewer-a" }, { login: "reviewer-b" }],
+			},
+			SCOPE,
+			NOW,
+		);
+		expect(metadata.additions).toBe(120);
+		expect(metadata.deletions).toBe(34);
+		expect(metadata.changedFiles).toBe(12);
+		expect(metadata.commits).toBe(7);
+		expect(metadata.comments).toBe(3);
+		expect(metadata.reviewComments).toBe(5);
+		expect(metadata.openedAt).toBe(Date.parse("2026-10-05T00:00:00Z"));
+		expect(metadata.updatedAt).toBe(Date.parse("2026-10-06T00:00:00Z"));
+		expect(metadata.labels).toEqual(["bug", "tracking"]);
+		expect(metadata.mergeableState).toBe("dirty");
+		expect(metadata.requestedReviewers).toEqual(["reviewer-a", "reviewer-b"]);
+	});
+
+	it("nulls provider detail fields that are absent or invalid", () => {
+		const metadata = normalizePrMetadata(
+			{
+				state: "open",
+				head: { sha: "abc123" },
+				additions: -1,
+				deletions: 2.5,
+				comments: "not-a-number",
+				mergeable_state: null,
+			},
+			SCOPE,
+			NOW,
+		);
+		expect(metadata.additions).toBeNull();
+		expect(metadata.deletions).toBeNull();
+		expect(metadata.changedFiles).toBeNull();
+		expect(metadata.commits).toBeNull();
+		expect(metadata.comments).toBeNull();
+		expect(metadata.reviewComments).toBeNull();
+		expect(metadata.openedAt).toBeNull();
+		expect(metadata.updatedAt).toBeNull();
+		expect(metadata.labels).toBeNull();
+		expect(metadata.mergeableState).toBeNull();
+		expect(metadata.requestedReviewers).toBeNull();
+	});
+
 	it("classifies reviews with author kind, own account, and pending state flags", () => {
 		const events = normalizeReviews(
 			[
