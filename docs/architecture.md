@@ -368,7 +368,7 @@ These are the architectural rules that are most important to preserve.
 
 Some of the highest-value rules are enforced automatically by lint.
 
-- outside `src/cline-sdk/`, only the two SDK boundary modules may import directly from `@clinebot/*`
+- `@clinebot/core` imports outside `src/cline-sdk/` are lint-restricted; go through the two SDK boundary modules instead
 - in the browser app, `createWorkspaceTrpcClient` is reserved for the runtime query helpers
 - the raw home agent session prefix should not be duplicated in app code
 
