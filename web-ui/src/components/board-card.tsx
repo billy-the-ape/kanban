@@ -814,7 +814,7 @@ export function BoardCard({
 									<p
 										ref={descriptionRef}
 										className={cn(
-											"text-sm leading-[1.4]",
+											"text-sm leading-[1.4] max-w-full overflow-hidden",
 											isTrashCard ? "text-text-tertiary" : "text-text-secondary",
 											!isDescriptionMeasured && !isDescriptionExpanded && "line-clamp-3",
 										)}
