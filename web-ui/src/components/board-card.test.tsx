@@ -313,7 +313,7 @@ describe("BoardCard", () => {
 		expect(container.textContent).not.toContain("final hidden segment");
 	});
 
-	it("shows the latest user prompt in the preview and keeps the title unchanged", async () => {
+	it("shows the first task message followed by the latest user prompt in the preview", async () => {
 		await act(async () => {
 			root.render(
 				<BoardCard
@@ -327,10 +327,112 @@ describe("BoardCard", () => {
 				/>,
 			);
 		});
-		expect(container.textContent).toContain("Updated by the user");
-		expect(container.textContent).not.toContain("Original description");
+		const text = container.textContent ?? "";
+		const firstMessageIndex = text.indexOf("Original description");
+		const lastMessageIndex = text.indexOf("Updated by the user");
+		// The first message renders before the latest user prompt.
+		expect(firstMessageIndex).toBeGreaterThanOrEqual(0);
+		expect(lastMessageIndex).toBeGreaterThan(firstMessageIndex);
 		// The title keeps its existing fallback behavior.
-		expect(container.textContent).toContain("Task title");
+		expect(text).toContain("Task title");
+	});
+
+	it("truncates each message independently with its own see more control", async () => {
+		const longFirst =
+			"Alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron first hidden tail";
+		const longLast =
+			"Alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron last hidden tail";
+
+		await act(async () => {
+			root.render(
+				<BoardCard
+					card={createCard({
+						prompt: `Task title||${longFirst}`,
+						lastPrompt: longLast,
+					})}
+					index={0}
+					columnId="backlog"
+				/>,
+			);
+		});
+
+		const findButtons = (label: string) =>
+			Array.from(container.querySelectorAll("button")).filter((button) => button.textContent?.trim() === label);
+
+		// Both messages are truncated, each with its own "See more" control.
+		expect(findButtons("See more").length).toBe(2);
+		expect(container.textContent).not.toContain("first hidden tail");
+		expect(container.textContent).not.toContain("last hidden tail");
+
+		// Expanding the first message does not expand the second one.
+		await act(async () => {
+			findButtons("See more")[0]?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+			findButtons("See more")[0]?.click();
+		});
+
+		expect(container.textContent).toContain("first hidden tail");
+		expect(container.textContent).not.toContain("last hidden tail");
+		expect(findButtons("See more").length).toBe(1);
+		expect(findButtons("Less").length).toBe(1);
+
+		// Expanding the second message keeps the first one expanded.
+		await act(async () => {
+			findButtons("See more")[0]?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+			findButtons("See more")[0]?.click();
+		});
+
+		expect(container.textContent).toContain("first hidden tail");
+		expect(container.textContent).toContain("last hidden tail");
+		expect(findButtons("See more").length).toBe(0);
+		expect(findButtons("Less").length).toBe(2);
+
+		// Collapsing only the first message leaves the second one expanded.
+		await act(async () => {
+			findButtons("Less")[0]?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+			findButtons("Less")[0]?.click();
+		});
+
+		expect(container.textContent).not.toContain("first hidden tail");
+		expect(container.textContent).toContain("last hidden tail");
+		expect(findButtons("See more").length).toBe(1);
+		expect(findButtons("Less").length).toBe(1);
+	});
+
+	it("shows only the latest user prompt when the original prompt contributes no description", async () => {
+		await act(async () => {
+			root.render(
+				<BoardCard
+					card={createCard({
+						title: "Task title",
+						prompt: "Task title",
+						lastPrompt: "Updated by the user",
+					})}
+					index={0}
+					columnId="backlog"
+				/>,
+			);
+		});
+		expect(container.textContent).toContain("Updated by the user");
+		// A single message must not render the "…" separator.
+		expect(container.textContent?.match(/…/g) ?? []).toHaveLength(0);
+	});
+
+	it("shows the message once when the latest user prompt matches the first message", async () => {
+		await act(async () => {
+			root.render(
+				<BoardCard
+					card={createCard({
+						title: "Task title",
+						prompt: "Task title||Update the docs",
+						lastPrompt: "Update the docs",
+					})}
+					index={0}
+					columnId="backlog"
+				/>,
+			);
+		});
+		expect((container.textContent?.match(/Update the docs/g) ?? []).length).toBe(1);
+		expect(container.textContent?.match(/…/g) ?? []).toHaveLength(0);
 	});
 
 	it("does not strip the card title from a latest user prompt preview", async () => {
