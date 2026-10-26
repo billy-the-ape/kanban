@@ -115,12 +115,14 @@ describe("resolveTaskToolFullOutput (DIAG-2 2b)", () => {
 		// legacy-reference step under test.
 		await writeFile(join(dir, "unrelated-artifact.txt"), "fixture output");
 		const reference = join(dir, "unrelated-artifact.txt");
-		// A diff/fixture line, a quoted mention, and a bare undocumented
-		// `full output:` line: none is a documented reference.
+		// A diff/fixture line, a quoted mention, a bare undocumented
+		// `full output:` line, and a bracketed marker missing the documented
+		// `... ` ellipsis prefix: none is a documented reference.
 		const texts = [
 			`+Full content: ${reference}`,
 			`line with "full output: ${reference}" quoted in prose`,
 			`full output: ${reference}`,
+			`see [truncated 3 lines; full output: ${reference}] below`,
 		];
 		for (const persistedResultText of texts) {
 			const evidence = await resolveTaskToolFullOutput({

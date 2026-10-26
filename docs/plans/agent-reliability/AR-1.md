@@ -53,7 +53,9 @@ labels in `web-ui/src/components/detail-panels/task-quality-summary-section.tsx`
 - **Artifact reference extraction** is restricted to the documented bounding
   envelopes: the standalone `Full content: <path>` marker line
   (`/^Full content: (\S+)$/gm`) and the bracketed
-  `[truncated N (chars|lines); full output: <path>]` marker. Quoted source,
+  `... [truncated N (chars|lines); full output: <path>]` marker (the
+  documented excerpt-hook shape, including its `... ` ellipsis prefix).
+  Quoted source,
   diff/fixture lines, and prose mentions are ignored; a bare `full output: <path>`
   line is not a reference. All collected references are deduplicated: exactly one
   distinct reference resolves; several distinct references return an explicit

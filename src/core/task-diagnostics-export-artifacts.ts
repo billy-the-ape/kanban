@@ -61,11 +61,12 @@ export const TASK_ARTIFACT_TRUNCATION_MARKER_PATTERN =
  * Quoted source, diff/fixture lines (a `+`/`-`/context prefix), and free
  * prose that merely mentions either phrase are never treated as references:
  * `Full content:` must be a standalone marker line, and `full output:` must
- * appear inside the documented bracketed truncation envelope. A bare
+ * appear inside the documented bracketed truncation envelope, which always
+ * carries the `... ` ellipsis prefix produced by the excerpt hook. A bare
  * `full output: <path>` line is not a documented envelope and is ignored.
  */
 const LEGACY_FULL_CONTENT_MARKER = /^Full content: (\S+)$/gm;
-const LEGACY_BRACKETED_FULL_OUTPUT_MARKER = /\[truncated \d+ (?:chars|lines); full output: ([^\s\]]+)\]/g;
+const LEGACY_BRACKETED_FULL_OUTPUT_MARKER = /\.\.\. \[truncated \d+ (?:chars|lines); full output: ([^\s\]]+)\]/g;
 
 function isContainedInParent(parent: string, candidate: string): boolean {
 	return candidate === parent || candidate.startsWith(parent + sep);
