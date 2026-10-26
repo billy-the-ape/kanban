@@ -169,7 +169,7 @@ export function BoardCardDescription({
 	};
 
 	return (
-		<div style={{ margin: "2px 0 0" }}>
+		<div className="mt-0.5">
 			{segments.map((text, index) => {
 				const clamp = clamps[index] ?? {
 					collapsed: { text, isTruncated: false },
