@@ -29,19 +29,34 @@ are not a mergeability verdict; auto-merge and merge-candidate UI are outside th
    fingerprint advances only at this execution boundary.
 
 Git verification always runs on admission, even when the PR snapshot is fresh. It
-requires a clean worktree, the PR head branch, no in-progress Git operation, and a
-configured GitHub remote matching the PR head repository (including fork identity).
-It fetches that branch into a temporary private ref, verifies its SHA against the PR
-snapshot, and only fast-forwards a behind branch. An ahead/divergent branch, detached
-HEAD, dirty worktree, missing/mismatched remote, fetch failure, or racing head change
-blocks the turn. No reset, stash, rebase, branch checkout, force push, or merge commit
-is performed. A successful fast-forward is retained if a later preparation check fails.
+requires a clean worktree, no in-progress Git operation, and a configured GitHub remote
+matching the PR head repository (including fork identity). The checkout may be either
+attached to the PR head branch or on a detached HEAD, which is how Kanban normally
+creates task worktrees (a task can publish its detached HEAD to the PR branch without
+attaching to it). Any other attached branch blocks. Verification fetches the PR branch
+into a temporary private ref, verifies its SHA against the PR snapshot, then rechecks
+that HEAD still has its original commit and attachment state: a detach/attach
+transition counts as a concurrent change even at the same commit. HEAD that already
+equals the PR head proceeds unchanged; HEAD that is an ancestor is fast-forwarded with
+`merge --ff-only` (hooks disabled), which updates the checkout and index and leaves a
+detached HEAD detached. The final HEAD must equal the captured PR head with the same
+attachment state.
+
+An ahead/divergent HEAD, other attached branch, dirty worktree, missing/mismatched
+remote, fetch failure, `symbolic-ref` failure, or racing head/attachment change blocks
+the turn. No reset, stash, rebase, checkout, branch attach/creation, force push, or
+merge commit is performed, so a detached repair never moves a local PR branch, including
+one checked out in another worktree. The temporary ref is removed on success and
+failure. A successful fast-forward is retained if a later preparation check fails.
 
 A Git blocker is stored as a failed dispatch with `errorCode: git_refresh_blocked`,
 shown with its reason and Resume action. Preserve/reconcile the worktree manually,
 then Resume; feedback remains eligible. Incomplete GitHub snapshots and local snapshot
 write/read failures also fail visibly before a model call. No new configuration/environment variables are
 required. Existing Git/gh authentication and network access remain prerequisites.
+Repairs paused by the former `Task worktree is on a detached HEAD` blocker need no
+manual reconciliation: Resume once after deployment. Feedback handled manually while
+paused may be reassessed, since that failed batch was never dispatched.
 
 ## Bounded feedback and later changes
 
@@ -96,7 +111,7 @@ visibly for Resume, since the scheduler's in-memory queue no longer exists.
 
 - `src/pr-tracking/github-pr-client.ts`: eligibility and feedback metadata.
 - `src/pr-tracking/comment-automation-service.ts`: debounce, dispatch, preparation and lifecycle.
-- `src/pr-tracking/comment-git-refresh.ts`: safe Git refresh.
+- `src/pr-tracking/comment-git-refresh.ts`: safe Git refresh for detached or PR-branch checkouts.
 - `src/pr-tracking/comment-handling-prompt.ts`: bounded batch rendering and verified snapshot fallback.
 - `src/workspace/task-artifacts.ts`: existing task artifact storage and lifecycle.
 - `src/cline-sdk/cline-turn-preparation.ts`: internal admission callback contract.

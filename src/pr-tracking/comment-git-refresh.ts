@@ -6,7 +6,21 @@ import type { GitHubPrSnapshot } from "./github-pr-client";
 
 export type CommentGitRunner = typeof runGit;
 
-/** No reset, stash, rebase, checkout, merge commit, push, or force update of a user branch. */
+const CHECKOUT_CHANGED = "The task checkout changed during refresh. Resume after other writers finish.";
+
+/** Kanban task worktrees are detached by default; a task may still be attached to the PR branch. */
+type HeadAttachment = { kind: "detached" } | { kind: "branch"; name: string };
+
+function isSameAttachment(left: HeadAttachment, right: HeadAttachment): boolean {
+	if (left.kind === "detached" || right.kind === "detached") return left.kind === right.kind;
+	return left.name === right.name;
+}
+
+/**
+ * Fast-forwards a clean detached HEAD or PR-branch checkout to the verified PR head.
+ * Never attaches, creates, or switches a branch, and performs no reset, stash, rebase,
+ * checkout, merge commit, push, or force update of a user branch.
+ */
 export async function refreshCommentWorktree(
 	cwd: string,
 	snapshot: GitHubPrSnapshot,
@@ -27,24 +41,24 @@ export async function refreshCommentWorktree(
 		if (!result.ok) throw new Error(`Git refresh failed (${args[0]}). Check repository access and retry.`);
 		return result.stdout;
 	};
-	await git(["check-ref-format", `refs/heads/${headRef}`]);
-	signal.throwIfAborted();
-	const symbolicRef = await runner(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"], {
-		timeoutMs: 30_000,
-		env: createGitProcessEnv({ GIT_TERMINAL_PROMPT: "0" }),
-	});
-	signal.throwIfAborted();
-	if (!symbolicRef.ok) {
+	const readAttachment = async (): Promise<HeadAttachment> => {
+		signal.throwIfAborted();
+		const symbolicRef = await runner(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"], {
+			timeoutMs: 30_000,
+			env: createGitProcessEnv({ GIT_TERMINAL_PROMPT: "0" }),
+		});
+		signal.throwIfAborted();
+		if (symbolicRef.ok) return { kind: "branch", name: symbolicRef.stdout };
 		// Exit code 1 means HEAD is not a branch ref (detached HEAD); fatal git
 		// errors (128), timeouts and spawn failures (normalized to -1 by
 		// runGit) keep the generic retry message.
-		if (symbolicRef.exitCode === 1) {
-			throw new Error(`Task worktree is on a detached HEAD; expected PR branch ${headRef}.`);
-		}
+		if (symbolicRef.exitCode === 1) return { kind: "detached" };
 		throw new Error(`Git refresh failed (symbolic-ref). Check repository access and retry.`);
-	}
-	const branch = symbolicRef.stdout;
-	if (branch !== headRef) throw new Error(`Expected PR branch ${headRef}; task is on ${branch}.`);
+	};
+	await git(["check-ref-format", `refs/heads/${headRef}`]);
+	const attachment = await readAttachment();
+	if (attachment.kind === "branch" && attachment.name !== headRef)
+		throw new Error(`Expected PR branch ${headRef}; task is on ${attachment.name}.`);
 	for (const marker of [
 		"MERGE_HEAD",
 		"rebase-merge",
@@ -69,6 +83,9 @@ export async function refreshCommentWorktree(
 			);
 		}
 	};
+	const assertSameAttachment = async () => {
+		if (!isSameAttachment(await readAttachment(), attachment)) throw new Error(CHECKOUT_CHANGED);
+	};
 	await assertClean();
 	const originalHead = await git(["rev-parse", "HEAD"]);
 	let remote: string | null = null;
@@ -90,21 +107,22 @@ export async function refreshCommentWorktree(
 		if (fetchedHead !== headSha)
 			throw new Error("The PR branch changed during refresh. Resume to capture its new state.");
 		await assertClean();
-		if (
-			(await git(["rev-parse", "HEAD"])) !== originalHead ||
-			(await git(["symbolic-ref", "--short", "HEAD"])) !== branch
-		) {
-			throw new Error("The task branch changed during refresh. Resume after other writers finish.");
-		}
+		if ((await git(["rev-parse", "HEAD"])) !== originalHead) throw new Error(CHECKOUT_CHANGED);
+		// A detach/attach transition is a concurrent change even when the commit is unchanged.
+		await assertSameAttachment();
 		if (originalHead !== fetchedHead) {
 			const ancestor = await runner(cwd, ["merge-base", "--is-ancestor", originalHead, fetchedHead]);
 			if (!ancestor.ok)
-				throw new Error("The task branch is ahead of or diverged from the PR head. Reconcile it before resuming.");
+				throw new Error(
+					"The task checkout is ahead of or diverged from the PR head. Reconcile it before resuming.",
+				);
+			// Fast-forwards the checkout and index; a detached HEAD stays detached.
 			await git(["-c", "core.hooksPath=/dev/null", "merge", "--ff-only", "--no-edit", fetchedHead]);
 		}
 		await assertClean();
 		const finalHead = await git(["rev-parse", "HEAD"]);
 		if (finalHead !== headSha) throw new Error("The task HEAD no longer matches the captured PR head.");
+		await assertSameAttachment();
 		return finalHead;
 	} finally {
 		await runner(cwd, ["update-ref", "-d", fetchRef], { timeoutMs: 5_000 });
