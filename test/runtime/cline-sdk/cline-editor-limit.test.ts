@@ -10,7 +10,7 @@ import { createClineToolFailureRecoveryHooks } from "../../../src/cline-sdk/clin
 async function run(cwd: string, inputs: Record<string, unknown>[]) {
 	const requests: AgentModelRequest[] = [];
 	const limits = createClineEditorLimitHooks(cwd);
-	const recovery = createClineToolFailureRecoveryHooks();
+	const recovery = createClineToolFailureRecoveryHooks(cwd);
 	let index = 0;
 	const model: AgentModel = {
 		async *stream(request) {
@@ -95,8 +95,8 @@ describe("local editor limit and model-facing recovery (real SDK tool and loop)"
 	});
 
 	it.each([
-		{ input: { old_text: "missing", new_text: "new" }, expected: "copy an exact, unique old_text anchor" },
-		{ input: { new_text: "new" }, expected: "include an explicit old_text string" },
+		{ input: { old_text: "missing", new_text: "new" }, expected: "No nearby candidate could be located" },
+		{ input: { new_text: "new" }, expected: "missing old_text" },
 		{ input: { insert_line: 99, new_text: "new" }, expected: "line_count + 1" },
 	])("puts original error and targeted guidance in the next model request: $expected", async ({ input, expected }) => {
 		const path = join(cwd, "file");
@@ -118,8 +118,44 @@ describe("local editor limit and model-facing recovery (real SDK tool and loop)"
 		const bad = { path, old_text: "missing", new_text: "replacement" };
 		const { requests, result } = await run(cwd, [bad, bad, { path, old_text: "original", new_text: "replacement" }]);
 		expect(result.status).toBe("completed");
-		expect(JSON.stringify(requests[2].messages)).toContain("This exact editor call already failed");
+		expect(JSON.stringify(requests[2].messages)).toContain("This repeats the earlier failed arguments");
 		expect(await readFile(path, "utf8")).toBe("replacement");
+	});
+
+	it("attaches bounded current-source evidence for a wrong tab count without modifying the file", async () => {
+		const path = join(cwd, "target.ts");
+		const source = "line one\n\t\tindented = true;\nline three\n";
+		await writeFile(path, source);
+		// The model submits three TABs; the source line has two.
+		const { requests, result } = await run(cwd, [
+			{ path, old_text: "\t\t\tindented = true;", new_text: "indented = true;" },
+		]);
+		expect(result.status).toBe("completed");
+		const toolResults = requests[1].messages
+			.flatMap((message) => message.content)
+			.filter((part) => part.type === "tool-result");
+		const transcript = JSON.stringify(toolResults);
+		expect(transcript).toContain("Editor operation failed:");
+		expect(transcript).toContain("matched 0 times in the current file");
+		expect(transcript).toContain('"evidence"');
+		expect(transcript).toContain("diagnostic evidence, not an automatically corrected anchor");
+		expect(transcript).toContain("submitted line 1 begins with 3 TAB character(s)");
+		expect(transcript).toContain("candidate line 2 begins with 2 TAB character(s)");
+		// The evidence window carries the current source line for correction.
+		expect(transcript).toContain("indented = true;");
+		// The failed call never modified the file.
+		expect(await readFile(path, "utf8")).toBe(source);
+	});
+
+	it("keeps the three-failure guard for identical failed editor calls", async () => {
+		const path = join(cwd, "file");
+		await writeFile(path, "original");
+		const bad = { path, old_text: "missing", new_text: "replacement" };
+		const { requests, result } = await run(cwd, [bad, bad, bad]);
+		expect(result.status).toBe("failed");
+		expect(result.error?.message).toContain("failed 3 times in a row with the same error");
+		expect(requests).toHaveLength(3);
+		expect(await readFile(path, "utf8")).toBe("original");
 	});
 
 	it("retains unique matching and missing old_text checks for large edits", async () => {
@@ -131,7 +167,7 @@ describe("local editor limit and model-facing recovery (real SDK tool and loop)"
 		]);
 		expect(await readFile(path, "utf8")).toBe("same same");
 		expect(JSON.stringify(requests[2].messages)).toContain("old_text");
-		expect(JSON.stringify(requests[2].messages)).toContain("multiple");
+		expect(JSON.stringify(requests[2].messages)).toContain("matched 2 times");
 		expect(JSON.stringify(requests[2].messages)).toContain("Do not repeat the ambiguous anchor");
 	});
 });

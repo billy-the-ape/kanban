@@ -1,10 +1,18 @@
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { type AgentModel, type AgentModelRequest, AgentRuntime, type AgentTool } from "@clinebot/agents";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	createClineToolFailureRecoveryHooks,
 	isClineToolTimeout,
 	readClineToolFailure,
 } from "../../../src/cline-sdk/cline-tool-failure-recovery";
+import {
+	CLINE_TOOL_RESULT_BOUND_TOOL_NAMES,
+	createClineToolResultBoundingHook,
+} from "../../../src/cline-sdk/cline-tool-result-bounding-hook";
+import type { ClineSdkAgentAfterToolHook, ClineSdkAgentHooks } from "../../../src/cline-sdk/sdk-runtime-boundary";
 
 /** Real SDK timeout shapes (see TIMEOUT_LINE_PATTERNS). */
 const READ_TIMEOUT = "Error reading file: File read timed out after 30000ms";
@@ -284,5 +292,159 @@ describe("bounded Cline tool recovery (real SDK agent loop)", () => {
 		expect(readClineToolFailure({ isError: true, content: [{ type: "text", text: "MCP unavailable" }] })).toContain(
 			"MCP unavailable",
 		);
+	});
+});
+
+describe("AR-2 editor failure evidence (scripted SDK agent loop)", () => {
+	let cwd: string;
+	beforeEach(async () => {
+		cwd = await mkdtemp(join(tmpdir(), "editor-recovery-"));
+	});
+	afterEach(async () => {
+		await rm(cwd, { recursive: true, force: true });
+	});
+
+	interface EditorRunOptions {
+		bounding?: ClineSdkAgentAfterToolHook;
+		deny?: boolean;
+	}
+
+	function editorRun(
+		execute: AgentTool["execute"],
+		inputs: Record<string, unknown>[],
+		options: EditorRunOptions = {},
+	) {
+		const requests: AgentModelRequest[] = [];
+		let index = 0;
+		const model: AgentModel = {
+			async *stream(request) {
+				requests.push(request);
+				const input = inputs[index++];
+				if (input) {
+					yield {
+						type: "tool-call-delta",
+						toolCallId: `call-${index}`,
+						toolName: "editor",
+						inputText: JSON.stringify(input),
+					};
+					yield { type: "finish", reason: "tool-calls" };
+				} else {
+					yield { type: "text-delta", text: "Done" };
+					yield { type: "finish", reason: "stop" };
+				}
+			},
+		};
+		const tool: AgentTool = { name: "editor", description: "Test", inputSchema: { type: "object" }, execute };
+		const recovery = createClineToolFailureRecoveryHooks(cwd);
+		const hooks: ClineSdkAgentHooks = {
+			beforeTool: (context) => recovery.beforeTool?.(context),
+			afterTool: async (context) => {
+				const recovered = await recovery.afterTool?.(context);
+				return (await options.bounding?.({ ...context, result: recovered?.result ?? context.result })) ?? recovered;
+			},
+		};
+		const runtime = new AgentRuntime({
+			model,
+			tools: [tool],
+			hooks,
+			...(options.deny
+				? {
+						toolPolicies: { editor: { autoApprove: false } },
+						requestToolApproval: async () => ({ approved: false, reason: "Denied" }),
+					}
+				: {}),
+		});
+		return { runtime, requests };
+	}
+
+	it("delivers the original error plus bounded evidence on the next model request", async () => {
+		const path = join(cwd, "target.ts");
+		const source = "line one\n\t\tindented = true;\nline three\n";
+		await writeFile(path, source);
+		const execute = vi.fn().mockResolvedValue({
+			query: "edit",
+			result: "",
+			success: false,
+			error: `Editor operation failed: No replacement performed: text not found in ${path}.`,
+		});
+		const { runtime, requests } = editorRun(execute, [
+			{ path, old_text: "\t\t\tindented = true;", new_text: "indented = false;" },
+		]);
+		expect((await runtime.run("Edit")).status).toBe("completed");
+		const transcript = JSON.stringify(requests[1].messages);
+		expect(transcript).toContain("Editor operation failed:");
+		expect(transcript).toContain("matched 0 times in the current file");
+		expect(transcript).toContain('"evidence"');
+		expect(transcript).toContain("diagnostic evidence, not an automatically corrected anchor");
+		expect(transcript).toContain("indented = true;");
+		expect(await readFile(path, "utf8")).toBe(source);
+	});
+
+	it("keeps the compact explanation within the output budget with result bounding enabled and large failure output", async () => {
+		const path = join(cwd, "target.ts");
+		await writeFile(path, "line one\n\t\tindented = true;\nline three\n");
+		const bigPayload = "x".repeat(48_000);
+		const execute = vi.fn().mockResolvedValue({
+			query: "edit",
+			result: "",
+			success: false,
+			error: `Editor operation failed: No replacement performed: text not found in ${path}.\n${bigPayload}`,
+		});
+		const writeArtifact = vi.fn(async () => "/tmp/ar2-test-artifact.txt");
+		const bounding = createClineToolResultBoundingHook({
+			taskId: "task-ar2",
+			limitTokens: 4_000,
+			toolNames: [...CLINE_TOOL_RESULT_BOUND_TOOL_NAMES, "editor"],
+			writeArtifact,
+		});
+		const { runtime, requests } = editorRun(
+			execute,
+			[{ path, old_text: "\t\t\tindented = true;", new_text: "indented = false;" }],
+			{ bounding },
+		);
+		expect((await runtime.run("Edit")).status).toBe("completed");
+		const toolResults = requests[1].messages
+			.flatMap((message) => message.content)
+			.filter((part) => part.type === "tool-result");
+		expect(toolResults).toHaveLength(1);
+		const output = JSON.stringify(toolResults[0]);
+		// The compact recovery explanation and the original error survive in the
+		// bounded head; the large payload does not.
+		expect(output).toContain("matched 0 times in the current file");
+		expect(output).toContain("Editor operation failed:");
+		expect(output).not.toContain("x".repeat(20_000));
+		expect(output.length).toBeLessThan(20_000);
+		// The full content is preserved as a local artifact, not dropped.
+		expect(writeArtifact).toHaveBeenCalledTimes(1);
+	});
+
+	it("performs no enrichment read after an approval denial", async () => {
+		const path = join(cwd, "denied.ts");
+		const source = "denied content\n";
+		await writeFile(path, source);
+		const execute = vi.fn();
+		const { runtime, requests } = editorRun(execute, [{ path, old_text: "missing", new_text: "x" }], { deny: true });
+		expect((await runtime.run("Edit")).status).toBe("completed");
+		expect(execute).not.toHaveBeenCalled();
+		const transcript = JSON.stringify(requests[1].messages);
+		expect(transcript).toContain("Denied");
+		expect(transcript).not.toContain("evidence");
+		expect(await readFile(path, "utf8")).toBe(source);
+	});
+
+	it("keeps timeout recovery without evidence for a timed-out editor call", async () => {
+		const path = join(cwd, "target.ts");
+		await writeFile(path, "line one\n");
+		const execute = vi.fn().mockResolvedValue({
+			query: "edit",
+			result: "",
+			success: false,
+			error: "Editor operation failed: Editor operation timed out after 30000ms",
+		});
+		const { runtime, requests } = editorRun(execute, [{ path, old_text: "line one", new_text: "line two" }]);
+		expect((await runtime.run("Edit")).status).toBe("completed");
+		const transcript = JSON.stringify(requests[1].messages);
+		expect(transcript).toContain("timed out");
+		expect(transcript).not.toContain('"evidence"');
 	});
 });
