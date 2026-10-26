@@ -1,6 +1,6 @@
 # AR-1: Correct recorded diagnostics and evidence classification
 
-Status: planned. One implementation PR into `main`. Dependencies: none.
+Status: implemented (reducer version 2). One implementation PR into `main`. Dependencies: none.
 Read [README.md](./README.md) and [EVIDENCE.md](./EVIDENCE.md).
 
 ## Outcome
@@ -8,6 +8,71 @@ Read [README.md](./README.md) and [EVIDENCE.md](./EVIDENCE.md).
 Summaries on native snapshots and exported JSON agree on structural tool failures
 and do not turn unknown arguments, source fixtures, or pipeline risks into false facts.
 This establishes the baseline for later behavior changes; it does not change execution.
+
+## Implementation outcome (reducer version 2)
+
+Implemented in `src/core/task-quality-summary.ts`,
+`src/core/task-diagnostics-export-artifacts.ts`, and `src/core/api-contract.ts`
+(evidence `resultIsError` field + documented `reducerVersion`), with compatible
+labels in `web-ui/src/components/detail-panels/task-quality-summary-section.tsx`.
+
+- **Native adapter (`extractDurableToolResultText`)** preserves, in addition to
+  string/text blocks: (a) a direct structured command-entry array persisted as the
+  tool_result content itself (serialized with `JSON.stringify`), and (b) Kanban's
+  `{ recovery, output }` envelope persisted as a record, including array-valued
+  `output`. Nothing else is serialized or scanned.
+- **`argumentStatus` provenance** (`present` / `empty` / `unavailable`) is carried on
+  every `TaskQualitySummaryToolPart` (computed by `argumentStatusForToolUse` in the
+  adapter; `"unavailable"` on tool_result parts).
+- **Classification (`classifyToolCall`)** interprets only documented envelopes:
+  - confirmed failures, each call counted once: tool-result `is_error` (an
+    `is_error` result on the `editor` tool now reports the documented category —
+    `editor_replacement_mismatch`, `editor_missing_old_text`, `editor_input_too_large`,
+    else `editor_other` — instead of being erased to `tool_result_is_error`; other
+    tools keep `tool_result_is_error`); the `{ recovery, output }` envelope;
+    documented structured `success: false` (top-level object, via the envelope's
+    original output when present); and the run_commands command-entry arrays, found
+    as a direct array, as `{ output: [...] }`, or inside a recovery envelope
+    (`extractCommandEntries` accepts the array directly). Entries whose documented
+    `error` is a timeout (`isClineToolTimeout`) classify as the distinct
+    `command_timeout` rule when every failing entry is a timeout; any non-timeout
+    failure entry in the same call stays `run_commands_nested_failure`.
+  - heuristic tags unchanged: masked pipeline, expected negative probes, nonzero
+    exit status. A pipeline's presence alone never proves a failure.
+- **Unchanged failed retries** are declared only when the recorded arguments can
+  prove identity: `present`, or `empty` for a tool documented to accept entirely
+  optional input (`EMPTY_INPUT_VALID_TOOLS` — no built-in tool currently qualifies,
+  so `{}` can never claim identity). Empty/unavailable calls are excluded; missing
+  provenance is reported as an `argument_provenance_unknown` ambiguity, never
+  claimed identical.
+- **Evidence** carries `resultIsError` (the recorded result's `is_error` flag;
+  `false` for unmatched calls). The response `reducerVersion` documents the
+  v1/v2 semantics; the schema stays `min(1)` for backward compatibility.
+- **Artifact reference extraction** is restricted to the documented bounding
+  envelopes: the standalone `Full content: <path>` marker line
+  (`/^Full content: (\S+)$/gm`) and the bracketed
+  `[truncated N (chars|lines); full output: <path>]` marker. Quoted source,
+  diff/fixture lines, and prose mentions are ignored; a bare `full output: <path>`
+  line is not a reference. All collected references are deduplicated: exactly one
+  distinct reference resolves; several distinct references return an explicit
+  `ambiguous` gap (never guessed). Containment/symlink checks are unchanged.
+- **Web UI**: the header shows the reducer version (`reducer v2`); "Reported
+  failures" is labeled "confirmed structural, once per call"; evidence rows show a
+  `· is_error` marker when the recorded result carried the structural flag.
+
+**Tests**: inherited restart snapshots carry identical totals (a direct structured
+array failure is counted exactly once across segments); `is_error` editor results
+report the documented category with `resultIsError: true`; timeouts are distinct and
+nested output text is never scanned (log-inspection fixture); quoted/fixture/prose
+failure text produces no failure evidence; recovery envelopes (text block and direct
+array output) are structural failures; empty `{}` and unavailable (`null`) editor
+arguments are excluded from unchanged-retry identity (unavailable →
+`argument_provenance_unknown` ambiguity) while proven-argument retries still count;
+raw persisted structured arrays survive the native adapter (modeled in the fixture
+through one explicit cast, since the typed persisted shape cannot express them);
+artifact reference extraction resolves only the documented styles, ignores
+diff/quoted/bare-phrase lines, returns an explicit `ambiguous` gap for multiple
+distinct references, and retains the escape/sibling/symlink regression coverage.
 
 ## Current integration points
 

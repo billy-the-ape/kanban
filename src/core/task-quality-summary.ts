@@ -34,13 +34,24 @@ import type {
 	ClineTaskExportToolOrigin,
 	ClineTaskExportToolOriginEntry,
 } from "../cline-sdk/cline-task-export-snapshot";
+import { isClineToolTimeout } from "../cline-sdk/cline-tool-failure-recovery";
 import type { ClineSdkPersistedMessage } from "../cline-sdk/sdk-runtime-boundary";
 import type { RuntimeTaskQualitySummaryResponse } from "./api-contract";
 import { TASK_ARTIFACT_TRUNCATION_MARKER_PATTERN } from "./task-diagnostics-export-artifacts";
 import type { TaskDiagnosticsExportV3Plan } from "./task-diagnostics-export-v3";
 
-/** Version of the reducer's analysis semantics (bump when rules change). */
-export const TASK_QUALITY_SUMMARY_VERSION = 1;
+/**
+ * Version of the reducer's analysis semantics (bump when rules change).
+ * V2 (AR-1): the native adapter preserves direct structured command arrays
+ * and the `{ recovery, output }` envelope; an `is_error` flag no longer
+ * erases a known editor category; command timeouts are a distinct confirmed
+ * rule; and calls whose recorded arguments are empty or unavailable are
+ * never declared identical for unchanged-retry evidence.
+ */
+export const TASK_QUALITY_SUMMARY_VERSION = 2;
+
+/** Provenance of a tool_use part's recorded arguments (V2). */
+export type TaskQualitySummaryArgumentStatus = "present" | "empty" | "unavailable";
 
 /** Structural tool part analyzed by the reducer (no SDK schema duplication). */
 export interface TaskQualitySummaryToolPart {
@@ -54,6 +65,13 @@ export interface TaskQualitySummaryToolPart {
 	arguments: unknown;
 	/** Canonicalized argument comparison key (sorted object key order). */
 	argumentKey: string | null;
+	/**
+	 * Provenance of the recorded arguments: `present` (recorded non-empty),
+	 * `empty` (recorded as `{}`/`[]`), or `unavailable` (no input recorded).
+	 * Only `present` arguments (and `empty` for tools where `{}` is a valid
+	 * input) can prove identity for unchanged-retry comparison.
+	 */
+	argumentStatus: TaskQualitySummaryArgumentStatus;
 	/** tool_result `is_error` flag. */
 	isResultError: boolean;
 	/** Extracted tool result text (string or joined text blocks). */
@@ -109,6 +127,8 @@ export type TaskQualitySummaryRuleId =
 	| "tool_result_is_error"
 	| "structured_success_false"
 	| "run_commands_nested_failure"
+	| "command_timeout"
+	| "recovery_envelope_failure"
 	| "editor_replacement_mismatch"
 	| "editor_missing_old_text"
 	| "editor_input_too_large"
@@ -120,6 +140,7 @@ export type TaskQualitySummaryRuleId =
 	| "nonzero_exit_status"
 	| "message_id_reuse_conflict"
 	| "tool_id_reuse_conflict"
+	| "argument_provenance_unknown"
 	| "duplicate_session";
 
 export type TaskQualitySummaryClassification =
@@ -139,6 +160,8 @@ export interface TaskQualitySummaryEvidence {
 	timestamp: number | null;
 	ruleId: TaskQualitySummaryRuleId;
 	classification: TaskQualitySummaryClassification;
+	/** The recorded result's `is_error` flag (structural evidence, V2). */
+	resultIsError: boolean;
 	/** The prior identical failed call for unchanged-retry evidence. */
 	priorReference: {
 		sessionId: string;
@@ -325,6 +348,53 @@ function editorFailureRule(errorText: string): TaskQualitySummaryRuleId {
 	return "editor_other";
 }
 
+/**
+ * Kanban's bounded tool-failure recovery envelope
+ * (`cline-tool-failure-recovery` afterTool hook): `{ recovery, output }`,
+ * where `recovery` is the guidance text and `output` is the original
+ * (failed) tool output — a string, a record, or the direct command-entry
+ * array of a run_commands result. Recovery guidance is only attached to
+ * failed results, so the envelope itself is structural failure evidence.
+ * Only this documented envelope shape is interpreted; any other record is
+ * not scanned for failure markers.
+ */
+function isRecoveryEnvelope(value: unknown): value is { recovery: string; output: unknown } {
+	return (
+		isPlainRecord(value) && typeof value.recovery === "string" && value.recovery.trim() !== "" && "output" in value
+	);
+}
+
+/**
+ * The documented editor error text of a failed editor result: the structured
+ * `error` field, the original output inside a recovery envelope (a string or
+ * its `error` field), or the raw result text. Nothing beyond these documented
+ * positions is searched — never nested command output, quoted source, or
+ * fixture JSON.
+ */
+function editorErrorText(resultText: string | null, parsed: unknown): string {
+	if (parsed !== null) {
+		if (isRecoveryEnvelope(parsed)) {
+			const inner = parsed.output;
+			if (typeof inner === "string") {
+				return inner;
+			}
+			if (isPlainRecord(inner) && typeof inner.error === "string") {
+				return inner.error;
+			}
+			return resultText ?? "";
+		}
+		if (isPlainRecord(parsed) && typeof parsed.error === "string") {
+			return parsed.error;
+		}
+	}
+	return resultText ?? "";
+}
+
+/** A command entry whose documented error is a tool timeout (SDK line shapes). */
+function isCommandTimeoutEntry(entry: Record<string, unknown>): boolean {
+	return typeof entry.error === "string" ? isClineToolTimeout(entry.error) : false;
+}
+
 // Heuristic risk patterns on the recorded command text. Neither tag is a
 // failure: a pipeline containing tail/grep only masks exit status, and a
 // search command with no matches can be an intentional probe.
@@ -358,13 +428,20 @@ export interface ToolCallClassification {
 }
 
 /**
- * Deterministic V1 classification of a matched tool call:
- * - confirmed failures: tool-result `is_error`, documented structured
- *   `success: false` (top-level object), and the run_commands nested
- *   command-entry arrays (each call counted once, even when several
- *   nested commands fail);
+ * Deterministic V2 classification of a matched tool call. Only documented
+ * result envelopes are interpreted — never recursive scans of command
+ * stdout, source code, fixture JSON, or quoted error prose:
+ * - confirmed failures: tool-result `is_error` (kept alongside the editor
+ *   category when one is documented, never erased by it), Kanban's
+ *   `{ recovery, output }` envelope, documented structured `success: false`
+ *   (top-level object), and the run_commands command-entry arrays, which may
+ *   appear as a direct array, as `{ output: [...] }`, or inside a recovery
+ *   envelope — each call counted once, even when several nested commands
+ *   fail; command entries whose documented error is a timeout are a
+ *   distinct confirmed rule (`command_timeout`);
  * - heuristic tags: masked pipeline risk, expected negative probes, and
  *   nonzero exit statuses that the documented success flag did not flag.
+ * A pipeline's presence alone never proves a failure.
  */
 export function classifyToolCall(input: {
 	toolName: string | null;
@@ -372,35 +449,52 @@ export function classifyToolCall(input: {
 	isResultError: boolean;
 	resultText: string | null;
 }): ToolCallClassification {
-	if (input.isResultError) {
-		return { confirmedRule: "tool_result_is_error", heuristicTags: [] };
-	}
 	const heuristicTags: TaskQualitySummaryRuleId[] = [];
-	if (input.resultText !== null) {
-		const parsed = parseDocumentedJsonResult(input.resultText);
-		if (parsed !== null) {
-			if (isPlainRecord(parsed) && parsed.success === false) {
-				return {
-					confirmedRule:
-						input.toolName === "editor"
-							? editorFailureRule(typeof parsed.error === "string" ? parsed.error : "")
-							: "structured_success_false",
-					heuristicTags,
-				};
-			}
-			if (input.toolName === "run_commands") {
-				const entries = extractCommandEntries(parsed);
-				if (entries !== null && entries.length > 0) {
-					if (entries.some((entry) => entry.success === false)) {
-						return { confirmedRule: "run_commands_nested_failure", heuristicTags };
-					}
-					if (entries.some((entry) => typeof entry.exitCode === "number" && entry.exitCode !== 0)) {
-						heuristicTags.push("nonzero_exit_status");
-					}
-				}
-			}
+	const parsed = input.resultText !== null ? parseDocumentedJsonResult(input.resultText) : null;
+	const envelope = parsed !== null && isRecoveryEnvelope(parsed) ? parsed : null;
+	// The envelope's original output is the documented result to interpret.
+	const effective = envelope !== null ? envelope.output : parsed;
+	const entries = input.toolName === "run_commands" && effective !== null ? extractCommandEntries(effective) : null;
+
+	let commandFailureRule: TaskQualitySummaryRuleId | null = null;
+	if (entries !== null && entries.length > 0) {
+		const failedEntries = entries.filter((entry) => entry.success === false);
+		if (failedEntries.length > 0) {
+			// One confirmed failure per call; timeouts stay distinguishable
+			// when every failing entry is a documented timeout.
+			const failedWithoutTimeout = failedEntries.some((entry) => !isCommandTimeoutEntry(entry));
+			commandFailureRule = failedWithoutTimeout ? "run_commands_nested_failure" : "command_timeout";
+		} else if (entries.some((entry) => typeof entry.exitCode === "number" && entry.exitCode !== 0)) {
+			heuristicTags.push("nonzero_exit_status");
 		}
 	}
+
+	const editorCategory = (): TaskQualitySummaryRuleId => editorFailureRule(editorErrorText(input.resultText, parsed));
+
+	if (input.isResultError) {
+		// The structural flag stays visible (evidence carries resultIsError);
+		// a known documented editor category is not erased by it.
+		if (input.toolName === "editor") {
+			return { confirmedRule: editorCategory(), heuristicTags };
+		}
+		return { confirmedRule: commandFailureRule ?? "tool_result_is_error", heuristicTags };
+	}
+	if (envelope !== null) {
+		if (input.toolName === "editor") {
+			return { confirmedRule: editorCategory(), heuristicTags };
+		}
+		return { confirmedRule: commandFailureRule ?? "recovery_envelope_failure", heuristicTags };
+	}
+	if (commandFailureRule !== null) {
+		return { confirmedRule: commandFailureRule, heuristicTags };
+	}
+	if (effective !== null && isPlainRecord(effective) && effective.success === false) {
+		if (input.toolName === "editor") {
+			return { confirmedRule: editorCategory(), heuristicTags };
+		}
+		return { confirmedRule: "structured_success_false", heuristicTags };
+	}
+
 	if (input.toolName === "run_commands") {
 		const commands = extractCommandStrings(input.arguments);
 		if (commands.some((command) => MASKED_PIPELINE_PATTERN.test(command))) {
@@ -417,7 +511,7 @@ export function classifyToolCall(input: {
 }
 
 /**
- * Deterministic V1 analysis of the recorded sessions. Pure: no I/O, no SDK
+ * Deterministic V2 analysis of the recorded sessions. Pure: no I/O, no SDK
  * schema access beyond the structural input, no LLM. The full logs remain
  * the evidence source; this returns summary numbers plus compact evidence
  * references for failed/unmatched calls, unchanged retries, and heuristic
@@ -441,6 +535,7 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 		toolName: string | null;
 		arguments: unknown;
 		argumentKey: string | null;
+		argumentStatus: TaskQualitySummaryArgumentStatus;
 		firstRef: {
 			sessionId: string;
 			kind: ClineTaskExportKind;
@@ -573,6 +668,7 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 					toolName: part.toolName,
 					arguments: part.arguments,
 					argumentKey: part.argumentKey,
+					argumentStatus: part.argumentStatus,
 					firstRef: reference,
 					timestamp: message.ts,
 					result: null,
@@ -612,18 +708,20 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 				timestamp: call.timestamp,
 				ruleId: "unmatched_tool_call",
 				classification: "unmatched_call",
+				resultIsError: false,
 				priorReference: null,
 			});
 			continue;
 		}
-		if (call.result.text !== null && TASK_ARTIFACT_TRUNCATION_MARKER_PATTERN.test(call.result.text)) {
+		const result = call.result;
+		if (result.text !== null && TASK_ARTIFACT_TRUNCATION_MARKER_PATTERN.test(result.text)) {
 			truncatedToolResults += 1;
 		}
 		const classification = classifyToolCall({
 			toolName: call.toolName,
 			arguments: call.arguments,
-			isResultError: call.result.isResultError,
-			resultText: call.result.text,
+			isResultError: result.isResultError,
+			resultText: result.text,
 		});
 		call.classified = classification;
 		if (classification.confirmedRule !== null) {
@@ -633,6 +731,7 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 				timestamp: call.timestamp,
 				ruleId: classification.confirmedRule,
 				classification: "confirmed_failure",
+				resultIsError: result.isResultError,
 				priorReference: null,
 			});
 		}
@@ -643,21 +742,46 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 				timestamp: call.timestamp,
 				ruleId: tag,
 				classification: "heuristic_tag",
+				resultIsError: result.isResultError,
 				priorReference: null,
 			});
 		}
 	}
 
 	/**
+	 * Tools whose documented input is entirely optional: a recorded empty
+	 * `{}` argument is a valid equality comparison for these only. No
+	 * built-in tool currently accepts empty input (every documented tool
+	 * requires at least one field), so a recorded `{}` is a malformed/parse
+	 * artifact elsewhere and can never prove identity.
+	 */
+	const EMPTY_INPUT_VALID_TOOLS: ReadonlySet<string> = new Set();
+
+	/**
 	 * Unchanged failed retries: later calls with identical tool name and
 	 * canonical arguments whose immediately preceding identical call
 	 * reported failure. No judgment about whether the retry was justified.
+	 * V2: only calls whose recorded arguments can prove identity qualify —
+	 * empty or unavailable arguments (e.g. malformed editor calls) never do.
 	 */
 	let unchangedFailedRetries = 0;
 	const lastCallByKey = new Map<string, { call: DistinctCall; failed: boolean }>();
 	for (const call of calls) {
 		if (call.toolName === null || call.argumentKey === null) {
 			continue; // identity cannot be proven
+		}
+		const comparable =
+			call.argumentStatus === "present" ||
+			(call.argumentStatus === "empty" && EMPTY_INPUT_VALID_TOOLS.has(call.toolName));
+		if (!comparable) {
+			// Missing provenance is labelled unknown, never claimed identical.
+			if (call.argumentStatus === "unavailable") {
+				ambiguities.push({
+					ruleId: "argument_provenance_unknown",
+					detail: `tool call ${call.id || "(no id)"} recorded no arguments; its identity cannot be proven, so it is excluded from unchanged-retry comparison`,
+				});
+			}
+			continue;
 		}
 		const key = `${call.toolName}\u0000${call.argumentKey}`;
 		const last = lastCallByKey.get(key);
@@ -668,6 +792,7 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 				timestamp: call.timestamp,
 				ruleId: "unchanged_failed_retry",
 				classification: "unchanged_retry",
+				resultIsError: call.result !== null ? call.result.isResultError : false,
 				priorReference: {
 					sessionId: last.call.firstRef.sessionId,
 					messageIndex: last.call.firstRef.messageIndex,
@@ -839,23 +964,66 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 // feed the same structural input.
 // ---------------------------------------------------------------------------
 
-interface DurableToolResultContent {
-	type: string;
-	text?: string;
-}
-
-/** Extract the text of a durable tool result (string or joined text blocks). */
+/**
+ * Extract the text of a durable tool result, preserving only the documented
+ * envelopes (V2): the string result, the text blocks, a direct structured
+ * command-entry array (some SDK paths persist tool results as the object
+ * array itself), and Kanban's `{ recovery, output }` envelope (including
+ * array-valued `output`). Nothing else is serialized or scanned.
+ */
 function extractDurableToolResultText(content: unknown): string {
 	if (typeof content === "string") {
 		return content;
 	}
-	if (!Array.isArray(content)) {
+	if (Array.isArray(content)) {
+		if (content.length === 0) {
+			return "";
+		}
+		// Text blocks: the standard display representation.
+		if (content.every((part) => isPlainRecord(part) && part.type === "text")) {
+			return content
+				.map((part) => (isPlainRecord(part) && typeof part.text === "string" ? part.text : ""))
+				.join("\n");
+		}
+		// Direct structured command entries: plain records that are not
+		// display blocks (no `type`, or a non-display type).
+		if (
+			content.every(
+				(part) => isPlainRecord(part) && part.type !== "text" && part.type !== "image" && part.type !== "file",
+			)
+		) {
+			try {
+				return JSON.stringify(content);
+			} catch {
+				return "";
+			}
+		}
 		return "";
 	}
-	return content
-		.filter((part): part is DurableToolResultContent => isPlainRecord(part) && part.type === "text")
-		.map((part) => part.text ?? "")
-		.join("\n");
+	// Kanban's bounded-failure recovery envelope persisted as a record.
+	if (isRecoveryEnvelope(content)) {
+		try {
+			return JSON.stringify(content);
+		} catch {
+			return "";
+		}
+	}
+	return "";
+}
+
+/** Provenance of a tool_use part's recorded arguments (V2). */
+function argumentStatusForToolUse(rawArguments: unknown): TaskQualitySummaryArgumentStatus {
+	if (rawArguments === null || rawArguments === undefined) {
+		return "unavailable";
+	}
+	if (Array.isArray(rawArguments)) {
+		return rawArguments.length === 0 ? "empty" : "present";
+	}
+	if (isPlainRecord(rawArguments)) {
+		return Object.keys(rawArguments).length === 0 ? "empty" : "present";
+	}
+	// A documented primitive argument (e.g. a bare string) is present.
+	return "present";
 }
 
 function toMetricCount(value: unknown): number | null {
@@ -883,6 +1051,7 @@ function adaptMessageToInput(
 				toolName: typeof part.name === "string" ? part.name : null,
 				arguments: toolArguments,
 				argumentKey: canonicalizeJsonValue(toolArguments),
+				argumentStatus: argumentStatusForToolUse(toolArguments),
 				isResultError: false,
 				resultText: null,
 				origin,
@@ -897,6 +1066,7 @@ function adaptMessageToInput(
 				toolName: null,
 				arguments: null,
 				argumentKey: null,
+				argumentStatus: "unavailable",
 				isResultError: part.is_error === true,
 				resultText: extractDurableToolResultText(part.content),
 				origin,

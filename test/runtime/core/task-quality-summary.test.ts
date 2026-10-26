@@ -30,10 +30,24 @@ function toolUsePart(
 	overrides: Partial<TaskQualitySummaryToolPart> &
 		Pick<TaskQualitySummaryToolPart, "toolCallId" | "toolName" | "arguments">,
 ): TaskQualitySummaryToolPart {
+	const args = overrides.arguments;
+	const argumentStatus: TaskQualitySummaryToolPart["argumentStatus"] =
+		args === null || args === undefined
+			? "unavailable"
+			: Array.isArray(args)
+				? args.length === 0
+					? "empty"
+					: "present"
+				: typeof args === "object"
+					? Object.keys(args).length === 0
+						? "empty"
+						: "present"
+					: "present";
 	return {
 		index: 0,
 		kind: "tool_use",
 		argumentKey: canonicalizeJsonValue(overrides.arguments),
+		argumentStatus,
 		isResultError: false,
 		resultText: null,
 		origin: "native",
@@ -50,6 +64,7 @@ function toolResultPart(
 		toolName: null,
 		arguments: null,
 		argumentKey: null,
+		argumentStatus: "unavailable",
 		isResultError: false,
 		origin: "native",
 		...overrides,
@@ -368,11 +383,281 @@ describe("analyzeTaskQualitySummary", () => {
 			],
 		});
 		const result = run([seg]);
-		// is_error wins: the structural flag is the confirmed rule.
+		// V2: the structural is_error stays visible (resultIsError), but a
+		// documented editor category is never erased by it.
 		expect(result.reportedToolFailures).toBe(1);
 		expect(result.evidence[0]).toEqual(
-			expect.objectContaining({ ruleId: "tool_result_is_error", classification: "confirmed_failure" }),
+			expect.objectContaining({
+				ruleId: "editor_replacement_mismatch",
+				classification: "confirmed_failure",
+				resultIsError: true,
+			}),
 		);
+	});
+
+	it("keeps tool_result_is_error for non-editor is_error results and editor_other for undocumented editor errors", () => {
+		const seg = session({
+			kind: "task",
+			sessionId: "s",
+			provider: "p",
+			model: "m",
+			messages: [
+				message({
+					role: "assistant",
+					contentKey: "a",
+					toolParts: [
+						toolUsePart({ toolCallId: "r1", toolName: "read_files", arguments: { path: "/tmp/a" } }),
+						toolUsePart({ index: 1, toolCallId: "e1", toolName: "editor", arguments: { path: "/tmp/a" } }),
+					],
+				}),
+				message({
+					role: "user",
+					contentKey: "r",
+					toolParts: [
+						toolResultPart({ toolCallId: "r1", isResultError: true, resultText: "read failed" }),
+						toolResultPart({
+							index: 1,
+							toolCallId: "e1",
+							isResultError: true,
+							resultText: "Editor operation failed: something odd",
+						}),
+					],
+				}),
+			],
+		});
+		const result = run([seg]);
+		expect(result.reportedToolFailures).toBe(2);
+		expect(result.evidence).toEqual([
+			expect.objectContaining({ ruleId: "tool_result_is_error", toolCallId: "r1", resultIsError: true }),
+			expect.objectContaining({ ruleId: "editor_other", toolCallId: "e1", resultIsError: true }),
+		]);
+	});
+
+	it("classifies command timeouts distinctly and does not recurse into nested output text", () => {
+		const timeoutEntry = { command: "make build", success: false, error: "Command timed out after 300000ms" };
+		const mixedEntries = [
+			{ command: "make test", success: false, error: "Command timed out after 300000ms" },
+			{ command: "make lint", success: false, error: "exit 1" },
+		];
+		// A log-inspection command that prints an earlier failed run's JSON:
+		// the entry itself succeeded, and its result text is never scanned.
+		const logInspection = {
+			success: true,
+			output: [{ command: "cat run.log", result: '{"success": false, "error": "boom"}' }],
+		};
+		const seg = session({
+			kind: "task",
+			sessionId: "s",
+			provider: "p",
+			model: "m",
+			messages: [
+				message({
+					role: "assistant",
+					contentKey: "a",
+					toolParts: [
+						toolUsePart({ toolCallId: "c1", toolName: "run_commands", arguments: { commands: ["make build"] } }),
+						toolUsePart({
+							index: 1,
+							toolCallId: "c2",
+							toolName: "run_commands",
+							arguments: { commands: ["make test", "make lint"] },
+						}),
+						toolUsePart({
+							index: 2,
+							toolCallId: "c3",
+							toolName: "run_commands",
+							arguments: { commands: ["cat run.log"] },
+						}),
+					],
+				}),
+				message({
+					role: "user",
+					contentKey: "r",
+					toolParts: [
+						toolResultPart({ toolCallId: "c1", resultText: JSON.stringify([timeoutEntry]) }),
+						toolResultPart({ index: 1, toolCallId: "c2", resultText: JSON.stringify(mixedEntries) }),
+						toolResultPart({ index: 2, toolCallId: "c3", resultText: JSON.stringify(logInspection) }),
+					],
+				}),
+			],
+		});
+		const result = run([seg]);
+		expect(result.reportedToolFailures).toBe(2);
+		expect(result.evidence).toEqual([
+			expect.objectContaining({ ruleId: "command_timeout", toolCallId: "c1", classification: "confirmed_failure" }),
+			expect.objectContaining({
+				ruleId: "run_commands_nested_failure",
+				toolCallId: "c2",
+				classification: "confirmed_failure",
+			}),
+		]);
+	});
+
+	it("never treats quoted source, fixture JSON, or prose failure text as failures", () => {
+		const seg = session({
+			kind: "task",
+			sessionId: "s",
+			provider: "p",
+			model: "m",
+			messages: [
+				message({
+					role: "assistant",
+					contentKey: "a",
+					toolParts: [
+						toolUsePart({ toolCallId: "e1", toolName: "editor", arguments: { path: "/tmp/a.ts" } }),
+						toolUsePart({
+							index: 1,
+							toolCallId: "r1",
+							toolName: "read_files",
+							arguments: { path: "/tmp/f.json" },
+						}),
+					],
+				}),
+				message({
+					role: "user",
+					contentKey: "r",
+					toolParts: [
+						// A success result whose text embeds a fixture failure
+						// line and a quoted `Full content:` marker: no failure,
+						// no artifact reference.
+						toolResultPart({
+							toolCallId: "e1",
+							resultText:
+								'File written (+3 lines). Fixture diff:\n+    {"success": false, "error": "boom"}\nFull content: /tmp/not-an-artifact.txt',
+						}),
+						// A successful read of a file that happens to hold a
+						// failed run's JSON array: not a command entry, not a
+						// failure (read_files is not run_commands).
+						toolResultPart({
+							index: 1,
+							toolCallId: "r1",
+							resultText: JSON.stringify([{ command: "old run", success: false, error: "boom" }]),
+						}),
+					],
+				}),
+			],
+		});
+		const result = run([seg]);
+		expect(result.reportedToolFailures).toBe(0);
+		expect(result.evidence).toEqual([]);
+	});
+
+	it("confirms Kanban's { recovery, output } envelope as a structural failure", () => {
+		const envelope = JSON.stringify({ recovery: "Retry with a corrected reference.", output: "grep: no such file" });
+		const seg = session({
+			kind: "task",
+			sessionId: "s",
+			provider: "p",
+			model: "m",
+			messages: [
+				message({
+					role: "assistant",
+					contentKey: "a",
+					toolParts: [
+						toolUsePart({ toolCallId: "c1", toolName: "run_commands", arguments: { commands: ["cat missing"] } }),
+					],
+				}),
+				message({
+					role: "user",
+					contentKey: "r",
+					toolParts: [toolResultPart({ toolCallId: "c1", resultText: envelope })],
+				}),
+			],
+		});
+		const result = run([seg]);
+		expect(result.reportedToolFailures).toBe(1);
+		expect(result.evidence[0]).toEqual(
+			expect.objectContaining({
+				ruleId: "recovery_envelope_failure",
+				classification: "confirmed_failure",
+				resultIsError: false,
+			}),
+		);
+	});
+
+	it("excludes empty and unavailable editor arguments from unchanged-retry identity", () => {
+		// Two malformed editor calls recorded with empty `{}` arguments
+		// (different ids) both fail: `{}` can never prove identity.
+		const emptySeg = session({
+			kind: "task",
+			sessionId: "empty",
+			provider: "p",
+			model: "m",
+			messages: [
+				message({
+					role: "assistant",
+					contentKey: "a1",
+					toolParts: [toolUsePart({ toolCallId: "e1", toolName: "editor", arguments: {} })],
+				}),
+				message({
+					role: "user",
+					contentKey: "r1",
+					toolParts: [
+						toolResultPart({
+							toolCallId: "e1",
+							isResultError: true,
+							resultText: "Parameter `old_text` is required",
+						}),
+					],
+				}),
+				message({
+					role: "assistant",
+					contentKey: "a2",
+					toolParts: [toolUsePart({ toolCallId: "e2", toolName: "editor", arguments: {} })],
+				}),
+				message({
+					role: "user",
+					contentKey: "r2",
+					toolParts: [
+						toolResultPart({
+							toolCallId: "e2",
+							isResultError: true,
+							resultText: "Parameter `old_text` is required",
+						}),
+					],
+				}),
+			],
+		});
+		const emptyResult = run([emptySeg]);
+		expect(emptyResult.reportedToolFailures).toBe(2);
+		expect(emptyResult.unchangedFailedRetries).toBe(0);
+		expect(emptyResult.evidence.filter((entry) => entry.ruleId === "unchanged_failed_retry")).toHaveLength(0);
+
+		// Unavailable provenance (no recorded input) is labelled unknown.
+		const unknownSeg = session({
+			kind: "task",
+			sessionId: "unknown",
+			provider: "p",
+			model: "m",
+			messages: [
+				message({
+					role: "assistant",
+					contentKey: "a1",
+					toolParts: [toolUsePart({ toolCallId: "u1", toolName: "editor", arguments: null })],
+				}),
+				message({
+					role: "user",
+					contentKey: "r1",
+					toolParts: [toolResultPart({ toolCallId: "u1", isResultError: true, resultText: "failed" })],
+				}),
+				message({
+					role: "assistant",
+					contentKey: "a2",
+					toolParts: [toolUsePart({ toolCallId: "u2", toolName: "editor", arguments: null })],
+				}),
+				message({
+					role: "user",
+					contentKey: "r2",
+					toolParts: [toolResultPart({ toolCallId: "u2", isResultError: true, resultText: "failed" })],
+				}),
+			],
+		});
+		const unknownResult = run([unknownSeg]);
+		expect(unknownResult.unchangedFailedRetries).toBe(0);
+		expect(unknownResult.ambiguities).toEqual([
+			expect.objectContaining({ ruleId: "argument_provenance_unknown", detail: expect.stringContaining("u1") }),
+			expect.objectContaining({ ruleId: "argument_provenance_unknown", detail: expect.stringContaining("u2") }),
+		]);
 	});
 
 	it("keeps zero counters at zero and missing counters unknown, with coverage", () => {
@@ -719,6 +1004,128 @@ describe("buildTaskQualitySummaryResponse", () => {
 			segments: overrides.segments ?? [],
 		};
 	}
+
+	it("preserves direct structured command arrays and recovery envelopes from persisted native results", () => {
+		// The SDK persists some tool results as the object array itself; the
+		// typed persisted-message shape cannot express that, so the fixture
+		// models the raw persisted JSON through one explicit cast. The native
+		// adapter must not drop these (the V1 text-block-only adapter produced
+		// an empty result and missed these failures).
+		const structuredFailureMessage = (ts: number) =>
+			({
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: "c1",
+						content: [{ command: "make build", success: false, error: "exit 2" }],
+					},
+				],
+				ts,
+			}) as unknown as ClineSdkPersistedMessage;
+		const useMessage = persistedMessage({
+			role: "assistant",
+			content: [{ type: "tool_use", id: "c1", name: "run_commands", input: { commands: ["make build"] } }],
+			ts: 1700000000101,
+		});
+		const segmentMessages = [useMessage, structuredFailureMessage(1700000000102)];
+		// Two inherited restart segments carry the same durable history: the
+		// failure is counted exactly once.
+		const response = buildTaskQualitySummaryResponse({
+			taskId: "task-1",
+			capturedAt: CAPTURED_AT,
+			taskSnapshot: snapshot({
+				kind: "task",
+				segments: [
+					segment({
+						sessionId: "s1",
+						kind: "task",
+						startedAt: "2026-10-15T10:00:00Z",
+						endedAt: "2026-10-15T10:30:00Z",
+						messages: segmentMessages,
+					}),
+					segment({
+						sessionId: "s2",
+						kind: "task",
+						startedAt: "2026-10-15T10:40:00Z",
+						endedAt: "2026-10-15T11:00:00Z",
+						messages: segmentMessages,
+					}),
+				],
+			}),
+			taskSnapshotError: null,
+			reviewSnapshot: null,
+			reviewSnapshotError: null,
+			sessionSource: null,
+			terminalSummaryAvailable: false,
+		});
+		expect(response.ok).toBe(true);
+		expect(response.tools.totalCalls).toBe(1);
+		expect(response.tools.reportedFailures).toBe(1);
+		expect(response.evidence).toEqual([
+			expect.objectContaining({
+				ruleId: "run_commands_nested_failure",
+				classification: "confirmed_failure",
+				resultIsError: false,
+			}),
+		]);
+
+		// A recovery envelope persisted as a JSON text block (array-valued
+		// output) is a structural failure.
+		const envelopeResponse = buildTaskQualitySummaryResponse({
+			taskId: "task-1",
+			capturedAt: CAPTURED_AT,
+			taskSnapshot: snapshot({
+				kind: "task",
+				segments: [
+					segment({
+						sessionId: "s1",
+						kind: "task",
+						messages: [
+							persistedMessage({
+								role: "assistant",
+								content: [{ type: "tool_use", id: "c2", name: "run_commands", input: { commands: ["make"] } }],
+								ts: 1700000000201,
+							}),
+							persistedMessage({
+								role: "user",
+								content: [
+									{
+										type: "tool_result",
+										tool_use_id: "c2",
+										is_error: true,
+										content: [
+											{
+												type: "text",
+												text: JSON.stringify({
+													recovery: "Run the command with an explicit timeout.",
+													output: [{ command: "make", success: false, error: "boom" }],
+												}),
+											},
+										],
+									},
+								],
+								ts: 1700000000202,
+							}),
+						],
+					}),
+				],
+			}),
+			taskSnapshotError: null,
+			reviewSnapshot: null,
+			reviewSnapshotError: null,
+			sessionSource: null,
+			terminalSummaryAvailable: false,
+		});
+		expect(envelopeResponse.tools.reportedFailures).toBe(1);
+		expect(envelopeResponse.evidence).toEqual([
+			expect.objectContaining({
+				ruleId: "run_commands_nested_failure",
+				classification: "confirmed_failure",
+				resultIsError: true,
+			}),
+		]);
+	});
 
 	it("assembles a complete summary for recorded native sessions", () => {
 		const response = buildTaskQualitySummaryResponse({

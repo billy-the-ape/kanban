@@ -49,11 +49,23 @@ export interface TaskArtifactFullOutputEvidence {
 export const TASK_ARTIFACT_TRUNCATION_MARKER_PATTERN =
 	/\.{3}\s*\[truncated \d+ (?:chars|lines)(?:; full output: [^\]]+)?\](?:\.{3})?/;
 
-/** Legacy reference patterns in persisted excerpt text (both excerpt families). */
-// The lowercase `full output:` reference appears inside the bracketed excerpt
-// marker (`... [truncated N lines; full output: <path>]`), so the capture must
-// stop at the closing bracket; `\S+` would swallow it and realpath would fail.
-const LEGACY_FULL_OUTPUT_PATTERNS: RegExp[] = [/Full content: (\S+)/, /full output: ([^\s\]]+)/];
+/**
+ * Legacy reference patterns in persisted excerpt text, restricted to the
+ * documented bounding envelopes only (both excerpt families):
+ * - the standalone `Full content: <absolute path>` marker line appended by
+ *   the character-based excerpt hook (`cline-tool-result-bounding-hook`), and
+ * - the bracketed `... [truncated N (chars|lines); full output: <path>]`
+ *   marker emitted by the command-line excerpt hook
+ *   (`cline-command-output-excerpt`); the capture stops at the closing
+ *   bracket, not swallowing it.
+ * Quoted source, diff/fixture lines (a `+`/`-`/context prefix), and free
+ * prose that merely mentions either phrase are never treated as references:
+ * `Full content:` must be a standalone marker line, and `full output:` must
+ * appear inside the documented bracketed truncation envelope. A bare
+ * `full output: <path>` line is not a documented envelope and is ignored.
+ */
+const LEGACY_FULL_CONTENT_MARKER = /^Full content: (\S+)$/gm;
+const LEGACY_BRACKETED_FULL_OUTPUT_MARKER = /\[truncated \d+ (?:chars|lines); full output: ([^\s\]]+)\]/g;
 
 function isContainedInParent(parent: string, candidate: string): boolean {
 	return candidate === parent || candidate.startsWith(parent + sep);
@@ -480,14 +492,34 @@ export async function resolveTaskToolFullOutput(input: {
 		};
 	}
 
-	// 3. Legacy: reference parsed out of the persisted excerpt text.
+	// 3. Legacy: references parsed out of the persisted excerpt text,
+	// restricted to the documented marker line and bracketed envelope. All
+	// references are collected: exactly one distinct reference resolves;
+	// several distinct references are ambiguous (explicit, never guessed).
 	const text = input.persistedResultText ?? "";
-	for (const pattern of LEGACY_FULL_OUTPUT_PATTERNS) {
-		const match = pattern.exec(text);
-		if (!match || typeof match[1] !== "string" || match[1].length === 0) {
-			continue;
+	const references: string[] = [];
+	for (const match of text.matchAll(LEGACY_FULL_CONTENT_MARKER)) {
+		if (typeof match[1] === "string" && match[1].length > 0) {
+			references.push(match[1]);
 		}
-		const reference = match[1];
+	}
+	for (const match of text.matchAll(LEGACY_BRACKETED_FULL_OUTPUT_MARKER)) {
+		if (typeof match[1] === "string" && match[1].length > 0) {
+			references.push(match[1]);
+		}
+	}
+	const distinctReferences = [...new Set(references)];
+	if (distinctReferences.length > 1) {
+		return {
+			status: "ambiguous",
+			artifactFileName: null,
+			artifactPath: null,
+			contentFormat: null,
+			gap: "The persisted excerpt records multiple distinct artifact references; refusing to guess which one is authoritative.",
+		};
+	}
+	const reference = distinctReferences[0];
+	if (typeof reference === "string" && reference.length > 0) {
 		const resolved = await resolveContainedArtifactPath(input.taskId, reference);
 		if (!resolved) {
 			return invalid(reference);

@@ -2935,6 +2935,8 @@ export const runtimeTaskQualitySummaryEvidenceSchema = z.object({
 	timestamp: z.number().nullable(),
 	ruleId: z.string(),
 	classification: z.enum(["confirmed_failure", "unmatched_call", "unchanged_retry", "heuristic_tag"]),
+	/** The recorded result's `is_error` flag (structural evidence, reducer v2). */
+	resultIsError: z.boolean(),
 	/** The prior identical failed call for unchanged-retry evidence. */
 	priorReference: z
 		.object({
@@ -2950,7 +2952,15 @@ export const runtimeTaskQualitySummaryResponseSchema = z.object({
 	ok: z.boolean(),
 	taskId: z.string(),
 	capturedAt: z.number().int(),
-	/** Version of the analysis semantics that produced this response. */
+	/**
+	 * Version of the analysis semantics that produced this response.
+	 * 1 = original semantics. 2 (AR-1): the native adapter preserves direct
+	 * structured command arrays and the `{ recovery, output }` envelope, an
+	 * `is_error` flag no longer erases a known editor category, command
+	 * timeouts are a distinct confirmed rule, evidence carries
+	 * `resultIsError`, and calls with empty/unavailable recorded arguments
+	 * are never declared identical for unchanged-retry evidence.
+	 */
 	reducerVersion: z.number().int().min(1),
 	coverage: z.object({
 		status: z.enum(["complete", "partial", "unavailable"]),

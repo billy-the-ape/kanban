@@ -87,16 +87,16 @@ describe("resolveTaskToolFullOutput (DIAG-2 2b)", () => {
 		expect(evidence.artifactFileName).toMatch(/^call-fb-\d+-[0-9a-f]{8}\.txt$/);
 	});
 
-	it("resolves all legacy reference styles from persisted excerpt text", async () => {
+	it("resolves the documented legacy reference styles from persisted excerpt text", async () => {
 		const dir = getTaskContextArtifactsDir("task-1");
 		await mkdir(dir, { recursive: true });
 		await writeFile(join(dir, "legacy-1-111-abcdef01.txt"), "legacy output");
-		const fullContentText = `excerpt head\n\nFull content: ${join(dir, "legacy-1-111-abcdef01.txt")}\n\ntail`;
-		const fullOutputText = `excerpt head\n\nfull output: ${join(dir, "legacy-1-111-abcdef01.txt")}\n\ntail`;
+		const reference = join(dir, "legacy-1-111-abcdef01.txt");
+		const fullContentText = `excerpt head\n\nFull content: ${reference}\n\ntail`;
 		// The real command-excerpt marker is bracketed; the capture must stop
 		// at the closing bracket, not swallow it.
-		const fullOutputBracketedText = `excerpt head\n\n... [truncated 5 lines; full output: ${join(dir, "legacy-1-111-abcdef01.txt")}]\n\ntail`;
-		for (const persistedResultText of [fullContentText, fullOutputText, fullOutputBracketedText]) {
+		const fullOutputBracketedText = `excerpt head\n\n... [truncated 5 lines; full output: ${reference}]\n\ntail`;
+		for (const persistedResultText of [fullContentText, fullOutputBracketedText]) {
 			const evidence = await resolveTaskToolFullOutput({
 				taskId: "task-1",
 				toolCallId: "legacy-1",
@@ -105,6 +105,51 @@ describe("resolveTaskToolFullOutput (DIAG-2 2b)", () => {
 			expect(evidence.status).toBe("resolved");
 			expect(evidence.artifactFileName).toBe("legacy-1-111-abcdef01.txt");
 		}
+	});
+
+	it("ignores quoted, fixture, and diff lines that mention the reference phrases", async () => {
+		const dir = getTaskContextArtifactsDir("task-1");
+		await mkdir(dir, { recursive: true });
+		// The file name deliberately does not share the tool call's sanitized
+		// prefix, so the deterministic filename fallback cannot mask the
+		// legacy-reference step under test.
+		await writeFile(join(dir, "unrelated-artifact.txt"), "fixture output");
+		const reference = join(dir, "unrelated-artifact.txt");
+		// A diff/fixture line, a quoted mention, and a bare undocumented
+		// `full output:` line: none is a documented reference.
+		const texts = [
+			`+Full content: ${reference}`,
+			`line with "full output: ${reference}" quoted in prose`,
+			`full output: ${reference}`,
+		];
+		for (const persistedResultText of texts) {
+			const evidence = await resolveTaskToolFullOutput({
+				taskId: "task-1",
+				toolCallId: "fixture-1",
+				persistedResultText,
+			});
+			expect(evidence.status).toBe("missing");
+			expect(evidence.artifactFileName).toBeNull();
+		}
+	});
+
+	it("reports an explicit gap when the excerpt carries multiple distinct references", async () => {
+		const dir = getTaskContextArtifactsDir("task-1");
+		await mkdir(dir, { recursive: true });
+		// Neither file name shares the tool call's sanitized prefix, so the
+		// deterministic filename fallback cannot resolve before the legacy
+		// reference step.
+		await writeFile(join(dir, "ref-one.txt"), "first");
+		await writeFile(join(dir, "ref-two.txt"), "second");
+		const text = `head\nFull content: ${join(dir, "ref-one.txt")}\n... [truncated 3 lines; full output: ${join(dir, "ref-two.txt")}]`;
+		const evidence = await resolveTaskToolFullOutput({
+			taskId: "task-1",
+			toolCallId: "ambig-1",
+			persistedResultText: text,
+		});
+		expect(evidence.status).toBe("ambiguous");
+		expect(evidence.artifactFileName).toBeNull();
+		expect(evidence.gap).toContain("multiple distinct artifact references");
 	});
 	it("resolves the current bracketed marker styles (chars and lines, with reference)", async () => {
 		const dir = getTaskContextArtifactsDir("task-1");
@@ -203,7 +248,9 @@ describe("resolveTaskToolFullOutput (DIAG-2 2b)", () => {
 		const evidence = await resolveTaskToolFullOutput({
 			taskId: "task-1",
 			toolCallId: "call-symlink",
-			persistedResultText: `full output: ${join(dir, "escape-link.txt")}`,
+			// A bare `full output:` line is no longer a documented reference;
+			// the escape check is exercised through the bracketed envelope.
+			persistedResultText: `excerpt ... [truncated 3 lines; full output: ${join(dir, "escape-link.txt")}]`,
 		});
 		expect(evidence.status).toBe("invalid");
 	});
