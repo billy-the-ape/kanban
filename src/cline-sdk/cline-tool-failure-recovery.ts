@@ -90,8 +90,7 @@ function classifyEditorFailure(error: string): EditorFailureKind | null {
  * AR-2: builds the model-facing editor recovery sentence from the measured
  * condition. Only the sentence appropriate to what was actually observed is
  * emitted; facts (match counts, whitespace, skip reasons) are substituted from
- * the evidence. `editorRecovery` (kept for the uninstrumented fallback) covers
- * the same shapes without evidence.
+ * the evidence.
  */
 function buildEditorRecovery(kind: EditorFailureKind, evidence: EditorEvidence | null): string {
 	const oldTextField = evidence?.fields.old_text;

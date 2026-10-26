@@ -192,11 +192,19 @@ interface CandidateRange {
 	spanLines: number;
 }
 
-/** Locates at most EVIDENCE_MAX_WINDOWS approximate candidate spans for old_text. */
+/**
+ * Locates at most EVIDENCE_MAX_WINDOWS approximate candidate spans for old_text.
+ * File lines are normalized once; the single-line fallback consults a
+ * precomputed first-occurrence map and scans at most MAX_DETAIL_LINES submitted
+ * lines, so the work is O(file lines + submitted lines) and bounded even for a
+ * 32,000-char old_text against a file near the size limit.
+ */
 function findCandidateRanges(fileLines: string[], oldText: string): CandidateRange[] {
-	const normalizedFile = fileLines.map(normalizeLineForCandidate).join("\n");
+	const normalizedFileLines = fileLines.map(normalizeLineForCandidate);
+	const normalizedFile = normalizedFileLines.join("\n");
 	const oldLines = oldText.split(/\r?\n/);
-	const normalizedOld = oldLines.map(normalizeLineForCandidate).join("\n");
+	const normalizedOldLines = oldLines.map(normalizeLineForCandidate);
+	const normalizedOld = normalizedOldLines.join("\n");
 	const ranges: CandidateRange[] = [];
 	if (normalizedOld.length > 0) {
 		let from = 0;
@@ -208,12 +216,20 @@ function findCandidateRanges(fileLines: string[], oldText: string): CandidateRan
 		}
 	}
 	if (ranges.length === 0) {
-		for (const oldLine of oldLines) {
+		const firstIndex = new Map<string, number>();
+		normalizedFileLines.forEach((line, index) => {
+			if (line.length > 0 && !firstIndex.has(line)) {
+				firstIndex.set(line, index);
+			}
+		});
+		const scanned = Math.min(oldLines.length, MAX_DETAIL_LINES);
+		for (let i = 0; i < scanned; i += 1) {
 			if (ranges.length >= EVIDENCE_MAX_WINDOWS) break;
-			const normalized = normalizeLineForCandidate(oldLine);
-			if (normalized.length === 0) continue;
-			const index = fileLines.findIndex((line) => normalizeLineForCandidate(line) === normalized);
-			if (index === -1 || ranges.some((range) => index >= range.line && index < range.line + range.spanLines)) {
+			const normalized = normalizedOldLines[i];
+			if (!normalized || normalized.length === 0) continue;
+			const index = firstIndex.get(normalized);
+			if (index === undefined) continue;
+			if (ranges.some((range) => index >= range.line && index < range.line + range.spanLines)) {
 				continue;
 			}
 			ranges.push({ line: index, spanLines: 1 });
@@ -222,36 +238,71 @@ function findCandidateRanges(fileLines: string[], oldText: string): CandidateRan
 	return ranges;
 }
 
-/** Builds one bounded window around a candidate span (budget: half of the total). */
+/**
+ * Builds one bounded window around a candidate span. Each window gets half of
+ * EVIDENCE_MAX_WINDOW_CHARS, so at most EVIDENCE_MAX_WINDOWS windows always stay
+ * within the total budget. Surrounding context is trimmed before any candidate
+ * span line is removed, and if the span alone still exceeds the budget it is
+ * clipped from its tail (the head, where the submitted anchor starts, is kept).
+ */
 function buildWindow(fileLines: string[], range: CandidateRange): EditorEvidenceWindow {
 	const spanStart = range.line;
-	const spanEnd = range.line + range.spanLines; // exclusive
-	let start = Math.max(0, spanStart - EVIDENCE_SURROUNDING_LINES);
-	let end = Math.min(fileLines.length, spanEnd + EVIDENCE_SURROUNDING_LINES); // exclusive
-	const budget = Math.floor(EVIDENCE_MAX_WINDOW_CHARS / 2);
-	const spanSize = spanEnd - spanStart;
-	const lines: string[] = [];
-	const pushLine = (raw: string) => {
-		const display = raw.replace(/\r$/, "");
-		lines.push(display.length > MAX_DISPLAY_LINE_CHARS ? display.slice(0, MAX_DISPLAY_LINE_CHARS) : display);
-	};
-	for (let i = start; i < end; i += 1) {
-		pushLine(fileLines[i]);
-	}
-	// Shrink symmetrically from the outer edges, always keeping the candidate span.
+	const spanEnd = Math.min(range.line + range.spanLines, fileLines.length); // exclusive
+	const budget = Math.floor(EVIDENCE_MAX_WINDOW_CHARS / EVIDENCE_MAX_WINDOWS);
+	const first = Math.max(0, spanStart - EVIDENCE_SURROUNDING_LINES);
+	const last = Math.min(fileLines.length, spanEnd + EVIDENCE_SURROUNDING_LINES); // exclusive
+	const all: string[] = [];
 	let truncated = false;
-	while (lines.join("\n").length > budget && lines.length > spanSize) {
-		lines.shift();
-		start += 1;
-		if (lines.length > spanSize) {
-			lines.pop();
-			end -= 1;
+	for (let i = first; i < last; i += 1) {
+		const text = (fileLines[i] ?? "").replace(/\r$/, "");
+		if (text.length > MAX_DISPLAY_LINE_CHARS) {
+			truncated = true;
+			all.push(text.slice(0, MAX_DISPLAY_LINE_CHARS));
+		} else {
+			all.push(text);
+		}
+	}
+	// Prefix sums of displayed line lengths (+1 separator each) for O(1) window totals.
+	const prefix: number[] = [0];
+	for (let i = 0; i < all.length; i += 1) {
+		prefix.push(prefix[i] + all[i].length + 1);
+	}
+	const spanLength = (lo: number, hi: number): number => (hi <= lo ? 0 : prefix[hi] - prefix[lo] - 1);
+	const spanOffset = spanStart - first;
+	const spanCount = spanEnd - spanStart;
+	let lo = 0;
+	let hi = all.length; // exclusive
+	// 1) Trim surrounding context only — candidate span lines are never dropped here.
+	while (spanLength(lo, hi) > budget && (lo < spanOffset || hi > spanOffset + spanCount)) {
+		if (lo < spanOffset && hi > spanOffset + spanCount) {
+			lo += 1;
+			hi -= 1;
+		} else if (lo < spanOffset) {
+			lo += 1;
+		} else {
+			hi -= 1;
 		}
 		truncated = true;
 	}
+	// 2) If the span alone is still over budget, keep as many leading span lines as fit.
+	let lines: string[];
+	if (spanLength(lo, hi) > budget && hi - lo > 1) {
+		const kept: string[] = [all[lo]];
+		let length = all[lo].length;
+		for (let i = lo + 1; i < hi; i += 1) {
+			if (length + all[i].length + 1 > budget) break;
+			kept.push(all[i]);
+			length += all[i].length + 1;
+		}
+		lines = kept;
+		hi = lo + kept.length;
+		truncated = true;
+	} else {
+		lines = all.slice(lo, hi);
+	}
 	return {
-		startLine: start + 1,
-		endLine: end,
+		startLine: first + lo + 1,
+		endLine: first + hi,
 		lines,
 		truncated,
 	};

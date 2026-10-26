@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	CLINE_EDITOR_EVIDENCE_MAX_FILE_BYTES,
 	collectEditorEvidence,
+	EVIDENCE_MAX_WINDOW_CHARS,
 } from "../../../src/cline-sdk/cline-editor-evidence";
 
 describe("AR-2 bounded editor failure evidence", () => {
@@ -238,6 +239,53 @@ describe("AR-2 bounded editor failure evidence", () => {
 		}
 		const total = windows.map((window) => window.lines.join("\n").length).reduce((sum, length) => sum + length, 0);
 		expect(total).toBeLessThanOrEqual(6000);
+	});
+
+	it("keeps a multi-line long-line candidate span within the per-window budget", async () => {
+		const path = join(cwd, "span.txt");
+		const longLine = "A".repeat(199) + " ";
+		const lines: string[] = ["start", ...Array.from({ length: 16 }, () => longLine), "end"];
+		await writeFile(path, lines.join("\n"));
+		// The submitted span differs from the file only by a trailing space per line,
+		// so it matches zero times exactly but normalizes to the 16-line span.
+		const oldText = Array.from({ length: 16 }, () => "A".repeat(199)).join("\n");
+		const evidence = await collectEditorEvidence({ cwd, input: { path, old_text: oldText, new_text: "x" } });
+		expect(evidence.oldText?.matchCount).toBe(0);
+		const window = evidence.candidates?.windows[0];
+		// The 16 × 200-char span alone exceeds the 3,000-char per-window budget, so the
+		// window is clipped from the tail of the span — never from its head.
+		const perWindow = Math.floor(EVIDENCE_MAX_WINDOW_CHARS / 2);
+		expect(window?.startLine).toBe(2);
+		expect(window?.lines.every((line) => line === longLine)).toBe(true);
+		expect(window?.lines.length).toBeGreaterThan(1);
+		expect(window?.lines.length).toBeLessThan(16);
+		expect(window?.lines.join("\n").length).toBeLessThanOrEqual(perWindow);
+		expect(window?.truncated).toBe(true);
+		// The candidate line list still starts at the span's first line.
+		expect(evidence.candidates?.candidateLines[0]?.line).toBe(2);
+	});
+
+	it("never drops candidate span lines when surrounding context is asymmetric", async () => {
+		const path = join(cwd, "top.txt");
+		const spanLine = "B".repeat(199) + " ";
+		const fillLine = "C".repeat(199) + " ";
+		// A 16-line candidate span at the top of the file, followed by more lines:
+		// no leading context exists, so trimming must only remove trailing context.
+		const lines: string[] = [
+			...Array.from({ length: 16 }, () => spanLine),
+			...Array.from({ length: 10 }, () => fillLine),
+		];
+		await writeFile(path, lines.join("\n"));
+		const oldText = Array.from({ length: 16 }, () => "B".repeat(199)).join("\n");
+		const evidence = await collectEditorEvidence({ cwd, input: { path, old_text: oldText, new_text: "x" } });
+		expect(evidence.oldText?.matchCount).toBe(0);
+		const window = evidence.candidates?.windows[0];
+		const perWindow = Math.floor(EVIDENCE_MAX_WINDOW_CHARS / 2);
+		expect(window?.startLine).toBe(1);
+		expect(window?.lines[0]).toBe(spanLine);
+		expect(window?.lines.every((line) => line === spanLine)).toBe(true);
+		expect(window?.lines.join("\n").length).toBeLessThanOrEqual(perWindow);
+		expect(window?.truncated).toBe(true);
 	});
 
 	it("handles a stale file read: evidence reflects the source at read time", async () => {
