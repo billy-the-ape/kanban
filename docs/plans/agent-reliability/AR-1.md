@@ -17,7 +17,9 @@ Implemented in `src/core/task-quality-summary.ts`,
 labels in `web-ui/src/components/detail-panels/task-quality-summary-section.tsx`.
 
 - **Native adapter (`extractDurableToolResultText`)** preserves, in addition to
-  string/text blocks: (a) a direct structured command-entry array persisted as the
+  string results and text blocks (kept even when mixed with image/file
+  blocks, which carry no documented text): (a) a direct structured
+  command-entry array persisted as the
   tool_result content itself (serialized with `JSON.stringify`), and (b) Kanban's
   `{ recovery, output }` envelope persisted as a record, including array-valued
   `output`. Nothing else is serialized or scanned.

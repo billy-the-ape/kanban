@@ -1127,6 +1127,84 @@ describe("buildTaskQualitySummaryResponse", () => {
 		]);
 	});
 
+	it("keeps text blocks when persisted tool results mix text with image/file blocks", () => {
+		// Regression: v2 must not drop the text of mixed display arrays
+		// (image/file blocks carry no documented text; the text blocks are
+		// the documented result).
+		const mixedResultMessage = (text: string) =>
+			({
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: "c1",
+						content: [
+							{ type: "image", data: "not-a-documented-text" },
+							{ type: "text", text },
+						],
+					},
+				],
+				ts: 1700000000302,
+			}) as unknown as ClineSdkPersistedMessage;
+		const useMessage = persistedMessage({
+			role: "assistant",
+			content: [{ type: "tool_use", id: "c1", name: "run_commands", input: { commands: ["make"] } }],
+			ts: 1700000000301,
+		});
+		const response = buildTaskQualitySummaryResponse({
+			taskId: "task-1",
+			capturedAt: CAPTURED_AT,
+			taskSnapshot: snapshot({
+				kind: "task",
+				segments: [
+					segment({
+						sessionId: "s1",
+						kind: "task",
+						messages: [
+							useMessage,
+							mixedResultMessage(
+								JSON.stringify({ success: true, output: [{ command: "make", success: false, error: "boom" }] }),
+							),
+						],
+					}),
+				],
+			}),
+			taskSnapshotError: null,
+			reviewSnapshot: null,
+			reviewSnapshotError: null,
+			sessionSource: null,
+			terminalSummaryAvailable: false,
+		});
+		expect(response.tools.totalCalls).toBe(1);
+		expect(response.tools.reportedFailures).toBe(1);
+		expect(response.evidence).toEqual([
+			expect.objectContaining({ ruleId: "run_commands_nested_failure", classification: "confirmed_failure" }),
+		]);
+
+		// Image/file-only content carries no documented text: no evidence.
+		const imageOnlyResponse = buildTaskQualitySummaryResponse({
+			taskId: "task-1",
+			capturedAt: CAPTURED_AT,
+			taskSnapshot: snapshot({
+				kind: "task",
+				segments: [
+					segment({
+						sessionId: "s1",
+						kind: "task",
+						messages: [useMessage, mixedResultMessage("")],
+					}),
+				],
+			}),
+			taskSnapshotError: null,
+			reviewSnapshot: null,
+			reviewSnapshotError: null,
+			sessionSource: null,
+			terminalSummaryAvailable: false,
+		});
+		expect(imageOnlyResponse.tools.reportedFailures).toBe(0);
+		expect(imageOnlyResponse.evidence).toEqual([]);
+	});
+
 	it("assembles a complete summary for recorded native sessions", () => {
 		const response = buildTaskQualitySummaryResponse({
 			taskId: "task-1",

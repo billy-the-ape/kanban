@@ -966,10 +966,11 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 
 /**
  * Extract the text of a durable tool result, preserving only the documented
- * envelopes (V2): the string result, the text blocks, a direct structured
- * command-entry array (some SDK paths persist tool results as the object
- * array itself), and Kanban's `{ recovery, output }` envelope (including
- * array-valued `output`). Nothing else is serialized or scanned.
+ * envelopes (V2): the string result, the text blocks (kept even when mixed
+ * with image/file blocks, which carry no documented text), a direct
+ * structured command-entry array (some SDK paths persist tool results as the
+ * object array itself), and Kanban's `{ recovery, output }` envelope
+ * (including array-valued `output`). Nothing else is serialized or scanned.
  */
 function extractDurableToolResultText(content: unknown): string {
 	if (typeof content === "string") {
@@ -979,9 +980,18 @@ function extractDurableToolResultText(content: unknown): string {
 		if (content.length === 0) {
 			return "";
 		}
-		// Text blocks: the standard display representation.
-		if (content.every((part) => isPlainRecord(part) && part.type === "text")) {
+		// Text blocks: the standard display representation. Image/file
+		// blocks carry no documented text, so mixed arrays keep their
+		// text blocks (v1 behavior preserved).
+		const isTextBlock = (part: unknown) => isPlainRecord(part) && part.type === "text";
+		if (
+			content.every(
+				(part) => isPlainRecord(part) && (part.type === "text" || part.type === "image" || part.type === "file"),
+			) &&
+			content.some(isTextBlock)
+		) {
 			return content
+				.filter(isTextBlock)
 				.map((part) => (isPlainRecord(part) && typeof part.text === "string" ? part.text : ""))
 				.join("\n");
 		}
