@@ -32,7 +32,7 @@ function createQualitySummaryResponse(
 		ok: true,
 		taskId: "task-1",
 		capturedAt: 1760246400000,
-		reducerVersion: 1,
+		reducerVersion: 2,
 		coverage: { status: "complete", reasons: [], warnings: [] },
 		timing: {
 			firstRecordedStart: null,
