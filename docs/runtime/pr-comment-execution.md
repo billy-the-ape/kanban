@@ -24,7 +24,8 @@ are not a mergeability verdict; auto-merge and merge-candidate UI are outside th
    Closed/merged PRs or an empty eligible batch skip the model call.
 4. Git is verified/refreshed in the actual task worktree. The final prompt replaces the
    placeholder in task chat and contains the pending feedback bodies, IDs, authors,
-   timestamps, URLs, and inline file/line/diff context when available. The dispatched
+   timestamps, URLs, and inline file/line/diff context when available (inline or via
+   the complete local snapshot described below). The dispatched
    fingerprint advances only at this execution boundary.
 
 Git verification always runs on admission, even when the PR snapshot is fresh. It
@@ -38,8 +39,8 @@ is performed. A successful fast-forward is retained if a later preparation check
 
 A Git blocker is stored as a failed dispatch with `errorCode: git_refresh_blocked`,
 shown with its reason and Resume action. Preserve/reconcile the worktree manually,
-then Resume; feedback remains eligible. Incomplete snapshots and oversized prompts
-also fail visibly before a model call. No new configuration/environment variables are
+then Resume; feedback remains eligible. Incomplete GitHub snapshots and local snapshot
+write/read failures also fail visibly before a model call. No new configuration/environment variables are
 required. Existing Git/gh authentication and network access remain prerequisites.
 
 ## Bounded feedback and later changes
@@ -51,10 +52,34 @@ publication conflict rather than force push, and leave thread resolution to revi
 because newer comments may have arrived. This is a prompt-level instruction; terminal
 access is unchanged, not a command-enforcement sandbox.
 
-The complete rendered prompt is capped at 32,000 characters. Oversized batches block
-for manual handling rather than truncating feedback and marking omitted items sent.
-Raw feedback is now included in normal task chat/SDK history; the separate workflow
-record continues to store only fingerprints and attribution metadata.
+The complete rendered prompt is capped at 32,000 characters, including instructions
+and JSON formatting. Small batches remain inline. When a batch exceeds that limit,
+preparation atomically writes the complete captured batch to a task context artifact
+and reads it back to verify the contents before touching Git or advancing the dispatch
+boundary. The short prompt supplies its absolute path and feedback count. No comments
+or long bodies are truncated, summarized, or silently omitted.
+
+The JSON snapshot includes the PR URL, capture timestamp, verified head SHA, and each
+item's ID, kind, body digest, full body, author, timestamp, URL, and inline context when
+available. It lives outside the checkout at
+`<task worktrees home>/<taskId>/context-artifacts/pr-feedback-<dispatchId>-<timestamp>-<random>.txt`,
+using the existing atomic artifact writer and diagnostic index. The agent reads all
+items in bounded sections (character slices for long JSON lines), accounts for each,
+and stops with an error if it cannot read the entire batch. It must not modify or commit
+the artifact or fetch live feedback as a substitute.
+
+Artifacts persist across runtime restarts and are removed with the owning task state
+directory, following existing context-artifact retention. A Resume captures a fresh
+batch and, if still oversized, creates a new artifact rather than overwriting the old
+snapshot. Preparation failures leave feedback undispatched and require Resume; failures
+after admission retain the existing previous-boundary restoration behavior.
+
+Raw feedback appears in task chat/SDK history for inline batches and in local artifacts
+and subsequent tool reads for oversized batches. The separate workflow record continues
+to store only fingerprints and attribution metadata. The runtime user must be able to
+write and read its existing task context-artifact directory; no new settings, environment
+variables, dependencies, or migrations are required. After deployment, use Resume once
+on repairs already paused by the old size-limit error.
 
 Polling continues while waiting and running. Feedback observed before admission is
 included in the refreshed batch; feedback added/edited after capture remains pending
@@ -72,6 +97,7 @@ visibly for Resume, since the scheduler's in-memory queue no longer exists.
 - `src/pr-tracking/github-pr-client.ts`: eligibility and feedback metadata.
 - `src/pr-tracking/comment-automation-service.ts`: debounce, dispatch, preparation and lifecycle.
 - `src/pr-tracking/comment-git-refresh.ts`: safe Git refresh.
-- `src/pr-tracking/comment-handling-prompt.ts`: bounded batch rendering.
+- `src/pr-tracking/comment-handling-prompt.ts`: bounded batch rendering and verified snapshot fallback.
+- `src/workspace/task-artifacts.ts`: existing task artifact storage and lifecycle.
 - `src/cline-sdk/cline-turn-preparation.ts`: internal admission callback contract.
 - `src/cline-sdk/cline-session-runtime.ts`: hook after scheduler admission for live/restarted sessions.
