@@ -48,7 +48,7 @@ import { resolveWorkspaceSessionSummaries } from "../core/workspace-session-summ
 import { isTaskWriterActive } from "../server/task-writer-activity";
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { refreshCommentWorktree } from "./comment-git-refresh";
-import { buildCommentHandlingInstruction } from "./comment-handling-prompt";
+import { prepareCommentHandlingInstruction } from "./comment-handling-prompt";
 import type { PrFeedbackEvent } from "./feedback-fingerprint";
 import { computePrFeedbackFingerprint, findPrFeedbackPendingEvents } from "./feedback-fingerprint";
 import type { GitHubPrClient, GitHubPrSnapshot } from "./github-pr-client";
@@ -1244,12 +1244,13 @@ export class PrCommentAutomationService {
 			const events = excludePublishedEvents(snapshot.events, automation.publication.published);
 			const pending = findPrFeedbackPendingEvents(events, input.baseline);
 			if (pending.length === 0) return skip();
-			// Build before touching Git so oversized feedback never mutates the worktree.
-			const prompt = buildCommentHandlingInstruction(sub.pr.url, {
-				events: pending,
-				capturedAt,
-				headSha: snapshot.headSha ?? "unknown",
-			});
+			// Save oversized feedback before touching Git or advancing the dispatch boundary.
+			const prompt = await prepareCommentHandlingInstruction(
+				sub.pr.url,
+				{ events: pending, capturedAt, headSha: snapshot.headSha ?? "unknown" },
+				{ taskId: owner.taskId, dispatchId },
+			);
+			signal.throwIfAborted();
 			errorCode = "git_refresh_blocked";
 			await (this.deps.refreshGit ?? refreshCommentWorktree)(input.cwd, snapshot, signal);
 			errorCode = "preparation_failed";
