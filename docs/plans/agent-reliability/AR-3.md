@@ -155,6 +155,10 @@ Notes and follow-ups:
   retained record immediately before writing, so a previous session's un-awaited settle
   (the ended-session handler's `cancelAllJobs`) can no longer be clobbered by an
   `interrupted` reclassification that would drop the `artifactPath`.
+- Review hardening, round 6 (PR feedback): the shell command flag is now any short-flag
+  cluster containing `c` (`-lc`, `-ec`, `-ic`, ...) rather than only a bare `-c`, and
+  value-consuming flags (`-o`/`-O`/`--option`) before it have their value skipped, so
+  combined-flag invocations cannot hide the payload from the parity scan.
 - The job status is not yet surfaced in the task diagnostics export (B-3); the scope boundary
   excludes a new tRPC control API, so the diagnostics wiring lands as a follow-up.
 - Killing covers the owned process group (POSIX) or child (Windows); daemonized grandchildren

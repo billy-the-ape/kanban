@@ -425,6 +425,28 @@ describe("createReviewToolPolicy — validation_job gating (AR-3)", () => {
 			}),
 		);
 		expect(absShell.approved).toBe(false);
+		// Combined short-flag clusters containing c are the command flag.
+		for (const flag of ["-lc", "-ec", "-ic"]) {
+			const clustered = await policy(
+				makeRequest("validation_job", {
+					action: "start",
+					command: "bash",
+					args: [flag, "git push origin HEAD"],
+				}),
+			);
+			expect(clustered.approved).toBe(false);
+			expect(clustered.reason).toMatch(/git push/);
+		}
+		// Value-consuming flags before the command flag are skipped.
+		const withOption = await policy(
+			makeRequest("validation_job", {
+				action: "start",
+				command: "bash",
+				args: ["-o", "pipefail", "-c", "git push origin HEAD"],
+			}),
+		);
+		expect(withOption.approved).toBe(false);
+		expect(withOption.reason).toMatch(/git push/);
 	});
 
 	it("delegates benign shell -c payloads and script-file runs", async () => {
@@ -445,6 +467,11 @@ describe("createReviewToolPolicy — validation_job gating (AR-3)", () => {
 			makeRequest("validation_job", { action: "start", command: "sh", args: ["script.sh"] }),
 		);
 		expect(script.approved).toBe(true);
-		expect(delegated).toEqual(["validation_job", "validation_job"]);
+		// Combined flags with a benign payload stay delegated.
+		const clustered = await policy(
+			makeRequest("validation_job", { action: "start", command: "bash", args: ["-e", "-c", "npm test"] }),
+		);
+		expect(clustered.approved).toBe(true);
+		expect(delegated).toEqual(["validation_job", "validation_job", "validation_job"]);
 	});
 });

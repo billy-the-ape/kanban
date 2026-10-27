@@ -323,10 +323,11 @@ function buildValidationJobArgv(input: Record<string, unknown>): string[] | null
 const SHELL_COMMAND_BASENAMES = new Set(["sh", "bash", "zsh", "dash", "ksh"]);
 
 /**
- * Finds the `-c` payload of a shell invocation (skipping simple flags to
- * locate `-c`), or null when the argv is not a shell invocation, or a
- * non-flag token appears before `-c` (script-file runs carry no inline
- * command to scan).
+ * Finds the `-c` payload of a shell invocation, or null when the argv is
+ * not a shell invocation, or a non-flag token appears before the command
+ * flag. A short-flag cluster containing `c` (`-c`, `-lc`, `-ec`, ...) is
+ * the command flag; `-o`/`-O`/`--option` consume their value, which is
+ * skipped (script-file runs carry no inline command to scan).
  */
 function findShellCPayload(argv: string[]): string | null {
 	const command = argv[0] ?? "";
@@ -335,8 +336,15 @@ function findShellCPayload(argv: string[]): string | null {
 	}
 	for (let i = 1; i < argv.length; i += 1) {
 		const token = argv[i] ?? "";
-		if (token === "-c") {
+		// A short-flag cluster containing `c` is the command flag; the next
+		// token is its payload.
+		if (/^-[A-Za-z]*c[A-Za-z]*$/.test(token)) {
 			return argv[i + 1] ?? null;
+		}
+		// These flags consume a value; skip the pair.
+		if (token === "-o" || token === "-O" || token === "--option") {
+			i += 1;
+			continue;
 		}
 		if (token.startsWith("-") && token.length > 1) {
 			continue;
