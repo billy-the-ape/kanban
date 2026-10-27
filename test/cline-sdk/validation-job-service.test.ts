@@ -4,7 +4,7 @@
 // owner-only file, and persists a versioned record per job. HOME is
 // redirected so the task-state tree (spools, records, artifacts) lives under
 // a temp dir instead of the user's real ~/.cline.
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -323,7 +323,7 @@ describe("ValidationJobService crash adoption", () => {
 			schemaVersion: VALIDATION_JOB_SCHEMA_VERSION,
 			taskId: "task-ar3",
 			sessionId: "session-old",
-			jobId: "orphan-job",
+			jobId: "0f9619ff-8b86-4d01-a22b-0f6d3e8b7f1a",
 			toolCallId: "call-old",
 			command: process.execPath,
 			args: ["-e", "1"],
@@ -340,11 +340,11 @@ describe("ValidationJobService crash adoption", () => {
 			logBytesOmitted: 0,
 			artifactPath: null,
 		};
-		await writeFile(join(taskDir, "orphan-job.json"), JSON.stringify(orphan, null, 2));
+		await writeFile(join(taskDir, "0f9619ff-8b86-4d01-a22b-0f6d3e8b7f1a.json"), JSON.stringify(orphan, null, 2));
 
 		const service = createService();
 		await service.initialize();
-		const adopted = await service.getJob("orphan-job");
+		const adopted = await service.getJob("0f9619ff-8b86-4d01-a22b-0f6d3e8b7f1a");
 		expect(adopted?.state).toBe("interrupted");
 		expect(adopted?.endedAt).toBeTruthy();
 
@@ -356,7 +356,7 @@ describe("ValidationJobService crash adoption", () => {
 			approve: async () => ({ approved: true }),
 		});
 		await second.initialize();
-		const still = await second.getJob("orphan-job");
+		const still = await second.getJob("0f9619ff-8b86-4d01-a22b-0f6d3e8b7f1a");
 		expect(still?.state).toBe("interrupted");
 	});
 
@@ -408,5 +408,98 @@ describe("ValidationJobService file hygiene", () => {
 			},
 			() => undefined,
 		);
+	});
+});
+
+describe("ValidationJobService review hardening", () => {
+	it("rejects traversal-shaped and unknown job ids without touching the filesystem", async () => {
+		const service = createService();
+		expect(await service.getJob("../../../../etc/passwd")).toBeNull();
+		expect(await service.getJob("nope")).toBeNull();
+		expect(await service.cancelJob("../up")).toBeNull();
+		expect(await service.readJobLog("../../../../etc/passwd")).toBeNull();
+	});
+
+	it("never opens a forged record's artifact path outside the task's artifact dir", async () => {
+		await mkdir(taskDir, { recursive: true });
+		const secret = join(worktreeDir, "secret.txt");
+		await writeFile(secret, "top secret");
+		const forgedId = "11111111-2222-4333-8444-555555555555";
+		const forged: ValidationJobRecord = {
+			schemaVersion: VALIDATION_JOB_SCHEMA_VERSION,
+			taskId: "task-ar3",
+			sessionId: "session-old",
+			jobId: forgedId,
+			toolCallId: "call-forged",
+			command: "true",
+			args: [],
+			cwd: "",
+			startedAt: new Date().toISOString(),
+			endedAt: new Date().toISOString(),
+			state: "exited",
+			exitCode: 0,
+			signal: null,
+			timedOut: false,
+			canceled: false,
+			logTruncated: false,
+			logBytesRetained: 0,
+			logBytesOmitted: 0,
+			artifactPath: secret,
+		};
+		await writeFile(join(taskDir, `${forgedId}.json`), JSON.stringify(forged, null, 2));
+		const service = createService();
+		// The record's metadata is readable (it is this task's record)...
+		const record = await service.getJob(forgedId);
+		expect(record?.state).toBe("exited");
+		// ...but the log read refuses the forged artifact path.
+		const page = await service.readJobLog(forgedId);
+		expect(page?.text).toBe("");
+		expect(page?.totalRetainedBytes).toBe(0);
+	});
+
+	it("does not report a settled state before archival completes", async () => {
+		const service = new ValidationJobService({
+			taskId: "task-ar3",
+			sessionId: "session-ar3",
+			worktreePath: worktreeDir,
+			approve: async () => ({ approved: true }),
+			archiveArtifact: async () => {
+				// Hold archival so the settle window is observable.
+				await new Promise((resolve) => setTimeout(resolve, 150));
+				return join(homeDir, ".cline", "worktrees", "task-ar3", "context-artifacts", "held.txt");
+			},
+		});
+		const started = await service.start({
+			toolCallId: "call-settle-race",
+			command: process.execPath,
+			args: "-e \"process.stdout.write('output')\"",
+		});
+		if (started.kind !== "started") {
+			throw new Error("expected started");
+		}
+		const settled = await waitForState(service, started.record.jobId, "exited");
+		// Observing `exited` implies the archive reference and retained bytes
+		// are already final (single synchronous publication).
+		expect(settled.artifactPath).toBeTruthy();
+		expect(settled.logBytesRetained).toBeGreaterThan(0);
+	});
+
+	it("serializes concurrent starts so at most one job is spawned", async () => {
+		const service = createService();
+		const [first, second] = await Promise.all([
+			service.start({ toolCallId: "call-race-1", command: process.execPath, args: '-e "setTimeout(()=>{},500)"' }),
+			service.start({ toolCallId: "call-race-2", command: process.execPath, args: "-e 1" }),
+		]);
+		const kinds = [first.kind, second.kind].sort();
+		expect(kinds).toEqual(["busy", "started"]);
+		const started = first.kind === "started" ? first : second;
+		if (started.kind !== "started") {
+			throw new Error("expected one started result");
+		}
+		expect(service.getLiveJob()?.jobId).toBe(started.record.jobId);
+		// Exactly one record exists on disk.
+		const entries = await readdir(taskDir);
+		expect(entries.filter((entry) => entry.endsWith(".json"))).toHaveLength(1);
+		await waitForState(service, started.record.jobId, "exited");
 	});
 });

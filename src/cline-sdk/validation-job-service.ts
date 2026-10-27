@@ -26,7 +26,7 @@ import { join } from "node:path";
 import { lockedFileSystem } from "../fs/locked-file-system";
 import { getTaskWorktreesHomePath } from "../state/workspace-state";
 import { isPathWithinRoot } from "../workspace/path-sandbox";
-import { writeTaskContextArtifact } from "../workspace/task-artifacts";
+import { getTaskContextArtifactsDir, writeTaskContextArtifact } from "../workspace/task-artifacts";
 import { normalizeTaskIdForWorktreePath } from "../workspace/task-worktree-path";
 import type { ClineSdkToolApprovalResult } from "./sdk-runtime-boundary";
 
@@ -39,6 +39,12 @@ export const VALIDATION_JOB_DEFAULT_MAX_LOG_BYTES = 25 * 1024 * 1024;
 /** Read page limit (8 KiB). */
 export const VALIDATION_JOB_READ_PAGE_BYTES = 8 * 1024;
 const TRUNCATION_MARKER_PREFIX = "[validation job log incomplete:";
+
+/** Job ids are generated UUIDs; anything else is rejected, never path-joined. */
+const VALIDATION_JOB_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+function isValidJobId(jobId: string): boolean {
+	return VALIDATION_JOB_ID_PATTERN.test(jobId);
+}
 
 export type ValidationJobState = "running" | "exited" | "canceled" | "timed_out" | "spawn_failed" | "interrupted";
 
@@ -237,6 +243,8 @@ export class ValidationJobService {
 	private readonly receiptByToolCallId = new Map<string, ValidationJobRecord>();
 	private liveJob: LiveJob | null = null;
 	private adopted: Promise<void> | null = null;
+	/** Serializes start() so concurrent tool calls cannot double-book the live slot. */
+	private startChain: Promise<void> = Promise.resolve();
 
 	constructor(options: ValidationJobServiceOptions) {
 		this.taskId = options.taskId;
@@ -265,9 +273,18 @@ export class ValidationJobService {
 	/**
 	 * Starts one job (or returns a receipt for an already-started one).
 	 * Approval happens once, before anything is spawned; a denied start
-	 * creates no process, spool, or record.
+	 * creates no process, spool, or record. Starts are serialized on a
+	 * promise chain so concurrent tool calls cannot double-book the single
+	 * live slot before the first start registers it.
 	 */
 	async start(request: ValidationJobStartRequest): Promise<ValidationJobStartResult> {
+		const run = this.startChain.then(() => this.performStart(request));
+		// Keep the chain alive even when a start rejects.
+		this.startChain = run.then(() => undefined).catch(() => undefined);
+		return await run;
+	}
+
+	private async performStart(request: ValidationJobStartRequest): Promise<ValidationJobStartResult> {
 		await this.initialize();
 		const command = request.command.trim();
 		if (!command || /\r?\n/.test(command)) {
@@ -382,7 +399,7 @@ export class ValidationJobService {
 	async getJob(jobId: string): Promise<ValidationJobRecord | null> {
 		await this.initialize();
 		const trimmed = jobId.trim();
-		if (!trimmed) {
+		if (!trimmed || !isValidJobId(trimmed)) {
 			return null;
 		}
 		const live = this.liveJob;
@@ -449,7 +466,7 @@ export class ValidationJobService {
 	async cancelJob(jobId: string): Promise<ValidationJobRecord | null> {
 		await this.initialize();
 		const trimmed = jobId.trim();
-		if (!trimmed) {
+		if (!trimmed || !isValidJobId(trimmed)) {
 			return null;
 		}
 		const live = this.liveJob;
@@ -518,7 +535,15 @@ export class ValidationJobService {
 				return null;
 			}
 			const record = parsed as ValidationJobRecord;
-			if (record.schemaVersion !== VALIDATION_JOB_SCHEMA_VERSION || record.taskId !== this.taskId) {
+			// The record's own id must match the file name we read: persisted
+			// JSON is untrusted, and a mismatched or malformed id must never be
+			// joined into a spool or artifact path.
+			if (
+				!isValidJobId(record.jobId) ||
+				record.jobId !== jobId ||
+				record.schemaVersion !== VALIDATION_JOB_SCHEMA_VERSION ||
+				record.taskId !== this.taskId
+			) {
 				return null;
 			}
 			return record;
@@ -566,6 +591,11 @@ export class ValidationJobService {
 			return spool;
 		}
 		if (record.artifactPath) {
+			// The record is persisted JSON: only open artifacts that live in
+			// this task's context-artifacts directory, never an arbitrary path.
+			if (!isPathWithinRoot(getTaskContextArtifactsDir(record.taskId), record.artifactPath)) {
+				return null;
+			}
 			return (await stat(record.artifactPath).catch(() => null))?.isFile() ? record.artifactPath : null;
 		}
 		return null;
@@ -703,43 +733,32 @@ export class ValidationJobService {
 			return live.settled;
 		}
 		const record = live.record;
-		record.endedAt = new Date().toISOString();
-		record.state = outcome.state;
-		if (outcome.exitCode !== undefined) {
-			record.exitCode = outcome.exitCode;
-		}
-		if (outcome.signal !== undefined) {
-			record.signal = outcome.signal;
-		}
-		if (outcome.state === "timed_out") {
-			record.timedOut = true;
-		}
-		if (outcome.state === "canceled") {
-			record.canceled = true;
-		}
+		// The settled fields are applied to the shared record only after
+		// archival completes (in one synchronous stretch), so readers never
+		// observe a settled state with missing log/archive fields, and a new
+		// start never mistakes a settling job for live or busy.
+		const endedAt = new Date().toISOString();
 		clearTimeout(live.deadlineTimer);
-		let spoolConsumed = false;
 		const settled = (async () => {
 			await live.drainTail;
 			if (!live.spoolClosed) {
 				live.spoolClosed = true;
 				await live.spool.close().catch(() => undefined);
 			}
+			let artifactPath: string | null = null;
+			let spoolConsumed = false;
 			if (record.logBytesRetained > 0) {
 				try {
 					let content = await readFile(this.spoolPathFor(record.jobId), "utf8");
 					if (record.logTruncated) {
 						content = `${content}\n\n${buildTruncationMarker(record.logBytesOmitted)}`;
 					}
-					const artifactPath = await this.archiveArtifact({
+					artifactPath = await this.archiveArtifact({
 						taskId: record.taskId,
 						toolCallId: record.toolCallId,
 						content,
 					});
-					if (artifactPath) {
-						record.artifactPath = artifactPath;
-						spoolConsumed = true;
-					}
+					spoolConsumed = artifactPath !== null;
 				} catch {
 					// Preserve the status even if archival failed; the spool stays.
 				}
@@ -750,7 +769,24 @@ export class ValidationJobService {
 			if (spoolConsumed) {
 				await rm(this.spoolPathFor(record.jobId), { force: true }).catch(() => undefined);
 			}
-			await this.writeRecord(record).catch(() => undefined);
+			// Persist the final record before flipping the shared one, so a
+			// reader can never observe a backward-going state from the file.
+			const finalRecord: ValidationJobRecord = {
+				...record,
+				endedAt,
+				state: outcome.state,
+				exitCode: outcome.exitCode ?? record.exitCode,
+				signal: outcome.signal ?? record.signal,
+				timedOut: outcome.state === "timed_out" ? true : record.timedOut,
+				canceled: outcome.state === "canceled" ? true : record.canceled,
+				artifactPath,
+			};
+			await this.writeRecord(finalRecord).catch(() => undefined);
+			// One synchronous stretch: publish the final state to the shared
+			// record and release the live slot, so `status` never reports a
+			// settled job with missing log or archive fields, and a new start
+			// never mistakes a settling job for live or busy.
+			Object.assign(record, finalRecord);
 			if (this.liveJob === live) {
 				this.liveJob = null;
 			}

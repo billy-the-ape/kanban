@@ -124,6 +124,15 @@ Implemented as a single PR against `main`:
 
 Notes and follow-ups:
 
+- Review hardening (PR feedback): `settle()` now publishes the settled fields
+  (state, times, exit info, archive reference) to the shared record only in one
+  synchronous stretch after archival completes, so `status` never reports a settled
+  job with missing fields and a new start never mistakes a settling job for live.
+  `start()` is serialized on a promise chain so concurrent tool calls cannot
+  double-book the single live slot. Job ids are validated against the generated
+  UUID shape in `getJob`/`readJobLog`/`cancelJob`/`readRecord` (a mismatch between
+  the record's own id and the file name is rejected), and `read` only opens
+  `record.artifactPath` when it lies inside the task's context-artifacts directory.
 - The job status is not yet surfaced in the task diagnostics export (B-3); the scope boundary
   excludes a new tRPC control API, so the diagnostics wiring lands as a follow-up.
 - Killing covers the owned process group (POSIX) or child (Windows); daemonized grandchildren
