@@ -190,6 +190,8 @@ interface CandidateRange {
 	line: number;
 	/** Number of file lines the candidate spans. */
 	spanLines: number;
+	/** 0-based index of the submitted old_text line the span starts at. */
+	submittedLine: number;
 }
 
 /**
@@ -211,7 +213,8 @@ function findCandidateRanges(fileLines: string[], oldText: string): CandidateRan
 		while (ranges.length < EVIDENCE_MAX_WINDOWS) {
 			const at = normalizedFile.indexOf(normalizedOld, from);
 			if (at === -1) break;
-			ranges.push({ line: countNewlinesBefore(normalizedFile, at), spanLines: oldLines.length });
+			// A whole-block match starts at submitted line 1.
+			ranges.push({ line: countNewlinesBefore(normalizedFile, at), spanLines: oldLines.length, submittedLine: 0 });
 			from = at + Math.max(1, normalizedOld.length);
 		}
 	}
@@ -232,7 +235,8 @@ function findCandidateRanges(fileLines: string[], oldText: string): CandidateRan
 			if (ranges.some((range) => index >= range.line && index < range.line + range.spanLines)) {
 				continue;
 			}
-			ranges.push({ line: index, spanLines: 1 });
+			// The range came from submitted line i, so the span starts there.
+			ranges.push({ line: index, spanLines: 1, submittedLine: i });
 		}
 	}
 	return ranges;
@@ -308,27 +312,26 @@ function buildWindow(fileLines: string[], range: CandidateRange): EditorEvidence
 	};
 }
 
-function whitespaceFacts(submitted: EditorEvidenceLineInfo[], candidates: EditorEvidenceLineInfo[]): string[] {
-	const facts: string[] = [];
-	for (let i = 0; i < Math.min(submitted.length, candidates.length) && facts.length < MAX_WHITESPACE_FACTS; i += 1) {
-		const submittedLine = submitted[i];
-		const candidateLine = candidates[i];
-		if (!submittedLine || !candidateLine) continue;
-		if (submittedLine.literalBackslashTab && !candidateLine.literalBackslashTab) {
-			facts.push(
-				`submitted line ${submittedLine.line} contains a literal backslash-t sequence; candidate line ${candidateLine.line} contains a TAB character`,
-			);
-		} else if (submittedLine.leadingTabs !== candidateLine.leadingTabs) {
-			facts.push(
-				`submitted line ${submittedLine.line} begins with ${submittedLine.leadingTabs} TAB character(s); candidate line ${candidateLine.line} begins with ${candidateLine.leadingTabs} TAB character(s)`,
-			);
-		} else if (submittedLine.leadingSpaces !== candidateLine.leadingSpaces) {
-			facts.push(
-				`submitted line ${submittedLine.line} begins with ${submittedLine.leadingSpaces} space(s); candidate line ${candidateLine.line} begins with ${candidateLine.leadingSpaces} space(s)`,
-			);
-		}
+/**
+ * Builds one whitespace-comparison fact for a pair of corresponding lines
+ * (a submitted old_text line and the candidate file line it maps to). Only
+ * measured values are reported: leading TAB/space counts and the presence of a
+ * literal backslash-t sequence in the submitted line.
+ */
+function whitespaceFactForPair(
+	submittedLine: EditorEvidenceLineInfo,
+	candidateLine: EditorEvidenceLineInfo,
+): string | null {
+	if (submittedLine.literalBackslashTab && !candidateLine.literalBackslashTab) {
+		return `submitted line ${submittedLine.line} contains a literal backslash-t sequence; candidate line ${candidateLine.line} begins with ${candidateLine.leadingTabs} TAB character(s) and ${candidateLine.leadingSpaces} space(s)`;
 	}
-	return facts;
+	if (submittedLine.leadingTabs !== candidateLine.leadingTabs) {
+		return `submitted line ${submittedLine.line} begins with ${submittedLine.leadingTabs} TAB character(s); candidate line ${candidateLine.line} begins with ${candidateLine.leadingTabs} TAB character(s)`;
+	}
+	if (submittedLine.leadingSpaces !== candidateLine.leadingSpaces) {
+		return `submitted line ${submittedLine.line} begins with ${submittedLine.leadingSpaces} space(s); candidate line ${candidateLine.line} begins with ${candidateLine.leadingSpaces} space(s)`;
+	}
+	return null;
 }
 
 function detectLineEnding(content: string): "lf" | "crlf" | "mixed" {
@@ -487,7 +490,20 @@ function buildCandidates(
 		.filter((lineNumber) => lineNumber <= fileLines.length)
 		.slice(0, MAX_DETAIL_LINES)
 		.map((lineNumber) => lineInfo(fileLines[lineNumber - 1]?.replace(/\r$/, "") ?? "", lineNumber));
-	const facts = whitespaceFacts(submittedLines, candidateLines);
+	// Pair each candidate span line with the submitted line it corresponds to
+	// (the span starts at range.submittedLine), so fallback candidates are
+	// compared against the line that actually matched, never by position.
+	const facts: string[] = [];
+	for (const range of ranges) {
+		for (let offset = 0; offset < range.spanLines && facts.length < MAX_WHITESPACE_FACTS; offset += 1) {
+			const submittedLine = submittedLines[range.submittedLine + offset];
+			const fileLineIndex = range.line + offset;
+			if (!submittedLine || fileLineIndex >= fileLines.length) continue;
+			const candidateLine = lineInfo(fileLines[fileLineIndex]?.replace(/\r$/, "") ?? "", fileLineIndex + 1);
+			const fact = whitespaceFactForPair(submittedLine, candidateLine);
+			if (fact) facts.push(fact);
+		}
+	}
 	const note =
 		facts.length > 0
 			? `Candidate lines for reference: ${facts.join("; ")}.`

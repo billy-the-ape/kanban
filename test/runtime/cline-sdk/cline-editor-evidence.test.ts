@@ -60,6 +60,47 @@ describe("AR-2 bounded editor failure evidence", () => {
 		expect(evidence.candidates?.note).toContain("literal backslash-t sequence");
 	});
 
+	it("does not invent a whitespace mismatch for a fallback candidate whose matching line is identical", async () => {
+		const path = join(cwd, "fallback.ts");
+		await writeFile(path, "function foo() {\n\t\tbar();\n}\n");
+		// Submitted line 1 differs in content, so the whole-block normalized match
+		// fails and the single-line fallback locates file line 2 via submitted line 2.
+		const oldText = "function foo(a) {\n\t\tbar();\n}";
+		const evidence = await collectEditorEvidence({ cwd, input: { path, old_text: oldText, new_text: "x" } });
+		expect(evidence.oldText?.matchCount).toBe(0);
+		// The first window covers the candidate on file line 2 (plus context).
+		expect(evidence.candidates?.windows[0]?.lines).toContain("\t\tbar();");
+		// Submitted line 2 (the matching line) is identical to candidate line 2,
+		// so no whitespace fact should be reported.
+		expect(evidence.candidates?.note).toBe("Candidates match only after whitespace normalization.");
+	});
+
+	it("reports the whitespace fact for the submitted line that matched in the fallback", async () => {
+		const path = join(cwd, "fallback-tab.ts");
+		await writeFile(path, "function foo() {\n\t\tbar();\n}\n");
+		// Submitted line 1 differs in content; submitted line 2 has one TAB where
+		// the file line has two, so the fallback pairs those two lines.
+		const oldText = "function foo(a) {\n\tbar();\n}";
+		const evidence = await collectEditorEvidence({ cwd, input: { path, old_text: oldText, new_text: "x" } });
+		expect(evidence.oldText?.matchCount).toBe(0);
+		expect(evidence.candidates?.note).toContain(
+			"submitted line 2 begins with 1 TAB character(s); candidate line 2 begins with 2 TAB character(s)",
+		);
+	});
+
+	it("reports the measured candidate indentation for a literal backslash-t anchor against spaces", async () => {
+		const path = join(cwd, "spaces.ts");
+		await writeFile(path, "if (x) {\n    code();\n}\n");
+		// The model sent the two-character backslash-t sequence; the file line is
+		// indented with four spaces and contains no TAB character.
+		const oldText = "if (x) {\n\\tcode();\n}";
+		const evidence = await collectEditorEvidence({ cwd, input: { path, old_text: oldText, new_text: "x" } });
+		expect(evidence.oldText?.matchCount).toBe(0);
+		expect(evidence.candidates?.note).toContain(
+			"submitted line 2 contains a literal backslash-t sequence; candidate line 2 begins with 0 TAB character(s) and 4 space(s)",
+		);
+	});
+
 	it("covers a multi-line candidate span and reports per-line whitespace facts", async () => {
 		const path = join(cwd, "block.ts");
 		await writeFile(path, "  alpha\n\tbeta\nrest");
