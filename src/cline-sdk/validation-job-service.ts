@@ -34,6 +34,12 @@ export const VALIDATION_JOB_TOOL_NAME = "validation_job";
 export const VALIDATION_JOB_SCHEMA_VERSION = 1;
 /** Wall-clock deadline for one job (30 minutes). */
 export const VALIDATION_JOB_DEFAULT_DEADLINE_MS = 30 * 60 * 1000;
+/**
+ * Grace period after the child's `exit` event before assuming a background
+ * member is holding the stdio pipes (in which case the group is killed and
+ * the job settles with the real exit status instead of waiting for `close`).
+ */
+const EXIT_CLOSE_GRACE_MS = 200;
 /** Spool retention limit (25 MiB). */
 export const VALIDATION_JOB_DEFAULT_MAX_LOG_BYTES = 25 * 1024 * 1024;
 /** Read page limit (8 KiB). */
@@ -134,6 +140,8 @@ interface LiveJob {
 	drainTail: Promise<void>;
 	deadlineTimer: NodeJS.Timeout;
 	pendingOutcome: Extract<ValidationJobState, "canceled" | "timed_out"> | null;
+	/** Armed on `exit`; fires when `close` does not follow within the grace period. */
+	exitGraceTimer: NodeJS.Timeout | null;
 	settled: Promise<ValidationJobRecord> | null;
 }
 
@@ -419,6 +427,7 @@ export class ValidationJobService {
 			drainTail: Promise.resolve(),
 			deadlineTimer: setTimeout(() => this.beginKill(liveJob, "timed_out"), this.deadlineMs),
 			pendingOutcome: null,
+			exitGraceTimer: null,
 			settled: null,
 		};
 		this.wireChildEvents(liveJob);
@@ -755,6 +764,28 @@ export class ValidationJobService {
 				this.settle(live, { state: "spawn_failed" });
 			}
 		});
+		// exit fires when the child itself exits, before close, which also
+		// requires the stdio pipes to be released. If a background member
+		// inherited the pipes, close never follows; the grace timer then
+		// force-settles with the real exit status instead of leaving the job
+		// running (and misreporting timed_out at the deadline).
+		child.on("exit", (code: number | null, signal: NodeJS.Signals | null) => {
+			if (live.settled !== null) {
+				return;
+			}
+			live.exitGraceTimer = setTimeout(() => {
+				live.exitGraceTimer = null;
+				if (live.settled !== null) {
+					return;
+				}
+				this.killProcessGroup(child);
+				this.settle(live, {
+					state: live.pendingOutcome ?? "exited",
+					exitCode: code ?? undefined,
+					signal: signal ? signal.toString() : undefined,
+				});
+			}, EXIT_CLOSE_GRACE_MS);
+		});
 		child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
 			this.settle(live, {
 				state: live.pendingOutcome ?? "exited",
@@ -800,6 +831,10 @@ export class ValidationJobService {
 		// start never mistakes a settling job for live or busy.
 		const endedAt = new Date().toISOString();
 		clearTimeout(live.deadlineTimer);
+		if (live.exitGraceTimer) {
+			clearTimeout(live.exitGraceTimer);
+			live.exitGraceTimer = null;
+		}
 		const settled = (async () => {
 			await live.drainTail;
 			if (!live.spoolClosed) {

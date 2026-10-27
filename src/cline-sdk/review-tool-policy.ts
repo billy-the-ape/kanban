@@ -342,8 +342,16 @@ function findShellCPayload(argv: string[]): string | null {
 			return argv[i + 1] ?? null;
 		}
 		// These flags consume a value; skip the pair.
-		if (token === "-o" || token === "-O" || token === "--option") {
+		if (token === "-o" || token === "-O" || token === "--option" || token === "--rcfile" || token === "--init-file") {
 			i += 1;
+			continue;
+		}
+		// `+` tokens toggle shell options (bash `+e`, zsh `+o <opt>`); they
+		// carry no command, but `+o` consumes a following value.
+		if (token.startsWith("+") && token.length > 1) {
+			if (token === "+o") {
+				i += 1;
+			}
 			continue;
 		}
 		if (token.startsWith("-") && token.length > 1) {

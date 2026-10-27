@@ -447,6 +447,25 @@ describe("createReviewToolPolicy — validation_job gating (AR-3)", () => {
 		);
 		expect(withOption.approved).toBe(false);
 		expect(withOption.reason).toMatch(/git push/);
+		// `+` option tokens and the values of --rcfile/--init-file before -c.
+		const plusOption = await policy(
+			makeRequest("validation_job", {
+				action: "start",
+				command: "bash",
+				args: ["+e", "-c", "git push origin HEAD"],
+			}),
+		);
+		expect(plusOption.approved).toBe(false);
+		expect(plusOption.reason).toMatch(/git push/);
+		const rcfile = await policy(
+			makeRequest("validation_job", {
+				action: "start",
+				command: "bash",
+				args: ["--rcfile", "/dev/null", "-c", "git push origin HEAD"],
+			}),
+		);
+		expect(rcfile.approved).toBe(false);
+		expect(rcfile.reason).toMatch(/git push/);
 	});
 
 	it("delegates benign shell -c payloads and script-file runs", async () => {

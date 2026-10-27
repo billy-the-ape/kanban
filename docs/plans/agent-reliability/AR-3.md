@@ -164,6 +164,14 @@ Notes and follow-ups:
   and session stop cannot settle a job while background members still hold the pipes
   (an empty group throws ESRCH, handled by the direct-kill fallback; Windows keeps the
   not-exited guard since it has no group kill).
+- Review hardening, round 8 (PR feedback): settlement no longer waits exclusively for
+  `close`. On the child's `exit`, a short grace timer waits for `close`; if a
+  background member is still holding the stdio pipes, the timer group-kills the process
+  and settles with the real exit code and signal, so an exited-but-pipe-holding command
+  can no longer sit `running` until the deadline misreports `timed_out`. The
+  `validation_job` shell scan also skips `+` option tokens (`+o <opt>` consumes its
+  value) and the values of `--rcfile`/`--init-file`, so `bash +e -c "git push ..."` and
+  `bash --rcfile x -c "git push ..."` stay denied per the parity guarantee.
 - The job status is not yet surfaced in the task diagnostics export (B-3); the scope boundary
   excludes a new tRPC control API, so the diagnostics wiring lands as a follow-up.
 - Killing covers the owned process group (POSIX) or child (Windows); daemonized grandchildren

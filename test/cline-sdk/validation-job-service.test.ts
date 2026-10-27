@@ -603,6 +603,43 @@ describe("ValidationJobService review hardening", () => {
 		await rm(pidFile, { force: true }).catch(() => undefined);
 	});
 
+	it("settles with the real exit status when a grandchild holds the pipes after exit", async () => {
+		// The leader exits 0 but leaves a backgrounded member holding the
+		// stdout pipe; the job must settle promptly via the exit grace path
+		// (group-kill + real status), not sit in running until the deadline
+		// misreports timed_out.
+		const pidFile = join(worktreeDir, `ar3-pipe-pid-${process.pid}-${Date.now()}`);
+		const service = createService();
+		const started = await service.start({
+			toolCallId: "call-pipe-hold",
+			command: "sh",
+			args: `-c "sleep 30 & echo $! > ${pidFile}; exit 0"`,
+		});
+		if (started.kind !== "started") {
+			throw new Error("expected started");
+		}
+		const settled = await waitForState(service, started.record.jobId, "exited", 15000);
+		expect(settled.exitCode).toBe(0);
+		expect(settled.timedOut).toBe(false);
+		const pid = Number((await readFile(pidFile, "utf8").catch(() => "")).trim());
+		expect(pid).toBeGreaterThan(0);
+		// Poll briefly so the subreaper can reap the group-killed process
+		// before the liveness probe (a zombie still answers kill(pid, 0)).
+		let alive = true;
+		for (let i = 0; i < 40 && alive; i += 1) {
+			try {
+				process.kill(pid, 0);
+			} catch {
+				alive = false;
+			}
+			if (alive) {
+				await new Promise((resolve) => setTimeout(resolve, 50));
+			}
+		}
+		expect(alive).toBe(false);
+		await rm(pidFile, { force: true }).catch(() => undefined);
+	});
+
 	it("discloses truncation when the spool is exactly full and output continues", async () => {
 		const service = createService({ maxLogBytes: 16 });
 		const started = await service.start({
