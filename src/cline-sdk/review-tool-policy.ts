@@ -31,6 +31,13 @@ export interface CreateReviewToolPolicyOptions {
 const approveByDefault: ReviewToolApprovalHandler = async () => ({ approved: true });
 
 const COMMAND_TOOL_NAMES = new Set(["run_commands", "bash"]);
+/**
+ * AR-3: the local validation-job tool. A `start` carries one executable plus
+ * one args string; a publication command rejected for review through
+ * `run_commands` stays rejected through this path too. Non-start actions
+ * (status / read / cancel) delegate.
+ */
+const VALIDATION_JOB_TOOL_NAME = "validation_job";
 const EDITOR_TOOL_NAMES = new Set(["editor", "write_to_file", "replace_in_file"]);
 const APPLY_PATCH_TOOL_NAME = "apply_patch";
 const READ_TOOL_NAMES = new Set(["read_files", "list_files", "search_codebase", "search_files", "fetch_web_content"]);
@@ -287,6 +294,13 @@ export function findDeniedReviewCommand(command: string): string | null {
 	return null;
 }
 
+/** Builds the scannable command string for a `validation_job` start input. */
+function buildValidationJobCommand(input: Record<string, unknown>): string {
+	const command = typeof input.command === "string" ? input.command.trim() : "";
+	const args = typeof input.args === "string" ? input.args : "";
+	return [command, args].filter(Boolean).join(" ");
+}
+
 /** Resolves a tool-input path against the worktree, returning a worktree-relative path or null. */
 function toWorktreeRelative(worktreePath: string, candidatePath: unknown): string | null {
 	if (typeof candidatePath !== "string") {
@@ -349,6 +363,19 @@ export function createReviewToolPolicy(options: CreateReviewToolPolicyOptions): 
 		if (COMMAND_TOOL_NAMES.has(toolName)) {
 			for (const command of extractCommandStrings(input)) {
 				const denial = findDeniedReviewCommand(command);
+				if (denial) {
+					return { approved: false, reason: denial };
+				}
+			}
+			return await delegate(request);
+		}
+
+		// AR-3: only a validation_job `start` carries a command worth
+		// scanning; status/read/cancel delegate like unknown tools.
+		if (toolName === VALIDATION_JOB_TOOL_NAME) {
+			const action = typeof input.action === "string" ? input.action.trim() : "";
+			if (action === "start") {
+				const denial = findDeniedReviewCommand(buildValidationJobCommand(input));
 				if (denial) {
 					return { approved: false, reason: denial };
 				}

@@ -1,6 +1,6 @@
 # AR-3: Run long validation as observable local jobs
 
-Status: planned. One implementation PR into `main`. Dependencies: none.
+Status: implemented (see [Final state](#final-state)). One implementation PR into `main`. Dependencies: none.
 Read [README.md](./README.md) and [EVIDENCE.md](./EVIDENCE.md).
 
 ## Outcome and scope boundary
@@ -84,3 +84,50 @@ This does not require every quick command to use a job or reduce required checks
 Normal rebuild/redeploy and new native local sessions. No new environment variables,
 model settings, database migration, or server-side configuration. Report filesystem
 spool/retention and local-mode availability prominently in the implementation PR.
+
+## Final state
+
+Implemented as a single PR against `main`:
+
+- `src/cline-sdk/validation-job-service.ts` — `ValidationJobService`: one live job per task,
+  direct spawn with no shell parsing, the approval gate resolves before anything is spawned,
+  per-tool-call-id receipts (duplicate/reuse/busy semantics), owned process-group lifecycle
+  (POSIX process group, Windows child), a 30-minute wall deadline, a 25 MiB owner-only (0o600)
+  spool with truncation disclosure, bounded byte-cursor reads (8 KiB pages), and cancel/status
+  actions that never block. Per-job versioned metadata lives under
+  `<task worktrees home>/<taskId>/validation-jobs/`, a sibling of the task's worktree state, so
+  the task's existing cleanup lifecycle bounds retention. On settlement the retained log is
+  archived through `writeTaskContextArtifact` keyed by the start tool-call id (AR-7
+  start/completion correlation); status is preserved when archival fails, and the spool is
+  dropped once consumed.
+- `src/cline-sdk/validation-job-tool.ts` — the single `validation_job` extraTool with the
+  discriminated `start`, `status`, `read`, and `cancel` actions, bounded string output, and
+  the proposed capability wording (`VALIDATION_JOB_CAPABILITY_TEXT`).
+- `src/cline-sdk/cline-session-runtime.ts` — local SDK hosts are detected by the absence of
+  `runtimeAddress` on the session host (hub-backed hosts expose it), so the tool is registered
+  and advertised (system-prompt append, idempotent across restarts) only where it actually
+  works. It merges into the same `extraTools` list the B-2.5 compaction calibration measures.
+  One service per task is created on every session start (replaced sessions settle first as
+  `canceled`), settled on stop/abort/clear/session-ended/shutdown, and resumed sessions adopt
+  any retained `running` record as `interrupted` — never auto-resumed, never killed by a
+  possibly-reused PID.
+- `src/cline-sdk/review-tool-policy.ts` — bounded review sessions deny `validation_job` starts
+  carrying Git publication / PR-creation / destructive-worktree commands and delegate every
+  other action to the workspace approval gate, so a rejected review publication command stays
+  rejected through the tool.
+- Tests: `test/cline-sdk/validation-job-service.test.ts` and
+  `test/cline-sdk/validation-job-tool.test.ts` (HOME-isolated, real child processes), additions
+  to `test/cline-sdk/review-tool-policy.test.ts` and
+  `test/runtime/cline-sdk/cline-session-runtime.test.ts`, plus the gated
+  `test/integration/validation-job.integration.test.ts` (observes a job beyond the 30-second
+  command deadline in real time; run with `KANBAN_AR3_INTEGRATION=1`).
+
+Notes and follow-ups:
+
+- The job status is not yet surfaced in the task diagnostics export (B-3); the scope boundary
+  excludes a new tRPC control API, so the diagnostics wiring lands as a follow-up.
+- Killing covers the owned process group (POSIX) or child (Windows); daemonized grandchildren
+  are explicitly not a sandboxed workload, per the fixed contract.
+- The tool is advertised to models only on local runtime hosts; hub-backed sessions are
+  unaffected and their persisted launch configs never carry the local-only tool.
+

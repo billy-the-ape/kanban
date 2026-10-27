@@ -278,3 +278,48 @@ describe("createReviewToolPolicy — workspace approval delegation", () => {
 		expect(delegated).toEqual(["read_files", "editor"]);
 	});
 });
+
+describe("createReviewToolPolicy — validation_job gating (AR-3)", () => {
+	it("denies a validation_job start that carries a publication command", async () => {
+		const policy = createPolicy();
+		const result = await policy(
+			makeRequest("validation_job", { action: "start", command: "git", args: "push origin main" }),
+		);
+		expect(result.approved).toBe(false);
+		expect(result.reason).toMatch(/git push/);
+	});
+
+	it("denies a validation_job start that would create a PR", async () => {
+		const policy = createPolicy();
+		const result = await policy(
+			makeRequest("validation_job", { action: "start", command: "gh", args: "pr create --title x" }),
+		);
+		expect(result.approved).toBe(false);
+		expect(result.reason).toMatch(/gh pr create/);
+	});
+
+	it("delegates benign validation_job starts to the workspace approval", async () => {
+		const delegated: string[] = [];
+		const policy = createReviewToolPolicy({
+			worktreePath: WORKTREE,
+			allowedWritePaths: ALLOWED_WRITE_PATHS,
+			delegate: async (request) => {
+				delegated.push(request.toolName);
+				return { approved: true };
+			},
+		});
+		const result = await policy(makeRequest("validation_job", { action: "start", command: "npm", args: "test" }));
+		expect(result.approved).toBe(true);
+		expect(delegated).toEqual(["validation_job"]);
+	});
+
+	it("delegates non-start validation_job actions regardless of the command", async () => {
+		const policy = createPolicy();
+		const status = await policy(makeRequest("validation_job", { action: "status", jobId: "job-1" }));
+		expect(status.approved).toBe(true);
+		const read = await policy(makeRequest("validation_job", { action: "read", jobId: "job-1", offset: 0 }));
+		expect(read.approved).toBe(true);
+		const cancel = await policy(makeRequest("validation_job", { action: "cancel", jobId: "job-1" }));
+		expect(cancel.approved).toBe(true);
+	});
+});
