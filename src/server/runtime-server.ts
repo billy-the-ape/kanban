@@ -49,6 +49,7 @@ import {
 	loadWorkspaceState,
 	mutateWorkspaceState,
 } from "../state/workspace-state";
+import { shouldRunMergedPrStartupRecovery } from "../task-dispatch/task-dispatch-service";
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { createTerminalWebSocketBridge } from "../terminal/ws-server";
 import { type RuntimeTrpcContext, type RuntimeTrpcWorkspaceScope, runtimeAppRouter } from "../trpc/app-router";
@@ -472,12 +473,13 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 					});
 				},
 				// Move the task to Done through the server-owned board
-				// mutation (idempotent), broadcast + reconcile, then fire the
-				// merge-completion successor pass exactly once so children
-				// waiting on this task release with their retained valid
-				// evidence. Called BEFORE the completion is persisted, so a
-				// failure leaves the binding untouched and the bounded
-				// reconciliation reads retry.
+				// mutation (idempotent), broadcast + reconcile, and return
+				// the released ready linked task ids. Called BEFORE the
+				// completion is persisted, so a failure leaves the binding
+				// untouched and the bounded reconciliation reads retry. The
+				// successor dispatch pass itself is fired by the consumer
+				// only AFTER the binding is persisted (dispatchSuccessors
+				// below).
 				completeTask: async (workspaceId, taskId) => {
 					const workspacePath = deps.workspaceRegistry.getWorkspacePathById(workspaceId);
 					if (!workspacePath) {
@@ -490,12 +492,21 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 						return { board: result.board, value: undefined, save: result.moved };
 					});
 					broadcastRuntimeWorkspaceStateUpdatedWithReconcile(workspaceId, workspacePath);
-					// MERGE-1: the successor pass uses the merged_pr trigger so it
-					// launches the just-released children even when the B-9
-					// task dispatch policy is disabled; only this task's direct
-					// linked dependents are candidates.
+					return readyLinkedTaskIds;
+				},
+				// MERGE-1: hand off the released children once the completed
+				// binding is persisted. The merged_pr trigger launches them
+				// even when the B-9 task dispatch policy is disabled; only
+				// this task's direct linked dependents are candidates.
+				// Fire-and-forget: a failure is warned, and the startup
+				// recovery pass retries it for policy-enabled workspaces.
+				dispatchSuccessors: async (workspaceId, _taskId, readyTaskIds) => {
+					const workspacePath = deps.workspaceRegistry.getWorkspacePathById(workspaceId);
+					if (!workspacePath) {
+						throw new Error(`Workspace ${workspaceId} not found; cannot dispatch merge-completed successors.`);
+					}
 					void buildRuntimeApi()
-						.dispatchMergedPrSuccessors({ workspaceId, workspacePath }, readyLinkedTaskIds)
+						.dispatchMergedPrSuccessors({ workspaceId, workspacePath }, readyTaskIds)
 						.catch((error) => {
 							deps.warn(
 								`[pr-tracking] Merge completion dispatch pass failed: ${
@@ -925,18 +936,24 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				);
 			});
 		// MERGE-1: crash recovery for the merge-completion → successor dispatch
-		// boundary — if the runtime died after a parent moved to Done but before
-		// the successor pass ran, the released children are still in the
-		// backlog and are re-eligible here (no-op when none exist).
-		void buildRuntimeApi()
-			.dispatchMergedPrSuccessors(reconcileScope, null)
-			.catch((error) => {
-				deps.warn(
-					`[task-dispatch] Merge-completion successor recovery failed for ${reconcileScope.workspaceId}: ${
-						error instanceof Error ? error.message : String(error)
-					}`,
-				);
-			});
+		// boundary — if the runtime died after a parent moved to Done but
+		// before the successor pass ran, the released children are still in
+		// the backlog and are re-eligible here (no-op when none exist).
+		// Policy-enabled workspaces only: with the task dispatch policy off,
+		// users rely on manual starts, and an unrestricted auto-start at
+		// every restart would relaunch parked or late-linked cards.
+		const startupConfig = await deps.workspaceRegistry.loadScopedRuntimeConfig(reconcileScope).catch(() => null);
+		if (shouldRunMergedPrStartupRecovery(startupConfig)) {
+			void buildRuntimeApi()
+				.dispatchMergedPrSuccessors(reconcileScope, null)
+				.catch((error) => {
+					deps.warn(
+						`[task-dispatch] Merge-completion successor recovery failed for ${reconcileScope.workspaceId}: ${
+							error instanceof Error ? error.message : String(error)
+						}`,
+					);
+				});
+		}
 	}
 
 	// B-5.7/B-5.9: background maintenance; close() waits for it so no git

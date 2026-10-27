@@ -40,6 +40,18 @@ export const TASK_DISPATCH_RETRY_CAP = 3;
 /** B-9: the queue is opt-in; one model worker per workspace by default. */
 export const TASK_DISPATCH_DEFAULT_POLICY: RuntimeTaskDispatchPolicy = { enabled: false, workerLimit: 1 };
 
+/**
+ * MERGE-1: gate for the startup successor-recovery pass. Only
+ * policy-enabled workspaces run it: with the task dispatch policy disabled,
+ * users rely on manual starts, and an unrestricted auto-start of every
+ * merge-ready backlog card at every restart would relaunch parked or
+ * late-linked cards. Enabled workspaces already auto-queue ready backlog
+ * cards (B-9), so the recovery pass is consistent with the mode.
+ */
+export function shouldRunMergedPrStartupRecovery(config: RuntimeConfigState | null): boolean {
+	return (config?.taskDispatchPolicy ?? TASK_DISPATCH_DEFAULT_POLICY).enabled;
+}
+
 const TASK_DISPATCH_LOCK_DIR_NAME = "dispatch";
 
 export interface TaskDispatchSessionStartInput {

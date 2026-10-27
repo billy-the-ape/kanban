@@ -29,8 +29,9 @@
 //
 // The observation flow per merged PR read:
 //   idempotency checks -> card eligibility -> writer check -> reservation ->
-//   worktree checks -> complete the task (board move + dispatch pass) ->
-//   persist completion (binding + terminal stop).
+//   worktree checks -> complete the task (board move) ->
+//   persist completion (binding) -> fire the successor dispatch pass ->
+//   persist the terminal stop.
 import type { GitHubPrMergeCompletion, RuntimeBoardCard, RuntimeBoardColumnId } from "../core/api-contract";
 import { GITHUB_PR_TRACKING_RECORD_SCHEMA_VERSION } from "../core/api-contract";
 import { runGit } from "../workspace/git-utils";
@@ -77,13 +78,23 @@ export interface PrMergeCompletionDeps {
 	/** True when a live writer (terminal process, Cline task session, or review session) exists for the task. */
 	isTaskWriterActive: (workspaceId: string, taskId: string) => Promise<boolean>;
 	/**
-	 * Persistently move the task to Done and fire the dispatch pass for
-	 * waiting children. Must be idempotent (a card already in Done is a
-	 * no-op); called BEFORE the completion is persisted on the binding, so
-	 * a failed move leaves the binding untouched and the bounded
-	 * reconciliation reads retry from scratch.
+	 * Persistently move the task to Done. Must be idempotent (a card already
+	 * in Done is a no-op); called BEFORE the completion is persisted on the
+	 * binding, so a failed move leaves the binding untouched and the bounded
+	 * reconciliation reads retry from scratch. Returns the ids of the linked
+	 * backlog tasks this move released (empty when the move was a no-op) so
+	 * the consumer can hand them off after the completion is persisted.
 	 */
-	completeTask: (workspaceId: string, taskId: string) => Promise<void>;
+	completeTask: (workspaceId: string, taskId: string) => Promise<string[]>;
+	/**
+	 * Fire the merge-completion successor dispatch pass for the released
+	 * children. Called only AFTER the completed binding is persisted:
+	 * merge-based dispatch readiness reads the binding from the store, so a
+	 * pass fired before that write could not see the merge evidence and
+	 * would silently drop the released children. Optional in partial
+	 * harnesses.
+	 */
+	dispatchSuccessors?: (workspaceId: string, taskId: string, readyTaskIds: string[]) => Promise<void>;
 	/**
 	 * Inspect the task worktree's relationship to its base branch. Null when
 	 * the task has no worktree (nothing to reconcile; the base-branch
@@ -415,8 +426,9 @@ export async function reconcileMergeCompletion(
 		// stranded card. A crash after the persist is recovered by the
 		// manual-reopen guard (active column without manualReopenAt re-runs
 		// this idempotent completion).
+		let readyLinkedTaskIds: string[] = [];
 		try {
-			await deps.completeTask(task.workspaceId, task.taskId);
+			readyLinkedTaskIds = await deps.completeTask(task.workspaceId, task.taskId);
 		} catch (error) {
 			warn(`PR merge completion move failed for ${task.taskId}: ${String(error)}`);
 			return { action: "pending", reason: "complete_move_failed" };
@@ -433,6 +445,16 @@ export async function reconcileMergeCompletion(
 		if (!write.ok) {
 			warn(`PR merge completion write failed (${write.reason}); will retry`);
 			return { action: "pending", reason: "completion_write_failed" };
+		}
+		// The successor dispatch pass runs only now, after the completed
+		// binding is persisted: merge-based dispatch readiness reads the
+		// binding from the store, so a pass fired before this write could
+		// not see the merge evidence and would silently drop the released
+		// children.
+		if (deps.dispatchSuccessors) {
+			await deps.dispatchSuccessors(task.workspaceId, task.taskId, readyLinkedTaskIds).catch((error) => {
+				warn(`PR merge completion successor dispatch failed for ${task.taskId}: ${String(error)}`);
+			});
 		}
 		await deps.store.setTaskTerminalStop(prKey, task, {
 			reason: "merged_completed",

@@ -29,6 +29,7 @@ import {
 	reconcileTaskDispatch,
 	releaseTaskFromDispatchQueue,
 	resolveReadyTasks,
+	shouldRunMergedPrStartupRecovery,
 	TASK_DISPATCH_RETRY_CAP,
 	type TaskDispatchDeps,
 	type TaskDispatchSessionSnapshot,
@@ -1202,5 +1203,83 @@ describe("MERGE-1: merge-completion successor handoff", () => {
 		expect(response.dispatchedTaskId).toBeNull();
 		expect(response.skippedReason).toBe("worker_busy");
 		expect(startedTasks).toHaveLength(0);
+	});
+
+	it("never dispatches a ready card outside the candidate list (late-linked card)", async () => {
+		// "late" was linked to an already-merged parent after the fact: it is
+		// ready, but it was not released by the just-completed parent, so the
+		// live handoff (candidates = that parent's readyTaskIds) must skip it
+		// and leave it for a manual start.
+		const board = createBoard({
+			cardsByColumn: {
+				backlog: [createCard("child"), createCard("late")],
+				done: [createCard("parent"), createCard("old-parent")],
+			},
+			dependencies: [
+				createDependency("dep-child-parent", "child", "parent"),
+				createDependency("dep-late-old", "late", "old-parent"),
+			],
+		});
+		const completions = new Map<string, GitHubPrMergeCompletion | null>([
+			["parent", createMergeCompletion("parent")],
+			["old-parent", createMergeCompletion("old-parent")],
+		]);
+		const { deps, startedTasks, getBoard } = createTestDeps({
+			board,
+			mergeCompletions: completions,
+			enabled: false,
+		});
+		const response = await dispatchReadyTasks(deps, { trigger: "merged_pr", candidateTaskIds: ["child"] });
+		expect(response.dispatchedTaskId).toBe("child");
+		expect(startedTasks.map((task) => task.taskId)).toEqual(["child"]);
+		expect(
+			getBoard()
+				.columns.find((column) => column.id === "backlog")
+				?.cards.map((card) => card.id),
+		).toEqual(["late"]);
+	});
+
+	it("keeps a manually parked released child parked on the merged_pr trigger", async () => {
+		const { deps, startedTasks, getBoard } = createTestDeps({
+			board: mergedParentBoard(),
+			mergeCompletions: mergedCompletions(),
+			enabled: false,
+		});
+		// The explicit "return unstarted queued task to Backlog" action parks
+		// the released child; no dispatch pass may relaunch it.
+		await writeTaskDispatchRecord({
+			...dispatchRecordFor("child"),
+			manuallyDeferred: true,
+			error: "parked by the user",
+		});
+		const response = await dispatchReadyTasks(deps, { trigger: "merged_pr", candidateTaskIds: ["child"] });
+		expect(response.dispatchedTaskId).toBeNull();
+		expect(response.skippedReason).toBe("no_ready_tasks");
+		expect(startedTasks).toHaveLength(0);
+		expect(
+			getBoard()
+				.columns.find((column) => column.id === "backlog")
+				?.cards.map((card) => card.id),
+		).toContain("child");
+	});
+});
+
+describe("shouldRunMergedPrStartupRecovery", () => {
+	it("skips workspaces without a task dispatch policy or with it disabled", () => {
+		expect(shouldRunMergedPrStartupRecovery(null)).toBe(false);
+		expect(shouldRunMergedPrStartupRecovery({} as unknown as RuntimeConfigState)).toBe(false);
+		expect(
+			shouldRunMergedPrStartupRecovery({
+				taskDispatchPolicy: { enabled: false, workerLimit: 1 },
+			} as unknown as RuntimeConfigState),
+		).toBe(false);
+	});
+
+	it("runs only for policy-enabled workspaces", () => {
+		expect(
+			shouldRunMergedPrStartupRecovery({
+				taskDispatchPolicy: { enabled: true, workerLimit: 2 },
+			} as unknown as RuntimeConfigState),
+		).toBe(true);
 	});
 });
