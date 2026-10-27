@@ -455,7 +455,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		// repair hook always runs first, so compaction sees a well-formed
 		// history (see cline-interrupted-tool-call-repair.ts).
 		const repairInterruptedToolCallsHook = createClineInterruptedToolCallRepairHook({ logger: sessionLogger });
-		const recoveryHooks = createClineToolFailureRecoveryHooks();
+		const recoveryHooks = createClineToolFailureRecoveryHooks(request.cwd);
 		const editorTraceHooks = createClineEditorTraceHooks(request.taskId, requestedSessionId);
 		const editorLimitHooks = createClineEditorLimitHooks(request.cwd);
 		const compactionHook =

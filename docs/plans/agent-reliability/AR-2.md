@@ -1,6 +1,6 @@
 # AR-2: Give failed edits bounded current-source evidence
 
-Status: planned. One implementation PR into `main`. Dependencies: none.
+Status: implemented. One implementation PR into `main`. Dependencies: none (adds to the AR-1 `{ recovery, output }` envelope shape, which AR-1's classification reads unchanged because it only requires a string `recovery` plus an `output` key).
 Read [README.md](./README.md) and [EVIDENCE.md](./EVIDENCE.md).
 
 ## Outcome
@@ -17,6 +17,53 @@ guessing tab counts or assuming that a parameter was dropped by the harness.
 - `src/cline-sdk/cline-editor-limit.ts`, `sdk-runtime-boundary.ts` and existing SDK
   executor/path contracts; `docs/runtime/editor-recovery.md`.
 - Existing failure-recovery/editor-limit tests under `test/runtime/cline-sdk/`.
+
+## Implementation outcome
+
+Implemented in `src/cline-sdk/cline-editor-evidence.ts` (new),
+`src/cline-sdk/cline-tool-failure-recovery.ts`,
+`src/cline-sdk/cline-session-runtime.ts`, with documentation in
+`docs/runtime/editor-recovery.md`.
+
+- **Evidence collector (`collectEditorEvidence`)**: best-effort, never throws.
+  Reports each parsed editor field's presence/type/length (`old_text` absent is
+  reported as absent in the parsed call); reads the current file only after
+  realpath containment in the task worktree and skips external paths, symlink
+  escapes, non-files, binary files, files over 256 KiB, and unreadable files
+  with a reason, under a hard 5-second I/O timeout. Counts exact occurrences
+  with SDK semantics (`content.split(old_text).length - 1`), and for zero
+  matches returns at most two approximate whitespace-normalized candidate
+  windows (eight surrounding lines each, 6,000 characters total) with
+  per-line leading TAB/space counts and literal backslash-t facts reported
+  distinctly from the source text. Never echoes `new_text`. Carries an ISO
+  `readAt` timestamp and, for an unchanged repeated failure, the relevant
+  unchanged fields.
+- **Recovery envelope**: for classified editor input defects, the afterTool
+  envelope becomes `{ recovery, evidence, output }` — additive over AR-1's
+  `{ recovery, output }` (AR-1's classification still matches). The `recovery`
+  text uses only the sentence matching the measured condition with actual
+  facts substituted (0-match wording only when a window exists; otherwise a
+  targeted `read_files` request; skip reasons surfaced when the file could not
+  be read). The repeated-failure prefix is replaced by the plan's
+  "repeats the earlier failed arguments" sentence. Timeouts keep their existing
+  recovery without evidence; denials never reach the evidence path (no hidden
+  read). Guard thresholds, replay semantics, approvals, and result pairing are
+  unchanged; no edit is replayed or rewritten.
+- **Runtime wiring**: `createClineToolFailureRecoveryHooks(request.cwd)` in
+  `cline-session-runtime.ts` scopes the evidence read to the task worktree;
+  the trace hook still records the original result before recovery, and the
+  result-bounding hook still bounds the envelope with the compact explanation
+  first.
+- **Verification**: `test/runtime/cline-sdk/cline-editor-evidence.test.ts`
+  (unit matrix: exact counts, wrong tabs, literal backslash-t, multi-line
+  spans, no-candidate, field facts, repeated fields, external/symlink/binary/
+  oversized/missing/directory/unreadable skips, CRLF, Unicode, window bounds,
+  stale source); `test/runtime/cline-sdk/cline-editor-limit.test.ts` (real SDK
+  tool + loop: evidence delivery, byte-identical files, three-failure guard);
+  `test/runtime/cline-sdk/cline-tool-failure-recovery.test.ts` (scripted loop
+  with evidence, bounding enabled with 48 KB failure output, no read after
+  denial, timeout recovery without evidence). Backend typecheck and the
+  focused suites pass; changed files formatted.
 
 ## Required implementation
 
