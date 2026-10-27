@@ -1924,6 +1924,14 @@ export const runtimeTaskDispatchPrerequisiteSchema = z.object({
 	taskCommitSha: z.string().nullable(),
 	/** null when the prerequisite has no durable delivery receipt yet. */
 	deliveryStatus: runtimeGitDeliveryStatusSchema.nullable(),
+	/**
+	 * MERGE-1: the landed merge commit when the prerequisite was completed by a
+	 * confirmed GitHub PR merge (null when it was not). Verified baseline
+	 * ancestry must contain this commit; it is the squash/rebase-safe landed
+	 * commit, never the original PR head. Defaulted so pre-MERGE-1 persisted
+	 * records (which predate the field) still parse on upgrade.
+	 */
+	mergeCommitSha: z.string().nullable().default(null),
 });
 export type RuntimeTaskDispatchPrerequisite = z.infer<typeof runtimeTaskDispatchPrerequisiteSchema>;
 
