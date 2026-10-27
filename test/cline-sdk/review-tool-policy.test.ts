@@ -392,4 +392,59 @@ describe("createReviewToolPolicy — validation_job gating (AR-3)", () => {
 		expect(result.approved).toBe(true);
 		expect(delegated).toEqual(["validation_job"]);
 	});
+
+	it("denies shell -c payloads that carry publication commands (run_commands parity)", async () => {
+		// A shell -c payload is one opaque argv element; it must be scanned as
+		// a command string so a publication command rejected via run_commands
+		// stays rejected through validation_job.
+		const policy = createPolicy();
+		const gitPush = await policy(
+			makeRequest("validation_job", {
+				action: "start",
+				command: "sh",
+				args: ["-c", "git push origin HEAD"],
+			}),
+		);
+		expect(gitPush.approved).toBe(false);
+		expect(gitPush.reason).toMatch(/git push/);
+		const ghCreate = await policy(
+			makeRequest("validation_job", {
+				action: "start",
+				command: "bash",
+				args: ["-c", "gh pr create --title x"],
+			}),
+		);
+		expect(ghCreate.approved).toBe(false);
+		expect(ghCreate.reason).toMatch(/gh pr create/);
+		// Absolute-path shells are matched by basename.
+		const absShell = await policy(
+			makeRequest("validation_job", {
+				action: "start",
+				command: "/bin/bash",
+				args: ["-c", "git push origin main"],
+			}),
+		);
+		expect(absShell.approved).toBe(false);
+	});
+
+	it("delegates benign shell -c payloads and script-file runs", async () => {
+		const delegated: string[] = [];
+		const policy = createReviewToolPolicy({
+			worktreePath: WORKTREE,
+			allowedWritePaths: ALLOWED_WRITE_PATHS,
+			delegate: async (request) => {
+				delegated.push(request.toolName);
+				return { approved: true };
+			},
+		});
+		const payload = await policy(
+			makeRequest("validation_job", { action: "start", command: "sh", args: ["-c", "npm test"] }),
+		);
+		expect(payload.approved).toBe(true);
+		const script = await policy(
+			makeRequest("validation_job", { action: "start", command: "sh", args: ["script.sh"] }),
+		);
+		expect(script.approved).toBe(true);
+		expect(delegated).toEqual(["validation_job", "validation_job"]);
+	});
 });

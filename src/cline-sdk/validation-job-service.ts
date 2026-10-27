@@ -622,9 +622,17 @@ export class ValidationJobService {
 			if (live && live.record.jobId === record.jobId) {
 				continue;
 			}
-			record.state = "interrupted";
-			record.endedAt = new Date().toISOString();
-			await this.writeRecord(record).catch(() => undefined);
+			// Re-read just before writing: a previous session's un-awaited
+			// settle (e.g. the ended-session handler) may finish between the
+			// scan and the write, and its final status (with artifactPath)
+			// must not be clobbered by an interrupted classification.
+			const fresh = await this.readRecord(entry.slice(0, -".json".length));
+			if (!fresh || fresh.state !== "running") {
+				continue;
+			}
+			fresh.state = "interrupted";
+			fresh.endedAt = new Date().toISOString();
+			await this.writeRecord(fresh).catch(() => undefined);
 		}
 	}
 

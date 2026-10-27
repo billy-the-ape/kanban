@@ -319,6 +319,32 @@ function buildValidationJobArgv(input: Record<string, unknown>): string[] | null
 	return tokens === null ? null : [command, ...tokens];
 }
 
+/** Command basenames whose `-c` argument carries a full command payload. */
+const SHELL_COMMAND_BASENAMES = new Set(["sh", "bash", "zsh", "dash", "ksh"]);
+
+/**
+ * Finds the `-c` payload of a shell invocation (`sh -c <payload>`, simple
+ * flags skipped), or null when the argv is not a shell `-c` invocation
+ * (script-file runs carry no inline command to scan).
+ */
+function findShellCPayload(argv: string[]): string | null {
+	const command = argv[0] ?? "";
+	if (!SHELL_COMMAND_BASENAMES.has(command.split("/").pop() ?? "")) {
+		return null;
+	}
+	for (let i = 1; i < argv.length; i += 1) {
+		const token = argv[i] ?? "";
+		if (token === "-c") {
+			return argv[i + 1] ?? null;
+		}
+		if (token.startsWith("-") && token.length > 1) {
+			continue;
+		}
+		return null;
+	}
+	return null;
+}
+
 /** Scans a structured argv for commands forbidden in review sessions. */
 function findDeniedReviewArgv(argv: string[]): string | null {
 	const git = locateGitSubcommand(argv);
@@ -329,6 +355,14 @@ function findDeniedReviewArgv(argv: string[]): string | null {
 	const ghDenial = checkGhInvocation(argv);
 	if (ghDenial) {
 		return ghDenial;
+	}
+	// A shell `-c` payload is one opaque argv element; scan it as a command
+	// string so a publication command rejected via run_commands stays
+	// rejected through this path too (parity guarantee).
+	const shellPayload = findShellCPayload(argv);
+	const shellDenial = shellPayload ? findDeniedReviewCommand(shellPayload) : null;
+	if (shellDenial) {
+		return shellDenial;
 	}
 	if (isDestructiveRemoval(argv)) {
 		return "removing the .git directory or the worktree itself (rm -rf) is not allowed in review sessions.";

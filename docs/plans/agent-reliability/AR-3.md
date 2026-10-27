@@ -148,6 +148,13 @@ Notes and follow-ups:
   the tool's "NOT complete" note). The spool is only removed after the final record is
   published and the live slot released, so a reader racing settlement always sees the
   spool (running) or the archive (settled), never an empty "end of retained log" page.
+- Review hardening, round 4 (PR feedback): shell `-c` payloads in a `validation_job`
+  start (`sh`/`bash`/`zsh`/`dash`/`ksh`, matched by basename, simple flags skipped) are
+  scanned as command strings so a publication command rejected via `run_commands` stays
+  rejected through `validation_job` (parity guarantee). Orphan adoption re-reads each
+  retained record immediately before writing, so a previous session's un-awaited settle
+  (the ended-session handler's `cancelAllJobs`) can no longer be clobbered by an
+  `interrupted` reclassification that would drop the `artifactPath`.
 - The job status is not yet surfaced in the task diagnostics export (B-3); the scope boundary
   excludes a new tRPC control API, so the diagnostics wiring lands as a follow-up.
 - Killing covers the owned process group (POSIX) or child (Windows); daemonized grandchildren

@@ -587,6 +587,70 @@ describe("ValidationJobService review hardening", () => {
 		expect(page?.text).toContain("validation job log incomplete");
 	});
 
+	it("does not reclassify a record that settled between the adoption scan and write", async () => {
+		// The ended-session handler fires cancelAllJobs without awaiting; a
+		// replacement service's adoption must not clobber the final status (and
+		// artifactPath) that settle writes between the scan and the pre-write
+		// re-read.
+		const jobId = "f47ac10d-58cc-4372-a567-0e02b2c3d479";
+		const record: ValidationJobRecord = {
+			schemaVersion: VALIDATION_JOB_SCHEMA_VERSION,
+			taskId: "task-ar3",
+			sessionId: "session-ar3",
+			jobId,
+			toolCallId: "call-adopt-race",
+			command: "node",
+			args: ["-e", "1"],
+			cwd: "",
+			startedAt: new Date().toISOString(),
+			endedAt: null,
+			state: "running",
+			exitCode: null,
+			signal: null,
+			timedOut: false,
+			canceled: false,
+			logTruncated: false,
+			logBytesRetained: 0,
+			logBytesOmitted: 0,
+			artifactPath: null,
+		};
+		await mkdir(taskDir, { recursive: true });
+		await writeFile(join(taskDir, `${jobId}.json`), JSON.stringify(record));
+		const service = createService();
+		const target = service as unknown as {
+			readRecord: (id: string) => Promise<ValidationJobRecord | null>;
+			writeRecord: (rec: ValidationJobRecord) => Promise<void>;
+		};
+		const originalRead = target.readRecord.bind(target);
+		let readCalls = 0;
+		target.readRecord = (id: string) => {
+			readCalls += 1;
+			if (readCalls === 1) {
+				return originalRead(id); // The scan sees the record still running.
+			}
+			// A competing settle lands between the scan and the pre-write re-read.
+			return Promise.resolve({
+				...record,
+				endedAt: new Date().toISOString(),
+				state: "canceled",
+				canceled: true,
+				artifactPath: join(homeDir, "artifact.txt"),
+			});
+		};
+		const writes: ValidationJobRecord[] = [];
+		const originalWrite = target.writeRecord.bind(target);
+		target.writeRecord = (rec: ValidationJobRecord) => {
+			writes.push(rec);
+			return originalWrite(rec);
+		};
+		await service.initialize();
+		expect(readCalls).toBeGreaterThanOrEqual(2);
+		expect(writes).toEqual([]);
+		const settled = await service.getJob(jobId);
+		expect(settled?.state).toBe("canceled");
+		expect(settled?.artifactPath).toBe(join(homeDir, "artifact.txt"));
+	});
+
 	it("never returns an empty complete page while settlement is in flight", async () => {
 		// While the archive is held, the settle window spans ~150ms: a reader
 		// must always see the spool (job running) or the archive (job settled),
