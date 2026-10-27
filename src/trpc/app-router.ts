@@ -413,6 +413,17 @@ export interface RuntimeTrpcContext {
 		) => Promise<RuntimeTaskQualitySummaryResponse>;
 		/** B-9: backend-owned sequential task dispatch — run one queue pass for this workspace. */
 		dispatchReadyTasks: (scope: RuntimeTrpcWorkspaceScope) => Promise<RuntimeTaskDispatchRunResponse>;
+		/**
+		 * MERGE-1: successor handoff — dispatch the backlog dependents of a
+		 * merge-completed task. Runs even when the task dispatch policy is
+		 * disabled; candidateTaskIds restricts the pass to the completed
+		 * parent's direct linked dependents (null → derived from readiness).
+		 * Internal (not a tRPC procedure): the browser never launches these.
+		 */
+		dispatchMergedPrSuccessors: (
+			scope: RuntimeTrpcWorkspaceScope,
+			candidateTaskIds: readonly string[] | null,
+		) => Promise<RuntimeTaskDispatchRunResponse>;
 		/** B-9: read-only queue status (ready/blocked tasks, active worker, dispatch records). */
 		getDispatchStatus: (scope: RuntimeTrpcWorkspaceScope) => Promise<RuntimeTaskDispatchStatusResponse>;
 		/** B-9.6: restart reconciliation — relaunch dispatched tasks that lost their session. */

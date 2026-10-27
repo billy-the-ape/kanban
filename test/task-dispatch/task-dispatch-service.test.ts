@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { baseTaskIdForReviewSessionId } from "../../src/cline-sdk/cline-review-session-service";
 import type { RuntimeConfigState } from "../../src/config/runtime-config";
 import type {
+	GitHubPrMergeCompletion,
 	RuntimeAgentId,
 	RuntimeBoardCard,
 	RuntimeBoardColumnId,
@@ -150,12 +151,36 @@ function createReceipt(
 interface CreateTestDepsOptions {
 	board?: RuntimeBoardData;
 	receipts?: Map<string, RuntimeGitDeliveryReceipt | null>;
+	mergeCompletions?: Map<string, GitHubPrMergeCompletion | null>;
 	sessions?: TaskDispatchSessionSnapshot[];
 	enabled?: boolean;
 	deliveryEnabled?: boolean;
 	workerLimit?: number;
 	startSessionError?: string;
 	prepareWorktree?: TaskDispatchDeps["prepareWorktree"];
+}
+
+/** A confirmed-merge completion binding on a task (MERGE-1 receipt). */
+function createMergeCompletion(
+	taskId: string,
+	status: GitHubPrMergeCompletion["status"] = "completed",
+): GitHubPrMergeCompletion {
+	return {
+		schemaVersion: 1,
+		workspaceId: WORKSPACE_ID,
+		taskId,
+		linkGeneration: 1,
+		prKey: `github|github.com|acme/repo|7-${taskId}`,
+		finalHeadSha: `h-${taskId}`,
+		baseRepository: `github.com|acme|repo`,
+		baseRef: "main",
+		mergeCommitSha: status === "completed" ? `m-${taskId}` : null,
+		mergedAt: status === "completed" ? 2 : null,
+		observedAt: 2,
+		status,
+		completedAt: status === "completed" ? 2 : null,
+		error: status === "blocked" ? `block-${taskId}` : null,
+	};
 }
 
 function createTestDeps(options: CreateTestDepsOptions = {}) {
@@ -177,6 +202,7 @@ function createTestDeps(options: CreateTestDepsOptions = {}) {
 		},
 		listSessions: () => Promise.resolve(options.sessions ?? []),
 		readReceipt: (taskId) => Promise.resolve(receipts.get(taskId) ?? null),
+		readMergeCompletion: (taskId) => Promise.resolve(options.mergeCompletions?.get(taskId) ?? null),
 		startSession: async (input) => {
 			startedTasks.push(input);
 			if (options.startSessionError) {
@@ -204,7 +230,11 @@ function createTestDeps(options: CreateTestDepsOptions = {}) {
 	};
 }
 
-function readinessInputFor(board: RuntimeBoardData, receipts: Map<string, RuntimeGitDeliveryReceipt | null>) {
+function readinessInputFor(
+	board: RuntimeBoardData,
+	receipts: Map<string, RuntimeGitDeliveryReceipt | null>,
+	mergeCompletions: Map<string, GitHubPrMergeCompletion | null> = new Map(),
+) {
 	const columnIdFor = (taskId: string): RuntimeBoardColumnId | null => {
 		for (const column of board.columns) {
 			if (column.cards.some((card) => card.id === taskId)) {
@@ -219,6 +249,7 @@ function readinessInputFor(board: RuntimeBoardData, receipts: Map<string, Runtim
 		prereqStatus: (taskId: string) => ({
 			columnId: columnIdFor(taskId),
 			receipt: receipts.get(taskId) ?? null,
+			mergeCompletion: mergeCompletions.get(taskId) ?? null,
 		}),
 	};
 }
@@ -613,8 +644,15 @@ describe("buildFreshDispatchPrompt", () => {
 					integratedSha: "a".repeat(40),
 					taskCommitSha: "c".repeat(40),
 					deliveryStatus: "delivered",
+					mergeCommitSha: null,
 				},
-				{ taskId: "task-n", integratedSha: null, taskCommitSha: null, deliveryStatus: "no_op" },
+				{
+					taskId: "task-n",
+					integratedSha: null,
+					taskCommitSha: null,
+					deliveryStatus: "no_op",
+					mergeCommitSha: null,
+				},
 			],
 			titleByTaskId: { "task-a": "Prepare the base", "task-n": "No changes" },
 		});
@@ -1036,5 +1074,133 @@ describe("getTaskDispatchStatus", () => {
 		expect(status.blockedTasks.map((view) => view.taskId)).toEqual(["c"]);
 		expect(status.blockedTasks[0]?.blockedReason).toContain("not done");
 		expect(status.records.map((record) => record.taskId)).toEqual(["w"]);
+	});
+});
+
+describe("MERGE-1: merge-completion successor handoff", () => {
+	// A parent completed by PR merge (done, no delivery receipt, confirmed
+	// merge binding) plus a receipt-delivered parent and one unrelated card.
+	const mergedParentBoard = () =>
+		createBoard({
+			cardsByColumn: {
+				backlog: [createCard("child"), createCard("unrelated")],
+				done: [createCard("parent"), createCard("delivered-parent")],
+			},
+			dependencies: [
+				createDependency("dep-child-parent", "child", "parent"),
+				createDependency("dep-unrelated-dp", "unrelated", "delivered-parent"),
+			],
+		});
+	const mergedCompletions = () =>
+		new Map<string, GitHubPrMergeCompletion | null>([["parent", createMergeCompletion("parent")]]);
+
+	it("treats a done prerequisite with a completed merge binding as satisfied", () => {
+		const result = resolveReadyTasks(readinessInputFor(mergedParentBoard(), new Map(), mergedCompletions()));
+		const child = findEntry(result, "child");
+		expect(child.ready).toBe(true);
+		expect(child.prerequisites).toEqual([
+			{
+				taskId: "parent",
+				integratedSha: null,
+				taskCommitSha: null,
+				deliveryStatus: null,
+				mergeCommitSha: "m-parent",
+			},
+		]);
+	});
+
+	it("does not satisfy a prerequisite whose merge is still pending", () => {
+		const result = resolveReadyTasks(
+			readinessInputFor(
+				mergedParentBoard(),
+				new Map(),
+				new Map<string, GitHubPrMergeCompletion | null>([["parent", createMergeCompletion("parent", "pending")]]),
+			),
+		);
+		const child = findEntry(result, "child");
+		expect(child.ready).toBe(false);
+		expect((child as { code: string }).code).toBe("prerequisite_delivery_missing");
+	});
+
+	it("dispatches the merge-released child even when the dispatch policy is disabled", async () => {
+		const { deps, startedTasks, getBoard } = createTestDeps({
+			board: mergedParentBoard(),
+			mergeCompletions: mergedCompletions(),
+			enabled: false,
+			deliveryEnabled: false,
+		});
+		const response = await dispatchReadyTasks(deps, { trigger: "merged_pr", candidateTaskIds: ["child"] });
+		expect(response.dispatchedTaskId).toBe("child");
+		expect(startedTasks).toHaveLength(1);
+		expect(startedTasks[0]?.taskId).toBe("child");
+		// The landed merge commit (not the PR head) is handed off in the prompt.
+		expect(startedTasks[0]?.prompt).toContain("its PR merged at m-parent");
+		// Unrelated backlog cards stay put.
+		expect(
+			getBoard()
+				.columns.find((column) => column.id === "backlog")
+				?.cards.map((card) => card.id),
+		).toEqual(["unrelated"]);
+	});
+
+	it("never dispatches receipt-completed backlog cards on the merged_pr trigger", async () => {
+		const { deps, startedTasks, getBoard } = createTestDeps({
+			board: mergedParentBoard(),
+			receipts: new Map<string, RuntimeGitDeliveryReceipt | null>([
+				["delivered-parent", createReceipt("delivered-parent", "delivered")],
+			]),
+			mergeCompletions: mergedCompletions(),
+			enabled: false,
+		});
+		// Both children are ready (one via merge, one via receipt); only the
+		// merge-released one may be launched by this trigger.
+		const response = await dispatchReadyTasks(deps, { trigger: "merged_pr" });
+		expect(response.dispatchedTaskId).toBe("child");
+		expect(startedTasks.map((task) => task.taskId)).toEqual(["child"]);
+		expect(
+			getBoard()
+				.columns.find((column) => column.id === "backlog")
+				?.cards.map((card) => card.id),
+		).toEqual(["unrelated"]);
+	});
+
+	it("limits merged_pr candidates to the provided task ids", async () => {
+		const { deps, startedTasks } = createTestDeps({
+			board: mergedParentBoard(),
+			mergeCompletions: mergedCompletions(),
+			enabled: false,
+		});
+		const response = await dispatchReadyTasks(deps, { trigger: "merged_pr", candidateTaskIds: ["unrelated"] });
+		expect(response.dispatchedTaskId).toBeNull();
+		expect(response.skippedReason).toBe("no_ready_tasks");
+		expect(startedTasks).toHaveLength(0);
+	});
+
+	it("also dispatches merge-released children through the default pass when enabled", async () => {
+		const { deps, startedTasks } = createTestDeps({
+			board: mergedParentBoard(),
+			mergeCompletions: mergedCompletions(),
+			enabled: true,
+			deliveryEnabled: false,
+		});
+		const response = await dispatchReadyTasks(deps);
+		// workerLimit 1: the first ready backlog card (board order) dispatches.
+		expect(response.dispatchedTaskId).toBe("child");
+		expect(startedTasks.map((task) => task.taskId)).toEqual(["child"]);
+	});
+
+	it("keeps the worker slot limit on the merged_pr trigger", async () => {
+		const board = mergedParentBoard();
+		board.columns.find((column) => column.id === "in_progress")?.cards.push(createCard("busy"));
+		const { deps, startedTasks } = createTestDeps({
+			board,
+			mergeCompletions: mergedCompletions(),
+			enabled: false,
+			sessions: [liveSession("busy")],
+		});
+		const response = await dispatchReadyTasks(deps, { trigger: "merged_pr", candidateTaskIds: ["child"] });
+		expect(response.dispatchedTaskId).toBeNull();
+		expect(response.skippedReason).toBe("worker_busy");
+		expect(startedTasks).toHaveLength(0);
 	});
 });

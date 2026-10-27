@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { baseTaskIdForReviewSessionId } from "../cline-sdk/cline-review-session-service";
 import type { RuntimeConfigState } from "../config/runtime-config";
 import type {
+	GitHubPrMergeCompletion,
 	RuntimeBoardCard,
 	RuntimeBoardColumnId,
 	RuntimeBoardData,
@@ -120,6 +121,13 @@ export interface TaskDispatchDeps {
 	listSessions: () => Promise<TaskDispatchSessionSnapshot[]>;
 	/** Read a task's durable delivery receipt (null when absent). */
 	readReceipt: (taskId: string) => Promise<RuntimeGitDeliveryReceipt | null>;
+	/**
+	 * MERGE-1: read the task's latest confirmed-merge completion binding (the
+	 * authoritative merge receipt; null when the task was not completed by a
+	 * confirmed PR merge). Absent in partial harnesses: readiness then falls
+	 * back to delivery receipts only.
+	 */
+	readMergeCompletion?: (taskId: string) => Promise<GitHubPrMergeCompletion | null>;
 	/** Start a fresh task session (agent/model resolution happens inside). */
 	startSession: (input: TaskDispatchSessionStartInput) => Promise<TaskDispatchSessionStartResult>;
 	/** Worktree creation/verification (injectable for tests). */
@@ -169,6 +177,8 @@ export interface TaskDispatchReadinessInput {
 	prereqStatus: (taskId: string) => {
 		columnId: RuntimeBoardColumnId | null;
 		receipt: RuntimeGitDeliveryReceipt | null;
+		/** MERGE-1: the prerequisite's confirmed-merge completion (null when not merge-completed). */
+		mergeCompletion: GitHubPrMergeCompletion | null;
 	} | null;
 }
 
@@ -220,10 +230,18 @@ function blockedReasonOf(entry: TaskDispatchReadiness): string | null {
 }
 
 function extractRequiredAncestors(prerequisites: RuntimeTaskDispatchPrerequisite[]): string[] {
-	return prerequisites
-		.filter((prereq) => prereq.deliveryStatus === "delivered")
-		.map((prereq) => prereq.integratedSha)
-		.filter((sha): sha is string => Boolean(sha));
+	const ancestors: string[] = [];
+	for (const prereq of prerequisites) {
+		if (prereq.deliveryStatus === "delivered" && prereq.integratedSha) {
+			ancestors.push(prereq.integratedSha);
+		}
+		// MERGE-1: a merge-completed prerequisite pins the landed merge commit
+		// (the squash/rebase-safe commit that actually entered the base).
+		if (prereq.mergeCommitSha) {
+			ancestors.push(prereq.mergeCommitSha);
+		}
+	}
+	return ancestors;
 }
 
 function getTaskDispatchLockRequest(workspaceId: string) {
@@ -268,12 +286,17 @@ function resolveTaskReadiness(card: RuntimeBoardCard, input: TaskDispatchReadine
 	for (const prereqId of prereqIds) {
 		const status = input.prereqStatus(prereqId);
 		const receipt = status?.receipt && status.receipt.workspaceId === input.workspaceId ? status.receipt : null;
+		const mergeCompletion =
+			status?.mergeCompletion && status.mergeCompletion.workspaceId === input.workspaceId
+				? status.mergeCompletion
+				: null;
 		columnIds.set(prereqId, status?.columnId ?? null);
 		prerequisites.push({
 			taskId: prereqId,
 			integratedSha: receipt?.integratedSha ?? null,
 			taskCommitSha: receipt?.taskCommitSha ?? null,
 			deliveryStatus: receipt?.status ?? null,
+			mergeCommitSha: mergeCompletion?.status === "completed" ? mergeCompletion.mergeCommitSha : null,
 		});
 	}
 	const blocked = (code: TaskDispatchReadinessCode, reason: string): TaskDispatchReadiness => ({
@@ -299,6 +322,12 @@ function resolveTaskReadiness(card: RuntimeBoardCard, input: TaskDispatchReadine
 			);
 		}
 		if (!prereq.deliveryStatus) {
+			// MERGE-1: a confirmed-merge completion is a first-class
+			// prerequisite receipt — no legacy delivery receipt is fabricated.
+			// The landed merge commit enters the required-ancestor check below.
+			if (prereq.mergeCommitSha !== null) {
+				continue;
+			}
 			const hint =
 				input.deliveryEnabled === false
 					? " Deterministic delivery (gitDeliveryPolicy) is disabled, so no receipt will be written; enable it to use the task queue."
@@ -334,9 +363,16 @@ async function buildReadinessInput(
 		prereqIds.add(dependency.toTaskId);
 	}
 	const receipts = new Map<string, RuntimeGitDeliveryReceipt | null>();
+	// MERGE-1: merge-completion bindings are an alternative to delivery
+	// receipts, so they are loaded for the same prerequisite set.
+	const mergeCompletions = new Map<string, GitHubPrMergeCompletion | null>();
 	await Promise.all(
 		[...prereqIds].map(async (taskId) => {
 			receipts.set(taskId, await deps.readReceipt(taskId).catch(() => null));
+			mergeCompletions.set(
+				taskId,
+				await (deps.readMergeCompletion?.(taskId) ?? Promise.resolve(null)).catch(() => null),
+			);
 		}),
 	);
 	return {
@@ -346,6 +382,7 @@ async function buildReadinessInput(
 		prereqStatus: (taskId) => ({
 			columnId: getTaskColumnId(board, taskId),
 			receipt: receipts.get(taskId) ?? null,
+			mergeCompletion: mergeCompletions.get(taskId) ?? null,
 		}),
 	};
 }
@@ -564,14 +601,21 @@ export function buildFreshDispatchPrompt(options: {
 	const taskPrompt = options.task.prompt?.trim();
 	const prereqLines = options.prerequisites.map((prereq) => {
 		const prereqTitle = options.titleByTaskId?.[prereq.taskId] ?? prereq.taskId;
+		let description: string;
 		if (prereq.deliveryStatus === "delivered" && prereq.integratedSha) {
 			const commit = prereq.taskCommitSha ? ` (task commit ${prereq.taskCommitSha.slice(0, 12)})` : "";
-			return `- "${prereqTitle}": delivered and integrated at ${prereq.integratedSha}${commit}.`;
+			description = `delivered and integrated at ${prereq.integratedSha}${commit}`;
+		} else if (prereq.deliveryStatus === "no_op") {
+			description = "completed with no changes (no-op delivery)";
+		} else {
+			description = `delivered (${prereq.deliveryStatus ?? "unknown"})`;
 		}
-		if (prereq.deliveryStatus === "no_op") {
-			return `- "${prereqTitle}": completed with no changes (no-op delivery).`;
+		// MERGE-1: merge-completed prerequisites hand off the landed merge
+		// commit (verified against this baseline), not the original PR head.
+		if (prereq.mergeCommitSha) {
+			description += `; its PR merged at ${prereq.mergeCommitSha}`;
 		}
-		return `- "${prereqTitle}": delivered (${prereq.deliveryStatus ?? "unknown"}).`;
+		return `- "${prereqTitle}": ${description}.`;
 	});
 	const prereqSection = prereqLines.length > 0 ? prereqLines.join("\n") : "- None — this task has no prerequisites.";
 	const promptBody =
@@ -735,16 +779,42 @@ async function dispatchSingleTask(
 }
 
 /**
+ * MERGE-1: options for a merge-completion-triggered queue pass.
+ */
+export interface TaskDispatchPassOptions {
+	/**
+	 * Runs even when the task dispatch policy is disabled. Only ready
+	 * candidates that owe their readiness to at least one prerequisite
+	 * completed by a confirmed PR merge are dispatched; unrelated backlog
+	 * cards are never launched by this trigger.
+	 */
+	trigger?: "merged_pr";
+	/**
+	 * Restrict candidates to these task ids (the direct linked dependents of
+	 * the just-completed task). When omitted, candidates are derived from the
+	 * readiness result itself.
+	 */
+	candidateTaskIds?: readonly string[];
+}
+
+/**
  * B-9.1/B-9.3: run one queue pass. Serialized per workspace by a dedicated
  * lock so concurrent triggers (board save, delivery, session stop) cannot
  * double-dispatch. Dispatches up to the free worker slots, in backlog order.
  */
-export async function dispatchReadyTasks(deps: TaskDispatchDeps): Promise<RuntimeTaskDispatchRunResponse> {
+export async function dispatchReadyTasks(
+	deps: TaskDispatchDeps,
+	options?: TaskDispatchPassOptions,
+): Promise<RuntimeTaskDispatchRunResponse> {
 	const config = await deps.loadConfig();
 	const policy = config.taskDispatchPolicy ?? TASK_DISPATCH_DEFAULT_POLICY;
+	const mergedPrTrigger = options?.trigger === "merged_pr";
 	// A disabled policy is a true no-op: no lock, no state directories, no
 	// readiness work — the browser keeps its legacy local auto-start behavior.
-	if (!policy.enabled) {
+	// MERGE-1: only the merged_pr trigger bypasses the gate — the runtime owns
+	// the successor handoff even without the reliable queue or deterministic
+	// delivery, and it launches only merge-released candidates.
+	if (!policy.enabled && !mergedPrTrigger) {
 		return {
 			dispatchedTaskId: null,
 			skippedReason: "disabled",
@@ -759,9 +829,21 @@ export async function dispatchReadyTasks(deps: TaskDispatchDeps): Promise<Runtim
 			await Promise.all(readiness.map((entry) => readTaskDispatchRecord(entry.taskId)))
 		).filter((record): record is RuntimeTaskDispatchRecord => record?.manuallyDeferred === true);
 		const deferredById = new Map(deferredRecords.map((record) => [record.taskId, record]));
-		const readyEntries = readiness.filter(
+		let readyEntries = readiness.filter(
 			(entry): entry is ReadyEntry => entry.ready && !deferredById.has(entry.taskId),
 		);
+		if (mergedPrTrigger) {
+			// MERGE-1: candidate gate — a candidate is a ready backlog card
+			// whose readiness owes at least one prerequisite to a confirmed
+			// merge completion (optionally restricted to the completed
+			// parent's direct linked dependents).
+			const candidateIds = options?.candidateTaskIds !== undefined ? new Set(options.candidateTaskIds) : null;
+			readyEntries = readyEntries.filter(
+				(entry) =>
+					(candidateIds === null || candidateIds.has(entry.taskId)) &&
+					entry.prerequisites.some((prereq) => prereq.mergeCommitSha !== null),
+			);
+		}
 		const blockedViews: RuntimeTaskDispatchTaskView[] = readiness
 			.filter((entry) => !entry.ready || deferredById.has(entry.taskId))
 			.map((entry) => toTaskView(board, entry, deferredById.get(entry.taskId)?.error ?? blockedReasonOf(entry)));

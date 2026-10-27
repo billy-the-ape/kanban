@@ -24,6 +24,7 @@ import type { ClineTurnPreparation } from "../cline-sdk/cline-turn-preparation";
 import type { RuntimeConfigState } from "../config/runtime-config";
 import { updateGlobalRuntimeConfig, updateRuntimeConfig } from "../config/runtime-config";
 import type {
+	GitHubPrMergeCompletion,
 	RuntimeCommandRunResponse,
 	RuntimeEffectiveContextWindow,
 	RuntimeGitDeliveryReceipt,
@@ -174,6 +175,13 @@ export interface CreateRuntimeApiDependencies {
 		scope: RuntimeTrpcWorkspaceScope,
 		taskId: string,
 	) => Promise<{ busy: boolean; reason: string | null }>;
+	/**
+	 * MERGE-1: completed merge-completion bindings per task in this workspace
+	 * (taskId → latest completed binding). Feeds dispatch readiness with merge
+	 * evidence as an alternative to delivery receipts. Optional in partial
+	 * harnesses: readiness then falls back to delivery receipts only.
+	 */
+	getCompletedMergeCompletions?: (scope: RuntimeTrpcWorkspaceScope) => Promise<Map<string, GitHubPrMergeCompletion>>;
 }
 
 /**
@@ -645,6 +653,10 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 	};
 
 	const buildTaskDispatchDeps = (workspaceScope: RuntimeTrpcWorkspaceScope): TaskDispatchDeps => {
+		// MERGE-1: per-pass cache of the workspace's completed merge-completion
+		// bindings — readiness loads every prerequisite in one parallel batch,
+		// so the store is read at most once per queue pass.
+		let mergeCompletionCache: Promise<Map<string, GitHubPrMergeCompletion>> | null = null;
 		return {
 			workspaceId: workspaceScope.workspaceId,
 			workspacePath: workspaceScope.workspacePath,
@@ -669,6 +681,19 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				});
 			},
 			readReceipt: (taskId) => readTaskDeliveryReceipt(taskId),
+			// MERGE-1: completed merge bindings are an alternative to delivery
+			// receipts for successor readiness.
+			readMergeCompletion: async (taskId) => {
+				if (!deps.getCompletedMergeCompletions) {
+					return null;
+				}
+				if (mergeCompletionCache === null) {
+					mergeCompletionCache = deps
+						.getCompletedMergeCompletions(workspaceScope)
+						.catch(() => new Map<string, GitHubPrMergeCompletion>());
+				}
+				return (await mergeCompletionCache).get(taskId) ?? null;
+			},
 			startSession: async ({ taskId, baseRef, prompt, taskTitle }) => {
 				const request: RuntimeTaskSessionStartRequest = {
 					taskId,
@@ -1361,6 +1386,15 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		// B-9: backend-owned sequential task dispatch ("reliable queue").
 		dispatchReadyTasks: async (workspaceScope) => {
 			return await runTaskDispatchPass(buildTaskDispatchDeps(workspaceScope));
+		},
+		// MERGE-1: successor handoff — run the queue pass for the backlog
+		// dependents of a merge-completed task. Runs even when the task
+		// dispatch policy is disabled; never launches unrelated backlog cards.
+		dispatchMergedPrSuccessors: async (workspaceScope, candidateTaskIds) => {
+			return await runTaskDispatchPass(buildTaskDispatchDeps(workspaceScope), {
+				trigger: "merged_pr",
+				candidateTaskIds: candidateTaskIds ?? undefined,
+			});
 		},
 		getDispatchStatus: async (workspaceScope) => {
 			return await getTaskDispatchStatus(buildTaskDispatchDeps(workspaceScope));

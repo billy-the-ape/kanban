@@ -17,6 +17,7 @@ import {
 } from "../cline-sdk/cline-task-session-service";
 import { createClineWatcherRegistry } from "../cline-sdk/cline-watcher-registry";
 import type {
+	GitHubPrMergeCompletion,
 	RuntimeAgentId,
 	RuntimeCommandRunResponse,
 	RuntimeRunUpdateResponse,
@@ -472,22 +473,29 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				},
 				// Move the task to Done through the server-owned board
 				// mutation (idempotent), broadcast + reconcile, then fire the
-				// dispatch pass exactly once so children waiting on this task
-				// release with their retained valid evidence. Called BEFORE
-				// the completion is persisted, so a failure leaves the binding
-				// untouched and the bounded reconciliation reads retry.
+				// merge-completion successor pass exactly once so children
+				// waiting on this task release with their retained valid
+				// evidence. Called BEFORE the completion is persisted, so a
+				// failure leaves the binding untouched and the bounded
+				// reconciliation reads retry.
 				completeTask: async (workspaceId, taskId) => {
 					const workspacePath = deps.workspaceRegistry.getWorkspacePathById(workspaceId);
 					if (!workspacePath) {
 						throw new Error(`Workspace ${workspaceId} not found; cannot move task ${taskId} to Done.`);
 					}
+					let readyLinkedTaskIds: string[] = [];
 					await mutateWorkspaceState<void>(workspacePath, (state) => {
 						const result = completeTaskAndGetReadyLinkedTaskIds(state.board, taskId);
+						readyLinkedTaskIds = result.readyTaskIds;
 						return { board: result.board, value: undefined, save: result.moved };
 					});
 					broadcastRuntimeWorkspaceStateUpdatedWithReconcile(workspaceId, workspacePath);
+					// MERGE-1: the successor pass uses the merged_pr trigger so it
+					// launches the just-released children even when the B-9
+					// task dispatch policy is disabled; only this task's direct
+					// linked dependents are candidates.
 					void buildRuntimeApi()
-						.dispatchReadyTasks({ workspaceId, workspacePath })
+						.dispatchMergedPrSuccessors({ workspaceId, workspacePath }, readyLinkedTaskIds)
 						.catch((error) => {
 							deps.warn(
 								`[pr-tracking] Merge completion dispatch pass failed: ${
@@ -612,6 +620,34 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 					busy: true,
 					reason: `The task's PR write target is reserved by ${holder.workspaceId}/${holder.taskId}; retry after it drains.`,
 				};
+			},
+			// MERGE-1: dispatch readiness needs the workspace's completed
+			// merge-completion bindings (taskId → latest completed binding),
+			// so merge-released successors can launch without a legacy
+			// delivery receipt.
+			getCompletedMergeCompletions: async (scope) => {
+				const { store } = getPrTrackingState();
+				const { records } = await store.listRecords().catch(() => ({
+					records: [],
+					malformedFiles: [] as string[],
+				}));
+				const completedByTask = new Map<string, GitHubPrMergeCompletion>();
+				for (const record of records) {
+					for (const binding of record.taskBindings) {
+						if (binding.workspaceId !== scope.workspaceId) {
+							continue;
+						}
+						const completion = binding.mergeCompletion;
+						if (!completion || completion.status !== "completed" || completion.mergeCommitSha === null) {
+							continue;
+						}
+						const existing = completedByTask.get(binding.taskId);
+						if (!existing || (completion.completedAt ?? 0) > (existing.completedAt ?? 0)) {
+							completedByTask.set(binding.taskId, completion);
+						}
+					}
+				}
+				return completedByTask;
 			},
 		});
 
@@ -884,6 +920,19 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			.catch((error) => {
 				deps.warn(
 					`[task-dispatch] Restart reconciliation failed for ${reconcileScope.workspaceId}: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				);
+			});
+		// MERGE-1: crash recovery for the merge-completion → successor dispatch
+		// boundary — if the runtime died after a parent moved to Done but before
+		// the successor pass ran, the released children are still in the
+		// backlog and are re-eligible here (no-op when none exist).
+		void buildRuntimeApi()
+			.dispatchMergedPrSuccessors(reconcileScope, null)
+			.catch((error) => {
+				deps.warn(
+					`[task-dispatch] Merge-completion successor recovery failed for ${reconcileScope.workspaceId}: ${
 						error instanceof Error ? error.message : String(error)
 					}`,
 				);
