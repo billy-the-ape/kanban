@@ -1206,6 +1206,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		await this.settleTaskValidationJobs(taskId);
 		await this.releaseTaskMcpToolBundle(taskId);
 	}
+
 	getTaskSessionId(taskId: string): string | null {
 		return this.sessionIdByTaskId.get(taskId) ?? null;
 	}
