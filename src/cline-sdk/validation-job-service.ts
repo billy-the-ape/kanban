@@ -707,7 +707,11 @@ export class ValidationJobService {
 	private beginKill(live: LiveJob, outcome: "canceled" | "timed_out"): void {
 		const child = live.child;
 		const exited = child.exitCode !== null || child.signalCode !== null;
-		if (!exited) {
+		if (!exited || process.platform !== "win32") {
+			// On POSIX always attempt the group kill: the group id stays valid
+			// while any member lives, so a leader that already exited cannot
+			// leave background members holding the pipes. An empty group
+			// throws ESRCH, which the fallback in killProcessGroup handles.
 			this.killProcessGroup(child);
 		}
 		live.pendingOutcome = outcome;

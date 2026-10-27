@@ -159,6 +159,11 @@ Notes and follow-ups:
   cluster containing `c` (`-lc`, `-ec`, `-ic`, ...) rather than only a bare `-c`, and
   value-consuming flags (`-o`/`-O`/`--option`) before it have their value skipped, so
   combined-flag invocations cannot hide the payload from the parity scan.
+- Review hardening, round 7 (PR feedback): `beginKill` now always attempts the POSIX
+  process-group kill, even when the group leader has already exited, so cancel, timeout,
+  and session stop cannot settle a job while background members still hold the pipes
+  (an empty group throws ESRCH, handled by the direct-kill fallback; Windows keeps the
+  not-exited guard since it has no group kill).
 - The job status is not yet surfaced in the task diagnostics export (B-3); the scope boundary
   excludes a new tRPC control API, so the diagnostics wiring lands as a follow-up.
 - Killing covers the owned process group (POSIX) or child (Windows); daemonized grandchildren

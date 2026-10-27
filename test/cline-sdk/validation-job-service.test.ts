@@ -566,6 +566,43 @@ describe("ValidationJobService review hardening", () => {
 		expect(entries).toEqual([]);
 	});
 
+	it("cancel kills group members still alive after the leader has exited", async () => {
+		// The leader exits immediately but leaves a background member holding
+		// the stdout pipe; cancel must still kill the whole process group, not
+		// just settle the record around the live grandchildren.
+		const pidFile = join(worktreeDir, `ar3-leak-pid-${process.pid}-${Date.now()}`);
+		const service = createService();
+		const started = await service.start({
+			toolCallId: "call-leak",
+			command: "sh",
+			args: `-c "sleep 30 & echo $! > ${pidFile}; exit 0"`,
+		});
+		if (started.kind !== "started") {
+			throw new Error("expected started");
+		}
+		// Let the leader exit while the background sleeper keeps the pipes open.
+		await new Promise((resolve) => setTimeout(resolve, 200));
+		const canceled = await service.cancelJob(started.record.jobId);
+		expect(canceled?.state).toBe("canceled");
+		const pid = Number((await readFile(pidFile, "utf8").catch(() => "")).trim());
+		expect(pid).toBeGreaterThan(0);
+		// Poll briefly so the subreaper can reap the killed process before
+		// the liveness probe (a zombie still answers kill(pid, 0)).
+		let alive = true;
+		for (let i = 0; i < 40 && alive; i += 1) {
+			try {
+				process.kill(pid, 0);
+			} catch {
+				alive = false;
+			}
+			if (alive) {
+				await new Promise((resolve) => setTimeout(resolve, 50));
+			}
+		}
+		expect(alive).toBe(false);
+		await rm(pidFile, { force: true }).catch(() => undefined);
+	});
+
 	it("discloses truncation when the spool is exactly full and output continues", async () => {
 		const service = createService({ maxLogBytes: 16 });
 		const started = await service.start({
