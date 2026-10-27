@@ -222,6 +222,76 @@ export const CLINE_EDITOR_SIZE_GUIDANCE = [
 	"- Prefer a new, separate file for large additions instead of growing an already large file.",
 ].join("\n");
 
+/**
+ * AR-4: planning and execution guidance for native coding sessions. Kept as
+ * one named constant, separate from the editor recovery guidance above and
+ * from the review/rollback role prompts. It is guidance about repeated
+ * communication and execution, not a cap on internal reasoning: no
+ * word/token/turn limits, no first-edit deadline, no forced one-plan rule,
+ * and no ban on rereads.
+ */
+export const CLINE_PROPORTIONAL_PLANNING_GUIDANCE = [
+	"Planning and execution:",
+	"Gather enough context to understand the requirements, relevant code, risks, and verification before editing. State an implementation plan proportional to the task. Expand the plan when complexity or uncertainty warrants it, including design decisions and experiments needed for correctness.",
+	"",
+	"Once the plan is sufficient, proceed with implementation and verification. Revisit it when new evidence changes the approach, requirements, or risk. Avoid restating an unchanged plan; use brief progress updates to explain what changed and what comes next. Follow explicit user requests for planning, and preserve all required checks and review steps.",
+].join("\n");
+
+/**
+ * The planning paragraph verbatim as shipped in the @clinebot/core 0.0.38
+ * default system prompt (inspected in the installed package's generated
+ * output). Its last sentence ("It's OK for this section to be quite long")
+ * directly conflicts with the proportionate planning guidance above.
+ */
+const SDK_VERBOSE_INITIAL_PLAN_PARAGRAPH =
+	"Begin by analyzing the user's input and gathering any necessary additional context. Then, present your plan at the start of your response along with tool calls before proceeding with the task. It's OK for this section to be quite long.";
+
+export type ProportionalPlanningGuidanceStatus = "replaced" | "already-present" | "appended";
+
+export interface ApplyProportionalPlanningGuidanceResult {
+	prompt: string;
+	/**
+	 * "replaced": the SDK's verbose planning paragraph above was found exactly
+	 * once and swapped in place for the guidance. "already-present": the
+	 * guidance is already in the prompt, so it is returned unchanged (guards
+	 * duplicate application). "appended": compatibility drift — the upstream
+	 * paragraph changed, so the upstream prompt is preserved intact and the
+	 * guidance is appended exactly once.
+	 */
+	status: ProportionalPlanningGuidanceStatus;
+}
+
+function countOccurrences(haystack: string, needle: string): number {
+	let count = 0;
+	let index = haystack.indexOf(needle);
+	while (index !== -1) {
+		count += 1;
+		index = haystack.indexOf(needle, index + needle.length);
+	}
+	return count;
+}
+
+/**
+ * AR-4: applies the proportionate planning guidance to the SDK's default
+ * system prompt at the narrow composition point. It never removes any other
+ * SDK section (reasoning, verification, approval, or safety); it either
+ * replaces the single verbose planning paragraph in place or, if that
+ * upstream wording drifts, appends the guidance once and surfaces the
+ * discrepancy through the returned status.
+ */
+export function applyProportionalPlanningGuidance(defaultPrompt: string): ApplyProportionalPlanningGuidanceResult {
+	if (defaultPrompt.includes(CLINE_PROPORTIONAL_PLANNING_GUIDANCE)) {
+		return { prompt: defaultPrompt, status: "already-present" };
+	}
+	if (countOccurrences(defaultPrompt, SDK_VERBOSE_INITIAL_PLAN_PARAGRAPH) === 1) {
+		return {
+			prompt: defaultPrompt.replace(SDK_VERBOSE_INITIAL_PLAN_PARAGRAPH, CLINE_PROPORTIONAL_PLANNING_GUIDANCE),
+			status: "replaced",
+		};
+	}
+	return { prompt: `${defaultPrompt}\n\n${CLINE_PROPORTIONAL_PLANNING_GUIDANCE}`, status: "appended" };
+}
+
 export async function resolveClineSdkSystemPrompt(input: {
 	cwd: string;
 	providerId: string;
@@ -239,5 +309,9 @@ export async function resolveClineSdkSystemPrompt(input: {
 		metadata: workspaceMetadata,
 		rules: input.rules ?? "",
 	});
-	return `${defaultPrompt}\n\n${CLINE_EDITOR_SIZE_GUIDANCE}`;
+	// AR-4: swap the SDK's verbose initial planning paragraph for the proportionate
+	// planning guidance. Only that one upstream paragraph is touched; every other
+	// section of the SDK prompt is preserved verbatim.
+	const { prompt: composedPrompt } = applyProportionalPlanningGuidance(defaultPrompt);
+	return `${composedPrompt}\n\n${CLINE_EDITOR_SIZE_GUIDANCE}`;
 }
