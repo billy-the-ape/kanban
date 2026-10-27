@@ -322,4 +322,74 @@ describe("createReviewToolPolicy — validation_job gating (AR-3)", () => {
 		const cancel = await policy(makeRequest("validation_job", { action: "cancel", jobId: "job-1" }));
 		expect(cancel.approved).toBe(true);
 	});
+
+	it("denies a git push hidden inside a quoted arg containing whitespace", async () => {
+		// Regression: the start's argv must be scanned as structured tokens.
+		// The runtime passes the service's exact tokenized argv; a quoted arg
+		// like "core.x=a b" must not mask the real subcommand (the service
+		// spawns exactly spawn("git", ["-c", "core.x=a b", "push"])).
+		const policy = createPolicy();
+		const result = await policy(
+			makeRequest("validation_job", {
+				action: "start",
+				command: "git",
+				args: ["-c", "core.x=a b", "push"],
+			}),
+		);
+		expect(result.approved).toBe(false);
+		expect(result.reason).toMatch(/git push/);
+		// The raw-args-string fallback (tokenized by the policy) must give the
+		// same answer for the same invocation.
+		const viaString = await policy(
+			makeRequest("validation_job", {
+				action: "start",
+				command: "git",
+				args: '"-c" "core.x=a b" push',
+			}),
+		);
+		expect(viaString.approved).toBe(false);
+		// An empty quoted arg must not let -c swallow the real subcommand.
+		const viaEmptyToken = await policy(
+			makeRequest("validation_job", {
+				action: "start",
+				command: "git",
+				args: ["-c", "", "push"],
+			}),
+		);
+		expect(viaEmptyToken.approved).toBe(false);
+	});
+
+	it("denies a destructive removal hidden in quoted args", async () => {
+		const policy = createPolicy();
+		const result = await policy(
+			makeRequest("validation_job", {
+				action: "start",
+				command: "rm",
+				args: '"-rf" ".git"',
+			}),
+		);
+		expect(result.approved).toBe(false);
+		expect(result.reason).toMatch(/rm -rf/);
+	});
+
+	it("delegates benign validation_job starts whose args contain whitespace", async () => {
+		const delegated: string[] = [];
+		const policy = createReviewToolPolicy({
+			worktreePath: WORKTREE,
+			allowedWritePaths: ALLOWED_WRITE_PATHS,
+			delegate: async (request) => {
+				delegated.push(request.toolName);
+				return { approved: true };
+			},
+		});
+		const result = await policy(
+			makeRequest("validation_job", {
+				action: "start",
+				command: "node",
+				args: '"script with space.js" --flag "a b"',
+			}),
+		);
+		expect(result.approved).toBe(true);
+		expect(delegated).toEqual(["validation_job"]);
+	});
 });

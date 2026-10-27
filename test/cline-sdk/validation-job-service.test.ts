@@ -502,4 +502,66 @@ describe("ValidationJobService review hardening", () => {
 		expect(entries.filter((entry) => entry.endsWith(".json"))).toHaveLength(1);
 		await waitForState(service, started.record.jobId, "exited");
 	});
+
+	it("does not spawn after the service is closed while approval is pending", async () => {
+		const gate: { resolve: (value: { approved: boolean; reason?: string }) => void } = {
+			resolve: () => undefined,
+		};
+		const service = createService({
+			approve: () =>
+				new Promise<{ approved: boolean; reason?: string }>((resolve) => {
+					gate.resolve = resolve;
+				}),
+		});
+		const starting = service.start({
+			toolCallId: "call-closed-1",
+			command: process.execPath,
+			args: '-e "setTimeout(()=>{},5000)"',
+		});
+		// Stop/clear/abort lands while the start is still awaiting approval.
+		await service.cancelAllJobs();
+		gate.resolve({ approved: true });
+		const result = await starting;
+		expect(result.kind).toBe("invalid");
+		expect(service.getLiveJob()).toBeNull();
+	});
+
+	it("does not spawn a start queued on the chain after the service is closed", async () => {
+		// Hold the first start's approval so the second start queues behind it
+		// on the start chain (not behind a live job).
+		const gate: { resolve: (value: { approved: boolean; reason?: string }) => void } = {
+			resolve: () => undefined,
+		};
+		const service = createService({
+			approve: () =>
+				new Promise<{ approved: boolean; reason?: string }>((resolve) => {
+					gate.resolve = resolve;
+				}),
+		});
+		const firstStart = service.start({
+			toolCallId: "call-queue-1",
+			command: process.execPath,
+			args: '-e "setTimeout(()=>{},5000)"',
+		});
+		const secondStart = service.start({ toolCallId: "call-queue-2", command: process.execPath, args: "-e 1" });
+		// Close with no live job: queued starts must not spawn afterwards.
+		await service.cancelAllJobs();
+		gate.resolve({ approved: true });
+		const [first, second] = await Promise.all([firstStart, secondStart]);
+		expect(first.kind).toBe("invalid");
+		expect(second.kind).toBe("invalid");
+		expect(service.getLiveJob()).toBeNull();
+	});
+
+	it("rejects NUL bytes in command or args before creating any state", async () => {
+		const service = createService();
+		expect((await service.start({ toolCallId: "call-nul-1", command: "node\u0000", args: "-e 1" })).kind).toBe(
+			"invalid",
+		);
+		expect((await service.start({ toolCallId: "call-nul-2", command: "node", args: '-e "a\u0000b"' })).kind).toBe(
+			"invalid",
+		);
+		const entries = await readdir(taskDir).catch(() => []);
+		expect(entries).toEqual([]);
+	});
 });

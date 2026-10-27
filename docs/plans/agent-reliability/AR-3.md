@@ -133,6 +133,15 @@ Notes and follow-ups:
   UUID shape in `getJob`/`readJobLog`/`cancelJob`/`readRecord` (a mismatch between
   the record's own id and the file name is rejected), and `read` only opens
   `record.artifactPath` when it lies inside the task's context-artifacts directory.
+- Review hardening, round 2 (PR feedback): the review-session policy scans a
+  `validation_job` start's structured argv (`[command, ...tokenizeCommandArgs(args)]`)
+  instead of a whitespace-joined string, so a quoted arg containing whitespace can no
+  longer mask a forbidden subcommand (e.g. `git "-c" "core.x=a b" push`). `spawn` is
+  wrapped so a synchronous throw closes the spool and settles a `spawn_failed` record
+  instead of leaking the fd and a phantom `running` record, and NUL bytes in the
+  command or args are rejected up front. A `closed` flag is set by `cancelAllJobs` and
+  re-checked after approval and just before `spawn`, so a stop/clear/abort during
+  approval or the start chain can never leave a spawn running on a removed service.
 - The job status is not yet surfaced in the task diagnostics export (B-3); the scope boundary
   excludes a new tRPC control API, so the diagnostics wiring lands as a follow-up.
 - Killing covers the owned process group (POSIX) or child (Windows); daemonized grandchildren

@@ -435,7 +435,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 						input: {
 							action: "start",
 							command: input.command,
-							args: input.args.join(" "),
+							args: input.args,
 							...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
 						},
 						policy: {},

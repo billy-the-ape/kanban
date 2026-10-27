@@ -245,6 +245,8 @@ export class ValidationJobService {
 	private adopted: Promise<void> | null = null;
 	/** Serializes start() so concurrent tool calls cannot double-book the live slot. */
 	private startChain: Promise<void> = Promise.resolve();
+	/** Set when the service is closed (stop/clear/abort/shutdown); no further spawns. */
+	private closed = false;
 
 	constructor(options: ValidationJobServiceOptions) {
 		this.taskId = options.taskId;
@@ -286,8 +288,11 @@ export class ValidationJobService {
 
 	private async performStart(request: ValidationJobStartRequest): Promise<ValidationJobStartResult> {
 		await this.initialize();
+		if (this.closed) {
+			return { kind: "invalid", reason: "the validation-job service has been closed; no new jobs can start." };
+		}
 		const command = request.command.trim();
-		if (!command || /\r?\n/.test(command)) {
+		if (!command || /\r?\n/.test(command) || command.includes("\0")) {
 			return { kind: "invalid", reason: "command must be a single non-empty executable name or path." };
 		}
 		const args = tokenizeCommandArgs(request.args);
@@ -296,6 +301,11 @@ export class ValidationJobService {
 				kind: "invalid",
 				reason: "args is not a valid argument string (unbalanced quote or dangling escape).",
 			};
+		}
+		// NUL bytes make spawn throw synchronously (ERR_INVALID_ARG_VALUE);
+		// reject them up front so no spool or record is created.
+		if (args.some((arg) => arg.includes("\0"))) {
+			return { kind: "invalid", reason: "args must not contain NUL bytes." };
 		}
 		const cwdRel = this.resolveCwd(request.cwd);
 		if (cwdRel === null) {
@@ -322,6 +332,11 @@ export class ValidationJobService {
 		});
 		if (!approval.approved) {
 			return { kind: "denied", reason: approval.reason?.trim() || "the tool policy did not approve this start." };
+		}
+		// A stop/clear/abort may have closed the service while approval
+		// was pending; never spawn on a closed service.
+		if (this.closed) {
+			return { kind: "invalid", reason: "the validation-job service was closed while approval was pending." };
 		}
 
 		const record: ValidationJobRecord = {
@@ -360,15 +375,41 @@ export class ValidationJobService {
 			return { kind: "invalid", reason: `could not persist the job record: ${toErrorMessage(error)}` };
 		}
 
+		if (this.closed) {
+			// Nothing has spawned and no receipt was handed out: drop the
+			// spool and record created above rather than leaving a phantom
+			// running record behind.
+			await spool.close().catch(() => undefined);
+			await rm(this.spoolPathFor(record.jobId), { force: true }).catch(() => undefined);
+			await rm(this.recordPathFor(record.jobId), { force: true }).catch(() => undefined);
+			return { kind: "invalid", reason: "the validation-job service was closed before the job could start." };
+		}
+
 		const detached = process.platform !== "win32";
-		const child = spawn(command, args, {
-			cwd: join(this.worktreePath, cwdRel),
-			stdio: ["ignore", "pipe", "pipe"],
-			// POSIX: become a process-group leader so cancel/timeout can kill
-			// the whole group. Windows: kill the child directly instead.
-			detached,
-			env: process.env,
-		});
+		let child: ChildProcess;
+		try {
+			child = spawn(command, args, {
+				cwd: join(this.worktreePath, cwdRel),
+				stdio: ["ignore", "pipe", "pipe"],
+				// POSIX: become a process-group leader so cancel/timeout can kill
+				// the whole group. Windows: kill the child directly instead.
+				detached,
+				env: process.env,
+			});
+		} catch (error) {
+			// spawn threw synchronously (e.g. an invalid argv): close the spool,
+			// persist a settled spawn_failed record, and report. No process was
+			// created, so there is nothing to kill.
+			const failed: ValidationJobRecord = {
+				...record,
+				endedAt: new Date().toISOString(),
+				state: "spawn_failed",
+			};
+			await this.writeRecord(failed).catch(() => undefined);
+			await spool.close().catch(() => undefined);
+			await rm(this.spoolPathFor(record.jobId), { force: true }).catch(() => undefined);
+			return { kind: "spawn_failed", record: failed, error: toErrorMessage(error) };
+		}
 		const liveJob: LiveJob = {
 			record,
 			child,
@@ -479,10 +520,12 @@ export class ValidationJobService {
 
 	/**
 	 * Settles every live job of this session (stop/cancel/clear/shutdown
-	 * paths). Never starts a process. Without a live job this is a no-op:
-	 * nothing to kill, no store I/O.
+	 * paths) and closes the service: no further jobs may spawn, including
+	 * starts still queued on the start chain or awaiting approval. Never
+	 * starts a process. Without a live job the only effect is the close flag.
 	 */
 	async cancelAllJobs(): Promise<ValidationJobRecord[]> {
+		this.closed = true;
 		const live = this.liveJob;
 		if (!live) {
 			return [];
