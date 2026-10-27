@@ -2,8 +2,9 @@
 // fresh-context prompt building, dispatch orchestration (durable records,
 // board ownership moves, bounded retries), and restart reconciliation.
 import { mkdtempSync, rmSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { baseTaskIdForReviewSessionId } from "../../src/cline-sdk/cline-review-session-service";
 import type { RuntimeConfigState } from "../../src/config/runtime-config";
@@ -19,7 +20,11 @@ import type {
 	RuntimeTaskSessionState,
 	RuntimeTaskSessionSummary,
 } from "../../src/core/api-contract";
-import { readTaskDispatchRecord, writeTaskDispatchRecord } from "../../src/task-dispatch/dispatch-records";
+import {
+	getTaskDispatchDir,
+	readTaskDispatchRecord,
+	writeTaskDispatchRecord,
+} from "../../src/task-dispatch/dispatch-records";
 import {
 	buildFreshDispatchPrompt,
 	collectTaskDispatchSessions,
@@ -1261,6 +1266,32 @@ describe("MERGE-1: merge-completion successor handoff", () => {
 				.columns.find((column) => column.id === "backlog")
 				?.cards.map((card) => card.id),
 		).toContain("child");
+	});
+
+	it("parses pre-MERGE-1 records: a prerequisite entry without mergeCommitSha stays readable", async () => {
+		// Upgraded on-disk records predate the mergeCommitSha field; the schema
+		// default must keep them readable, or in-flight, exhausted, and
+		// manuallyDeferred state is silently lost on upgrade.
+		const legacy = {
+			...dispatchRecordFor("b"),
+			manuallyDeferred: true,
+			status: "exhausted",
+			prerequisites: [
+				{
+					taskId: "a",
+					integratedSha: "a-integrated",
+					taskCommitSha: "a-commit",
+					deliveryStatus: "delivered",
+				},
+			],
+		};
+		const dispatchDir = join(getTaskDispatchDir("b"), "dispatch.json");
+		await mkdir(dirname(dispatchDir), { recursive: true });
+		await writeFile(dispatchDir, JSON.stringify(legacy), "utf8");
+		const record = await readTaskDispatchRecord("b");
+		expect(record?.status).toBe("exhausted");
+		expect(record?.manuallyDeferred).toBe(true);
+		expect(record?.prerequisites[0]?.mergeCommitSha).toBeNull();
 	});
 });
 
