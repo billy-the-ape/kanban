@@ -16,6 +16,7 @@ import {
 	type ValidationJobRecord,
 	ValidationJobService,
 } from "../../src/cline-sdk/validation-job-service";
+import { getTaskContextArtifactsDir } from "../../src/workspace/task-artifacts";
 
 let originalHome: string | undefined;
 let originalUserProfile: string | undefined;
@@ -563,5 +564,72 @@ describe("ValidationJobService review hardening", () => {
 		);
 		const entries = await readdir(taskDir).catch(() => []);
 		expect(entries).toEqual([]);
+	});
+
+	it("discloses truncation when the spool is exactly full and output continues", async () => {
+		const service = createService({ maxLogBytes: 16 });
+		const started = await service.start({
+			toolCallId: "call-trunc-exact",
+			command: process.execPath,
+			// First chunk fills the 16-byte spool exactly; the second is dropped
+			// entirely by the remaining <= 0 branch.
+			args: "-e \"process.stdout.write('aaaaaaaaaaaaaaaa');process.stdout.write('b')\"",
+		});
+		if (started.kind !== "started") {
+			throw new Error("expected started");
+		}
+		const settled = await waitForState(service, started.record.jobId, "exited");
+		expect(settled.logBytesRetained).toBe(16);
+		expect(settled.logBytesOmitted).toBeGreaterThan(0);
+		expect(settled.logTruncated).toBe(true);
+		// The settled log must carry the truncation marker, not claim completeness.
+		const page = await service.readJobLog(started.record.jobId);
+		expect(page?.text).toContain("validation job log incomplete");
+	});
+
+	it("never returns an empty complete page while settlement is in flight", async () => {
+		// While the archive is held, the settle window spans ~150ms: a reader
+		// must always see the spool (job running) or the archive (job settled),
+		// never neither.
+		const service = new ValidationJobService({
+			taskId: "task-ar3",
+			sessionId: "session-ar3",
+			worktreePath: worktreeDir,
+			approve: async () => ({ approved: true }),
+			archiveArtifact: async ({ content, toolCallId }) => {
+				await new Promise((resolve) => setTimeout(resolve, 150));
+				const dir = getTaskContextArtifactsDir("task-ar3");
+				await mkdir(dir, { recursive: true });
+				const path = join(dir, `${toolCallId}.txt`);
+				await writeFile(path, content);
+				return path;
+			},
+		});
+		const started = await service.start({
+			toolCallId: "call-settle-read",
+			command: process.execPath,
+			args: "-e \"process.stdout.write('hello-log')\"",
+		});
+		if (started.kind !== "started") {
+			throw new Error("expected started");
+		}
+		let settledSeen = false;
+		let emptyPageSeen = false;
+		for (let i = 0; i < 40 && !settledSeen; i += 1) {
+			const record = await service.getJob(started.record.jobId);
+			const page = await service.readJobLog(started.record.jobId);
+			if (record !== null && record.state !== "running") {
+				settledSeen = true;
+			}
+			if (page !== null && page.totalRetainedBytes > 0 && page.text.trim() === "") {
+				emptyPageSeen = true;
+			}
+			await new Promise((resolve) => setTimeout(resolve, 15));
+		}
+		expect(settledSeen).toBe(true);
+		expect(emptyPageSeen).toBe(false);
+		// And the settled page is still readable from the archive.
+		const page = await service.readJobLog(started.record.jobId);
+		expect(page?.text).toContain("hello-log");
 	});
 });

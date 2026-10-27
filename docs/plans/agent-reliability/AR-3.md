@@ -142,6 +142,12 @@ Notes and follow-ups:
   command or args are rejected up front. A `closed` flag is set by `cancelAllJobs` and
   re-checked after approval and just before `spawn`, so a stop/clear/abort during
   approval or the start chain can never leave a spawn running on a removed service.
+- Review hardening, round 3 (PR feedback): `logTruncated` is now also set when a chunk
+  is dropped entirely because the spool is already exactly full (previously
+  `logBytesOmitted > 0` with `logTruncated === false` skipped the truncation marker and
+  the tool's "NOT complete" note). The spool is only removed after the final record is
+  published and the live slot released, so a reader racing settlement always sees the
+  spool (running) or the archive (settled), never an empty "end of retained log" page.
 - The job status is not yet surfaced in the task diagnostics export (B-3); the scope boundary
   excludes a new tRPC control API, so the diagnostics wiring lands as a follow-up.
 - Killing covers the owned process group (POSIX) or child (Windows); daemonized grandchildren

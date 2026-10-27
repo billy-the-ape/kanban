@@ -674,8 +674,11 @@ export class ValidationJobService {
 				const remaining = this.maxLogBytes - job.record.logBytesRetained;
 				if (remaining <= 0) {
 					// Keep draining so the child never blocks on a full pipe,
-					// but retain no additional bytes beyond the limit.
+					// but retain no additional bytes beyond the limit. Every
+					// byte dropped here is truncation, even when the spool was
+					// already exactly full by the previous chunk.
 					job.record.logBytesOmitted += chunk.length;
+					job.record.logTruncated = true;
 					return;
 				}
 				const toWrite = chunk.subarray(0, Math.min(chunk.length, remaining));
@@ -806,11 +809,9 @@ export class ValidationJobService {
 					// Preserve the status even if archival failed; the spool stays.
 				}
 			} else {
-				// Nothing retained: the spool is safe to drop.
+				// Nothing retained: the spool is safe to drop (after the final
+				// record is published; see below).
 				spoolConsumed = true;
-			}
-			if (spoolConsumed) {
-				await rm(this.spoolPathFor(record.jobId), { force: true }).catch(() => undefined);
 			}
 			// Persist the final record before flipping the shared one, so a
 			// reader can never observe a backward-going state from the file.
@@ -832,6 +833,14 @@ export class ValidationJobService {
 			Object.assign(record, finalRecord);
 			if (this.liveJob === live) {
 				this.liveJob = null;
+			}
+			// Only delete the spool after the final record is published and the
+			// live slot is released: a reader racing settlement must see either
+			// the spool (job running) or the archive (job settled), never
+			// neither — an empty "end of retained log" page would misreport a
+			// retained log as empty and complete.
+			if (spoolConsumed) {
+				await rm(this.spoolPathFor(record.jobId), { force: true }).catch(() => undefined);
 			}
 			return record;
 		})();
