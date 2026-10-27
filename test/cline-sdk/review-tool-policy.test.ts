@@ -278,3 +278,219 @@ describe("createReviewToolPolicy — workspace approval delegation", () => {
 		expect(delegated).toEqual(["read_files", "editor"]);
 	});
 });
+
+describe("createReviewToolPolicy — validation_job gating (AR-3)", () => {
+	it("denies a validation_job start that carries a publication command", async () => {
+		const policy = createPolicy();
+		const result = await policy(
+			makeRequest("validation_job", { action: "start", command: "git", args: "push origin main" }),
+		);
+		expect(result.approved).toBe(false);
+		expect(result.reason).toMatch(/git push/);
+	});
+
+	it("denies a validation_job start that would create a PR", async () => {
+		const policy = createPolicy();
+		const result = await policy(
+			makeRequest("validation_job", { action: "start", command: "gh", args: "pr create --title x" }),
+		);
+		expect(result.approved).toBe(false);
+		expect(result.reason).toMatch(/gh pr create/);
+	});
+
+	it("delegates benign validation_job starts to the workspace approval", async () => {
+		const delegated: string[] = [];
+		const policy = createReviewToolPolicy({
+			worktreePath: WORKTREE,
+			allowedWritePaths: ALLOWED_WRITE_PATHS,
+			delegate: async (request) => {
+				delegated.push(request.toolName);
+				return { approved: true };
+			},
+		});
+		const result = await policy(makeRequest("validation_job", { action: "start", command: "npm", args: "test" }));
+		expect(result.approved).toBe(true);
+		expect(delegated).toEqual(["validation_job"]);
+	});
+
+	it("delegates non-start validation_job actions regardless of the command", async () => {
+		const policy = createPolicy();
+		const status = await policy(makeRequest("validation_job", { action: "status", jobId: "job-1" }));
+		expect(status.approved).toBe(true);
+		const read = await policy(makeRequest("validation_job", { action: "read", jobId: "job-1", offset: 0 }));
+		expect(read.approved).toBe(true);
+		const cancel = await policy(makeRequest("validation_job", { action: "cancel", jobId: "job-1" }));
+		expect(cancel.approved).toBe(true);
+	});
+
+	it("denies a git push hidden inside a quoted arg containing whitespace", async () => {
+		// Regression: the start's argv must be scanned as structured tokens.
+		// The runtime passes the service's exact tokenized argv; a quoted arg
+		// like "core.x=a b" must not mask the real subcommand (the service
+		// spawns exactly spawn("git", ["-c", "core.x=a b", "push"])).
+		const policy = createPolicy();
+		const result = await policy(
+			makeRequest("validation_job", {
+				action: "start",
+				command: "git",
+				args: ["-c", "core.x=a b", "push"],
+			}),
+		);
+		expect(result.approved).toBe(false);
+		expect(result.reason).toMatch(/git push/);
+		// The raw-args-string fallback (tokenized by the policy) must give the
+		// same answer for the same invocation.
+		const viaString = await policy(
+			makeRequest("validation_job", {
+				action: "start",
+				command: "git",
+				args: '"-c" "core.x=a b" push',
+			}),
+		);
+		expect(viaString.approved).toBe(false);
+		// An empty quoted arg must not let -c swallow the real subcommand.
+		const viaEmptyToken = await policy(
+			makeRequest("validation_job", {
+				action: "start",
+				command: "git",
+				args: ["-c", "", "push"],
+			}),
+		);
+		expect(viaEmptyToken.approved).toBe(false);
+	});
+
+	it("denies a destructive removal hidden in quoted args", async () => {
+		const policy = createPolicy();
+		const result = await policy(
+			makeRequest("validation_job", {
+				action: "start",
+				command: "rm",
+				args: '"-rf" ".git"',
+			}),
+		);
+		expect(result.approved).toBe(false);
+		expect(result.reason).toMatch(/rm -rf/);
+	});
+
+	it("delegates benign validation_job starts whose args contain whitespace", async () => {
+		const delegated: string[] = [];
+		const policy = createReviewToolPolicy({
+			worktreePath: WORKTREE,
+			allowedWritePaths: ALLOWED_WRITE_PATHS,
+			delegate: async (request) => {
+				delegated.push(request.toolName);
+				return { approved: true };
+			},
+		});
+		const result = await policy(
+			makeRequest("validation_job", {
+				action: "start",
+				command: "node",
+				args: '"script with space.js" --flag "a b"',
+			}),
+		);
+		expect(result.approved).toBe(true);
+		expect(delegated).toEqual(["validation_job"]);
+	});
+
+	it("denies shell -c payloads that carry publication commands (run_commands parity)", async () => {
+		// A shell -c payload is one opaque argv element; it must be scanned as
+		// a command string so a publication command rejected via run_commands
+		// stays rejected through validation_job.
+		const policy = createPolicy();
+		const gitPush = await policy(
+			makeRequest("validation_job", {
+				action: "start",
+				command: "sh",
+				args: ["-c", "git push origin HEAD"],
+			}),
+		);
+		expect(gitPush.approved).toBe(false);
+		expect(gitPush.reason).toMatch(/git push/);
+		const ghCreate = await policy(
+			makeRequest("validation_job", {
+				action: "start",
+				command: "bash",
+				args: ["-c", "gh pr create --title x"],
+			}),
+		);
+		expect(ghCreate.approved).toBe(false);
+		expect(ghCreate.reason).toMatch(/gh pr create/);
+		// Absolute-path shells are matched by basename.
+		const absShell = await policy(
+			makeRequest("validation_job", {
+				action: "start",
+				command: "/bin/bash",
+				args: ["-c", "git push origin main"],
+			}),
+		);
+		expect(absShell.approved).toBe(false);
+		// Combined short-flag clusters containing c are the command flag.
+		for (const flag of ["-lc", "-ec", "-ic"]) {
+			const clustered = await policy(
+				makeRequest("validation_job", {
+					action: "start",
+					command: "bash",
+					args: [flag, "git push origin HEAD"],
+				}),
+			);
+			expect(clustered.approved).toBe(false);
+			expect(clustered.reason).toMatch(/git push/);
+		}
+		// Value-consuming flags before the command flag are skipped.
+		const withOption = await policy(
+			makeRequest("validation_job", {
+				action: "start",
+				command: "bash",
+				args: ["-o", "pipefail", "-c", "git push origin HEAD"],
+			}),
+		);
+		expect(withOption.approved).toBe(false);
+		expect(withOption.reason).toMatch(/git push/);
+		// `+` option tokens and the values of --rcfile/--init-file before -c.
+		const plusOption = await policy(
+			makeRequest("validation_job", {
+				action: "start",
+				command: "bash",
+				args: ["+e", "-c", "git push origin HEAD"],
+			}),
+		);
+		expect(plusOption.approved).toBe(false);
+		expect(plusOption.reason).toMatch(/git push/);
+		const rcfile = await policy(
+			makeRequest("validation_job", {
+				action: "start",
+				command: "bash",
+				args: ["--rcfile", "/dev/null", "-c", "git push origin HEAD"],
+			}),
+		);
+		expect(rcfile.approved).toBe(false);
+		expect(rcfile.reason).toMatch(/git push/);
+	});
+
+	it("delegates benign shell -c payloads and script-file runs", async () => {
+		const delegated: string[] = [];
+		const policy = createReviewToolPolicy({
+			worktreePath: WORKTREE,
+			allowedWritePaths: ALLOWED_WRITE_PATHS,
+			delegate: async (request) => {
+				delegated.push(request.toolName);
+				return { approved: true };
+			},
+		});
+		const payload = await policy(
+			makeRequest("validation_job", { action: "start", command: "sh", args: ["-c", "npm test"] }),
+		);
+		expect(payload.approved).toBe(true);
+		const script = await policy(
+			makeRequest("validation_job", { action: "start", command: "sh", args: ["script.sh"] }),
+		);
+		expect(script.approved).toBe(true);
+		// Combined flags with a benign payload stay delegated.
+		const clustered = await policy(
+			makeRequest("validation_job", { action: "start", command: "bash", args: ["-e", "-c", "npm test"] }),
+		);
+		expect(clustered.approved).toBe(true);
+		expect(delegated).toEqual(["validation_job", "validation_job", "validation_job"]);
+	});
+});

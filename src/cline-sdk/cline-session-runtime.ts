@@ -45,7 +45,12 @@ import { createClineToolFailureRecoveryHooks } from "./cline-tool-failure-recove
 import { createClineToolResultBoundingHook } from "./cline-tool-result-bounding-hook";
 import { CLINE_TURN_SKIPPED, type ClineTurnPreparation } from "./cline-turn-preparation";
 import { type ClineTurnScheduler, sharedClineTurnScheduler } from "./cline-turn-scheduler";
-import { CLINE_MODEL_CATALOG_DEFAULTS, SDK_DEFAULT_MODEL_ID, SDK_DEFAULT_PROVIDER_ID } from "./sdk-provider-boundary";
+import {
+	CLINE_MODEL_CATALOG_DEFAULTS,
+	SDK_DEFAULT_MODEL_ID,
+	SDK_DEFAULT_PROVIDER_ID,
+	type SdkMcpTool,
+} from "./sdk-provider-boundary";
 import {
 	CLINE_SDK_DEFAULT_CONTEXT_WINDOW_TOKENS,
 	type ClineSdkAgentHooks,
@@ -59,12 +64,28 @@ import {
 	createClineSdkSessionHost,
 	getClineCorePackageVersion,
 } from "./sdk-runtime-boundary";
+import { VALIDATION_JOB_TOOL_NAME, ValidationJobService } from "./validation-job-service";
+import { createValidationJobTool, VALIDATION_JOB_CAPABILITY_TEXT } from "./validation-job-tool";
 
 export { CLINE_MODEL_CATALOG_DEFAULTS } from "./sdk-provider-boundary";
 
 const DEFAULT_CLINE_MAX_CONSECUTIVE_MISTAKES = 6;
 
+type ClineToolApprovalHandler = (request: ClineSdkToolApprovalRequest) => Promise<ClineSdkToolApprovalResult>;
+
+/** AR-3: approval gate used when a session has no workspace approval override. */
+const defaultClineToolApproval: ClineToolApprovalHandler = async (request) => ({
+	approved: true,
+	reason: `Approved by Kanban runtime for ${request.toolName}.`,
+});
+
 interface ClineSessionHostBoundary {
+	/**
+	 * AR-3: set on hub-backed SDK hosts (the hub runtime address). Local SDK
+	 * hosts leave it undefined; only local hosts receive the validation_job
+	 * extraTool, so the capability is advertised only when actually usable.
+	 */
+	readonly runtimeAddress?: string;
 	start(input: ClineSdkStartSessionInput): Promise<{ sessionId: string; result?: unknown }>;
 	send(input: Parameters<ClineSdkSessionHost["send"]>[0]): Promise<unknown>;
 	stop(sessionId: string): Promise<void>;
@@ -287,6 +308,8 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		Omit<StartClineSessionRuntimeRequest, "prompt" | "images" | "initialMessages">
 	>();
 	private readonly mcpToolBundleByTaskId = new Map<string, ClineMcpToolBundle>();
+	/** AR-3: one validation-job service per task (recreated on every session start). */
+	private readonly validationJobServiceByTaskId = new Map<string, ValidationJobService>();
 	private readonly resolveClineLaunchConfig: ClineLaunchConfigResolver | null;
 	private readonly resolveWorkspaceRuntime: ClineWorkspaceRuntimeResolver | null;
 	private readonly onCompactionObserved: ((taskId: string, info: ClineCompactionObservedInfo) => void) | null;
@@ -383,6 +406,45 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		const sessionHost = await this.ensureSessionHost();
 		const userImages = toSdkUserImages(request.images);
 		const shouldSendInitialTurn = request.prompt.trim().length > 0 || Boolean(userImages?.length);
+		// AR-3: the validation_job tool is a local-runtime extraTool (local-only
+		// config keys never cross the hub boundary), so it is registered — and
+		// advertised in the system prompt — only on local SDK hosts.
+		const isLocalRuntimeHost = sessionHost.runtimeAddress === undefined;
+		let validationJobTool: SdkMcpTool | null = null;
+		if (isLocalRuntimeHost) {
+			const previousValidationJobs = this.validationJobServiceByTaskId.get(request.taskId);
+			if (previousValidationJobs) {
+				// Cancel the replaced session's jobs before the new service
+				// adopts the task's retained records, so live jobs settle as
+				// canceled rather than interrupted.
+				await previousValidationJobs.cancelAllJobs().catch(() => undefined);
+				this.validationJobServiceByTaskId.delete(request.taskId);
+			}
+			const validationJobService = new ValidationJobService({
+				taskId: request.taskId,
+				sessionId: requestedSessionId,
+				worktreePath: request.cwd,
+				approve: (input) =>
+					(request.requestToolApproval ?? defaultClineToolApproval)({
+						sessionId: requestedSessionId,
+						agentId: requestedSessionId,
+						conversationId: requestedSessionId,
+						iteration: 0,
+						toolCallId: input.toolCallId,
+						toolName: VALIDATION_JOB_TOOL_NAME,
+						input: {
+							action: "start",
+							command: input.command,
+							args: input.args,
+							...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
+						},
+						policy: {},
+					}),
+			});
+			await validationJobService.initialize().catch(() => undefined);
+			this.validationJobServiceByTaskId.set(request.taskId, validationJobService);
+			validationJobTool = createValidationJobTool(validationJobService);
+		}
 		let startResult: Awaited<ReturnType<ClineSessionHostBoundary["start"]>>;
 		const sessionLogger = createKanbanClineLogger({
 			runtime: "kanban",
@@ -419,7 +481,10 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 				config: request.compaction,
 				systemPrompt: request.systemPrompt,
 				providerId: request.providerId,
-				extraTools: hasMcpExtraTools ? (mcpToolBundle?.tools ?? []) : [],
+				// AR-3: calibrate against every injected extra tool (MCP tools
+				// plus the local validation_job tool) so its schema overhead
+				// is counted in the budget.
+				extraTools: [...(mcpToolBundle?.tools ?? []), ...(validationJobTool ? [validationJobTool] : [])],
 				safetyMarginTokens: request.compactionSafetyMarginTokens,
 			});
 			effectiveCompaction = calibration.config;
@@ -508,6 +573,15 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		};
 		try {
 			signal.throwIfAborted();
+			// AR-3: advertise the validation_job capability only when the
+			// tool is actually registered in this session. The persisted
+			// launch config keeps the UNADVERTISED request.systemPrompt, so
+			// restarts re-append exactly once (the text is the idempotency
+			// marker).
+			const sessionSystemPrompt =
+				validationJobTool && !request.systemPrompt.includes(VALIDATION_JOB_CAPABILITY_TEXT)
+					? `${request.systemPrompt}\n\n${VALIDATION_JOB_CAPABILITY_TEXT}`
+					: request.systemPrompt;
 			// Hub-backed SDK hosts create the interactive session in start; the first turn runs through send.
 			startResult = await sessionHost.start({
 				config: {
@@ -525,11 +599,13 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 					enableTools: true,
 					enableSpawnAgent: false,
 					enableAgentTeams: false,
+					// AR-3: the validation_job tool alone is never permission to
+					// disable the SDK's MCP settings tools.
 					...(hasMcpExtraTools ? { disableMcpSettingsTools: true } : {}),
 					execution: {
 						maxConsecutiveMistakes: DEFAULT_CLINE_MAX_CONSECUTIVE_MISTAKES,
 					},
-					systemPrompt: request.systemPrompt,
+					systemPrompt: sessionSystemPrompt,
 					// B-2.4: explicit compaction config so the SDK uses the
 					// resolved effective window, reserve, and the same local
 					// summarizer instead of its built-in defaults. B-2.5: window
@@ -573,13 +649,22 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 								},
 							}
 						: {}),
-					...(hasMcpExtraTools ? { extraTools: mcpToolBundle?.tools ?? [] } : {}),
+					// AR-3: merge the local validation_job tool into the same
+					// extraTools list the compaction calibration was built from.
+					...(hasMcpExtraTools || validationJobTool
+						? { extraTools: [...(mcpToolBundle?.tools ?? []), ...(validationJobTool ? [validationJobTool] : [])] }
+						: {}),
 				},
 				...(request.requestToolApproval
 					? { capabilities: { requestToolApproval: request.requestToolApproval } }
 					: {}),
 			});
 		} catch (error) {
+			const failedValidationJobs = this.validationJobServiceByTaskId.get(request.taskId);
+			if (failedValidationJobs) {
+				this.validationJobServiceByTaskId.delete(request.taskId);
+				await failedValidationJobs.cancelAllJobs().catch(() => undefined);
+			}
 			this.clearTaskSessionBinding(request.taskId, requestedSessionId);
 			await this.releaseTaskMcpToolBundle(request.taskId);
 			throw error;
@@ -588,6 +673,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		if (signal.aborted) {
 			await sessionHost.abort(startResult.sessionId).catch(() => undefined);
 			this.clearTaskSessionBinding(request.taskId, requestedSessionId);
+			await this.settleTaskValidationJobs(request.taskId);
 			await this.releaseTaskMcpToolBundle(request.taskId);
 			signal.throwIfAborted();
 		}
@@ -606,6 +692,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 				});
 			} catch (error) {
 				this.clearTaskSessionBinding(request.taskId, startResult.sessionId);
+				await this.settleTaskValidationJobs(request.taskId);
 				await this.releaseTaskMcpToolBundle(request.taskId);
 				throw error;
 			}
@@ -985,6 +1072,21 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			return null;
 		}
 		this.bindTaskSession(taskId, record.sessionId);
+		// AR-3: a resumed session came from a previous process whose job
+		// processes are gone; adopt any retained "running" records as
+		// interrupted so no phantom live job remains. Skipped when this
+		// process still owns a service for the task (its jobs are live).
+		if (!this.validationJobServiceByTaskId.has(taskId)) {
+			await new ValidationJobService({
+				taskId,
+				sessionId: record.sessionId,
+				worktreePath: typeof record.cwd === "string" ? record.cwd : "",
+				// Adoption-only service: it never spawns, so it never approves.
+				approve: async () => ({ approved: true }),
+			})
+				.initialize()
+				.catch(() => undefined);
+		}
 		const messages = await sessionHost.readMessages(record.sessionId);
 		return {
 			record,
@@ -1025,6 +1127,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			try {
 				await this.abortSupersededTaskSessions(taskId);
 			} finally {
+				await this.settleTaskValidationJobs(taskId);
 				await this.releaseTaskMcpToolBundle(taskId);
 			}
 			return;
@@ -1043,6 +1146,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			try {
 				await this.abortSupersededTaskSessions(taskId);
 			} finally {
+				await this.settleTaskValidationJobs(taskId);
 				await this.releaseTaskMcpToolBundle(taskId);
 			}
 		}
@@ -1055,6 +1159,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			try {
 				await this.abortSupersededTaskSessions(taskId);
 			} finally {
+				await this.settleTaskValidationJobs(taskId);
 				await this.releaseTaskMcpToolBundle(taskId);
 			}
 			return;
@@ -1073,6 +1178,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			try {
 				await this.abortSupersededTaskSessions(taskId);
 			} finally {
+				await this.settleTaskValidationJobs(taskId);
 				await this.releaseTaskMcpToolBundle(taskId);
 			}
 		}
@@ -1097,6 +1203,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			this.taskIdBySessionId.delete(sessionId);
 		}
 		this.clearTaskSessionBinding(taskId);
+		await this.settleTaskValidationJobs(taskId);
 		await this.releaseTaskMcpToolBundle(taskId);
 	}
 
@@ -1142,6 +1249,15 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		this.taskIdBySessionId.clear();
 		this.lastStartRequestByTaskId.clear();
 
+		// AR-3: settle all live validation jobs before disposing the host.
+		const validationServices = [...this.validationJobServiceByTaskId.values()];
+		this.validationJobServiceByTaskId.clear();
+		await Promise.all(
+			validationServices.map(async (service) => {
+				await service.cancelAllJobs().catch(() => undefined);
+			}),
+		);
+
 		const mcpBundles = [...this.mcpToolBundleByTaskId.values()];
 		this.mcpToolBundleByTaskId.clear();
 		await Promise.all(
@@ -1149,6 +1265,16 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 				await bundle.dispose().catch(() => undefined);
 			}),
 		);
+	}
+
+	/** AR-3: cancels and settles the task's live validation jobs (stop/abort/clear/shutdown). */
+	private async settleTaskValidationJobs(taskId: string): Promise<void> {
+		const service = this.validationJobServiceByTaskId.get(taskId);
+		if (!service) {
+			return;
+		}
+		this.validationJobServiceByTaskId.delete(taskId);
+		await service.cancelAllJobs().catch(() => undefined);
 	}
 
 	private replaceTaskMcpToolBundle(taskId: string, bundle: ClineMcpToolBundle | null): void {
@@ -1270,6 +1396,13 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		if (ended) {
 			this.clearTaskSessionBinding(taskId, sessionId);
 			void this.releaseTaskMcpToolBundle(taskId);
+			// AR-3: an ended session no longer owns its validation jobs;
+			// settle them (kills owned processes, persists final status).
+			const endedValidationJobs = this.validationJobServiceByTaskId.get(taskId);
+			if (endedValidationJobs && endedValidationJobs.sessionId === sessionId) {
+				this.validationJobServiceByTaskId.delete(taskId);
+				void endedValidationJobs.cancelAllJobs().catch(() => undefined);
+			}
 		}
 	}
 }
