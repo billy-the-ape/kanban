@@ -323,9 +323,10 @@ function buildValidationJobArgv(input: Record<string, unknown>): string[] | null
 const SHELL_COMMAND_BASENAMES = new Set(["sh", "bash", "zsh", "dash", "ksh"]);
 
 /**
- * Finds the `-c` payload of a shell invocation (`sh -c <payload>`, simple
- * flags skipped), or null when the argv is not a shell `-c` invocation
- * (script-file runs carry no inline command to scan).
+ * Finds the `-c` payload of a shell invocation (skipping simple flags to
+ * locate `-c`), or null when the argv is not a shell invocation, or a
+ * non-flag token appears before `-c` (script-file runs carry no inline
+ * command to scan).
  */
 function findShellCPayload(argv: string[]): string | null {
 	const command = argv[0] ?? "";
@@ -442,8 +443,8 @@ export function createReviewToolPolicy(options: CreateReviewToolPolicyOptions): 
 		// AR-3: only a validation_job `start` carries a command worth
 		// scanning; status/read/cancel delegate like unknown tools. The
 		// start's argv is scanned as structured tokens (the service's own
-		// tokenizer), so a quoted arg containing whitespace cannot mask the
-		// real subcommand.
+		// tokenizer), so a quoted arg containing whitespace cannot hide a
+		// forbidden git/gh subcommand or a destructive removal.
 		if (toolName === VALIDATION_JOB_TOOL_NAME) {
 			const action = typeof input.action === "string" ? input.action.trim() : "";
 			if (action === "start") {

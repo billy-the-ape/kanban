@@ -275,9 +275,10 @@ export class ValidationJobService {
 	/**
 	 * Starts one job (or returns a receipt for an already-started one).
 	 * Approval happens once, before anything is spawned; a denied start
-	 * creates no process, spool, or record. Starts are serialized on a
-	 * promise chain so concurrent tool calls cannot double-book the single
-	 * live slot before the first start registers it.
+	 * creates no process, spool, or record (a start refused because the
+	 * service closed after approval drops the spool and record it created).
+	 * Starts are serialized on a promise chain so concurrent tool calls cannot
+	 * double-book the single live slot before the first start registers it.
 	 */
 	async start(request: ValidationJobStartRequest): Promise<ValidationJobStartResult> {
 		const run = this.startChain.then(() => this.performStart(request));
@@ -522,7 +523,8 @@ export class ValidationJobService {
 	 * Settles every live job of this session (stop/cancel/clear/shutdown
 	 * paths) and closes the service: no further jobs may spawn, including
 	 * starts still queued on the start chain or awaiting approval. Never
-	 * starts a process. Without a live job the only effect is the close flag.
+	 * starts a process. Without a live job it only sets the close flag and
+	 * returns an empty list.
 	 */
 	async cancelAllJobs(): Promise<ValidationJobRecord[]> {
 		this.closed = true;
@@ -622,10 +624,11 @@ export class ValidationJobService {
 			if (live && live.record.jobId === record.jobId) {
 				continue;
 			}
-			// Re-read just before writing: a previous session's un-awaited
-			// settle (e.g. the ended-session handler) may finish between the
-			// scan and the write, and its final status (with artifactPath)
-			// must not be clobbered by an interrupted classification.
+			// Re-read just before writing: a competing settle (a previous
+			// session's un-awaited cancelAllJobs, or any other process
+			// reclassifying the same record) may finish between the scan and
+			// the write, and its final status (with artifactPath) must not be
+			// clobbered by an interrupted classification.
 			const fresh = await this.readRecord(entry.slice(0, -".json".length));
 			if (!fresh || fresh.state !== "running") {
 				continue;
