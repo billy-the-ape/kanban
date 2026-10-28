@@ -308,7 +308,10 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 				<VirtualChatMessageRow
 					message={message}
 					isCompletedResponse={message.id === completedMessageId}
-					expanded={expandedMessages.get(message.id) ?? (message.role === "reasoning" && message.meta?.hookEventName === "reasoning_delta")}
+					expanded={
+						expandedMessages.get(message.id) ??
+						(message.role === "reasoning" && message.meta?.hookEventName === "reasoning_delta")
+					}
 					onExpandedChange={handleExpandedChange}
 				/>
 			),
@@ -316,7 +319,7 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 		);
 		const getVirtualMessageKey = useCallback((_index: number, message: ClineChatMessage) => message.id, []);
 		const handleVirtualAtBottom = useCallback((atBottom: boolean) => {
-			setIsAutoScrollEnabled((previous) => previous === atBottom ? previous : atBottom);
+			setIsAutoScrollEnabled(atBottom);
 		}, []);
 		const followVirtualOutput = useCallback((atBottom: boolean) => {
 			// Use Virtuoso's immediate internal value, not its throttled callback:
