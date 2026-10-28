@@ -3,6 +3,7 @@
 // controller hook so multiple surfaces can share the same behavior.
 
 import { AlertTriangle } from "lucide-react";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import React, {
 	type ReactElement,
 	useCallback,
@@ -40,6 +41,53 @@ import type {
 import type { TaskImage } from "@/types";
 
 const BOTTOM_LOCK_THRESHOLD_PX = 24;
+// Keep the existing, simpler DOM for short chats and virtualize larger histories.
+// This avoids mounting hundreds of Markdown/tool components on mobile.
+export const CHAT_VIRTUALIZATION_THRESHOLD = 80;
+
+type VirtualChatFooterContext = {
+	showThinking: boolean;
+	showCreditLimit: boolean;
+};
+
+function VirtualChatFooter({ context }: { context?: VirtualChatFooterContext }): ReactElement | null {
+	if (!context?.showThinking && !context?.showCreditLimit) return null;
+	return (
+		<div className="flex flex-col gap-2 pb-2">
+			{context.showThinking ? <ClineThinkingIndicator /> : null}
+			{context.showCreditLimit ? <ClineCreditLimitNotice /> : null}
+		</div>
+	);
+}
+
+const VIRTUAL_CHAT_COMPONENTS = { Footer: VirtualChatFooter };
+
+const VirtualChatMessageRow = React.memo(function VirtualChatMessageRow({
+	message,
+	isCompletedResponse,
+	expanded,
+	onExpandedChange,
+}: {
+	message: ClineChatMessage;
+	isCompletedResponse: boolean;
+	expanded: boolean;
+	onExpandedChange: (id: string, expanded: boolean) => void;
+}): ReactElement {
+	const handleExpandedChange = useCallback(
+		(next: boolean) => onExpandedChange(message.id, next),
+		[message.id, onExpandedChange],
+	);
+	return (
+		<div className="pb-2" data-testid="virtual-chat-message">
+			<ClineChatMessageItem
+				message={message}
+				isCompletedResponse={isCompletedResponse}
+				expanded={expanded}
+				onExpandedChange={handleExpandedChange}
+			/>
+		</div>
+	);
+});
 const CLINE_BUY_CREDITS_URL = "https://app.cline.bot/";
 
 const ClineCreditLimitNotice = React.memo(function ClineCreditLimitNotice() {
@@ -172,6 +220,19 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 			showMoveToTrash,
 		});
 		const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+		const virtuosoRef = useRef<VirtuosoHandle | null>(null);
+		// Virtual rows unmount when scrolled away. Keep their expansion state here
+		// rather than losing it when a row leaves the viewport.
+		const [expandedMessages, setExpandedMessages] = useState<Map<string, boolean>>(() => new Map());
+		const handleExpandedChange = useCallback((id: string, expanded: boolean) => {
+			setExpandedMessages((previous) => {
+				if (previous.get(id) === expanded) return previous;
+				const next = new Map(previous);
+				next.set(id, expanded);
+				return next;
+			});
+		}, []);
+		const usesVirtualizedMessages = messages.length >= CHAT_VIRTUALIZATION_THRESHOLD;
 		// TODO: Persist per-task mode immediately when toggled so page refresh restores unsent mode changes.
 		const modeByTaskIdRef = useRef<Map<string, RuntimeTaskSessionMode>>(new Map());
 		const [composerError, setComposerError] = useState<string | null>(null);
@@ -228,6 +289,25 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 
 		const completedMessageId = getCompletedAssistantMessageId(messages, summary, taskColumnId);
 		const panelError = composerError ?? error;
+		const virtualFooterContext = useMemo(
+			() => ({ showThinking: showAgentProgressIndicator, showCreditLimit: isCreditLimitNoticeVisible }),
+			[showAgentProgressIndicator, isCreditLimitNoticeVisible],
+		);
+		const renderVirtualMessage = useCallback(
+			(_index: number, message: ClineChatMessage) => (
+				<VirtualChatMessageRow
+					message={message}
+					isCompletedResponse={message.id === completedMessageId}
+					expanded={expandedMessages.get(message.id) ?? (message.role === "reasoning" && message.meta?.hookEventName === "reasoning_delta")}
+					onExpandedChange={handleExpandedChange}
+				/>
+			),
+			[completedMessageId, expandedMessages, handleExpandedChange],
+		);
+		const getVirtualMessageKey = useCallback((_index: number, message: ClineChatMessage) => message.id, []);
+		const handleVirtualAtBottom = useCallback((atBottom: boolean) => {
+			setIsAutoScrollEnabled((previous) => previous === atBottom ? previous : atBottom);
+		}, []);
 		const attachmentWarningMessage =
 			draftImages.length > 0 && selectedModel?.supportsVision === false
 				? "The selected Cline model may not accept image input. Choose a vision-capable model to use these images."
@@ -251,12 +331,13 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 
 		useLayoutEffect(() => {
 			const container = scrollContainerRef.current;
-			if (!container || !isAutoScrollEnabled) {
+			if (usesVirtualizedMessages || !container || !isAutoScrollEnabled) {
 				return;
 			}
 			container.scrollTop = container.scrollHeight;
 		}, [
 			isAutoScrollEnabled,
+			usesVirtualizedMessages,
 			messages,
 			showAgentProgressIndicator,
 			showActionFooter,
@@ -270,7 +351,16 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 
 		useEffect(() => {
 			setIsAutoScrollEnabled(true);
+			setExpandedMessages(new Map());
 		}, [taskId]);
+
+		// followOutput handles appended items. Streaming updates can resize the
+		// final item without changing item count, so also follow those changes.
+		// Run after paint; the virtualizer measures only mounted items.
+		useEffect(() => {
+			if (!usesVirtualizedMessages || !isAutoScrollEnabled || messages.length === 0) return;
+			virtuosoRef.current?.scrollToIndex({ index: messages.length - 1, align: "end", behavior: "auto" });
+		}, [usesVirtualizedMessages, isAutoScrollEnabled, messages, showAgentProgressIndicator, isCreditLimitNoticeVisible]);
 
 		useEffect(() => {
 			const persistedMode = modeByTaskIdRef.current.get(taskId);
@@ -423,21 +513,41 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 
 		return (
 			<div className="flex min-h-0 min-w-0 flex-1 flex-col">
-				<div
-					ref={scrollContainerRef}
-					className="flex min-h-0 min-w-0 flex-1 flex-col gap-2 overflow-x-hidden overflow-y-auto px-2 py-3"
-					onScroll={handleMessageListScroll}
-				>
-					{messages.map((message) => (
-						<ClineChatMessageItem
-							key={message.id}
-							message={message}
-							isCompletedResponse={message.id === completedMessageId}
-						/>
-					))}
-					{showAgentProgressIndicator ? <ClineThinkingIndicator /> : null}
-					{isCreditLimitNoticeVisible ? <ClineCreditLimitNotice /> : null}
-				</div>
+				{usesVirtualizedMessages ? (
+					<Virtuoso<ClineChatMessage, VirtualChatFooterContext>
+						ref={virtuosoRef}
+						className="min-h-0 min-w-0 flex-1 overflow-x-hidden px-2 py-3"
+						data-testid="virtual-chat-list"
+						data={messages}
+						computeItemKey={getVirtualMessageKey}
+						itemContent={renderVirtualMessage}
+						components={VIRTUAL_CHAT_COMPONENTS}
+						context={virtualFooterContext}
+						initialTopMostItemIndex={{ index: messages.length - 1, align: "end" }}
+						alignToBottom
+						atBottomThreshold={BOTTOM_LOCK_THRESHOLD_PX}
+						atBottomStateChange={handleVirtualAtBottom}
+						followOutput={isAutoScrollEnabled}
+						defaultItemHeight={72}
+						increaseViewportBy={{ top: 150, bottom: 150 }}
+					/>
+				) : (
+					<div
+						ref={scrollContainerRef}
+						className="flex min-h-0 min-w-0 flex-1 flex-col gap-2 overflow-x-hidden overflow-y-auto px-2 py-3"
+						onScroll={handleMessageListScroll}
+					>
+						{messages.map((message) => (
+							<ClineChatMessageItem
+								key={message.id}
+								message={message}
+								isCompletedResponse={message.id === completedMessageId}
+							/>
+						))}
+						{showAgentProgressIndicator ? <ClineThinkingIndicator /> : null}
+						{isCreditLimitNoticeVisible ? <ClineCreditLimitNotice /> : null}
+					</div>
+				)}
 				{panelError ? (
 					<div className="border-t border-status-red/30 bg-status-red/10 px-2 py-2 text-xs text-status-red">
 						{panelError}
