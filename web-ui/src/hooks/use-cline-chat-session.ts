@@ -32,6 +32,25 @@ interface UseClineChatSessionResult {
 	cancelTurn: () => Promise<boolean>;
 }
 
+/**
+ * Image payloads can be multi-megabyte base64 strings. Compare the known
+ * schema fields directly rather than constructing another serialized copy.
+ */
+function areMessageImagesEqual(left: ClineChatMessage["images"], right: ClineChatMessage["images"]): boolean {
+	if (left === right) return true;
+	if (!left || !right || left.length !== right.length) return false;
+	return left.every((image, index) => {
+		const other = right[index];
+		return (
+			other !== undefined &&
+			image.id === other.id &&
+			image.mimeType === other.mimeType &&
+			image.name === other.name &&
+			image.data === other.data
+		);
+	});
+}
+
 function areMessagesEqual(left: ClineChatMessage, right: ClineChatMessage): boolean {
 	if (left === right) {
 		return true;
@@ -41,7 +60,7 @@ function areMessagesEqual(left: ClineChatMessage, right: ClineChatMessage): bool
 		left.role === right.role &&
 		left.createdAt === right.createdAt &&
 		(left.meta === right.meta || JSON.stringify(left.meta ?? null) === JSON.stringify(right.meta ?? null)) &&
-		(left.images === right.images || JSON.stringify(left.images ?? null) === JSON.stringify(right.images ?? null))
+		areMessageImagesEqual(left.images, right.images)
 	);
 }
 
@@ -85,7 +104,8 @@ export function mergeClineChatMessages(
 			result.push(message);
 			continue;
 		}
-		if (!areMessagesEqual(result[index]!, message)) {
+		const existing = result[index];
+		if (existing && !areMessagesEqual(existing, message)) {
 			if (result === baseMessages) result = [...baseMessages];
 			result[index] = message;
 		}
@@ -212,7 +232,9 @@ export function useClineChatSession({
 					setMessages((currentMessages) => upsertMessage(currentMessages, sentMessage));
 				} else if (onLoadMessages) {
 					const loadedMessages = await onLoadMessages(taskId);
-					setMessages((currentMessages) => mergeClineChatMessages(loadedMessages ?? [], currentMessages));
+					// A post-send reload is authoritative (notably for /clear).
+					// Merging stale local messages would restore a cleared transcript.
+					setMessages(loadedMessages ?? []);
 				}
 				return true;
 			} catch (sendError) {
