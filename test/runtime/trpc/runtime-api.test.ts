@@ -7,6 +7,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RuntimeConfigState } from "../../../src/config/runtime-config";
 import type {
 	RuntimeBoardData,
+	RuntimeTaskDiagnosticsResponse,
+	RuntimeTaskPrTrackingStateResponse,
 	RuntimeTaskSessionSummary,
 	RuntimeWorkspaceStateResponse,
 } from "../../../src/core/api-contract";
@@ -3678,13 +3680,24 @@ describe("createRuntimeApi buildTaskDiagnosticsExportPlan (DIAG-3)", () => {
 		};
 	}
 
-	function createExportApi(getTaskExportSnapshot: (scope: unknown, taskId: string) => Promise<unknown>) {
+	function createExportApi(
+		getTaskExportSnapshot: (scope: unknown, taskId: string) => Promise<unknown>,
+		evidence: {
+			cline?: RuntimeTaskSessionSummary;
+			terminal?: RuntimeTaskSessionSummary;
+			comments?: RuntimeTaskPrTrackingStateResponse;
+		} = {},
+	) {
 		return createTestRuntimeApi({
 			getActiveWorkspaceId: () => "workspace-1",
 			loadScopedRuntimeConfig: async () => createRuntimeConfigState(),
 			setActiveRuntimeConfig: vi.fn(),
-			getScopedTerminalManager: async () => ({ getSummary: () => null }) as never,
-			getScopedClineTaskSessionService: async () => createClineTaskSessionServiceMock() as never,
+			getScopedTerminalManager: async () =>
+				({ getSummary: () => evidence.terminal ?? null, hasActiveProcess: () => false }) as never,
+			getScopedClineTaskSessionService: async () =>
+				({ ...createClineTaskSessionServiceMock(), getSummary: () => evidence.cline ?? null }) as never,
+			getPrCommentAutomationService: () =>
+				({ getTaskPrTrackingState: async () => evidence.comments ?? null }) as never,
 			resolveInteractiveShellCommand: vi.fn(),
 			runCommand: vi.fn(),
 			getTaskExportSnapshot: getTaskExportSnapshot as never,
@@ -3694,7 +3707,7 @@ describe("createRuntimeApi buildTaskDiagnosticsExportPlan (DIAG-3)", () => {
 	type PlanBundle = {
 		schemaVersion: number;
 		completeness: { status: string; reasons: string[]; warnings: string[] };
-		diagnostics: { ok: boolean; task: { id: string; title: string } | null };
+		diagnostics: RuntimeTaskDiagnosticsResponse;
 		taskPrompt: string | null;
 		sessions: Array<{
 			kind: string;
@@ -3738,6 +3751,50 @@ describe("createRuntimeApi buildTaskDiagnosticsExportPlan (DIAG-3)", () => {
 		expect(plan.sessions).toEqual([]);
 		expect(plan.completeness.status).toBe("unavailable");
 		expect(plan.completeness.reasons).toContain("no Cline session transcript is recorded for this task");
+	});
+
+	it("exports both raw session sources and the durable PR wait reason without starting a turn", async () => {
+		vi.spyOn(workspaceState, "loadWorkspaceBoardById").mockResolvedValue(createExportBoard());
+		const comments: RuntimeTaskPrTrackingStateResponse = {
+			ok: true,
+			state: {
+				enabled: true,
+				supported: true,
+				pr: null,
+				pendingCount: 16,
+				pendingDeadline: 100,
+				dispatch: null,
+				blocker: null,
+				resumable: false,
+				resumeRequiresAcknowledgment: false,
+				dispatchHold: {
+					kind: "writer_active",
+					message: "Waiting for the task agent.",
+					since: 100,
+					lastCheckedAt: 200,
+					retryAt: 300,
+				},
+			},
+		};
+		const evidence = {
+			cline: createSummary({ agentId: "cline", state: "awaiting_review" }),
+			terminal: createSummary({ agentId: "cline", state: "running" }),
+			comments,
+		};
+		const api = createExportApi(async () => ({ taskSnapshot: null, reviewSnapshot: null }), evidence);
+		const scope = { workspaceId: "workspace-1", workspacePath: "/tmp/repo" };
+		const plan: PlanBundle = await api.buildTaskDiagnosticsExportPlan(scope, "task-1");
+		expect(plan.diagnostics.session.writerActivity).toEqual({
+			clineSummary: evidence.cline,
+			terminalSummary: evidence.terminal,
+			terminalHasActiveProcess: false,
+			writerActive: false,
+		});
+		expect(plan.diagnostics.prCommentHandling).toEqual(comments);
+		expect(plan.diagnostics.session.summary?.state).toBe("awaiting_review");
+		const diagnostics = await api.getTaskDiagnostics(scope, { taskId: "task-1" });
+		expect(diagnostics.session.writerActivity?.terminalSummary?.state).toBe("running");
+		expect(diagnostics.prCommentHandling?.state.dispatchHold?.since).toBe(100);
 	});
 
 	it("carries a review snapshot read failure as an explicit completeness gap", async () => {
@@ -3835,7 +3892,7 @@ describe("createRuntimeApi getTaskQualitySummary (DIAG-PANEL)", () => {
 			getActiveWorkspaceId: () => "workspace-1",
 			loadScopedRuntimeConfig: async () => createRuntimeConfigState(),
 			setActiveRuntimeConfig: vi.fn(),
-			getScopedTerminalManager: async () => ({ getSummary: () => null }) as never,
+			getScopedTerminalManager: async () => ({ getSummary: () => null, hasActiveProcess: () => false }) as never,
 			getScopedClineTaskSessionService: async () => createClineTaskSessionServiceMock() as never,
 			resolveInteractiveShellCommand: vi.fn(),
 			runCommand: vi.fn(),

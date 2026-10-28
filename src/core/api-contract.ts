@@ -409,6 +409,23 @@ export const runtimePrAutoSendAttemptSchema = z.object({
 });
 export type RuntimePrAutoSendAttempt = z.infer<typeof runtimePrAutoSendAttemptSchema>;
 
+export const runtimePrCommentDispatchHoldSchema = z.object({
+	kind: z.enum([
+		"writer_active",
+		"session_unavailable",
+		"github_auth",
+		"snapshot_incomplete",
+		"publication_pending",
+		"internal_error",
+		"not_subscribed",
+	]),
+	message: z.string(),
+	since: z.number().int().nonnegative(),
+	lastCheckedAt: z.number().int().nonnegative(),
+	retryAt: z.number().int().nonnegative().nullable(),
+});
+export type RuntimePrCommentDispatchHold = z.infer<typeof runtimePrCommentDispatchHoldSchema>;
+
 /**
  * Minimal comment automation block in the PR tracking record. No comment
  * bodies, per-item dispositions, batch ledgers, or repair-budget counters
@@ -424,6 +441,8 @@ export const runtimePrCommentAutomationSchema = z.object({
 	/** Watermark preserved when previously dispatched feedback disappears. */
 	lastDispatchedFeedbackFingerprint: runtimePrFeedbackFingerprintSchema.nullable(),
 	dispatch: runtimePrCommentDispatchSchema.nullable(),
+	/** Last observed pre-send hold; optional for records created before hold diagnostics. */
+	dispatchHold: runtimePrCommentDispatchHoldSchema.nullable().optional(),
 	/** Implementation-published feedback excluded from automatic handling. */
 	publication: runtimePrPublicationAttributionSchema,
 	/** Automatic send attempts within the rolling 60-minute safety window. */
@@ -491,6 +510,7 @@ export const runtimeTaskPrTrackingStateSchema = z.object({
 	pr: runtimeTaskPullRequestSchema.nullable(),
 	pendingCount: z.number().int().nonnegative(),
 	pendingDeadline: z.number().nullable(),
+	dispatchHold: runtimePrCommentDispatchHoldSchema.nullable().optional(),
 	dispatch: runtimePrCommentDispatchSchema.nullable(),
 	blocker: z.string().nullable(),
 	/** A failed dispatch that can be resumed via "Resume comment handling". */
@@ -2852,6 +2872,16 @@ export const runtimeTaskDiagnosticsPreservedWorkSchema = z.object({
 });
 export type RuntimeTaskDiagnosticsPreservedWork = z.infer<typeof runtimeTaskDiagnosticsPreservedWorkSchema>;
 
+export const runtimeTaskWriterActivitySchema = z.object({
+	clineSummary: runtimeTaskSessionSummarySchema.nullable(),
+	terminalSummary: runtimeTaskSessionSummarySchema.nullable(),
+	/** Null means the terminal source could not be read. */
+	terminalHasActiveProcess: z.boolean().nullable(),
+	/** Null means one or both session sources could not be read safely. */
+	writerActive: z.boolean().nullable(),
+});
+export type RuntimeTaskWriterActivity = z.infer<typeof runtimeTaskWriterActivitySchema>;
+
 export const runtimeTaskDiagnosticsResponseSchema = z.object({
 	ok: z.boolean(),
 	/** null when the task no longer exists on the board. */
@@ -2875,10 +2905,13 @@ export const runtimeTaskDiagnosticsResponseSchema = z.object({
 	dispatchRecord: runtimeTaskDispatchRecordSchema.nullable(),
 	session: z.object({
 		summary: runtimeTaskSessionSummarySchema.nullable(),
-		/** True when a Cline session is running for the task right now. */
+		writerActivity: runtimeTaskWriterActivitySchema.optional(),
+		/** True when a live session is running or awaiting review input. */
 		active: z.boolean(),
 	}),
 	context: runtimeClineContextUsageResponseSchema,
+	/** Includes the durable queued intent and hold timestamps; distinct from the task queue. */
+	prCommentHandling: runtimeTaskPrTrackingStateResponseSchema.nullable().optional(),
 	actions: runtimeTaskDiagnosticsActionsSchema,
 	error: z.string().nullable(),
 });

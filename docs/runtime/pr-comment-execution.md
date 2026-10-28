@@ -14,6 +14,31 @@ are not a mergeability verdict; auto-merge and merge-candidate UI are outside th
 
 ## Queuing and execution
 
+An unsent intent has status `queued` and `attemptedAt: null`. Once its deadline
+passes, it waits only for actual runtime or provider prerequisites; it is not in
+the model-capacity queue yet. Terminal summaries restored from disk count as
+writers only when `hasActiveProcess(taskId)` is true. A native Cline `running`
+session still blocks delivery, as does a running terminal agent with a process.
+An `awaiting_review` Cline session alone does not block delivery.
+
+Pre-send holds persist a `dispatchHold` containing `kind`, `message`, `since`,
+`lastCheckedAt`, and `retryAt` (epoch milliseconds). The original `since` survives
+rechecks and restarts while the same reason remains. Reasons cover active writers,
+unreadable session services, unavailable GitHub authentication, incomplete fresh
+snapshots, unresolved publications, and dispatch-check errors. The UI shows the
+reason and elapsed wait; its tooltip includes the check and retry timestamps.
+These holds retry automatically on the existing cadence and never consume feedback
+or require Resume. Missing task subscriptions are reported separately with a
+lane/workspace diagnostic. An overdue intent without a recorded reason is shown
+as overdue rather than promising execution "shortly".
+
+Existing records need no migration. Unsent overdue intents are revalidated after
+runtime restart and send once their real blocker clears. Running, failed, and
+ambiguous previously attempted intents retain their existing safety semantics.
+Dirty worktrees still block preparation; preserve or complete partial edits before
+using automatic Resume. Failed repair messages include the session's recorded error
+when available, so a tool failure is not hidden behind the generic lifecycle error.
+
 1. Polling collects feedback about every 60 seconds. The existing 120-second quiet
    window (600-second maximum from first pending feedback) schedules one repair intent.
 2. Task chat accepts a placeholder. Dispatch status `waiting` means the turn has not

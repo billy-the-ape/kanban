@@ -31,6 +31,7 @@ import type {
 	RuntimeBoardCard,
 	RuntimeGitHubPrTrackingRecord,
 	RuntimePrCommentAutomation,
+	RuntimePrCommentDispatchHold,
 	RuntimePrCommentOwner,
 	RuntimePrFeedbackFingerprint,
 	RuntimePrPublicationPending,
@@ -342,6 +343,7 @@ export function applyPrPollOutcome(
 		nextAutomation.pendingCount = null;
 		nextAutomation.debounceDeadline = null;
 		nextAutomation.firstPendingAt = null;
+		nextAutomation.dispatchHold = null;
 		if (
 			nextAutomation.dispatch !== null &&
 			nextAutomation.dispatch.status === "queued" &&
@@ -362,6 +364,7 @@ export function applyPrPollOutcome(
 			nextAutomation.pendingCount = null;
 			nextAutomation.debounceDeadline = null;
 			nextAutomation.firstPendingAt = null;
+			nextAutomation.dispatchHold = null;
 			if (dispatch !== null && dispatch.status === "queued") {
 				// Nothing left to dispatch: cancel the queued intent.
 				nextAutomation.dispatch = dispatch.attemptedAt === null ? null : dispatch;
@@ -373,6 +376,7 @@ export function applyPrPollOutcome(
 				nextAutomation.pendingCount = 0;
 				nextAutomation.debounceDeadline = null;
 				nextAutomation.firstPendingAt = null;
+				nextAutomation.dispatchHold = null;
 			} else {
 				const firstPendingAt = automation.firstPendingAt ?? input.nowMs;
 				nextAutomation.pendingFeedbackFingerprint = fingerprint;
@@ -420,6 +424,7 @@ export function applyPrPollOutcome(
 			nextAutomation.pendingCount = pending.length;
 			nextAutomation.debounceDeadline = null;
 			nextAutomation.firstPendingAt = null;
+			nextAutomation.dispatchHold = null;
 		}
 	}
 
@@ -463,6 +468,37 @@ export class PrCommentAutomationService {
 
 	private warn(message: string): void {
 		this.deps.warn ? this.deps.warn(message) : process.stderr.write(`[pr-comment-automation] ${message}\n`);
+	}
+
+	/** A hold never consumes feedback or requires Resume; normal ticks recheck it. */
+	private async holdDispatch(
+		sub: PrSubscriptionState,
+		kind: RuntimePrCommentDispatchHold["kind"],
+		message: string,
+	): Promise<void> {
+		const nowMs = this.nowMs();
+		sub.dispatchRetryAt = nowMs + DISPATCH_RETRY_MS;
+		const loaded = await loadPrTrackingRecord(sub.key);
+		if (loaded.status !== "ok") return;
+		await upsertPrTrackingRecord(sub.key, { accessScopeId: loaded.record.accessScopeId, pr: sub.pr }, (record) => {
+			const automation = record.commentAutomation;
+			const dispatch = automation.dispatch;
+			if (
+				automation.debounceDeadline === null ||
+				(dispatch && (dispatch.status !== "queued" || dispatch.attemptedAt !== null))
+			)
+				return record;
+			const previous = automation.dispatchHold;
+			const hold = {
+				kind,
+				message,
+				since: previous?.kind === kind && previous.message === message ? previous.since : nowMs,
+				lastCheckedAt: nowMs,
+				retryAt: sub.dispatchRetryAt,
+			};
+			if (JSON.stringify(previous) === JSON.stringify(hold)) return record;
+			return { ...record, revision: record.revision + 1, commentAutomation: { ...automation, dispatchHold: hold } };
+		});
 	}
 
 	/** Reconciles durable state from a restart, then starts the poll tick. */
@@ -730,8 +766,13 @@ export class PrCommentAutomationService {
 			sub.settleInFlight = true;
 			settles.push(
 				this.settleDispatch(sub)
-					.catch((error: unknown) => {
+					.catch(async (error: unknown) => {
 						this.warn(`settle failed: ${error instanceof Error ? error.message : String(error)}`);
+						await this.holdDispatch(
+							sub,
+							"internal_error",
+							`Dispatch check failed: ${error instanceof Error ? error.message : String(error)}`,
+						).catch((holdError: unknown) => this.warn(`could not persist dispatch hold: ${String(holdError)}`));
 					})
 					.finally(() => {
 						sub.settleInFlight = false;
@@ -853,7 +894,11 @@ export class PrCommentAutomationService {
 				return;
 			}
 			if (session.state === "failed" || session.state === "interrupted" || session.reviewReason === "error") {
-				await this.setDispatchFailed(sub, `The comment-handling turn ended without completion.`);
+				const detail = session.warningMessage ?? session.latestHookActivity?.finalMessage;
+				await this.setDispatchFailed(
+					sub,
+					`The comment-handling turn ended without completion.${detail ? ` ${detail.slice(0, 2000)}` : ""}`,
+				);
 				return;
 			}
 			if (session.state === "idle" || session.state === "awaiting_review") {
@@ -892,7 +937,12 @@ export class PrCommentAutomationService {
 		// an in-flight implementation reply could send work the reply is
 		// already addressing or that was never recorded.
 		if (automation.publication.pending.length > 0 || this.captureBlocked.has(sub.key)) {
-			sub.dispatchRetryAt = nowMs + DISPATCH_RETRY_MS;
+			if (sub.dispatchRetryAt === null || nowMs >= sub.dispatchRetryAt)
+				await this.holdDispatch(
+					sub,
+					"publication_pending",
+					"Waiting for an implementation publication to be identified.",
+				);
 			return;
 		}
 		if (sub.dispatchRetryAt !== null && nowMs < sub.dispatchRetryAt) {
@@ -916,7 +966,7 @@ export class PrCommentAutomationService {
 		try {
 			accessScopeId = await this.deps.getGitHubAccessScopeId();
 		} catch {
-			sub.dispatchRetryAt = nowMs + DISPATCH_RETRY_MS;
+			await this.holdDispatch(sub, "github_auth", "Waiting for GitHub authentication to become available.");
 			return;
 		}
 		// At the due time: a successful fresh read re-validates the owner,
@@ -927,7 +977,7 @@ export class PrCommentAutomationService {
 			accessScopeId,
 		);
 		if (!snapshot.complete) {
-			sub.dispatchRetryAt = nowMs + DISPATCH_RETRY_MS;
+			await this.holdDispatch(sub, "snapshot_incomplete", "Waiting for a complete fresh GitHub feedback snapshot.");
 			return;
 		}
 		if (snapshot.prState !== "open") {
@@ -968,12 +1018,12 @@ export class PrCommentAutomationService {
 			const clineTaskSessionService = await this.deps.getClineTaskSessionService(candidate);
 			const terminalManager = await this.deps.getTerminalManager(candidate);
 			if (isTaskWriterActive(owner.taskId, { clineTaskSessionService, terminalManager })) {
-				sub.dispatchRetryAt = nowMs + DISPATCH_RETRY_MS;
+				await this.holdDispatch(sub, "writer_active", "Waiting for the task's running agent to finish.");
 				return;
 			}
 		} catch (error) {
 			this.warn(`writer check failed: ${error instanceof Error ? error.message : String(error)}`);
-			sub.dispatchRetryAt = nowMs + DISPATCH_RETRY_MS;
+			await this.holdDispatch(sub, "session_unavailable", "Waiting for task session activity to be readable.");
 			return;
 		}
 		await this.executeDispatch(sub, owner, candidate, accessScopeId, snapshot, nowMs);
@@ -1101,6 +1151,7 @@ export class PrCommentAutomationService {
 						...pruneAutoSendAttempts(record.commentAutomation.autoSendAttempts, nowMs),
 						{ dispatchId, attemptedAt: nowMs },
 					],
+					dispatchHold: null,
 					dispatch: { ...dispatch, attemptedAt: nowMs, status: "waiting" },
 				},
 			};
@@ -1193,6 +1244,7 @@ export class PrCommentAutomationService {
 				pendingCount: null,
 				debounceDeadline: null,
 				firstPendingAt: null,
+				dispatchHold: null,
 				dispatch: automation.dispatch ? { ...automation.dispatch, status: "completed", error: null } : null,
 			}));
 			return null;
@@ -1287,6 +1339,7 @@ export class PrCommentAutomationService {
 					pendingCount: null,
 					debounceDeadline: null,
 					firstPendingAt: null,
+					dispatchHold: null,
 					lastDispatchedFeedbackFingerprint: computePrFeedbackFingerprint(events),
 					dispatch: current.dispatch
 						? {
@@ -1370,6 +1423,7 @@ export class PrCommentAutomationService {
 					pendingCount: null,
 					debounceDeadline: null,
 					firstPendingAt: null,
+					dispatchHold: null,
 					lastDispatchedFeedbackFingerprint:
 						currentDispatch.previousFeedbackFingerprint !== undefined
 							? currentDispatch.previousFeedbackFingerprint
@@ -1393,6 +1447,7 @@ export class PrCommentAutomationService {
 			automation.pendingCount !== null ||
 			automation.debounceDeadline !== null ||
 			automation.firstPendingAt !== null ||
+			automation.dispatchHold != null ||
 			(automation.dispatch !== null &&
 				automation.dispatch.status === "queued" &&
 				automation.dispatch.attemptedAt === null);
@@ -1410,6 +1465,7 @@ export class PrCommentAutomationService {
 					pendingCount: null,
 					debounceDeadline: null,
 					firstPendingAt: null,
+					dispatchHold: null,
 					...(currentAutomation.dispatch !== null &&
 					currentAutomation.dispatch.status === "queued" &&
 					currentAutomation.dispatch.attemptedAt === null
@@ -1902,6 +1958,7 @@ export class PrCommentAutomationService {
 										pendingCount: null,
 										debounceDeadline: null,
 										firstPendingAt: null,
+										dispatchHold: null,
 									}
 								: {}),
 							publication: { published, pending: nextPending },
@@ -2037,6 +2094,7 @@ export class PrCommentAutomationService {
 										pendingCount: null,
 										debounceDeadline: null,
 										firstPendingAt: null,
+										dispatchHold: null,
 										lastDispatchedFeedbackFingerprint: currentDispatch.fingerprint,
 									}
 								: {}),
@@ -2144,6 +2202,24 @@ export class PrCommentAutomationService {
 			(entry) => entry.uncertain || this.isCapturePendingStale(entry, nowMs),
 		);
 		const capturePaused = this.captureBlocked.has(key);
+		const dispatch = automation.dispatch;
+		const unsent =
+			dispatch === null ||
+			dispatch.status === "completed" ||
+			(dispatch.status === "queued" && dispatch.attemptedAt === null);
+		const pending = (automation.pendingCount ?? 0) > 0 && automation.debounceDeadline !== null;
+		const dispatchHold =
+			pending && unsent
+				? !sub?.candidates.has(`${scope.workspaceId}/${taskId}`)
+					? {
+							kind: "not_subscribed" as const,
+							message: "Comment handling is not subscribed for this task. Check its lane and runtime workspace.",
+							since: automation.firstPendingAt ?? nowMs,
+							lastCheckedAt: nowMs,
+							retryAt: null,
+						}
+					: (automation.dispatchHold ?? null)
+				: null;
 		const blocker = capturePaused
 			? `Publication capture could not be persisted; automatic comment handling is paused for this pull request.`
 			: uncertainEntry
@@ -2164,6 +2240,7 @@ export class PrCommentAutomationService {
 				pr,
 				pendingCount: automation.pendingCount ?? 0,
 				pendingDeadline: automation.debounceDeadline,
+				dispatchHold,
 				dispatch: automation.dispatch,
 				blocker,
 				resumable:
@@ -2331,6 +2408,7 @@ export class PrCommentAutomationService {
 						pendingCount: null,
 						debounceDeadline: null,
 						firstPendingAt: null,
+						dispatchHold: null,
 						dispatch: { ...currentDispatch, status: "completed" },
 					},
 				};
