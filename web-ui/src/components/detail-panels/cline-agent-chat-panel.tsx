@@ -374,10 +374,10 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 		}, [taskId]);
 
 		useLayoutEffect(() => {
-			if (!usesVirtualizedMessages && messages.length >= CHAT_VIRTUALIZATION_THRESHOLD && isAutoScrollEnabled) {
+			if (virtualizedTaskId !== taskId && messages.length >= CHAT_VIRTUALIZATION_THRESHOLD && isAutoScrollEnabled) {
 				setVirtualizedTaskId(taskId);
 			}
-		}, [isAutoScrollEnabled, messages.length, taskId, usesVirtualizedMessages]);
+		}, [isAutoScrollEnabled, messages.length, taskId, virtualizedTaskId]);
 
 		// Size changes within the final streamed row do not append an item.
 		// Virtuoso's autoscrollToBottom respects its internal scroll-up state,
