@@ -171,6 +171,25 @@ function normalizeTaskPullRequests(rawPullRequests: unknown): RuntimeTaskPullReq
 	return pullRequests.length > 0 ? pullRequests : undefined;
 }
 
+/**
+ * AUTOGIT: the server-owned dedupe record is validated on the way in so a
+ * malformed payload can never suppress (or fake) an auto prompt.
+ */
+function normalizeSentGitActionPrompt(raw: unknown): { action: "commit" | "pr"; sentAt: number } | undefined {
+	if (!raw || typeof raw !== "object") {
+		return undefined;
+	}
+	const value = raw as { action?: unknown; sentAt?: unknown };
+	if (
+		(value.action !== "commit" && value.action !== "pr") ||
+		typeof value.sentAt !== "number" ||
+		!Number.isFinite(value.sentAt)
+	) {
+		return undefined;
+	}
+	return { action: value.action, sentAt: value.sentAt };
+}
+
 function normalizeCard(rawCard: unknown): BoardCard | null {
 	if (!rawCard || typeof rawCard !== "object") {
 		return null;
@@ -198,6 +217,7 @@ function normalizeCard(rawCard: unknown): BoardCard | null {
 		settingsRevision?: unknown;
 		lastPrompt?: unknown;
 		lastPromptAt?: unknown;
+		sentGitActionPrompt?: unknown;
 		createdAt?: unknown;
 		updatedAt?: unknown;
 	};
@@ -222,6 +242,7 @@ function normalizeCard(rawCard: unknown): BoardCard | null {
 	});
 
 	const now = Date.now();
+	const sentGitActionPrompt = normalizeSentGitActionPrompt(card.sentGitActionPrompt);
 
 	return {
 		id: typeof card.id === "string" && card.id ? card.id : createShortTaskId(createBrowserUuid),
@@ -256,6 +277,10 @@ function normalizeCard(rawCard: unknown): BoardCard | null {
 		...(typeof card.lastPromptAt === "number" && Number.isFinite(card.lastPromptAt)
 			? { lastPromptAt: card.lastPromptAt }
 			: {}),
+		// AUTOGIT: server-owned; carried through board hydration so the
+		// auto-review scheduler can suppress the already-delivered prompt
+		// for this episode without waiting for the server acquire.
+		...(sentGitActionPrompt !== undefined ? { sentGitActionPrompt } : {}),
 		createdAt: typeof card.createdAt === "number" ? card.createdAt : now,
 		updatedAt: typeof card.updatedAt === "number" ? card.updatedAt : now,
 	};

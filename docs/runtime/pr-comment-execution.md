@@ -14,6 +14,31 @@ are not a mergeability verdict; auto-merge and merge-candidate UI are outside th
 
 ## Queuing and execution
 
+An unsent intent has status `queued` and `attemptedAt: null`. Once its deadline
+passes, it waits only for actual runtime or provider prerequisites; it is not in
+the model-capacity queue yet. Terminal summaries restored from disk count as
+writers only when `hasActiveProcess(taskId)` is true. A native Cline `running`
+session still blocks delivery, as does a running terminal agent with a process.
+An `awaiting_review` Cline session alone does not block delivery.
+
+Pre-send holds persist a `dispatchHold` containing `kind`, `message`, `since`,
+`lastCheckedAt`, and `retryAt` (epoch milliseconds). The original `since` survives
+rechecks and restarts while the same reason remains. Reasons cover active writers,
+unreadable session services, unavailable GitHub authentication, incomplete fresh
+snapshots, unresolved publications, and dispatch-check errors. The UI shows the
+reason and elapsed wait; its tooltip includes the check and retry timestamps.
+These holds retry automatically on the existing cadence and never consume feedback
+or require Resume. Missing task subscriptions are reported separately with a
+lane/workspace diagnostic. An overdue intent without a recorded reason is shown
+as overdue rather than promising execution "shortly".
+
+Existing records need no migration. Unsent overdue intents are revalidated after
+runtime restart and send once their real blocker clears. Running, failed, and
+ambiguous previously attempted intents retain their existing safety semantics.
+Dirty worktrees still block preparation; preserve or complete partial edits before
+using automatic Resume. Failed repair messages include the session's recorded error
+when available, so a tool failure is not hidden behind the generic lifecycle error.
+
 1. Polling collects feedback about every 60 seconds. The existing 120-second quiet
    window (600-second maximum from first pending feedback) schedules one repair intent.
 2. Task chat accepts a placeholder. Dispatch status `waiting` means the turn has not
@@ -24,23 +49,39 @@ are not a mergeability verdict; auto-merge and merge-candidate UI are outside th
    Closed/merged PRs or an empty eligible batch skip the model call.
 4. Git is verified/refreshed in the actual task worktree. The final prompt replaces the
    placeholder in task chat and contains the pending feedback bodies, IDs, authors,
-   timestamps, URLs, and inline file/line/diff context when available. The dispatched
+   timestamps, URLs, and inline file/line/diff context when available (inline or via
+   the complete local snapshot described below). The dispatched
    fingerprint advances only at this execution boundary.
 
 Git verification always runs on admission, even when the PR snapshot is fresh. It
-requires a clean worktree, the PR head branch, no in-progress Git operation, and a
-configured GitHub remote matching the PR head repository (including fork identity).
-It fetches that branch into a temporary private ref, verifies its SHA against the PR
-snapshot, and only fast-forwards a behind branch. An ahead/divergent branch, detached
-HEAD, dirty worktree, missing/mismatched remote, fetch failure, or racing head change
-blocks the turn. No reset, stash, rebase, branch checkout, force push, or merge commit
-is performed. A successful fast-forward is retained if a later preparation check fails.
+requires a clean worktree, no in-progress Git operation, and a configured GitHub remote
+matching the PR head repository (including fork identity). The checkout may be either
+attached to the PR head branch or on a detached HEAD, which is how Kanban normally
+creates task worktrees (a task can publish its detached HEAD to the PR branch without
+attaching to it). Any other attached branch blocks. Verification fetches the PR branch
+into a temporary private ref, verifies its SHA against the PR snapshot, then rechecks
+that HEAD still has its original commit and attachment state: a detach/attach
+transition counts as a concurrent change even at the same commit. HEAD that already
+equals the PR head proceeds unchanged; HEAD that is an ancestor is fast-forwarded with
+`merge --ff-only` (hooks disabled), which updates the checkout and index and leaves a
+detached HEAD detached. The final HEAD must equal the captured PR head with the same
+attachment state.
+
+An ahead/divergent HEAD, other attached branch, dirty worktree, missing/mismatched
+remote, fetch failure, `symbolic-ref` failure, or racing head/attachment change blocks
+the turn. No reset, stash, rebase, checkout, branch attach/creation, force push, or
+merge commit is performed, so a detached repair never moves a local PR branch, including
+one checked out in another worktree. The temporary ref is removed on success and
+failure. A successful fast-forward is retained if a later preparation check fails.
 
 A Git blocker is stored as a failed dispatch with `errorCode: git_refresh_blocked`,
 shown with its reason and Resume action. Preserve/reconcile the worktree manually,
-then Resume; feedback remains eligible. Incomplete snapshots and oversized prompts
-also fail visibly before a model call. No new configuration/environment variables are
+then Resume; feedback remains eligible. Incomplete GitHub snapshots and local snapshot
+write/read failures also fail visibly before a model call. No new configuration/environment variables are
 required. Existing Git/gh authentication and network access remain prerequisites.
+Repairs paused by the former `Task worktree is on a detached HEAD` blocker need no
+manual reconciliation: Resume once after deployment. Feedback handled manually while
+paused may be reassessed, since that failed batch was never dispatched.
 
 ## Bounded feedback and later changes
 
@@ -51,10 +92,34 @@ publication conflict rather than force push, and leave thread resolution to revi
 because newer comments may have arrived. This is a prompt-level instruction; terminal
 access is unchanged, not a command-enforcement sandbox.
 
-The complete rendered prompt is capped at 32,000 characters. Oversized batches block
-for manual handling rather than truncating feedback and marking omitted items sent.
-Raw feedback is now included in normal task chat/SDK history; the separate workflow
-record continues to store only fingerprints and attribution metadata.
+The complete rendered prompt is capped at 32,000 characters, including instructions
+and JSON formatting. Small batches remain inline. When a batch exceeds that limit,
+preparation atomically writes the complete captured batch to a task context artifact
+and reads it back to verify the contents before touching Git or advancing the dispatch
+boundary. The short prompt supplies its absolute path and feedback count. No comments
+or long bodies are truncated, summarized, or silently omitted.
+
+The JSON snapshot includes the PR URL, capture timestamp, verified head SHA, and each
+item's ID, kind, body digest, full body, author, timestamp, URL, and inline context when
+available. It lives outside the checkout at
+`<task worktrees home>/<taskId>/context-artifacts/pr-feedback-<dispatchId>-<timestamp>-<random>.txt`,
+using the existing atomic artifact writer and diagnostic index. The agent reads all
+items in bounded sections (character slices for long JSON lines), accounts for each,
+and stops with an error if it cannot read the entire batch. It must not modify or commit
+the artifact or fetch live feedback as a substitute.
+
+Artifacts persist across runtime restarts and are removed with the owning task state
+directory, following existing context-artifact retention. A Resume captures a fresh
+batch and, if still oversized, creates a new artifact rather than overwriting the old
+snapshot. Preparation failures leave feedback undispatched and require Resume; failures
+after admission retain the existing previous-boundary restoration behavior.
+
+Raw feedback appears in task chat/SDK history for inline batches and in local artifacts
+and subsequent tool reads for oversized batches. The separate workflow record continues
+to store only fingerprints and attribution metadata. The runtime user must be able to
+write and read its existing task context-artifact directory; no new settings, environment
+variables, dependencies, or migrations are required. After deployment, use Resume once
+on repairs already paused by the old size-limit error.
 
 Polling continues while waiting and running. Feedback observed before admission is
 included in the refreshed batch; feedback added/edited after capture remains pending
@@ -71,7 +136,8 @@ visibly for Resume, since the scheduler's in-memory queue no longer exists.
 
 - `src/pr-tracking/github-pr-client.ts`: eligibility and feedback metadata.
 - `src/pr-tracking/comment-automation-service.ts`: debounce, dispatch, preparation and lifecycle.
-- `src/pr-tracking/comment-git-refresh.ts`: safe Git refresh.
-- `src/pr-tracking/comment-handling-prompt.ts`: bounded batch rendering.
+- `src/pr-tracking/comment-git-refresh.ts`: safe Git refresh for detached or PR-branch checkouts.
+- `src/pr-tracking/comment-handling-prompt.ts`: bounded batch rendering and verified snapshot fallback.
+- `src/workspace/task-artifacts.ts`: existing task artifact storage and lifecycle.
 - `src/cline-sdk/cline-turn-preparation.ts`: internal admission callback contract.
 - `src/cline-sdk/cline-session-runtime.ts`: hook after scheduler admission for live/restarted sessions.

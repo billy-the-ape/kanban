@@ -51,7 +51,7 @@ If you remember nothing else, remember this:
                                 v                                v
 +-------------------------------+--+          +------------------+-------------------+
 | Worktrees and shell processes    |          | Published Cline SDK packages        |
-| per-task cwd, CLI agents, shell  |          | `@clinebot/core`, `@clinebot/agents`, `@clinebot/llms` |
+| per-task cwd, CLI agents, shell  |          | @clinebot/core, @clinebot/shared    |
 +----------------------------------+          | provider store, session host,       |
                                               | session artifact persistence         |
                                               +--------------------------------------+
@@ -251,7 +251,7 @@ runtime-api.ts
     |    sdk-provider-boundary.ts
     |        |
     |        v
-    |    @clinebot/core and @clinebot/llms provider store, catalog, OAuth helpers
+    |    @clinebot/core provider store, catalog, and OAuth helpers
     |
     v
 cline-task-session-service.ts
@@ -262,7 +262,7 @@ cline-task-session-service.ts
     |    sdk-runtime-boundary.ts
     |        |
     |        v
-    |    @clinebot/core session host and persisted session records, plus @clinebot/agents prompt helpers
+    |    @clinebot/core session host, persisted session records, and prompt helpers
     |
     +--> cline-message-repository.ts
     |        |
@@ -326,7 +326,7 @@ The current behavior is:
 - when the selected sidebar agent is Cline, the sidebar renders native chat
 - when the selected sidebar agent is another provider, the sidebar renders a terminal panel
 - the home session is keyed to the current workspace and relevant agent descriptor
-- switching between Projects and Agent in the sidebar should not restart the session
+- switching between the sidebar sections (Projects, Tasks, Kanbani) should not restart the session
 - switching to a different project or materially different agent configuration should rotate the session
 
 This is one of the places where the architecture still has a little intentional weirdness. It is not a first-class workspace-native session type yet, but it is now documented and contained.
@@ -368,7 +368,7 @@ These are the architectural rules that are most important to preserve.
 
 Some of the highest-value rules are enforced automatically by lint.
 
-- only the two SDK boundary modules may import directly from `@clinebot/*`
+- outside `src/cline-sdk/`, only the two SDK boundary modules may import directly from `@clinebot/*`
 - in the browser app, `createWorkspaceTrpcClient` is reserved for the runtime query helpers
 - the raw home agent session prefix should not be duplicated in app code
 

@@ -32,17 +32,44 @@ interface UseClineChatSessionResult {
 	cancelTurn: () => Promise<boolean>;
 }
 
+/**
+ * Image payloads can be multi-megabyte base64 strings. Compare the known
+ * schema fields directly rather than constructing another serialized copy.
+ */
+function areMessageImagesEqual(left: ClineChatMessage["images"], right: ClineChatMessage["images"]): boolean {
+	if (left === right) return true;
+	if (!left || !right || left.length !== right.length) return false;
+	return left.every((image, index) => {
+		const other = right[index];
+		return (
+			other !== undefined &&
+			image.id === other.id &&
+			image.mimeType === other.mimeType &&
+			image.name === other.name &&
+			image.data === other.data
+		);
+	});
+}
+
 function areMessagesEqual(left: ClineChatMessage, right: ClineChatMessage): boolean {
+	if (left === right) {
+		return true;
+	}
 	return (
 		left.content === right.content &&
 		left.role === right.role &&
 		left.createdAt === right.createdAt &&
-		JSON.stringify(left.meta ?? null) === JSON.stringify(right.meta ?? null)
+		(left.meta === right.meta || JSON.stringify(left.meta ?? null) === JSON.stringify(right.meta ?? null)) &&
+		areMessageImagesEqual(left.images, right.images)
 	);
 }
 
 function upsertMessage(currentMessages: ClineChatMessage[], nextMessage: ClineChatMessage): ClineChatMessage[] {
-	const existingIndex = currentMessages.findIndex((message) => message.id === nextMessage.id);
+	// Streaming usually updates the final message; avoid a history scan per token.
+	const lastIndex = currentMessages.length - 1;
+	const existingIndex = currentMessages[lastIndex]?.id === nextMessage.id
+		? lastIndex
+		: currentMessages.findIndex((message) => message.id === nextMessage.id);
 	if (existingIndex < 0) {
 		return [...currentMessages, nextMessage];
 	}
@@ -55,8 +82,35 @@ function upsertMessage(currentMessages: ClineChatMessage[], nextMessage: ClineCh
 	return nextMessages;
 }
 
-function mergeMessages(baseMessages: ClineChatMessage[], additionalMessages: ClineChatMessage[]): ClineChatMessage[] {
-	return additionalMessages.reduce((nextMessages, message) => upsertMessage(nextMessages, message), [...baseMessages]);
+/**
+ * Merge by message ID in O(base + incoming) time rather than repeatedly
+ * scanning and copying the growing history. Preserve the original order and
+ * references for unchanged messages so virtualized rows do not rerender.
+ */
+export function mergeClineChatMessages(
+	baseMessages: ClineChatMessage[],
+	additionalMessages: ClineChatMessage[],
+): ClineChatMessage[] {
+	if (additionalMessages.length === 0) {
+		return baseMessages;
+	}
+	const indexes = new Map(baseMessages.map((message, index) => [message.id, index]));
+	let result = baseMessages;
+	for (const message of additionalMessages) {
+		const index = indexes.get(message.id);
+		if (index === undefined) {
+			if (result === baseMessages) result = [...baseMessages];
+			indexes.set(message.id, result.length);
+			result.push(message);
+			continue;
+		}
+		const existing = result[index];
+		if (existing && !areMessagesEqual(existing, message)) {
+			if (result === baseMessages) result = [...baseMessages];
+			result[index] = message;
+		}
+	}
+	return result;
 }
 
 export function useClineChatSession({
@@ -91,7 +145,7 @@ export function useClineChatSession({
 				if (cancelled) {
 					return;
 				}
-				setMessages((currentMessages) => mergeMessages(loadedMessages ?? [], currentMessages));
+				setMessages((currentMessages) => mergeClineChatMessages(loadedMessages ?? [], currentMessages));
 			})
 			.catch((loadError) => {
 				if (cancelled) {
@@ -118,7 +172,7 @@ export function useClineChatSession({
 			setMessages([]);
 			return;
 		}
-		setMessages((currentMessages) => mergeMessages(currentMessages, incomingMessages));
+		setMessages((currentMessages) => mergeClineChatMessages(currentMessages, incomingMessages));
 	}, [incomingMessages]);
 
 	useEffect(() => {
@@ -178,6 +232,8 @@ export function useClineChatSession({
 					setMessages((currentMessages) => upsertMessage(currentMessages, sentMessage));
 				} else if (onLoadMessages) {
 					const loadedMessages = await onLoadMessages(taskId);
+					// A post-send reload is authoritative (notably for /clear).
+					// Merging stale local messages would restore a cleared transcript.
 					setMessages(loadedMessages ?? []);
 				}
 				return true;

@@ -18,6 +18,7 @@ import {
 	formatPullRequestIdentity,
 	formatPullRequestLabel,
 	formatPullRequestSource,
+	getPullRequestDetailParts,
 	getPullRequestKey,
 } from "@/utils/task-pull-requests";
 
@@ -72,6 +73,7 @@ export function TaskPullRequestRow({
 	metaParts.push(`Source: ${formatPullRequestSource(pullRequest.source)}`);
 	metaParts.push(`First recorded ${formatApproximateAge(pullRequest.createdAt)}`);
 	metaParts.push(`Last observed ${formatApproximateAge(pullRequest.lastSeenAt ?? pullRequest.createdAt)}`);
+	const detailParts = getPullRequestDetailParts(pullRequest);
 
 	return (
 		<div
@@ -112,6 +114,18 @@ export function TaskPullRequestRow({
 					title={pullRequest.title}
 				>
 					{pullRequest.title}
+				</div>
+			) : null}
+			{detailParts.length > 0 ? (
+				<div
+					className="flex min-w-0 flex-wrap gap-x-2 gap-y-0.5 text-[11px] text-text-secondary"
+					data-testid={`task-pr-view-details-${pullRequest.number}`}
+				>
+					{detailParts.map((part) => (
+						<span key={part} className="min-w-0 break-words">
+							{part}
+						</span>
+					))}
 				</div>
 			) : null}
 			<div

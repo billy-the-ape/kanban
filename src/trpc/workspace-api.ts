@@ -7,6 +7,8 @@ import type {
 	RuntimeGitSummaryResponse,
 	RuntimeGitSyncAction,
 	RuntimeGitSyncResponse,
+	RuntimeTaskGitActionPromptReleaseResponse,
+	RuntimeTaskGitActionPromptResponse,
 	RuntimeTaskPullRequestLinkResponse,
 	RuntimeTaskPullRequestRefreshResponse,
 	RuntimeTaskPullRequestsRefreshResponse,
@@ -17,6 +19,8 @@ import type {
 } from "../core/api-contract";
 import {
 	parseGitCheckoutRequest,
+	parseTaskGitActionPromptReleaseRequest,
+	parseTaskGitActionPromptRequest,
 	parseTaskPreservationRequest,
 	parseTaskPullRequestLinkedRefreshRequest,
 	parseTaskPullRequestLinkRequest,
@@ -48,6 +52,7 @@ import { readTaskDeliveryReceipt } from "../workspace/git-delivery";
 import { getCommitDiff, getGitLog, getGitRefs } from "../workspace/git-history";
 import { discardGitChanges, getGitSyncSummary, runGitCheckoutAction, runGitSyncAction } from "../workspace/git-sync";
 import { searchWorkspaceFiles } from "../workspace/search-workspace-files";
+import { acquireTaskGitActionPrompt, releaseTaskGitActionPrompt } from "../workspace/task-git-action-prompt";
 import {
 	findTasksEnteringReviewWithoutPullRequests,
 	fireReviewPullRequestLookup,
@@ -513,6 +518,35 @@ export function createWorkspaceApi(deps: CreateWorkspaceApiDependencies): Runtim
 				}
 				throw error;
 			}
+		},
+		// AUTOGIT: server-owned dedupe record for the generated auto
+		// commit/PR prompts. A write only happens on state change, so a
+		// successful mutation broadcasts the board update that lets the
+		// clients' auto-review evaluations observe the new record.
+		acquireTaskGitActionPrompt: async (workspaceScope, input): Promise<RuntimeTaskGitActionPromptResponse> => {
+			const body = parseTaskGitActionPromptRequest(input);
+			const status = await acquireTaskGitActionPrompt({
+				workspacePath: workspaceScope.workspacePath,
+				taskId: body.taskId,
+				action: body.action,
+				intent: body.intent,
+			});
+			if (status === "acquired") {
+				void deps.broadcastRuntimeWorkspaceStateUpdated(workspaceScope.workspaceId, workspaceScope.workspacePath);
+			}
+			return { ok: true, status };
+		},
+		releaseTaskGitActionPrompt: async (workspaceScope, input): Promise<RuntimeTaskGitActionPromptReleaseResponse> => {
+			const body = parseTaskGitActionPromptReleaseRequest(input);
+			const released = await releaseTaskGitActionPrompt({
+				workspacePath: workspaceScope.workspacePath,
+				taskId: body.taskId,
+				action: body.action,
+			});
+			if (released) {
+				void deps.broadcastRuntimeWorkspaceStateUpdated(workspaceScope.workspaceId, workspaceScope.workspacePath);
+			}
+			return { ok: released };
 		},
 		// PRLINK-5: manual PR link add. The server re-parses the URL with the
 		// strict shared parser (authoritative); invalid URLs are never stored.

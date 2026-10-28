@@ -107,7 +107,7 @@ export function TaskQualitySummarySection({
 				{summary ? <CoverageBadge status={summary.coverage.status} /> : null}
 				<span className="min-w-0 flex-1 truncate text-[12px] text-text-tertiary">
 					{summary
-						? `captured ${formatDiagnosticsTimestamp(summary.capturedAt)}`
+						? `captured ${formatDiagnosticsTimestamp(summary.capturedAt)} · reducer v${summary.reducerVersion}`
 						: isLoading
 							? "Analyzing recorded sessions…"
 							: "On-demand snapshot of recorded native sessions"}
@@ -213,7 +213,7 @@ export function TaskQualitySummarySection({
 					{summary.tools.reportedFailures > 0 ? (
 						<DiagnosticsValue
 							label="Reported failures"
-							value={`${summary.tools.reportedFailures} (confirmed, once per call)`}
+							value={`${summary.tools.reportedFailures} (confirmed structural, once per call)`}
 						/>
 					) : null}
 					{summary.tools.unmatchedCalls > 0 ? (
@@ -284,8 +284,9 @@ export function TaskQualitySummarySection({
 								<ul className="max-h-32 space-y-0.5 overflow-y-auto p-0 m-0 list-none">
 									{summary.evidence.map((record, index) => (
 										<li key={index} className="truncate font-mono text-[11px] text-text-secondary">
-											{record.classification}: {record.toolCallId || "(no id)"} · {record.ruleId} · msg{" "}
-											{record.messageIndex}:{record.partIndex} ({record.sessionId})
+											{record.classification}: {record.toolCallId || "(no id)"} · {record.ruleId}
+											{record.resultIsError ? " · is_error" : ""} · msg {record.messageIndex}:
+											{record.partIndex} ({record.sessionId})
 											{record.priorReference
 												? ` · after msg ${record.priorReference.messageIndex}:${record.priorReference.partIndex} in ${record.priorReference.sessionId}`
 												: ""}

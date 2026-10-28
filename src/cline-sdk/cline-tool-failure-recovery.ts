@@ -1,3 +1,4 @@
+import { collectEditorEvidence, type EditorEvidence } from "./cline-editor-evidence";
 import type { ClineSdkAgentAfterToolContext, ClineSdkAgentHooks } from "./sdk-runtime-boundary";
 
 type Tool = ClineSdkAgentAfterToolContext["tool"];
@@ -6,6 +7,9 @@ const REPLAY_SAFE_TOOLS = new Set(["read_files", "search_codebase", "fetch_web_c
 const MAX_TIMEOUTS_PER_CALL = 2;
 /** The same call failing with the same error this many times in a row, with no successful tool call between, ends the run. */
 const MAX_IDENTICAL_FAILURES = 3;
+/** AR-2: the repeated-failure sentence. The call and error are identical, so the relevant fields are unchanged. */
+const REPEATED_EDITOR_FAILURE_SENTENCE =
+	"This repeats the earlier failed arguments. The relevant fields have not changed. Correct the identified mismatch or read a targeted current section before another attempt. ";
 /**
  * Timeouts are recognised by the exact shapes the SDK and Kanban's MCP layer emit, one error line at a time.
  * A free-text search is wrong here: stderr, file paths, regexes, and echoed model input routinely contain
@@ -65,23 +69,63 @@ function callKey(toolName: string, input: unknown): string {
 	return `${toolName}\n${JSON.stringify(input) ?? ""}`;
 }
 
-function editorRecovery(error: string): string | null {
-	if (error.startsWith("Editor operation failed: No replacement performed: multiple occurrences")) {
-		return "The replacement anchor matched more than once. Read the current file section and include enough surrounding text in old_text to identify exactly one occurrence. Do not repeat the ambiguous anchor.";
-	}
-	if (error.startsWith("Editor operation failed: No replacement performed: text not found")) {
-		return "Replacement text did not match. Read the current file section with read_files, then copy an exact, unique old_text anchor from that fresh read. Do not repeat unchanged arguments or guess whitespace. insert_line is only for a pure insertion, not a replacement.";
-	}
-	if (error.startsWith("Editor operation failed: Parameter `old_text` is required")) {
-		return "The editor received an existing-file edit without usable old_text. Read the current file section and include an explicit old_text string in the actual arguments. Use insert_line only for an intended insertion; do not assume the tool dropped a field.";
-	}
-	if (error.startsWith("Editor operation failed: Invalid insert_line:")) {
-		return "Read the current file to determine its line count and insertion boundary. insert_line is one-based; use line_count + 1 to append. Do not repeat the invalid line number.";
-	}
-	if (error.startsWith("Editor input too large:")) {
-		return "Split the edit into smaller sequential calls; keep old_text and new_text below 30000 characters each. Read the current file before anchoring the next edit. Do not retry the same oversized payload.";
-	}
+type EditorFailureKind =
+	| "missing_old_text"
+	| "no_match"
+	| "ambiguous_match"
+	| "invalid_insert_line"
+	| "input_too_large";
+
+function classifyEditorFailure(error: string): EditorFailureKind | null {
+	if (error.startsWith("Editor operation failed: No replacement performed: multiple occurrences"))
+		return "ambiguous_match";
+	if (error.startsWith("Editor operation failed: No replacement performed: text not found")) return "no_match";
+	if (error.startsWith("Editor operation failed: Parameter `old_text` is required")) return "missing_old_text";
+	if (error.startsWith("Editor operation failed: Invalid insert_line:")) return "invalid_insert_line";
+	if (error.startsWith("Editor input too large:")) return "input_too_large";
 	return null;
+}
+
+/**
+ * AR-2: builds the model-facing editor recovery sentence from the measured
+ * condition. Only the sentence appropriate to what was actually observed is
+ * emitted; facts (match counts, whitespace, skip reasons) are substituted from
+ * the evidence.
+ */
+function buildEditorRecovery(kind: EditorFailureKind, evidence: EditorEvidence | null): string {
+	const oldTextField = evidence?.fields.old_text;
+	switch (kind) {
+		case "missing_old_text": {
+			const head =
+				oldTextField?.present && oldTextField.length === 0
+					? "The parsed editor call has an empty old_text."
+					: "The parsed editor call is missing old_text.";
+			return `${head} For a replacement, include path, an exact unique old_text anchor, and new_text in the actual arguments. Use insert_line only for an intended insertion.`;
+		}
+		case "no_match": {
+			const matchCount = evidence?.oldText?.matchCount;
+			const count = typeof matchCount === "number" ? matchCount : 0;
+			if (evidence?.file?.state === "skipped") {
+				return `The submitted anchor did not match the current file. Current-source evidence was skipped: ${evidence.file.reason ?? "unknown reason"}. Read a targeted section of the current file with read_files, then copy a short exact anchor from that fresh read. Do not repeat unchanged arguments or guess whitespace.`;
+			}
+			if (evidence?.candidates && evidence.candidates.windows.length > 0) {
+				return `The submitted anchor matched ${count} time${count === 1 ? "" : "s"} in the current file. The nearby source below is diagnostic evidence, not an automatically corrected anchor. Copy a short exact anchor from current source and include enough context to make it unique. Let the repository formatter handle indentation introduced by your edit.`;
+			}
+			return `The submitted anchor matched ${count} time${count === 1 ? "" : "s"} in the current file. No nearby candidate could be located. Read a targeted section of the current file with read_files, then copy a short exact anchor from that fresh read. Do not repeat unchanged arguments or guess whitespace.`;
+		}
+		case "ambiguous_match": {
+			const matchCount = evidence?.oldText?.matchCount;
+			const head =
+				typeof matchCount === "number" && matchCount > 1
+					? `The replacement anchor matched ${matchCount} times in the current file.`
+					: "The replacement anchor matched more than once.";
+			return `${head} Include enough surrounding text in old_text to identify exactly one occurrence. Do not repeat the ambiguous anchor.`;
+		}
+		case "invalid_insert_line":
+			return "Read the current file to determine its line count and insertion boundary. insert_line is one-based; use line_count + 1 to append. Do not repeat the invalid line number.";
+		case "input_too_large":
+			return "Split the edit into smaller sequential calls; keep old_text and new_text below 30000 characters each. Read the current file before anchoring the next edit. Do not retry the same oversized payload.";
+	}
 }
 
 /**
@@ -92,7 +136,7 @@ function editorRecovery(error: string): string | null {
  * Only the same call failing with the same
  * error repeatedly, with no successful tool call in between, ends the run. Reset only on a new user turn.
  */
-export function createClineToolFailureRecoveryHooks(): ClineSdkAgentHooks {
+export function createClineToolFailureRecoveryHooks(cwd?: string): ClineSdkAgentHooks {
 	const wrapped = new WeakSet<Tool>();
 	const attempts = new Map<string, number>();
 	const timeouts = new Map<string, { count: number; iteration: number }>();
@@ -180,7 +224,7 @@ export function createClineToolFailureRecoveryHooks(): ClineSdkAgentHooks {
 			};
 			return undefined;
 		},
-		afterTool: ({ snapshot, toolCall, input, result }) => {
+		afterTool: async ({ snapshot, toolCall, input, result }) => {
 			const error = readClineToolFailure(result.output) ?? (result.isError ? summarize(result.output) : null);
 			const count = attempts.get(toolCall.toolCallId) ?? 1;
 			attempts.delete(toolCall.toolCallId);
@@ -195,20 +239,28 @@ export function createClineToolFailureRecoveryHooks(): ClineSdkAgentHooks {
 			const boundedRecovery = isClineToolTimeout(error)
 				? timeoutFailure(toolCall.toolName, input, error, count, snapshot.iteration)
 				: repeatedFailure(toolCall.toolName, input, error, snapshot.iteration);
-			const editorGuidance = toolCall.toolName === "editor" ? editorRecovery(error) : null;
 			const key = `${callKey(toolCall.toolName, input)}\n${error}`;
 			const repeated = (identicalFailures.get(key)?.count ?? 0) > 1;
-			const recovery =
-				boundedRecovery ??
-				(editorGuidance
-					? `${repeated ? "This exact editor call already failed. Change your approach before another attempt. " : ""}${editorGuidance}`
-					: null);
+			// AR-2: a genuine failed editor call (executed and rejected) gets a
+			// bounded current-source evidence read attached to its recovery
+			// envelope. Approval denials and policy skips fail before execution
+			// and never reach this path, so no hidden enrichment read follows a
+			// denial. Timeouts keep their existing bounded recovery without evidence.
+			let recovery: string | null = boundedRecovery;
+			let evidence: EditorEvidence | null = null;
+			if (recovery === null && toolCall.toolName === "editor") {
+				const kind = classifyEditorFailure(error);
+				if (kind) {
+					evidence = cwd ? await collectEditorEvidence({ cwd, input, repeated }) : null;
+					recovery = `${repeated ? REPEATED_EDITOR_FAILURE_SENTENCE : ""}${buildEditorRecovery(kind, evidence)}`;
+				}
+			}
 			if (!recovery) return;
 			return {
 				result: {
 					...result,
 					isError: true,
-					output: { recovery, output: result.output },
+					output: { recovery, ...(evidence ? { evidence } : {}), output: result.output },
 				},
 			};
 		},

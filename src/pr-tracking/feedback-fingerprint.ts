@@ -16,7 +16,8 @@ export type PrFeedbackKind = "review" | "inline" | "conversation";
 
 /**
  * One eligible piece of PR feedback, normalized for scheduling. `body` is
- * transient input only — never persisted to the durable workflow store.
+ * never persisted to the durable workflow store. Oversized dispatch batches
+ * preserve the full body separately in a task context artifact.
  */
 export interface PrFeedbackEvent {
 	kind: PrFeedbackKind;
@@ -31,7 +32,7 @@ export interface PrFeedbackEvent {
 	updatedAt: number;
 	/** SHA-256 (hex) of the raw feedback body. */
 	bodyDigest: string;
-	/** Transient raw body; not stored durably. */
+	/** Raw body; stored only in task context artifacts, never workflow records. */
 	body: string;
 	/**
 	 * For inline (review) comments: the id of the review the comment belongs

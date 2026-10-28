@@ -160,13 +160,26 @@ export function TaskPrCommentHandlingPanel({ workspaceId, taskId, pullRequests }
 				{resumeButton}
 			</span>
 		);
+	} else if (state?.dispatchHold) {
+		const hold = state.dispatchHold;
+		const minutes = Math.max(0, Math.floor((Date.now() - hold.since) / 60_000));
+		statusLine = (
+			<span
+				className="text-[11px] text-status-orange"
+				data-testid="task-pr-comment-status-held"
+				title={`Waiting since ${new Date(hold.since).toLocaleString()}. Last checked ${new Date(hold.lastCheckedAt).toLocaleString()}.${hold.retryAt === null ? "" : ` Next retry ${new Date(hold.retryAt).toLocaleString()}.`}`}
+			>
+				{hold.message} {minutes > 0 ? `Waiting ${minutes}m. ` : ""}
+				{hold.retryAt === null ? "Check task diagnostics." : "Retries automatically."}
+			</span>
+		);
 	} else if (pendingCount > 0 && pendingDeadline !== null) {
 		const remainingSeconds = Math.max(0, Math.ceil((pendingDeadline - Date.now()) / 1000));
 		statusLine = (
 			<span className="text-[11px] text-text-secondary" data-testid="task-pr-comment-status-pending">
 				{remainingSeconds > 0
 					? `Waiting to address ${pendingCount} new ${pendingCount === 1 ? "comment" : "comments"} in ${remainingSeconds}s`
-					: `Addressing ${pendingCount} new ${pendingCount === 1 ? "comment" : "comments"} shortly`}
+					: `${pendingCount} new ${pendingCount === 1 ? "comment" : "comments"} pending; dispatch overdue by ${Math.floor((Date.now() - pendingDeadline) / 60_000)}m. Waiting for the dispatch check.`}
 			</span>
 		);
 	} else if (enabled) {

@@ -1,15 +1,9 @@
 import type { RuntimeTaskDisplayState } from "@runtime-task-display-state";
+import { runtimeTaskDisplayStateSchema } from "@runtime-task-display-state";
 import { useCallback, useState } from "react";
 import { LocalStorageKey, readLocalStorageItem, writeLocalStorageItem } from "@/storage/local-storage-store";
 
-const KNOWN_TASK_DISPLAY_STATES = new Set<RuntimeTaskDisplayState>([
-	"backlog",
-	"in_progress",
-	"paused",
-	"review",
-	"done",
-	"trash",
-]);
+const KNOWN_TASK_DISPLAY_STATES = new Set<string>(runtimeTaskDisplayStateSchema.options);
 
 const DEFAULT_SELECTED_STATES: readonly RuntimeTaskDisplayState[] = ["in_progress"];
 
@@ -30,8 +24,7 @@ function readStoredSelection(): ReadonlySet<RuntimeTaskDisplayState> {
 		// An empty array is a valid stored value (the user switched every state
 		// off); unknown/foreign entries are ignored.
 		const valid = parsed.filter(
-			(value): value is RuntimeTaskDisplayState =>
-				typeof value === "string" && KNOWN_TASK_DISPLAY_STATES.has(value as RuntimeTaskDisplayState),
+			(value): value is RuntimeTaskDisplayState => typeof value === "string" && KNOWN_TASK_DISPLAY_STATES.has(value),
 		);
 		return new Set<RuntimeTaskDisplayState>(valid);
 	} catch {

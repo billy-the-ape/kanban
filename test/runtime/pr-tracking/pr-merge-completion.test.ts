@@ -109,13 +109,20 @@ interface TestBoardState {
 
 interface TestDeps extends PrMergeCompletionDeps {
 	completeCalls: Array<{ workspaceId: string; taskId: string }>;
+	successorCalls: Array<{ workspaceId: string; taskId: string; readyTaskIds: string[] }>;
 	warnings: string[];
+	/** The ids the fake board move releases (returned by completeTask). */
+	readyLinkedTaskIds?: string[];
 	/** Simulate server-side board transitions (manual reopen, moves). */
 	setBoard: (state: TestBoardState) => void;
 }
 
-function makeDeps(store: InMemoryPrRecordStore, overrides: Partial<PrMergeCompletionDeps> = {}): TestDeps {
+function makeDeps(
+	store: InMemoryPrRecordStore,
+	overrides: Partial<PrMergeCompletionDeps> & { readyLinkedTaskIds?: string[] } = {},
+): TestDeps {
 	const completeCalls: Array<{ workspaceId: string; taskId: string }> = [];
+	const successorCalls: Array<{ workspaceId: string; taskId: string; readyTaskIds: string[] }> = [];
 	const warnings: string[] = [];
 	// Server board mirror: completeTask moves the card to Done (idempotently)
 	// and clears the manual-reopen marker, as moveTaskToColumn does.
@@ -131,12 +138,17 @@ function makeDeps(store: InMemoryPrRecordStore, overrides: Partial<PrMergeComple
 			completeCalls.push({ workspaceId, taskId });
 			board.columnId = "done";
 			delete board.manualReopenAt;
+			return overrides.readyLinkedTaskIds ?? [];
+		},
+		dispatchSuccessors: async (workspaceId, taskId, readyTaskIds) => {
+			successorCalls.push({ workspaceId, taskId, readyTaskIds });
 		},
 		warn: (message) => {
 			warnings.push(message);
 		},
 		now: () => NOW,
 		completeCalls,
+		successorCalls,
 		warnings,
 		setBoard: (state) => {
 			board.columnId = state.columnId;
@@ -179,6 +191,39 @@ describe("pr-merge-completion consumer", () => {
 		expect(binding.terminalStop?.reason).toBe("merged_completed");
 		// The merge reservation is released when the episode ends.
 		expect(record.reservation.state).toBe("none");
+	});
+
+	it("fires the successor dispatch pass only after the completed binding is persisted", async () => {
+		const store = await makeStore();
+		const deps = makeDeps(store, { readyLinkedTaskIds: ["child-1", "child-2"] });
+		// Prove, from the store's point of view, that the completed binding
+		// is already visible when the pass fires (readiness reads it).
+		let observedBinding: unknown = "missing";
+		deps.dispatchSuccessors = async (workspaceId, taskId, readyTaskIds) => {
+			deps.successorCalls.push({ workspaceId, taskId, readyTaskIds });
+			const record = await loadRecord(store);
+			observedBinding = record.taskBindings[0].mergeCompletion;
+		};
+		await expect(reconcileMergeCompletion(makeObservation(await loadRecord(store)), deps)).resolves.toEqual({
+			action: "completed",
+		});
+		expect(deps.successorCalls).toEqual([
+			{ workspaceId: TASK.workspaceId, taskId: TASK.taskId, readyTaskIds: ["child-1", "child-2"] },
+		]);
+		expect(observedBinding).toMatchObject({ status: "completed", mergeCommitSha: "mergesha1" });
+	});
+
+	it("does not fire the successor pass when the completion write fails", async () => {
+		const store = await makeStore();
+		store.updateTaskBinding = async () => ({ ok: false, reason: "conflict" });
+		const deps = makeDeps(store);
+		await expect(reconcileMergeCompletion(makeObservation(await loadRecord(store)), deps)).resolves.toEqual({
+			action: "pending",
+			reason: "completion_write_failed",
+		});
+		expect(deps.successorCalls.length).toBe(0);
+		const record = await loadRecord(store);
+		expect(record.taskBindings[0].mergeCompletion).toBeNull();
 	});
 
 	it("completes again only for a LATER merge (a different merge commit)", async () => {
@@ -534,6 +579,7 @@ describe("pr-merge-completion coordinator delivery", () => {
 			isTaskWriterActive: async () => false,
 			completeTask: async (workspaceId, taskId) => {
 				completeCalls.push({ workspaceId, taskId });
+				return [];
 			},
 			now: () => NOW,
 		});

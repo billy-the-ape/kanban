@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createInMemoryClineSessionRuntime } from "../../../src/cline-sdk/cline-session-runtime";
 import { ClineTurnScheduler } from "../../../src/cline-sdk/cline-turn-scheduler";
 import type { ClineSdkSessionRecord } from "../../../src/cline-sdk/sdk-runtime-boundary";
+import { VALIDATION_JOB_CAPABILITY_TEXT } from "../../../src/cline-sdk/validation-job-tool";
 
 function createNoopMcpRuntimeService() {
 	return {
@@ -152,6 +153,90 @@ describe("InMemoryClineSessionRuntime", () => {
 				}),
 			}),
 		);
+	});
+
+	it("registers the validation_job tool and advertises it only on local SDK hosts", async () => {
+		const fakeHost = {
+			start: vi.fn(async (input: { config?: { sessionId?: string } }) => ({
+				sessionId: input.config?.sessionId ?? "session-1",
+				result: {},
+			})),
+			send: vi.fn(async () => ({})),
+			stop: vi.fn(async () => {}),
+			abort: vi.fn(async () => {}),
+			delete: vi.fn(async () => true),
+			dispose: vi.fn(async () => {}),
+			get: vi.fn(async () => undefined),
+			list: vi.fn(async () => []),
+			readMessages: vi.fn(async () => []),
+			subscribe: vi.fn(() => () => {}),
+		};
+		const runtime = createInMemoryClineSessionRuntime({
+			createSessionHost: async () => fakeHost,
+			createMcpRuntimeService: createNoopMcpRuntimeService,
+		});
+
+		await runtime.startTaskSession({
+			taskId: "task-vj-local",
+			cwd: "/tmp/worktree",
+			prompt: "Investigate startup",
+			providerId: "anthropic",
+			modelId: "claude-sonnet-4-6",
+			systemPrompt: "You are a helpful coding assistant.",
+		});
+
+		const startCall = fakeHost.start.mock.calls[0]?.[0] as {
+			config: { systemPrompt?: string; disableMcpSettingsTools?: boolean };
+			localRuntime?: { extraTools?: Array<{ name?: string }> };
+		};
+		// Local host (no runtimeAddress): the tool is registered and advertised.
+		expect(startCall.config.systemPrompt).toContain(VALIDATION_JOB_CAPABILITY_TEXT);
+		expect(startCall.config.disableMcpSettingsTools).toBeUndefined();
+		expect(startCall.localRuntime?.extraTools).toEqual(
+			expect.arrayContaining([expect.objectContaining({ name: "validation_job" })]),
+		);
+		await runtime.dispose();
+	});
+
+	it("does not register the validation_job tool on hub-backed SDK hosts", async () => {
+		const fakeHost = {
+			runtimeAddress: "ws://127.0.0.1:41831/runtime",
+			start: vi.fn(async (input: { config?: { sessionId?: string } }) => ({
+				sessionId: input.config?.sessionId ?? "session-1",
+				result: {},
+			})),
+			send: vi.fn(async () => ({})),
+			stop: vi.fn(async () => {}),
+			abort: vi.fn(async () => {}),
+			delete: vi.fn(async () => true),
+			dispose: vi.fn(async () => {}),
+			get: vi.fn(async () => undefined),
+			list: vi.fn(async () => []),
+			readMessages: vi.fn(async () => []),
+			subscribe: vi.fn(() => () => {}),
+		};
+		const runtime = createInMemoryClineSessionRuntime({
+			createSessionHost: async () => fakeHost,
+			createMcpRuntimeService: createNoopMcpRuntimeService,
+		});
+
+		await runtime.startTaskSession({
+			taskId: "task-vj-hub",
+			cwd: "/tmp/worktree",
+			prompt: "Investigate startup",
+			providerId: "anthropic",
+			modelId: "claude-sonnet-4-6",
+			systemPrompt: "You are a helpful coding assistant.",
+		});
+
+		const startCall = fakeHost.start.mock.calls[0]?.[0] as {
+			config: { systemPrompt?: string };
+			localRuntime?: { extraTools?: Array<{ name?: string }> };
+		};
+		// Hub host: the capability is neither advertised nor registered.
+		expect(startCall.config.systemPrompt).not.toContain(VALIDATION_JOB_CAPABILITY_TEXT);
+		expect(startCall.localRuntime?.extraTools).toBeUndefined();
+		await runtime.dispose();
 	});
 
 	it("leaves reasoning effort unset when no override is provided", async () => {

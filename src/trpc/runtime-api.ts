@@ -24,6 +24,7 @@ import type { ClineTurnPreparation } from "../cline-sdk/cline-turn-preparation";
 import type { RuntimeConfigState } from "../config/runtime-config";
 import { updateGlobalRuntimeConfig, updateRuntimeConfig } from "../config/runtime-config";
 import type {
+	GitHubPrMergeCompletion,
 	RuntimeCommandRunResponse,
 	RuntimeEffectiveContextWindow,
 	RuntimeGitDeliveryReceipt,
@@ -41,10 +42,12 @@ import type {
 	RuntimeTaskPhasesResponse,
 	RuntimeTaskPreservationInfoResponse,
 	RuntimeTaskPreservationRecord,
+	RuntimeTaskPrTrackingStateResponse,
 	RuntimeTaskQualitySummaryResponse,
 	RuntimeTaskReviewInfoResponse,
 	RuntimeTaskSessionStartRequest,
 	RuntimeTaskSessionSummary,
+	RuntimeTaskWriterActivity,
 	RuntimeUpdateStatusResponse,
 } from "../core/api-contract";
 import { runtimeTaskInitialStartStatusRequestSchema } from "../core/api-contract";
@@ -93,6 +96,7 @@ import { resolveTaskTitle } from "../core/task-title.js";
 import { reconcileOrphanedSessionSummary, resolveWorkspaceSessionSummaries } from "../core/workspace-session-summaries";
 import type { PrCommentAutomationService } from "../pr-tracking/comment-automation-service";
 import { openInBrowser } from "../server/browser";
+import { getTaskWriterActivity } from "../server/task-writer-activity";
 import { loadWorkspaceBoardById, mutateWorkspaceState } from "../state/workspace-state";
 import { readTaskDispatchRecord, writeTaskDispatchRecord } from "../task-dispatch/dispatch-records";
 import {
@@ -174,6 +178,13 @@ export interface CreateRuntimeApiDependencies {
 		scope: RuntimeTrpcWorkspaceScope,
 		taskId: string,
 	) => Promise<{ busy: boolean; reason: string | null }>;
+	/**
+	 * MERGE-1: completed merge-completion bindings per task in this workspace
+	 * (taskId → latest completed binding). Feeds dispatch readiness with merge
+	 * evidence as an alternative to delivery receipts. Optional in partial
+	 * harnesses: readiness then falls back to delivery receipts only.
+	 */
+	getCompletedMergeCompletions?: (scope: RuntimeTrpcWorkspaceScope) => Promise<Map<string, GitHubPrMergeCompletion>>;
 }
 
 /**
@@ -645,6 +656,10 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 	};
 
 	const buildTaskDispatchDeps = (workspaceScope: RuntimeTrpcWorkspaceScope): TaskDispatchDeps => {
+		// MERGE-1: per-pass cache of the workspace's completed merge-completion
+		// bindings — readiness loads every prerequisite in one parallel batch,
+		// so the store is read at most once per queue pass.
+		let mergeCompletionCache: Promise<Map<string, GitHubPrMergeCompletion>> | null = null;
 		return {
 			workspaceId: workspaceScope.workspaceId,
 			workspacePath: workspaceScope.workspacePath,
@@ -669,6 +684,19 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				});
 			},
 			readReceipt: (taskId) => readTaskDeliveryReceipt(taskId),
+			// MERGE-1: completed merge bindings are an alternative to delivery
+			// receipts for successor readiness.
+			readMergeCompletion: async (taskId) => {
+				if (!deps.getCompletedMergeCompletions) {
+					return null;
+				}
+				if (mergeCompletionCache === null) {
+					mergeCompletionCache = deps
+						.getCompletedMergeCompletions(workspaceScope)
+						.catch(() => new Map<string, GitHubPrMergeCompletion>());
+				}
+				return (await mergeCompletionCache).get(taskId) ?? null;
+			},
 			startSession: async ({ taskId, baseRef, prompt, taskTitle }) => {
 				const request: RuntimeTaskSessionStartRequest = {
 					taskId,
@@ -704,6 +732,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 
 	/** The task's session as the runtime sees it right now (Cline or terminal agent). */
 	interface TaskSessionState {
+		writerActivity: RuntimeTaskWriterActivity;
 		summary: RuntimeTaskSessionSummary | null;
 		/** A session is live in this runtime (running or awaiting review input) and can be cancelled. */
 		active: boolean;
@@ -725,19 +754,34 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		]);
 		return (taskId) => {
 			const clineSummary = (clineTaskSessionService?.getSummary(taskId) ?? null) as RuntimeTaskSessionSummary | null;
-			if (clineSummary) {
-				return { summary: clineSummary, active: isLiveSessionState(clineSummary.state), source: "cline" };
-			}
 			const terminalSummary = terminalManager?.getSummary(taskId) ?? null;
+			const writerActivity =
+				clineTaskSessionService && terminalManager
+					? getTaskWriterActivity(taskId, { clineTaskSessionService, terminalManager })
+					: {
+							clineSummary,
+							terminalSummary,
+							terminalHasActiveProcess: terminalManager?.hasActiveProcess(taskId) ?? null,
+							writerActive: null,
+						};
+			if (clineSummary) {
+				return {
+					summary: clineSummary,
+					active: isLiveSessionState(clineSummary.state),
+					source: "cline",
+					writerActivity,
+				};
+			}
 			if (terminalSummary) {
 				const hasActiveProcess = terminalManager?.hasActiveProcess(taskId) === true;
 				return {
 					summary: reconcileOrphanedSessionSummary(terminalSummary, hasActiveProcess),
 					active: isLiveSessionState(terminalSummary.state) && hasActiveProcess,
 					source: "terminal",
+					writerActivity,
 				};
 			}
-			return { summary: null, active: false, source: null };
+			return { summary: null, active: false, source: null, writerActivity };
 		};
 	};
 
@@ -745,6 +789,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		state === "running" || state === "awaiting_review";
 
 	interface TaskDiagnosticsCore {
+		prCommentHandling: RuntimeTaskPrTrackingStateResponse | null;
 		task: { id: string; title: string; columnId: string; updatedAt: number } | null;
 		/** The card's prompt — the authoritative description a review retry needs. */
 		taskPrompt: string | null;
@@ -765,12 +810,16 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		const card = columnWithTask?.cards.find((c) => c.id === taskId) ?? null;
 		// Reuse the exact procedure behavior (including the cross-workspace
 		// receipt filter) rather than duplicating it here.
-		const [delivery, review, dispatchRecord, preservation, lookupSession] = await Promise.all([
+		const [delivery, review, dispatchRecord, preservation, lookupSession, prCommentHandling] = await Promise.all([
 			runtimeApi.getTaskDeliveryInfo(workspaceScope, { taskId }),
 			runtimeApi.getTaskReviewInfo(workspaceScope, { taskId }),
 			readTaskDispatchRecord(taskId).catch(() => null),
 			getTaskPreservationInfo({ repoPath: workspaceScope.workspacePath, taskId }).catch(() => null),
 			createTaskSessionLookup(workspaceScope),
+			deps
+				.getPrCommentAutomationService?.()
+				?.getTaskPrTrackingState(workspaceScope, taskId)
+				.catch(() => null) ?? null,
 		]);
 
 		return {
@@ -790,6 +839,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			dispatchRecord,
 			preservation,
 			session: lookupSession(taskId),
+			prCommentHandling,
 		};
 	};
 
@@ -1022,7 +1072,9 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			session: {
 				summary: snapshot.session.summary,
 				active: snapshot.session.active,
+				writerActivity: snapshot.session.writerActivity,
 			},
+			prCommentHandling: snapshot.prCommentHandling,
 			context: await buildDiagnosticsContextUsage(workspaceScope, snapshot),
 			actions: phase.actions,
 			error: null,
@@ -1361,6 +1413,15 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		// B-9: backend-owned sequential task dispatch ("reliable queue").
 		dispatchReadyTasks: async (workspaceScope) => {
 			return await runTaskDispatchPass(buildTaskDispatchDeps(workspaceScope));
+		},
+		// MERGE-1: successor handoff — run the queue pass for the backlog
+		// dependents of a merge-completed task. Runs even when the task
+		// dispatch policy is disabled; never launches unrelated backlog cards.
+		dispatchMergedPrSuccessors: async (workspaceScope, candidateTaskIds) => {
+			return await runTaskDispatchPass(buildTaskDispatchDeps(workspaceScope), {
+				trigger: "merged_pr",
+				candidateTaskIds: candidateTaskIds ?? undefined,
+			});
 		},
 		getDispatchStatus: async (workspaceScope) => {
 			return await getTaskDispatchStatus(buildTaskDispatchDeps(workspaceScope));

@@ -42,7 +42,6 @@ import { useCrossProjectTasks } from "@/hooks/use-cross-project-tasks";
 import { useDebugTools } from "@/hooks/use-debug-tools";
 import { useDetailTaskNavigation } from "@/hooks/use-detail-task-navigation";
 import { useDocumentVisibility } from "@/hooks/use-document-visibility";
-import { useFeaturebaseFeedbackWidget } from "@/hooks/use-featurebase-feedback-widget";
 import { useGitActions } from "@/hooks/use-git-actions";
 import { useHomeSidebarAgentPanel } from "@/hooks/use-home-sidebar-agent-panel";
 import { useKanbanAccessGate } from "@/hooks/use-kanban-access-gate";
@@ -83,6 +82,7 @@ import {
 } from "@/stores/workspace-metadata-store";
 import { useTerminalThemeColors } from "@/terminal/theme-colors";
 import type { BoardData } from "@/types";
+import { normalizePromptForDisplay, truncateTaskPromptLabel } from "@/utils/task-prompt";
 
 export default function App(): ReactElement {
 	const terminalThemeColors = useTerminalThemeColors();
@@ -149,10 +149,6 @@ export default function App(): ReactElement {
 	const settingsWorkspaceId = navigationCurrentProjectId ?? currentProjectId;
 	const { config: settingsRuntimeProjectConfig, refresh: refreshSettingsRuntimeProjectConfig } =
 		useRuntimeProjectConfig(settingsWorkspaceId);
-	const featurebaseFeedbackState = useFeaturebaseFeedbackWidget({
-		workspaceId: settingsWorkspaceId,
-		clineProviderSettings: settingsRuntimeProjectConfig?.clineProviderSettings ?? null,
-	});
 	const {
 		isStartupOnboardingDialogOpen,
 		handleOpenStartupOnboardingDialog,
@@ -278,6 +274,13 @@ export default function App(): ReactElement {
 		hasReceivedSnapshot,
 	});
 
+	const selectedTaskTitle = useMemo(() => {
+		if (!selectedCard) {
+			return null;
+		}
+		return normalizePromptForDisplay(selectedCard.card.title) || truncateTaskPromptLabel(selectedCard.card.prompt);
+	}, [selectedCard]);
+
 	useReviewReadyNotifications({
 		activeWorkspaceId: activeNotificationWorkspaceId,
 		board,
@@ -285,6 +288,7 @@ export default function App(): ReactElement {
 		latestTaskReadyForReview,
 		taskSessions: sessions,
 		readyForReviewNotificationsEnabled,
+		selectedTaskTitle,
 		workspacePath,
 	});
 
@@ -917,8 +921,6 @@ export default function App(): ReactElement {
 						canShowAgentSection={!hasNoProjects && Boolean(currentProjectId)}
 						agentSectionContent={homeSidebarAgentPanel}
 						selectedAgentId={settingsRuntimeProjectConfig?.selectedAgentId ?? null}
-						clineProviderSettings={settingsRuntimeProjectConfig?.clineProviderSettings ?? null}
-						featurebaseFeedbackState={featurebaseFeedbackState}
 						onSelectProject={(projectId) => {
 							void handleSelectProject(projectId);
 						}}

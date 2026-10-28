@@ -1,4 +1,4 @@
-import { cn } from "../ui/cn";
+import { cn } from "@/components/ui/cn";
 
 interface TaskPrTrackingCheckboxProps {
 	label: string;

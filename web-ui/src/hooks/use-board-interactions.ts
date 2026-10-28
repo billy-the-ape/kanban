@@ -700,6 +700,7 @@ export function useBoardInteractions({
 		completeOnGitActionSuccess: deterministicDeliveryEnabled,
 		prCompletionGatedTaskIds,
 		resetKey: currentProjectId,
+		taskSessions: sessions,
 	});
 
 	// Reopens a discarded (trash) or completed (done) task in Review: recreate

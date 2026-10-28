@@ -57,13 +57,18 @@ export interface BoardCard {
 	selectedAutomationPrKey?: string;
 	/** PRTRACK-1: optimistic-concurrency revision shared by the server-owned settings block. */
 	settingsRevision?: number;
-	/**
-	 * LASTPROMPT: the latest user-authored task-chat prompt (server-owned).
+	/** LASTPROMPT: the latest user-authored task-chat prompt (server-owned).
 	 * Display-only: the card preview falls back to `prompt` when absent.
 	 */
 	lastPrompt?: string;
 	/** LASTPROMPT: acceptance timestamp of `lastPrompt` (server-owned). */
 	lastPromptAt?: number;
+	/**
+	 * AUTOGIT: a generated auto git-action prompt (commit or PR) was already
+	 * delivered to this task's session during the current review episode
+	 * (server-owned; cleared automatically when the card leaves Review).
+	 */
+	sentGitActionPrompt?: { action: "commit" | "pr"; sentAt: number };
 	baseRef: string;
 	/** UPD-0: missing values normalize to true; an explicit false disables the pre-start base refresh. */
 	updateBaseRefBeforeStart?: boolean;

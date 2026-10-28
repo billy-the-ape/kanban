@@ -851,6 +851,48 @@ function mergeServerOwnedLastPrompt(clientBoard: RuntimeBoardData, persistedBoar
 }
 
 /**
+ * AUTOGIT: server-owned auto git-action prompt dedupe record. Written only
+ * through the acquire/release mutations under the workspace lock, so a stale
+ * whole-board save can neither forge nor drop it while the card stays in
+ * Review; leaving Review ends the episode and clears it (a new episode may
+ * prompt again).
+ */
+export function mergeServerOwnedSentGitActionPrompt(
+	board: RuntimeBoardData,
+	persistedBoard: RuntimeBoardData,
+): RuntimeBoardData {
+	// Only records from persisted cards that were still in Review continue the
+	// episode. Server-side moves that bypass this merge (auto-completion via
+	// mutateWorkspaceState, CLI done/trash paths) spread the card and keep the
+	// field on the Done/Trash card; restoring from any column would resurrect
+	// that stale record when the card next lands in Review and suppress the
+	// new episode's prompt.
+	const persistedByTaskId = new Map<string, RuntimeBoardCard["sentGitActionPrompt"]>();
+	for (const column of persistedBoard.columns) {
+		for (const card of column.cards) {
+			if (column.id === "review" && card.sentGitActionPrompt !== undefined) {
+				persistedByTaskId.set(card.id, card.sentGitActionPrompt);
+			}
+		}
+	}
+	return {
+		...board,
+		columns: board.columns.map((column) => ({
+			...column,
+			cards: column.cards.map((card) => {
+				const next: RuntimeBoardCard = { ...card };
+				delete next.sentGitActionPrompt;
+				const persisted = persistedByTaskId.get(card.id);
+				if (persisted !== undefined && column.id === "review") {
+					next.sentGitActionPrompt = persisted;
+				}
+				return next;
+			}),
+		})),
+	};
+}
+
+/**
  * MERGE-1: server-owned manual-reopen marker. The board is client-owned, but
  * the marker is derived server-side from the persisted -> incoming column
  * transition so a stale client board can neither forge nor drop it:
@@ -947,7 +989,10 @@ export async function saveWorkspaceState(
 		const board = applyManualReopenMarkers(
 			mergeServerOwnedLastPrompt(
 				mergeServerOwnedPrSettings(
-					mergeServerOwnedPullRequests(parsedPayload.board, persistedBoard),
+					mergeServerOwnedSentGitActionPrompt(
+						mergeServerOwnedPullRequests(parsedPayload.board, persistedBoard),
+						persistedBoard,
+					),
 					persistedBoard,
 				),
 				persistedBoard,

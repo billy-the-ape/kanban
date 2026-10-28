@@ -173,6 +173,25 @@ export const runtimeTaskPullRequestSchema = z.object({
 	 * clears the extras.
 	 */
 	isPrimary: z.boolean().optional(),
+	/**
+	 * PRLINK-9: provider detail projected from a metadata refresh (same read
+	 * as title/state — no extra fetch). Optional so older cards keep
+	 * validating and the UI hides anything absent.
+	 */
+	headSha: z.string().optional(),
+	additions: z.number().int().nonnegative().optional(),
+	deletions: z.number().int().nonnegative().optional(),
+	changedFiles: z.number().int().nonnegative().optional(),
+	commits: z.number().int().nonnegative().optional(),
+	comments: z.number().int().nonnegative().optional(),
+	reviewComments: z.number().int().nonnegative().optional(),
+	/** Provider-side PR creation time (epoch ms). */
+	openedAt: z.number().nonnegative().optional(),
+	/** Provider-side PR last-update time (epoch ms). */
+	updatedAt: z.number().nonnegative().optional(),
+	labels: z.array(z.string()).optional(),
+	mergeableState: z.string().optional(),
+	requestedReviewers: z.array(z.string()).optional(),
 });
 export type RuntimeTaskPullRequest = z.infer<typeof runtimeTaskPullRequestSchema>;
 
@@ -390,6 +409,23 @@ export const runtimePrAutoSendAttemptSchema = z.object({
 });
 export type RuntimePrAutoSendAttempt = z.infer<typeof runtimePrAutoSendAttemptSchema>;
 
+export const runtimePrCommentDispatchHoldSchema = z.object({
+	kind: z.enum([
+		"writer_active",
+		"session_unavailable",
+		"github_auth",
+		"snapshot_incomplete",
+		"publication_pending",
+		"internal_error",
+		"not_subscribed",
+	]),
+	message: z.string(),
+	since: z.number().int().nonnegative(),
+	lastCheckedAt: z.number().int().nonnegative(),
+	retryAt: z.number().int().nonnegative().nullable(),
+});
+export type RuntimePrCommentDispatchHold = z.infer<typeof runtimePrCommentDispatchHoldSchema>;
+
 /**
  * Minimal comment automation block in the PR tracking record. No comment
  * bodies, per-item dispositions, batch ledgers, or repair-budget counters
@@ -405,6 +441,8 @@ export const runtimePrCommentAutomationSchema = z.object({
 	/** Watermark preserved when previously dispatched feedback disappears. */
 	lastDispatchedFeedbackFingerprint: runtimePrFeedbackFingerprintSchema.nullable(),
 	dispatch: runtimePrCommentDispatchSchema.nullable(),
+	/** Last observed pre-send hold; optional for records created before hold diagnostics. */
+	dispatchHold: runtimePrCommentDispatchHoldSchema.nullable().optional(),
 	/** Implementation-published feedback excluded from automatic handling. */
 	publication: runtimePrPublicationAttributionSchema,
 	/** Automatic send attempts within the rolling 60-minute safety window. */
@@ -472,6 +510,7 @@ export const runtimeTaskPrTrackingStateSchema = z.object({
 	pr: runtimeTaskPullRequestSchema.nullable(),
 	pendingCount: z.number().int().nonnegative(),
 	pendingDeadline: z.number().nullable(),
+	dispatchHold: runtimePrCommentDispatchHoldSchema.nullable().optional(),
 	dispatch: runtimePrCommentDispatchSchema.nullable(),
 	blocker: z.string().nullable(),
 	/** A failed dispatch that can be resumed via "Resume comment handling". */
@@ -502,6 +541,39 @@ export const runtimeTaskPrCommentResumeResponseSchema = z.object({
 	dispatched: z.boolean(),
 });
 export type RuntimeTaskPrCommentResumeResponse = z.infer<typeof runtimeTaskPrCommentResumeResponseSchema>;
+
+/** AUTOGIT: the generated git action kinds that can be prompted to an agent. */
+export type RuntimeTaskGitActionPromptAction = "commit" | "pr";
+
+/**
+ * AUTOGIT: client request to record (or re-record, for manual intent) that a
+ * generated auto git-action prompt was sent to the task's session.
+ */
+export const runtimeTaskGitActionPromptRequestSchema = z.object({
+	taskId: z.string(),
+	action: z.enum(["commit", "pr"]),
+	/** "auto" is set-if-absent (dedupe); "manual" always records the send. */
+	intent: z.enum(["manual", "auto"]),
+});
+export type RuntimeTaskGitActionPromptRequest = z.infer<typeof runtimeTaskGitActionPromptRequestSchema>;
+
+export const runtimeTaskGitActionPromptResponseSchema = z.object({
+	ok: z.boolean(),
+	status: z.enum(["acquired", "already_sent", "no_task", "not_in_review", "error"]),
+});
+export type RuntimeTaskGitActionPromptResponse = z.infer<typeof runtimeTaskGitActionPromptResponseSchema>;
+
+/** AUTOGIT: client request to clear a recorded auto git-action prompt (failed send). */
+export const runtimeTaskGitActionPromptReleaseRequestSchema = z.object({
+	taskId: z.string(),
+	action: z.enum(["commit", "pr"]),
+});
+export type RuntimeTaskGitActionPromptReleaseRequest = z.infer<typeof runtimeTaskGitActionPromptReleaseRequestSchema>;
+
+export const runtimeTaskGitActionPromptReleaseResponseSchema = z.object({
+	ok: z.boolean(),
+});
+export type RuntimeTaskGitActionPromptReleaseResponse = z.infer<typeof runtimeTaskGitActionPromptReleaseResponseSchema>;
 
 export const runtimeBoardCardSchema = z
 	.object({
@@ -579,6 +651,21 @@ export const runtimeBoardCardSchema = z
 		 * overwrites a newer one, regardless of async completion order).
 		 */
 		lastPromptAt: z.number().int().nonnegative().optional(),
+		/**
+		 * AUTOGIT: server-owned dedupe record — a generated auto git-action
+		 * prompt (commit or PR) was already delivered to this task's session
+		 * during the current review episode. Written only through the
+		 * acquire/release mutations under the workspace lock; restored over
+		 * any client-supplied value by `saveWorkspaceState` while the card
+		 * stays in Review, and cleared automatically once the card leaves
+		 * Review (a new episode may prompt again).
+		 */
+		sentGitActionPrompt: z
+			.object({
+				action: z.enum(["commit", "pr"]),
+				sentAt: z.number().int().nonnegative(),
+			})
+			.optional(),
 		createdAt: z.number(),
 		updatedAt: z.number(),
 	})
@@ -1857,6 +1944,14 @@ export const runtimeTaskDispatchPrerequisiteSchema = z.object({
 	taskCommitSha: z.string().nullable(),
 	/** null when the prerequisite has no durable delivery receipt yet. */
 	deliveryStatus: runtimeGitDeliveryStatusSchema.nullable(),
+	/**
+	 * MERGE-1: the landed merge commit when the prerequisite was completed by a
+	 * confirmed GitHub PR merge (null when it was not). Verified baseline
+	 * ancestry must contain this commit; it is the squash/rebase-safe landed
+	 * commit, never the original PR head. Defaulted so pre-MERGE-1 persisted
+	 * records (which predate the field) still parse on upgrade.
+	 */
+	mergeCommitSha: z.string().nullable().default(null),
 });
 export type RuntimeTaskDispatchPrerequisite = z.infer<typeof runtimeTaskDispatchPrerequisiteSchema>;
 
@@ -2777,6 +2872,16 @@ export const runtimeTaskDiagnosticsPreservedWorkSchema = z.object({
 });
 export type RuntimeTaskDiagnosticsPreservedWork = z.infer<typeof runtimeTaskDiagnosticsPreservedWorkSchema>;
 
+export const runtimeTaskWriterActivitySchema = z.object({
+	clineSummary: runtimeTaskSessionSummarySchema.nullable(),
+	terminalSummary: runtimeTaskSessionSummarySchema.nullable(),
+	/** Null means the terminal source could not be read. */
+	terminalHasActiveProcess: z.boolean().nullable(),
+	/** Null means one or both session sources could not be read safely. */
+	writerActive: z.boolean().nullable(),
+});
+export type RuntimeTaskWriterActivity = z.infer<typeof runtimeTaskWriterActivitySchema>;
+
 export const runtimeTaskDiagnosticsResponseSchema = z.object({
 	ok: z.boolean(),
 	/** null when the task no longer exists on the board. */
@@ -2800,10 +2905,13 @@ export const runtimeTaskDiagnosticsResponseSchema = z.object({
 	dispatchRecord: runtimeTaskDispatchRecordSchema.nullable(),
 	session: z.object({
 		summary: runtimeTaskSessionSummarySchema.nullable(),
-		/** True when a Cline session is running for the task right now. */
+		writerActivity: runtimeTaskWriterActivitySchema.optional(),
+		/** True when a live session is running or awaiting review input. */
 		active: z.boolean(),
 	}),
 	context: runtimeClineContextUsageResponseSchema,
+	/** Includes the durable queued intent and hold timestamps; distinct from the task queue. */
+	prCommentHandling: runtimeTaskPrTrackingStateResponseSchema.nullable().optional(),
 	actions: runtimeTaskDiagnosticsActionsSchema,
 	error: z.string().nullable(),
 });
@@ -2868,6 +2976,8 @@ export const runtimeTaskQualitySummaryEvidenceSchema = z.object({
 	timestamp: z.number().nullable(),
 	ruleId: z.string(),
 	classification: z.enum(["confirmed_failure", "unmatched_call", "unchanged_retry", "heuristic_tag"]),
+	/** The recorded result's `is_error` flag (structural evidence, reducer v2). */
+	resultIsError: z.boolean(),
 	/** The prior identical failed call for unchanged-retry evidence. */
 	priorReference: z
 		.object({
@@ -2883,7 +2993,15 @@ export const runtimeTaskQualitySummaryResponseSchema = z.object({
 	ok: z.boolean(),
 	taskId: z.string(),
 	capturedAt: z.number().int(),
-	/** Version of the analysis semantics that produced this response. */
+	/**
+	 * Version of the analysis semantics that produced this response.
+	 * 1 = original semantics. 2 (AR-1): the native adapter preserves direct
+	 * structured command arrays and the `{ recovery, output }` envelope, an
+	 * `is_error` flag no longer erases a known editor category, command
+	 * timeouts are a distinct confirmed rule, evidence carries
+	 * `resultIsError`, and calls with empty/unavailable recorded arguments
+	 * are never declared identical for unchanged-retry evidence.
+	 */
 	reducerVersion: z.number().int().min(1),
 	coverage: z.object({
 		status: z.enum(["complete", "partial", "unavailable"]),
@@ -3025,6 +3143,23 @@ export const githubPrMetadataSnapshotSchema = z
 		 * (no second fetch). Optional so older snapshots keep validating.
 		 */
 		title: z.string().optional(),
+		/**
+		 * PRLINK-9: optional provider details projected from the same read
+		 * (no second fetch). Nullable so older snapshots keep validating.
+		 */
+		additions: z.number().int().nonnegative().nullable().optional(),
+		deletions: z.number().int().nonnegative().nullable().optional(),
+		changedFiles: z.number().int().nonnegative().nullable().optional(),
+		commits: z.number().int().nonnegative().nullable().optional(),
+		comments: z.number().int().nonnegative().nullable().optional(),
+		reviewComments: z.number().int().nonnegative().nullable().optional(),
+		/** Provider-side PR creation time (epoch ms). */
+		openedAt: z.number().nullable().optional(),
+		/** Provider-side PR last-update time (epoch ms). */
+		updatedAt: z.number().nullable().optional(),
+		labels: z.array(z.string()).nullable().optional(),
+		mergeableState: z.string().nullable().optional(),
+		requestedReviewers: z.array(z.string()).nullable().optional(),
 	})
 	.passthrough();
 export type GitHubPrMetadataSnapshot = z.infer<typeof githubPrMetadataSnapshotSchema>;

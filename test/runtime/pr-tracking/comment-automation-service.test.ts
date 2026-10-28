@@ -1,5 +1,5 @@
-import { mkdir, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClineTaskSessionService } from "../../../src/cline-sdk/cline-task-session-service";
 import type { ClineTurnPreparation } from "../../../src/cline-sdk/cline-turn-preparation";
@@ -21,6 +21,7 @@ import {
 	createPrCommentAutomationService,
 } from "../../../src/pr-tracking/comment-automation-service";
 import type { refreshCommentWorktree } from "../../../src/pr-tracking/comment-git-refresh";
+import { MAX_COMMENT_PROMPT_CHARS } from "../../../src/pr-tracking/comment-handling-prompt";
 import type { PrFeedbackEvent } from "../../../src/pr-tracking/feedback-fingerprint";
 import { computePrFeedbackFingerprint } from "../../../src/pr-tracking/feedback-fingerprint";
 import type { GitHubPrSnapshot } from "../../../src/pr-tracking/github-pr-client";
@@ -31,6 +32,7 @@ import {
 	upsertPrTrackingRecord,
 } from "../../../src/pr-tracking/pr-comment-record-store";
 import type { TerminalSessionManager } from "../../../src/terminal/session-manager";
+import { getTaskContextArtifactsDir, readTaskContextArtifact } from "../../../src/workspace/task-artifacts";
 import { isolateTestEnvironment } from "../../utilities/test-environment";
 
 let env: ReturnType<typeof isolateTestEnvironment>;
@@ -175,6 +177,7 @@ function makeService(
 			workspaceId: string;
 			workspacePath: string;
 		}) => Promise<ClineTaskSessionService>;
+		getTerminalManager?: () => Promise<TerminalSessionManager>;
 		now?: () => number;
 		getGitHubAccessScopeId?: () => Promise<string>;
 	} = {},
@@ -196,7 +199,7 @@ function makeService(
 				return state;
 			}),
 		getClineTaskSessionService: overrides.getClineTaskSessionService ?? (async () => idleCline),
-		getTerminalManager: async () => idleTerminal,
+		getTerminalManager: overrides.getTerminalManager ?? (async () => idleTerminal),
 		resolveWorkspacePathById: overrides.resolveWorkspacePathById,
 		refreshGit: overrides.refreshGit ?? (async () => "abc"),
 		sendTaskChatMessage: async (scope, body, prepare) => {
@@ -479,6 +482,134 @@ describe("applyPrPollOutcome", () => {
 
 describe("PrCommentAutomationService", () => {
 	const scope = { workspaceId: "w1", workspacePath: "/w1" };
+
+	it("recovers an overdue unsent repair after restart despite a stale terminal running summary", async () => {
+		let now = NOW;
+		let active = true;
+		const workspaceStates = new Map([
+			["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })])],
+		]);
+		const options = {
+			workspaceStates,
+			now: () => now,
+			snapshot: { events: [makeEvent({ providerId: "inline-1" })] },
+			getClineTaskSessionService: async () =>
+				({
+					getSummary: () => makeSummary({ state: "awaiting_review" }),
+					listSummaries: () => [],
+				}) as unknown as ClineTaskSessionService,
+			getTerminalManager: async () =>
+				({
+					getSummary: () => makeSummary({ state: "running" }),
+					hasActiveProcess: () => active,
+					listSummaries: () => [],
+				}) as unknown as TerminalSessionManager,
+		};
+		const first = makeService(options);
+		await first.service.refreshWorkspace(scope);
+		await first.service.runTick();
+		now += 121_000;
+		await first.service.runTick();
+		expect(first.sent).toHaveLength(0);
+		const held = await first.service.getTaskPrTrackingState(scope, "t1");
+		expect(held.state.dispatchHold).toMatchObject({ kind: "writer_active", since: now, lastCheckedAt: now });
+		expect(held.state.dispatch?.attemptedAt).toBeNull();
+		expect(held.state.resumable).toBe(false);
+		now += 30_000;
+		await first.service.runTick();
+		const checked = await first.service.getTaskPrTrackingState(scope, "t1");
+		expect(checked.state.dispatchHold?.since).toBe(held.state.dispatchHold?.since);
+		expect(checked.state.dispatchHold?.lastCheckedAt).toBe(now);
+		await first.service.dispose();
+
+		// A restored summary still says running, but no process survived the restart.
+		active = false;
+		now += 2 * 24 * 60 * 60 * 1000;
+		const restarted = makeService(options);
+		await restarted.service.start();
+		await restarted.service.runTick();
+		expect(restarted.sent).toHaveLength(1);
+		const sent = await restarted.service.getTaskPrTrackingState(scope, "t1");
+		expect(sent.state.dispatchHold).toBeNull();
+		expect(sent.state.dispatch?.status).toBe("running");
+		await restarted.service.runTick();
+		expect(restarted.sent).toHaveLength(1);
+		await restarted.service.dispose();
+	});
+
+	it("exposes a persisted authentication hold without marking feedback dispatched", async () => {
+		let now = NOW;
+		let authenticated = true;
+		const harness = makeService({
+			now: () => now,
+			workspaceStates: new Map([
+				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })])],
+			]),
+			snapshot: { events: [makeEvent({ providerId: "inline-1" })] },
+			getGitHubAccessScopeId: async () => {
+				if (!authenticated) throw new Error("unavailable");
+				return "scope-1";
+			},
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		now += 121_000;
+		authenticated = false;
+		await harness.service.runTick();
+		const state = (await harness.service.getTaskPrTrackingState(scope, "t1")).state;
+		expect(state.dispatchHold).toMatchObject({ kind: "github_auth", retryAt: now + 30_000 });
+		expect(state.dispatch?.attemptedAt).toBeNull();
+		expect(harness.sent).toHaveLength(0);
+		const loaded = await loadPrTrackingRecord(KEY);
+		if (loaded.status !== "ok") throw new Error("missing record");
+		expect(loaded.record.commentAutomation.lastDispatchedFeedbackFingerprint).toBeNull();
+		authenticated = true;
+		now += 30_000;
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(1);
+	});
+
+	it("hides an old hold while fresh feedback restarts debounce, then dispatches when due", async () => {
+		let now = NOW;
+		let running = true;
+		const events = [makeEvent({ providerId: "inline-1", updatedAt: now })];
+		const harness = makeService({
+			now: () => now,
+			snapshot: { events },
+			workspaceStates: new Map([
+				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })])],
+			]),
+			getClineTaskSessionService: async () =>
+				({
+					getSummary: () => makeSummary({ state: running ? "running" : "awaiting_review" }),
+					listSummaries: () => [],
+				}) as unknown as ClineTaskSessionService,
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		now += 121_000;
+		await harness.service.runTick();
+		const held = (await harness.service.getTaskPrTrackingState(scope, "t1")).state;
+		expect(held.dispatchHold?.kind).toBe("writer_active");
+
+		now += 65_000;
+		running = false;
+		events.push(makeEvent({ providerId: "inline-2", updatedAt: now }));
+		await harness.service.runTick();
+		const quiet = (await harness.service.getTaskPrTrackingState(scope, "t1")).state;
+		expect(quiet.pendingDeadline).toBe(now + 120_000);
+		expect(quiet.dispatchHold).toBeNull();
+		expect(harness.sent).toHaveLength(0);
+		const loaded = await loadPrTrackingRecord(KEY);
+		if (loaded.status !== "ok") throw new Error("missing record");
+		// Reading the UI projection does not discard historical hold evidence.
+		expect(loaded.record.commentAutomation.dispatchHold).toEqual(held.dispatchHold);
+
+		now += 121_000;
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(1);
+		expect((await harness.service.getTaskPrTrackingState(scope, "t1")).state.dispatchHold).toBeNull();
+	});
 
 	it("builds the exact fixed instruction", () => {
 		expect(buildCommentHandlingInstruction(PR.url)).toBe(
@@ -1748,6 +1879,31 @@ describe("COMMENT-0 publication capture", () => {
 		expect(record.commentAutomation.dispatch?.error).toBeNull();
 	});
 
+	it("includes the underlying session error when a repair turn fails", async () => {
+		const event = makeEvent({ providerId: "conversation-1", updatedAt: NOW });
+		await seedRunningDispatch(fingerprintOf([event]));
+		const harness = makeService({
+			workspaceStates: new Map([
+				[
+					"/w1",
+					makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })], {
+						t1: {
+							...makeSummary({ state: "awaiting_review", lastOutputAt: NOW + 1_000 }),
+							reviewReason: "error",
+							warningMessage: "Editor operation failed: old_text is required",
+						},
+					}),
+				],
+			]),
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		const record = await load();
+		expect(record.commentAutomation.dispatch?.status).toBe("failed");
+		expect(record.commentAutomation.dispatch?.error).toContain("old_text is required");
+		expect(harness.sent).toHaveLength(0);
+	});
+
 	it("completes a restart-surviving dispatch with post-dispatch live evidence", async () => {
 		const event = makeEvent({ providerId: "conversation-1", updatedAt: NOW });
 		await seedRunningDispatch(fingerprintOf([event]));
@@ -2556,6 +2712,71 @@ describe("PR repair execution freshness", () => {
 		return loaded.record.commentAutomation;
 	}
 
+	it("sends an oversized refreshed batch by file and retains later/edited feedback for another turn", async () => {
+		let clock = NOW;
+		const oversized = { ...first, body: "feedback".repeat(MAX_COMMENT_PROMPT_CHARS), bodyDigest: "long" };
+		const ownReply = makeEvent({ providerId: "conversation-99", body: "Agent reply" });
+		const snapshot = { events: [first] };
+		const harness = makeService({ deferPreparation: true, workspaceStates: states(), snapshot, now: () => clock });
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		clock += 30_001;
+		snapshot.events = [oversized, ownReply];
+		await upsertSeed((current) => ({
+			...current,
+			revision: current.revision + 1,
+			commentAutomation: {
+				...current.commentAutomation,
+				publication: { published: [{ kind: "conversation", id: 99 }], pending: [] },
+			},
+		}));
+		const prompt = await harness.preparations[0]?.(context());
+		expect(prompt).toContain("Feedback snapshot file:");
+		expect(prompt?.length).toBeLessThanOrEqual(MAX_COMMENT_PROMPT_CHARS);
+		const dir = getTaskContextArtifactsDir("t1");
+		const file = (await readdir(dir)).find((name) => name.endsWith(".txt"));
+		const saved = JSON.parse(await readTaskContextArtifact(join(dir, file ?? "missing")));
+		expect(saved.events).toHaveLength(1);
+		expect(saved.events[0]).toMatchObject({ id: oversized.providerId, body: oversized.body, bodyDigest: "long" });
+		expect((await record()).lastDispatchedFeedbackFingerprint).toEqual(fingerprintOf([oversized]));
+		clock += 70_000;
+		const edited = { ...oversized, body: "Updated feedback", bodyDigest: "edited", updatedAt: clock };
+		const later = makeEvent({ providerId: "inline-2", body: "Later feedback", updatedAt: clock });
+		snapshot.events = [edited, later, ownReply];
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(1);
+		expect((await record()).pendingFeedbackFingerprint).toEqual(fingerprintOf([edited, later]));
+		expect((await record()).lastDispatchedFeedbackFingerprint).toEqual(fingerprintOf([oversized]));
+	});
+
+	it("keeps feedback undispatched on snapshot write failure and successfully retries on Resume", async () => {
+		const oversized = { ...first, body: "x".repeat(MAX_COMMENT_PROMPT_CHARS) };
+		const refreshGit = vi.fn(async () => "abc");
+		const harness = makeService({
+			deferPreparation: true,
+			workspaceStates: states(),
+			snapshot: { events: [oversized] },
+			refreshGit,
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		const dir = getTaskContextArtifactsDir("t1");
+		await mkdir(dirname(dir), { recursive: true });
+		await writeFile(dir, "block artifact directory");
+		await expect(harness.preparations[0]?.(context())).rejects.toThrow("Could not prepare the PR feedback snapshot");
+		expect(refreshGit).not.toHaveBeenCalled();
+		expect((await record()).dispatch).toMatchObject({ status: "failed", errorCode: "preparation_failed" });
+		expect((await record()).lastDispatchedFeedbackFingerprint).toBeNull();
+		expect((await harness.service.getTaskPrTrackingState(scope, "t1")).state.resumable).toBe(true);
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(1);
+		await rm(dir);
+		expect(await harness.service.resumeCommentHandling(scope, "t1")).toEqual({ ok: true, dispatched: true });
+		expect(await harness.preparations[1]?.(context())).toContain("Feedback snapshot file:");
+		expect((await record()).lastDispatchedFeedbackFingerprint).toEqual(fingerprintOf([oversized]));
+		expect(refreshGit).toHaveBeenCalledOnce();
+	});
+
 	it("defers capture until admission, refreshes after 30s, and absorbs edits/new feedback into one prompt", async () => {
 		let clock = NOW;
 		const snapshot = { events: [first] };
@@ -2662,25 +2883,53 @@ describe("PR repair execution freshness", () => {
 		expect((await record()).pendingFeedbackFingerprint).toEqual(fingerprintOf([later]));
 		expect((await record()).lastDispatchedFeedbackFingerprint).toEqual(fingerprintOf([first]));
 	});
-	it("restores the pre-turn boundary after an admitted failure so Resume can retry the captured batch", async () => {
-		let live = makeSummary({ state: "idle" });
-		const sessions = { getSummary: () => live, listSummaries: () => [live] } as unknown as ClineTaskSessionService;
-		const harness = makeService({
-			deferPreparation: true,
-			workspaceStates: states(),
-			snapshot: { events: [first] },
-			getClineTaskSessionService: async () => sessions,
-		});
+	it.each(["inline", "artifact"])(
+		"restores the pre-turn boundary after an admitted %s failure so Resume can retry",
+		async (delivery) => {
+			let live = makeSummary({ state: "idle" });
+			const event = delivery === "inline" ? first : { ...first, body: "x".repeat(MAX_COMMENT_PROMPT_CHARS) };
+			const sessions = { getSummary: () => live, listSummaries: () => [live] } as unknown as ClineTaskSessionService;
+			const harness = makeService({
+				deferPreparation: true,
+				workspaceStates: states(),
+				snapshot: { events: [event] },
+				getClineTaskSessionService: async () => sessions,
+			});
+			await harness.service.refreshWorkspace(scope);
+			await harness.service.runTick();
+			await harness.preparations[0]?.(context());
+			expect((await record()).lastDispatchedFeedbackFingerprint).not.toBeNull();
+			live = { ...makeSummary({ state: "awaiting_review", lastOutputAt: NOW + 10 }), reviewReason: "error" };
+			await harness.service.runTick();
+			expect((await record()).dispatch?.status).toBe("failed");
+			expect((await record()).lastDispatchedFeedbackFingerprint).toBeNull();
+			expect(await harness.service.resumeCommentHandling(scope, "t1")).toEqual({ ok: true, dispatched: true });
+			expect(await harness.preparations[1]?.(context())).toContain(
+				delivery === "inline" ? "Fix first" : "Feedback snapshot file:",
+			);
+		},
+	);
+
+	it("retains an admitted oversized snapshot across restart without automatically replaying it", async () => {
+		const event = { ...first, body: "x".repeat(MAX_COMMENT_PROMPT_CHARS) };
+		const harness = makeService({ deferPreparation: true, workspaceStates: states(), snapshot: { events: [event] } });
 		await harness.service.refreshWorkspace(scope);
 		await harness.service.runTick();
 		await harness.preparations[0]?.(context());
-		expect((await record()).lastDispatchedFeedbackFingerprint).not.toBeNull();
-		live = { ...makeSummary({ state: "awaiting_review", lastOutputAt: NOW + 10 }), reviewReason: "error" };
-		await harness.service.runTick();
-		expect((await record()).dispatch?.status).toBe("failed");
-		expect((await record()).lastDispatchedFeedbackFingerprint).toBeNull();
-		expect(await harness.service.resumeCommentHandling(scope, "t1")).toEqual({ ok: true, dispatched: true });
-		expect(await harness.preparations[1]?.(context())).toContain("Fix first");
+		const dir = getTaskContextArtifactsDir("t1");
+		const file = (await readdir(dir)).find((name) => name.endsWith(".txt"));
+		const path = join(dir, file ?? "missing");
+		const before = await readTaskContextArtifact(path);
+		const restarted = makeService({ workspaceStates: states(), snapshot: { events: [event] } });
+		try {
+			await restarted.service.start();
+			expect(restarted.sent).toHaveLength(0);
+			expect((await record()).dispatch?.status).toBe("failed");
+			expect((await record()).lastDispatchedFeedbackFingerprint).toBeNull();
+			expect(await readTaskContextArtifact(path)).toBe(before);
+		} finally {
+			await restarted.service.dispose();
+		}
 	});
 
 	it("never replays an accepted capacity-waiting repair after restart", async () => {

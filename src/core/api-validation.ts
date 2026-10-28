@@ -27,6 +27,8 @@ import {
 	type RuntimeTaskDeliveryStartRequest,
 	type RuntimeTaskDiagnosticsActionRequest,
 	type RuntimeTaskDiagnosticsRequest,
+	type RuntimeTaskGitActionPromptReleaseRequest,
+	type RuntimeTaskGitActionPromptRequest,
 	type RuntimeTaskPhasesRequest,
 	type RuntimeTaskPrAutomationSettingsRequest,
 	type RuntimeTaskPrCommentResumeRequest,
@@ -76,6 +78,8 @@ import {
 	runtimeTaskDeliveryStartRequestSchema,
 	runtimeTaskDiagnosticsActionRequestSchema,
 	runtimeTaskDiagnosticsRequestSchema,
+	runtimeTaskGitActionPromptReleaseRequestSchema,
+	runtimeTaskGitActionPromptRequestSchema,
 	runtimeTaskPhasesRequestSchema,
 	runtimeTaskPrAutomationSettingsRequestSchema,
 	runtimeTaskPrCommentResumeRequestSchema,
@@ -382,6 +386,32 @@ export function parseTaskDiagnosticsActionRequest(value: unknown): RuntimeTaskDi
 	return {
 		taskId,
 		action: parsed.action,
+	};
+}
+
+/** AUTOGIT: validate the git action prompt acquire request. */
+export function parseTaskGitActionPromptRequest(value: unknown): RuntimeTaskGitActionPromptRequest {
+	const parsed = parseWithSchema(runtimeTaskGitActionPromptRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Missing taskId");
+	}
+	return {
+		...parsed,
+		taskId,
+	};
+}
+
+/** AUTOGIT: validate the git action prompt release request. */
+export function parseTaskGitActionPromptReleaseRequest(value: unknown): RuntimeTaskGitActionPromptReleaseRequest {
+	const parsed = parseWithSchema(runtimeTaskGitActionPromptReleaseRequestSchema, value);
+	const taskId = parsed.taskId.trim();
+	if (!taskId) {
+		throw new Error("Missing taskId");
+	}
+	return {
+		...parsed,
+		taskId,
 	};
 }
 

@@ -1,18 +1,7 @@
 import * as Collapsible from "@radix-ui/react-collapsible";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
-import {
-	ArrowRightFromLine,
-	ChevronDown,
-	ChevronUp,
-	Ellipsis,
-	ExternalLink,
-	Info,
-	Lightbulb,
-	Plus,
-	X,
-} from "lucide-react";
+import { ArrowRightFromLine, ChevronDown, ChevronUp, Ellipsis, Lightbulb, Plus, X } from "lucide-react";
 import { type MouseEvent as ReactMouseEvent, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
-import { canShowFeaturebaseFeedbackButton } from "@/components/featurebase-feedback-button";
 import { buildProjectTaskCountBadges } from "@/components/project-task-count-badges";
 import { Button } from "@/components/ui/button";
 import { ClineIcon } from "@/components/ui/cline-icon";
@@ -29,9 +18,8 @@ import {
 } from "@/components/ui/dialog";
 import { Kbd } from "@/components/ui/kbd";
 import { Spinner } from "@/components/ui/spinner";
-import type { FeaturebaseFeedbackState } from "@/hooks/use-featurebase-feedback-widget";
 import { useIsMobile } from "@/hooks/use-is-mobile";
-import type { RuntimeAgentId, RuntimeClineProviderSettings, RuntimeProjectSummary } from "@/runtime/types";
+import type { RuntimeAgentId, RuntimeProjectSummary } from "@/runtime/types";
 import {
 	LocalStorageKey,
 	readLocalStorageItem,
@@ -46,7 +34,6 @@ const COLLAPSED_WIDTH = 48;
 const SIDEBAR_COLLAPSE_THRESHOLD = 120;
 const SIDEBAR_MIN_EXPANDED_WIDTH = 200;
 const SIDEBAR_MAX_EXPANDED_WIDTH = 600;
-const GITHUB_ISSUES_URL = "https://github.com/cline/kanban/issues";
 
 export function ProjectNavigationPanel({
 	projects,
@@ -59,8 +46,6 @@ export function ProjectNavigationPanel({
 	canShowAgentSection,
 	agentSectionContent,
 	selectedAgentId,
-	clineProviderSettings,
-	featurebaseFeedbackState,
 	onSelectProject,
 	onRemoveProject,
 	onAddProject,
@@ -81,8 +66,6 @@ export function ProjectNavigationPanel({
 	canShowAgentSection: boolean;
 	agentSectionContent?: ReactNode;
 	selectedAgentId?: RuntimeAgentId | null;
-	clineProviderSettings?: RuntimeClineProviderSettings | null;
-	featurebaseFeedbackState?: FeaturebaseFeedbackState;
 	onSelectProject: (projectId: string) => void;
 	onRemoveProject: (projectId: string) => Promise<boolean>;
 	onAddProject: () => void;
@@ -92,11 +75,6 @@ export function ProjectNavigationPanel({
 	setSidebarCollapsed: (collapsed: boolean, persist?: boolean) => void;
 }): React.ReactElement {
 	const sortedProjects = [...projects].sort((a, b) => a.path.localeCompare(b.path));
-	const shouldShowFeaturebaseFeedback = canShowFeaturebaseFeedbackButton({
-		selectedAgentId,
-		clineProviderSettings,
-		featurebaseFeedbackState,
-	});
 
 	const [pendingProjectRemoval, setPendingProjectRemoval] = useState<RuntimeProjectSummary | null>(null);
 	const isProjectRemovalPending = pendingProjectRemoval !== null && removingProjectId === pendingProjectRemoval.id;
@@ -336,44 +314,22 @@ export function ProjectNavigationPanel({
 				</div>
 				<div className="mt-2 rounded-md bg-surface-2 border border-border p-1">
 					<div className="grid grid-cols-3 gap-1">
-						<button
-							type="button"
-							onClick={() => onActiveSectionChange("projects")}
-							className={cn(
-								"cursor-pointer rounded-sm px-2 py-1 text-xs font-medium",
-								activeSection === "projects"
-									? "bg-surface-4 text-text-primary border border-border"
-									: "text-text-secondary hover:text-text-primary border border-transparent",
-							)}
-						>
-							Projects
-						</button>
-						<button
-							type="button"
-							onClick={() => onActiveSectionChange("tasks")}
-							className={cn(
-								"cursor-pointer rounded-sm px-2 py-1 text-xs font-medium",
-								activeSection === "tasks"
-									? "bg-surface-4 text-text-primary border border-border"
-									: "text-text-secondary hover:text-text-primary border border-transparent",
-							)}
-						>
-							Tasks
-						</button>
-						<button
-							type="button"
-							onClick={() => onActiveSectionChange("agent")}
+						<SidebarSectionTab
+							label="Projects"
+							active={activeSection === "projects"}
+							onSelect={() => onActiveSectionChange("projects")}
+						/>
+						<SidebarSectionTab
+							label="Tasks"
+							active={activeSection === "tasks"}
+							onSelect={() => onActiveSectionChange("tasks")}
+						/>
+						<SidebarSectionTab
+							label="Kanbani"
+							active={activeSection === "agent"}
 							disabled={!canShowAgentSection}
-							className={cn(
-								"cursor-pointer rounded-sm px-2 py-1 text-xs font-medium",
-								activeSection === "agent"
-									? "bg-surface-4 text-text-primary border border-border"
-									: "text-text-secondary hover:text-text-primary border border-transparent",
-								!canShowAgentSection ? "cursor-not-allowed opacity-50" : null,
-							)}
-						>
-							Kanbani
-						</button>
+							onSelect={() => onActiveSectionChange("agent")}
+						/>
 					</div>
 				</div>
 			</div>
@@ -428,10 +384,6 @@ export function ProjectNavigationPanel({
 						) : null}
 					</div>
 					<ShortcutsCard />
-					{/* <ProjectSupportFooter
-						shouldShowFeaturebaseFeedback={shouldShowFeaturebaseFeedback}
-						featurebaseFeedbackState={featurebaseFeedbackState}
-					/> */}
 				</>
 			) : activeSection === "tasks" ? (
 				<div className="flex flex-1 min-h-0 flex-col">{renderTasksSection({ closeOnMobile })}</div>
@@ -579,51 +531,8 @@ function TerminalAgentHints(): React.ReactElement {
 	);
 }
 
-function ProjectSupportFooter({
-	shouldShowFeaturebaseFeedback,
-	featurebaseFeedbackState,
-}: {
-	shouldShowFeaturebaseFeedback: boolean;
-	featurebaseFeedbackState?: FeaturebaseFeedbackState;
-}): React.ReactElement {
-	const isOpening = featurebaseFeedbackState?.authState === "loading";
-
-	const handleAction = () => {
-		if (shouldShowFeaturebaseFeedback) {
-			void featurebaseFeedbackState?.openFeedbackWidget();
-		} else {
-			window.open(GITHUB_ISSUES_URL, "_blank");
-		}
-	};
-
-	const actionLabel = shouldShowFeaturebaseFeedback ? (isOpening ? "Opening..." : "Send feedback") : "Report issue";
-
-	return (
-		<div style={{ padding: "4px 12px 12px" }}>
-			<div className="flex items-start gap-2 rounded-md border border-border bg-surface-2 px-3 py-2.5">
-				<Info size={14} className="mt-px shrink-0 text-text-tertiary" />
-				<div className="flex flex-col gap-1.5">
-					<p className="m-0 text-xs text-text-secondary">
-						Kanban is in beta. Help us improve by sharing your experience.
-					</p>
-					<button
-						type="button"
-						className="m-0 flex cursor-pointer items-center gap-1 self-start border-none bg-transparent p-0 text-xs font-semibold text-text-secondary hover:text-text-primary active:text-text-tertiary disabled:cursor-default disabled:opacity-50"
-						disabled={shouldShowFeaturebaseFeedback && isOpening}
-						onClick={handleAction}
-					>
-						{actionLabel} {!isOpening && <ExternalLink size={11} />}
-					</button>
-				</div>
-			</div>
-		</div>
-	);
-}
-
 const MOD = isMacPlatform ? "⌘" : modifierKeyLabel;
 const ALT = isMacPlatform ? "⌥" : "Alt";
-
-const ESSENTIAL_SHORTCUTS: { keys: string[]; label: string }[] = [];
 
 const MORE_SHORTCUTS = [
 	{ keys: ["C"], label: "New task" },
@@ -657,11 +566,6 @@ function ShortcutsCard(): React.ReactElement {
 	return (
 		<div style={{ padding: "8px 12px" }}>
 			<div style={{ padding: "0 8px" }}>
-				<div className="flex flex-col gap-0.5">
-					{ESSENTIAL_SHORTCUTS.map((s) => (
-						<ShortcutHint key={s.label} keys={s.keys} label={s.label} />
-					))}
-				</div>
 				<Collapsible.Root open={expanded} onOpenChange={setExpanded}>
 					<Collapsible.Content>
 						<div className="flex flex-col gap-0.5">
@@ -682,6 +586,36 @@ function ShortcutsCard(): React.ReactElement {
 				</Collapsible.Root>
 			</div>
 		</div>
+	);
+}
+
+function SidebarSectionTab({
+	label,
+	active,
+	disabled = false,
+	onSelect,
+}: {
+	label: string;
+	active: boolean;
+	disabled?: boolean;
+	onSelect: () => void;
+}): React.ReactElement {
+	return (
+		<button
+			type="button"
+			aria-pressed={active}
+			disabled={disabled}
+			onClick={onSelect}
+			className={cn(
+				"cursor-pointer rounded-sm px-2 py-1 text-xs font-medium",
+				active
+					? "bg-surface-4 text-text-primary border border-border"
+					: "text-text-secondary hover:text-text-primary border border-transparent",
+				disabled ? "cursor-not-allowed opacity-50" : null,
+			)}
+		>
+			{label}
+		</button>
 	);
 }
 

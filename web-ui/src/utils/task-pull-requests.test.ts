@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import type { RuntimeTaskPullRequest } from "@/runtime/types";
 import {
+	formatMergeableStateLabel,
 	formatPullRequestLabel,
+	getPullRequestDetailParts,
 	getPullRequestKey,
 	getPullRequestRefreshMessage,
 	getPullRequestTooltipLines,
@@ -151,5 +153,100 @@ describe("getPullRequestTooltipLines", () => {
 			"First recorded 5m ago",
 			"Last observed (approximate) 5m ago",
 		]);
+	});
+});
+
+describe("getPullRequestDetailParts", () => {
+	const NOW = 1_800_000_000_000;
+
+	it("returns an empty list when no provider details are stored", () => {
+		expect(getPullRequestDetailParts(createPullRequest(), NOW)).toEqual([]);
+	});
+
+	it("renders change counts, files, commits, and comment counts", () => {
+		const parts = getPullRequestDetailParts(
+			createPullRequest({
+				additions: 120,
+				deletions: 34,
+				changedFiles: 12,
+				commits: 7,
+				comments: 3,
+				reviewComments: 5,
+			}),
+			NOW,
+		);
+		expect(parts).toEqual(["+120 -34 (12 files)", "7 commits", "3 comments · 5 review comments"]);
+	});
+
+	it("singularizes counts of one", () => {
+		const parts = getPullRequestDetailParts(
+			createPullRequest({
+				additions: 1,
+				deletions: 1,
+				changedFiles: 1,
+				commits: 1,
+				comments: 1,
+				reviewComments: 1,
+			}),
+			NOW,
+		);
+		expect(parts).toEqual(["+1 -1 (1 file)", "1 commit", "1 comment · 1 review comment"]);
+	});
+
+	it("renders the head commit, mergeability, labels, reviewers, and dates", () => {
+		const parts = getPullRequestDetailParts(
+			createPullRequest({
+				headSha: "abc123def456789",
+				mergeableState: "dirty",
+				labels: ["bug", "tracking"],
+				requestedReviewers: ["reviewer-a", "reviewer-b"],
+				openedAt: NOW - 2 * DAY_MS,
+				updatedAt: NOW - 1 * HOUR_MS,
+			}),
+			NOW,
+		);
+		expect(parts).toEqual([
+			"Head abc123d",
+			"Merge conflicts",
+			"Labels: bug, tracking",
+			"Reviewers: reviewer-a, reviewer-b",
+			"Opened 2d ago",
+			"Updated 1h ago",
+		]);
+	});
+});
+
+describe("formatMergeableStateLabel", () => {
+	it("labels only noteworthy mergeable states", () => {
+		expect(formatMergeableStateLabel("dirty")).toBe("Merge conflicts");
+		expect(formatMergeableStateLabel("blocked")).toBe("Merge blocked");
+		expect(formatMergeableStateLabel("behind")).toBe("Behind base branch");
+		expect(formatMergeableStateLabel("unstable")).toBe("Checks failing");
+		expect(formatMergeableStateLabel("clean")).toBeNull();
+		expect(formatMergeableStateLabel("stable")).toBeNull();
+		expect(formatMergeableStateLabel(undefined)).toBeNull();
+	});
+});
+
+describe("getPullRequestTooltipLines with details", () => {
+	it("includes the detail line and full head commit when stored", () => {
+		const now = Date.now();
+		const lines = getPullRequestTooltipLines(
+			createPullRequest({
+				title: "Fix the bug",
+				headSha: "abc123def456789",
+				additions: 10,
+				deletions: 2,
+				changedFiles: 3,
+				createdAt: now - 5 * MINUTE_MS,
+				lastSeenAt: now - 2 * MINUTE_MS,
+			}),
+			now,
+		);
+		expect(lines).toContain("cline/kanban#123");
+		expect(lines).toContain("Fix the bug");
+		expect(lines).toContain("+10 -2 (3 files) · Head abc123d");
+		expect(lines).toContain("Head commit abc123def456789");
+		expect(lines).toContain("First recorded 5m ago");
 	});
 });

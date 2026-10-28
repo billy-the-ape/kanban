@@ -13,6 +13,7 @@
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
 import type { ClineSdkToolApprovalRequest, ClineSdkToolApprovalResult } from "./sdk-runtime-boundary";
+import { tokenizeCommandArgs } from "./validation-job-service";
 
 export type ReviewToolApprovalHandler = (request: ClineSdkToolApprovalRequest) => Promise<ClineSdkToolApprovalResult>;
 
@@ -31,6 +32,13 @@ export interface CreateReviewToolPolicyOptions {
 const approveByDefault: ReviewToolApprovalHandler = async () => ({ approved: true });
 
 const COMMAND_TOOL_NAMES = new Set(["run_commands", "bash"]);
+/**
+ * AR-3: the local validation-job tool. A `start` carries one executable plus
+ * one args string; a publication command rejected for review through
+ * `run_commands` stays rejected through this path too. Non-start actions
+ * (status / read / cancel) delegate.
+ */
+const VALIDATION_JOB_TOOL_NAME = "validation_job";
 const EDITOR_TOOL_NAMES = new Set(["editor", "write_to_file", "replace_in_file"]);
 const APPLY_PATCH_TOOL_NAME = "apply_patch";
 const READ_TOOL_NAMES = new Set(["read_files", "list_files", "search_codebase", "search_files", "fetch_web_content"]);
@@ -287,6 +295,98 @@ export function findDeniedReviewCommand(command: string): string | null {
 	return null;
 }
 
+/**
+ * Builds the structured argv of a `validation_job` start input. The runtime
+ * passes the service's exact tokenized argv (string array); a raw args string
+ * is tokenized with the service's own tokenizer as a fallback. Scanning the
+ * argv directly keeps arguments that contain whitespace (or empty quoted
+ * args) from hiding the subcommand. Null when the command is missing or the
+ * args string does not tokenize (the service rejects such starts itself).
+ */
+function buildValidationJobArgv(input: Record<string, unknown>): string[] | null {
+	const command = typeof input.command === "string" ? input.command.trim() : "";
+	if (!command) {
+		return null;
+	}
+	const args = input.args;
+	if (Array.isArray(args)) {
+		return [command, ...args.filter((arg): arg is string => typeof arg === "string")];
+	}
+	if (typeof args !== "string" || args.trim() === "") {
+		return [command];
+	}
+	const tokens = tokenizeCommandArgs(args);
+	return tokens === null ? null : [command, ...tokens];
+}
+
+/** Command basenames whose `-c` argument carries a full command payload. */
+const SHELL_COMMAND_BASENAMES = new Set(["sh", "bash", "zsh", "dash", "ksh"]);
+
+/**
+ * Finds the `-c` payload of a shell invocation, or null when the argv is
+ * not a shell invocation, or a non-flag token appears before the command
+ * flag. A short-flag cluster containing `c` (`-c`, `-lc`, `-ec`, ...) is
+ * the command flag; `-o`/`-O`/`--option` consume their value, which is
+ * skipped (script-file runs carry no inline command to scan).
+ */
+function findShellCPayload(argv: string[]): string | null {
+	const command = argv[0] ?? "";
+	if (!SHELL_COMMAND_BASENAMES.has(command.split("/").pop() ?? "")) {
+		return null;
+	}
+	for (let i = 1; i < argv.length; i += 1) {
+		const token = argv[i] ?? "";
+		// A short-flag cluster containing `c` is the command flag; the next
+		// token is its payload.
+		if (/^-[A-Za-z]*c[A-Za-z]*$/.test(token)) {
+			return argv[i + 1] ?? null;
+		}
+		// These flags consume a value; skip the pair.
+		if (token === "-o" || token === "-O" || token === "--option" || token === "--rcfile" || token === "--init-file") {
+			i += 1;
+			continue;
+		}
+		// `+` tokens toggle shell options (bash `+e`, zsh `+o <opt>`); they
+		// carry no command, but `+o` consumes a following value.
+		if (token.startsWith("+") && token.length > 1) {
+			if (token === "+o") {
+				i += 1;
+			}
+			continue;
+		}
+		if (token.startsWith("-") && token.length > 1) {
+			continue;
+		}
+		return null;
+	}
+	return null;
+}
+
+/** Scans a structured argv for commands forbidden in review sessions. */
+function findDeniedReviewArgv(argv: string[]): string | null {
+	const git = locateGitSubcommand(argv);
+	const gitDenial = git ? checkGitInvocation(git.subcommand, git.rest) : null;
+	if (gitDenial) {
+		return gitDenial;
+	}
+	const ghDenial = checkGhInvocation(argv);
+	if (ghDenial) {
+		return ghDenial;
+	}
+	// A shell `-c` payload is one opaque argv element; scan it as a command
+	// string so a publication command rejected via run_commands stays
+	// rejected through this path too (parity guarantee).
+	const shellPayload = findShellCPayload(argv);
+	const shellDenial = shellPayload ? findDeniedReviewCommand(shellPayload) : null;
+	if (shellDenial) {
+		return shellDenial;
+	}
+	if (isDestructiveRemoval(argv)) {
+		return "removing the .git directory or the worktree itself (rm -rf) is not allowed in review sessions.";
+	}
+	return null;
+}
+
 /** Resolves a tool-input path against the worktree, returning a worktree-relative path or null. */
 function toWorktreeRelative(worktreePath: string, candidatePath: unknown): string | null {
 	if (typeof candidatePath !== "string") {
@@ -349,6 +449,23 @@ export function createReviewToolPolicy(options: CreateReviewToolPolicyOptions): 
 		if (COMMAND_TOOL_NAMES.has(toolName)) {
 			for (const command of extractCommandStrings(input)) {
 				const denial = findDeniedReviewCommand(command);
+				if (denial) {
+					return { approved: false, reason: denial };
+				}
+			}
+			return await delegate(request);
+		}
+
+		// AR-3: only a validation_job `start` carries a command worth
+		// scanning; status/read/cancel delegate like unknown tools. The
+		// start's argv is scanned as structured tokens (the service's own
+		// tokenizer), so a quoted arg containing whitespace cannot hide a
+		// forbidden git/gh subcommand or a destructive removal.
+		if (toolName === VALIDATION_JOB_TOOL_NAME) {
+			const action = typeof input.action === "string" ? input.action.trim() : "";
+			if (action === "start") {
+				const argv = buildValidationJobArgv(input);
+				const denial = argv ? findDeniedReviewArgv(argv) : null;
 				if (denial) {
 					return { approved: false, reason: denial };
 				}

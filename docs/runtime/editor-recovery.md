@@ -27,6 +27,42 @@ timeout policy remain in place. Successful intermediate calls still reset the gu
 Instructions require a fresh file read and a corrected unique anchor, or a valid
 one-based insertion boundary for pure additions.
 
+## Bounded current-source evidence (AR-2)
+
+For a failed editor call that the hooks classify as an input defect (missing or
+empty old_text, zero matches, ambiguous matches, invalid insertion line, or an
+oversized payload), the recovery envelope additionally carries an `evidence`
+field: a machine-readable, best-effort snapshot of the current source. It
+includes
+
+- the presence, type, and length of each parsed editor field (`path`,
+  `old_text`, `new_text`, `insert_line`) — an absent field is reported as absent
+  in the parsed call, never attributed to the harness,
+- the exact occurrence count of a nonempty `old_text` using SDK-equivalent
+  semantics (non-overlapping substring count), when the file could be read,
+- for zero matches, at most two approximate, whitespace-normalized candidate
+  windows with eight surrounding lines each and 6,000 characters total, always
+  marked diagnostic (never an automatically corrected anchor),
+- per-line leading-whitespace facts reported distinctly from source text:
+  TAB counts, space counts, and literal two-character backslash-t sequences,
+- for an unchanged repeated failure, the relevant fields that stayed
+  unchanged, and
+- an ISO timestamp of when the source was read.
+
+The evidence read is confined to the task worktree after realpath checks and
+skips external paths, symlink escapes, non-files, binary files, files over
+256 KiB, and unreadable files, each with a reason. It uses asynchronous bounded
+I/O under a hard timeout, never echoes the replacement payload, never writes,
+and never fails the session: any failure preserves the original editor error.
+No enrichment read follows an approval denial (denied calls never reach the
+evidence path), and timeouts keep their existing recovery without evidence.
+
+The `recovery` wording uses only the sentence matching the measured condition
+with the actual facts substituted; when no trustworthy candidate exists it says
+so and asks for a targeted `read_files` section. The envelope nests the
+original output unchanged, so the existing artifact bounding still applies and
+the compact explanation stays first within the output budget.
+
 Tests run the real SDK tool and agent loop against temporary files, and inspect
 the next model request to verify both original errors and recovery guidance.
 This proves delivery, not that the model follows the instructions.

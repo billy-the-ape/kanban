@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ProjectNavigationPanel } from "@/components/project-navigation-panel";
 import { useProjectNavigationLayout } from "@/resize/use-project-navigation-layout";
-import type { RuntimeClineProviderSettings, RuntimeProjectSummary } from "@/runtime/types";
+import type { RuntimeProjectSummary } from "@/runtime/types";
 import { LocalStorageKey } from "@/storage/local-storage-store";
 
 vi.mock("@/resize/layout-customizations", () => ({
@@ -41,19 +41,6 @@ const PROJECTS: RuntimeProjectSummary[] = [
 		},
 	},
 ];
-
-const CLINE_OAUTH_SETTINGS: RuntimeClineProviderSettings = {
-	providerId: null,
-	modelId: "cline-sonnet",
-	baseUrl: null,
-	reasoningEffort: null,
-	apiKeyConfigured: false,
-	oauthProvider: "cline",
-	oauthAccessTokenConfigured: true,
-	oauthRefreshTokenConfigured: true,
-	oauthAccountId: "acc-1",
-	oauthExpiresAt: 1_800_000_000_000,
-};
 
 function getSidebar(container: HTMLElement): HTMLElement {
 	const sidebar = container.querySelector("aside");
@@ -140,8 +127,6 @@ describe("ProjectNavigationPanel width persistence", () => {
 					renderTasksSection={() => <div>tasks-section-content</div>}
 					canShowAgentSection
 					selectedAgentId={null}
-					clineProviderSettings={null}
-					featurebaseFeedbackState={undefined}
 					onSelectProject={() => {}}
 					onRemoveProject={async () => true}
 					onAddProject={() => {}}
@@ -280,6 +265,7 @@ describe("ProjectNavigationPanel width persistence", () => {
 			["Projects", "Tasks", "Kanbani"].includes(button.textContent ?? ""),
 		);
 		expect(sectionButtons.map((button) => button.textContent)).toEqual(["Projects", "Tasks", "Kanbani"]);
+		expect(sectionButtons.map((button) => button.getAttribute("aria-pressed"))).toEqual(["true", "false", "false"]);
 		const tasksButton = sectionButtons.find((button) => button.textContent === "Tasks");
 		if (!tasksButton) {
 			throw new Error("Tasks section button was not rendered");

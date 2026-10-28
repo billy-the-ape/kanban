@@ -39,6 +39,7 @@ import {
 	createTaskEntryFromPersistedSession,
 } from "./cline-message-repository";
 import { type ClineRuntimeSetup, createClineRuntimeSetup } from "./cline-runtime-setup";
+import { isPublicationCapableSessionId } from "./cline-session-ids";
 import {
 	type ClineLaunchConfigResolver,
 	type ClinePersistedTaskSessionSnapshot,
@@ -346,6 +347,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 						cwd,
 						providerId: rebuildSystemPromptForProvider,
 						rules: runtimeSetup.loadRules(),
+						includePublicationGuidance: isPublicationCapableSessionId(taskId),
 					});
 					const appended = resolveHomeAgentAppendSystemPrompt(taskId);
 					if (appended) systemPrompt = `${systemPrompt}\n\n${appended}`;
@@ -880,6 +882,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 						cwd: request.cwd,
 						providerId,
 						rules: runtimeSetup.loadRules(),
+						includePublicationGuidance: isPublicationCapableSessionId(request.taskId),
 					}));
 				const appendedSystemPrompt = resolveHomeAgentAppendSystemPrompt(request.taskId);
 				if (appendedSystemPrompt) {
