@@ -240,7 +240,9 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 		// messages avoids replacing the scroller and losing their position.
 		// Once activated, keep the virtualizer mounted for that task.
 		const [virtualizedTaskId, setVirtualizedTaskId] = useState<string | null>(null);
-		const usesVirtualizedMessages = virtualizedTaskId === taskId;
+		const usesVirtualizedMessages =
+			virtualizedTaskId === taskId ||
+			(messages.length >= CHAT_VIRTUALIZATION_THRESHOLD && isAutoScrollEnabled);
 		// TODO: Persist per-task mode immediately when toggled so page refresh restores unsent mode changes.
 		const modeByTaskIdRef = useRef<Map<string, RuntimeTaskSessionMode>>(new Map());
 		const [composerError, setComposerError] = useState<string | null>(null);
