@@ -1020,3 +1020,27 @@ describe("Cline concurrency configuration", () => {
 		}
 	});
 });
+
+describe("AR-5 — default Auto-PR template", () => {
+	it("keeps the working body-file publication instruction in the default template", async () => {
+		const home = createTempDir("kanban-ar5-autopr-template-");
+		try {
+			await withTemporaryEnv({ home: home.path }, async () => {
+				const state = await loadRuntimeConfig(home.path);
+				// AR-5 adds system-prompt guidance instead of changing the
+				// working Auto-PR template instructions.
+				expect(state.openPrPromptTemplateDefault).toContain(
+					"write the description to a UTF-8 file in the task worktree and pass it with gh pr create --body-file <path>",
+				);
+				expect(state.openPrPromptTemplateDefault).toContain(
+					"Do not encode line breaks as literal backslash-n text",
+				);
+				expect(state.openPrPromptTemplateDefault).toContain("Do not run destructive commands");
+				// No configured template: the effective template is the default.
+				expect(state.openPrPromptTemplate).toBe(state.openPrPromptTemplateDefault);
+			});
+		} finally {
+			home.cleanup();
+		}
+	});
+});

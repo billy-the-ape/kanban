@@ -37,6 +37,7 @@ Architecture opinions
 
 Git guardrails
 - NEVER commit to main unless user asks.
+- Task worktrees in this fork start at the base branch tip in detached HEAD (no local branch). Create a task branch from HEAD (repo convention: `arN/<topic>` for AR plans) before committing and pushing, or the first commit lands on a detached HEAD that must be re-attached before `git push`.
 
 GitHub issues
 When reading issues:

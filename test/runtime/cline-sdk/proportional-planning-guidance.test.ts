@@ -61,7 +61,11 @@ describe("AR-4 proportionate planning guidance", () => {
 	});
 
 	it("composes the act-mode coding prompt with the guidance exactly once", async () => {
-		const prompt = await resolveClineSdkSystemPrompt({ cwd: process.cwd(), providerId: "openai" });
+		const prompt = await resolveClineSdkSystemPrompt({
+			cwd: process.cwd(),
+			providerId: "openai",
+			includePublicationGuidance: true,
+		});
 		expect(countOccurrences(prompt, CLINE_PROPORTIONAL_PLANNING_GUIDANCE)).toBe(1);
 		expect(prompt).not.toContain("It's OK for this section to be quite long");
 		// The editor recovery/publication guidance stays a separate intact section.
@@ -69,7 +73,11 @@ describe("AR-4 proportionate planning guidance", () => {
 	});
 
 	it("keeps explicit planning requests authoritative", async () => {
-		const prompt = await resolveClineSdkSystemPrompt({ cwd: process.cwd(), providerId: "openai" });
+		const prompt = await resolveClineSdkSystemPrompt({
+			cwd: process.cwd(),
+			providerId: "openai",
+			includePublicationGuidance: true,
+		});
 		expect(CLINE_PROPORTIONAL_PLANNING_GUIDANCE).toContain("Follow explicit user requests for planning");
 		// The SDK's own planning bullet is preserved, so explicit plan-mode
 		// instructions remain authoritative in the composed prompt.
@@ -89,7 +97,11 @@ describe("AR-4 proportionate planning guidance", () => {
 	});
 
 	it("keeps the SDK guardrails unchanged around the replaced section", async () => {
-		const prompt = await resolveClineSdkSystemPrompt({ cwd: process.cwd(), providerId: "openai" });
+		const prompt = await resolveClineSdkSystemPrompt({
+			cwd: process.cwd(),
+			providerId: "openai",
+			includePublicationGuidance: true,
+		});
 		// The replaced section is followed verbatim by the guardrails that used
 		// to follow the SDK's planning paragraph.
 		expect(prompt).toContain(`${CLINE_PROPORTIONAL_PLANNING_GUIDANCE}\n\nREMEMBER, be helpful and proactive!`);
@@ -128,7 +140,11 @@ describe("AR-4 proportionate planning guidance", () => {
 	});
 
 	it("applies the guidance at most once, including for composed home-agent prompts", async () => {
-		const base = await resolveClineSdkSystemPrompt({ cwd: process.cwd(), providerId: "openai" });
+		const base = await resolveClineSdkSystemPrompt({
+			cwd: process.cwd(),
+			providerId: "openai",
+			includePublicationGuidance: true,
+		});
 		const appended = resolveHomeAgentAppendSystemPrompt("__home_agent__:workspace-1:codex", {
 			currentVersion: "0.1.10",
 			cwd: "/Users/example/repo",

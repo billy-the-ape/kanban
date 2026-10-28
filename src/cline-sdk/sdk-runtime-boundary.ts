@@ -238,6 +238,21 @@ export const CLINE_PROPORTIONAL_PLANNING_GUIDANCE = [
 ].join("\n");
 
 /**
+ * AR-5: safe publication guidance for native coding sessions. Kept as one
+ * named constant at the composer, separate from the planning and editor
+ * guidance above and from the review/rollback role prompts. It does not
+ * authorize publication, broaden a feedback snapshot, or require checking
+ * for fresh comments during an implementation loop; it standardizes how
+ * authorized Markdown publications preserve their bytes (the working
+ * Auto-PR `--body-file` instruction is the source of truth).
+ */
+export const CLINE_PUBLICATION_GUIDANCE = [
+	"When publication is authorized, preserve the exact intended Markdown. If using gh CLI for a multiline PR description or comment, write the body as UTF-8 to a file and use the command's supported --body-file option. For an API operation, use its supported structured input or file input. Keep backticks, dollar signs, quotes, and real newlines out of shell-interpolated body arguments. Keep temporary body files out of commits.",
+	"",
+	"Verify the stored body once after publication, and retain the identity/output required by the current workflow. If publication times out or its identity is unclear, inspect the existing remote state before creating another object. Follow the current bounded feedback instructions when choosing which comments to address.",
+].join("\n");
+
+/**
  * The planning paragraph verbatim as shipped in the @clinebot/core 0.0.38
  * default system prompt (inspected in the installed package's generated
  * output). Its last sentence ("It's OK for this section to be quite long")
@@ -296,6 +311,12 @@ export async function resolveClineSdkSystemPrompt(input: {
 	cwd: string;
 	providerId: string;
 	rules?: string;
+	/**
+	 * AR-5: append the safe publication guidance. Set only for
+	 * publication-capable native coding sessions; sidebar-only (home agent)
+	 * and bounded review sessions compose without it.
+	 */
+	includePublicationGuidance: boolean;
 }): Promise<string> {
 	// The Cline SDK can run against non-Cline providers too, but only the
 	// "cline" provider expects the extra workspace metadata block that powers
@@ -313,5 +334,11 @@ export async function resolveClineSdkSystemPrompt(input: {
 	// planning guidance. Only that one upstream paragraph is touched; every other
 	// section of the SDK prompt is preserved verbatim.
 	const { prompt: composedPrompt } = applyProportionalPlanningGuidance(defaultPrompt);
-	return `${composedPrompt}\n\n${CLINE_EDITOR_SIZE_GUIDANCE}`;
+	const sections = [composedPrompt, CLINE_EDITOR_SIZE_GUIDANCE];
+	// AR-5: the publication guidance is a separate final section for
+	// publication-capable coding sessions only.
+	if (input.includePublicationGuidance) {
+		sections.push(CLINE_PUBLICATION_GUIDANCE);
+	}
+	return sections.join("\n\n");
 }
