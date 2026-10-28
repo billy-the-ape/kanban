@@ -33,11 +33,15 @@ interface UseClineChatSessionResult {
 }
 
 function areMessagesEqual(left: ClineChatMessage, right: ClineChatMessage): boolean {
+	if (left === right) {
+		return true;
+	}
 	return (
 		left.content === right.content &&
 		left.role === right.role &&
 		left.createdAt === right.createdAt &&
-		JSON.stringify(left.meta ?? null) === JSON.stringify(right.meta ?? null)
+		(left.meta === right.meta || JSON.stringify(left.meta ?? null) === JSON.stringify(right.meta ?? null)) &&
+		(left.images === right.images || JSON.stringify(left.images ?? null) === JSON.stringify(right.images ?? null))
 	);
 }
 
@@ -55,8 +59,34 @@ function upsertMessage(currentMessages: ClineChatMessage[], nextMessage: ClineCh
 	return nextMessages;
 }
 
-function mergeMessages(baseMessages: ClineChatMessage[], additionalMessages: ClineChatMessage[]): ClineChatMessage[] {
-	return additionalMessages.reduce((nextMessages, message) => upsertMessage(nextMessages, message), [...baseMessages]);
+/**
+ * Merge by message ID in O(base + incoming) time rather than repeatedly
+ * scanning and copying the growing history. Preserve the original order and
+ * references for unchanged messages so virtualized rows do not rerender.
+ */
+export function mergeClineChatMessages(
+	baseMessages: ClineChatMessage[],
+	additionalMessages: ClineChatMessage[],
+): ClineChatMessage[] {
+	if (additionalMessages.length === 0) {
+		return baseMessages;
+	}
+	const indexes = new Map(baseMessages.map((message, index) => [message.id, index]));
+	let result = baseMessages;
+	for (const message of additionalMessages) {
+		const index = indexes.get(message.id);
+		if (index === undefined) {
+			if (result === baseMessages) result = [...baseMessages];
+			indexes.set(message.id, result.length);
+			result.push(message);
+			continue;
+		}
+		if (!areMessagesEqual(result[index]!, message)) {
+			if (result === baseMessages) result = [...baseMessages];
+			result[index] = message;
+		}
+	}
+	return result;
 }
 
 export function useClineChatSession({
@@ -91,7 +121,7 @@ export function useClineChatSession({
 				if (cancelled) {
 					return;
 				}
-				setMessages((currentMessages) => mergeMessages(loadedMessages ?? [], currentMessages));
+				setMessages((currentMessages) => mergeClineChatMessages(loadedMessages ?? [], currentMessages));
 			})
 			.catch((loadError) => {
 				if (cancelled) {
@@ -118,7 +148,7 @@ export function useClineChatSession({
 			setMessages([]);
 			return;
 		}
-		setMessages((currentMessages) => mergeMessages(currentMessages, incomingMessages));
+		setMessages((currentMessages) => mergeClineChatMessages(currentMessages, incomingMessages));
 	}, [incomingMessages]);
 
 	useEffect(() => {
@@ -178,7 +208,7 @@ export function useClineChatSession({
 					setMessages((currentMessages) => upsertMessage(currentMessages, sentMessage));
 				} else if (onLoadMessages) {
 					const loadedMessages = await onLoadMessages(taskId);
-					setMessages(loadedMessages ?? []);
+					setMessages((currentMessages) => mergeClineChatMessages(loadedMessages ?? [], currentMessages));
 				}
 				return true;
 			} catch (sendError) {
