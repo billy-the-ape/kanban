@@ -152,6 +152,34 @@ describe("TaskPrCommentHandlingPanel", () => {
 		expect(pending?.textContent).toContain("Waiting to address 2 new comments");
 		expect(document.querySelector('[data-testid="task-pr-comment-status-blocked"]')).toBeNull();
 	});
+	it("shows the dispatch hold and wait duration instead of shortly", () => {
+		const now = Date.now();
+		render(
+			makeState({
+				pendingCount: 16,
+				pendingDeadline: now - 86_400_000,
+				dispatchHold: {
+					kind: "writer_active",
+					message: "Waiting for the task's running agent to finish.",
+					since: now - 120_000,
+					lastCheckedAt: now,
+					retryAt: now + 30_000,
+				},
+			}),
+		);
+		const held = document.querySelector('[data-testid="task-pr-comment-status-held"]');
+		expect(held?.textContent).toContain("running agent");
+		expect(held?.textContent).toContain("Waiting 2m");
+		expect(held?.getAttribute("title")).toContain("Last checked");
+		expect(document.querySelector('[data-testid="task-pr-comment-status-pending"]')).toBeNull();
+		expect(document.querySelector('[data-testid="task-pr-comment-resume-button"]')).toBeNull();
+	});
+
+	it("identifies an overdue intent even before its first recorded hold", () => {
+		render(makeState({ pendingCount: 2, pendingDeadline: Date.now() - 60_000 }));
+		expect(container.textContent).toContain("dispatch overdue by 1m");
+		expect(container.textContent).not.toContain("shortly");
+	});
 	it("distinguishes queued execution from a Git refresh blocker and exposes Resume", () => {
 		const dispatch = {
 			dispatchId: "repair",

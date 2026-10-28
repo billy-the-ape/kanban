@@ -177,6 +177,7 @@ function makeService(
 			workspaceId: string;
 			workspacePath: string;
 		}) => Promise<ClineTaskSessionService>;
+		getTerminalManager?: () => Promise<TerminalSessionManager>;
 		now?: () => number;
 		getGitHubAccessScopeId?: () => Promise<string>;
 	} = {},
@@ -198,7 +199,7 @@ function makeService(
 				return state;
 			}),
 		getClineTaskSessionService: overrides.getClineTaskSessionService ?? (async () => idleCline),
-		getTerminalManager: async () => idleTerminal,
+		getTerminalManager: overrides.getTerminalManager ?? (async () => idleTerminal),
 		resolveWorkspacePathById: overrides.resolveWorkspacePathById,
 		refreshGit: overrides.refreshGit ?? (async () => "abc"),
 		sendTaskChatMessage: async (scope, body, prepare) => {
@@ -481,6 +482,134 @@ describe("applyPrPollOutcome", () => {
 
 describe("PrCommentAutomationService", () => {
 	const scope = { workspaceId: "w1", workspacePath: "/w1" };
+
+	it("recovers an overdue unsent repair after restart despite a stale terminal running summary", async () => {
+		let now = NOW;
+		let active = true;
+		const workspaceStates = new Map([
+			["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })])],
+		]);
+		const options = {
+			workspaceStates,
+			now: () => now,
+			snapshot: { events: [makeEvent({ providerId: "inline-1" })] },
+			getClineTaskSessionService: async () =>
+				({
+					getSummary: () => makeSummary({ state: "awaiting_review" }),
+					listSummaries: () => [],
+				}) as unknown as ClineTaskSessionService,
+			getTerminalManager: async () =>
+				({
+					getSummary: () => makeSummary({ state: "running" }),
+					hasActiveProcess: () => active,
+					listSummaries: () => [],
+				}) as unknown as TerminalSessionManager,
+		};
+		const first = makeService(options);
+		await first.service.refreshWorkspace(scope);
+		await first.service.runTick();
+		now += 121_000;
+		await first.service.runTick();
+		expect(first.sent).toHaveLength(0);
+		const held = await first.service.getTaskPrTrackingState(scope, "t1");
+		expect(held.state.dispatchHold).toMatchObject({ kind: "writer_active", since: now, lastCheckedAt: now });
+		expect(held.state.dispatch?.attemptedAt).toBeNull();
+		expect(held.state.resumable).toBe(false);
+		now += 30_000;
+		await first.service.runTick();
+		const checked = await first.service.getTaskPrTrackingState(scope, "t1");
+		expect(checked.state.dispatchHold?.since).toBe(held.state.dispatchHold?.since);
+		expect(checked.state.dispatchHold?.lastCheckedAt).toBe(now);
+		await first.service.dispose();
+
+		// A restored summary still says running, but no process survived the restart.
+		active = false;
+		now += 2 * 24 * 60 * 60 * 1000;
+		const restarted = makeService(options);
+		await restarted.service.start();
+		await restarted.service.runTick();
+		expect(restarted.sent).toHaveLength(1);
+		const sent = await restarted.service.getTaskPrTrackingState(scope, "t1");
+		expect(sent.state.dispatchHold).toBeNull();
+		expect(sent.state.dispatch?.status).toBe("running");
+		await restarted.service.runTick();
+		expect(restarted.sent).toHaveLength(1);
+		await restarted.service.dispose();
+	});
+
+	it("exposes a persisted authentication hold without marking feedback dispatched", async () => {
+		let now = NOW;
+		let authenticated = true;
+		const harness = makeService({
+			now: () => now,
+			workspaceStates: new Map([
+				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })])],
+			]),
+			snapshot: { events: [makeEvent({ providerId: "inline-1" })] },
+			getGitHubAccessScopeId: async () => {
+				if (!authenticated) throw new Error("unavailable");
+				return "scope-1";
+			},
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		now += 121_000;
+		authenticated = false;
+		await harness.service.runTick();
+		const state = (await harness.service.getTaskPrTrackingState(scope, "t1")).state;
+		expect(state.dispatchHold).toMatchObject({ kind: "github_auth", retryAt: now + 30_000 });
+		expect(state.dispatch?.attemptedAt).toBeNull();
+		expect(harness.sent).toHaveLength(0);
+		const loaded = await loadPrTrackingRecord(KEY);
+		if (loaded.status !== "ok") throw new Error("missing record");
+		expect(loaded.record.commentAutomation.lastDispatchedFeedbackFingerprint).toBeNull();
+		authenticated = true;
+		now += 30_000;
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(1);
+	});
+
+	it("hides an old hold while fresh feedback restarts debounce, then dispatches when due", async () => {
+		let now = NOW;
+		let running = true;
+		const events = [makeEvent({ providerId: "inline-1", updatedAt: now })];
+		const harness = makeService({
+			now: () => now,
+			snapshot: { events },
+			workspaceStates: new Map([
+				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })])],
+			]),
+			getClineTaskSessionService: async () =>
+				({
+					getSummary: () => makeSummary({ state: running ? "running" : "awaiting_review" }),
+					listSummaries: () => [],
+				}) as unknown as ClineTaskSessionService,
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		now += 121_000;
+		await harness.service.runTick();
+		const held = (await harness.service.getTaskPrTrackingState(scope, "t1")).state;
+		expect(held.dispatchHold?.kind).toBe("writer_active");
+
+		now += 65_000;
+		running = false;
+		events.push(makeEvent({ providerId: "inline-2", updatedAt: now }));
+		await harness.service.runTick();
+		const quiet = (await harness.service.getTaskPrTrackingState(scope, "t1")).state;
+		expect(quiet.pendingDeadline).toBe(now + 120_000);
+		expect(quiet.dispatchHold).toBeNull();
+		expect(harness.sent).toHaveLength(0);
+		const loaded = await loadPrTrackingRecord(KEY);
+		if (loaded.status !== "ok") throw new Error("missing record");
+		// Reading the UI projection does not discard historical hold evidence.
+		expect(loaded.record.commentAutomation.dispatchHold).toEqual(held.dispatchHold);
+
+		now += 121_000;
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(1);
+		expect((await harness.service.getTaskPrTrackingState(scope, "t1")).state.dispatchHold).toBeNull();
+	});
 
 	it("builds the exact fixed instruction", () => {
 		expect(buildCommentHandlingInstruction(PR.url)).toBe(
@@ -1748,6 +1877,31 @@ describe("COMMENT-0 publication capture", () => {
 		const record = await load();
 		expect(record.commentAutomation.dispatch?.status).toBe("completed");
 		expect(record.commentAutomation.dispatch?.error).toBeNull();
+	});
+
+	it("includes the underlying session error when a repair turn fails", async () => {
+		const event = makeEvent({ providerId: "conversation-1", updatedAt: NOW });
+		await seedRunningDispatch(fingerprintOf([event]));
+		const harness = makeService({
+			workspaceStates: new Map([
+				[
+					"/w1",
+					makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })], {
+						t1: {
+							...makeSummary({ state: "awaiting_review", lastOutputAt: NOW + 1_000 }),
+							reviewReason: "error",
+							warningMessage: "Editor operation failed: old_text is required",
+						},
+					}),
+				],
+			]),
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		const record = await load();
+		expect(record.commentAutomation.dispatch?.status).toBe("failed");
+		expect(record.commentAutomation.dispatch?.error).toContain("old_text is required");
+		expect(harness.sent).toHaveLength(0);
 	});
 
 	it("completes a restart-surviving dispatch with post-dispatch live evidence", async () => {

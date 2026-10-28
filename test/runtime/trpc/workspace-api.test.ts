@@ -368,12 +368,14 @@ describe("createWorkspaceApi deleteWorktree (B-5.5)", () => {
 	function createApi(states: {
 		cline: RuntimeTaskSessionSummary["state"] | null;
 		terminal: RuntimeTaskSessionSummary["state"] | null;
+		terminalHasActiveProcess?: boolean;
 	}) {
 		return createWorkspaceApi({
 			ensureTerminalManagerForWorkspace: vi.fn(
 				async () =>
 					({
 						getSummary: vi.fn(() => (states.terminal ? createSummary({ state: states.terminal }) : null)),
+						hasActiveProcess: vi.fn(() => states.terminalHasActiveProcess ?? states.terminal === "running"),
 					}) as never,
 			),
 			getScopedClineTaskSessionService: vi.fn(
@@ -420,6 +422,17 @@ describe("createWorkspaceApi deleteWorktree (B-5.5)", () => {
 			repoPath: "/tmp/repo",
 			taskId: "task-1",
 		});
+	});
+
+	it("removes the worktree when a restored terminal says running but has no process", async () => {
+		const response = await createApi({
+			cline: "awaiting_review",
+			terminal: "running",
+			terminalHasActiveProcess: false,
+		}).deleteWorktree(scope, { taskId: "task-1" });
+		expect(response.ok).toBe(true);
+		expect(response.removed).toBe(true);
+		expect(workspaceTaskWorktreeMocks.deleteTaskWorktree).toHaveBeenCalledTimes(1);
 	});
 });
 
