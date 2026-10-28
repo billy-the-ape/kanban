@@ -6,7 +6,11 @@ describe("Cline editor size guidance", () => {
 		expect(CLINE_EDITOR_SIZE_GUIDANCE).toContain("under 30000 characters");
 		expect(CLINE_EDITOR_SIZE_GUIDANCE).toContain("hard limit is 32000");
 		expect(CLINE_EDITOR_SIZE_GUIDANCE).toContain("read the current file section");
-		const prompt = await resolveClineSdkSystemPrompt({ cwd: process.cwd(), providerId: "openai" });
+		const prompt = await resolveClineSdkSystemPrompt({
+			cwd: process.cwd(),
+			providerId: "openai",
+			includePublicationGuidance: true,
+		});
 		expect(prompt).toContain(CLINE_EDITOR_SIZE_GUIDANCE);
 	});
 });

@@ -44,6 +44,11 @@ import {
 import { resolveTaskCwd } from "../workspace/task-worktree";
 import { buildClineCompactionConfig } from "./cline-compaction-config";
 import type { ResolvedClineLaunchConfig } from "./cline-provider-service";
+import {
+	baseTaskIdForReviewSessionId,
+	reviewSessionIdForTask,
+	VERIFICATION_REPAIR_SESSION_SUFFIX,
+} from "./cline-session-ids";
 import type { ClineLaunchConfigResolver } from "./cline-session-runtime";
 import { buildSessionIdPrefix } from "./cline-session-state";
 import {
@@ -57,37 +62,13 @@ import type { ClineTaskSessionService, StartClineTaskSessionRequest } from "./cl
 import { buildReviewInitialPrompt, buildReviewRepairPrompt, buildVerificationRepairPrompt } from "./review-prompt";
 import { createReviewToolPolicy } from "./review-tool-policy";
 
-/** Suffix that makes the review session id distinct from the task's working session. */
-const REVIEW_SESSION_SUFFIX = "::review";
-/** B-7.5: each verification repair round runs in its own fresh session. */
-const VERIFICATION_REPAIR_SESSION_SUFFIX = "::verification-repair-";
+export { baseTaskIdForReviewSessionId, reviewSessionIdForTask };
+
 /** B-6.5: default bounded repair-round budget (initial evaluation value is two). */
 const DEFAULT_MAX_REPAIR_ROUNDS = 2;
 /** B-6: a single review/repair turn that runs longer than this is stopped and reported as failed. */
 const DEFAULT_REVIEW_TURN_TIMEOUT_MS = 30 * 60_000;
 
-/** B-6.2: the review session id is derived from (and distinct from) the task id. */
-export function reviewSessionIdForTask(taskId: string): string {
-	return `${taskId}${REVIEW_SESSION_SUFFIX}`;
-}
-
-/**
- * B-11.2: the base task id for a review session id (review or
- * verification-repair sessions); null for plain task sessions. Review work
- * holds the base task's model worker slot, so budgets scope sessions by it.
- */
-export function baseTaskIdForReviewSessionId(sessionId: string): string | null {
-	if (sessionId.endsWith(REVIEW_SESSION_SUFFIX)) {
-		return sessionId.slice(0, -REVIEW_SESSION_SUFFIX.length);
-	}
-	const repairIndex = sessionId.indexOf(VERIFICATION_REPAIR_SESSION_SUFFIX);
-	if (repairIndex > 0) {
-		return sessionId.slice(0, repairIndex);
-	}
-	return null;
-}
-
-/** B-6: the evidence a review run needs, abstracted for unit testing. */
 export interface ClineReviewEvidencePort {
 	loadTaskBaseRef(taskId: string): Promise<string | null>;
 	resolveWorktreePath(taskId: string, baseRef: string): Promise<string>;
