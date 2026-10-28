@@ -2208,6 +2208,9 @@ export class PrCommentAutomationService {
 			dispatch.status === "completed" ||
 			(dispatch.status === "queued" && dispatch.attemptedAt === null);
 		const pending = (automation.pendingCount ?? 0) > 0 && automation.debounceDeadline !== null;
+		// A previous admission hold is historical while newer feedback restarts
+		// the quiet window. Show the countdown until admission is due again.
+		const due = automation.debounceDeadline !== null && nowMs >= automation.debounceDeadline;
 		const dispatchHold =
 			pending && unsent
 				? !sub?.candidates.has(`${scope.workspaceId}/${taskId}`)
@@ -2218,7 +2221,9 @@ export class PrCommentAutomationService {
 							lastCheckedAt: nowMs,
 							retryAt: null,
 						}
-					: (automation.dispatchHold ?? null)
+					: due
+						? (automation.dispatchHold ?? null)
+						: null
 				: null;
 		const blocker = capturePaused
 			? `Publication capture could not be persisted; automatic comment handling is paused for this pull request.`

@@ -569,6 +569,48 @@ describe("PrCommentAutomationService", () => {
 		expect(harness.sent).toHaveLength(1);
 	});
 
+	it("hides an old hold while fresh feedback restarts debounce, then dispatches when due", async () => {
+		let now = NOW;
+		let running = true;
+		const events = [makeEvent({ providerId: "inline-1", updatedAt: now })];
+		const harness = makeService({
+			now: () => now,
+			snapshot: { events },
+			workspaceStates: new Map([
+				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })])],
+			]),
+			getClineTaskSessionService: async () =>
+				({
+					getSummary: () => makeSummary({ state: running ? "running" : "awaiting_review" }),
+					listSummaries: () => [],
+				}) as unknown as ClineTaskSessionService,
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		now += 121_000;
+		await harness.service.runTick();
+		const held = (await harness.service.getTaskPrTrackingState(scope, "t1")).state;
+		expect(held.dispatchHold?.kind).toBe("writer_active");
+
+		now += 65_000;
+		running = false;
+		events.push(makeEvent({ providerId: "inline-2", updatedAt: now }));
+		await harness.service.runTick();
+		const quiet = (await harness.service.getTaskPrTrackingState(scope, "t1")).state;
+		expect(quiet.pendingDeadline).toBe(now + 120_000);
+		expect(quiet.dispatchHold).toBeNull();
+		expect(harness.sent).toHaveLength(0);
+		const loaded = await loadPrTrackingRecord(KEY);
+		if (loaded.status !== "ok") throw new Error("missing record");
+		// Reading the UI projection does not discard historical hold evidence.
+		expect(loaded.record.commentAutomation.dispatchHold).toEqual(held.dispatchHold);
+
+		now += 121_000;
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(1);
+		expect((await harness.service.getTaskPrTrackingState(scope, "t1")).state.dispatchHold).toBeNull();
+	});
+
 	it("builds the exact fixed instruction", () => {
 		expect(buildCommentHandlingInstruction(PR.url)).toBe(
 			[
