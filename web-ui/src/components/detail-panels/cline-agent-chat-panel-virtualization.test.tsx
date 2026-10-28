@@ -133,7 +133,7 @@ describe("ClineAgentChatPanel long conversations", () => {
 				taskId="task-scroll"
 				summary={null}
 				onLoadMessages={onLoadMessages}
-				incomingMessage={{ ...messages[119], content: "Streaming newer content" }}
+				incomingMessage={{ ...message(119), content: "Streaming newer content" }}
 			/>,
 		);
 		expect(container.textContent).toContain("Reply 0:");
