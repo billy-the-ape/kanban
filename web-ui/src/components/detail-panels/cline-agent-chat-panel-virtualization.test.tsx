@@ -45,7 +45,16 @@ vi.mock("react-virtuoso", async () => {
 					>Oldest</button>
 					<button
 					type="button"
-					data-testid="show-newest"
+					data-testid="show-oldest-notify"
+					onClick={() => {
+						atBottom.current = false;
+						setStart(0);
+						atBottomStateChange?.(false);
+					}}
+					>Scroll up (notify)</button>
+					<button
+						type="button"
+						data-testid="show-newest"
 					onClick={() => {
 							atBottom.current = true;
 							setStart(Math.max(0, data.length - 6));
@@ -138,6 +147,19 @@ describe("ClineAgentChatPanel long conversations", () => {
 		);
 		expect(container.textContent).toContain("Reply 0:");
 		expect(container.textContent).not.toContain("Streaming newer content");
+	});
+
+	it("keeps the virtual list mounted when scrolling up after activation", async () => {
+		const messages = Array.from({ length: 120 }, (_, index) => message(index));
+		const onLoadMessages = async () => messages;
+		await render(<ClineAgentChatPanel taskId="task-sticky" summary={null} onLoadMessages={onLoadMessages} />);
+		expect(container.querySelectorAll('[data-testid="virtual-chat-message"]')).toHaveLength(6);
+		await click("show-oldest-notify");
+		// Unlike the delayed callback test, this delivers the false event.
+		expect(container.querySelector('[data-testid="virtual-chat-list"]')).toBeTruthy();
+		expect(container.querySelectorAll('[data-testid="virtual-chat-message"]')).toHaveLength(6);
+		expect(container.textContent).toContain("Reply 0:");
+		expect(container.textContent).not.toContain("Reply 119:");
 	});
 
 	it("preserves tool expansion when moving from the plain list to virtualization", async () => {
