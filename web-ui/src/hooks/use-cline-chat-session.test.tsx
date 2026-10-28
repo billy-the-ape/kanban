@@ -251,6 +251,39 @@ describe("useClineChatSession", () => {
 		expect(onLoadMessages).toHaveBeenCalledTimes(1);
 	});
 
+	it("treats a post-send null chatMessage reload as authoritative for /clear", async () => {
+		const beforeClear: ClineChatMessage = {
+			id: "old",
+			role: "assistant",
+			content: "Old transcript",
+			createdAt: 1,
+		};
+		const onLoadMessages = vi.fn()
+			.mockResolvedValueOnce([beforeClear])
+			.mockResolvedValueOnce([]);
+		const onSendMessage = vi.fn(async () => ({ ok: true, chatMessage: null }));
+		const snapshots: HookSnapshot[] = [];
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					taskId="task-1"
+					onSendMessage={onSendMessage}
+					onLoadMessages={onLoadMessages}
+					onSnapshot={(snapshot) => snapshots.push(snapshot)}
+				/>,
+			);
+			await Promise.resolve();
+		});
+		expect(snapshots.at(-1)?.messageIds).toEqual(["old"]);
+
+		await act(async () => {
+			await snapshots.at(-1)?.sendMessage("/clear");
+		});
+		expect(onLoadMessages).toHaveBeenCalledTimes(2);
+		expect(snapshots.at(-1)?.messageIds).toEqual([]);
+	});
+
 	it("forwards attached images through the send callback", async () => {
 		const onLoadMessages = vi.fn(async () => []);
 		const onSendMessage = vi.fn(async () => ({ ok: true }));
