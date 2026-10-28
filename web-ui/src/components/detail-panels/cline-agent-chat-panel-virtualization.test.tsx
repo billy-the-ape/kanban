@@ -1,4 +1,4 @@
-import { act, type ReactElement } from "react";
+import { act, type ReactElement, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -14,7 +14,7 @@ vi.mock("react-virtuoso", async () => {
 	const React = await import("react");
 	type MockProps = {
 		data: ClineChatMessage[];
-		itemContent: (index: number, message: ClineChatMessage) => React.ReactNode;
+		itemContent: (index: number, message: ClineChatMessage) => ReactNode;
 		initialTopMostItemIndex: { index: number };
 		atBottomStateChange?: (atBottom: boolean) => void;
 		followOutput?: boolean;
