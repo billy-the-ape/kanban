@@ -1,6 +1,6 @@
 import * as Collapsible from "@radix-ui/react-collapsible";
 import { Brain, ChevronDown, ChevronRight, XCircle } from "lucide-react";
-import { type ReactElement, useEffect, useMemo, useRef, useState } from "react";
+import { memo, type ReactElement, useEffect, useMemo, useRef, useState } from "react";
 import {
 	formatToolInputForDisplay,
 	getToolDisplay,
@@ -15,11 +15,25 @@ import { cn } from "@/components/ui/cn";
 import { Spinner } from "@/components/ui/spinner";
 import type { ClineChatMessage } from "@/hooks/use-cline-chat-session";
 
-function ToolMessageBlock({ message }: { message: ClineChatMessage }): ReactElement {
+function ToolMessageBlock({
+	message,
+	controlledExpanded,
+	onExpandedChange,
+}: {
+	message: ClineChatMessage;
+	controlledExpanded?: boolean;
+	onExpandedChange?: (expanded: boolean) => void;
+}): ReactElement {
 	const parsed = useMemo(() => parseToolMessageContent(message.content), [message.content]);
 	const isRunning = message.meta?.hookEventName === "tool_call_start";
 	const hasError = Boolean(parsed.error);
-	const [expanded, setExpanded] = useState(false);
+	const [localExpanded, setLocalExpanded] = useState(false);
+	const expanded = controlledExpanded ?? localExpanded;
+	const toggleExpanded = (): void => {
+		const next = !expanded;
+		setLocalExpanded(next);
+		onExpandedChange?.(next);
+	};
 
 	const toolDisplay = useMemo(() => getToolDisplay(parsed.toolName, parsed.input), [parsed.toolName, parsed.input]);
 	const toolOutput = useMemo(() => (parsed.output ? parseToolOutput(parsed.output) : null), [parsed.output]);
@@ -36,7 +50,7 @@ function ToolMessageBlock({ message }: { message: ClineChatMessage }): ReactElem
 		<div className="w-full">
 			<button
 				type="button"
-				onClick={hasExpandableContent ? () => setExpanded((e) => !e) : undefined}
+				onClick={hasExpandableContent ? toggleExpanded : undefined}
 				className={cn(
 					"group flex w-full items-center gap-1.5 rounded px-1.5 py-0 text-left text-sm",
 					hasExpandableContent && "cursor-pointer",
@@ -151,17 +165,31 @@ function ToolMessageBlock({ message }: { message: ClineChatMessage }): ReactElem
 	);
 }
 
-function ReasoningMessageBlock({ message }: { message: ClineChatMessage }): ReactElement {
+function ReasoningMessageBlock({
+	message,
+	controlledExpanded,
+	onExpandedChange,
+}: {
+	message: ClineChatMessage;
+	controlledExpanded?: boolean;
+	onExpandedChange?: (expanded: boolean) => void;
+}): ReactElement {
 	const isStreaming = message.meta?.hookEventName === "reasoning_delta";
-	const [expanded, setExpanded] = useState(isStreaming);
+	const [localExpanded, setLocalExpanded] = useState(isStreaming);
+	const expanded = controlledExpanded ?? localExpanded;
+	const setExpanded = (next: boolean): void => {
+		setLocalExpanded(next);
+		onExpandedChange?.(next);
+	};
 	const wasStreamingRef = useRef(isStreaming);
 
 	useEffect(() => {
 		if (wasStreamingRef.current && !isStreaming) {
-			setExpanded(false);
+			setLocalExpanded(false);
+			onExpandedChange?.(false);
 		}
 		wasStreamingRef.current = isStreaming;
-	}, [isStreaming]);
+	}, [isStreaming, onExpandedChange]);
 
 	return (
 		<Collapsible.Root open={expanded} onOpenChange={setExpanded} className="w-full">
@@ -198,18 +226,23 @@ function ReasoningMessageBlock({ message }: { message: ClineChatMessage }): Reac
 	);
 }
 
-export function ClineChatMessageItem({
+export const ClineChatMessageItem = memo(function ClineChatMessageItem({
 	message,
 	isCompletedResponse = false,
+	expanded,
+	onExpandedChange,
 }: {
 	message: ClineChatMessage;
 	isCompletedResponse?: boolean;
+	/** Controlled expansion is used for virtualized rows, which unmount off-screen. */
+	expanded?: boolean;
+	onExpandedChange?: (expanded: boolean) => void;
 }): ReactElement {
 	if (message.role === "tool") {
-		return <ToolMessageBlock message={message} />;
+		return <ToolMessageBlock message={message} controlledExpanded={expanded} onExpandedChange={onExpandedChange} />;
 	}
 	if (message.role === "reasoning") {
-		return <ReasoningMessageBlock message={message} />;
+		return <ReasoningMessageBlock message={message} controlledExpanded={expanded} onExpandedChange={onExpandedChange} />;
 	}
 	if (message.role === "user") {
 		const hasText = message.content.trim().length > 0;
@@ -246,4 +279,4 @@ export function ClineChatMessageItem({
 			{message.content}
 		</div>
 	);
-}
+});
