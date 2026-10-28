@@ -69,6 +69,7 @@ const DEFAULT_MAX_REPAIR_ROUNDS = 2;
 /** B-6: a single review/repair turn that runs longer than this is stopped and reported as failed. */
 const DEFAULT_REVIEW_TURN_TIMEOUT_MS = 30 * 60_000;
 
+/** B-6: the evidence a review run needs, abstracted for unit testing. */
 export interface ClineReviewEvidencePort {
 	loadTaskBaseRef(taskId: string): Promise<string | null>;
 	resolveWorktreePath(taskId: string, baseRef: string): Promise<string>;
