@@ -50,17 +50,20 @@ type VirtualChatFooterContext = {
 	showCreditLimit: boolean;
 };
 
-function VirtualChatFooter({ context }: { context?: VirtualChatFooterContext }): ReactElement | null {
-	if (!context?.showThinking && !context?.showCreditLimit) return null;
+function VirtualChatHeader(): ReactElement {
+	return <div className="h-3" aria-hidden="true" />;
+}
+
+function VirtualChatFooter({ context }: { context?: VirtualChatFooterContext }): ReactElement {
 	return (
-		<div className="flex flex-col gap-2 pb-2">
-			{context.showThinking ? <ClineThinkingIndicator /> : null}
-			{context.showCreditLimit ? <ClineCreditLimitNotice /> : null}
+		<div className="px-2 pb-3">
+			{context?.showThinking ? <ClineThinkingIndicator /> : null}
+			{context?.showCreditLimit ? <ClineCreditLimitNotice /> : null}
 		</div>
 	);
 }
 
-const VIRTUAL_CHAT_COMPONENTS = { Footer: VirtualChatFooter };
+const VIRTUAL_CHAT_COMPONENTS = { Header: VirtualChatHeader, Footer: VirtualChatFooter };
 
 const VirtualChatMessageRow = React.memo(function VirtualChatMessageRow({
 	message,
@@ -78,7 +81,7 @@ const VirtualChatMessageRow = React.memo(function VirtualChatMessageRow({
 		[message.id, onExpandedChange],
 	);
 	return (
-		<div className="pb-2" data-testid="virtual-chat-message">
+		<div className="px-2 pb-2" data-testid="virtual-chat-message">
 			<ClineChatMessageItem
 				message={message}
 				isCompletedResponse={isCompletedResponse}
@@ -232,7 +235,12 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 				return next;
 			});
 		}, []);
-		const usesVirtualizedMessages = messages.length >= CHAT_VIRTUALIZATION_THRESHOLD;
+		// Activate virtualization once a task reaches the threshold while the
+		// reader is at the bottom. Deferring the switch while reading older
+		// messages avoids replacing the scroller and losing their position.
+		// Once activated, keep the virtualizer mounted for that task.
+		const [virtualizedTaskId, setVirtualizedTaskId] = useState<string | null>(null);
+		const usesVirtualizedMessages = virtualizedTaskId === taskId;
 		// TODO: Persist per-task mode immediately when toggled so page refresh restores unsent mode changes.
 		const modeByTaskIdRef = useRef<Map<string, RuntimeTaskSessionMode>>(new Map());
 		const [composerError, setComposerError] = useState<string | null>(null);
@@ -308,6 +316,15 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 		const handleVirtualAtBottom = useCallback((atBottom: boolean) => {
 			setIsAutoScrollEnabled((previous) => previous === atBottom ? previous : atBottom);
 		}, []);
+		const followVirtualOutput = useCallback((atBottom: boolean) => {
+			// Use Virtuoso's immediate internal value, not its throttled callback:
+			// otherwise streaming can snap the reader back during upward scrolling.
+			return atBottom ? "auto" : false;
+		}, []);
+		const handlePlainExpandedChange = useCallback(
+			(id: string, expanded: boolean) => handleExpandedChange(id, expanded),
+			[handleExpandedChange],
+		);
 		const attachmentWarningMessage =
 			draftImages.length > 0 && selectedModel?.supportsVision === false
 				? "The selected Cline model may not accept image input. Choose a vision-capable model to use these images."
@@ -354,13 +371,20 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 			setExpandedMessages(new Map());
 		}, [taskId]);
 
-		// followOutput handles appended items. Streaming updates can resize the
-		// final item without changing item count, so also follow those changes.
-		// Run after paint; the virtualizer measures only mounted items.
-		useEffect(() => {
-			if (!usesVirtualizedMessages || !isAutoScrollEnabled || messages.length === 0) return;
-			virtuosoRef.current?.scrollToIndex({ index: messages.length - 1, align: "end", behavior: "auto" });
-		}, [usesVirtualizedMessages, isAutoScrollEnabled, messages, showAgentProgressIndicator, isCreditLimitNoticeVisible]);
+		useLayoutEffect(() => {
+			if (!usesVirtualizedMessages && messages.length >= CHAT_VIRTUALIZATION_THRESHOLD && isAutoScrollEnabled) {
+				setVirtualizedTaskId(taskId);
+			}
+		}, [isAutoScrollEnabled, messages.length, taskId, usesVirtualizedMessages]);
+
+		// Size changes within the final streamed row do not append an item.
+		// Virtuoso's autoscrollToBottom respects its internal scroll-up state,
+		// unlike scrollToIndex(last) on every delta. Register before row
+		// measurements to avoid tugging a reader away from older messages.
+		useLayoutEffect(() => {
+			if (!usesVirtualizedMessages) return;
+			virtuosoRef.current?.autoscrollToBottom();
+		}, [usesVirtualizedMessages, messages, showAgentProgressIndicator, isCreditLimitNoticeVisible]);
 
 		useEffect(() => {
 			const persistedMode = modeByTaskIdRef.current.get(taskId);
@@ -516,7 +540,7 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 				{usesVirtualizedMessages ? (
 					<Virtuoso<ClineChatMessage, VirtualChatFooterContext>
 						ref={virtuosoRef}
-						className="min-h-0 min-w-0 flex-1 overflow-x-hidden px-2 py-3"
+						className="min-h-0 min-w-0 flex-1 overflow-x-hidden"
 						data-testid="virtual-chat-list"
 						data={messages}
 						computeItemKey={getVirtualMessageKey}
@@ -527,7 +551,7 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 						alignToBottom
 						atBottomThreshold={BOTTOM_LOCK_THRESHOLD_PX}
 						atBottomStateChange={handleVirtualAtBottom}
-						followOutput={isAutoScrollEnabled}
+						followOutput={followVirtualOutput}
 						defaultItemHeight={72}
 						increaseViewportBy={{ top: 150, bottom: 150 }}
 					/>
@@ -542,6 +566,11 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 								key={message.id}
 								message={message}
 								isCompletedResponse={message.id === completedMessageId}
+								expanded={
+									expandedMessages.get(message.id) ??
+									(message.role === "reasoning" && message.meta?.hookEventName === "reasoning_delta")
+								}
+								onExpandedChange={(expanded) => handlePlainExpandedChange(message.id, expanded)}
 							/>
 						))}
 						{showAgentProgressIndicator ? <ClineThinkingIndicator /> : null}
