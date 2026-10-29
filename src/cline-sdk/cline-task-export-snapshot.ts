@@ -47,6 +47,10 @@ export interface ClineTaskExportLaunchConfig {
 	systemPrompt: string;
 	/** "none" when the task explicitly disabled reasoning; null when unset. */
 	reasoningEffort: string | null;
+	/** Recorded @clinebot/core version at launch (AR-7); null for older sessions. */
+	sdkVersion: string | null;
+	/** Kanban-owned guidance version at launch (AR-7); null for older sessions. */
+	guidanceVersion: string | null;
 }
 
 /**
@@ -217,6 +221,8 @@ export function extractLaunchConfigFromRecord(record: ClineSdkSessionRecord): Cl
 		mode: config.mode,
 		systemPrompt: config.systemPrompt,
 		reasoningEffort: config.reasoningEffort ?? null,
+		sdkVersion: config.sdkVersion,
+		guidanceVersion: config.guidanceVersion,
 	};
 }
 
@@ -224,11 +230,15 @@ export function buildLaunchConfigFromStartRequest(input: {
 	mode?: string | null;
 	systemPrompt: string | null;
 	reasoningEffort?: string | null;
+	sdkVersion?: string | null;
+	guidanceVersion?: string | null;
 }): ClineTaskExportLaunchConfig {
 	return {
 		mode: input.mode ?? "act",
 		systemPrompt: input.systemPrompt ?? "",
 		reasoningEffort: input.reasoningEffort ?? null,
+		sdkVersion: input.sdkVersion ?? null,
+		guidanceVersion: input.guidanceVersion ?? null,
 	};
 }
 

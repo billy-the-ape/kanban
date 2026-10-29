@@ -32,7 +32,7 @@ function createQualitySummaryResponse(
 		ok: true,
 		taskId: "task-1",
 		capturedAt: 1760246400000,
-		reducerVersion: 2,
+		reducerVersion: 3,
 		coverage: { status: "complete", reasons: [], warnings: [] },
 		timing: {
 			firstRecordedStart: null,
@@ -67,6 +67,12 @@ function createQualitySummaryResponse(
 		sessionSource: null,
 		terminalSummaryAvailable: false,
 		sourceWarning: null,
+		sessionSpans: { working: null, review: null, verificationRepair: null },
+		failuresByRule: {},
+		editEpisodes: { total: 0, omitted: 0, cap: 100, items: [] },
+		launchProvenance: [],
+		validationJobs: { total: 0, items: [] },
+		measuredCompaction: null,
 		error: null,
 		...overrides,
 	};

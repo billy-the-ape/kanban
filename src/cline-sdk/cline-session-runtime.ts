@@ -74,6 +74,7 @@ import {
 	type ClineSdkUserInstructionService,
 	createClineSdkSessionHost,
 	getClineCorePackageVersion,
+	KANBAN_SYSTEM_PROMPT_GUIDANCE_VERSION,
 } from "./sdk-runtime-boundary";
 import { VALIDATION_JOB_TOOL_NAME, ValidationJobService } from "./validation-job-service";
 import { createValidationJobTool, VALIDATION_JOB_CAPABILITY_TEXT } from "./validation-job-tool";
@@ -613,7 +614,10 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 				validationJobTool && !request.systemPrompt.includes(VALIDATION_JOB_CAPABILITY_TEXT)
 					? `${request.systemPrompt}\n\n${VALIDATION_JOB_CAPABILITY_TEXT}`
 					: request.systemPrompt;
-			// Hub-backed SDK hosts create the interactive session in start; the first turn runs through send.
+			// AR-7: record the actual installed SDK version and the Kanban
+			// guidance version this launch ran under. Unknown (unlocatable
+			// package) stays null, never guessed.
+			const sdkVersion = getClineCorePackageVersion();
 			startResult = await sessionHost.start({
 				config: {
 					sessionId: requestedSessionId,
@@ -658,6 +662,8 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 						systemPrompt: request.systemPrompt,
 						taskTitle: request.taskTitle,
 						reasoningEffort: request.reasoningEffort,
+						sdkVersion: sdkVersion === "unknown" ? null : sdkVersion,
+						guidanceVersion: KANBAN_SYSTEM_PROMPT_GUIDANCE_VERSION,
 					}),
 				),
 				initialMessages: request.initialMessages,
@@ -907,6 +913,10 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 							mode: startRequest.mode ?? null,
 							systemPrompt: startRequest.systemPrompt,
 							reasoningEffort: startRequest.reasoningEffort ?? null,
+							// AR-7: a live session runs under the currently
+							// installed SDK and the current Kanban guidance.
+							sdkVersion: getClineCorePackageVersion() === "unknown" ? null : getClineCorePackageVersion(),
+							guidanceVersion: KANBAN_SYSTEM_PROMPT_GUIDANCE_VERSION,
 						})
 					: null,
 				transcript: { status: "complete", reason: null },

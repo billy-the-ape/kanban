@@ -2967,6 +2967,90 @@ export const runtimeTaskQualitySummaryUsageCounterSchema = z.object({
 });
 
 /** Compact evidence reference (session/message/part) — never full text. */
+export const runtimeTaskQualitySummaryReferenceSchema = z.object({
+	sessionId: z.string(),
+	kind: z.enum(["task", "review", "verification-repair"]),
+	messageIndex: z.number().int().min(0),
+	partIndex: z.number().int().min(0),
+	toolCallId: z.string(),
+});
+
+/**
+ * AR-7 conservative edit-recovery episode: a confirmed failed editor call
+ * plus the next successful editor call to the same canonical file in the
+ * task's recorded lineage (or an explicit unresolved end). `elapsedMs` is a
+ * wall-clock interval that includes intervening work and waits — it is never
+ * active runtime, and sums of episodes are never subtracted from totals.
+ */
+export const runtimeTaskQualitySummaryEditEpisodeSchema = z.object({
+	failureReference: runtimeTaskQualitySummaryReferenceSchema,
+	/** The confirmed editor-failure rule that opened the episode. */
+	failureRule: z.string(),
+	/** Canonical file path from the recorded editor arguments (null = unknown). */
+	file: z.string().nullable(),
+	/** Distinct editor calls to this file observed between failure and end. */
+	attemptsBetween: z.number().int().min(0),
+	/** Distinct read calls referencing this file observed between failure and end. */
+	readsBetween: z.number().int().min(0),
+	/** The next successful edit of this file, when one was recorded. */
+	nextSuccessReference: runtimeTaskQualitySummaryReferenceSchema.nullable(),
+	end: z.enum([
+		"next_successful_edit",
+		"no_successful_edit_before_next_failure",
+		"no_successful_edit_recorded",
+		"file_path_unknown",
+	]),
+	/** Failure message timestamp (null when not recorded). */
+	startedAt: z.number().nullable(),
+	/** End reference timestamp (null when the episode has no successful end). */
+	endedAt: z.number().nullable(),
+	/** Wall-clock failure→success interval; null when timestamps are unknown. */
+	elapsedMs: z.number().int().min(0).nullable(),
+	/** True when a timestamp was missing or chronologically inconsistent. */
+	timestampWarning: z.boolean(),
+	/** Reducer version that classified this episode. */
+	ruleVersion: z.number().int().min(1),
+});
+
+/**
+ * AR-7 per-session launch provenance. Fingerprints are deterministic hashes
+ * of the recorded composed prompt bytes; SDK/guidance versions are recorded
+ * only for launches made after AR-7 (null = unknown, never inferred).
+ */
+export const runtimeTaskQualitySummaryLaunchProvenanceSchema = z.object({
+	sessionId: z.string(),
+	kind: z.enum(["task", "review", "verification-repair"]),
+	/** SHA-256 hex of the recorded composed system prompt (null = not recorded). */
+	promptFingerprint: z.string().nullable(),
+	/** True when a composed prompt was recorded for this session. */
+	promptRecorded: z.boolean(),
+	sdkVersion: z.string().nullable(),
+	guidanceVersion: z.string().nullable(),
+});
+
+/**
+ * AR-3/AR-7: one recorded validation-job observation. Statuses are
+ * observations of the durable record — reading them never starts a test.
+ */
+export const runtimeTaskQualitySummaryJobEventSchema = z.object({
+	jobId: z.string(),
+	/** Links the transcript's start receipt to the settled record. */
+	toolCallId: z.string(),
+	sessionId: z.string(),
+	command: z.string(),
+	/** Recorded state as written by the job service. */
+	state: z.enum(["running", "exited", "canceled", "timed_out", "spawn_failed", "interrupted"]),
+	/** Normalized outcome for display (started/completed/failed/timeout/cancelled). */
+	outcome: z.enum(["started", "completed", "failed", "timeout", "cancelled", "interrupted"]),
+	exitCode: z.number().int().nullable(),
+	startedAt: z.string(),
+	endedAt: z.string().nullable(),
+	/** Path of the retained archived log (null when no log was archived). */
+	logReference: z.string().nullable(),
+	logTruncated: z.boolean(),
+});
+
+/** Compact evidence reference (session/message/part) — never full text. */
 export const runtimeTaskQualitySummaryEvidenceSchema = z.object({
 	sessionId: z.string(),
 	kind: z.enum(["task", "review", "verification-repair"]),
@@ -3001,6 +3085,11 @@ export const runtimeTaskQualitySummaryResponseSchema = z.object({
 	 * timeouts are a distinct confirmed rule, evidence carries
 	 * `resultIsError`, and calls with empty/unavailable recorded arguments
 	 * are never declared identical for unchanged-retry evidence.
+	 * 3 (AR-7): adds per-rule failure counts, per-session-class recorded
+	 * spans, conservative edit-recovery episodes, per-session launch
+	 * provenance (prompt fingerprint + recorded SDK/guidance versions),
+	 * AR-3 validation-job observations, and the measured compaction record
+	 * shown separately from the estimated context usage.
 	 */
 	reducerVersion: z.number().int().min(1),
 	coverage: z.object({
@@ -3082,6 +3171,33 @@ export const runtimeTaskQualitySummaryResponseSchema = z.object({
 	terminalSummaryAvailable: z.boolean(),
 	/** Set when the current session is terminal and native totals are historical. */
 	sourceWarning: z.string().nullable(),
+	/** Union of valid closed session intervals per session class (recorded, never runtime). */
+	sessionSpans: z.object({
+		working: z.number().int().min(0).nullable(),
+		review: z.number().int().min(0).nullable(),
+		verificationRepair: z.number().int().min(0).nullable(),
+	}),
+	/** Confirmed failure counts by rule id (structural categories, once per call). */
+	failuresByRule: z.record(z.string(), z.number().int().min(0)),
+	/** AR-7: conservative edit-recovery episodes, capped with total/omitted counts. */
+	editEpisodes: z.object({
+		/** All episodes found over the full source (not just the returned items). */
+		total: z.number().int().min(0),
+		/** Episodes omitted because the returned list is capped. */
+		omitted: z.number().int().min(0),
+		/** Cap applied to the returned item list. */
+		cap: z.number().int().min(0),
+		items: z.array(runtimeTaskQualitySummaryEditEpisodeSchema),
+	}),
+	/** AR-7: recorded launch provenance per distinct session (mixed values stay mixed). */
+	launchProvenance: z.array(runtimeTaskQualitySummaryLaunchProvenanceSchema),
+	/** AR-3: observations of the task's recorded validation-job events (read-only). */
+	validationJobs: z.object({
+		total: z.number().int().min(0),
+		items: z.array(runtimeTaskQualitySummaryJobEventSchema),
+	}),
+	/** AR-7: the measured compaction record, separate from the estimated context usage. */
+	measuredCompaction: runtimeClineContextCompactionEventSchema.nullable(),
 	/** Non-null only when the summary could not be built at all. */
 	error: z.string().nullable(),
 });

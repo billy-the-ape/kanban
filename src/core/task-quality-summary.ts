@@ -27,6 +27,8 @@
 // - `liveTail` display messages are never counted; the gap is exposed.
 // - Sessions themselves are deduplicated before any counting.
 
+import { createHash } from "node:crypto";
+
 import type {
 	ClineTaskExportKind,
 	ClineTaskExportSegmentHeader,
@@ -47,8 +49,14 @@ import type { TaskDiagnosticsExportV3Plan } from "./task-diagnostics-export-v3";
  * erases a known editor category; command timeouts are a distinct confirmed
  * rule; and calls whose recorded arguments are empty or unavailable are
  * never declared identical for unchanged-retry evidence.
+ * V3 (AR-7): adds confirmed-failure counts per rule, recorded spans per
+ * session class, conservative edit-recovery episodes (a confirmed failed
+ * editor call paired with the next successful editor call to the same
+ * recorded file in the task's observed lineage), and per-session launch
+ * provenance (recorded prompt fingerprint plus recorded SDK/guidance
+ * versions; older sessions stay unknown, never inferred).
  */
-export const TASK_QUALITY_SUMMARY_VERSION = 2;
+export const TASK_QUALITY_SUMMARY_VERSION = 3;
 
 /** Provenance of a tool_use part's recorded arguments (V2). */
 export type TaskQualitySummaryArgumentStatus = "present" | "empty" | "unavailable";
@@ -114,6 +122,12 @@ export interface TaskQualitySummarySession {
 	transcriptReason: string | null;
 	/** True when the capture has a live display tail (excluded from totals). */
 	hasLiveTail: boolean;
+	/** AR-7: SHA-256 of the recorded composed prompt (null = not recorded). */
+	promptFingerprint: string | null;
+	/** AR-7: recorded @clinebot/core version (null = unknown/older sessions). */
+	sdkVersion: string | null;
+	/** AR-7: recorded Kanban guidance version (null = unknown/older sessions). */
+	guidanceVersion: string | null;
 	messages: TaskQualitySummaryMessage[];
 }
 
@@ -171,6 +185,97 @@ export interface TaskQualitySummaryEvidence {
 	} | null;
 }
 
+/** AR-7: compact reference for an edit-recovery episode endpoint. */
+export interface TaskQualitySummaryEpisodeReference {
+	sessionId: string;
+	kind: ClineTaskExportKind;
+	messageIndex: number;
+	partIndex: number;
+	toolCallId: string;
+}
+
+/**
+ * AR-7 conservative edit-recovery episode: a confirmed failed editor call
+ * plus the next successful editor call to the same recorded file in the
+ * task's observed lineage, or an explicit unresolved end. `elapsedMs` is a
+ * wall-clock interval that includes intervening work and waits — never
+ * active runtime; episode sums are never subtracted from recorded spans.
+ */
+export interface TaskQualitySummaryEditEpisode {
+	failureReference: TaskQualitySummaryEpisodeReference;
+	/** The confirmed editor-failure rule that opened the episode. */
+	failureRule: TaskQualitySummaryRuleId;
+	/** File path from the recorded editor arguments (null = unknown). */
+	file: string | null;
+	/** Distinct editor calls to this file observed between failure and end. */
+	attemptsBetween: number;
+	/** Distinct read calls referencing this file observed between failure and end. */
+	readsBetween: number;
+	/** The next successful edit of this file, when one was recorded. */
+	nextSuccessReference: TaskQualitySummaryEpisodeReference | null;
+	end:
+		| "next_successful_edit"
+		| "no_successful_edit_before_next_failure"
+		| "no_successful_edit_recorded"
+		| "file_path_unknown";
+	/** Failure message timestamp (null when not recorded). */
+	startedAt: number | null;
+	/** End reference timestamp (null when the episode has no successful end). */
+	endedAt: number | null;
+	/** Wall-clock failure→success interval; null when timestamps are unknown. */
+	elapsedMs: number | null;
+	/** True when a timestamp was missing or chronologically inconsistent. */
+	timestampWarning: boolean;
+	/** Reducer version that classified this episode. */
+	ruleVersion: number;
+}
+
+/** AR-7: recorded launch provenance of one distinct session. */
+export interface TaskQualitySummaryLaunchProvenance {
+	sessionId: string;
+	kind: ClineTaskExportKind;
+	/** SHA-256 of the recorded composed prompt (null = not recorded). */
+	promptFingerprint: string | null;
+	/** True when a composed prompt was recorded for this session. */
+	promptRecorded: boolean;
+	/** Recorded @clinebot/core version (null = unknown/older sessions). */
+	sdkVersion: string | null;
+	/** Recorded Kanban guidance version (null = unknown/older sessions). */
+	guidanceVersion: string | null;
+}
+
+/** AR-7: cap on returned edit-recovery episode items (total/omitted stay exact). */
+export const TASK_QUALITY_SUMMARY_EDIT_EPISODE_CAP = 100;
+
+/** AR-3: a recorded validation-job observation mapped into the summary. */
+export interface TaskQualitySummaryJobEvent {
+	jobId: string;
+	/** Links the transcript's start receipt to the settled record. */
+	toolCallId: string;
+	sessionId: string;
+	command: string;
+	/** Recorded state as written by the job service. */
+	state: "running" | "exited" | "canceled" | "timed_out" | "spawn_failed" | "interrupted";
+	/** Normalized outcome for display. */
+	outcome: "started" | "completed" | "failed" | "timeout" | "cancelled" | "interrupted";
+	exitCode: number | null;
+	startedAt: string;
+	endedAt: string | null;
+	/** Path of the retained archived log (null when no log was archived). */
+	logReference: string | null;
+	logTruncated: boolean;
+}
+
+/** AR-7: the measured compaction record, as persisted by the SDK observer. */
+export interface TaskQualitySummaryMeasuredCompaction {
+	at: string;
+	trigger: "proactive" | "overflow";
+	tokensBefore: number;
+	tokensAfter: number;
+	messagesBefore: number;
+	messagesAfter: number;
+}
+
 export interface TaskQualitySummaryAmbiguity {
 	ruleId: TaskQualitySummaryRuleId;
 	detail: string;
@@ -195,12 +300,17 @@ export interface TaskQualitySummaryResult {
 	openSegmentCount: number;
 	/** Segments whose end is valid but whose start is invalid or earlier than the end. */
 	invalidIntervalCount: number;
-	/**
-	 * Union of valid closed start/end intervals across all included classes.
+	/** Union of valid closed start/end intervals across all included classes.
 	 * Includes waits inside sessions; excludes gaps between sessions.
 	 * Never active runtime.
 	 */
 	recordedSessionSpanMs: number | null;
+	/** AR-7: union of valid closed session intervals per session class. */
+	sessionSpans: {
+		working: number | null;
+		review: number | null;
+		verificationRepair: number | null;
+	};
 	coveredSegmentCount: number;
 	totalSegmentCount: number;
 	/** Restarts are multiple recorded working segments, not automatically crashes. */
@@ -248,6 +358,20 @@ export interface TaskQualitySummaryResult {
 	/** True when the capture has a live display tail (excluded from totals). */
 	liveTailExcluded: boolean;
 	evidence: TaskQualitySummaryEvidence[];
+	/** AR-7: confirmed failure counts by rule id (once per distinct call). */
+	failuresByRule: Record<string, number>;
+	/** AR-7: conservative edit-recovery episodes (capped; total stays exact). */
+	editEpisodes: {
+		/** All episodes found over the full source (not just the returned items). */
+		total: number;
+		/** Episodes omitted because the returned list is capped. */
+		omitted: number;
+		/** Cap applied to the returned item list. */
+		cap: number;
+		items: TaskQualitySummaryEditEpisode[];
+	};
+	/** AR-7: recorded launch provenance per distinct session. */
+	launchProvenance: TaskQualitySummaryLaunchProvenance[];
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -621,8 +745,18 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 	 */
 	const calls: DistinctCall[] = [];
 	const callRecordsById = new Map<string, DistinctCall[]>();
+	const callIndexByCall = new Map<DistinctCall, number>();
 	const resultKeysById = new Map<string, Set<string>>();
 	const firstResultById = new Map<string, { text: string | null; isResultError: boolean }>();
+	/** AR-7: every observed tool_use in lineage order (one per observation). */
+	const observations: Array<{
+		reference: TaskQualitySummaryEpisodeReference;
+		toolName: string | null;
+		arguments: unknown;
+		/** Index of the distinct call in `calls` this observation belongs to. */
+		callIndex: number;
+		timestamp: number | null;
+	}> = [];
 	for (const session of sessions) {
 		session.messages.forEach((message, messageIndex) => {
 			for (const part of message.toolParts) {
@@ -655,6 +789,15 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 					(record) => record.toolName === part.toolName && record.argumentKey === part.argumentKey,
 				);
 				if (duplicate !== undefined) {
+					// AR-7: an inherited copy of an already-counted call is
+					// still an observation in lineage order.
+					observations.push({
+						reference,
+						toolName: part.toolName,
+						arguments: part.arguments,
+						callIndex: callIndexByCall.get(duplicate) ?? -1,
+						timestamp: message.ts,
+					});
 					continue; // observed call already counted once
 				}
 				if (records.length > 0) {
@@ -675,6 +818,14 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 					classified: null,
 				};
 				calls.push(call);
+				callIndexByCall.set(call, calls.length - 1);
+				observations.push({
+					reference,
+					toolName: part.toolName,
+					arguments: part.arguments,
+					callIndex: calls.length - 1,
+					timestamp: message.ts,
+				});
 				if (part.toolCallId !== "") {
 					callRecordsById.set(part.toolCallId, [...records, call]);
 				}
@@ -694,6 +845,8 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 	/** Aggregate: counts, usage, failures, unmatched, truncation, heuristics. */
 	const byName: Record<string, number> = {};
 	const heuristicTagCounts: Record<string, number> = {};
+	/** AR-7: confirmed failure counts by rule id (once per distinct call). */
+	const failuresByRule: Record<string, number> = {};
 	const evidence: TaskQualitySummaryEvidence[] = [];
 	let reportedToolFailures = 0;
 	let unmatchedToolCalls = 0;
@@ -726,6 +879,7 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 		call.classified = classification;
 		if (classification.confirmedRule !== null) {
 			reportedToolFailures += 1;
+			failuresByRule[classification.confirmedRule] = (failuresByRule[classification.confirmedRule] ?? 0) + 1;
 			evidence.push({
 				...call.firstRef,
 				timestamp: call.timestamp,
@@ -804,6 +958,161 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 		lastCallByKey.set(key, { call, failed: call.classified !== null && call.classified.confirmedRule !== null });
 	}
 
+	/**
+	 * AR-7: conservative edit-recovery episodes. Each distinct editor call
+	 * is considered once, at its first observed position in the task's
+	 * lineage (all included session classes in capture order). A confirmed
+	 * failed editor call opens an episode for its recorded file; the episode
+	 * ends at the next successful editor call to the same file, at a later
+	 * confirmed editor failure to the same file, or at the end of the
+	 * lineage. Inherited (seeded) copies of an already-considered call never
+	 * open an episode or count toward its between counts; a successful copy
+	 * can still close an open episode at its observed position (it is a real
+	 * observation in the lineage). Success requires a matched non-failed
+	 * result — an unmatched editor call proves neither. Elapsed time is
+	 * wall-clock between recorded message timestamps and includes intervening
+	 * work and waits; it is never active runtime.
+	 */
+	const editorFileOf = (rawArguments: unknown): string | null => {
+		if (!isPlainRecord(rawArguments)) {
+			return null;
+		}
+		const path = rawArguments.path;
+		return typeof path === "string" && path.trim() !== "" ? path : null;
+	};
+	const readFilesReferences = (rawArguments: unknown, file: string): boolean => {
+		if (!isPlainRecord(rawArguments) || !Array.isArray(rawArguments.files)) {
+			return false;
+		}
+		return rawArguments.files.some((entry) => isPlainRecord(entry) && entry.path === file);
+	};
+	const openEpisodesByFile = new Map<string, { episode: TaskQualitySummaryEditEpisode; observationIndex: number }>();
+	const editEpisodes: TaskQualitySummaryEditEpisode[] = [];
+	const processedCallIndexes = new Set<number>();
+	const firstObservationIndexByCall = new Map<number, number>();
+	const closeEditEpisode = (
+		state: { episode: TaskQualitySummaryEditEpisode; observationIndex: number },
+		end: { endIndex: number; endReference: TaskQualitySummaryEpisodeReference | null; endTimestamp: number | null },
+	): void => {
+		const { episode } = state;
+		if (end.endReference === null) {
+			episode.end = episode.file === null ? "file_path_unknown" : "no_successful_edit_before_next_failure";
+		} else {
+			episode.end = "next_successful_edit";
+			episode.nextSuccessReference = end.endReference;
+			episode.endedAt = end.endTimestamp;
+			const startedAt = episode.startedAt;
+			if (startedAt !== null && end.endTimestamp !== null && end.endTimestamp >= startedAt) {
+				episode.elapsedMs = end.endTimestamp - startedAt;
+			} else {
+				episode.timestampWarning = true;
+			}
+		}
+		if (episode.file === null) {
+			return;
+		}
+		// Between counts: distinct editor calls and read calls touching this
+		// file observed strictly between the failure and the end.
+		const file = episode.file;
+		for (let index = state.observationIndex + 1; index < end.endIndex; index += 1) {
+			const other = observations[index];
+			if (other === undefined) {
+				continue;
+			}
+			if (other.callIndex >= 0 && firstObservationIndexByCall.get(other.callIndex) !== index) {
+				continue; // inherited copy, already considered at first sighting
+			}
+			if (other.toolName === "editor" && editorFileOf(other.arguments) === file) {
+				episode.attemptsBetween += 1;
+			} else if (other.toolName === "read_files" && readFilesReferences(other.arguments, file)) {
+				episode.readsBetween += 1;
+			}
+		}
+	};
+	observations.forEach((observation, observationIndex) => {
+		const callIndex = observation.callIndex;
+		if (callIndex >= 0) {
+			if (processedCallIndexes.has(callIndex)) {
+				return; // inherited copy of an already-considered call
+			}
+			processedCallIndexes.add(callIndex);
+			firstObservationIndexByCall.set(callIndex, observationIndex);
+		}
+		const call = callIndex >= 0 ? (calls[callIndex] ?? null) : null;
+		if (observation.toolName !== "editor") {
+			return; // reads/commands feed between-counts only, never open/close
+		}
+		const file = editorFileOf(observation.arguments);
+		const confirmedRule =
+			call !== null && call.result !== null && call.classified !== null ? call.classified.confirmedRule : null;
+		if (confirmedRule !== null && confirmedRule.startsWith("editor")) {
+			// A later failed edit to the same file supersedes the open one.
+			const open = file !== null ? openEpisodesByFile.get(file) : undefined;
+			if (open !== undefined) {
+				closeEditEpisode(open, { endIndex: observationIndex, endReference: null, endTimestamp: null });
+			}
+			const episode: TaskQualitySummaryEditEpisode = {
+				failureReference: observation.reference,
+				failureRule: confirmedRule,
+				file,
+				attemptsBetween: 0,
+				readsBetween: 0,
+				nextSuccessReference: null,
+				end: file === null ? "file_path_unknown" : "no_successful_edit_recorded",
+				startedAt: observation.timestamp,
+				endedAt: null,
+				elapsedMs: null,
+				timestampWarning: false,
+				ruleVersion: TASK_QUALITY_SUMMARY_VERSION,
+			};
+			editEpisodes.push(episode);
+			if (file !== null) {
+				openEpisodesByFile.set(file, { episode, observationIndex });
+			}
+			return;
+		}
+		if (call !== null && call.result !== null && confirmedRule === null) {
+			if (file === null) {
+				return;
+			}
+			const open = openEpisodesByFile.get(file);
+			if (open === undefined) {
+				return;
+			}
+			closeEditEpisode(open, {
+				endIndex: observationIndex,
+				endReference: observation.reference,
+				endTimestamp: observation.timestamp,
+			});
+			openEpisodesByFile.delete(file);
+		}
+	});
+	const totalEditEpisodes = editEpisodes.length;
+	const editEpisodeItems = [...editEpisodes]
+		.sort((a, b) => {
+			if (a.elapsedMs === null && b.elapsedMs === null) {
+				return 0;
+			}
+			if (a.elapsedMs === null) {
+				return 1; // unknown elapsed time sorts last
+			}
+			if (b.elapsedMs === null) {
+				return -1;
+			}
+			return b.elapsedMs - a.elapsedMs;
+		})
+		.slice(0, TASK_QUALITY_SUMMARY_EDIT_EPISODE_CAP);
+
+	/** AR-7: recorded launch provenance per distinct session (no inference). */
+	const launchProvenance: TaskQualitySummaryLaunchProvenance[] = sessions.map((session) => ({
+		sessionId: session.sessionId,
+		kind: session.kind,
+		promptFingerprint: session.promptFingerprint,
+		promptRecorded: session.promptFingerprint !== null,
+		sdkVersion: session.sdkVersion,
+		guidanceVersion: session.guidanceVersion,
+	}));
+
 	/** Recorded session timing (never active runtime). */
 	let firstRecordedStart: number | null = null;
 	let lastRecordedEnd: number | null = null;
@@ -811,6 +1120,11 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 	let invalidIntervalCount = 0;
 	let coveredSegmentCount = 0;
 	const intervals: Array<[number, number]> = [];
+	const intervalsByKind: Record<"task" | "review" | "verification-repair", Array<[number, number]>> = {
+		task: [],
+		review: [],
+		"verification-repair": [],
+	};
 	for (const session of sessions) {
 		const start = parseIsoTimestamp(session.startedAt);
 		const end = parseIsoTimestamp(session.endedAt);
@@ -832,25 +1146,42 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 			lastRecordedEnd = end;
 		}
 		intervals.push([start, end]);
+		intervalsByKind[session.kind].push([start, end]);
 		coveredSegmentCount += 1;
 	}
-	intervals.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
-	let recordedSessionSpanMs: number | null = null;
-	let cursorEnd: number | null = null;
-	for (const [start, end] of intervals) {
-		if (recordedSessionSpanMs === null) {
-			recordedSessionSpanMs = end - start;
-			cursorEnd = end;
-		} else if (cursorEnd !== null && start <= cursorEnd) {
-			if (end > cursorEnd) {
-				recordedSessionSpanMs += end - cursorEnd;
+	/**
+	 * Union of valid closed intervals: overlapping/touching intervals count
+	 * once; gaps between sessions are excluded. Never active runtime.
+	 */
+	const unionSpanMs = (raw: Array<[number, number]>): number | null => {
+		if (raw.length === 0) {
+			return null;
+		}
+		const sorted = [...raw].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+		let span = 0;
+		let cursorEnd: number | null = null;
+		for (const [start, end] of sorted) {
+			if (cursorEnd === null) {
+				span = end - start;
+				cursorEnd = end;
+			} else if (start <= cursorEnd) {
+				if (end > cursorEnd) {
+					span += end - cursorEnd;
+					cursorEnd = end;
+				}
+			} else {
+				span += end - start;
 				cursorEnd = end;
 			}
-		} else {
-			recordedSessionSpanMs += end - start;
-			cursorEnd = end;
 		}
-	}
+		return span;
+	};
+	const recordedSessionSpanMs = unionSpanMs(intervals);
+	const sessionSpans = {
+		working: unionSpanMs(intervalsByKind.task),
+		review: unionSpanMs(intervalsByKind.review),
+		verificationRepair: unionSpanMs(intervalsByKind["verification-repair"]),
+	};
 
 	/** Models from headers and assistant message metadata (no inference). */
 	const modelPairMap = new Map<string, { provider: string; model: string }>();
@@ -956,6 +1287,15 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 		heuristicTags: heuristicTagCounts,
 		liveTailExcluded: sessions.some((session) => session.hasLiveTail),
 		evidence,
+		failuresByRule,
+		editEpisodes: {
+			total: totalEditEpisodes,
+			omitted: Math.max(0, totalEditEpisodes - editEpisodeItems.length),
+			cap: TASK_QUALITY_SUMMARY_EDIT_EPISODE_CAP,
+			items: editEpisodeItems,
+		},
+		launchProvenance,
+		sessionSpans,
 	};
 }
 
@@ -1110,6 +1450,13 @@ interface SegmentInput {
 	readable: boolean;
 	reason: string | null;
 	toolOrigins: ClineTaskExportToolOriginEntry[];
+	/** AR-7: recorded launch provenance for the segment's session. */
+	launchConfig: { systemPrompt: string; sdkVersion: string | null; guidanceVersion: string | null } | null;
+}
+
+/** AR-7: deterministic SHA-256 fingerprint of the recorded prompt bytes. */
+function sha256Hex(value: string): string {
+	return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
 function adaptSegmentToSession(segment: SegmentInput): TaskQualitySummarySession {
@@ -1117,6 +1464,7 @@ function adaptSegmentToSession(segment: SegmentInput): TaskQualitySummarySession
 	for (const entry of segment.toolOrigins) {
 		origins.set(`${entry.messageIndex}:${entry.partIndex}`, entry.origin);
 	}
+	const systemPrompt = segment.launchConfig?.systemPrompt ?? "";
 	return {
 		kind: segment.header.kind,
 		sessionId: segment.header.sessionId,
@@ -1127,6 +1475,9 @@ function adaptSegmentToSession(segment: SegmentInput): TaskQualitySummarySession
 		transcriptReadable: segment.readable,
 		transcriptReason: segment.reason,
 		hasLiveTail: segment.hasLiveTail,
+		promptFingerprint: systemPrompt.trim() !== "" ? sha256Hex(systemPrompt) : null,
+		sdkVersion: segment.launchConfig?.sdkVersion ?? null,
+		guidanceVersion: segment.launchConfig?.guidanceVersion ?? null,
 		messages: segment.messages.map((message, messageIndex) => adaptMessageToInput(message, messageIndex, origins)),
 	};
 }
@@ -1147,6 +1498,7 @@ export function adaptSessionSnapshotToSessions(snapshot: ClineTaskExportSnapshot
 			readable: segment.readError === null,
 			reason: segment.readError,
 			toolOrigins: segment.toolOrigins,
+			launchConfig: segment.launchConfig,
 		}),
 	);
 }
@@ -1169,6 +1521,7 @@ export function adaptExportedV3PlanSessions(plan: TaskDiagnosticsExportV3Plan): 
 					readable: segment.transcript.status !== "unavailable",
 					reason: segment.transcript.reason,
 					toolOrigins: segment.toolOrigins,
+					launchConfig: segment.launchConfig,
 				}),
 			);
 		}
@@ -1191,6 +1544,10 @@ export interface TaskQualitySummarySource {
 	sessionSource: "cline" | "terminal" | null;
 	/** A terminal session summary exists for the current session. */
 	terminalSummaryAvailable: boolean;
+	/** AR-3: recorded validation-job observations (read-only; never starts a test). */
+	jobEvents: TaskQualitySummaryJobEvent[];
+	/** AR-7: the measured compaction record, separate from the estimated context usage. */
+	measuredCompaction: TaskQualitySummaryMeasuredCompaction | null;
 }
 
 const EMPTY_USAGE_COUNTER: TaskQualitySummaryUsageCounter = { total: null, coverage: 0 };
@@ -1292,6 +1649,15 @@ export function buildTaskQualitySummaryResponse(source: TaskQualitySummarySource
 		sessionSource: source.sessionSource,
 		terminalSummaryAvailable: source.terminalSummaryAvailable,
 		sourceWarning,
+		sessionSpans: result.sessionSpans,
+		failuresByRule: result.failuresByRule,
+		editEpisodes: result.editEpisodes,
+		launchProvenance: result.launchProvenance,
+		validationJobs: {
+			total: source.jobEvents.length,
+			items: source.jobEvents,
+		},
+		measuredCompaction: source.measuredCompaction,
 		error: null,
 	};
 }
@@ -1335,6 +1701,17 @@ export function buildUnavailableTaskQualitySummaryResponse(
 		heuristicTags: {},
 		liveTailExcluded: false,
 		evidence: [],
+		sessionSpans: { working: null, review: null, verificationRepair: null },
+		failuresByRule: {},
+		editEpisodes: {
+			total: 0,
+			omitted: 0,
+			cap: TASK_QUALITY_SUMMARY_EDIT_EPISODE_CAP,
+			items: [],
+		},
+		launchProvenance: [],
+		validationJobs: { total: 0, items: [] },
+		measuredCompaction: null,
 		sessionSource: null,
 		terminalSummaryAvailable: false,
 		sourceWarning: null,
