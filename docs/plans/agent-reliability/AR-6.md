@@ -68,6 +68,7 @@ or event-race cause. Reproduce with controlled event ordering before selecting a
 No new review model, broad review prompt rewrite, reduced checks, or PR posting behavior.
 Normal rebuild/redeploy; no new environment variables or storage migration. Do not
 restart/retarget in-flight reviews silently; verify using new reviews after deployment.
+
 ## Final state
 
 Implemented in `src/cline-sdk/cline-review-session-service.ts` and
