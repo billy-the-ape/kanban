@@ -13,6 +13,7 @@ import {
 	updateGlobalRuntimeConfig,
 	updateRuntimeConfig,
 } from "../../../src/config/runtime-config";
+import { PR_CI_HANDOFF_GUIDANCE } from "../../../src/prompts/pr-ci-handoff";
 import { createTempDir } from "../../utilities/temp-dir";
 
 function withTemporaryEnv<T>(
@@ -1036,6 +1037,7 @@ describe("AR-5 — default Auto-PR template", () => {
 					"Do not encode line breaks as literal backslash-n text",
 				);
 				expect(state.openPrPromptTemplateDefault).toContain("Do not run destructive commands");
+				expect(state.openPrPromptTemplateDefault).toContain(PR_CI_HANDOFF_GUIDANCE);
 				// No configured template: the effective template is the default.
 				expect(state.openPrPromptTemplate).toBe(state.openPrPromptTemplateDefault);
 			});

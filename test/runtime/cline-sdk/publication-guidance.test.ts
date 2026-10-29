@@ -12,6 +12,7 @@ import {
 	resolveClineSdkSystemPrompt,
 } from "../../../src/cline-sdk/sdk-runtime-boundary";
 import { resolveHomeAgentAppendSystemPrompt } from "../../../src/prompts/append-system-prompt";
+import { PR_CI_HANDOFF_GUIDANCE } from "../../../src/prompts/pr-ci-handoff";
 
 function countOccurrences(haystack: string, needle: string): number {
 	let count = 0;
@@ -52,6 +53,7 @@ describe("AR-5 safe publication guidance", () => {
 			includePublicationGuidance: true,
 		});
 		expect(countOccurrences(prompt, CLINE_PUBLICATION_GUIDANCE)).toBe(1);
+		expect(countOccurrences(prompt, PR_CI_HANDOFF_GUIDANCE)).toBe(1);
 		// The other guidance sections stay intact and separate.
 		expect(countOccurrences(prompt, CLINE_PROPORTIONAL_PLANNING_GUIDANCE)).toBe(1);
 		expect(countOccurrences(prompt, CLINE_EDITOR_SIZE_GUIDANCE)).toBe(1);
@@ -66,6 +68,7 @@ describe("AR-5 safe publication guidance", () => {
 			includePublicationGuidance: false,
 		});
 		expect(prompt).not.toContain(CLINE_PUBLICATION_GUIDANCE);
+		expect(prompt).not.toContain(PR_CI_HANDOFF_GUIDANCE);
 		// The other guidance sections are unaffected.
 		expect(prompt).toContain(CLINE_PROPORTIONAL_PLANNING_GUIDANCE);
 		expect(prompt).toContain(CLINE_EDITOR_SIZE_GUIDANCE);

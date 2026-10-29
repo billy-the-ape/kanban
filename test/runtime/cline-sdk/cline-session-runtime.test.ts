@@ -186,11 +186,12 @@ describe("InMemoryClineSessionRuntime", () => {
 		});
 
 		const startCall = fakeHost.start.mock.calls[0]?.[0] as {
-			config: { systemPrompt?: string; disableMcpSettingsTools?: boolean };
+			config: { systemPrompt?: string; disableMcpSettingsTools?: boolean; execution?: { loopDetection?: false } };
 			localRuntime?: { extraTools?: Array<{ name?: string }> };
 		};
 		// Local host (no runtimeAddress): the tool is registered and advertised.
 		expect(startCall.config.systemPrompt).toContain(VALIDATION_JOB_CAPABILITY_TEXT);
+		expect(startCall.config.execution?.loopDetection).toBe(false);
 		expect(startCall.config.disableMcpSettingsTools).toBeUndefined();
 		expect(startCall.localRuntime?.extraTools).toEqual(
 			expect.arrayContaining([expect.objectContaining({ name: "validation_job" })]),
@@ -230,11 +231,12 @@ describe("InMemoryClineSessionRuntime", () => {
 		});
 
 		const startCall = fakeHost.start.mock.calls[0]?.[0] as {
-			config: { systemPrompt?: string };
+			config: { systemPrompt?: string; execution?: { loopDetection?: false } };
 			localRuntime?: { extraTools?: Array<{ name?: string }> };
 		};
 		// Hub host: the capability is neither advertised nor registered.
 		expect(startCall.config.systemPrompt).not.toContain(VALIDATION_JOB_CAPABILITY_TEXT);
+		expect(startCall.config.execution?.loopDetection).toBeUndefined();
 		expect(startCall.localRuntime?.extraTools).toBeUndefined();
 		await runtime.dispose();
 	});

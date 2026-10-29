@@ -20,6 +20,7 @@ import type {
 	RuntimeVerificationConfigSave,
 } from "../core/api-contract";
 import { type LockRequest, lockedFileSystem } from "../fs/locked-file-system";
+import { PR_CI_HANDOFF_GUIDANCE } from "../prompts/pr-ci-handoff";
 import { detectInstalledCommands } from "../terminal/agent-registry";
 import { areRuntimeProjectShortcutsEqual } from "./shortcut-utils";
 
@@ -150,7 +151,9 @@ Steps:
    - PR title: PR URL
    - Base branch
    - Head branch
-   - Any follow-up needed`;
+   - Any follow-up needed
+
+${PR_CI_HANDOFF_GUIDANCE}`;
 
 export function pickBestInstalledAgentIdFromDetected(detectedCommands: readonly string[]): RuntimeAgentId | null {
 	const detected = new Set(detectedCommands);

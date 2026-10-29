@@ -23,6 +23,7 @@ import { statSync } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import { chmod, mkdir, open, readdir, readFile, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { lockedFileSystem } from "../fs/locked-file-system";
 import { getTaskWorktreesHomePath } from "../state/workspace-state";
 import { isPathWithinRoot } from "../workspace/path-sandbox";
@@ -44,6 +45,8 @@ const EXIT_CLOSE_GRACE_MS = 200;
 export const VALIDATION_JOB_DEFAULT_MAX_LOG_BYTES = 25 * 1024 * 1024;
 /** Read page limit (8 KiB). */
 export const VALIDATION_JOB_READ_PAGE_BYTES = 8 * 1024;
+/** Stay below the ordinary 30-second tool deadline. */
+export const VALIDATION_JOB_MAX_WAIT_MS = 25_000;
 const TRUNCATION_MARKER_PREFIX = "[validation job log incomplete:";
 
 /** Job ids are generated UUIDs; anything else is rejected, never path-joined. */
@@ -143,6 +146,8 @@ interface LiveJob {
 	/** Armed on `exit`; fires when `close` does not follow within the grace period. */
 	exitGraceTimer: NodeJS.Timeout | null;
 	settled: Promise<ValidationJobRecord> | null;
+	completion: Promise<void>;
+	notifyCompletion: () => void;
 }
 
 function toErrorMessage(error: unknown): string {
@@ -419,6 +424,10 @@ export class ValidationJobService {
 			await rm(this.spoolPathFor(record.jobId), { force: true }).catch(() => undefined);
 			return { kind: "spawn_failed", record: failed, error: toErrorMessage(error) };
 		}
+		let notifyCompletion = () => {};
+		const completion = new Promise<void>((resolve) => {
+			notifyCompletion = resolve;
+		});
 		const liveJob: LiveJob = {
 			record,
 			child,
@@ -429,6 +438,8 @@ export class ValidationJobService {
 			pendingOutcome: null,
 			exitGraceTimer: null,
 			settled: null,
+			completion,
+			notifyCompletion,
 		};
 		this.wireChildEvents(liveJob);
 		this.liveJob = liveJob;
@@ -444,6 +455,33 @@ export class ValidationJobService {
 			return { kind: "spawn_failed", record: settled, error: toErrorMessage(spawnOutcome.error) };
 		}
 		return { kind: "started", record };
+	}
+
+	/** Wait for an owned job to settle, or return its current state at the bounded deadline. */
+	async waitForJob(
+		jobId: string,
+		timeoutMs = VALIDATION_JOB_MAX_WAIT_MS,
+		signal?: AbortSignal,
+	): Promise<ValidationJobRecord | null> {
+		signal?.throwIfAborted();
+		const record = await this.getJob(jobId);
+		signal?.throwIfAborted();
+		const live = this.liveJob;
+		if (!record || record.state !== "running" || live?.record !== record) return record;
+		if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw new Error("Invalid validation wait duration.");
+		const timer = new AbortController();
+		const waitSignal = signal ? AbortSignal.any([signal, timer.signal]) : timer.signal;
+		try {
+			await Promise.race([
+				live.completion,
+				delay(Math.min(timeoutMs, VALIDATION_JOB_MAX_WAIT_MS), undefined, { signal: waitSignal }),
+			]);
+			signal?.throwIfAborted();
+			return record;
+		} finally {
+			// Remove the losing timer and abort listeners when completion wins.
+			timer.abort();
+		}
 	}
 
 	/** Reads a job's ownership/status metadata (live or settled); null when unknown for this task. */
@@ -881,6 +919,7 @@ export class ValidationJobService {
 			// settled job with missing log or archive fields, and a new start
 			// never mistakes a settling job for live or busy.
 			Object.assign(record, finalRecord);
+			live.notifyCompletion();
 			if (this.liveJob === live) {
 				this.liveJob = null;
 			}

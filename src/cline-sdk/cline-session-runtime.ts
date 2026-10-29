@@ -42,6 +42,7 @@ import {
 	TASK_LAUNCH_CONFIG_METADATA_KEY,
 } from "./cline-task-launch-config";
 import { createClineToolFailureRecoveryHooks } from "./cline-tool-failure-recovery";
+import { createClineToolLoopGuard } from "./cline-tool-loop-guard";
 import { createClineToolResultBoundingHook } from "./cline-tool-result-bounding-hook";
 import { CLINE_TURN_SKIPPED, type ClineTurnPreparation } from "./cline-turn-preparation";
 import { type ClineTurnScheduler, sharedClineTurnScheduler } from "./cline-turn-scheduler";
@@ -521,6 +522,11 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		// history (see cline-interrupted-tool-call-repair.ts).
 		const repairInterruptedToolCallsHook = createClineInterruptedToolCallRepairHook({ logger: sessionLogger });
 		const recoveryHooks = createClineToolFailureRecoveryHooks(request.cwd);
+		const validationJobs = this.validationJobServiceByTaskId.get(request.taskId);
+		const loopGuard = createClineToolLoopGuard((jobId) => {
+			const job = validationJobs?.getLiveJob();
+			return job?.jobId === jobId && job.state === "running";
+		});
 		const editorTraceHooks = createClineEditorTraceHooks(request.taskId, requestedSessionId);
 		const editorLimitHooks = createClineEditorLimitHooks(request.cwd);
 		const compactionHook =
@@ -547,6 +553,11 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 				: undefined;
 		const agentHooks: ClineSdkAgentHooks = {
 			...recoveryHooks,
+			beforeRun: async (context) => {
+				await recoveryHooks.beforeRun?.(context);
+				await loopGuard.beforeRun?.(context);
+				return undefined;
+			},
 			afterModel: editorTraceHooks.afterModel,
 			beforeTool: async (context) => {
 				await editorTraceHooks.beforeTool?.(context);
@@ -554,6 +565,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 				return recoveryHooks.beforeTool?.(context);
 			},
 			beforeModel: async (context) => {
+				await loopGuard.beforeModel?.(context);
 				const editorTools = await editorLimitHooks.beforeModel?.(context);
 				const repaired = await repairInterruptedToolCallsHook(context);
 				const recovered = await recoveryHooks.beforeModel?.({
@@ -568,7 +580,12 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			afterTool: async (context) => {
 				await editorTraceHooks.afterTool?.(context);
 				const recovered = await recoveryHooks.afterTool?.(context);
-				return (await boundingHook?.({ ...context, result: recovered?.result ?? context.result })) ?? recovered;
+				const guarded = await loopGuard.afterTool?.({ ...context, result: recovered?.result ?? context.result });
+				return (
+					(await boundingHook?.({ ...context, result: guarded?.result ?? recovered?.result ?? context.result })) ??
+					guarded ??
+					recovered
+				);
 			},
 		};
 		try {
@@ -604,6 +621,8 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 					...(hasMcpExtraTools ? { disableMcpSettingsTools: true } : {}),
 					execution: {
 						maxConsecutiveMistakes: DEFAULT_CLINE_MAX_CONSECUTIVE_MISTAKES,
+						// Hooks are local-only. Hub sessions retain the SDK's default protection.
+						...(isLocalRuntimeHost ? { loopDetection: false as const } : {}),
 					},
 					systemPrompt: sessionSystemPrompt,
 					// B-2.4: explicit compaction config so the SDK uses the

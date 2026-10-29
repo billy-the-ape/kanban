@@ -6,6 +6,7 @@ import {
 	MAX_COMMENT_PROMPT_CHARS,
 	prepareCommentHandlingInstruction,
 } from "../../../src/pr-tracking/comment-handling-prompt";
+import { PR_CI_HANDOFF_GUIDANCE } from "../../../src/prompts/pr-ci-handoff";
 import * as artifacts from "../../../src/workspace/task-artifacts";
 import { isolateTestEnvironment } from "../../utilities/test-environment";
 
@@ -19,6 +20,9 @@ afterEach(() => {
 });
 
 describe("bounded PR feedback prompt", () => {
+	it("hands CI off in manual and captured feedback prompts", () => {
+		expect(buildCommentHandlingInstruction("https://github.com/o/r/pull/1")).toContain(PR_CI_HANDOFF_GUIDANCE);
+	});
 	const event = {
 		kind: "inline" as const,
 		providerId: "inline-12",

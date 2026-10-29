@@ -771,3 +771,67 @@ describe("ValidationJobService review hardening", () => {
 		expect(page?.text).toContain("hello-log");
 	});
 });
+
+describe("ValidationJobService.waitForJob", () => {
+	async function startWaitingJob(service: ValidationJobService, args = '-e "setTimeout(()=>{},60000)"') {
+		const result = await service.start({ toolCallId: "wait-start", command: process.execPath, args });
+		if (result.kind !== "started") throw new Error("expected started job");
+		return result.record.jobId;
+	}
+
+	it("returns early with the real exit code and archived output", async () => {
+		const service = createService();
+		try {
+			const jobId = await startWaitingJob(service, '-e "console.log(123);process.exitCode=7"');
+			const record = await service.waitForJob(jobId);
+			expect(record?.state).toBe("exited");
+			expect(record?.exitCode).toBe(7);
+			expect(record?.artifactPath).toBeTruthy();
+			expect((await service.waitForJob(jobId))?.state).toBe("exited");
+			expect(await service.waitForJob("unknown")).toBeNull();
+		} finally {
+			await service.cancelAllJobs();
+		}
+	});
+
+	it("returns running at the wait deadline without killing or restarting the job", async () => {
+		const service = createService();
+		try {
+			const jobId = await startWaitingJob(service);
+			const record = await service.waitForJob(jobId, 20);
+			expect(record?.state).toBe("running");
+			expect(record?.timedOut).toBe(false);
+			expect(service.getLiveJob()?.jobId).toBe(jobId);
+		} finally {
+			await service.cancelAllJobs();
+		}
+	});
+
+	it("aborts the observation promptly without canceling its job", async () => {
+		const service = createService();
+		try {
+			const jobId = await startWaitingJob(service);
+			const controller = new AbortController();
+			const waiting = service.waitForJob(jobId, 25000, controller.signal);
+			const rejected = expect(waiting).rejects.toThrow();
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			controller.abort();
+			await rejected;
+			expect(service.getLiveJob()?.state).toBe("running");
+		} finally {
+			await service.cancelAllJobs();
+		}
+	});
+
+	it.each(["cancel", "deadline"])("wakes a pending wait on %s", async (outcome) => {
+		const service = createService({ deadlineMs: outcome === "deadline" ? 100 : undefined });
+		try {
+			const jobId = await startWaitingJob(service);
+			const waiting = service.waitForJob(jobId);
+			if (outcome === "cancel") await service.cancelJob(jobId);
+			expect((await waiting)?.state).toBe(outcome === "cancel" ? "canceled" : "timed_out");
+		} finally {
+			await service.cancelAllJobs();
+		}
+	});
+});
