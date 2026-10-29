@@ -32,6 +32,7 @@ import {
 } from "../../../src/cline-sdk/cline-task-session-service";
 import type * as WorkspaceState from "../../../src/state/workspace-state";
 import { createFakeMcpRuntimeService, createFakeRuntimeSetup } from "../../utilities/cline-session-service-harness";
+import { createGitTestEnv } from "../../utilities/git-env";
 
 const turnCheckpointMocks = vi.hoisted(() => ({
 	captureTaskTurnCheckpoint: vi.fn(),
@@ -213,7 +214,7 @@ async function startSession(taskId: string): Promise<void> {
 		taskId,
 		cwd: probeDir,
 		prompt:
-			"Use the editor tool to replace 'beta' with 'beta-replaced' in " + targetFilePath + " using old_text 'beta'.",
+			`Use the editor tool to replace 'beta' with 'beta-replaced' in ${targetFilePath} using old_text 'beta'.`,
 		providerId: "ollama",
 		modelId: "probe-model",
 		apiKey: "sk-test-key",
@@ -240,7 +241,7 @@ beforeAll(async () => {
 	process.env.CLINE_LOG_ENABLED = "1";
 	process.env.CLINE_LOG_LEVEL = "debug";
 	process.env.CLINE_LOG_PATH = join(probeDir, "kanban.log");
-	execFileSync("git", ["init", "-q"], { cwd: probeDir });
+	execFileSync("git", ["init", "-q"], { cwd: probeDir, env: createGitTestEnv() });
 	workspaceStateMocks.getTaskWorktreesHomePath.mockReturnValue(join(probeDir, "worktrees-home"));
 	targetFilePath = join(probeDir, "target.txt");
 	writeFileSync(targetFilePath, TARGET_CONTENT, "utf8");

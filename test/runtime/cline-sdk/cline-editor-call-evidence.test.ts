@@ -328,4 +328,45 @@ describe("collectTaskEditorCallEvidence", () => {
 		expect(JSON.stringify(evidence)).not.toContain(otherTaskArguments);
 		expect(call?.comparison).toBe("not-comparable");
 	});
+
+	it("ignores unattributed raw captures with unrelated tool-call ids", () => {
+		const lines = [
+			rawLine({
+				taskId: null,
+				sessionId: null,
+				toolCallId: "call_other_task",
+				assembledArguments: '{"path":"/tmp/other.txt", "new_text": "other"}',
+			}),
+			rawLine({ assembledArguments: '{"path":"/tmp/file.txt", "old_text": "old", "new_text": "new"}' }),
+			hookLine("model-call", editorInput({ old_text: "old" })),
+			hookLine("before-execution", editorInput({ old_text: "old" })),
+			hookLine("result", editorInput({ old_text: "old" }), "ok"),
+		];
+		const evidence = collectTaskEditorCallEvidence({
+			sessionId: SESSION_ID,
+			knownEditorToolCallIds: ["call_editor_1"],
+			lines,
+		});
+		const call = evidence.calls[0];
+		// The unrelated unattributed capture must not change status, the counter,
+		// or the verdict for this session's call.
+		expect(evidence.status).toBe("captured");
+		expect(evidence.unmatchedRawCaptures).toBe(0);
+		expect(call?.raw.status).toBe("captured");
+		expect(call?.comparison).toBe("present-in-both");
+	});
+
+	it("keeps raw status unavailable when only an unrelated unattributed capture exists", () => {
+		const lines = [
+			rawLine({ taskId: null, sessionId: null, toolCallId: "call_other_task" }),
+			hookLine("model-call", editorInput()),
+		];
+		const evidence = collectTaskEditorCallEvidence({
+			sessionId: SESSION_ID,
+			knownEditorToolCallIds: ["call_editor_1"],
+			lines,
+		});
+		expect(evidence.calls[0]?.raw.status).toBe("unavailable");
+		expect(evidence.unmatchedRawCaptures).toBe(0);
+	});
 });

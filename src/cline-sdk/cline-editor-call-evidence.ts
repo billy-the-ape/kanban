@@ -277,6 +277,7 @@ export function collectTaskEditorCallEvidence(input: {
 
 	const calls: EditorCallEvidence[] = [];
 	const matchedRawKeys = new Set<string>();
+	const unattributedKnownIdPresent = unattributedRawRecords.some((record) => knownIds.includes(record.toolCallId));
 
 	for (const callId of knownIds) {
 		const matched = [
@@ -293,9 +294,9 @@ export function collectTaskEditorCallEvidence(input: {
 		const [singleRecord] = matched;
 		if (matched.length === 0) {
 			raw = {
-				status: sessionRawRecords.length === 0 && unattributedRawRecords.length === 0 ? "unavailable" : "unmatched",
+				status: sessionRawRecords.length === 0 && !unattributedKnownIdPresent ? "unavailable" : "unmatched",
 				note:
-					sessionRawRecords.length === 0 && unattributedRawRecords.length === 0
+					sessionRawRecords.length === 0 && !unattributedKnownIdPresent
 						? "no raw transport capture was recorded for this session"
 						: "no raw transport capture matched this tool-call id",
 				records: [],
@@ -358,15 +359,12 @@ export function collectTaskEditorCallEvidence(input: {
 		});
 	}
 
-	const unmatchedRaw =
-		sessionRawRecords.filter(
-			(record) => !matchedRawKeys.has(`${record.requestId}:${record.host}:${record.toolCallId}`),
-		).length +
-		unattributedRawRecords.filter(
-			(record) =>
-				!matchedRawKeys.has(`${record.requestId}:${record.host}:${record.toolCallId}`) &&
-				!knownIds.includes(record.toolCallId),
-		).length;
+	// Only session-attributed captures count here: unattributed records may belong
+	// to other sessions sharing the provider host, and counting them would leak
+	// other tasks' activity into this export and force a spurious "partial" status.
+	const unmatchedRaw = sessionRawRecords.filter(
+		(record) => !matchedRawKeys.has(`${record.requestId}:${record.host}:${record.toolCallId}`),
+	).length;
 
 	const problems: string[] = [];
 	if (unmatchedRaw > 0) {
