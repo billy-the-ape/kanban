@@ -392,7 +392,10 @@ export async function streamTaskDiagnosticsExportV3(
 				}
 				await writeToolEvidence(evidence, writer, seen, readArtifact);
 			}
-			await writer.write("]}");
+			await writer.write("]");
+			await writer.write(',"editorCallEvidence":');
+			await writer.writeValue(segment.editorCallEvidence, seen);
+			await writer.write("}");
 		}
 		await writer.write("]}");
 	}

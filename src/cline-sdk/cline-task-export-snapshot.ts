@@ -10,6 +10,7 @@
 // The snapshot is strictly additive: building one never pauses, clears, or
 // mutates the task session state.
 
+import type { TaskEditorCallEvidence } from "./cline-editor-call-evidence";
 import type { ClineTaskMessage } from "./cline-session-state";
 import { readPersistedTaskLaunchConfig } from "./cline-task-launch-config";
 import type { ClineSdkPersistedMessage, ClineSdkSessionRecord } from "./sdk-runtime-boundary";
@@ -99,6 +100,13 @@ export interface ClineTaskExportSegment {
 	readError: string | null;
 	/** Tool-origin evidence with message/part references (Decision 4). */
 	toolOrigins: ClineTaskExportToolOriginEntry[];
+	/**
+	 * Additive editor transport evidence for this session's editor tool calls
+	 * (raw pre-parse fragments + parsed/execution/result stages + factual
+	 * old_text comparison). Null is not used: when no evidence was recorded
+	 * the value's `status` is "unavailable", keeping old exports compatible.
+	 */
+	editorCallEvidence: TaskEditorCallEvidence;
 }
 
 /** All sessions owned by one service-scoped task id (e.g. `<base>::review`). */
