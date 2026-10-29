@@ -5,10 +5,12 @@
 // counters, missing/truncated results, mixed models, session intervals,
 // review/repair lineage, live tails, unchanged failed retries, and
 // complete/partial/unavailable coverage.
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { emptyTaskEditorCallEvidence } from "../../../src/cline-sdk/cline-editor-call-evidence";
 import type {
 	ClineTaskExportKind,
+	ClineTaskExportLaunchConfig,
 	ClineTaskExportSegment,
 	ClineTaskExportSnapshot,
 	ClineTaskExportToolOriginEntry,
@@ -96,6 +98,9 @@ function session(
 		transcriptReadable: true,
 		transcriptReason: null,
 		hasLiveTail: false,
+		promptFingerprint: null,
+		sdkVersion: null,
+		guidanceVersion: null,
 		messages: [],
 		...overrides,
 	};
@@ -938,6 +943,313 @@ describe("analyzeTaskQualitySummary", () => {
 		expect(result.unchangedFailedRetries).toBe(0);
 		expect(result.evidence.filter((entry) => entry.ruleId === "unchanged_failed_retry")).toHaveLength(0);
 	});
+
+	it("counts confirmed failures per rule, deduplicating inherited restart copies", () => {
+		const editorUse = toolUsePart({
+			toolCallId: "e1",
+			toolName: "editor",
+			arguments: { path: "/tmp/a.ts", old_text: "x", new_text: "y" },
+		});
+		const editorFail = toolResultPart({
+			toolCallId: "e1",
+			resultText: "Editor operation failed: No replacement performed: text not found.",
+			isResultError: true,
+		});
+		const commandUse = toolUsePart({
+			toolCallId: "c1",
+			toolName: "run_commands",
+			arguments: { commands: ["make build"] },
+		});
+		const commandFail = toolResultPart({
+			toolCallId: "c1",
+			resultText: JSON.stringify({ output: [{ command: "make build", success: false, error: "exit 2" }] }),
+		});
+		const segment = (sessionId: string): TaskQualitySummarySession =>
+			session({
+				kind: "task",
+				sessionId,
+				provider: "p",
+				model: "m",
+				messages: [
+					message({ role: "assistant", contentKey: "turn", ts: 1000, toolParts: [editorUse, commandUse] }),
+					message({ role: "user", contentKey: "results", ts: 2000, toolParts: [editorFail, commandFail] }),
+				],
+			});
+		const result = run([segment("s1"), segment("s2")]);
+		// The seeded copy in s2 is the same recorded calls: one failure each.
+		expect(result.failuresByRule).toEqual({
+			editor_replacement_mismatch: 1,
+			run_commands_nested_failure: 1,
+		});
+	});
+
+	it("reports recorded spans per session class, excluding gaps between sessions", () => {
+		const task = session({
+			kind: "task",
+			sessionId: "t",
+			provider: "p",
+			model: "m",
+			startedAt: "2026-10-15T10:00:00Z",
+			endedAt: "2026-10-15T10:30:00Z",
+		});
+		const review = session({
+			kind: "review",
+			sessionId: "r",
+			provider: "p",
+			model: "m",
+			startedAt: "2026-10-15T11:00:00Z",
+			endedAt: "2026-10-15T11:15:00Z",
+		});
+		const result = run([task, review]);
+		expect(result.sessionSpans).toEqual({ working: 1_800_000, review: 900_000, verificationRepair: null });
+		// 45 recorded minutes total; the 30-minute gap between sessions is excluded.
+		expect(result.recordedSessionSpanMs).toBe(2_700_000);
+	});
+
+	it("closes an edit-recovery episode at the next successful edit to the same file", () => {
+		const failUse = toolUsePart({
+			toolCallId: "e1",
+			toolName: "editor",
+			arguments: { path: "/tmp/a.ts", old_text: "x", new_text: "y" },
+		});
+		const failResult = toolResultPart({
+			toolCallId: "e1",
+			resultText: "Editor operation failed: No replacement performed: text not found.",
+			isResultError: true,
+		});
+		const readUse = toolUsePart({
+			toolCallId: "r1",
+			toolName: "read_files",
+			arguments: { files: [{ path: "/tmp/a.ts" }] },
+		});
+		const readResult = toolResultPart({ toolCallId: "r1", resultText: "line 1" });
+		const okUse = toolUsePart({
+			toolCallId: "e2",
+			toolName: "editor",
+			arguments: { path: "/tmp/a.ts", old_text: "x2", new_text: "y2" },
+		});
+		const okResult = toolResultPart({ toolCallId: "e2", resultText: "Edited /tmp/a.ts" });
+		const seg = session({
+			kind: "task",
+			sessionId: "s1",
+			provider: "p",
+			model: "m",
+			messages: [
+				message({ role: "assistant", contentKey: "a1", ts: 1000, toolParts: [failUse] }),
+				message({ role: "user", contentKey: "u1", ts: 2000, toolParts: [failResult] }),
+				message({ role: "assistant", contentKey: "a2", ts: 3000, toolParts: [readUse] }),
+				message({ role: "user", contentKey: "u2", ts: 4000, toolParts: [readResult] }),
+				message({ role: "assistant", contentKey: "a3", ts: 5000, toolParts: [okUse] }),
+				message({ role: "user", contentKey: "u3", ts: 6000, toolParts: [okResult] }),
+			],
+		});
+		const result = run([seg]);
+		expect(result.failuresByRule).toEqual({ editor_replacement_mismatch: 1 });
+		expect(result.editEpisodes.total).toBe(1);
+		expect(result.editEpisodes.omitted).toBe(0);
+		const episode = result.editEpisodes.items[0];
+		expect(episode.failureRule).toBe("editor_replacement_mismatch");
+		expect(episode.file).toBe("/tmp/a.ts");
+		expect(episode.end).toBe("next_successful_edit");
+		expect(episode.attemptsBetween).toBe(0);
+		expect(episode.readsBetween).toBe(1);
+		expect(episode.startedAt).toBe(1000);
+		expect(episode.endedAt).toBe(5000);
+		expect(episode.elapsedMs).toBe(4000);
+		expect(episode.timestampWarning).toBe(false);
+		expect(episode.failureReference).toEqual({
+			sessionId: "s1",
+			kind: "task",
+			messageIndex: 0,
+			partIndex: 0,
+			toolCallId: "e1",
+		});
+		expect(episode.nextSuccessReference).toEqual({
+			sessionId: "s1",
+			kind: "task",
+			messageIndex: 4,
+			partIndex: 0,
+			toolCallId: "e2",
+		});
+	});
+
+	it("leaves an episode open at the end of the lineage when no successful edit is recorded", () => {
+		const failUse = toolUsePart({
+			toolCallId: "e1",
+			toolName: "editor",
+			arguments: { path: "/tmp/a.ts", old_text: "x", new_text: "y" },
+		});
+		const failResult = toolResultPart({
+			toolCallId: "e1",
+			resultText: "Editor operation failed: No replacement performed: text not found.",
+			isResultError: true,
+		});
+		const seg = session({
+			kind: "task",
+			sessionId: "s1",
+			provider: "p",
+			model: "m",
+			messages: [
+				message({ role: "assistant", contentKey: "a1", ts: 1000, toolParts: [failUse] }),
+				message({ role: "user", contentKey: "u1", ts: 2000, toolParts: [failResult] }),
+			],
+		});
+		const result = run([seg]);
+		expect(result.editEpisodes.total).toBe(1);
+		const episode = result.editEpisodes.items[0];
+		expect(episode.end).toBe("no_successful_edit_recorded");
+		expect(episode.nextSuccessReference).toBeNull();
+		expect(episode.elapsedMs).toBeNull();
+	});
+
+	it("closes an episode as superseded when the next same-file edit also fails", () => {
+		const firstFailUse = toolUsePart({
+			toolCallId: "e1",
+			toolName: "editor",
+			arguments: { path: "/tmp/a.ts", old_text: "x", new_text: "y" },
+		});
+		const firstFailResult = toolResultPart({
+			toolCallId: "e1",
+			resultText: "Editor operation failed: No replacement performed: text not found.",
+			isResultError: true,
+		});
+		const readUse = toolUsePart({
+			toolCallId: "r1",
+			toolName: "read_files",
+			arguments: { files: [{ path: "/tmp/a.ts" }] },
+		});
+		const readResult = toolResultPart({ toolCallId: "r1", resultText: "line 1" });
+		const otherOkUse = toolUsePart({
+			toolCallId: "e2",
+			toolName: "editor",
+			arguments: { path: "/tmp/b.ts", old_text: "x", new_text: "y" },
+		});
+		const otherOkResult = toolResultPart({ toolCallId: "e2", resultText: "Edited /tmp/b.ts" });
+		const secondFailUse = toolUsePart({
+			toolCallId: "e3",
+			toolName: "editor",
+			arguments: { path: "/tmp/a.ts", old_text: "z", new_text: "w" },
+		});
+		const secondFailResult = toolResultPart({
+			toolCallId: "e3",
+			resultText: "Editor operation failed: No replacement performed: text not found.",
+			isResultError: true,
+		});
+		const seg = session({
+			kind: "task",
+			sessionId: "s1",
+			provider: "p",
+			model: "m",
+			messages: [
+				message({ role: "assistant", contentKey: "a1", ts: 1000, toolParts: [firstFailUse] }),
+				message({ role: "user", contentKey: "u1", ts: 2000, toolParts: [firstFailResult] }),
+				message({ role: "assistant", contentKey: "a2", ts: 3000, toolParts: [readUse] }),
+				message({ role: "user", contentKey: "u2", ts: 4000, toolParts: [readResult] }),
+				message({ role: "assistant", contentKey: "a3", ts: 5000, toolParts: [otherOkUse] }),
+				message({ role: "user", contentKey: "u3", ts: 6000, toolParts: [otherOkResult] }),
+				message({ role: "assistant", contentKey: "a4", ts: 7000, toolParts: [secondFailUse] }),
+				message({ role: "user", contentKey: "u4", ts: 8000, toolParts: [secondFailResult] }),
+			],
+		});
+		const result = run([seg]);
+		expect(result.editEpisodes.total).toBe(2);
+		const [first, second] = result.editEpisodes.items;
+		expect(first.end).toBe("no_successful_edit_before_next_failure");
+		// The /tmp/b.ts success is a different file: it is neither an attempt
+		// nor a close for the /tmp/a.ts episode; the read of /tmp/a.ts is.
+		expect(first.attemptsBetween).toBe(0);
+		expect(first.readsBetween).toBe(1);
+		expect(second.end).toBe("no_successful_edit_recorded");
+	});
+
+	it("lets a seeded successful edit in a later session close the episode, counting copies once", () => {
+		const failUse = toolUsePart({
+			toolCallId: "e1",
+			toolName: "editor",
+			arguments: { path: "/tmp/a.ts", old_text: "x", new_text: "y" },
+		});
+		const failResult = toolResultPart({
+			toolCallId: "e1",
+			resultText: "Editor operation failed: No replacement performed: text not found.",
+			isResultError: true,
+		});
+		const okUse = toolUsePart({
+			toolCallId: "e2",
+			toolName: "editor",
+			arguments: { path: "/tmp/a.ts", old_text: "x2", new_text: "y2" },
+		});
+		const okResult = toolResultPart({ toolCallId: "e2", resultText: "Edited /tmp/a.ts" });
+		const task = session({
+			kind: "task",
+			sessionId: "s1",
+			provider: "p",
+			model: "m",
+			messages: [
+				message({ role: "assistant", contentKey: "a1", ts: 1000, toolParts: [failUse] }),
+				message({ role: "user", contentKey: "u1", ts: 2000, toolParts: [failResult] }),
+			],
+		});
+		// The review session seeds the same failed call (same id and args, so it
+		// is the same recorded call) and later edits the file successfully.
+		const review = session({
+			kind: "review",
+			sessionId: "s2",
+			provider: "p",
+			model: "m",
+			messages: [
+				message({ role: "assistant", contentKey: "a1-copy", ts: 7000, toolParts: [failUse] }),
+				message({ role: "user", contentKey: "u1-copy", ts: 7100, toolParts: [failResult] }),
+				message({ role: "assistant", contentKey: "a2", ts: 8000, toolParts: [okUse] }),
+				message({ role: "user", contentKey: "u2", ts: 8100, toolParts: [okResult] }),
+			],
+		});
+		const result = run([task, review]);
+		expect(result.failuresByRule).toEqual({ editor_replacement_mismatch: 1 });
+		expect(result.editEpisodes.total).toBe(1);
+		const episode = result.editEpisodes.items[0];
+		expect(episode.end).toBe("next_successful_edit");
+		expect(episode.attemptsBetween).toBe(0); // the seeded copy is not an attempt
+		expect(episode.elapsedMs).toBe(7000); // 1000 (recorded failure) -> 8000 (recorded success)
+		expect(episode.nextSuccessReference).toEqual({
+			sessionId: "s2",
+			kind: "review",
+			messageIndex: 2,
+			partIndex: 0,
+			toolCallId: "e2",
+		});
+	});
+
+	it("records file_path_unknown when the failed editor call has no recorded file path", () => {
+		const failUse = toolUsePart({ toolCallId: "e1", toolName: "editor", arguments: { path: "", new_text: "y" } });
+		const failResult = toolResultPart({
+			toolCallId: "e1",
+			resultText: "Editor operation failed: No replacement performed: text not found.",
+			isResultError: true,
+		});
+		const seg = session({
+			kind: "task",
+			sessionId: "s1",
+			provider: "p",
+			model: "m",
+			messages: [
+				message({ role: "assistant", contentKey: "a1", ts: 1000, toolParts: [failUse] }),
+				message({ role: "user", contentKey: "u1", ts: 2000, toolParts: [failResult] }),
+			],
+		});
+		const result = run([seg]);
+		expect(result.editEpisodes.total).toBe(1);
+		const episode = result.editEpisodes.items[0];
+		expect(episode.file).toBeNull();
+		expect(episode.end).toBe("file_path_unknown");
+	});
+
+	it("returns empty AR-7 fields for an empty capture", () => {
+		const result = analyzeTaskQualitySummary({ capturedAt: CAPTURED_AT, sessions: [] });
+		expect(result.failuresByRule).toEqual({});
+		expect(result.sessionSpans).toEqual({ working: null, review: null, verificationRepair: null });
+		expect(result.editEpisodes).toEqual({ total: 0, omitted: 0, cap: 100, items: [] });
+		expect(result.launchProvenance).toEqual([]);
+	});
 });
 
 describe("buildTaskQualitySummaryResponse", () => {
@@ -959,6 +1271,7 @@ describe("buildTaskQualitySummaryResponse", () => {
 		readError?: string | null;
 		liveTail?: boolean;
 		toolOrigins?: ClineTaskExportToolOriginEntry[];
+		launchConfig?: ClineTaskExportLaunchConfig | null;
 	}): ClineTaskExportSegment {
 		return {
 			header: {
@@ -976,7 +1289,7 @@ describe("buildTaskQualitySummaryResponse", () => {
 				exitCode: null,
 			},
 			artifactTaskId: "task-1",
-			launchConfig: null,
+			launchConfig: overrides.launchConfig ?? null,
 			transcript: {
 				status: overrides.readError === null ? "complete" : "unavailable",
 				reason: overrides.readError ?? null,
@@ -1060,6 +1373,8 @@ describe("buildTaskQualitySummaryResponse", () => {
 			reviewSnapshotError: null,
 			sessionSource: null,
 			terminalSummaryAvailable: false,
+			jobEvents: [],
+			measuredCompaction: null,
 		});
 		expect(response.ok).toBe(true);
 		expect(response.tools.totalCalls).toBe(1);
@@ -1118,6 +1433,8 @@ describe("buildTaskQualitySummaryResponse", () => {
 			reviewSnapshotError: null,
 			sessionSource: null,
 			terminalSummaryAvailable: false,
+			jobEvents: [],
+			measuredCompaction: null,
 		});
 		expect(envelopeResponse.tools.reportedFailures).toBe(1);
 		expect(envelopeResponse.evidence).toEqual([
@@ -1176,6 +1493,8 @@ describe("buildTaskQualitySummaryResponse", () => {
 			reviewSnapshotError: null,
 			sessionSource: null,
 			terminalSummaryAvailable: false,
+			jobEvents: [],
+			measuredCompaction: null,
 		});
 		expect(response.tools.totalCalls).toBe(1);
 		expect(response.tools.reportedFailures).toBe(1);
@@ -1202,6 +1521,8 @@ describe("buildTaskQualitySummaryResponse", () => {
 			reviewSnapshotError: null,
 			sessionSource: null,
 			terminalSummaryAvailable: false,
+			jobEvents: [],
+			measuredCompaction: null,
 		});
 		expect(imageOnlyResponse.tools.reportedFailures).toBe(0);
 		expect(imageOnlyResponse.evidence).toEqual([]);
@@ -1242,6 +1563,8 @@ describe("buildTaskQualitySummaryResponse", () => {
 			reviewSnapshotError: null,
 			sessionSource: "cline",
 			terminalSummaryAvailable: true,
+			jobEvents: [],
+			measuredCompaction: null,
 		});
 		expect(response.ok).toBe(true);
 		expect(response.coverage.status).toBe("complete");
@@ -1282,6 +1605,8 @@ describe("buildTaskQualitySummaryResponse", () => {
 			reviewSnapshotError: null,
 			sessionSource: null,
 			terminalSummaryAvailable: false,
+			jobEvents: [],
+			measuredCompaction: null,
 		});
 		expect(response.coverage.status).toBe("partial");
 		expect(response.coverage.reasons).toEqual([expect.stringContaining("broken")]);
@@ -1299,6 +1624,8 @@ describe("buildTaskQualitySummaryResponse", () => {
 			reviewSnapshotError: null,
 			sessionSource: null,
 			terminalSummaryAvailable: false,
+			jobEvents: [],
+			measuredCompaction: null,
 		});
 		expect(response.coverage.status).toBe("unavailable");
 		expect(response.coverage.reasons).toEqual([
@@ -1327,6 +1654,8 @@ describe("buildTaskQualitySummaryResponse", () => {
 			reviewSnapshotError: null,
 			sessionSource: "terminal",
 			terminalSummaryAvailable: true,
+			jobEvents: [],
+			measuredCompaction: null,
 		});
 		expect(response.coverage.status).toBe("partial");
 		expect(response.sourceWarning).toBeTypeOf("string");
@@ -1345,10 +1674,111 @@ describe("buildTaskQualitySummaryResponse", () => {
 			reviewSnapshotError: null,
 			sessionSource: null,
 			terminalSummaryAvailable: false,
+			jobEvents: [],
+			measuredCompaction: null,
 		});
 		expect(response.coverage.status).toBe("unavailable");
 		expect(response.coverage.reasons).toEqual(["no Cline session transcript is recorded for this task"]);
 		expect(response.sessionCounts.distinctSessions).toBe(0);
+	});
+
+	it("carries observed validation jobs and the measured compaction record", () => {
+		const jobEvent = {
+			jobId: "job-1",
+			toolCallId: "vj-1",
+			sessionId: "s1",
+			command: "npx vitest run",
+			state: "exited" as const,
+			outcome: "completed" as const,
+			exitCode: 0,
+			startedAt: "2026-10-15T10:00:00Z",
+			endedAt: "2026-10-15T10:02:00Z",
+			logReference: "/tmp/artifacts/job-1.log",
+			logTruncated: false,
+		};
+		const measured = {
+			at: "2026-10-15T10:01:00Z",
+			trigger: "proactive" as const,
+			tokensBefore: 100000,
+			tokensAfter: 40000,
+			messagesBefore: 120,
+			messagesAfter: 30,
+		};
+		const response = buildTaskQualitySummaryResponse({
+			taskId: "task-1",
+			capturedAt: CAPTURED_AT,
+			taskSnapshot: snapshot({ kind: "task" }),
+			taskSnapshotError: null,
+			reviewSnapshot: null,
+			reviewSnapshotError: null,
+			sessionSource: null,
+			terminalSummaryAvailable: false,
+			jobEvents: [jobEvent],
+			measuredCompaction: measured,
+		});
+		expect(response.validationJobs).toEqual({ total: 1, items: [jobEvent] });
+		expect(response.measuredCompaction).toEqual(measured);
+	});
+
+	it("records launch provenance from the persisted launch config (no inference)", () => {
+		const prompt = "Build the ACME export.";
+		const fingerprint = createHash("sha256").update(prompt, "utf8").digest("hex");
+		const response = buildTaskQualitySummaryResponse({
+			taskId: "task-1",
+			capturedAt: CAPTURED_AT,
+			taskSnapshot: snapshot({
+				kind: "task",
+				segments: [
+					segment({
+						sessionId: "s1",
+						kind: "task",
+						messages: [persistedMessage({ role: "assistant", content: "Done.", ts: 1700000000101 })],
+						launchConfig: {
+							mode: "act",
+							systemPrompt: prompt,
+							reasoningEffort: null,
+							sdkVersion: "0.0.38",
+							guidanceVersion: "g-1",
+						},
+					}),
+				],
+			}),
+			taskSnapshotError: null,
+			reviewSnapshot: snapshot({
+				kind: "review",
+				segments: [
+					segment({
+						sessionId: "s2",
+						kind: "review",
+						messages: [persistedMessage({ role: "user", content: "Review", ts: 1700000000102 })],
+					}),
+				],
+			}),
+			reviewSnapshotError: null,
+			sessionSource: null,
+			terminalSummaryAvailable: false,
+			jobEvents: [],
+			measuredCompaction: null,
+		});
+		expect(response.launchProvenance).toEqual([
+			{
+				sessionId: "s1",
+				kind: "task",
+				promptFingerprint: fingerprint,
+				promptRecorded: true,
+				sdkVersion: "0.0.38",
+				guidanceVersion: "g-1",
+			},
+			{
+				// Older session without a recorded launch config: unknown, never inferred.
+				sessionId: "s2",
+				kind: "review",
+				promptFingerprint: null,
+				promptRecorded: false,
+				sdkVersion: null,
+				guidanceVersion: null,
+			},
+		]);
 	});
 });
 

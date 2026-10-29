@@ -224,6 +224,15 @@ export const CLINE_EDITOR_SIZE_GUIDANCE = [
 ].join("\n");
 
 /**
+ * AR-7: Kanban-owned version of the composed system-prompt guidance this
+ * runtime appends or swaps (editor size, proportionate planning, publication,
+ * and CI handoff sections). Recorded into the persisted launch config of new
+ * sessions so historical comparisons can identify which guidance a session
+ * ran under. Bump when any of Kanban's guidance sections change meaning.
+ */
+export const KANBAN_SYSTEM_PROMPT_GUIDANCE_VERSION = "1";
+
+/**
  * AR-4: planning and execution guidance for native coding sessions. Kept as
  * one named constant, separate from the editor recovery guidance above and
  * from the review/rollback role prompts. It is guidance about repeated

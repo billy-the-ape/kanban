@@ -1,6 +1,6 @@
 # AR-7: Show evidence-linked recovery episodes in diagnostics
 
-Status: planned. One implementation PR into `main`. Dependencies: AR-1, AR-3, AR-6.
+Status: implemented (reducer version 3; see [Final state](#final-state)). One implementation PR into `main`. Dependencies: AR-1, AR-3, AR-6.
 Read [README.md](./README.md) and [EVIDENCE.md](./EVIDENCE.md).
 
 ## Outcome and UI budget
@@ -68,6 +68,49 @@ LLM evaluation. Reuse the current load/refresh action and source evidence refere
   every card or periodic workspace scans; retain target-only snapshot and in-flight dedupe.
 - Run focused reducer/API/hook/UI tests, both typechecks, formatting, and a browser smoke
   of one successful task and one failed/recovered task. Do not commit private exports.
+
+## Final state
+
+1. `TASK_QUALITY_SUMMARY_VERSION` is 3; `RuntimeTaskQualitySummaryResponse.reducerVersion`
+   documents the v3 semantics alongside the existing v1/v2 notes.
+2. `failuresByRule` counts confirmed structural failures by rule id, once per distinct
+   call after inherited-copy deduplication. Heuristic tags and the aggregate
+   `reportedFailures` total stay separate (no single mistake total).
+3. `sessionSpans` reports the interval-union recorded span per session class
+   (working/review/verification-repair); gaps between sessions are excluded and it is
+   never active runtime.
+4. `editEpisodes` builds conservative edit-recovery episodes: a confirmed failed editor
+   call plus the next successful editor call to the same canonical file in the task's
+   recorded lineage, or an explicit unresolved end (`no_successful_edit_before_next_failure`,
+   `no_successful_edit_recorded`, `file_path_unknown`). Items carry failure and
+   next-success references (session/kind/message/part/toolCallId), same-file
+   attempts/reads between, wall-clock `elapsedMs` (null + `timestampWarning` when
+   timestamps are missing/inconsistent), and the classifying `ruleVersion`. The list is
+   capped at 100 with `total`/`omitted` counts and sorted by elapsed interval (unknown
+   last); the reducers' aggregate counters cover the complete source.
+5. `launchProvenance` is per distinct session: deterministic SHA-256 of the recorded
+   composed prompt bytes (empty/absent stays null, never inferred), plus `sdkVersion`
+   and `guidanceVersion` only where the launch recorded them. New native launches now
+   persist `sdkVersion` (from the installed `@clinebot/core`) and a Kanban-owned
+   `guidanceVersion` in `ClineTaskExportLaunchConfig`; historical sessions stay unknown.
+6. `validationJobs` surfaces AR-3 job events as read-only observations
+   (started/completed/failed/timeout/cancelled/interrupted, exit code, retained-log
+   reference), capped; reading them never starts a test.
+7. `measuredCompaction` carries the task's recorded compaction event separately from the
+   estimated context usage; no compaction count or provider finish reason is manufactured.
+8. `getTaskQualitySummary` (runtime API) collects the task's job events and compaction
+   event and passes them to the response builder; the target-only snapshot capture,
+   zod validation, and in-flight dedupe are unchanged.
+9. The diagnostics panel's recorded-summary section gains the compact additions: per-class
+   session spans, failure categories, launch provenance, measured compaction, and two
+   expandable lists (capped edit-recovery episodes with wall-clock labels, and validation
+   jobs with log references). Each episode offers the precise session/message/part/tool
+   reference text as the copyable fallback; no new transcript browser or deep links.
+10. Tests: reducer tests cover per-rule failure counts, session spans, episode open/close
+    variants (including seeded inherited copies and unknown paths), provenance,
+    jobs/compaction pass-through, and the empty-capture zeros; API, hook, and section UI
+    tests cover loading, partial data, capped lists, unknown metadata, reference
+    fallback, and task-switch/refresh behavior.
 
 ## Deployment
 

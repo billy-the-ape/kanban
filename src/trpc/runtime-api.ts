@@ -11,6 +11,7 @@ import {
 	buildClineCompactionConfig,
 	CLINE_COMPACTION_RESERVE_TOKENS_DEFAULT,
 } from "../cline-sdk/cline-compaction-config";
+import { readTaskCompactionEvent } from "../cline-sdk/cline-context-events";
 import { buildTaskContextUsage } from "../cline-sdk/cline-context-usage";
 import { createClineMcpRuntimeService } from "../cline-sdk/cline-mcp-runtime-service";
 import { createClineMcpSettingsService } from "../cline-sdk/cline-mcp-settings-service";
@@ -21,6 +22,12 @@ import { isClineClearSlashCommand } from "../cline-sdk/cline-slash-commands";
 import type { ClineTaskExportSnapshot } from "../cline-sdk/cline-task-export-snapshot";
 import type { ClineTaskSessionService } from "../cline-sdk/cline-task-session-service";
 import type { ClineTurnPreparation } from "../cline-sdk/cline-turn-preparation";
+import {
+	listValidationJobRecords,
+	readValidationJobLogPreview,
+	readValidationJobLogReference,
+	type ValidationJobRecord,
+} from "../cline-sdk/validation-job-service";
 import type { RuntimeConfigState } from "../config/runtime-config";
 import { updateGlobalRuntimeConfig, updateRuntimeConfig } from "../config/runtime-config";
 import type {
@@ -91,6 +98,7 @@ import { buildTaskDiagnosticsExportV3, type TaskDiagnosticsExportV3Plan } from "
 import {
 	buildTaskQualitySummaryResponse,
 	buildUnavailableTaskQualitySummaryResponse,
+	type TaskQualitySummaryJobEvent,
 } from "../core/task-quality-summary";
 import { resolveTaskTitle } from "../core/task-title.js";
 import { reconcileOrphanedSessionSummary, resolveWorkspaceSessionSummaries } from "../core/workspace-session-summaries";
@@ -332,6 +340,52 @@ async function resolveExistingTaskCwdOrEnsure(options: {
 			ensure: true,
 		});
 	}
+}
+
+/** AR-3/AR-7: cap on the quality summary's validation-job item list. */
+const TASK_QUALITY_SUMMARY_JOB_EVENT_LIMIT = 200;
+
+/** AR-3: normalized outcome of a settled validation-job record (for display). */
+function validationJobOutcome(record: ValidationJobRecord): TaskQualitySummaryJobEvent["outcome"] {
+	if (record.state === "running") return "started";
+	if (record.state === "exited") return record.exitCode === 0 ? "completed" : "failed";
+	if (record.state === "canceled") return "cancelled";
+	if (record.state === "timed_out") return "timeout";
+	if (record.state === "spawn_failed") return "failed";
+	return "interrupted";
+}
+
+/**
+ * AR-3/AR-7: read-only observation of a task's validation jobs for the
+ * quality summary. Never starts, cancels, or reclassifies anything; a read
+ * problem degrades to an empty list, never an error. Most recent first,
+ * capped (the response's total covers all records).
+ */
+async function collectQualitySummaryJobEvents(taskId: string): Promise<TaskQualitySummaryJobEvent[]> {
+	const records = await listValidationJobRecords(taskId).catch(() => [] as ValidationJobRecord[]);
+	const recent = [...records].sort((a, b) => (a.startedAt > b.startedAt ? -1 : a.startedAt < b.startedAt ? 1 : 0));
+	const jobEvents: TaskQualitySummaryJobEvent[] = [];
+	for (const record of recent) {
+		if (jobEvents.length >= TASK_QUALITY_SUMMARY_JOB_EVENT_LIMIT) break;
+		const logReference = await readValidationJobLogReference(record).catch(() => null);
+		const preview = logReference !== null ? await readValidationJobLogPreview(record).catch(() => null) : null;
+		jobEvents.push({
+			jobId: record.jobId,
+			toolCallId: record.toolCallId,
+			sessionId: record.sessionId,
+			command: record.command,
+			state: record.state,
+			outcome: validationJobOutcome(record),
+			exitCode: record.exitCode,
+			startedAt: record.startedAt,
+			endedAt: record.endedAt,
+			logReference,
+			logTruncated:
+				record.logTruncated ||
+				(preview !== null && record.logBytesRetained > 0 && preview.length < record.logBytesRetained),
+		});
+	}
+	return jobEvents;
 }
 
 export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrpcContext["runtimeApi"] {
@@ -1606,6 +1660,12 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 								reviewSnapshotError: message,
 							};
 						});
+					// AR-3/AR-7: observed validation jobs (read-only — nothing
+					// is started, canceled, or reclassified here).
+					const jobEvents = await collectQualitySummaryJobEvents(body.taskId);
+					// AR-7: the measured compaction record (B-10.4 latest
+					// event), read separately from the estimated context usage.
+					const measuredCompaction = await readTaskCompactionEvent(body.taskId).catch(() => null);
 					// The task's own current-session lookup (never other
 					// tasks' summaries) separates terminal summary
 					// availability from native transcript availability.
@@ -1620,6 +1680,8 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 						reviewSnapshotError,
 						sessionSource: session.source,
 						terminalSummaryAvailable: session.summary !== null,
+						jobEvents,
+						measuredCompaction,
 					});
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);

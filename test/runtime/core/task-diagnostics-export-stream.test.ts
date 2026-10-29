@@ -116,7 +116,7 @@ function createSegment(
 			cwd: `${HOME}/.cline/worktrees/task-1/repo`,
 		}),
 		artifactTaskId: "task-1",
-		launchConfig: { mode: "act", systemPrompt: "", reasoningEffort: null },
+		launchConfig: { mode: "act", systemPrompt: "", reasoningEffort: null, sdkVersion: null, guidanceVersion: null },
 		transcript: { status: "complete", reason: null },
 		messages,
 		liveTail: null,
