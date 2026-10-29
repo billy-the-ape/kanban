@@ -6,6 +6,7 @@
 // review/repair lineage, live tails, unchanged failed retries, and
 // complete/partial/unavailable coverage.
 import { describe, expect, it } from "vitest";
+import { emptyTaskEditorCallEvidence } from "../../../src/cline-sdk/cline-editor-call-evidence";
 import type {
 	ClineTaskExportKind,
 	ClineTaskExportSegment,
@@ -986,6 +987,7 @@ describe("buildTaskQualitySummaryResponse", () => {
 				: null,
 			readError: overrides.readError ?? null,
 			toolOrigins: overrides.toolOrigins ?? [],
+			editorCallEvidence: emptyTaskEditorCallEvidence(),
 		};
 	}
 

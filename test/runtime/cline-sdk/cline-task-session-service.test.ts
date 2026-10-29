@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { ToolApprovalRequest, ToolApprovalResult } from "@clinebot/core";
 import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import { readTaskCompactionEvent } from "../../../src/cline-sdk/cline-context-events";
+import { emptyTaskEditorCallEvidence } from "../../../src/cline-sdk/cline-editor-call-evidence";
 import type { ClineRuntimeSetup } from "../../../src/cline-sdk/cline-runtime-setup";
 import type {
 	ClinePersistedTaskSessionSnapshot,
@@ -304,6 +305,7 @@ function createFakeClineSessionRuntime(): FakeClineSessionRuntimeController {
 							liveTail: null,
 							readError,
 							toolOrigins: [],
+							editorCallEvidence: emptyTaskEditorCallEvidence(),
 						},
 					],
 				};

@@ -19,6 +19,7 @@
 // serializer lives in task-diagnostics-export-stream.ts (artifacts are streamed
 // one at a time and never held as a second huge JSON string).
 
+import type { TaskEditorCallEvidence } from "../cline-sdk/cline-editor-call-evidence";
 import type {
 	ClineTaskExportKind,
 	ClineTaskExportLaunchConfig,
@@ -86,6 +87,13 @@ export interface TaskDiagnosticsExportSegment {
 	liveTail: ClineTaskExportLiveTail | null;
 	toolOrigins: ClineTaskExportToolOriginEntry[];
 	toolEvidence: TaskDiagnosticsExportToolEvidence[];
+	/**
+	 * Additive editor transport evidence for this session (raw pre-parse
+	 * fragments + parsed/execution/result stages + factual old_text
+	 * comparison). "unavailable" keeps historical sessions/exports
+	 * compatible.
+	 */
+	editorCallEvidence: TaskEditorCallEvidence;
 }
 
 export interface TaskDiagnosticsExportSession {
@@ -256,6 +264,7 @@ interface SnapshotSegmentForBuild {
 	liveTail: ClineTaskExportLiveTail | null;
 	readError: string | null;
 	toolOrigins: ClineTaskExportToolOriginEntry[];
+	editorCallEvidence: TaskEditorCallEvidence;
 }
 
 /**
@@ -305,10 +314,16 @@ export async function buildTaskDiagnosticsExportV3(
 					{ artifactTaskId: segment.artifactTaskId, messages: segment.messages },
 					artifactResolver,
 				),
+				editorCallEvidence: segment.editorCallEvidence,
 			});
 			if (segment.liveTail) {
 				warnings.push(
 					`session ${segment.header.sessionId} carries a live tail of ${segment.liveTail.messages.length} Kanban display message(s) that may overlap the durable transcript`,
+				);
+			}
+			if (segment.editorCallEvidence.status === "partial" && segment.editorCallEvidence.reason) {
+				warnings.push(
+					`editor transport evidence for session ${segment.header.sessionId} is incomplete: ${segment.editorCallEvidence.reason}`,
 				);
 			}
 		}
@@ -418,5 +433,6 @@ function snapshotSegments(snapshot: ClineTaskExportSnapshot): SnapshotSegmentFor
 		liveTail: segment.liveTail,
 		readError: segment.readError,
 		toolOrigins: segment.toolOrigins,
+		editorCallEvidence: segment.editorCallEvidence,
 	}));
 }

@@ -171,6 +171,7 @@ vi.mock("../../../src/workspace/task-last-prompt.js", async () => {
 });
 
 import { buildClineCompactionConfig } from "../../../src/cline-sdk/cline-compaction-config";
+import { emptyTaskEditorCallEvidence } from "../../../src/cline-sdk/cline-editor-call-evidence";
 import * as workspaceState from "../../../src/state/workspace-state";
 import * as dispatchRecords from "../../../src/task-dispatch/dispatch-records";
 import type { RuntimeTrpcContext } from "../../../src/trpc/app-router";
@@ -3675,6 +3676,7 @@ describe("createRuntimeApi buildTaskDiagnosticsExportPlan (DIAG-3)", () => {
 					liveTail: null,
 					readError: null,
 					toolOrigins: [],
+					editorCallEvidence: emptyTaskEditorCallEvidence(),
 				},
 			],
 		};
@@ -3882,6 +3884,7 @@ describe("createRuntimeApi getTaskQualitySummary (DIAG-PANEL)", () => {
 					liveTail: null,
 					readError: null,
 					toolOrigins: [],
+					editorCallEvidence: emptyTaskEditorCallEvidence(),
 				},
 			],
 		};

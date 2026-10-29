@@ -12,8 +12,18 @@ import {
 	calibrateClineCompactionConfig,
 } from "./cline-compaction-config";
 import type { ContextLimitSource } from "./cline-context-policy";
+import {
+	collectEditorToolCallIds,
+	collectTaskEditorCallEvidence,
+	readEditorTraceLines,
+} from "./cline-editor-call-evidence";
 import { createClineEditorLimitHooks } from "./cline-editor-limit";
 import { createClineEditorTraceHooks } from "./cline-editor-trace";
+import {
+	type EditorTransportCapture,
+	initEditorTransportCapture,
+	resolveEditorTransportHost,
+} from "./cline-editor-transport-capture";
 import { extractClineSessionId } from "./cline-event-adapter";
 import { createClineInterruptedToolCallRepairHook } from "./cline-interrupted-tool-call-repair";
 import {
@@ -319,6 +329,10 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 	private readonly schedulerOwner = Symbol("cline-runtime");
 	private readonly turnGenerationByTaskId = new Map<string, number>();
 	private disposed = false;
+	/** Opt-in raw editor transport capture (null when KANBAN_TRACE_EDITOR is not enabled). */
+	private editorTransportCapture: EditorTransportCapture | null = null;
+	/** Session ids this runtime tracked for editor transport capture. */
+	private readonly trackedEditorTransportSessions = new Set<string>();
 	/** DIAG-2 (2a): explicit session-listing limit for export snapshots (Decision 3). */
 	static readonly EXPORT_SESSION_LIST_LIMIT = 1000;
 
@@ -678,6 +692,11 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 					? { capabilities: { requestToolApproval: request.requestToolApproval } }
 					: {}),
 			});
+			// Opt-in raw editor transport capture: track this session's provider
+			// host so the fetch wrapper can observe the SSE stream before the
+			// first model request (no-op unless KANBAN_TRACE_EDITOR=1 and the
+			// host is local with a resolvable base-URL host).
+			this.trackEditorTransportSession(request, startResult.sessionId, isLocalRuntimeHost);
 		} catch (error) {
 			const failedValidationJobs = this.validationJobServiceByTaskId.get(request.taskId);
 			if (failedValidationJobs) {
@@ -692,6 +711,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		if (signal.aborted) {
 			await sessionHost.abort(startResult.sessionId).catch(() => undefined);
 			this.clearTaskSessionBinding(request.taskId, requestedSessionId);
+			this.untrackEditorTransportSession(startResult.sessionId);
 			await this.settleTaskValidationJobs(request.taskId);
 			await this.releaseTaskMcpToolBundle(request.taskId);
 			signal.throwIfAborted();
@@ -711,6 +731,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 				});
 			} catch (error) {
 				this.clearTaskSessionBinding(request.taskId, startResult.sessionId);
+				this.untrackEditorTransportSession(startResult.sessionId);
 				await this.settleTaskValidationJobs(request.taskId);
 				await this.releaseTaskMcpToolBundle(request.taskId);
 				throw error;
@@ -836,6 +857,11 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 				compareExportStringValues(a.updatedAt ?? "", b.updatedAt ?? ""),
 		);
 		const segments: ClineTaskExportSegment[] = [];
+		// Additive editor transport evidence: correlate the raw (pre-parse)
+		// SSE fragments with the parsed/execution/result hook stages from the
+		// shared editor-trace file. A missing or empty file yields
+		// "unavailable" evidence, keeping historical exports compatible.
+		const editorTraceLines = readEditorTraceLines();
 		for (const record of matches) {
 			let messages: ClineSdkPersistedMessage[];
 			let readError: string | null = null;
@@ -857,6 +883,11 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 				liveTail: null,
 				readError,
 				toolOrigins: [],
+				editorCallEvidence: collectTaskEditorCallEvidence({
+					sessionId: record.sessionId,
+					knownEditorToolCallIds: collectEditorToolCallIds(messages),
+					lines: editorTraceLines,
+				}),
 			});
 		}
 		const activeSessionId = this.sessionIdByTaskId.get(taskId);
@@ -883,6 +914,11 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 				liveTail: null,
 				readError: null,
 				toolOrigins: [],
+				editorCallEvidence: collectTaskEditorCallEvidence({
+					sessionId: activeSessionId,
+					knownEditorToolCallIds: [],
+					lines: editorTraceLines,
+				}),
 			});
 		}
 		if (segments.length === 0) {
@@ -1155,10 +1191,12 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		try {
 			await sessionHost.stop(sessionId);
 			this.clearTaskSessionBinding(taskId, sessionId);
+			this.untrackEditorTransportSession(sessionId);
 		} catch (error) {
 			const persistedRecord = await sessionHost.get(sessionId).catch(() => undefined);
 			if (!persistedRecord) {
 				this.clearTaskSessionBinding(taskId, sessionId);
+				this.untrackEditorTransportSession(sessionId);
 			}
 			throw error;
 		} finally {
@@ -1187,10 +1225,12 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		try {
 			await sessionHost.abort(sessionId);
 			this.clearTaskSessionBinding(taskId, sessionId);
+			this.untrackEditorTransportSession(sessionId);
 		} catch (error) {
 			const persistedRecord = await sessionHost.get(sessionId).catch(() => undefined);
 			if (!persistedRecord) {
 				this.clearTaskSessionBinding(taskId, sessionId);
+				this.untrackEditorTransportSession(sessionId);
 			}
 			throw error;
 		} finally {
@@ -1220,6 +1260,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		for (const sessionId of matchingSessionIds) {
 			await sessionHost.delete(sessionId).catch(() => false);
 			this.taskIdBySessionId.delete(sessionId);
+			this.untrackEditorTransportSession(sessionId);
 		}
 		this.clearTaskSessionBinding(taskId);
 		await this.settleTaskValidationJobs(taskId);
@@ -1267,6 +1308,10 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		this.sessionIdByTaskId.clear();
 		this.taskIdBySessionId.clear();
 		this.lastStartRequestByTaskId.clear();
+		for (const sessionId of this.trackedEditorTransportSessions) {
+			this.editorTransportCapture?.untrackSession(sessionId);
+		}
+		this.trackedEditorTransportSessions.clear();
 
 		// AR-3: settle all live validation jobs before disposing the host.
 		const validationServices = [...this.validationJobServiceByTaskId.values()];
@@ -1335,6 +1380,41 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		}
 		this.sessionIdByTaskId.delete(taskId);
 		this.taskIdBySessionId.delete(activeSessionId);
+	}
+
+	/**
+	 * Opt-in raw editor transport capture: tracks the session's provider host
+	 * so the process-wide fetch wrapper can observe SSE streams. Local hosts
+	 * only; no-op when capture is disabled or the host cannot be resolved.
+	 */
+	private trackEditorTransportSession(
+		request: StartClineSessionRuntimeRequest,
+		sessionId: string,
+		isLocalRuntimeHost: boolean,
+	): void {
+		if (!isLocalRuntimeHost) {
+			return;
+		}
+		if (this.editorTransportCapture === null) {
+			this.editorTransportCapture = initEditorTransportCapture();
+		}
+		const host = resolveEditorTransportHost(request.baseUrl, request.providerId);
+		if (this.editorTransportCapture === null || host === null) {
+			return;
+		}
+		this.editorTransportCapture.trackSession({
+			taskId: request.taskId,
+			sessionId,
+			host,
+			providerId: request.providerId,
+			modelId: request.modelId,
+		});
+		this.trackedEditorTransportSessions.add(sessionId);
+	}
+
+	private untrackEditorTransportSession(sessionId: string): void {
+		this.trackedEditorTransportSessions.delete(sessionId);
+		this.editorTransportCapture?.untrackSession(sessionId);
 	}
 
 	private async findPersistedTaskSessionRecord(
@@ -1414,6 +1494,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 		}
 		if (ended) {
 			this.clearTaskSessionBinding(taskId, sessionId);
+			this.untrackEditorTransportSession(sessionId);
 			void this.releaseTaskMcpToolBundle(taskId);
 			// AR-3: an ended session no longer owns its validation jobs;
 			// settle them (kills owned processes, persists final status).

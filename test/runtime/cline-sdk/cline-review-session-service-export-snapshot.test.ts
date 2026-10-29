@@ -2,6 +2,7 @@
 // verification-repair round, kind-tagged, de-duplicated, and sorted in
 // creation order, with live tails preserved and listing gaps propagated.
 import { describe, expect, it, vi } from "vitest";
+import { emptyTaskEditorCallEvidence } from "../../../src/cline-sdk/cline-editor-call-evidence";
 import type { ClineReviewEvidencePort } from "../../../src/cline-sdk/cline-review-session-service";
 import { createClineReviewSessionService } from "../../../src/cline-sdk/cline-review-session-service";
 import type { ClineLaunchConfigResolver } from "../../../src/cline-sdk/cline-session-runtime";
@@ -38,6 +39,7 @@ function createLineageSnapshot(
 			liveTail: null,
 			readError: null,
 			toolOrigins: [],
+			editorCallEvidence: emptyTaskEditorCallEvidence(),
 		})),
 	};
 }

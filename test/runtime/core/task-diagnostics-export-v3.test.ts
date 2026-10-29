@@ -1,6 +1,7 @@
 // DIAG-2 (2b/2c): the schemaVersion 3 plan builder — full-fidelity transcript
 // assembly, tool evidence attachment, and Decision-5 completeness semantics.
 import { describe, expect, it } from "vitest";
+import { emptyTaskEditorCallEvidence } from "../../../src/cline-sdk/cline-editor-call-evidence";
 import type { ClineTaskExportSnapshot } from "../../../src/cline-sdk/cline-task-export-snapshot";
 import { buildSyntheticSessionHeader } from "../../../src/cline-sdk/cline-task-export-snapshot";
 import type { ClineSdkPersistedMessage } from "../../../src/cline-sdk/sdk-runtime-boundary";
@@ -136,6 +137,7 @@ function createSnapshot(
 				liveTail: null,
 				readError: null,
 				toolOrigins: [],
+				editorCallEvidence: emptyTaskEditorCallEvidence(),
 			},
 		],
 		...rest,
@@ -287,6 +289,7 @@ describe("buildTaskDiagnosticsExportV3", () => {
 					liveTail: null,
 					readError: "EACCES: permission denied",
 					toolOrigins: [],
+					editorCallEvidence: emptyTaskEditorCallEvidence(),
 				},
 			],
 		};

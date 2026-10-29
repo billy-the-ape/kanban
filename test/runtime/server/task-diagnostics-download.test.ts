@@ -11,6 +11,7 @@ import { createServer } from "node:http";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { emptyTaskEditorCallEvidence } from "../../../src/cline-sdk/cline-editor-call-evidence";
 import type { RuntimeTaskDiagnosticsResponse } from "../../../src/core/api-contract";
 import type { TaskDiagnosticsExportV3Plan } from "../../../src/core/task-diagnostics-export-v3";
 import {
@@ -149,6 +150,7 @@ function createPlanFixture(completeness: "complete" | "partial" | "unavailable")
 									liveTail: null,
 									toolOrigins: [],
 									toolEvidence: [],
+									editorCallEvidence: emptyTaskEditorCallEvidence(),
 								},
 							],
 						},

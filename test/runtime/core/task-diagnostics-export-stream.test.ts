@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { emptyTaskEditorCallEvidence } from "../../../src/cline-sdk/cline-editor-call-evidence";
 import { buildSyntheticSessionHeader } from "../../../src/cline-sdk/cline-task-export-snapshot";
 import type { ClineSdkPersistedMessage } from "../../../src/cline-sdk/sdk-runtime-boundary";
 import type { RuntimeTaskDiagnosticsResponse } from "../../../src/core/api-contract";
@@ -121,6 +122,7 @@ function createSegment(
 		liveTail: null,
 		toolOrigins: [],
 		toolEvidence,
+		editorCallEvidence: emptyTaskEditorCallEvidence(),
 	};
 }
 

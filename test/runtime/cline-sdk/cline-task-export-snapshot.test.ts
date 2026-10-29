@@ -2,6 +2,7 @@
 // snapshot — header allowlists, the fixed-priority live tail, and the
 // Decision-4 tool-origin labeling across restart segments.
 import { describe, expect, it } from "vitest";
+import { emptyTaskEditorCallEvidence } from "../../../src/cline-sdk/cline-editor-call-evidence";
 import type { ClineTaskMessage } from "../../../src/cline-sdk/cline-session-state";
 import {
 	buildAllowlistedSessionHeader,
@@ -191,6 +192,7 @@ describe("labelSegmentToolOrigins", () => {
 			liveTail: null,
 			readError: null,
 			toolOrigins: [],
+			editorCallEvidence: emptyTaskEditorCallEvidence(),
 		};
 	}
 
