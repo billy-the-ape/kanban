@@ -1,6 +1,6 @@
 # AR-6: Bind review results to the current turn and change set
 
-Status: planned. One implementation PR into `main`. Dependencies: none.
+Status: implemented (see [Final state](#final-state)). One implementation PR into `main`. Dependencies: none.
 Read [README.md](./README.md) and [EVIDENCE.md](./EVIDENCE.md).
 
 ## Outcome
@@ -68,3 +68,58 @@ or event-race cause. Reproduce with controlled event ordering before selecting a
 No new review model, broad review prompt rewrite, reduced checks, or PR posting behavior.
 Normal rebuild/redeploy; no new environment variables or storage migration. Do not
 restart/retarget in-flight reviews silently; verify using new reviews after deployment.
+
+## Final state
+
+Implemented in `src/cline-sdk/cline-review-session-service.ts` and
+`src/workspace/task-review-handoff.ts`; no new durable storage.
+
+**Turn receipts (DIAG-0).** `startBoundedSession` now returns a turn receipt
+alongside the session id: the id of the user message recorded as the accepted
+input for that dispatch (`captureTurnReceipt`). The transcript is inspected
+immediately after `startTaskSession`/`sendTaskSessionInput` resolves; when no
+user message exists for the dispatched turn, the review fails explicitly
+instead of resolving against an earlier turn's terminal summary. `startTaskReview`
+resolves the result from the receipt of the last dispatched turn:
+
+- a terminal summary that arrives after a repair dispatch is never treated as
+  that repair's completion;
+- a repair turn that ends without its own `kanban-review-result` block is
+  `parse_failed` — the earlier turn's block is not inherited (neither as a
+  fresh finding that would trigger another round, nor as the verdict);
+- multiple result blocks in one turn must normalize identically, or the turn
+  is `parse_failed` (no arbitrary choice);
+- result blocks are read only from assistant messages after the current
+  turn's accepted input;
+- a repair input the session service rejects (`sendTaskSessionInput` resolving
+  to `null`) or a start that recorded no user input is an explicit failure.
+
+When the terminal state is observed before the turn's reply is appended to the
+in-memory transcript (the reply is appended by the session service's dispatch
+code after the turn result resolves), `extractTurnResult` settles with a
+bounded wait (`TURN_RESULT_SETTLE_MS`, 25 ms polls) before declaring
+`parse_failed`; a landed reply without a block is a definitive parse failure.
+
+**Trusted baseline.** `resolveReviewBaseline`
+(`src/workspace/task-review-handoff.ts`) resolves the baseline the candidate
+change set is measured against in a fixed order: (1) the recorded starting
+revision, (2) the preserved starting commit, (3) the merge base of the task's
+base branch and HEAD. When none is available, `buildReviewHandoffArtifact`
+throws with an actionable message — no base is guessed (HEAD/`HEAD^`) and no
+silently empty change set is passed. A proven-empty change set against a known
+baseline remains a valid condition (untracked files are still listed).
+`BuildReviewHandoffInput` accepts `baseRef` (the task's base branch from the
+board), the service passes it, and `extractReviewDiff` uses the same
+resolution (the artifact's resolved base plus the `baseRef` fallback), so the
+prompt's diff always matches the handoff's changed paths. Merged base updates
+contribute nothing when the base commit is at or after the merge point; task
+commits after the start are always included.
+
+**Tests.** `test/cline-sdk/cline-review-session-service.test.ts` adds the
+turn-bound completion suite (inherited result, contradictory blocks, rejected
+repair send, start without accepted input, instant completion before the await
+subscription, native-session restart between turns, multi-task isolation), and
+`test/workspace/task-review-handoff.test.ts` adds the `buildReviewHandoffArtifact`
+matrix (multiple task commits, dirty/untracked, merge exclusion, proven empty,
+missing-baseline failure) plus the merge-base diff derivation.
+

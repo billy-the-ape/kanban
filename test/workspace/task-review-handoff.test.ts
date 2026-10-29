@@ -1,9 +1,13 @@
 // B-6.1 + B-6.2/B-6.3 — unit tests for the review handoff helpers:
-//   - extractReviewDiff: the unified diff vs the recorded starting revision,
-//     with HEAD fallback and an empty result when there is no usable base.
+//   - extractReviewDiff: the unified diff against the trusted baseline
+//     (recorded start, preserved start, or the merge base of the task's base
+//     branch and HEAD), with an empty result when no baseline can be resolved.
+//   - buildReviewHandoffArtifact: the fresh-context briefing, including
+//     multi-commit change sets, dirty/untracked paths, and the actionable
+//     failure when no trusted baseline exists.
 //   - findTaskBaseRef: locating a task's base branch on the workspace board.
 //
-// extractReviewDiff runs against real temporary git repositories; findTaskBaseRef
+// The git helpers run against real temporary git repositories; findTaskBaseRef
 // runs against a mocked workspace board (the board load is the only I/O).
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -11,7 +15,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { RuntimeBoardData } from "../../src/core/api-contract";
 import { runGit } from "../../src/workspace/git-utils";
-import { extractReviewDiff, findTaskBaseRef } from "../../src/workspace/task-review-handoff";
+import {
+	buildReviewHandoffArtifact,
+	extractReviewDiff,
+	findTaskBaseRef,
+} from "../../src/workspace/task-review-handoff";
 import { createTempDir } from "../utilities/temp-dir";
 
 const workspaceStateMocks = vi.hoisted(() => ({
@@ -65,7 +73,7 @@ describe("extractReviewDiff", () => {
 		const base = await commitFile(dir, "a.txt", "line1\n");
 		await writeFile(join(dir, "a.txt"), "line1\nline2\n");
 
-		const diff = await extractReviewDiff(dir, base);
+		const diff = await extractReviewDiff(dir, "task-1", base);
 
 		expect(diff).toContain("a.txt");
 		expect(diff).toContain("+line2");
@@ -77,43 +85,148 @@ describe("extractReviewDiff", () => {
 		const base = await commitFile(dir, "a.txt", "line1\n");
 		await commitFile(dir, "a.txt", "line1\nline2\n");
 
-		const diff = await extractReviewDiff(dir, base);
+		const diff = await extractReviewDiff(dir, "task-1", base);
 
 		expect(diff).toContain("a.txt");
 		expect(diff).toContain("+line2");
 	});
 
-	it("falls back to HEAD when no starting revision is recorded", async () => {
+	it("derives the merge base of the base branch when no starting revision is recorded", async () => {
 		const dir = createRepo();
 		await initRepo(dir);
 		await commitFile(dir, "a.txt", "line1\n");
 		await writeFile(join(dir, "a.txt"), "line1\nline2\n");
 
-		const diff = await extractReviewDiff(dir, null);
+		// HEAD is on main, so merge-base(main, HEAD) is HEAD: only the
+		// uncommitted change is part of the diff — never a guessed parent.
+		const diff = await extractReviewDiff(dir, "task-1", null, "main");
 
 		expect(diff).toContain("a.txt");
 		expect(diff).toContain("+line2");
 	});
 
-	it("falls back to HEAD when the recorded starting revision is unreachable", async () => {
+	it("derives the merge base of the base branch when the recorded starting revision is unreachable", async () => {
 		const dir = createRepo();
 		await initRepo(dir);
 		await commitFile(dir, "a.txt", "line1\n");
 		await writeFile(join(dir, "a.txt"), "line1\nline2\n");
 
-		const diff = await extractReviewDiff(dir, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+		const diff = await extractReviewDiff(dir, "task-1", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "main");
 
 		expect(diff).toContain("a.txt");
 		expect(diff).toContain("+line2");
 	});
 
-	it("returns an empty string when there are no commits and no recorded base", async () => {
+	it("returns an empty string when no trusted baseline can be resolved", async () => {
 		const dir = createRepo();
 		await initRepo(dir);
 
-		const diff = await extractReviewDiff(dir, null);
+		// No commits (no HEAD), no recorded start, no base branch to derive from.
+		const diff = await extractReviewDiff(dir, "task-1", null);
 
 		expect(diff).toBe("");
+	});
+});
+
+describe("buildReviewHandoffArtifact", () => {
+	it("records every tracked change made after the starting revision (multiple task commits)", async () => {
+		const dir = createRepo();
+		await initRepo(dir);
+		const base = await commitFile(dir, "a.txt", "line1\n");
+		await commitFile(dir, "a.txt", "line1\nline2\n");
+		await commitFile(dir, "b.txt", "b1\n");
+
+		const artifact = await buildReviewHandoffArtifact({
+			taskId: "task-multi",
+			worktreePath: dir,
+			repoPath: dir,
+			description: "Implement the change",
+			startingCommit: base,
+			baseRef: "main",
+		});
+
+		expect(artifact.startingCommit).toBe(base);
+		expect(artifact.changedPaths).toEqual(["a.txt", "b.txt"]);
+		expect(artifact.untrackedPaths).toEqual([]);
+	});
+
+	it("lists dirty tracked changes and untracked files separately", async () => {
+		const dir = createRepo();
+		await initRepo(dir);
+		const base = await commitFile(dir, "a.txt", "line1\n");
+		await writeFile(join(dir, "a.txt"), "line1\nline2\n");
+		await writeFile(join(dir, "new.txt"), "fresh\n");
+
+		const artifact = await buildReviewHandoffArtifact({
+			taskId: "task-dirty",
+			worktreePath: dir,
+			repoPath: dir,
+			description: "Implement the change",
+			startingCommit: base,
+			baseRef: "main",
+		});
+
+		expect(artifact.changedPaths).toEqual(["a.txt"]);
+		expect(artifact.untrackedPaths).toEqual(["new.txt"]);
+	});
+
+	it("excludes merged base-branch changes from the derived change set", async () => {
+		const dir = createRepo();
+		await initRepo(dir);
+		await commitFile(dir, "a.txt", "a\n");
+		await runGit(dir, ["checkout", "-b", "task"]);
+		await commitFile(dir, "b.txt", "b\n");
+		await runGit(dir, ["checkout", "main"]);
+		await commitFile(dir, "c.txt", "c\n");
+		await runGit(dir, ["checkout", "task"]);
+		await runGit(dir, ["merge", "main", "-m", "merge main"]);
+
+		// No recorded start: the baseline derives from merge-base(main, HEAD),
+		// so main's own new file (c.txt) is not part of the task's change set.
+		const artifact = await buildReviewHandoffArtifact({
+			taskId: "task-merge",
+			worktreePath: dir,
+			repoPath: dir,
+			description: "Implement the change",
+			baseRef: "main",
+		});
+
+		expect(artifact.changedPaths).toEqual(["b.txt"]);
+	});
+
+	it("keeps a proven empty change set valid", async () => {
+		const dir = createRepo();
+		await initRepo(dir);
+		const head = await commitFile(dir, "a.txt", "line1\n");
+
+		const artifact = await buildReviewHandoffArtifact({
+			taskId: "task-empty",
+			worktreePath: dir,
+			repoPath: dir,
+			description: "Implement the change",
+			startingCommit: head,
+			baseRef: "main",
+		});
+
+		expect(artifact.changedPaths).toEqual([]);
+		expect(artifact.untrackedPaths).toEqual([]);
+	});
+
+	it("fails with an actionable message when no trusted baseline exists", async () => {
+		const dir = createRepo();
+		await initRepo(dir);
+		await commitFile(dir, "a.txt", "line1\n");
+
+		await expect(
+			buildReviewHandoffArtifact({
+				taskId: "task-nobase",
+				worktreePath: dir,
+				repoPath: dir,
+				description: "Implement the change",
+				startingCommit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+				baseRef: "no-such-branch",
+			}),
+		).rejects.toThrow(/No trusted starting revision/);
 	});
 });
 

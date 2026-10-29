@@ -17,6 +17,7 @@ import {
 	reviewSessionIdForTask,
 } from "../../src/cline-sdk/cline-review-session-service";
 import type { ClineLaunchConfigResolver } from "../../src/cline-sdk/cline-session-runtime";
+import type { ClineTaskSessionService } from "../../src/cline-sdk/cline-task-session-service";
 import type {
 	RuntimeReviewHandoffArtifact,
 	RuntimeReviewOutcomeFile,
@@ -380,6 +381,208 @@ describe("ClineReviewSessionService.startTaskReview", () => {
 		expect(response.ok).toBe(false);
 		expect(response.status).toBe("failed");
 		expect(response.error).toMatch(/base branch/i);
+	});
+});
+describe("ClineReviewSessionService.startTaskReview — AR-6 turn-bound completion", () => {
+	it("does not inherit an earlier turn's result: a repair turn without its own block is parse_failed", async () => {
+		const harness = createTaskSessionServiceHarness({ resolveClineLaunchConfig: makeResolver() });
+		services.push(harness);
+		const reviewService = createReviewService(harness, createFakeEvidencePort());
+		scriptTurns(harness, [
+			{ reply: reviewResultBlock(BLOCKED_RESULT), reason: "completed" }, // turn 1: findings
+			{ reply: "Fix verified. (No result block in this turn.)", reason: "completed" }, // turn 2: no block of its own
+		]);
+
+		const response = await reviewService.startTaskReview({
+			taskId: "task-1",
+			description: "Implement feature X",
+			reviewPolicy: { enabled: "required", instructions: "", modelOverride: null, maxRepairRounds: 2 },
+		});
+
+		// A result inherited from turn 1 must not be treated as turn 2's
+		// finding (which would trigger another repair) nor as its verdict.
+		expect(response.ok).toBe(false);
+		expect(response.status).toBe("parse_failed");
+		expect(response.result).toBeNull();
+		// Initial review + exactly one repair — no extra round from an
+		// inherited block.
+		await vi.waitFor(() => expect(harness.host.sentPrompts.length).toBe(2));
+	});
+
+	it("reports parse_failed when one turn carries contradictory result blocks", async () => {
+		const harness = createTaskSessionServiceHarness({ resolveClineLaunchConfig: makeResolver() });
+		services.push(harness);
+		const reviewService = createReviewService(harness, createFakeEvidencePort());
+		// One turn, two distinct result blocks: no arbitrary choice is allowed.
+		const contradictory = [reviewResultBlock(CLEAN_RESULT), reviewResultBlock(BLOCKED_RESULT)].join("\n\n");
+		scriptTurns(harness, [{ reply: contradictory, reason: "completed" }]);
+
+		const response = await reviewService.startTaskReview({
+			taskId: "task-1",
+			description: "Implement feature X",
+			reviewPolicy: { enabled: "required", instructions: "", modelOverride: null, maxRepairRounds: 1 },
+		});
+
+		expect(response.ok).toBe(false);
+		expect(response.status).toBe("parse_failed");
+		expect(response.result).toBeNull();
+		// No repair round must be triggered by the arbitrary choice.
+		await vi.waitFor(() => expect(harness.host.sentPrompts.length).toBe(1));
+	});
+
+	it("fails explicitly when the repair send is rejected by the session service", async () => {
+		const harness = createTaskSessionServiceHarness({ resolveClineLaunchConfig: makeResolver() });
+		services.push(harness);
+		// Simulate a rejected dispatch (e.g. the session is in a state that
+		// refuses new input): sendTaskSessionInput resolves to null.
+		const rejectingService = new Proxy(harness.service, {
+			get(target, property, receiver) {
+				const value = Reflect.get(target, property, receiver);
+				if (property === "sendTaskSessionInput") {
+					return () => Promise.resolve(null);
+				}
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		}) as ClineTaskSessionService;
+		const reviewService = createClineReviewSessionService({
+			clineTaskSessionService: rejectingService,
+			resolveClineLaunchConfig: makeResolver(),
+			workspaceId: "ws-1",
+			repoPath: "/tmp/repo",
+			evidence: createFakeEvidencePort(),
+		});
+		scriptTurns(harness, [{ reply: reviewResultBlock(BLOCKED_RESULT), reason: "completed" }]);
+
+		const response = await reviewService.startTaskReview({
+			taskId: "task-1",
+			description: "Implement feature X",
+			reviewPolicy: { enabled: "required", instructions: "", modelOverride: null, maxRepairRounds: 1 },
+		});
+
+		// An unaccepted repair input fails explicitly — it never resolves
+		// against the previous turn's terminal summary.
+		expect(response.ok).toBe(false);
+		expect(response.status).toBe("failed");
+		expect(response.error).toMatch(/not accepted/);
+		// The rejected repair never dispatched a turn.
+		await vi.waitFor(() => expect(harness.host.sentPrompts.length).toBe(1));
+	});
+
+	it("fails explicitly when the start dispatch records no accepted input", async () => {
+		const harness = createTaskSessionServiceHarness({ resolveClineLaunchConfig: makeResolver() });
+		services.push(harness);
+		// Simulate a start that accepted the session but dispatched no user
+		// input (the dispatch was lost): the transcript has no user message.
+		const startlessService = new Proxy(harness.service, {
+			get(target, property, receiver) {
+				const value = Reflect.get(target, property, receiver);
+				if (property === "startTaskSession") {
+					return (request: Parameters<ClineTaskSessionService["startTaskSession"]>[0]) =>
+						target.startTaskSession({ ...request, prompt: "" });
+				}
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		}) as ClineTaskSessionService;
+		const reviewService = createClineReviewSessionService({
+			clineTaskSessionService: startlessService,
+			resolveClineLaunchConfig: makeResolver(),
+			workspaceId: "ws-1",
+			repoPath: "/tmp/repo",
+			evidence: createFakeEvidencePort(),
+		});
+		scriptTurns(harness, [{ reply: reviewResultBlock(CLEAN_RESULT), reason: "completed" }]);
+
+		const response = await reviewService.startTaskReview({ taskId: "task-1", description: "Implement feature X" });
+
+		expect(response.ok).toBe(false);
+		expect(response.status).toBe("failed");
+		expect(response.error).toMatch(/did not accept the review input/);
+	});
+	it("completes a turn that started and finished before the await subscription is set up", async () => {
+		const harness = createTaskSessionServiceHarness({ resolveClineLaunchConfig: makeResolver() });
+		services.push(harness);
+		const reviewService = createReviewService(harness, createFakeEvidencePort());
+		const { host, store } = harness;
+		// The turn ends synchronously inside the dispatch: by the time the
+		// review service subscribes for the terminal state, the session is
+		// already awaiting review — the receipt must still let it resolve.
+		store.onTurn = (context) => {
+			host.emitEvent({ type: "ended", payload: { sessionId: context.sessionId, reason: "completed" } });
+			return reviewResultBlock(CLEAN_RESULT);
+		};
+
+		const response = await reviewService.startTaskReview({ taskId: "task-1", description: "Implement feature X" });
+
+		expect(response.ok).toBe(true);
+		expect(response.status).toBe("ready");
+		expect(response.result?.blocking).toBe(false);
+	});
+
+	it("completes a repair turn after the native SDK session disappears and restarts", async () => {
+		const harness = createTaskSessionServiceHarness({ resolveClineLaunchConfig: makeResolver() });
+		services.push(harness);
+		const reviewService = createReviewService(harness, createFakeEvidencePort());
+		const { host, store } = harness;
+		const originalSend = host.send.bind(host);
+		// Between the review turn and its repair round, the durable SDK
+		// session record vanishes (a native session restart). The repair
+		// send must fail "session not found" and the service must restart
+		// the native session instead of consuming stale state.
+		store.onTurn = (context) => {
+			const reply = context.turnCount === 1 ? reviewResultBlock(BLOCKED_RESULT) : reviewResultBlock(CLEAN_RESULT);
+			setImmediate(() => {
+				host.emitEvent({ type: "ended", payload: { sessionId: context.sessionId, reason: "completed" } });
+				if (context.turnCount === 1) {
+					store.records.delete(context.sessionId);
+					host.send = ((input) => {
+						if (!store.records.get(input.sessionId)) {
+							return Promise.reject(new Error(`session not found: ${input.sessionId}`));
+						}
+						return originalSend(input);
+					}) as typeof host.send;
+				}
+			});
+			return reply;
+		};
+
+		const response = await reviewService.startTaskReview({
+			taskId: "task-1",
+			description: "Implement feature X",
+			reviewPolicy: { enabled: "required", instructions: "", modelOverride: null, maxRepairRounds: 1 },
+		});
+
+		// The repair turn completes against the restarted session.
+		expect(response.ok).toBe(true);
+		expect(response.status).toBe("ready");
+		expect(response.result?.blocking).toBe(false);
+		// Initial review + the repaired (restarted) repair turn.
+		await vi.waitFor(() => expect(harness.host.sentPrompts.length).toBe(2));
+	});
+
+	it("keeps each task's review session independent when reviewing multiple tasks", async () => {
+		const harness = createTaskSessionServiceHarness({ resolveClineLaunchConfig: makeResolver() });
+		services.push(harness);
+		const reviewService = createReviewService(harness, createFakeEvidencePort());
+		scriptTurns(harness, [
+			{ reply: reviewResultBlock(BLOCKED_RESULT), reason: "completed" }, // task-1 initial
+			{ reply: reviewResultBlock(CLEAN_RESULT), reason: "completed" }, // task-1 repair
+			{ reply: reviewResultBlock(CLEAN_RESULT), reason: "completed" }, // task-2 initial
+		]);
+
+		const first = await reviewService.startTaskReview({
+			taskId: "task-1",
+			description: "Implement feature X",
+			reviewPolicy: { enabled: "required", instructions: "", modelOverride: null, maxRepairRounds: 1 },
+		});
+		const second = await reviewService.startTaskReview({ taskId: "task-2", description: "Implement feature Y" });
+
+		expect(first.status).toBe("ready");
+		expect(second.status).toBe("ready");
+		// task-2 must not inherit task-1's transcript or verdict.
+		const secondMessages = harness.service.listMessages(reviewSessionIdForTask("task-2"));
+		expect(secondMessages).toHaveLength(2);
+		expect(secondMessages.some((message) => message.content.includes("off-by-one"))).toBe(false);
+		expect(second.result?.candidateTreeHash).toBe("tree-hash-1");
 	});
 });
 

@@ -16,6 +16,15 @@
 // task. Results are bound to a candidate tree hash (the content hash of the
 // tracked + untracked worktree state) so callers can tell when later edits
 // invalidated a stored "ready" verdict.
+//
+// AR-6 — trusted baseline: the candidate change set is always measured
+// against a baseline resolved in this order: (1) the recorded starting
+// revision, (2) the preserved starting commit, (3) the merge base of the
+// task's base branch and HEAD. When none is available the handoff build
+// fails with an actionable message — an empty diff is never silently passed
+// and no base (HEAD, HEAD^) is ever guessed. A proven empty change set (a
+// known baseline with no tracked diff) remains a valid condition; untracked
+// files are always listed separately.
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -82,30 +91,55 @@ async function listUntrackedPaths(worktreePath: string): Promise<string[]> {
 	return parseNameOnlyOutput(result.stdout);
 }
 
+/** AR-6: the baseline the candidate change set is measured against. */
+interface ReviewBaseline {
+	baseCommit: string;
+	/** How the baseline was established: recorded start, preserved start, or derived merge base. */
+	source: "recorded" | "preservation" | "derived";
+}
+
+/** AR-6: true when `commit` resolves to a commit object in the worktree. */
+async function isReachableCommit(worktreePath: string, commit: string): Promise<boolean> {
+	const result = await runGit(worktreePath, ["rev-parse", "--verify", "--quiet", `${commit}^{commit}`]);
+	return result.ok;
+}
+
 /**
- * Tracked working-tree changes vs `startingCommit` (covers committed +
- * uncommitted). Falls back to HEAD when the recorded start is not reachable
- * (e.g. stale preservation record), and to HEAD-only changes when no start
- * was ever recorded.
+ * AR-6: resolves the trusted baseline the candidate change set is measured
+ * against. Resolution order: (1) the recorded starting revision, (2) the
+ * preserved starting commit, (3) the merge base of the task's base branch
+ * and HEAD. The merge-base step covers multi-commit task branches and merged
+ * base updates without assuming HEAD^ spans the change set. Returns null
+ * when no trusted baseline can be established — callers must surface an
+ * actionable review failure rather than guess a base or pass a silently
+ * empty change set.
  */
-async function listTrackedChangedPaths(worktreePath: string, startingCommit: string | null): Promise<string[]> {
+async function resolveReviewBaseline(
+	worktreePath: string,
+	taskId: string,
+	recordedStartingCommit: string | null,
+	baseRef: string | null,
+): Promise<ReviewBaseline | null> {
+	if (recordedStartingCommit && (await isReachableCommit(worktreePath, recordedStartingCommit))) {
+		return { baseCommit: recordedStartingCommit, source: "recorded" };
+	}
+	const record = await readTaskPreservationRecord(taskId).catch(() => null);
+	if (record?.startingCommit && (await isReachableCommit(worktreePath, record.startingCommit))) {
+		return { baseCommit: record.startingCommit, source: "preservation" };
+	}
 	const head = await readGitHeadInfo(worktreePath);
-	let base = startingCommit ?? null;
-	if (base) {
-		const reachable = await runGit(worktreePath, ["rev-parse", "--verify", "--quiet", `${base}^{commit}`]);
-		if (!reachable.ok) {
-			base = null;
+	if (baseRef && head.headCommit) {
+		const mergeBase = await runGit(worktreePath, ["merge-base", baseRef, "HEAD"]);
+		if (mergeBase.ok && mergeBase.stdout.trim() && (await isReachableCommit(worktreePath, mergeBase.stdout.trim()))) {
+			return { baseCommit: mergeBase.stdout.trim(), source: "derived" };
 		}
 	}
-	if (!head.headCommit && !base) {
-		// No commits and no usable baseline: nothing is tracked-changed yet.
-		return [];
-	}
-	const diffBase = base ?? (head.headCommit ? "HEAD" : null);
-	if (!diffBase) {
-		return [];
-	}
-	const diff = await runGit(worktreePath, ["diff", "--name-only", diffBase]);
+	return null;
+}
+
+/** Tracked working-tree changes vs the resolved baseline (covers committed + uncommitted). */
+async function listTrackedChangedPaths(worktreePath: string, baseCommit: string): Promise<string[]> {
+	const diff = await runGit(worktreePath, ["diff", "--name-only", baseCommit]);
 	if (!diff.ok) {
 		return [];
 	}
@@ -113,25 +147,26 @@ async function listTrackedChangedPaths(worktreePath: string, startingCommit: str
 }
 
 /**
- * B-6.3: the unified diff vs the recorded starting revision (tracked changes,
- * committed + uncommitted). Uses the same base-fallback as the handoff's
- * changed-path listing so the prompt's diff always matches the artifact's
- * changed paths. Empty string when there is no usable base or diff.
+ * B-6.3 / AR-6: the unified diff vs the trusted baseline (tracked changes,
+ * committed + uncommitted). Uses the same baseline resolution as the
+ * handoff's changed-path listing so the prompt's diff always matches the
+ * artifact's changed paths. Returns an empty string only when no trusted
+ * baseline exists (the handoff build fails with an actionable error) or the
+ * change set is proven empty against the baseline.
  */
-export async function extractReviewDiff(worktreePath: string, startingCommit: string | null): Promise<string> {
-	const head = await readGitHeadInfo(worktreePath);
-	let base = startingCommit ?? null;
-	if (base) {
-		const reachable = await runGit(worktreePath, ["rev-parse", "--verify", "--quiet", `${base}^{commit}`]);
-		if (!reachable.ok) {
-			base = null;
-		}
-	}
-	const diffBase = base ?? (head.headCommit ? "HEAD" : null);
-	if (!diffBase) {
+export async function extractReviewDiff(
+	worktreePath: string,
+	taskId: string,
+	startingCommit: string | null,
+	baseRef: string | null = null,
+): Promise<string> {
+	const baseline = await resolveReviewBaseline(worktreePath, taskId, startingCommit, baseRef);
+	if (!baseline) {
+		// No trusted baseline: never guess one (HEAD/HEAD^) and never present
+		// a partial diff as the full change set.
 		return "";
 	}
-	const diff = await runGit(worktreePath, ["diff", diffBase]);
+	const diff = await runGit(worktreePath, ["diff", baseline.baseCommit]);
 	if (!diff.ok) {
 		return "";
 	}
@@ -213,6 +248,8 @@ export interface BuildReviewHandoffInput {
 	} | null;
 	/** Recorded starting revision; falls back to the task preservation record. */
 	startingCommit?: string | null;
+	/** AR-6: the task's base branch, used to derive a baseline when no recorded start is usable. */
+	baseRef?: string | null;
 	/** Timestamp injection for deterministic artifacts (tests). */
 	timestampMs?: number;
 }
@@ -221,19 +258,28 @@ export interface BuildReviewHandoffInput {
  * B-6.1: builds the implementation handoff for a fresh review session.
  * Reads the live worktree state (never trusting the implementation
  * session's self-report), fingerprints plan documents, and records the
- * baseline the change set is measured against.
+ * baseline the change set is measured against. AR-6: when no trusted
+ * baseline can be resolved (recorded start, preserved start, or derived
+ * base) this throws with an actionable message instead of building an
+ * artifact with a guessed base or a silently empty change set.
  */
 export async function buildReviewHandoffArtifact(
 	input: BuildReviewHandoffInput,
 ): Promise<RuntimeReviewHandoffArtifact> {
 	const head = await readGitHeadInfo(input.worktreePath);
-	let startingCommit = input.startingCommit ?? null;
-	if (!startingCommit) {
-		const record = await readTaskPreservationRecord(input.taskId).catch(() => null);
-		startingCommit = record?.startingCommit ?? null;
+	const baseline = await resolveReviewBaseline(
+		input.worktreePath,
+		input.taskId,
+		input.startingCommit ?? null,
+		input.baseRef ?? null,
+	);
+	if (!baseline) {
+		throw new Error(
+			"No trusted starting revision for the review change set: the recorded starting commit is missing or unreachable, no preserved starting commit is available, and no base branch could be derived in the worktree. Re-establish the task's base branch or preservation record, then start the review again.",
+		);
 	}
 	const [changedPaths, untrackedPaths] = await Promise.all([
-		listTrackedChangedPaths(input.worktreePath, startingCommit),
+		listTrackedChangedPaths(input.worktreePath, baseline.baseCommit),
 		listUntrackedPaths(input.worktreePath),
 	]);
 	const planDocuments = await Promise.all(
@@ -244,7 +290,7 @@ export async function buildReviewHandoffArtifact(
 		taskId: input.taskId,
 		worktreePath: input.worktreePath,
 		repoPath: input.repoPath,
-		startingCommit,
+		startingCommit: baseline.baseCommit,
 		latestCommit: head.headCommit,
 		changedPaths,
 		untrackedPaths,
