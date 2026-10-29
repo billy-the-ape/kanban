@@ -83,8 +83,9 @@ diagnostics download UI; no new UI was added.
 - Custom providers without a resolvable base-URL host are not tracked for the raw
   stage (hook stages still apply).
 - When several sessions share one provider host, requests cannot always be
-  attributed to a session; the evidence then correlates by tool-call id and marks
-  repeated/ambiguous captures explicitly instead of guessing.
+  attributed to a session. Such captures are never used for a definitive verdict:
+  they are marked `ambiguous` (with the unattributed arguments not listed, to
+  keep task isolation), and the affected call's comparison is `not-comparable`.
 - Upstream ambiguity: `absent-in-both` cannot distinguish a model omission from an
   inference-server tool-parser or gateway modification. It is labeled upstream,
   never as proven model error.

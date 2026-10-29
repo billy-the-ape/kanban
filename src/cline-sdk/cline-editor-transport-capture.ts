@@ -132,7 +132,10 @@ export class EditorArgumentFragmentExtractor {
 		}
 	}
 
-	private handleLine(line: string): void {
+	private handleLine(rawLine: string): void {
+		// SSE framing may be CRLF: strip one trailing CR so "data: [DONE]\r"
+		// and JSON payloads still parse identically to LF framing.
+		const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
 		if (line.length === 0) {
 			return;
 		}
@@ -193,7 +196,7 @@ export class EditorArgumentFragmentExtractor {
 				if (typeof record.id === "string" && record.id.length > 0) {
 					state.id = record.id;
 				}
-				if (typeof record.function?.name === "string") {
+				if (typeof record.function?.name === "string" && record.function.name.length > 0) {
 					state.name = record.function.name;
 				}
 				const fragment = record.function?.arguments;
@@ -222,6 +225,13 @@ export class EditorArgumentFragmentExtractor {
 
 	/** Editor tool-call captures keyed by index, in index order. */
 	finish(): Array<{ index: number; id: string | null; name: string | null; fragments: string[]; truncated: boolean }> {
+		// A final "data:" line without a trailing newline is still a complete
+		// SSE event for our purposes; process any residual buffer.
+		if (this.lineBuffer.length > 0) {
+			const residual = this.lineBuffer;
+			this.lineBuffer = "";
+			this.handleLine(residual);
+		}
 		const result: Array<{
 			index: number;
 			id: string | null;
@@ -491,6 +501,18 @@ export function initEditorTransportCapture(): EditorTransportCapture | null {
 	return capture;
 }
 
+/**
+ * TransformStream init shape with an optional `cancel` hook. The repo's Node
+ * type declarations do not expose the `Transformer` init type globally, and
+ * the typed `cancel` member is version-sensitive; Node >= 22 honors `cancel`
+ * at runtime regardless.
+ */
+interface CancellableTransformer {
+	transform(chunk: Uint8Array, controller: TransformStreamDefaultController<Uint8Array>): void;
+	flush?(controller: TransformStreamDefaultController<Uint8Array>): void;
+	cancel?(reason?: unknown): void;
+}
+
 function observeSseResponse(
 	response: Response,
 	init: RequestInit | undefined,
@@ -500,7 +522,9 @@ function observeSseResponse(
 	const requestId = `evt-${++requestCounter}`;
 	const requestStartedAt = new Date().toISOString();
 	const meta = extractRequestMeta(typeof init?.body === "string" ? init.body : undefined);
-	const attribution = sessions.length === 1 ? { taskId: sessions[0].taskId, sessionId: sessions[0].sessionId } : null;
+	const [onlySession] = sessions;
+	const attribution =
+		sessions.length === 1 && onlySession ? { taskId: onlySession.taskId, sessionId: onlySession.sessionId } : null;
 	const state: RequestCaptureState = {
 		requestId,
 		host,
@@ -517,17 +541,6 @@ function observeSseResponse(
 
 	let onAbort: (() => void) | null = null;
 	const signal = (init as { signal?: AbortSignal } | undefined)?.signal;
-	if (signal) {
-		onAbort = () => {
-			state.aborted = true;
-		};
-		if (signal.aborted) {
-			state.aborted = true;
-		} else {
-			signal.addEventListener("abort", onAbort, { once: true });
-		}
-	}
-
 	const decoder = new TextDecoder();
 	const emit = () => {
 		if (state.emitted) {
@@ -577,14 +590,26 @@ function observeSseResponse(
 		}
 	};
 
+	if (signal) {
+		onAbort = () => {
+			state.aborted = true;
+			// Emit even if the runtime never invokes the transform's cancel
+			// callback, so aborted streams are still recorded.
+			emit();
+		};
+		if (signal.aborted) {
+			state.aborted = true;
+			emit();
+		} else {
+			signal.addEventListener("abort", onAbort, { once: true });
+		}
+	}
+
 	// Cancellation (session stop/abort, client disconnect) fires the transform's
 	// cancel callback; the stream close fires flush. Either way exactly one
 	// record emission happens, and the bytes reaching the consumer are always
 	// the original unmodified chunks.
-	const markInterrupted = () => {
-		emit();
-	};
-	const transform = new TransformStream<Uint8Array, Uint8Array>({
+	const transform: CancellableTransformer = {
 		transform(chunk, controller) {
 			try {
 				const text = decoder.decode(chunk, { stream: true });
@@ -599,14 +624,14 @@ function observeSseResponse(
 			emit();
 		},
 		cancel() {
-			markInterrupted();
+			emit();
 		},
-	});
+	};
 	const body = response.body;
 	if (!body) {
 		return response;
 	}
-	const transformed = body.pipeThrough(transform);
+	const transformed = body.pipeThrough(new TransformStream(transform));
 
 	return new Response(transformed, {
 		status: response.status,

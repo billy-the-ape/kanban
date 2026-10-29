@@ -280,7 +280,7 @@ describe("collectTaskEditorCallEvidence", () => {
 		expect(evidence.unmatchedRawCaptures).toBe(0);
 	});
 
-	it("attributes un-attributed raw captures to matching tool-call ids (concurrent sessions)", () => {
+	it("treats a single un-attributed raw capture as ambiguous (shared provider host)", () => {
 		const lines = [
 			rawLine({
 				taskId: null,
@@ -294,7 +294,38 @@ describe("collectTaskEditorCallEvidence", () => {
 			knownEditorToolCallIds: ["call_editor_1"],
 			lines,
 		});
-		expect(evidence.calls[0]?.raw.status).toBe("captured");
-		expect(evidence.calls[0]?.comparison).toBe("present-in-both");
+		const call = evidence.calls[0];
+		// Without session attribution the id match alone is not conclusive.
+		expect(call?.raw.status).toBe("ambiguous");
+		expect(call?.raw.complete).toBe(false);
+		expect(call?.raw.records).toHaveLength(0);
+		expect(call?.raw.note).toContain("none could be attributed");
+		expect(call?.comparison).toBe("not-comparable");
+	});
+
+	it("does not let an un-attributed cross-task capture change the verdict or leak its arguments", () => {
+		const otherTaskArguments = '{"path":"/tmp/other-task-file.txt", "old_text": "secret", "new_text": "other"}';
+		const lines = [
+			rawLine({ assembledArguments: '{"path":"/tmp/file.txt", "old_text": "old", "new_text": "new"}' }),
+			rawLine({
+				taskId: "task-other",
+				sessionId: null,
+				requestId: "req-other",
+				assembledArguments: otherTaskArguments,
+			}),
+			hookLine("model-call", editorInput({ old_text: "old" })),
+		];
+		const evidence = collectTaskEditorCallEvidence({
+			sessionId: SESSION_ID,
+			knownEditorToolCallIds: ["call_editor_1"],
+			lines,
+		});
+		const call = evidence.calls[0];
+		expect(call?.raw.status).toBe("ambiguous");
+		expect(call?.raw.complete).toBe(false);
+		// Only the record attributed to this session is listed.
+		expect(call?.raw.records).toHaveLength(1);
+		expect(JSON.stringify(evidence)).not.toContain(otherTaskArguments);
+		expect(call?.comparison).toBe("not-comparable");
 	});
 });

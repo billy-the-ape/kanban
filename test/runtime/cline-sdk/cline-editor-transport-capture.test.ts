@@ -482,6 +482,198 @@ describe("raw editor transport capture (real fetch, controlled SSE)", () => {
 		expect(records[0]?.streamStatus).toBe("interrupted");
 	});
 
+	it("parses CRLF-framed SSE exactly like LF framing", async () => {
+		const fullArguments = '{"path":"/tmp/crlf.txt","old_text":"x","new_text":"y"}';
+		const lf =
+			sseLine({
+				choices: [
+					{
+						index: 0,
+						delta: {
+							role: "assistant",
+							content: "",
+							tool_calls: [{ index: 0, id: "call_crlf", type: "function", function: { name: "editor" } }],
+						},
+					},
+				],
+			}) +
+			sseLine({
+				choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: fullArguments } }] } }],
+			}) +
+			sseLine({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }) +
+			"data: [DONE]\n\n";
+		// Same stream with CRLF line endings (e.g. sse-starlette-style servers).
+		const crlf = lf.replace(/\n/g, "\r\n");
+		nextHandler = (_req, res) => {
+			res.writeHead(200, { "content-type": "text/event-stream" });
+			res.write(crlf);
+			res.end();
+		};
+		const response = await fetch(`${baseUrl}/chat/completions`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: editorToolBody(),
+		});
+		expect(await response.text()).toBe(crlf);
+		const records = rawRecords();
+		expect(records).toHaveLength(1);
+		expect(records[0]?.toolCallId).toBe("call_crlf");
+		expect(records[0]?.assembledArguments).toBe(fullArguments);
+		expect(records[0]?.streamStatus).toBe("completed");
+		expect(records[0]?.parseErrors).toBe(0);
+	});
+
+	it("processes a final data line that has no trailing newline", async () => {
+		const fullArguments = '{"path":"/tmp/residual.txt","old_text":"a","new_text":"b"}';
+		nextHandler = (_req, res) => {
+			res.writeHead(200, { "content-type": "text/event-stream" });
+			res.write(
+				sseLine({
+					choices: [
+						{
+							index: 0,
+							delta: {
+								role: "assistant",
+								content: "",
+								tool_calls: [{ index: 0, id: "call_res", type: "function", function: { name: "editor" } }],
+							},
+						},
+					],
+				}),
+			);
+			// Final event without a terminating newline.
+			res.write(
+				`data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: fullArguments } }] } }] })}`,
+			);
+			res.end();
+		};
+		const response = await fetch(`${baseUrl}/chat/completions`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: editorToolBody(),
+		});
+		await response.text();
+		const records = rawRecords();
+		expect(records).toHaveLength(1);
+		expect(records[0]?.toolCallId).toBe("call_res");
+		expect(records[0]?.assembledArguments).toBe(fullArguments);
+		expect(records[0]?.parseErrors).toBe(0);
+		expect(records[0]?.streamStatus).toBe("ended-early");
+	});
+
+	it("keeps the tracked name when continuation deltas carry empty id and name", async () => {
+		const fullArguments = '{"path":"/tmp/n.txt","old_text":"a","new_text":"b"}';
+		const fragmentOne = fullArguments.slice(0, 20);
+		const fragmentTwo = fullArguments.slice(20);
+		nextHandler = (_req, res) => {
+			res.writeHead(200, { "content-type": "text/event-stream" });
+			res.write(
+				sseLine({
+					choices: [
+						{
+							index: 0,
+							delta: {
+								role: "assistant",
+								content: "",
+								tool_calls: [{ index: 0, id: "call_noname", type: "function", function: { name: "editor" } }],
+							},
+						},
+					],
+				}),
+			);
+			// Some gateways repeat empty id/name on every continuation delta.
+			res.write(
+				sseLine({
+					choices: [
+						{
+							index: 0,
+							delta: { tool_calls: [{ index: 0, id: "", function: { name: "", arguments: fragmentOne } }] },
+						},
+					],
+				}),
+			);
+			res.write(
+				sseLine({
+					choices: [
+						{
+							index: 0,
+							delta: { tool_calls: [{ index: 0, id: "", function: { name: "", arguments: fragmentTwo } }] },
+						},
+					],
+				}),
+			);
+			res.write(sseLine({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }));
+			res.write("data: [DONE]\n\n");
+			res.end();
+		};
+		const response = await fetch(`${baseUrl}/chat/completions`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: editorToolBody(),
+		});
+		await response.text();
+		const records = rawRecords();
+		expect(records).toHaveLength(1);
+		expect(records[0]?.toolCallId).toBe("call_noname");
+		expect(records[0]?.assembledArguments).toBe(fullArguments);
+		expect(records[0]?.streamStatus).toBe("completed");
+	});
+
+	it("emits an interrupted record when the consumer cancels the body stream", async () => {
+		nextHandler = (_req, res) => {
+			res.writeHead(200, { "content-type": "text/event-stream" });
+			res.write(
+				sseLine({
+					choices: [
+						{
+							index: 0,
+							delta: {
+								role: "assistant",
+								content: "",
+								tool_calls: [{ index: 0, id: "call_cancel", type: "function", function: { name: "editor" } }],
+							},
+						},
+					],
+				}),
+			);
+			res.write(
+				sseLine({
+					choices: [
+						{
+							index: 0,
+							delta: {
+								tool_calls: [
+									{ index: 0, function: { arguments: '{"path":"/tmp/c.txt","old_text":"c","new_text":"d"}' } },
+								],
+							},
+						},
+					],
+				}),
+			);
+			// Keep the connection open; the consumer cancels the reader instead.
+			setTimeout(() => {
+				res.end();
+			}, 5_000);
+		};
+		const response = await fetch(`${baseUrl}/chat/completions`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: editorToolBody(),
+		});
+		expect(response.body).not.toBeNull();
+		const reader = response.body?.getReader();
+		expect(reader).not.toBeNull();
+		// Drain the enqueued chunks, then cancel: the transform's cancel must
+		// fire (or the record would never be emitted).
+		await reader?.read();
+		await reader?.cancel();
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		const records = rawRecords();
+		expect(records).toHaveLength(1);
+		expect(records[0]?.toolCallId).toBe("call_cancel");
+		expect(records[0]?.streamStatus).toBe("interrupted");
+	});
+
 	it("truncates oversized assembled arguments and flags them explicitly", async () => {
 		const bigText = "x".repeat(40_000);
 		const editorArgs = `{"path":"/tmp/big.txt", "new_text": "${bigText}"}`;

@@ -288,6 +288,9 @@ export function collectTaskEditorCallEvidence(input: {
 		}
 		let raw: EditorRawStageEvidence;
 		let rawComplete = false;
+		const attributedMatches = matched.filter((record) => record.sessionId !== null);
+		const unattributedMatches = matched.length - attributedMatches.length;
+		const [singleRecord] = matched;
 		if (matched.length === 0) {
 			raw = {
 				status: sessionRawRecords.length === 0 && unattributedRawRecords.length === 0 ? "unavailable" : "unmatched",
@@ -298,20 +301,30 @@ export function collectTaskEditorCallEvidence(input: {
 				records: [],
 				complete: false,
 			};
-		} else if (matched.length === 1) {
-			const record = matched[0];
-			rawComplete = !record.assembledTruncated && record.streamStatus === "completed" && record.parseErrors === 0;
+		} else if (matched.length === 1 && unattributedMatches === 0 && singleRecord) {
+			rawComplete =
+				!singleRecord.assembledTruncated &&
+				singleRecord.streamStatus === "completed" &&
+				singleRecord.parseErrors === 0;
 			raw = {
 				status: "captured",
-				note: rawComplete ? null : describeRawIncompleteness(record),
-				records: [record],
+				note: rawComplete ? null : describeRawIncompleteness(singleRecord),
+				records: [singleRecord],
 				complete: rawComplete,
 			};
 		} else {
+			// Unattributed captures (more than one session on a provider host)
+			// match by tool-call id alone. Listing or trusting them would risk
+			// a wrong verdict and another task's file contents leaking into this
+			// export, so they are counted but never listed.
+			const note =
+				attributedMatches.length === 0
+					? `${matched.length} raw capture(s) matched this tool-call id but none could be attributed to this session (multiple sessions shared the provider host); unattributed arguments are not listed`
+					: `${matched.length} raw captures share this tool-call id (retry, id reuse, or an unattributed capture on a shared provider host); only captures attributed to this session are listed`;
 			raw = {
 				status: "ambiguous",
-				note: `${matched.length} raw captures share this tool-call id (retry or id reuse across requests); each is listed`,
-				records: matched,
+				note,
+				records: attributedMatches,
 				complete: false,
 			};
 		}
