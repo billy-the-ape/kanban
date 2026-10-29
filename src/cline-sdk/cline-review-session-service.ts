@@ -1,4 +1,4 @@
-// B-6.2 / B-6.4 / B-6.5 / B-6.7 — bounded, fresh-context review sessions.
+// B-6.2 / B-6.4 / B-6.5 / B-6.7 / B-6.9 — bounded, fresh-context review sessions.
 //
 // A review session is a separate, bounded Cline session that reviews one task's
 // change set. It starts from a fresh context: no implementation transcript —
@@ -13,6 +13,15 @@
 // task's working session). The git/FS work (handoff, diff, tree hash, durable
 // artifacts) is abstracted behind ClineReviewEvidencePort so the orchestration
 // is unit-testable without a live worktree.
+//
+// AR-6 — outcome correlation: the session service dispatches turns
+// fire-and-forget and can reject an input outright, so every dispatched turn
+// carries a receipt (the transcript's user message holding its accepted
+// input). A turn's terminal state is only consumed after its receipt proves
+// the input was accepted — an already-terminal prior summary is never
+// completion evidence for a newer turn, and the structured result is extracted
+// from that turn's own messages only (an inherited earlier block is a parse
+// failure, never a fallback).
 import type {
 	RuntimeReviewHandoffArtifact,
 	RuntimeReviewOutcomeFile,
@@ -68,6 +77,10 @@ export { baseTaskIdForReviewSessionId, reviewSessionIdForTask };
 const DEFAULT_MAX_REPAIR_ROUNDS = 2;
 /** B-6: a single review/repair turn that runs longer than this is stopped and reported as failed. */
 const DEFAULT_REVIEW_TURN_TIMEOUT_MS = 30 * 60_000;
+/** AR-6: bounded settle for a turn's reply landing in the transcript after the terminal state. */
+const TURN_RESULT_SETTLE_MS = 5_000;
+/** AR-6: poll interval while settling a turn's reply into the transcript. */
+const TURN_RESULT_SETTLE_POLL_MS = 25;
 
 /** B-6: the evidence a review run needs, abstracted for unit testing. */
 export interface ClineReviewEvidencePort {
@@ -77,7 +90,17 @@ export interface ClineReviewEvidencePort {
 	buildHandoffArtifact(input: BuildReviewHandoffInput): Promise<RuntimeReviewHandoffArtifact>;
 	persistHandoff(artifact: RuntimeReviewHandoffArtifact): Promise<string>;
 	readHandoff(taskId: string): Promise<RuntimeReviewHandoffArtifact | null>;
-	extractDiff(worktreePath: string, startingCommit: string | null): Promise<string>;
+	/**
+	 * AR-6: derives the review diff against the trusted baseline (recorded
+	 * start, preserved start, or the task's base branch) — the same resolution
+	 * as the handoff artifact, so the prompt's diff matches its changed paths.
+	 */
+	extractDiff(
+		worktreePath: string,
+		taskId: string,
+		startingCommit: string | null,
+		baseRef: string | null,
+	): Promise<string>;
 	computeTreeHash(worktreePath: string): Promise<string | null>;
 	persistOutcome(taskId: string, outcome: RuntimeReviewOutcomeFile): Promise<string>;
 	readOutcome(taskId: string): Promise<RuntimeReviewOutcomeFile | null>;
@@ -144,7 +167,8 @@ function createDefaultReviewEvidencePort(workspaceId: string, repoPath: string):
 		buildHandoffArtifact: (input) => buildReviewHandoffArtifact(input),
 		persistHandoff: (artifact) => persistReviewHandoff(artifact),
 		readHandoff: (taskId) => readReviewHandoff(taskId),
-		extractDiff: (worktreePath, startingCommit) => extractReviewDiff(worktreePath, startingCommit),
+		extractDiff: (worktreePath, taskId, startingCommit, baseRef) =>
+			extractReviewDiff(worktreePath, taskId, startingCommit, baseRef),
 		computeTreeHash: (worktreePath) => computeCandidateTreeHash(worktreePath),
 		persistOutcome: (taskId, outcome) => persistReviewOutcome(taskId, outcome),
 		readOutcome: (taskId) => readReviewOutcome(taskId),
@@ -158,11 +182,17 @@ function toErrorMessage(error: unknown): string {
 	return "Unknown error";
 }
 
-/** Extracts the fenced `kanban-review-result` JSON body from a message (null when absent). */
-function extractReviewResultBlock(text: string): string | null {
-	const match = text.match(/```kanban-review-result[ \t]*\r?\n([\s\S]*?)```/);
-	const body = match?.[1]?.trim();
-	return body && body.length > 0 ? body : null;
+/** Extracts every fenced `kanban-review-result` JSON body from a message, in order. */
+function extractReviewResultBlocks(text: string): string[] {
+	const blocks: string[] = [];
+	const pattern = /```kanban-review-result[ \t]*\r?\n([\s\S]*?)```/g;
+	for (const match of text.matchAll(pattern)) {
+		const body = match[1]?.trim();
+		if (body && body.length > 0) {
+			blocks.push(body);
+		}
+	}
+	return blocks;
 }
 
 /** A terminal summary is a failure when the session was interrupted or the agent errored. */
@@ -178,6 +208,40 @@ function terminalFailureReason(summary: RuntimeTaskSessionSummary): string | nul
 		return "The review session was interrupted before it produced a result.";
 	}
 	return null;
+}
+
+/**
+ * AR-6: binds a dispatched review/repair turn to its accepted input. The
+ * session service appends the accepted input as a user message before
+ * dispatching the turn, so the receipt points at that exact message.
+ */
+interface ReviewTurnReceipt {
+	sessionId: string;
+	/** Id of the user message holding this turn's accepted input. */
+	userMessageId: string;
+}
+
+/**
+ * AR-6: locates the user message holding a turn's accepted input. Throws when
+ * the dispatch did not record an accepted input (a rejected send or a start
+ * that dispatched nothing) — an unsuccessful dispatch must fail explicitly,
+ * never resolve against an older turn's terminal summary.
+ */
+function captureTurnReceipt(
+	listMessages: (taskId: string) => Array<{ id: string; role: string }>,
+	sessionId: string,
+	messageCountBefore: number,
+): ReviewTurnReceipt {
+	const messages = listMessages(sessionId);
+	for (let index = messages.length - 1; index >= messageCountBefore; index -= 1) {
+		const message = messages[index];
+		if (message && message.role === "user") {
+			return { sessionId, userMessageId: message.id };
+		}
+	}
+	throw new Error(
+		"The session did not accept the review input (no user message was recorded for the dispatched turn).",
+	);
 }
 
 /**
@@ -467,6 +531,9 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 		const agentNotes = input.agentNotes !== undefined ? input.agentNotes : selfReport.agentNotes;
 
 		// B-6.1: build + persist the handoff artifact (the fresh-context briefing).
+		// AR-6: the handoff must be built from a trusted starting/base commit
+		// (recorded, preserved, or derived from the base branch); a missing
+		// baseline fails here with an actionable message, never an empty diff.
 		let artifact: RuntimeReviewHandoffArtifact;
 		try {
 			artifact = await this.evidence.buildHandoffArtifact({
@@ -477,6 +544,7 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 				planDocumentPaths,
 				agentNotes,
 				startingCommit: input.startingCommit ?? null,
+				baseRef,
 			});
 		} catch (error) {
 			return this.failureResponse(
@@ -488,7 +556,11 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 		await this.evidence.persistHandoff(artifact).catch(() => {});
 
 		// B-6.3: initial prompt = diff vs the starting revision + the briefing.
-		const diff = await this.evidence.extractDiff(worktreePath, artifact.startingCommit).catch(() => "");
+		// AR-6: the diff uses the same baseline resolution as the artifact so
+		// the prompt's change set always matches the artifact's changed paths.
+		const diff = await this.evidence
+			.extractDiff(worktreePath, taskId, artifact.startingCommit, baseRef)
+			.catch(() => "");
 		const initialPrompt = buildReviewInitialPrompt({
 			artifact,
 			diff,
@@ -532,8 +604,11 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 		}
 
 		// B-6.2: a fresh, bounded review session (own session id + context).
-		const startBoundedSession = async (id: string, prompt: string): Promise<void> => {
+		// AR-6: the start returns the turn receipt (the accepted input's user
+		// message); a start that records no accepted input fails explicitly.
+		const startBoundedSession = async (id: string, prompt: string): Promise<ReviewTurnReceipt> => {
 			await this.resetSession(id);
+			const messageCountBefore = this.sessionService.listMessages(id).length;
 			await this.sessionService.startTaskSession({
 				taskId: id,
 				cwd: worktreePath,
@@ -549,9 +624,11 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 				compaction: buildClineCompactionConfig({ launchConfig }),
 				compactionSafetyMarginTokens: launchConfig.compactionSettings?.safetyMarginTokens,
 			});
+			return captureTurnReceipt(this.sessionService.listMessages.bind(this.sessionService), id, messageCountBefore);
 		};
+		let firstReceipt: ReviewTurnReceipt;
 		try {
-			await startBoundedSession(sessionId, initialPrompt);
+			firstReceipt = await startBoundedSession(sessionId, initialPrompt);
 		} catch (error) {
 			return this.failureResponse(
 				sessionId,
@@ -562,11 +639,15 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 		}
 
 		// B-6.4: the session service dispatches turns fire-and-forget, so await the
-		// terminal state before inspecting the result.
+		// terminal state before inspecting the result. AR-6: only reached after
+		// the receipt proves the input was accepted, so an older terminal
+		// summary can never stand in for this turn's completion.
 		const firstTurn = await this.awaitTurn(sessionId);
 		let sessionFailed = firstTurn.failed;
 		let failureReason = firstTurn.failureReason;
-		let result: RuntimeReviewResultOutput | null = sessionFailed ? null : this.extractResult(sessionId);
+		let result: RuntimeReviewResultOutput | null = sessionFailed
+			? null
+			: await this.extractTurnResult(sessionId, firstReceipt);
 		// B-7.5: the repair-round budget is shared between review repairs and verification repairs.
 		let round = 0;
 
@@ -580,7 +661,27 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 					round,
 					maxRounds: reviewPolicy.maxRepairRounds,
 				});
-				await this.sessionService.sendTaskSessionInput(sessionId, repairPrompt);
+				// AR-6: a rejected send (null) or a dispatch that records no
+				// accepted input fails explicitly — the turn is never awaited
+				// against an older terminal summary.
+				const messageCountBefore = this.sessionService.listMessages(sessionId).length;
+				const accepted = await this.sessionService.sendTaskSessionInput(sessionId, repairPrompt);
+				let repairReceipt: ReviewTurnReceipt;
+				try {
+					repairReceipt = captureTurnReceipt(
+						this.sessionService.listMessages.bind(this.sessionService),
+						sessionId,
+						messageCountBefore,
+					);
+				} catch (error) {
+					sessionFailed = true;
+					failureReason =
+						accepted === null
+							? "The repair input was not accepted by the review session; no repair turn was dispatched."
+							: toErrorMessage(error);
+					result = null;
+					break;
+				}
 				const turn = await this.awaitTurn(sessionId);
 				if (turn.failed) {
 					sessionFailed = true;
@@ -588,7 +689,10 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 					result = null;
 					break;
 				}
-				result = this.extractResult(sessionId);
+				// AR-6: the result comes from this turn's own messages only; an
+				// inherited block from an earlier turn is a parse failure, not a
+				// fallback (this is what prevented the repeated-finding loop).
+				result = await this.extractTurnResult(sessionId, repairReceipt);
 				if (!result) {
 					break;
 				}
@@ -716,8 +820,9 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 	}
 
 	/**
-	 * Awaits the end of the current turn. A turn that exceeds the turn timeout
-	 * is stopped and reported as a failure instead of hanging the caller.
+	 * Awaits the end of the turn whose input was accepted (see the turn
+	 * receipt). A turn that exceeds the turn timeout is stopped and reported
+	 * as a failure instead of hanging the caller.
 	 */
 	private async awaitTurn(sessionId: string): Promise<ReviewTurnOutcome> {
 		const summary = await this.waitForTerminalState(sessionId, this.turnTimeoutMs);
@@ -735,9 +840,12 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 
 	/**
 	 * Resolves once the session leaves the running state (null on timeout).
-	 * Checks the current summary first so a turn that finished before the
-	 * subscription is set up is not missed (the session service dispatches
-	 * turns fire-and-forget).
+	 * Checks the current summary first so a turn that started and finished
+	 * before the subscription is set up is not missed (the session service
+	 * dispatches turns fire-and-forget). AR-6: this is only entered after the
+	 * turn receipt proves the dispatched input was accepted, so an
+	 * already-terminal summary from an older turn can never be consumed as
+	 * this turn's completion.
 	 */
 	private async waitForTerminalState(sessionId: string, timeoutMs: number): Promise<RuntimeTaskSessionSummary | null> {
 		const current = this.sessionService.getSummary(sessionId);
@@ -761,31 +869,82 @@ class ClineReviewSessionServiceImpl implements ClineReviewSessionService {
 	}
 
 	/**
-	 * B-6.4: extracts the reviewer's structured result. The most recent assistant
-	 * message containing a fenced block is authoritative — a missing or malformed
-	 * block is a parse failure (never a pass), and it never falls back to an older block.
+	 * AR-6: extracts the turn's structured result, waiting (bounded) for the
+	 * turn's reply to land in the transcript when the terminal state was
+	 * observed before the reply was appended. A turn whose reply carries no
+	 * result block of its own is a parse failure.
 	 */
-	private extractResult(sessionId: string): RuntimeReviewResultOutput | null {
+	private async extractTurnResult(
+		sessionId: string,
+		receipt: ReviewTurnReceipt,
+	): Promise<RuntimeReviewResultOutput | null> {
+		const deadline = Date.now() + TURN_RESULT_SETTLE_MS;
+		for (;;) {
+			const result = this.extractResult(sessionId, receipt);
+			if (result !== null) {
+				return result;
+			}
+			const messages = this.sessionService.listMessages(sessionId);
+			const turnStart = messages.findIndex((message) => message.id === receipt.userMessageId);
+			const replyLanded =
+				turnStart >= 0 && messages.slice(turnStart + 1).some((message) => message.role === "assistant");
+			if (replyLanded || Date.now() >= deadline) {
+				// The reply has landed without a block (a definitive parse
+				// failure), or the settle window expired.
+				return null;
+			}
+			await new Promise((resolve) => setTimeout(resolve, TURN_RESULT_SETTLE_POLL_MS));
+		}
+	}
+
+	/**
+	 * AR-6: structured result from the turn's own messages only. The last
+	 * assistant block after the accepted input is authoritative: a missing or
+	 * malformed block is a parse failure (never a pass, never a fallback to an
+	 * inherited earlier block), and multiple distinct result blocks in one
+	 * turn is an explicit parse failure rather than an arbitrary choice.
+	 */
+	private extractResult(sessionId: string, receipt: ReviewTurnReceipt): RuntimeReviewResultOutput | null {
 		const messages = this.sessionService.listMessages(sessionId);
-		for (let index = messages.length - 1; index >= 0; index -= 1) {
+		const turnStart = messages.findIndex((message) => message.id === receipt.userMessageId);
+		if (turnStart < 0) {
+			return null;
+		}
+		const blocks: string[] = [];
+		for (let index = turnStart + 1; index < messages.length; index += 1) {
 			const message = messages[index];
 			if (!message || message.role !== "assistant") {
 				continue;
 			}
-			const block = extractReviewResultBlock(message.content);
-			if (block === null) {
-				continue;
-			}
-			let parsedJson: unknown;
+			blocks.push(...extractReviewResultBlocks(message.content));
+		}
+		if (blocks.length === 0) {
+			return null;
+		}
+		const finalBlock = blocks[blocks.length - 1];
+		const normalized = (block: string): string | null => {
 			try {
-				parsedJson = JSON.parse(block);
+				return JSON.stringify(JSON.parse(block));
 			} catch {
 				return null;
 			}
-			const parsed = runtimeReviewResultOutputSchema.safeParse(parsedJson);
-			return parsed.success ? parsed.data : null;
+		};
+		const finalNormalized = normalized(finalBlock);
+		for (const block of blocks.slice(0, -1)) {
+			const priorNormalized = normalized(block);
+			if (priorNormalized !== null && finalNormalized !== null && priorNormalized !== finalNormalized) {
+				// Contradictory result blocks in one turn: no arbitrary choice.
+				return null;
+			}
 		}
-		return null;
+		let parsedJson: unknown;
+		try {
+			parsedJson = JSON.parse(finalBlock);
+		} catch {
+			return null;
+		}
+		const parsed = runtimeReviewResultOutputSchema.safeParse(parsedJson);
+		return parsed.success ? parsed.data : null;
 	}
 
 	private buildOutcome(input: {
