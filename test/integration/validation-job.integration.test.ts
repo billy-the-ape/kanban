@@ -7,9 +7,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { type AgentModel, AgentRuntime } from "@clinebot/agents";
 import { describe, expect, it } from "vitest";
-
-import { type ValidationJobRecord, ValidationJobService } from "../../src/cline-sdk/validation-job-service";
+import { createClineToolLoopGuard } from "../../src/cline-sdk/cline-tool-loop-guard";
+import { ValidationJobService } from "../../src/cline-sdk/validation-job-service";
+import { createValidationJobTool } from "../../src/cline-sdk/validation-job-tool";
 
 describe.runIf(process.env.KANBAN_AR3_INTEGRATION === "1")("AR-3 validation job lifecycle (real time)", () => {
 	let originalHome: string | undefined;
@@ -44,18 +46,36 @@ describe.runIf(process.env.KANBAN_AR3_INTEGRATION === "1")("AR-3 validation job 
 			// The job is observable while running...
 			const running = await service.getJob(jobId);
 			expect(running?.state).toBe("running");
-			// ...and settles with the real exit status well beyond 30 seconds.
-			const deadline = Date.now() + 80_000;
-			let record: ValidationJobRecord | null = null;
-			while (!record || record.state !== "exited") {
-				if (Date.now() > deadline) {
-					throw new Error(`job did not settle; last state was ${record?.state ?? "missing"}`);
-				}
-				await new Promise((resolve) => setTimeout(resolve, 500));
-				record = await service.getJob(jobId);
-			}
-			expect(record.exitCode).toBe(0);
-			expect(record.endedAt).toBeTruthy();
+			// Drive repeated identical waits through the real SDK agent loop.
+			// This exceeds both the old five-call limit and the command deadline.
+			let observations = 0;
+			const model: AgentModel = {
+				async *stream() {
+					if (service.getLiveJob()) {
+						if (observations > 80) throw new Error("job did not settle");
+						yield {
+							type: "tool-call-delta",
+							toolCallId: `wait-${observations++}`,
+							toolName: "validation_job",
+							inputText: JSON.stringify({ action: "wait", jobId, timeoutMs: 1000 }),
+						};
+						yield { type: "finish", reason: "tool-calls" };
+					} else {
+						yield { type: "text-delta", text: "Done" };
+						yield { type: "finish", reason: "stop" };
+					}
+				},
+			};
+			const agent = new AgentRuntime({
+				model,
+				tools: [createValidationJobTool(service)],
+				hooks: createClineToolLoopGuard((id) => service.getLiveJob()?.jobId === id),
+			});
+			expect((await agent.run("Observe validation")).status).toBe("completed");
+			expect(observations).toBeGreaterThan(5);
+			const record = await service.getJob(jobId);
+			expect(record?.exitCode).toBe(0);
+			expect(record?.endedAt).toBeTruthy();
 		} finally {
 			if (originalHome === undefined) {
 				delete process.env.HOME;

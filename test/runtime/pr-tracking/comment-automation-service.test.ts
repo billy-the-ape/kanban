@@ -31,6 +31,7 @@ import {
 	loadPrTrackingRecord,
 	upsertPrTrackingRecord,
 } from "../../../src/pr-tracking/pr-comment-record-store";
+import { PR_CI_HANDOFF_GUIDANCE } from "../../../src/prompts/pr-ci-handoff";
 import type { TerminalSessionManager } from "../../../src/terminal/session-manager";
 import { getTaskContextArtifactsDir, readTaskContextArtifact } from "../../../src/workspace/task-artifacts";
 import { isolateTestEnvironment } from "../../utilities/test-environment";
@@ -619,6 +620,7 @@ describe("PrCommentAutomationService", () => {
 				"Fix valid issues, explain any disagreements, and update the same PR.",
 				"When you post a PR comment, review, or reply, keep its API response (full JSON) or returned comment/review URL visible in the tool result — do not filter it to just `.id`/`.body`, suppress it, or mix it with unrelated output; post one publication per tool result where practical.",
 				"Explain changes and disagreements in PR comments and within task chat.",
+				PR_CI_HANDOFF_GUIDANCE,
 			].join(" "),
 		);
 	});

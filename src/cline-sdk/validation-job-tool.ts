@@ -2,12 +2,13 @@
 //
 // One tool, one job service per session. The model gets a bounded receipt on
 // start and can poll status, page the retained log with a byte cursor, and
-// cancel. The tool never blocks: every action returns the current state.
+// cancel. Waiting is bounded and abortable; other observations are paced.
 import { randomUUID } from "node:crypto";
 
 import type { AgentTool, AgentToolContext } from "@clinebot/shared";
 
 import {
+	VALIDATION_JOB_MAX_WAIT_MS,
 	VALIDATION_JOB_READ_PAGE_BYTES,
 	VALIDATION_JOB_TOOL_NAME,
 	type ValidationJobLogPage,
@@ -25,14 +26,14 @@ export { VALIDATION_JOB_TOOL_NAME } from "./validation-job-service";
  * from a persisted launch config.
  */
 export const VALIDATION_JOB_CAPABILITY_TEXT = [
-	"For validation likely to outlast run_commands, start a validation_job and use its job ID to check status and read the retained log. Check the recorded exit status before reporting success. Inspect another log range instead of rerunning an unchanged check only to obtain a different excerpt. Rerun after relevant changes or when deliberately checking flakiness. Do not start a duplicate while its job is still running.",
+	"For validation likely to outlast run_commands, start a validation_job and use its job ID with action wait to await completion in bounded intervals, or read to inspect the retained log. Use status sparingly; do not use shell sleep loops to wait for validation. Check the recorded exit status before reporting success. Inspect another log range instead of rerunning an unchanged check only to obtain a different excerpt. Rerun after relevant changes or when deliberately checking flakiness. Do not start a duplicate while its job is still running.",
 ].join("\n");
 
 const VALIDATION_JOB_TOOL_DESCRIPTION = [
 	"Start and observe long-running validation commands as owned background jobs.",
-	"Actions: start (one executable plus one string of args, optional worktree-relative cwd), status, read (page the retained log by byte offset), cancel.",
+	"Actions: start (one executable plus one string of args, optional worktree-relative cwd), status, wait (up to 25 seconds, returns early on completion), read (page the retained log by byte offset), cancel.",
 	"Use this for checks that may outlast run_commands' 30-second limit (builds, full test suites, long network jobs).",
-	"Start returns immediately with a job ID; poll status later instead of blocking.",
+	"Start returns immediately with a job ID. Prefer wait for completion; status is a snapshot. Repeated identical observations are paced at least one second apart while the job is running.",
 	"Only one job runs at a time per task; a second, different start while one is running returns a busy result.",
 	"The recorded exit status is the real result: a nonzero exit is a failed check even if the log text looks fine.",
 	"read pages at most 8192 bytes per call; pass offset (the previous nextOffset) to continue.",
@@ -43,7 +44,7 @@ const VALIDATION_JOB_INPUT_SCHEMA: Record<string, unknown> = {
 	properties: {
 		action: {
 			type: "string",
-			enum: ["start", "status", "read", "cancel"],
+			enum: ["start", "status", "wait", "read", "cancel"],
 			description: "Which action to perform.",
 		},
 		command: {
@@ -61,6 +62,12 @@ const VALIDATION_JOB_INPUT_SCHEMA: Record<string, unknown> = {
 		jobId: {
 			type: "string",
 			description: "Job ID returned by start (required for status, read, and cancel).",
+		},
+		timeoutMs: {
+			type: "integer",
+			minimum: 1000,
+			maximum: VALIDATION_JOB_MAX_WAIT_MS,
+			description: "Maximum wait duration in milliseconds (wait only; default 25000). Returns early on completion.",
 		},
 		offset: {
 			type: "number",
@@ -83,6 +90,7 @@ interface ValidationJobToolInput {
 	jobId?: string;
 	offset?: number;
 	limit?: number;
+	timeoutMs?: number;
 }
 
 function formatCommand(record: ValidationJobRecord): string {
@@ -122,7 +130,7 @@ function renderRecordHeader(record: ValidationJobRecord): string {
 function renderVerdict(record: ValidationJobRecord): string {
 	switch (record.state) {
 		case "running":
-			return "Still running; poll status again later (do not block and do not start a duplicate).";
+			return 'Still running; use action "wait" to await completion, or read another log range. Do not start a duplicate.';
 		case "exited":
 			return record.exitCode === 0
 				? "Result: the check passed (exit code 0)."
@@ -146,7 +154,7 @@ function renderStartResult(result: ValidationJobStartResult): string {
 			return [
 				renderRecordHeader(result.record),
 				"",
-				`Next: call validation_job with action "status" and job ID ${result.record.jobId} to check progress, or action "read" to page the retained log.`,
+				`Next: call validation_job with action "wait" and job ID ${result.record.jobId} to check progress, or action "read" to page the retained log.`,
 			].join("\n");
 		case "duplicate":
 			return [
@@ -167,7 +175,7 @@ function renderStartResult(result: ValidationJobStartResult): string {
 		case "busy":
 			return [
 				`Cannot start: another validation job is already running for this task (job ${result.running.jobId}, command: ${formatCommand(result.running)}).`,
-				`Wait for it to finish (action "status") or cancel it (action "cancel") before starting a new one.`,
+				`Wait for it to finish (action "wait") or cancel it (action "cancel") before starting a new one.`,
 			].join("\n");
 		case "denied":
 			return `Validation job start was denied by the tool policy: ${result.reason}`;
@@ -216,6 +224,8 @@ function renderCancel(record: ValidationJobRecord): string {
 }
 
 export function createValidationJobTool(service: ValidationJobService): AgentTool {
+	let lastObservation = "";
+	let nextObservationAt = 0;
 	return {
 		name: VALIDATION_JOB_TOOL_NAME,
 		description: VALIDATION_JOB_TOOL_DESCRIPTION,
@@ -233,12 +243,29 @@ export function createValidationJobTool(service: ValidationJobService): AgentToo
 					await service.start({ toolCallId, command, args, ...(cwd !== undefined ? { cwd } : {}) }),
 				);
 			}
-			if (action !== "status" && action !== "read" && action !== "cancel") {
-				throw new Error(`Unsupported validation_job action "${action}". Use start, status, read, or cancel.`);
+			if (action !== "status" && action !== "wait" && action !== "read" && action !== "cancel") {
+				throw new Error(`Unsupported validation_job action "${action}". Use start, status, wait, read, or cancel.`);
 			}
 			const jobId = typeof input.jobId === "string" ? input.jobId.trim() : "";
 			if (!jobId) {
-				throw new Error("status, read, and cancel require the jobId returned by a start action.");
+				throw new Error("status, wait, read, and cancel require the jobId returned by a start action.");
+			}
+			context.signal?.throwIfAborted();
+			if (action === "wait") {
+				const timeoutMs = input.timeoutMs ?? VALIDATION_JOB_MAX_WAIT_MS;
+				if (!Number.isInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > VALIDATION_JOB_MAX_WAIT_MS) {
+					throw new Error("timeoutMs must be an integer between 1000 and 25000.");
+				}
+				const record = await service.waitForJob(jobId, timeoutMs, context.signal);
+				if (!record) throw new Error(`Unknown validation job "${jobId}" for this task.`);
+				return renderStatus(record);
+			}
+			if (action === "status" || action === "read") {
+				const key = JSON.stringify([action, jobId, input.offset ?? 0, input.limit ?? null]);
+				const waitMs = key === lastObservation ? Math.max(0, nextObservationAt - Date.now()) : 0;
+				lastObservation = key;
+				nextObservationAt = Date.now() + waitMs + 1000;
+				if (waitMs > 0) await service.waitForJob(jobId, waitMs, context.signal);
 			}
 			if (action === "status") {
 				const record = await service.getJob(jobId);
@@ -269,7 +296,7 @@ export function createValidationJobTool(service: ValidationJobService): AgentToo
 				}
 				return renderCancel(record);
 			}
-			throw new Error(`Unsupported validation_job action "${action}". Use start, status, read, or cancel.`);
+			throw new Error(`Unsupported validation_job action "${action}". Use start, status, wait, read, or cancel.`);
 		},
 	};
 }

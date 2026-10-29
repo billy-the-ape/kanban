@@ -1,0 +1,3 @@
+/** Shared by coding sessions, PR publication, and bounded feedback turns. */
+export const PR_CI_HANDOFF_GUIDANCE =
+	"Complete the required local verification before publishing a PR or pushing a repair. After publication, report the PR and verification results and end the turn; do not sleep, poll, watch checks, or wait for CI or PR review to finish. The reviewer workflow handles CI results and Kanban can dispatch later feedback in another turn. This does not waive local tests or benchmarks needed for the task, or prevent inspecting an already completed CI failure supplied with feedback. Follow an explicit user request to monitor CI if one is given.";

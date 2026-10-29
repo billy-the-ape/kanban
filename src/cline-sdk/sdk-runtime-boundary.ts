@@ -33,6 +33,7 @@ import {
 	type ToolApprovalResult,
 	type UserInstructionConfigService,
 } from "@clinebot/core";
+import { PR_CI_HANDOFF_GUIDANCE } from "../prompts/pr-ci-handoff";
 import { CLINE_BUILTIN_SLASH_COMMANDS } from "./cline-slash-commands";
 import { getCliTelemetryService } from "./cline-telemetry-service";
 
@@ -250,6 +251,8 @@ export const CLINE_PUBLICATION_GUIDANCE = [
 	"When publication is authorized, preserve the exact intended Markdown. If using gh CLI for a multiline PR description or comment, write the body as UTF-8 to a file and use the command's supported --body-file option. For an API operation, use its supported structured input or file input. Keep backticks, dollar signs, quotes, and real newlines out of shell-interpolated body arguments. Keep temporary body files out of commits.",
 	"",
 	"Verify the stored body once after publication, and retain the identity/output required by the current workflow. If publication times out or its identity is unclear, inspect the existing remote state before creating another object. Follow the current bounded feedback instructions when choosing which comments to address.",
+	"",
+	PR_CI_HANDOFF_GUIDANCE,
 ].join("\n");
 
 /**

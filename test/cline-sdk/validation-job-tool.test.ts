@@ -75,7 +75,7 @@ describe("validation_job tool", () => {
 		expect(tool.description).toMatch(/start/i);
 		const schema = tool.inputSchema as { required?: string[]; properties?: Record<string, { enum?: string[] }> };
 		expect(schema.required).toEqual(["action"]);
-		expect(schema.properties?.action?.enum).toEqual(["start", "status", "read", "cancel"]);
+		expect(schema.properties?.action?.enum).toEqual(["start", "status", "wait", "read", "cancel"]);
 		expect(VALIDATION_JOB_CAPABILITY_TEXT).toMatch(/validation_job/);
 	});
 
@@ -90,7 +90,7 @@ describe("validation_job tool", () => {
 		expect(text).toMatch(/Validation job /);
 		expect(text).toMatch(/State: running/);
 		expect(text).toMatch(/job ID/);
-		expect(text).toMatch(/status/);
+		expect(text).toMatch(/action "wait"/);
 	});
 
 	it("status reports the real exit status (pass vs fail)", async () => {
@@ -225,6 +225,32 @@ describe("validation_job tool", () => {
 		const live = service.getLiveJob();
 		if (live) {
 			await service.cancelJob(live.jobId);
+		}
+	});
+});
+
+describe("validation_job bounded waiting", () => {
+	it("supports wait and paces repeated status reads without losing completion", async () => {
+		const { tool, service } = createTool();
+		const context = { agentId: "agent-1", iteration: 1 };
+		try {
+			await tool.execute(
+				{ action: "start", command: process.execPath, args: '-e "setTimeout(()=>{},60000)"' },
+				context,
+			);
+			const jobId = service.getLiveJob()?.jobId;
+			if (!jobId) throw new Error("expected job");
+			await tool.execute({ action: "status", jobId }, context);
+			const began = Date.now();
+			await tool.execute({ action: "status", jobId }, context);
+			expect(Date.now() - began).toBeGreaterThanOrEqual(900);
+			await expect(tool.execute({ action: "wait", jobId, timeoutMs: 0 }, context)).rejects.toThrow("timeoutMs");
+			await expect(tool.execute({ action: "wait", jobId, timeoutMs: 30000 }, context)).rejects.toThrow("timeoutMs");
+			const waiting = tool.execute({ action: "wait", jobId }, context);
+			await service.cancelJob(jobId);
+			expect(await waiting).toContain("State: canceled");
+		} finally {
+			await service.cancelAllJobs();
 		}
 	});
 });
