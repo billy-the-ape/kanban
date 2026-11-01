@@ -24,8 +24,13 @@ export const TASK_LAUNCH_CONFIG_METADATA_KEY = "kanban.taskLaunchConfig";
  * Schema version of the persisted launch config. Bump it when the shape
  * changes; `readPersistedTaskLaunchConfig` rejects unknown versions so
  * records written by other versions degrade to the in-memory-only behavior.
+ * Version 2 (AR-7) adds the recorded SDK version and the Kanban-owned
+ * guidance version; version 1 records remain readable with those fields
+ * unknown (null) — historical launches are preserved, never guessed.
  */
-export const TASK_LAUNCH_CONFIG_SCHEMA_VERSION = 1;
+export const TASK_LAUNCH_CONFIG_SCHEMA_VERSION = 2;
+/** Older persisted versions this reader still accepts (new fields stay null). */
+export const LEGACY_TASK_LAUNCH_CONFIG_SCHEMA_VERSIONS: readonly number[] = [1];
 
 export interface PersistedTaskLaunchConfig {
 	version: number;
@@ -37,6 +42,16 @@ export interface PersistedTaskLaunchConfig {
 	 * means the task did not set an effort and the provider default applies.
 	 */
 	reasoningEffort?: RuntimeClineReasoningEffort | null;
+	/**
+	 * Version of the installed @clinebot/core package at launch time (AR-7).
+	 * `null` when the launch predates recording it (unknown, never inferred).
+	 */
+	sdkVersion: string | null;
+	/**
+	 * Version of Kanban's own composed system-prompt guidance at launch time
+	 * (AR-7). `null` when the launch predates recording it (unknown).
+	 */
+	guidanceVersion: string | null;
 	savedAt: string;
 }
 
@@ -60,11 +75,17 @@ export function buildPersistedTaskLaunchConfig(input: {
 	systemPrompt?: string | null;
 	taskTitle?: string | null;
 	reasoningEffort?: RuntimeClineReasoningEffort | null;
+	/** Recorded @clinebot/core version at launch time (AR-7); unknown when omitted. */
+	sdkVersion?: string | null;
+	/** Kanban-owned guidance version at launch time (AR-7); unknown when omitted. */
+	guidanceVersion?: string | null;
 }): PersistedTaskLaunchConfig {
 	const config: PersistedTaskLaunchConfig = {
 		version: TASK_LAUNCH_CONFIG_SCHEMA_VERSION,
 		mode: input.mode ?? "act",
 		systemPrompt: input.systemPrompt ?? "",
+		sdkVersion: input.sdkVersion ?? null,
+		guidanceVersion: input.guidanceVersion ?? null,
 		savedAt: new Date().toISOString(),
 	};
 	const taskTitle = input.taskTitle?.trim();
@@ -95,7 +116,10 @@ export function readPersistedTaskLaunchConfig(
 		return null;
 	}
 	const value = raw as Record<string, unknown>;
-	if (value.version !== TASK_LAUNCH_CONFIG_SCHEMA_VERSION) {
+	if (
+		value.version !== TASK_LAUNCH_CONFIG_SCHEMA_VERSION &&
+		!(typeof value.version === "number" && LEGACY_TASK_LAUNCH_CONFIG_SCHEMA_VERSIONS.includes(value.version))
+	) {
 		return null;
 	}
 	if (!isTaskSessionMode(value.mode)) {
@@ -111,6 +135,12 @@ export function readPersistedTaskLaunchConfig(
 		version: value.version,
 		mode: value.mode,
 		systemPrompt: value.systemPrompt,
+		// Version-1 records (and anything unrecorded) stay unknown, never guessed.
+		sdkVersion: typeof value.sdkVersion === "string" && value.sdkVersion.trim() !== "" ? value.sdkVersion : null,
+		guidanceVersion:
+			typeof value.guidanceVersion === "string" && value.guidanceVersion.trim() !== ""
+				? value.guidanceVersion
+				: null,
 		savedAt: value.savedAt,
 	};
 	if (typeof value.taskTitle === "string" && value.taskTitle.trim().length > 0) {

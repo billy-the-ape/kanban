@@ -235,6 +235,98 @@ export function getTaskValidationJobsDir(taskId: string): string {
 }
 
 /**
+ * AR-7: read-only observation of a task's settled validation-job records.
+ * Never starts, cancels, or reclassifies anything (no orphan adoption); a
+ * missing directory yields an empty list, and malformed or foreign records
+ * are skipped rather than surfaced. Ordered by recorded start time.
+ */
+export async function listValidationJobRecords(taskId: string): Promise<ValidationJobRecord[]> {
+	const dir = getTaskValidationJobsDir(taskId);
+	const entries = await readdir(dir).catch(() => []);
+	const records: ValidationJobRecord[] = [];
+	for (const entry of entries) {
+		if (!entry.endsWith(".json")) {
+			continue;
+		}
+		const jobId = entry.slice(0, -".json".length);
+		if (!isValidJobId(jobId)) {
+			continue;
+		}
+		const raw = await readFile(join(dir, entry), "utf8").catch(() => null);
+		if (!raw) {
+			continue;
+		}
+		try {
+			const parsed: unknown = JSON.parse(raw);
+			if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+				continue;
+			}
+			const record = parsed as ValidationJobRecord;
+			// Persisted JSON is untrusted: the id must match its file name and
+			// the schema version must be one this reader understands.
+			if (record.jobId !== jobId || record.schemaVersion !== VALIDATION_JOB_SCHEMA_VERSION) {
+				continue;
+			}
+			records.push(record);
+		} catch {
+			// Malformed JSON is skipped, never fatal to a diagnostics read.
+		}
+	}
+	records.sort((a, b) => (a.startedAt < b.startedAt ? -1 : a.startedAt > b.startedAt ? 1 : 0));
+	return records;
+}
+
+/** AR-7: default byte limit of a job-log preview in a quality summary. */
+export const VALIDATION_JOB_LOG_PREVIEW_LIMIT_BYTES = 64 * 1024;
+
+/**
+ * AR-7: read-only access to a job's retained log for diagnostics
+ * observations. Returns the archived log path when it exists and lives in
+ * this task's context-artifacts directory (null when no log is available).
+ * Never starts, cancels, or reclassifies anything.
+ */
+export async function readValidationJobLogReference(record: ValidationJobRecord): Promise<string | null> {
+	if (!record.artifactPath) {
+		return null;
+	}
+	if (!isPathWithinRoot(getTaskContextArtifactsDir(record.taskId), record.artifactPath)) {
+		return null;
+	}
+	return (await stat(record.artifactPath).catch(() => null))?.isFile() ? record.artifactPath : null;
+}
+
+/**
+ * AR-7: a bounded preview of the job's retained log (null when no log is
+ * available). Reads at most `limitBytes` from the start of the archived log.
+ * Never starts, cancels, or reclassifies anything.
+ */
+export async function readValidationJobLogPreview(
+	record: ValidationJobRecord,
+	limitBytes: number = VALIDATION_JOB_LOG_PREVIEW_LIMIT_BYTES,
+): Promise<string | null> {
+	const path = await readValidationJobLogReference(record);
+	if (!path) {
+		return null;
+	}
+	const handle = await open(path, "r").catch(() => null);
+	if (!handle) {
+		return null;
+	}
+	try {
+		const size = (await handle.stat().catch(() => null))?.size ?? 0;
+		const length = Math.min(Math.max(0, Math.trunc(limitBytes)), size);
+		if (length <= 0) {
+			return "";
+		}
+		const buffer = Buffer.alloc(length);
+		const { bytesRead } = await handle.read(buffer, 0, length, 0);
+		return buffer.subarray(0, bytesRead).toString("utf8");
+	} finally {
+		await handle.close().catch(() => undefined);
+	}
+}
+
+/**
  * Owns the validation jobs of one task for one session: at most one live job
  * at a time, one owner-only spool per job, and one versioned metadata record
  * per job. The process is never auto-retried.

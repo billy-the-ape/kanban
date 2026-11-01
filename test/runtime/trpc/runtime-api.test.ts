@@ -3664,7 +3664,13 @@ describe("createRuntimeApi buildTaskDiagnosticsExportPlan (DIAG-3)", () => {
 						exitCode: 0,
 					},
 					artifactTaskId: kind === "review" ? "task-1::review" : "task-1",
-					launchConfig: { mode: "act", systemPrompt: "", reasoningEffort: null },
+					launchConfig: {
+						mode: "act",
+						systemPrompt: "",
+						reasoningEffort: null,
+						sdkVersion: null,
+						guidanceVersion: null,
+					},
 					transcript: { status: "complete", reason: null },
 					messages: [
 						{
@@ -3870,7 +3876,13 @@ describe("createRuntimeApi getTaskQualitySummary (DIAG-PANEL)", () => {
 						exitCode: 0,
 					},
 					artifactTaskId: kind === "review" ? "task-1::review" : "task-1",
-					launchConfig: { mode: "act", systemPrompt: "", reasoningEffort: null },
+					launchConfig: {
+						mode: "act",
+						systemPrompt: "",
+						reasoningEffort: null,
+						sdkVersion: null,
+						guidanceVersion: null,
+					},
 					transcript: { status: "complete", reason: null },
 					messages: [
 						{

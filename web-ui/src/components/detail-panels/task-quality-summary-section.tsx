@@ -15,6 +15,7 @@ import { useTaskQualitySummary } from "@/hooks/use-task-quality-summary";
 import type { RuntimeTaskQualitySummaryResponse } from "@/runtime/types";
 import { formatDiagnosticsDuration, formatDiagnosticsTimestamp } from "@/utils/task-diagnostics-summary";
 import { DiagnosticsSection, DiagnosticsValue } from "./task-diagnostics-primitives";
+import { EditEpisodeList, ValidationJobList } from "./task-quality-summary-episodes";
 
 type QualitySummaryCoverageStatus = RuntimeTaskQualitySummaryResponse["coverage"]["status"];
 
@@ -71,6 +72,34 @@ function UsageCounterRow({
 					? "no reported metrics"
 					: `${total === null ? "unknown" : total.toLocaleString()} (reported by ${reported}/${responses})`
 			}
+		/>
+	);
+}
+
+function sessionSpanText(value: number | null): string {
+	return value === null ? "unknown" : (formatDiagnosticsDuration(value) ?? "unknown");
+}
+
+/**
+ * AR-7: recorded launch provenance per session. Mixed values stay mixed;
+ * pre-AR-7 launches stay unknown — never inferred from the installed SDK.
+ */
+function LaunchProvenanceValue({ summary }: { summary: RuntimeTaskQualitySummaryResponse }): React.ReactElement | null {
+	const provenance = summary.launchProvenance;
+	if (provenance.length === 0) {
+		return null;
+	}
+	const recorded = provenance.filter((entry) => entry.promptRecorded).length;
+	const distinct = (values: Array<string | null>): string => {
+		const distinctValues = [...new Set(values)];
+		return distinctValues.length <= 1 ? (distinctValues[0] ?? "unknown") : "mixed";
+	};
+	return (
+		<DiagnosticsValue
+			label="Launch provenance"
+			value={`${recorded}/${provenance.length} prompt fingerprints recorded · sdk ${distinct(provenance.map((entry) => entry.sdkVersion))} · guidance ${distinct(
+				provenance.map((entry) => entry.guidanceVersion),
+			)}`}
 		/>
 	);
 }
@@ -167,6 +196,16 @@ export function TaskQualitySummarySection({
 						label="Sessions"
 						value={`${summary.sessionCounts.working} working · ${summary.sessionCounts.review} review · ${summary.sessionCounts.verificationRepair} repair`}
 					/>
+					{summary.sessionSpans.working !== null ||
+					summary.sessionSpans.review !== null ||
+					summary.sessionSpans.verificationRepair !== null ? (
+						<DiagnosticsValue
+							label="Session spans"
+							value={`working ${sessionSpanText(summary.sessionSpans.working)} · review ${sessionSpanText(summary.sessionSpans.review)} · repair ${sessionSpanText(
+								summary.sessionSpans.verificationRepair,
+							)} (recorded, not runtime)`}
+						/>
+					) : null}
 					<ModelPairs summary={summary} />
 					<DiagnosticsValue
 						label="Assistant responses"
@@ -216,6 +255,14 @@ export function TaskQualitySummarySection({
 							value={`${summary.tools.reportedFailures} (confirmed structural, once per call)`}
 						/>
 					) : null}
+					{Object.keys(summary.failuresByRule).length > 0 ? (
+						<DiagnosticsValue
+							label="Failure categories"
+							value={Object.entries(summary.failuresByRule)
+								.map(([rule, count]) => `${rule}×${count}`)
+								.join(", ")}
+						/>
+					) : null}
 					{summary.tools.unmatchedCalls > 0 ? (
 						<DiagnosticsValue
 							label="Unmatched calls"
@@ -238,6 +285,15 @@ export function TaskQualitySummarySection({
 							value={Object.entries(summary.heuristicTags)
 								.map(([rule, count]) => `${rule}×${count}`)
 								.join(", ")}
+						/>
+					) : null}
+					<LaunchProvenanceValue summary={summary} />
+					{summary.measuredCompaction ? (
+						<DiagnosticsValue
+							label="Measured compaction"
+							value={`${summary.measuredCompaction.tokensBefore.toLocaleString()} → ${summary.measuredCompaction.tokensAfter.toLocaleString()} tokens (${
+								summary.measuredCompaction.trigger
+							}, ${formatDiagnosticsTimestamp(new Date(summary.measuredCompaction.at).getTime()) ?? "unknown time"})`}
 						/>
 					) : null}
 					{summary.liveTailExcluded ? (
@@ -296,6 +352,8 @@ export function TaskQualitySummarySection({
 							) : null}
 						</div>
 					) : null}
+					<EditEpisodeList summary={summary} />
+					<ValidationJobList summary={summary} />
 				</>
 			) : null}
 		</DiagnosticsSection>
