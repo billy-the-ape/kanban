@@ -24,7 +24,6 @@ import type { ClineTaskSessionService } from "../cline-sdk/cline-task-session-se
 import type { ClineTurnPreparation } from "../cline-sdk/cline-turn-preparation";
 import {
 	listValidationJobRecords,
-	readValidationJobLogPreview,
 	readValidationJobLogReference,
 	type ValidationJobRecord,
 } from "../cline-sdk/validation-job-service";
@@ -358,18 +357,21 @@ function validationJobOutcome(record: ValidationJobRecord): TaskQualitySummaryJo
 /**
  * AR-3/AR-7: read-only observation of a task's validation jobs for the
  * quality summary. Never starts, cancels, or reclassifies anything; a read
- * problem degrades to an empty list, never an error. Most recent first,
- * capped (the response's total covers all records).
+ * problem degrades to an empty list, never an error. Most recent first;
+ * `items` is capped while `total` covers all recorded job records.
  */
-async function collectQualitySummaryJobEvents(taskId: string): Promise<TaskQualitySummaryJobEvent[]> {
+async function collectQualitySummaryJobEvents(taskId: string): Promise<{
+	events: TaskQualitySummaryJobEvent[];
+	total: number;
+}> {
 	const records = await listValidationJobRecords(taskId).catch(() => [] as ValidationJobRecord[]);
+	const total = records.length;
 	const recent = [...records].sort((a, b) => (a.startedAt > b.startedAt ? -1 : a.startedAt < b.startedAt ? 1 : 0));
-	const jobEvents: TaskQualitySummaryJobEvent[] = [];
+	const events: TaskQualitySummaryJobEvent[] = [];
 	for (const record of recent) {
-		if (jobEvents.length >= TASK_QUALITY_SUMMARY_JOB_EVENT_LIMIT) break;
+		if (events.length >= TASK_QUALITY_SUMMARY_JOB_EVENT_LIMIT) break;
 		const logReference = await readValidationJobLogReference(record).catch(() => null);
-		const preview = logReference !== null ? await readValidationJobLogPreview(record).catch(() => null) : null;
-		jobEvents.push({
+		events.push({
 			jobId: record.jobId,
 			toolCallId: record.toolCallId,
 			sessionId: record.sessionId,
@@ -380,12 +382,12 @@ async function collectQualitySummaryJobEvents(taskId: string): Promise<TaskQuali
 			startedAt: record.startedAt,
 			endedAt: record.endedAt,
 			logReference,
-			logTruncated:
-				record.logTruncated ||
-				(preview !== null && record.logBytesRetained > 0 && preview.length < record.logBytesRetained),
+			// The record's own retention-cap flag is the truncation signal;
+			// a retained full log is not truncated by this read-only view.
+			logTruncated: record.logTruncated,
 		});
 	}
-	return jobEvents;
+	return { events, total };
 }
 
 export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrpcContext["runtimeApi"] {
@@ -1662,7 +1664,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 						});
 					// AR-3/AR-7: observed validation jobs (read-only — nothing
 					// is started, canceled, or reclassified here).
-					const jobEvents = await collectQualitySummaryJobEvents(body.taskId);
+					const jobObservations = await collectQualitySummaryJobEvents(body.taskId);
 					// AR-7: the measured compaction record (B-10.4 latest
 					// event), read separately from the estimated context usage.
 					const measuredCompaction = await readTaskCompactionEvent(body.taskId).catch(() => null);
@@ -1680,7 +1682,8 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 						reviewSnapshotError,
 						sessionSource: session.source,
 						terminalSummaryAvailable: session.summary !== null,
-						jobEvents,
+						jobEvents: jobObservations.events,
+						jobEventsTotal: jobObservations.total,
 						measuredCompaction,
 					});
 				} catch (error) {

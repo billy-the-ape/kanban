@@ -54,7 +54,7 @@ function createQualitySummaryResponse(
 		failuresByRule: {},
 		editEpisodes: { total: 0, omitted: 0, cap: 100, items: [] },
 		launchProvenance: [],
-		validationJobs: { total: 0, items: [] },
+		validationJobs: { total: 0, omitted: 0, items: [] },
 		measuredCompaction: null,
 		error: null,
 		...overrides,
@@ -271,7 +271,8 @@ describe("TaskQualitySummarySection", () => {
 		fetchTaskQualitySummaryMock.mockResolvedValue(
 			createQualitySummaryResponse({
 				validationJobs: {
-					total: 2,
+					total: 4,
+					omitted: 2,
 					items: [
 						jobEvent(),
 						jobEvent({
@@ -293,7 +294,7 @@ describe("TaskQualitySummarySection", () => {
 		});
 		clickButton("Validation jobs");
 		const text = container.textContent ?? "";
-		expect(text).toContain("Validation jobs (2)");
+		expect(text).toContain("Validation jobs (4, 2 more not listed)");
 		expect(text).toContain("completed: npx vitest run · exit 0");
 		expect(text).toContain("/tmp/artifacts/job-1.log");
 		expect(text).toContain("timeout: npx vitest run");

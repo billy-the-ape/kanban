@@ -3193,7 +3193,10 @@ export const runtimeTaskQualitySummaryResponseSchema = z.object({
 	launchProvenance: z.array(runtimeTaskQualitySummaryLaunchProvenanceSchema),
 	/** AR-3: observations of the task's recorded validation-job events (read-only). */
 	validationJobs: z.object({
+		/** All recorded job records for the task, not just the returned items. */
 		total: z.number().int().min(0),
+		/** Records omitted because the returned item list is capped. */
+		omitted: z.number().int().min(0),
 		items: z.array(runtimeTaskQualitySummaryJobEventSchema),
 	}),
 	/** AR-7: the measured compaction record, separate from the estimated context usage. */

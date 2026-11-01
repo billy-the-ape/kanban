@@ -87,7 +87,9 @@ LLM evaluation. Reuse the current load/refresh action and source evidence refere
    attempts/reads between, wall-clock `elapsedMs` (null + `timestampWarning` when
    timestamps are missing/inconsistent), and the classifying `ruleVersion`. The list is
    capped at 100 with `total`/`omitted` counts and sorted by elapsed interval (unknown
-   last); the reducers' aggregate counters cover the complete source.
+   last); the reducers' aggregate counters cover the complete source. Episodes still
+   open at the end of the lineage keep their explicit unresolved end but still report
+   the evidence between the failure and the lineage end.
 5. `launchProvenance` is per distinct session: deterministic SHA-256 of the recorded
    composed prompt bytes (empty/absent stays null, never inferred), plus `sdkVersion`
    and `guidanceVersion` only where the launch recorded them. New native launches now
@@ -95,7 +97,9 @@ LLM evaluation. Reuse the current load/refresh action and source evidence refere
    `guidanceVersion` in `ClineTaskExportLaunchConfig`; historical sessions stay unknown.
 6. `validationJobs` surfaces AR-3 job events as read-only observations
    (started/completed/failed/timeout/cancelled/interrupted, exit code, retained-log
-   reference), capped; reading them never starts a test.
+   reference). `total` covers all recorded job records; the returned `items` are capped
+   and the gap is explicit via `omitted`. Reading them never starts a test, and
+   `logTruncated` mirrors the record's own retention-cap flag.
 7. `measuredCompaction` carries the task's recorded compaction event separately from the
    estimated context usage; no compaction count or provider finish reason is manufactured.
 8. `getTaskQualitySummary` (runtime API) collects the task's job events and compaction

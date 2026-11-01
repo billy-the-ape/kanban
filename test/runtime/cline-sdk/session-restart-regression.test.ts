@@ -26,6 +26,7 @@ import { buildSessionIdPrefix } from "../../../src/cline-sdk/cline-session-state
 import {
 	readPersistedTaskLaunchConfig,
 	TASK_LAUNCH_CONFIG_METADATA_KEY,
+	TASK_LAUNCH_CONFIG_SCHEMA_VERSION,
 } from "../../../src/cline-sdk/cline-task-launch-config";
 import {
 	createTaskSessionServiceHarness,
@@ -280,7 +281,7 @@ describe("service restart with a persisted session (B-1.7)", () => {
 		// The launch config is durable so a process restart can rebuild the
 		// start request from the record (B-4.8 / B-1.7).
 		const persisted = readPersistedTaskLaunchConfig(record);
-		expect(persisted?.version).toBe(1);
+		expect(persisted?.version).toBe(TASK_LAUNCH_CONFIG_SCHEMA_VERSION);
 		expect(persisted?.mode).toBe("act");
 		expect(persisted?.systemPrompt).toBe("test system prompt");
 		expect(persisted?.taskTitle).toBe("B-4.8 launch config");

@@ -93,8 +93,8 @@ const JOB_OUTCOME_CLASS: Record<
 	completed: "text-status-green",
 	failed: "text-status-red",
 	timeout: "text-status-orange",
-	cancelled: "text-status-tertiary",
-	interrupted: "text-status-tertiary",
+	cancelled: "text-text-tertiary",
+	interrupted: "text-text-tertiary",
 };
 
 export function ValidationJobList({
@@ -114,7 +114,8 @@ export function ValidationJobList({
 				onClick={() => setExpanded((current) => !current)}
 			>
 				{expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-				Validation jobs ({summary.validationJobs.total})
+				Validation jobs ({summary.validationJobs.total}
+				{summary.validationJobs.omitted > 0 ? `, ${summary.validationJobs.omitted} more not listed` : ""})
 			</button>
 			{expanded ? (
 				<ul className="max-h-32 space-y-0.5 overflow-y-auto p-0 m-0 list-none">

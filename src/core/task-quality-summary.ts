@@ -990,6 +990,32 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 	const editEpisodes: TaskQualitySummaryEditEpisode[] = [];
 	const processedCallIndexes = new Set<number>();
 	const firstObservationIndexByCall = new Map<number, number>();
+	const countBetween = (
+		state: { episode: TaskQualitySummaryEditEpisode; observationIndex: number },
+		endIndex: number,
+	): void => {
+		const { episode } = state;
+		if (episode.file === null) {
+			return;
+		}
+		// Between counts: distinct editor calls and read calls touching this
+		// file observed strictly between the failure and the end.
+		const file = episode.file;
+		for (let index = state.observationIndex + 1; index < endIndex; index += 1) {
+			const other = observations[index];
+			if (other === undefined) {
+				continue;
+			}
+			if (other.callIndex >= 0 && firstObservationIndexByCall.get(other.callIndex) !== index) {
+				continue; // inherited copy, already considered at first sighting
+			}
+			if (other.toolName === "editor" && editorFileOf(other.arguments) === file) {
+				episode.attemptsBetween += 1;
+			} else if (other.toolName === "read_files" && readFilesReferences(other.arguments, file)) {
+				episode.readsBetween += 1;
+			}
+		}
+	};
 	const closeEditEpisode = (
 		state: { episode: TaskQualitySummaryEditEpisode; observationIndex: number },
 		end: { endIndex: number; endReference: TaskQualitySummaryEpisodeReference | null; endTimestamp: number | null },
@@ -1008,26 +1034,7 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 				episode.timestampWarning = true;
 			}
 		}
-		if (episode.file === null) {
-			return;
-		}
-		// Between counts: distinct editor calls and read calls touching this
-		// file observed strictly between the failure and the end.
-		const file = episode.file;
-		for (let index = state.observationIndex + 1; index < end.endIndex; index += 1) {
-			const other = observations[index];
-			if (other === undefined) {
-				continue;
-			}
-			if (other.callIndex >= 0 && firstObservationIndexByCall.get(other.callIndex) !== index) {
-				continue; // inherited copy, already considered at first sighting
-			}
-			if (other.toolName === "editor" && editorFileOf(other.arguments) === file) {
-				episode.attemptsBetween += 1;
-			} else if (other.toolName === "read_files" && readFilesReferences(other.arguments, file)) {
-				episode.readsBetween += 1;
-			}
-		}
+		countBetween(state, end.endIndex);
 	};
 	observations.forEach((observation, observationIndex) => {
 		const callIndex = observation.callIndex;
@@ -1087,6 +1094,12 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 			openEpisodesByFile.delete(file);
 		}
 	});
+	// Episodes still open at the end of the lineage: count the evidence
+	// between the failure and the end, but keep the explicit unresolved
+	// end — an open episode never claims recovery.
+	for (const state of openEpisodesByFile.values()) {
+		countBetween(state, observations.length);
+	}
 	const totalEditEpisodes = editEpisodes.length;
 	const editEpisodeItems = [...editEpisodes]
 		.sort((a, b) => {
@@ -1546,6 +1559,8 @@ export interface TaskQualitySummarySource {
 	terminalSummaryAvailable: boolean;
 	/** AR-3: recorded validation-job observations (read-only; never starts a test). */
 	jobEvents: TaskQualitySummaryJobEvent[];
+	/** AR-7: total recorded validation-job records for the task (may exceed the capped list). */
+	jobEventsTotal: number;
 	/** AR-7: the measured compaction record, separate from the estimated context usage. */
 	measuredCompaction: TaskQualitySummaryMeasuredCompaction | null;
 }
@@ -1654,7 +1669,8 @@ export function buildTaskQualitySummaryResponse(source: TaskQualitySummarySource
 		editEpisodes: result.editEpisodes,
 		launchProvenance: result.launchProvenance,
 		validationJobs: {
-			total: source.jobEvents.length,
+			total: source.jobEventsTotal,
+			omitted: Math.max(0, source.jobEventsTotal - source.jobEvents.length),
 			items: source.jobEvents,
 		},
 		measuredCompaction: source.measuredCompaction,
@@ -1710,7 +1726,7 @@ export function buildUnavailableTaskQualitySummaryResponse(
 			items: [],
 		},
 		launchProvenance: [],
-		validationJobs: { total: 0, items: [] },
+		validationJobs: { total: 0, omitted: 0, items: [] },
 		measuredCompaction: null,
 		sessionSource: null,
 		terminalSummaryAvailable: false,

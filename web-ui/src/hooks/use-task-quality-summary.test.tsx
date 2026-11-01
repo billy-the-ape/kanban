@@ -71,7 +71,7 @@ function createQualitySummaryResponse(
 		failuresByRule: {},
 		editEpisodes: { total: 0, omitted: 0, cap: 100, items: [] },
 		launchProvenance: [],
-		validationJobs: { total: 0, items: [] },
+		validationJobs: { total: 0, omitted: 0, items: [] },
 		measuredCompaction: null,
 		error: null,
 		...overrides,

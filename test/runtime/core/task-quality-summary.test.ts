@@ -1084,14 +1084,26 @@ describe("analyzeTaskQualitySummary", () => {
 			resultText: "Editor operation failed: No replacement performed: text not found.",
 			isResultError: true,
 		});
+		const readUse = toolUsePart({
+			toolCallId: "r1",
+			toolName: "read_files",
+			arguments: { files: [{ path: "/tmp/a.ts" }] },
+		});
+		const readResult = toolResultPart({ toolCallId: "r1", resultText: "line 1" });
+		const otherOkUse = toolUsePart({
+			toolCallId: "e2",
+			toolName: "editor",
+			arguments: { path: "/tmp/b.ts", old_text: "x", new_text: "y" },
+		});
+		const otherOkResult = toolResultPart({ toolCallId: "e2", resultText: "Edited successfully." });
 		const seg = session({
 			kind: "task",
 			sessionId: "s1",
 			provider: "p",
 			model: "m",
 			messages: [
-				message({ role: "assistant", contentKey: "a1", ts: 1000, toolParts: [failUse] }),
-				message({ role: "user", contentKey: "u1", ts: 2000, toolParts: [failResult] }),
+				message({ role: "assistant", contentKey: "a1", ts: 1000, toolParts: [failUse, readUse, otherOkUse] }),
+				message({ role: "user", contentKey: "u1", ts: 2000, toolParts: [failResult, readResult, otherOkResult] }),
 			],
 		});
 		const result = run([seg]);
@@ -1100,6 +1112,11 @@ describe("analyzeTaskQualitySummary", () => {
 		expect(episode.end).toBe("no_successful_edit_recorded");
 		expect(episode.nextSuccessReference).toBeNull();
 		expect(episode.elapsedMs).toBeNull();
+		// The unresolved episode still reports the evidence between the
+		// failure and the end of the lineage (the successful edit of a
+		// different file does not count as an attempt on this file).
+		expect(episode.attemptsBetween).toBe(0);
+		expect(episode.readsBetween).toBe(1);
 	});
 
 	it("closes an episode as superseded when the next same-file edit also fails", () => {
@@ -1374,6 +1391,7 @@ describe("buildTaskQualitySummaryResponse", () => {
 			sessionSource: null,
 			terminalSummaryAvailable: false,
 			jobEvents: [],
+			jobEventsTotal: 0,
 			measuredCompaction: null,
 		});
 		expect(response.ok).toBe(true);
@@ -1434,6 +1452,7 @@ describe("buildTaskQualitySummaryResponse", () => {
 			sessionSource: null,
 			terminalSummaryAvailable: false,
 			jobEvents: [],
+			jobEventsTotal: 0,
 			measuredCompaction: null,
 		});
 		expect(envelopeResponse.tools.reportedFailures).toBe(1);
@@ -1494,6 +1513,7 @@ describe("buildTaskQualitySummaryResponse", () => {
 			sessionSource: null,
 			terminalSummaryAvailable: false,
 			jobEvents: [],
+			jobEventsTotal: 0,
 			measuredCompaction: null,
 		});
 		expect(response.tools.totalCalls).toBe(1);
@@ -1522,6 +1542,7 @@ describe("buildTaskQualitySummaryResponse", () => {
 			sessionSource: null,
 			terminalSummaryAvailable: false,
 			jobEvents: [],
+			jobEventsTotal: 0,
 			measuredCompaction: null,
 		});
 		expect(imageOnlyResponse.tools.reportedFailures).toBe(0);
@@ -1564,6 +1585,7 @@ describe("buildTaskQualitySummaryResponse", () => {
 			sessionSource: "cline",
 			terminalSummaryAvailable: true,
 			jobEvents: [],
+			jobEventsTotal: 0,
 			measuredCompaction: null,
 		});
 		expect(response.ok).toBe(true);
@@ -1606,6 +1628,7 @@ describe("buildTaskQualitySummaryResponse", () => {
 			sessionSource: null,
 			terminalSummaryAvailable: false,
 			jobEvents: [],
+			jobEventsTotal: 0,
 			measuredCompaction: null,
 		});
 		expect(response.coverage.status).toBe("partial");
@@ -1625,6 +1648,7 @@ describe("buildTaskQualitySummaryResponse", () => {
 			sessionSource: null,
 			terminalSummaryAvailable: false,
 			jobEvents: [],
+			jobEventsTotal: 0,
 			measuredCompaction: null,
 		});
 		expect(response.coverage.status).toBe("unavailable");
@@ -1655,6 +1679,7 @@ describe("buildTaskQualitySummaryResponse", () => {
 			sessionSource: "terminal",
 			terminalSummaryAvailable: true,
 			jobEvents: [],
+			jobEventsTotal: 0,
 			measuredCompaction: null,
 		});
 		expect(response.coverage.status).toBe("partial");
@@ -1675,6 +1700,7 @@ describe("buildTaskQualitySummaryResponse", () => {
 			sessionSource: null,
 			terminalSummaryAvailable: false,
 			jobEvents: [],
+			jobEventsTotal: 0,
 			measuredCompaction: null,
 		});
 		expect(response.coverage.status).toBe("unavailable");
@@ -1714,9 +1740,12 @@ describe("buildTaskQualitySummaryResponse", () => {
 			sessionSource: null,
 			terminalSummaryAvailable: false,
 			jobEvents: [jobEvent],
+			// Only the most recent records are returned by the caller; the
+			// total covers everything recorded, and the gap is explicit.
+			jobEventsTotal: 3,
 			measuredCompaction: measured,
 		});
-		expect(response.validationJobs).toEqual({ total: 1, items: [jobEvent] });
+		expect(response.validationJobs).toEqual({ total: 3, omitted: 2, items: [jobEvent] });
 		expect(response.measuredCompaction).toEqual(measured);
 	});
 
@@ -1758,6 +1787,7 @@ describe("buildTaskQualitySummaryResponse", () => {
 			sessionSource: null,
 			terminalSummaryAvailable: false,
 			jobEvents: [],
+			jobEventsTotal: 0,
 			measuredCompaction: null,
 		});
 		expect(response.launchProvenance).toEqual([
