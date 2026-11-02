@@ -12,7 +12,13 @@ import type {
 } from "../core/api-contract";
 import { type LockRequest, lockedFileSystem } from "../fs/locked-file-system";
 import { getTaskWorktreesHomePath, loadWorkspaceContext } from "../state/workspace-state";
-import { getGitCommandErrorMessage, getGitStdout, readGitHeadInfo, runGit } from "./git-utils";
+import {
+	findMissingAncestorCommits,
+	getGitCommandErrorMessage,
+	getGitStdout,
+	readGitHeadInfo,
+	runGit,
+} from "./git-utils";
 import { fetchTaskBaseRefTarget, updateLocalBaseBranch } from "./task-base-refresh";
 import {
 	clearInitialStartLiveStage,
@@ -701,6 +707,10 @@ export interface InitialStartPreparationResponse {
  * 4. a fresh task (no durable evidence) refreshes the selected base ref
  *    against origin when the persisted policy allows it, then creates the
  *    worktree detached at the post-refresh SHA and persists the baseline.
+ *    When the caller names required ancestors (dispatch prerequisite work),
+ *    the fixed baseline must contain every one of them BEFORE the worktree
+ *    is created, so a stale base blocks without persisting a prepared
+ *    baseline that would strand the task on it.
  *
  * Lock scope: the local recovery checks (1-3) and the worktree mutation
  * (5-6) run under the per-repo setup lock; the network refresh in (4) runs
@@ -721,6 +731,14 @@ export async function prepareInitialTaskWorktree(options: {
 	updateBaseRefBeforeStart: boolean;
 	/** True when durable session records show this task already started. */
 	hasPriorSession?: boolean;
+	/**
+	 * Commits a fresh task's fixed baseline must contain (dispatch
+	 * prerequisite work, e.g. a merged PR's landed commit). Verified against
+	 * the post-refresh baseline, not the possibly stale local base ref.
+	 * Existing worktrees and historical evidence are returned as-is; callers
+	 * verify those after preparation.
+	 */
+	requiredAncestors?: readonly string[];
 }): Promise<InitialStartPreparationResponse> {
 	const startedAt = Date.now();
 	const taskId = normalizeTaskIdForWorktreePath(options.taskId);
@@ -969,6 +987,28 @@ export async function prepareInitialTaskWorktree(options: {
 				});
 			}
 			baselineSha = resolved.stdout;
+		}
+
+		// The fixed baseline must contain the caller's required prerequisite
+		// work. Checked after the refresh (a GitHub merge lands on origin, so
+		// the local base ref usually lags it) and before the worktree exists,
+		// so a block never leaves a prepared baseline behind to be reused.
+		const requiredAncestors = options.requiredAncestors ?? [];
+		if (requiredAncestors.length > 0) {
+			const ancestry = await findMissingAncestorCommits(context.repoPath, requiredAncestors, baselineSha);
+			if (ancestry.error !== null || ancestry.missing.length > 0) {
+				const reason =
+					ancestry.error ??
+					`Base ref "${baseRef}" (at ${baselineSha.slice(0, 12)}) does not contain delivered prerequisite work: ${ancestry.missing.join(", ")}`;
+				return fail(reason, {
+					category: "unsupported_ref",
+					reason,
+					remedy: refreshed
+						? "Integrate the prerequisite work into the task's base branch on origin, or change the task's base ref."
+						: "Update the task's local base branch (or enable updating the base ref before starting), or change the task's base ref.",
+					selectedRef: baseRef,
+				});
+			}
 		}
 
 		// Phase 3 (setup lock): create the worktree at the fixed baseline.

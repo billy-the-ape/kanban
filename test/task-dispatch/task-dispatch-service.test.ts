@@ -1195,19 +1195,75 @@ describe("MERGE-1: merge-completion successor handoff", () => {
 		expect(startedTasks.map((task) => task.taskId)).toEqual(["child"]);
 	});
 
-	it("keeps the worker slot limit on the merged_pr trigger", async () => {
+	it("is not capped by the worker limit on the merged_pr trigger when the dispatch policy is disabled", async () => {
+		// Regression: with the queue off, nothing re-runs the handoff when a
+		// slot frees, so a cap here dropped the released child for good
+		// whenever any other card held a session (awaiting review counts).
 		const board = mergedParentBoard();
 		board.columns.find((column) => column.id === "in_progress")?.cards.push(createCard("busy"));
+		board.columns.find((column) => column.id === "review")?.cards.push(createCard("waiting-review"));
+		const { deps, startedTasks, getBoard } = createTestDeps({
+			board,
+			mergeCompletions: mergedCompletions(),
+			enabled: false,
+			sessions: [liveSession("busy"), liveSession("waiting-review", "awaiting_review")],
+		});
+		const response = await dispatchReadyTasks(deps, { trigger: "merged_pr", candidateTaskIds: ["child"] });
+		expect(response.dispatchedTaskId).toBe("child");
+		expect(response.skippedReason).toBeNull();
+		expect(startedTasks.map((task) => task.taskId)).toEqual(["child"]);
+		expect(
+			getBoard()
+				.columns.find((column) => column.id === "in_progress")
+				?.cards.map((card) => card.id),
+		).toContain("child");
+	});
+
+	it("dispatches every released child of the merged parent when the dispatch policy is disabled", async () => {
+		const board = createBoard({
+			cardsByColumn: {
+				backlog: [createCard("child-1"), createCard("child-2")],
+				done: [createCard("parent")],
+			},
+			dependencies: [
+				createDependency("dep-child-1-parent", "child-1", "parent"),
+				createDependency("dep-child-2-parent", "child-2", "parent"),
+			],
+		});
 		const { deps, startedTasks } = createTestDeps({
 			board,
 			mergeCompletions: mergedCompletions(),
 			enabled: false,
-			sessions: [liveSession("busy")],
+		});
+		const response = await dispatchReadyTasks(deps, {
+			trigger: "merged_pr",
+			candidateTaskIds: ["child-1", "child-2"],
+		});
+		expect(response.dispatchedTaskId).toBe("child-1");
+		expect(startedTasks.map((task) => task.taskId)).toEqual(["child-1", "child-2"]);
+	});
+
+	it("keeps the configured worker slot limit on the merged_pr trigger when the dispatch policy is enabled", async () => {
+		// An enabled queue re-runs a pass when the slot frees, and its default
+		// pass accepts merge-completed prerequisites, so the child waits.
+		const board = mergedParentBoard();
+		board.columns.find((column) => column.id === "in_progress")?.cards.push(createCard("busy"));
+		const sessions = [liveSession("busy")];
+		const { deps, startedTasks } = createTestDeps({
+			board,
+			mergeCompletions: mergedCompletions(),
+			enabled: true,
+			sessions,
 		});
 		const response = await dispatchReadyTasks(deps, { trigger: "merged_pr", candidateTaskIds: ["child"] });
 		expect(response.dispatchedTaskId).toBeNull();
 		expect(response.skippedReason).toBe("worker_busy");
 		expect(startedTasks).toHaveLength(0);
+
+		sessions.length = 0;
+		const afterRelease = await dispatchReadyTasks(deps);
+		expect(afterRelease.dispatchedTaskId).toBe("child");
+		expect(startedTasks.map((task) => task.taskId)).toEqual(["child"]);
 	});
 
 	it("never dispatches a ready card outside the candidate list (late-linked card)", async () => {

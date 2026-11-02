@@ -233,6 +233,77 @@ describe.sequential("task base refresh integration (UPD-0)", () => {
 		},
 	);
 
+	it("verifies required ancestors against the post-refresh baseline, not the stale local base", async () => {
+		await withTemporaryHome(async () => {
+			const { path: sandboxRoot, cleanup } = createTempDir("kanban-base-refresh-ancestors-");
+			try {
+				const fixture = createBaseRefreshFixture(sandboxRoot);
+				// The remote-only commit (e.g. a merged PR) is not in the local
+				// base branch yet; the refresh must bring it in before the check.
+				const prepared = await prepareInitialTaskWorktree({
+					cwd: fixture.workspacePath,
+					taskId: "task-required-ancestor",
+					baseRef: fixture.baseRef,
+					updateBaseRefBeforeStart: true,
+					requiredAncestors: [fixture.remoteBaseSha],
+				});
+				expect(prepared.ok, JSON.stringify(prepared, null, 2)).toBe(true);
+				expect(prepared.baseCommit).toBe(fixture.remoteBaseSha);
+			} finally {
+				cleanup();
+			}
+		});
+	});
+
+	it.each([
+		{ label: "the local base", updateBaseRefBeforeStart: false },
+		{ label: "the refreshed base", updateBaseRefBeforeStart: true },
+	])(
+		"blocks before creating a worktree when $label lacks a required ancestor",
+		async ({ updateBaseRefBeforeStart }) => {
+			await withTemporaryHome(async () => {
+				const { path: sandboxRoot, cleanup } = createTempDir("kanban-base-refresh-missing-ancestor-");
+				try {
+					const fixture = createBaseRefreshFixture(sandboxRoot);
+					const taskId = randomUUID();
+					// A commit that never reaches the base branch (local or origin).
+					runGit(fixture.workspacePath, ["checkout", "-q", "-b", "elsewhere"]);
+					writeFileSync(join(fixture.workspacePath, "elsewhere.txt"), "elsewhere\n", "utf8");
+					runGit(fixture.workspacePath, ["add", "elsewhere.txt"]);
+					runGit(fixture.workspacePath, ["commit", "-q", "-m", "work on another branch"]);
+					const unrelatedSha = runGit(fixture.workspacePath, ["rev-parse", "HEAD"]);
+					runGit(fixture.workspacePath, ["checkout", "-q", fixture.baseRef]);
+
+					const blocked = await prepareInitialTaskWorktree({
+						cwd: fixture.workspacePath,
+						taskId,
+						baseRef: fixture.baseRef,
+						updateBaseRefBeforeStart,
+						requiredAncestors: [unrelatedSha],
+					});
+					expect(blocked.ok).toBe(false);
+					expect(blocked.error).toContain("does not contain delivered prerequisite work");
+					expect(blocked.error).toContain(unrelatedSha);
+					expect(blocked.initialStart.stage).toBe("blocked");
+					// Nothing was fixed on the stale base: no worktree and no
+					// prepared baseline that a later start would have to reuse.
+					expect(existsSync(getTaskWorktreePath(fixture.workspacePath, taskId))).toBe(false);
+					expect((await getTaskInitialStartEvidence(taskId)).preparedBaselineSha).toBeNull();
+
+					const retried = await prepareInitialTaskWorktree({
+						cwd: fixture.workspacePath,
+						taskId,
+						baseRef: fixture.baseRef,
+						updateBaseRefBeforeStart,
+					});
+					expect(retried.ok, JSON.stringify(retried, null, 2)).toBe(true);
+				} finally {
+					cleanup();
+				}
+			});
+		},
+	);
+
 	it("refreshes a stale base and creates the worktree at the post-refresh SHA", async () => {
 		await withTemporaryHome(async () => {
 			const { path: sandboxRoot, cleanup } = createTempDir("kanban-base-refresh-refreshed-");

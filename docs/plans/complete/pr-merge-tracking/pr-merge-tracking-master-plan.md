@@ -121,6 +121,12 @@ Backlog with a dispatch-wait reason, not a fake model queue position. Persist di
 before the board move/start; board move is server-owned and precedes startTaskSession.
 Use the child's existing agent/model/plan-mode settings and normal start API.
 
+Amended 2026-11-02 (successor handoff fix): the worker cap applies to this trigger only while
+taskDispatchPolicy is enabled, because only an enabled queue re-runs passes when a slot frees.
+With the policy disabled the handoff fires once per merge, so it is uncapped (like the browser's
+complete-and-start-linked-tasks path) and still limited to the parent's released dependents;
+capping it at the default of 1 dropped the children whenever any other card held a session.
+
 Re-run candidate passes after merge completion, relevant board/dependency change, worker/turn
 release, model admission cancellation and runtime startup. Only eligible undispatched children
 launch, once. Preserve existing retry cap/manual deferral. If prerequisites are reopened before

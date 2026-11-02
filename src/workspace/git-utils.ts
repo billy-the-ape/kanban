@@ -111,6 +111,41 @@ export async function readGitHeadInfo(cwd: string): Promise<GitHeadInfo> {
 	};
 }
 
+export interface MissingAncestorCommits {
+	/** The required commits that are not ancestors of the head. */
+	missing: string[];
+	/** Set when an ancestry probe failed for a reason other than "not an ancestor". */
+	error: string | null;
+}
+
+/**
+ * Which of `ancestors` are not ancestors of `headSha`. git exits 1 for "not an
+ * ancestor" (a deliberate answer); any other failure (for example an object
+ * that is not available locally) is reported as an error.
+ */
+export async function findMissingAncestorCommits(
+	repoPath: string,
+	ancestors: readonly string[],
+	headSha: string,
+): Promise<MissingAncestorCommits> {
+	const missing: string[] = [];
+	for (const ancestorSha of ancestors) {
+		const check = await runGit(repoPath, ["merge-base", "--is-ancestor", ancestorSha, headSha]);
+		if (check.ok) {
+			continue;
+		}
+		if (check.exitCode === 1) {
+			missing.push(ancestorSha);
+			continue;
+		}
+		return {
+			missing,
+			error: `Ancestry check failed for ${ancestorSha}: ${check.stderr || check.error || "unknown error"}`,
+		};
+	}
+	return { missing, error: null };
+}
+
 export function getGitCommandErrorMessage(error: unknown): string {
 	if (error && typeof error === "object" && "stderr" in error) {
 		const stderr = (error as { stderr?: unknown }).stderr;

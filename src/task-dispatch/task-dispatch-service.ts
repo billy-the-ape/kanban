@@ -30,7 +30,7 @@ import type {
 import { getTaskColumnId, moveTaskToColumn } from "../core/task-board-mutations";
 import { lockedFileSystem } from "../fs/locked-file-system";
 import { getWorkspaceDirectoryPath } from "../state/workspace-state";
-import { readGitHeadInfo, runGit } from "../workspace/git-utils";
+import { findMissingAncestorCommits, readGitHeadInfo } from "../workspace/git-utils";
 import { prepareInitialTaskWorktree, resolveTaskCwd } from "../workspace/task-worktree";
 import { clearTaskDispatchRecord, readTaskDispatchRecord, writeTaskDispatchRecord } from "./dispatch-records";
 
@@ -431,75 +431,7 @@ function hasRecoverableSession(sessions: TaskDispatchSessionSnapshot[], taskId: 
 	);
 }
 
-// --- base SHA resolution (B-9.4) --------------------------------------------
-
-export interface TaskDispatchBaseShaResult {
-	baseSha: string | null;
-	error: string | null;
-	missingAncestry: string[];
-}
-
-/**
- * Resolve a candidate base commit from the card's base ref and verify that it
- * contains every delivered prerequisite's integrated commit. A missing
- * ancestor means the destination branch has not caught up (stale base) — the
- * dependent task must stay blocked until the branch is integrated again.
- */
-export async function resolveDispatchBaseSha(options: {
-	repoPath: string;
-	baseRef: string;
-	requiredAncestors: string[];
-}): Promise<TaskDispatchBaseShaResult> {
-	const normalizedBaseRef = options.baseRef.trim();
-	const resolved = await runGit(options.repoPath, ["rev-parse", "--verify", `${normalizedBaseRef}^{commit}`]);
-	if (!resolved.ok) {
-		return {
-			baseSha: null,
-			error: `Cannot resolve base ref "${normalizedBaseRef}": ${resolved.stderr || resolved.error || "unknown error"}`,
-			missingAncestry: [],
-		};
-	}
-	const baseSha = resolved.stdout.trim();
-	const ancestry = await findMissingAncestors(options.repoPath, options.requiredAncestors, baseSha);
-	if (ancestry.error) {
-		return { baseSha: null, error: ancestry.error, missingAncestry: ancestry.missing };
-	}
-	if (ancestry.missing.length > 0) {
-		return {
-			baseSha: null,
-			error: `Base ref "${normalizedBaseRef}" does not contain delivered prerequisite work: ${ancestry.missing.join(", ")}`,
-			missingAncestry: ancestry.missing,
-		};
-	}
-	return { baseSha, error: null, missingAncestry: [] };
-}
-
-/**
- * Which of `ancestors` are not ancestors of `headSha`. git exits 1 for "not an
- * ancestor" (a deliberate answer); any other failure is reported as an error.
- */
-async function findMissingAncestors(
-	repoPath: string,
-	ancestors: string[],
-	headSha: string,
-): Promise<{ missing: string[]; error: string | null }> {
-	const missing: string[] = [];
-	for (const ancestorSha of ancestors) {
-		const check = await runGit(repoPath, ["merge-base", "--is-ancestor", ancestorSha, headSha]);
-		if (check.ok) {
-			continue;
-		}
-		if (check.exitCode === 1) {
-			missing.push(ancestorSha);
-			continue;
-		}
-		return {
-			missing,
-			error: `Ancestry check failed for ${ancestorSha}: ${check.stderr || check.error || "unknown error"}`,
-		};
-	}
-	return { missing, error: null };
-}
+// --- baseline verification (B-9.4) -------------------------------------------
 
 /** Worktree variant of the ancestry check: null when every delivered prerequisite is present. */
 async function describeMissingWorktreeAncestors(
@@ -507,7 +439,7 @@ async function describeMissingWorktreeAncestors(
 	ancestors: string[],
 	headSha: string,
 ): Promise<string | null> {
-	const ancestry = await findMissingAncestors(repoPath, ancestors, headSha);
+	const ancestry = await findMissingAncestorCommits(repoPath, ancestors, headSha);
 	if (ancestry.error) {
 		return ancestry.error;
 	}
@@ -526,7 +458,10 @@ async function describeMissingWorktreeAncestors(
  * delivered prerequisite, the result is a block, not a silent reset.
  * UPD-0: missing worktrees are created through the start-owned preparation
  * (persisted refresh policy + fixed-baseline evidence), never the generic
- * ensure route.
+ * ensure route. The preparation verifies the required ancestors against the
+ * baseline it fixes (after the origin refresh) before creating the worktree:
+ * a merged PR lands on origin, so checking the local base ref first would
+ * block every merge successor until the user pulled the base by hand.
  */
 export async function prepareTaskWorktreeBaseline(options: {
 	workspacePath: string;
@@ -560,23 +495,18 @@ export async function prepareTaskWorktreeBaseline(options: {
 		return { ok: true, worktreePath: existingPath, baseSha: headSha, error: null };
 	}
 
-	const resolved = await resolveDispatchBaseSha({
-		repoPath: options.workspacePath,
-		baseRef: options.baseRef,
-		requiredAncestors: options.requiredAncestors,
-	});
-	if (!resolved.baseSha) {
-		return { ok: false, worktreePath: null, baseSha: null, error: resolved.error };
-	}
 	// UPD-0: the start-owned preparation is the only initial-creation path.
 	// It honors the persisted refresh policy and fixed-baseline evidence
 	// (prepared baseline, preservation, patch, receipt, prior session) and
-	// never re-resolves a baseline that was already prepared.
+	// never re-resolves a baseline that was already prepared. A fresh
+	// baseline that lacks a required ancestor blocks before the worktree is
+	// created.
 	const prepared = await prepareInitialTaskWorktree({
 		cwd: options.workspacePath,
 		taskId: options.taskId,
 		baseRef: options.baseRef,
 		updateBaseRefBeforeStart: options.updateBaseRefBeforeStart,
+		requiredAncestors: options.requiredAncestors,
 	});
 	if (!prepared.ok || prepared.path === null || prepared.baseCommit === null) {
 		return {
@@ -587,7 +517,8 @@ export async function prepareTaskWorktreeBaseline(options: {
 		};
 	}
 	// B-5: when preserved work is restored or a stored patch is applied, the
-	// baseline is the recorded commit, not the requested base ref.
+	// baseline is the recorded commit, not the requested base ref, so the
+	// ancestry is verified again on what was actually checked out.
 	const baseSha = prepared.baseCommit;
 	const missing = await describeMissingWorktreeAncestors(prepared.path, options.requiredAncestors, baseSha);
 	if (missing) {
@@ -795,10 +726,11 @@ async function dispatchSingleTask(
  */
 export interface TaskDispatchPassOptions {
 	/**
-	 * Runs even when the task dispatch policy is disabled. Only ready
-	 * candidates that owe their readiness to at least one prerequisite
-	 * completed by a confirmed PR merge are dispatched; unrelated backlog
-	 * cards are never launched by this trigger.
+	 * Runs even when the task dispatch policy is disabled (and is then not
+	 * capped by the queue's worker limit, since no later pass retries it).
+	 * Only ready candidates that owe their readiness to at least one
+	 * prerequisite completed by a confirmed PR merge are dispatched;
+	 * unrelated backlog cards are never launched by this trigger.
 	 */
 	trigger?: "merged_pr";
 	/**
@@ -860,8 +792,17 @@ export async function dispatchReadyTasks(
 			.filter((entry) => !entry.ready || deferredById.has(entry.taskId))
 			.map((entry) => toTaskView(board, entry, deferredById.get(entry.taskId)?.error ?? blockedReasonOf(entry)));
 
-		const activeWorkers = getActiveWorkerTaskIds(await deps.listSessions(), board);
-		const slotsToFill = policy.workerLimit - activeWorkers.length;
+		// The worker limit is the reliable queue's cap, and only an enabled
+		// queue re-runs passes when a slot frees (session stop, delivery,
+		// board save). With the policy disabled, only the merged_pr handoff
+		// reaches this point and it fires once per merge: capping it would
+		// drop the released children for good whenever any other card holds a
+		// session (a card awaiting review counts). It is then uncapped, like
+		// the browser's own complete-and-start-linked-tasks path, and stays
+		// limited to the just-completed parent's released dependents.
+		const slotsToFill = policy.enabled
+			? policy.workerLimit - getActiveWorkerTaskIds(await deps.listSessions(), board).length
+			: Number.POSITIVE_INFINITY;
 		const titleByTaskId = collectCardTitles(board);
 		let boardChanged = false;
 		const dispatchedTaskIds: string[] = [];
