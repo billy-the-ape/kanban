@@ -11,6 +11,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { loadRuntimeConfig, updateRuntimeConfig } from "../../src/config/runtime-config";
 import type {
+	GitHubPrMergeCompletion,
 	RuntimeBoardCard,
 	RuntimeBoardColumnId,
 	RuntimeBoardData,
@@ -554,5 +555,182 @@ describe("B-11 task dispatch integration (parallel branches, shared budget)", ()
 		expect(runGit(repoPath, ["show", "HEAD:c.txt"])).toBe("c");
 		expect(parallelRun.started[2]?.prompt).toContain(t2IntegratedSha);
 		expect(parallelRun.started[2]?.prompt).toContain(t3IntegratedSha);
+	});
+});
+
+// MERGE-1 integration: the parent's PR was merged on GitHub, so the landed
+// merge commit lives on origin while the workspace's local base branch still
+// lags it (the user has not pulled). The reliable queue policy is disabled,
+// as it is by default. The merged_pr handoff must refresh the child's base
+// from origin and verify the merge commit against THAT baseline, not block on
+// the stale local branch (which stranded every successor in the backlog).
+describe("MERGE-1 merge successor dispatch from a stale local base (real origin)", () => {
+	let previousHomeMerge: string | undefined;
+	let previousUserProfileMerge: string | undefined;
+	let home: { path: string; cleanup: () => void };
+	let sandbox: { path: string; cleanup: () => void };
+	let workspacePath: string;
+	let workspaceId: string;
+	let staleLocalSha: string;
+	let mergeSha: string;
+	const mergeRun = createSessionProbe();
+
+	function seedMergeBoard(): RuntimeBoardData {
+		const now = Date.now();
+		const card = (id: string, updateBaseRefBeforeStart: boolean): RuntimeBoardCard => ({
+			id,
+			title: id,
+			prompt: `Do the work for ${id}`,
+			startInPlanMode: false,
+			baseRef: "main",
+			updateBaseRefBeforeStart,
+			createdAt: now,
+			updatedAt: now,
+		});
+		return {
+			columns: [
+				{ id: "backlog", title: "Backlog", cards: [card("pinned-child", false), card("child", true)] },
+				{ id: "in_progress", title: "In Progress", cards: [] },
+				{ id: "review", title: "Review", cards: [] },
+				{ id: "done", title: "Done", cards: [card("parent", true)] },
+				{ id: "trash", title: "Trash", cards: [] },
+			],
+			dependencies: [
+				{ id: "dep-pinned-parent", fromTaskId: "pinned-child", toTaskId: "parent", createdAt: now },
+				{ id: "dep-child-parent", fromTaskId: "child", toTaskId: "parent", createdAt: now },
+			],
+		};
+	}
+
+	function buildMergeDeps(): TaskDispatchDeps {
+		const completion: GitHubPrMergeCompletion = {
+			schemaVersion: 1,
+			workspaceId,
+			taskId: "parent",
+			linkGeneration: 1,
+			prKey: "github|github.com|acme/repo|7",
+			finalHeadSha: mergeSha,
+			baseRepository: "github.com|acme|repo",
+			baseRef: "main",
+			mergeCommitSha: mergeSha,
+			mergedAt: 1,
+			observedAt: 1,
+			status: "completed",
+			completedAt: 1,
+			error: null,
+		};
+		return {
+			...buildDeps(workspaceId, workspacePath, mergeRun),
+			readMergeCompletion: async (taskId) => (taskId === "parent" ? completion : null),
+		};
+	}
+
+	beforeAll(async () => {
+		previousHomeMerge = process.env.HOME;
+		previousUserProfileMerge = process.env.USERPROFILE;
+		home = createTempDir("kanban-merge1-home-");
+		sandbox = createTempDir("kanban-merge1-repo-");
+		process.env.HOME = home.path;
+		process.env.USERPROFILE = home.path;
+
+		const originPath = join(sandbox.path, "origin.git");
+		workspacePath = join(sandbox.path, "workspace");
+		await mkdir(originPath, { recursive: true });
+		runGit(originPath, ["init", "--bare"]);
+		await mkdir(workspacePath, { recursive: true });
+		runGit(workspacePath, ["init"]);
+		runGit(workspacePath, ["branch", "-m", "main"]);
+		await writeFile(join(workspacePath, "README.md"), "# repo\n");
+		runGit(workspacePath, ["add", "."]);
+		runGit(workspacePath, ["commit", "-m", "initial"]);
+		runGit(workspacePath, ["remote", "add", "origin", originPath]);
+		runGit(workspacePath, ["push", "-u", "origin", "main"]);
+		staleLocalSha = runGit(workspacePath, ["rev-parse", "HEAD"]);
+
+		// The parent's PR merges on the remote (another clone stands in for
+		// GitHub landing the merge commit on the base branch).
+		runGit(sandbox.path, ["clone", "-q", "-b", "main", originPath, "github"]);
+		const githubPath = join(sandbox.path, "github");
+		await writeFile(join(githubPath, "parent.txt"), "parent work\n");
+		runGit(githubPath, ["add", "."]);
+		runGit(githubPath, ["commit", "-m", "Merge parent PR"]);
+		runGit(githubPath, ["push", "-q", "origin", "main"]);
+		mergeSha = runGit(githubPath, ["rev-parse", "HEAD"]);
+
+		// The merge-completion inspection fetches the merge commit, which
+		// updates the remote-tracking ref but never the local base branch.
+		runGit(workspacePath, ["fetch", "-q", "origin", "main"]);
+		expect(runGit(workspacePath, ["rev-parse", "main"])).toBe(staleLocalSha);
+
+		const context = await loadWorkspaceContext(workspacePath);
+		workspaceId = context.workspaceId;
+		await mutateWorkspaceState<void>(workspacePath, () => ({
+			board: seedMergeBoard(),
+			value: undefined,
+		}));
+	});
+
+	afterAll(() => {
+		if (previousHomeMerge === undefined) {
+			delete process.env.HOME;
+		} else {
+			process.env.HOME = previousHomeMerge;
+		}
+		if (previousUserProfileMerge === undefined) {
+			delete process.env.USERPROFILE;
+		} else {
+			process.env.USERPROFILE = previousUserProfileMerge;
+		}
+		home.cleanup();
+		sandbox.cleanup();
+	});
+
+	it("blocks a child that does not refresh its base, without creating a worktree on the stale base", async () => {
+		const response = await dispatchReadyTasks(buildMergeDeps(), {
+			trigger: "merged_pr",
+			candidateTaskIds: ["pinned-child"],
+		});
+		expect(response.dispatchedTaskId).toBeNull();
+		expect(mergeRun.started).toHaveLength(0);
+		const view = response.blockedTasks.find((entry) => entry.taskId === "pinned-child");
+		expect(view?.blockedReason).toContain("does not contain delivered prerequisite work");
+		expect(view?.blockedReason).toContain(mergeSha);
+		// No prepared baseline was left behind to strand the task on the stale base.
+		expect(
+			await resolveTaskCwd({ cwd: workspacePath, taskId: "pinned-child", baseRef: "main", ensure: false }).catch(
+				() => null,
+			),
+		).toBeNull();
+		const record = await readTaskDispatchRecord("pinned-child");
+		expect(record?.status).toBe("blocked");
+		const board = await loadWorkspaceBoardById(workspaceId);
+		expect(columnIdOf(board, "pinned-child")).toBe("backlog");
+	});
+
+	it("dispatches the merge-released child on the refreshed base that contains the merge commit", async () => {
+		const response = await dispatchReadyTasks(buildMergeDeps(), {
+			trigger: "merged_pr",
+			candidateTaskIds: ["child"],
+		});
+		expect(response.dispatchedTaskId).toBe("child");
+		expect(mergeRun.started.map((session) => session.taskId)).toEqual(["child"]);
+		expect(mergeRun.started[0]?.prompt).toContain(`its PR merged at ${mergeSha}`);
+
+		const board = await loadWorkspaceBoardById(workspaceId);
+		expect(columnIdOf(board, "child")).toBe("in_progress");
+
+		// Real git: the worktree sits on the refreshed origin tip (which
+		// contains the merge commit) and the local base was fast-forwarded.
+		const childWorktree = await resolveTaskCwd({
+			cwd: workspacePath,
+			taskId: "child",
+			baseRef: "main",
+			ensure: false,
+		});
+		expect(runGit(childWorktree, ["rev-parse", "HEAD"])).toBe(mergeSha);
+		expect(runGit(workspacePath, ["rev-parse", "main"])).toBe(mergeSha);
+		const record = await readTaskDispatchRecord("child");
+		expect(record?.status).toBe("dispatched");
+		expect(record?.baseSha).toBe(mergeSha);
 	});
 });
