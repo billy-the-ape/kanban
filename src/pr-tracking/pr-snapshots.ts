@@ -117,6 +117,9 @@ export function normalizePrMetadata(raw: unknown, accessScopeId: string, checked
 	// PRLINK-9: optional display title projected from the same read.
 	const title = asString(pr.title);
 	// PRLINK-9: display details projected from the same read (no second fetch).
+	// AM-2: authoritative merge-evidence facts from the same read.
+	const author = authorInfo(pr.user);
+	const autoMerge = typeof pr.auto_merge === "object" && pr.auto_merge !== null ? pr.auto_merge : null;
 	return {
 		accessScopeId,
 		checkedAt,
@@ -140,6 +143,13 @@ export function normalizePrMetadata(raw: unknown, accessScopeId: string, checked
 		labels: asStringList(pr.labels),
 		mergeableState: asString(pr.mergeable_state),
 		requestedReviewers: asStringList(pr.requested_reviewers),
+		// AM-2: authoritative facts for the merge-evidence envelope (no
+		// second fetch): base head SHA, mergeability, PR author, and native
+		// GitHub auto-merge presence (field absent on PRs without it).
+		baseSha: asString(base?.sha),
+		mergeable: typeof pr.mergeable === "boolean" ? pr.mergeable : null,
+		authorLogin: author.login === "unknown" ? null : author.login,
+		autoMergePresent: autoMerge !== null ? true : null,
 	};
 }
 

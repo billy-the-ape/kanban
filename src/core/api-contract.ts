@@ -3296,6 +3296,16 @@ export const githubPrMetadataSnapshotSchema = z
 		labels: z.array(z.string()).nullable().optional(),
 		mergeableState: z.string().nullable().optional(),
 		requestedReviewers: z.array(z.string()).nullable().optional(),
+		/**
+		 * AM-2: authoritative facts projected from the same read. All
+		 * nullable+optional so older snapshots keep validating.
+		 */
+		baseSha: z.string().nullable().optional(),
+		/** `null` when GitHub has not computed mergeability yet. */
+		mergeable: z.boolean().nullable().optional(),
+		authorLogin: z.string().nullable().optional(),
+		/** Native GitHub auto-merge enabled for the PR (field absent = null). */
+		autoMergePresent: z.boolean().nullable().optional(),
 	})
 	.passthrough();
 export type GitHubPrMetadataSnapshot = z.infer<typeof githubPrMetadataSnapshotSchema>;
@@ -3669,6 +3679,117 @@ export const autoMergePolicyUpdateResponseSchema = z.object({
 	reason: z.enum(["invalid", "conflict", "malformed"]).nullable(),
 });
 export type AutoMergePolicyUpdateResponse = z.infer<typeof autoMergePolicyUpdateResponseSchema>;
+
+// ── AM-2: transient auto-merge evidence envelopes (read-only) ───────────────
+
+/**
+ * AM-2: one coherent, exact-head GitHub evidence snapshot for a canonical PR.
+ * Transient only (never persisted whole): the caller (AM-3) derives a small
+ * eligibility summary. `complete` is true only when every source was read to
+ * completion AND the head/base identity was unchanged between the first and
+ * the final metadata read. Any partial/failed read, head churn, unknown
+ * mergeability, or auth problem makes `complete` false with stable reason
+ * tokens — unknown evidence is never green.
+ */
+export const AUTO_MERGE_EVIDENCE_SCHEMA_VERSION = 1;
+
+/** One effective (latest) CI observation for one check name/context. */
+export const autoMergeCheckEvidenceSchema = z
+	.object({
+		kind: z.enum(["check_run", "commit_status"]),
+		/** Check-run `name` or status `context` (case-sensitive exact name). */
+		name: z.string(),
+		/**
+		 * Reporting identity: the check-run app integration id, or the
+		 * status `creator` login. Null when the provider omitted it.
+		 */
+		sourceId: z.string().nullable(),
+		/** Check-run `status`; commit statuses map to a terminal/in-progress phase. */
+		status: z.string().nullable(),
+		/** Check-run `conclusion`; commit statuses carry their `state` here. */
+		conclusion: z.string().nullable(),
+		/** Exact head SHA the observation was collected for. */
+		sha: z.string(),
+		/** Provider run/status identity (check-run id or status id, as string). */
+		runId: z.string(),
+		/** Effective-attempt selection timestamp (epoch ms); 0 when omitted. */
+		occurredAt: z.number(),
+	})
+	.passthrough();
+export type AutoMergeCheckEvidence = z.infer<typeof autoMergeCheckEvidenceSchema>;
+
+/**
+ * One submitted-or-pending GitHub review with its authoritative facts.
+ * `state` is the raw REST review state (APPROVED, CHANGES_REQUESTED,
+ * COMMENTED, DISMISSED, PENDING, ...): classification happens downstream,
+ * never from the (absent) body text.
+ */
+export const autoMergeReviewEvidenceSchema = z
+	.object({
+		id: z.string(),
+		state: z.string(),
+		authorLogin: z.string(),
+		authorKind: z.enum(["human", "bot"]),
+		isOwnAccount: z.boolean(),
+		/** Head SHA the review was submitted against (`commit_id`). */
+		commitId: z.string().nullable(),
+		submittedAt: z.number().nullable(),
+	})
+	.passthrough();
+export type AutoMergeReviewEvidence = z.infer<typeof autoMergeReviewEvidenceSchema>;
+
+/** Completeness of each evidence source in the envelope. */
+export const autoMergeEvidenceSourcesSchema = z
+	.object({
+		prMetadata: z.boolean(),
+		reviews: z.boolean(),
+		checkRuns: z.boolean(),
+		commitStatuses: z.boolean(),
+		reviewThreads: z.boolean(),
+	})
+	.passthrough();
+export type AutoMergeEvidenceSources = z.infer<typeof autoMergeEvidenceSourcesSchema>;
+
+export const autoMergeEvidenceEnvelopeSchema = z
+	.object({
+		schemaVersion: z.literal(AUTO_MERGE_EVIDENCE_SCHEMA_VERSION),
+		accessScopeId: z.string(),
+		/** End of the coherent collection window (epoch ms). */
+		checkedAt: z.number(),
+		/** Repository policy revision this evidence was read for. */
+		policyRevision: z.number().int().nonnegative(),
+		/** Null when the initial metadata read failed. */
+		headSha: z.string().nullable(),
+		baseSha: z.string().nullable(),
+		baseRepository: z.string().nullable(),
+		baseRef: z.string().nullable(),
+		headRepository: z.string().nullable(),
+		headRef: z.string().nullable(),
+		prState: z.enum(["open", "closed", "draft", "merged", "unknown"]),
+		draft: z.boolean(),
+		/** Null = unknown (never computed by GitHub, or metadata unread). */
+		mergeable: z.boolean().nullable(),
+		mergeableState: z.string().nullable(),
+		authorLogin: z.string().nullable(),
+		autoMergePresent: z.boolean().nullable(),
+		sources: autoMergeEvidenceSourcesSchema,
+		/** Unresolved, non-outdated review threads; null = unknown. */
+		unresolvedActiveThreads: z.number().int().nonnegative().nullable(),
+		complete: z.boolean(),
+		/** Stable reason tokens (empty when complete). */
+		reasons: z.array(z.string()),
+		/** All submitted/pending reviews, in provider order. */
+		reviews: z.array(autoMergeReviewEvidenceSchema),
+		/** Effective latest check-run attempt per check name. */
+		checks: z.array(autoMergeCheckEvidenceSchema),
+		/** Effective latest commit status per context. */
+		statuses: z.array(autoMergeCheckEvidenceSchema),
+	})
+	.passthrough();
+export type AutoMergeEvidenceEnvelope = z.infer<typeof autoMergeEvidenceEnvelopeSchema>;
+
+/** Result of one bounded auto-merge evidence read (always an envelope). */
+export type AutoMergeEvidenceResult = AutoMergeEvidenceEnvelope;
 
 export const runtimeTaskAutomationPrSelectRequestSchema = z.object({
 	taskId: z.string().min(1),
