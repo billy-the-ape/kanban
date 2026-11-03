@@ -53,14 +53,11 @@ export function normalizeAutoMergeRepository(repository: string): string | null 
 		return null;
 	}
 	for (const segment of segments) {
-		if (segment.length === 0 || segment.length > MAX_REPOSITORY_SEGMENT_LENGTH) {
-			return null;
-		}
-		if (!REPOSITORY_SEGMENT_PATTERN.test(segment)) {
+		if (segment.length > MAX_REPOSITORY_SEGMENT_LENGTH || !REPOSITORY_SEGMENT_PATTERN.test(segment)) {
 			return null;
 		}
 	}
-	return `${segments[0]}/${segments[1]}`;
+	return trimmed;
 }
 
 /**

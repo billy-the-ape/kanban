@@ -1305,16 +1305,10 @@ export function updateTaskPrSettings(
 	if (input.autoMergeWhenApproved === true) {
 		const selectedKey = task.selectedAutomationPrKey;
 		const parsed = selectedKey ? parseCanonicalPrKey(selectedKey) : null;
-		const matchesLink =
-			parsed !== null &&
-			(task.pullRequests ?? []).some((pullRequest) => getPullRequestIdentityKey(pullRequest) === selectedKey);
-		if (
-			!selectedKey ||
-			parsed === null ||
-			parsed.provider !== "github" ||
-			parsed.host !== "github.com" ||
-			!matchesLink
-		) {
+		const matchesLink = (task.pullRequests ?? []).some(
+			(pullRequest) => getPullRequestIdentityKey(pullRequest) === selectedKey,
+		);
+		if (parsed === null || parsed.provider !== "github" || parsed.host !== "github.com" || !matchesLink) {
 			return { ...base(task), reason: "no_selected_pr" };
 		}
 		const policy = options.autoMergePolicy;
