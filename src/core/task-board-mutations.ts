@@ -1335,7 +1335,6 @@ export function updateTaskPrSettings(
 		if (task.autoMergeWhenApproved === true) {
 			autoMerge = false;
 		}
-		armRevision = null;
 	}
 
 	// AM-1: re-enabling while already armed at the current policy revision —

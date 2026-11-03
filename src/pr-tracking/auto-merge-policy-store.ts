@@ -21,7 +21,7 @@ import type { LockRequest } from "../fs/locked-file-system";
 import { lockedFileSystem } from "../fs/locked-file-system";
 import { getRuntimeHomePath } from "../state/workspace-state";
 
-export const AUTO_MERGE_DIR_NAME = "auto-merge";
+const AUTO_MERGE_DIR_NAME = "auto-merge";
 const POLICIES_FILENAME = "policies.json";
 const POLICY_FILE_VERSION = 1;
 /** Bound the store: at most this many configured checks per repository. */

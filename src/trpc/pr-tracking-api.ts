@@ -1082,7 +1082,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			normalized,
 			{
 				requiredChecks: input.requiredChecks,
-				...(input.mergeMethod !== undefined ? { mergeMethod: input.mergeMethod } : {}),
+				mergeMethod: input.mergeMethod,
 			},
 			input.expectedRevision,
 		);
