@@ -54,17 +54,18 @@ interface ScriptedCall {
 type RestHandler = (page: number, callIndex: number) => { stdout: string } | { stderr: string };
 type RestHandlers = Record<string, RestHandler>;
 
-function makeScriptedRunner(handlers: RestHandlers, graphqlStdout?: string) {
+function makeScriptedRunner(handlers: RestHandlers, graphqlStdout?: string | ((graphqlCallIndex: number) => string)) {
 	const calls: ScriptedCall[] = [];
 	const perEndpoint = new Map<string, number>();
 	const runner = async (args: string[], _cwd: string): Promise<GhRunnerCommandResult> => {
 		const endpointRaw = args[3] ?? "";
 		if (endpointRaw === "graphql") {
 			calls.push({ kind: "graphql", endpoint: null, page: null });
+			const graphqlCallIndex = calls.filter((call) => call.kind === "graphql").length;
 			return {
 				ok: true,
 				stdout:
-					graphqlStdout ??
+					(typeof graphqlStdout === "function" ? graphqlStdout(graphqlCallIndex) : graphqlStdout) ??
 					JSON.stringify({
 						data: { node: { reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } },
 					}),
@@ -91,7 +92,7 @@ function makeScriptedRunner(handlers: RestHandlers, graphqlStdout?: string) {
 	return { runner, calls };
 }
 
-function adapterFor(handlers: RestHandlers, graphqlStdout?: string) {
+function adapterFor(handlers: RestHandlers, graphqlStdout?: string | ((graphqlCallIndex: number) => string)) {
 	const scripted = makeScriptedRunner(handlers, graphqlStdout);
 	return {
 		adapter: createGitHubGhAdapter({ ghRunner: scripted.runner, now: () => NOW, cwd: "/tmp/fake-repo" }),
@@ -99,7 +100,10 @@ function adapterFor(handlers: RestHandlers, graphqlStdout?: string) {
 	};
 }
 
-async function collect(handlers: RestHandlers, options: { declaredHeadSha?: string; graphqlStdout?: string } = {}) {
+async function collect(
+	handlers: RestHandlers,
+	options: { declaredHeadSha?: string; graphqlStdout?: string | ((graphqlCallIndex: number) => string) } = {},
+) {
 	const { adapter, calls } = adapterFor(handlers, options.graphqlStdout);
 	return {
 		envelope: await collectAutoMergeEvidence(adapter, PARSED, SCOPE, {
@@ -601,6 +605,53 @@ describe("auto-merge-evidence reader", () => {
 		expect(envelope.statuses).toEqual([]);
 		expect(envelope.unresolvedActiveThreads).toBe(0);
 		expect(envelope.sources.reviewThreads).toBe(true);
+	});
+	it("leaves the poller's conditional-read cache untouched (poll, change, evidence, poll)", async () => {
+		// Poll 1 reads establish the adapter's conditional digests; then the
+		// provider changes (merged at a new head, new thread data); then an
+		// evidence read; then the poll must still see the changed bodies and
+		// never a shadowed `not_modified` from a digest the evidence read
+		// recorded.
+		const { adapter } = adapterFor(
+			{
+				[PR_ENDPOINT]: (_page, callIndex) => ({
+					stdout: callIndex === 0 ? prMetadataBody() : prMetadataBody({ state: "closed", merged: true }, "def456"),
+				}),
+				[REVIEWS_ENDPOINT]: () => ({ stdout: "[]" }),
+				[CHECK_RUNS_ENDPOINT]: () => ({ stdout: JSON.stringify({ total_count: 0, check_runs: [] }) }),
+				[STATUSES_ENDPOINT]: () => ({ stdout: JSON.stringify({ state: "success", total_count: 0, statuses: [] }) }),
+			},
+			(graphqlCallIndex) =>
+				threadsStdout(
+					graphqlCallIndex === 1
+						? [{ id: "t-old", resolved: false, outdated: false }]
+						: [{ id: "t-new", resolved: false, outdated: false }],
+				),
+		);
+
+		const poll1 = await adapter.readPrMetadata(PARSED, SCOPE);
+		expect(poll1.kind).toBe("ok");
+		const threads1 = await adapter.readReviewThreads(PARSED, SCOPE, "PR_49");
+		expect(threads1.kind).toBe("ok_threads");
+
+		// The evidence read observes the merged PR without recording digests.
+		const envelope = await collectAutoMergeEvidence(adapter, PARSED, SCOPE, {
+			policyRevision: 7,
+			declaredHeadSha: null,
+			now: () => NOW,
+		});
+		expect(envelope.prState).toBe("merged");
+		expect(envelope.headSha).toBe("def456");
+
+		// The next poll's non-fresh reads must see the change.
+		const poll2 = await adapter.readPrMetadata(PARSED, SCOPE);
+		expect(poll2.kind).toBe("ok");
+		if (poll2.kind === "ok") {
+			expect(poll2.metadata.state).toBe("merged");
+			expect(poll2.metadata.headSha).toBe("def456");
+		}
+		const threads2 = await adapter.readReviewThreads(PARSED, SCOPE, "PR_49");
+		expect(threads2.kind).toBe("ok_threads");
 	});
 });
 

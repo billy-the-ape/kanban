@@ -491,12 +491,24 @@ export class GitHubGhAdapter {
 		return `${parsed.host}|${parsed.repository}|${parsed.number}|${scope.accessScopeId}|${source}`;
 	}
 
-	private applyConditionalRead(key: string, body: string, fresh: boolean): "changed" | "not_modified" {
+	/**
+	 * Conditional-read bookkeeping. `recordDigest: false` reads the cache but
+	 * never writes it, so cache-neutral readers (e.g. AM-2 evidence reads)
+	 * cannot shadow the poller's own `not_modified` short-circuit.
+	 */
+	private applyConditionalRead(
+		key: string,
+		body: string,
+		fresh: boolean,
+		recordDigest = true,
+	): "changed" | "not_modified" {
 		const digest = sha256Digest(body);
 		if (!fresh && this.bodyDigestCache.get(key) === digest) {
 			return "not_modified";
 		}
-		this.bodyDigestCache.set(key, digest);
+		if (recordDigest) {
+			this.bodyDigestCache.set(key, digest);
+		}
 		return "changed";
 	}
 
@@ -507,7 +519,7 @@ export class GitHubGhAdapter {
 	async readPrMetadata(
 		parsed: ParsedCanonicalPrKey,
 		scope: AccessScope,
-		options?: { fresh?: boolean },
+		options?: { fresh?: boolean; recordDigest?: boolean },
 	): Promise<MetadataReadResult> {
 		const endpoint = `repos/${parsed.repository}/pulls/${parsed.number}`;
 		const outcome = await this.callRest(endpoint);
@@ -521,6 +533,7 @@ export class GitHubGhAdapter {
 			this.conditionalKey(parsed, scope, "metadata"),
 			outcome.stdout,
 			options?.fresh ?? false,
+			options?.recordDigest ?? true,
 		);
 		if (condition === "not_modified") {
 			return { kind: "not_modified" };
@@ -670,7 +683,7 @@ export class GitHubGhAdapter {
 			// Complete pagination: stop on a short (final) page or once the
 			// known total_count is reached.
 			if (reachedTotal || items.length < REST_LIST_PAGE_SIZE) {
-				if (!reachedTotal && totalCount !== null && all.length < totalCount) {
+				if (totalCount !== null && all.length < totalCount) {
 					// Short page below a known total: ambiguous completeness.
 					return {
 						kind: "failed",
@@ -775,7 +788,7 @@ export class GitHubGhAdapter {
 		parsed: ParsedCanonicalPrKey,
 		scope: AccessScope,
 		nodeId: string,
-		options?: { fresh?: boolean },
+		options?: { fresh?: boolean; recordDigest?: boolean },
 	): Promise<FeedbackReadResult> {
 		const key = this.conditionalKey(parsed, scope, "threads");
 		const threads = new Map<string, PrThreadInfo>();
@@ -875,7 +888,7 @@ export class GitHubGhAdapter {
 			after = endCursor;
 		}
 		const body = JSON.stringify([...threads.entries()]);
-		const condition = this.applyConditionalRead(key, body, options?.fresh ?? false);
+		const condition = this.applyConditionalRead(key, body, options?.fresh ?? false, options?.recordDigest ?? true);
 		if (condition === "not_modified") {
 			return { kind: "not_modified" };
 		}

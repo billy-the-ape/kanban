@@ -10,8 +10,8 @@
 // evidence (retry next eligible cycle).
 //
 // This module NEVER merges, arms, writes to GitHub, or starts a timer. The
-// coordinator exposes it as a consumer-requested read that coalesces on the
-// existing ~60-second PR cycle machinery; unrelated tasks never trigger
+// coordinator exposes it as a consumer-requested read that coalesces
+// concurrent requests per (PR, scope); unrelated tasks never trigger
 // these reads. The normalization layer is pure and injectable (tests script
 // the adapter's gh runner).
 import type { AutoMergeCheckEvidence, AutoMergeEvidenceEnvelope, AutoMergeReviewEvidence } from "../core/api-contract";
@@ -270,7 +270,13 @@ export async function collectAutoMergeEvidence(
 	const repo = parsed.repository;
 	const number = parsed.number;
 
-	const initial: MetadataReadResult = await adapter.readPrMetadata(parsed, scope, { fresh: true });
+	// Cache-neutral conditional reads: `recordDigest: false` keeps this read
+	// from recording digests into the adapter's shared cache, which the
+	// poller relies on for its own `not_modified` short-circuits.
+	const initial: MetadataReadResult = await adapter.readPrMetadata(parsed, scope, {
+		fresh: true,
+		recordDigest: false,
+	});
 	if (initial.kind !== "ok") {
 		const envelope = baseEnvelope(scope.accessScopeId, now(), policyRevision, options.declaredHeadSha ?? null);
 		addReason(envelope.reasons, initial.kind === "failed" ? initial.failure.category : "metadata_unreadable");
@@ -318,7 +324,7 @@ export async function collectAutoMergeEvidence(
 		adapter.readRawRestList(`repos/${repo}/commits/${headSha}/check-runs`, "check_runs"),
 		adapter.readCommitStatuses(`repos/${repo}/commits/${headSha}/status`),
 		nodeId
-			? adapter.readReviewThreads(parsed, scope, nodeId, { fresh: true })
+			? adapter.readReviewThreads(parsed, scope, nodeId, { fresh: true, recordDigest: false })
 			: Promise.resolve<FeedbackReadResult>({
 					kind: "failed",
 					failure: { category: "network", message: "missing PR node id", at: now() },
@@ -327,7 +333,10 @@ export async function collectAutoMergeEvidence(
 
 	// Coherent-snapshot check: re-read the authoritative identity and discard
 	// if ANY of head/base changed while the sources were being collected.
-	const final: MetadataReadResult = await adapter.readPrMetadata(parsed, scope, { fresh: true });
+	const final: MetadataReadResult = await adapter.readPrMetadata(parsed, scope, {
+		fresh: true,
+		recordDigest: false,
+	});
 	const envelope = baseEnvelope(scope.accessScopeId, now(), policyRevision, headSha);
 	Object.assign(envelope, {
 		baseSha: start.baseSha ?? null,
