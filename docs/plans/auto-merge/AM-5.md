@@ -8,13 +8,14 @@ Expose deterministic auto-merge in the **existing task PR tracking panel**, with
 
 ## UX contract
 
-- Add **"Auto merge when CI passes and PR is approved"** beside existing **"Auto complete when the PR merges"** in `web-ui/src/components/detail-panels/task-pr-tracking-settings.tsx`. Keep checkboxes independent; default both unchanged (new one defaults off).
+- Add **"Auto-merge when CI passes and at least one review approves"** beside existing **"Auto complete when the PR merges"** in `web-ui/src/components/detail-panels/task-pr-tracking-settings.tsx`. Help text: **"Automatically merge the selected PR when all configured CI checks pass and at least one valid approving GitHub review is present. GitHub\'s repository rules still apply."** Keep checkboxes independent; default both unchanged (new one defaults off). Approval count is a fixed minimum of one; there is no count-setting UI in V1.
 - Show the selected **Automation PR** identity. If multiple linked PRs exist and selection is ambiguous, display a blocker and do not enable. The existing `Automation PR` selector remains authoritative.
 - Add a small **repository CI policy** affordance in the same panel: configured exact required check names; selected merge method (`merge`, `squash`, `rebase`); evidence that the contexts actually exist. Configure the policy once per normalized GitHub repository. Never autofill with an unverified placeholder. For convenience, suggest names from observed GitHub check runs **but require explicit operator confirmation**. When policy is missing, empty, incompatible or changed, disable arming and show why.
-- Before enabling, make the merge consequences explicit (this action actually merges into the target base, not merely marks the card Done). On successful enable, show armed policy revision. When policy changes, mark existing opt-ins disarmed and require re-arm.
+- Before enabling, make the merge consequences explicit (this action actually merges into the target base, not merely marks the card Done). Explain that GitHub branch protections and rulesets can impose additional approval or deployment requirements that Kanban does not override. On successful enable, show armed policy revision. When policy changes, mark existing opt-ins disarmed and require re-arm.
 - Present separate concise status: `off`, `waiting: approval`, `waiting: CI`, `waiting: writer/comment repair`, `blocked: missing policy/ambiguous PR/permission/conflicts`, `merging`, `merged`, `needs attention`. Include last verified time and current head abbreviation; never show stale evidence as green.
 - If `autoFinishOnMerge` is off, explain that the **PR can auto-merge while the card remains In Review**. Offer an independent checkbox, not a forced implicit toggle.
 - Show explicit server error/conflict feedback for policy writes and task toggles. Support a retry/re-arm affordance only where the state machine allows; do not add a one-click bypass of CI or approval.
+- Do not add configurable approval counts, reviewer roles or custom conditions in V1. Future options are documented in the roadmap only.
 - UI remains accessible on mobile and does no expensive GitHub parsing. Keep `useTaskPrTrackingState`'s existing visible-panel poll strategy; no new browser poller or extra body-sized payloads.
 
 ## E2E acceptance matrix
@@ -24,6 +25,8 @@ Expose deterministic auto-merge in the **existing task PR tracking panel**, with
 | Opt-in off; approved + CI green | No auto-merge |
 | Opt-in on; CI pending or review missing | Wait; no merge |
 | CI succeeds then valid review; or review then CI | Exactly one verified merge attempt |
+| Two approvals and green CI | Same Kanban eligibility as one approval |
+| One approval, green CI, but GitHub requires two approvals | GitHub denies the merge; show a blocker; never bypass or retry indefinitely |
 | No configured CI names despite green-looking GitHub PR | Configuration blocker, no merge |
 | Old-head approval or successful check; draft; conflicts; missing permissions | Block, never merge |
 | Comment repair in progress; unaddressed changes request; head moves | Wait or block; re-evaluate before write |
