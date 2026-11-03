@@ -1,4 +1,4 @@
-import { parseCanonicalPrKey } from "../pr-tracking/pr-identity";
+import { parseCanonicalPrKey } from "../pr-tracking/pr-key-parsing";
 import type {
 	RuntimeAgentId,
 	RuntimeBoardCard,
