@@ -55,7 +55,7 @@ function subscriptionKey(workspaceId: string, taskId: string): string {
 }
 
 function sameConsumers(a: Record<RuntimePrConsumerKind, boolean>, b: Record<RuntimePrConsumerKind, boolean>): boolean {
-	return a.comments === b.comments && a.mergeCompletion === b.mergeCompletion;
+	return a.comments === b.comments && a.mergeCompletion === b.mergeCompletion && a.autoMerge === b.autoMerge;
 }
 
 /**
@@ -93,8 +93,17 @@ export function computeTaskSubscriptionDemand(
 				const consumers: Record<RuntimePrConsumerKind, boolean> = {
 					comments: card.autoAddressComments === true && installed.comments && commentsServable,
 					mergeCompletion: card.autoFinishOnMerge === true && installed.mergeCompletion,
+					// AM-3: the auto-merge opt-in arms a subscription against
+					// the repository policy. Demand requires the armed
+					// revision to exist; the evaluator still enforces the
+					// full policy-revision match and fails closed on a
+					// stale arm.
+					autoMerge:
+						card.autoMergeWhenApproved === true &&
+						card.armedAutoMergePolicyRevision !== undefined &&
+						installed.autoMerge,
 				};
-				if (!consumers.comments && !consumers.mergeCompletion) {
+				if (!consumers.comments && !consumers.mergeCompletion && !consumers.autoMerge) {
 					continue;
 				}
 				demands.push({
@@ -186,7 +195,7 @@ export async function reconcileTaskSubscriptions(
 		return { added, removed, updated };
 	}
 	let demands: PrTaskSubscriptionDemand[];
-	if (!installed.comments && !installed.mergeCompletion) {
+	if (!installed.comments && !installed.mergeCompletion && !installed.autoMerge) {
 		demands = [];
 	} else {
 		const boards = await source.listBoards();

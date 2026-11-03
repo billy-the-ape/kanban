@@ -861,6 +861,7 @@ async function completeTaskById(input: {
 		const prGateInstalled: PrInstalledConsumers = {
 			comments: (latestRecord.task.agentId ?? selectedAgentId) === "cline",
 			mergeCompletion: true,
+			autoMerge: true,
 		};
 		const prLifecycleGate = evaluatePrLifecycleGate({ card: latestRecord.task, installed: prGateInstalled });
 		if (prLifecycleGate.legacyCompletionGated) {

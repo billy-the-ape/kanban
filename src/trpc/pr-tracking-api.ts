@@ -172,9 +172,10 @@ function toReservationView(record: GitHubPrTrackingRecord | null): RuntimePrRese
 export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 	const source = {
 		listBoards: () => deps.listManagedWorkspaceBoards(),
-		// Both PR tracking consumers (comment follow-up and merge completion)
-		// are always installed.
-		installedConsumers: () => ({ comments: true, mergeCompletion: true }),
+		// All three PR tracking consumers (comment follow-up, merge
+		// completion, and the AM-3 auto-merge eligibility observer) are
+		// always installed.
+		installedConsumers: () => ({ comments: true, mergeCompletion: true, autoMerge: true }),
 	};
 
 	/** Reconcile live task-derived subscriptions after a board change. */
@@ -431,6 +432,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 				reservation: { state: "none", reservedBy: null, reservedOperation: null, fencingGeneration: 0 },
 				snapshot: null,
 				terminalStop: null,
+				autoMergeEligibility: null,
 				error: null,
 			};
 		}
@@ -458,7 +460,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		// lifecycle gate keys off the task's own PR automation settings —
 		// except the comments half, which only owns tasks the comment
 		// automation can actually serve (native Cline).
-		const installed: PrInstalledConsumers = { comments: nativeClineTask, mergeCompletion: true };
+		const installed: PrInstalledConsumers = { comments: nativeClineTask, mergeCompletion: true, autoMerge: true };
 		const gate = evaluatePrLifecycleGate({ card, installed });
 		const blockers: Array<{ kind: RuntimeTaskTrackingStateResponse["blockers"][number]["kind"]; message: string }> =
 			[];
@@ -569,6 +571,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			terminalStop: binding?.terminalStop
 				? { reason: binding.terminalStop.reason, observedAt: binding.terminalStop.observedAt }
 				: null,
+			autoMergeEligibility: binding?.autoMerge ?? null,
 			error: null,
 		};
 	};

@@ -368,6 +368,8 @@ export abstract class PrRecordStoreBase implements PrRecordStorePort {
 							linkedAt: this.nowValue(),
 							terminalStop: null,
 							mergeCompletion: null,
+							// AM-3: no eligibility summary yet.
+							autoMerge: null,
 							replayCursors: emptyReplayCursors(),
 						},
 					];

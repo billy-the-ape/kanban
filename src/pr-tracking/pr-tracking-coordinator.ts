@@ -48,7 +48,7 @@ import {
 	type PrThreadInfo,
 } from "./pr-snapshots";
 
-export type PrTrackingConsumerKind = "comments" | "mergeCompletion";
+export type PrTrackingConsumerKind = "comments" | "mergeCompletion" | "autoMerge";
 
 /**
  * A fake/inspect-only subscription (the PRTRACK-0 seam). PRTRACK-1 replaces
@@ -387,9 +387,11 @@ export class PrTrackingCoordinator {
 		if (!binding) {
 			return;
 		}
-		const persisted = [binding.replayCursors.comments, binding.replayCursors.mergeCompletion].filter(
-			(cursor): cursor is number => typeof cursor === "number",
-		);
+		const persisted = [
+			binding.replayCursors.comments,
+			binding.replayCursors.mergeCompletion,
+			binding.replayCursors.autoMerge,
+		].filter((cursor): cursor is number => typeof cursor === "number");
 		if (persisted.length > 0) {
 			this.snapshotSeq.set(key, Math.max(...persisted));
 		}
@@ -455,7 +457,7 @@ export class PrTrackingCoordinator {
 	async readTaskSnapshotEvents(
 		workspaceId: string,
 		taskId: string,
-		consumer: "comments" | "mergeCompletion",
+		consumer: PrTrackingConsumerKind,
 		fromCursor?: number,
 	): Promise<{ events: RuntimePrSnapshotEvent[]; nextCursor: number }> {
 		const sub = this.subscriptions.get(this.subscriptionKey(workspaceId, taskId));
@@ -962,7 +964,7 @@ export class PrTrackingCoordinator {
 				blocker: "unsupported_host",
 			};
 		}
-		const anyConsumer = sub.consumers.comments || sub.consumers.mergeCompletion;
+		const anyConsumer = sub.consumers.comments || sub.consumers.mergeCompletion || sub.consumers.autoMerge;
 		if (!anyConsumer) {
 			return { subscription: sub, binding, mode: "stopped", stopReason: "no_enabled_consumers", blocker: null };
 		}

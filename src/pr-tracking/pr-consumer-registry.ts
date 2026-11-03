@@ -27,6 +27,10 @@ import type {
 export const PR_CONSUMER_READ_SOURCES: Record<RuntimePrConsumerKind, RuntimePrConsumerReadSource[]> = {
 	comments: ["metadata", "reviews", "conversationComments", "inlineComments", "threads"],
 	mergeCompletion: ["metadata"],
+	// AM-3: the auto-merge consumer rides the metadata demand (the poll that
+	// delivers observations); its merge-evidence reads are consumer-requested
+	// through the coordinator, never timer-driven.
+	autoMerge: ["metadata"],
 };
 
 export interface PrConsumerRegistration {
@@ -60,6 +64,8 @@ export interface PrConsumerObservation {
 export interface PrInstalledConsumers {
 	comments: boolean;
 	mergeCompletion: boolean;
+	/** AM-3: the auto-merge eligibility observer. */
+	autoMerge: boolean;
 }
 
 export class PrConsumerRegistry {
@@ -136,5 +142,6 @@ export function toInstalledConsumerFlags(registry: PrConsumerRegistry): PrInstal
 	return {
 		comments: registry.isInstalled("comments"),
 		mergeCompletion: registry.isInstalled("mergeCompletion"),
+		autoMerge: registry.isInstalled("autoMerge"),
 	};
 }
