@@ -8,12 +8,12 @@
 
 import { AlertTriangle, RefreshCw } from "lucide-react";
 import { useMemo, useState } from "react";
-import { cn } from "@/components/ui/cn";
 import { getRuntimeTrpcClient } from "@/runtime/trpc-client";
 import type { RuntimeTaskPullRequest, RuntimeTaskTrackingStateResponse } from "@/runtime/types";
 import type { BoardCard } from "@/types";
 import { toCanonicalPrKeyForLink } from "@/utils/pr-tracking";
 import { TaskPrCommentHandlingPanel } from "../task-pr-comment-handling-panel";
+import { TaskPrTrackingCheckbox } from "./task-pr-tracking-checkbox";
 
 function prLabel(link: RuntimeTaskPullRequest): string {
 	return `${link.repository}#${link.number}`;
@@ -24,44 +24,6 @@ function formatAsOf(timestamp: number | null): string | null {
 		return null;
 	}
 	return new Date(timestamp).toLocaleTimeString();
-}
-
-function PrTrackingCheckbox({
-	label,
-	hint,
-	checked,
-	disabled,
-	acting,
-	onChange,
-}: {
-	label: string;
-	hint: string | null;
-	checked: boolean;
-	disabled: boolean;
-	acting: boolean;
-	onChange: (next: boolean) => void;
-}): React.ReactElement {
-	return (
-		<label
-			className={cn(
-				"flex items-start gap-2 text-xs text-text-secondary",
-				!disabled && "cursor-pointer hover:text-text-primary",
-			)}
-		>
-			<input
-				type="checkbox"
-				checked={checked}
-				disabled={disabled || acting}
-				onChange={(event) => onChange(event.target.checked)}
-				className="mt-0.5 h-3.5 w-3.5 accent-(--color-accent)"
-				aria-label={label}
-			/>
-			<span className="leading-tight">
-				{label}
-				{hint ? <span className="block text-text-tertiary">{hint}</span> : null}
-			</span>
-		</label>
-	);
 }
 
 /**
@@ -161,7 +123,7 @@ export function TaskPrTrackingSettings({
 				{workspaceId !== null ? (
 					<TaskPrCommentHandlingPanel workspaceId={workspaceId} taskId={taskId} pullRequests={links} />
 				) : null}
-				<PrTrackingCheckbox
+				<TaskPrTrackingCheckbox
 					label="Auto complete when the PR merges"
 					hint={null}
 					checked={tracking.autoFinishOnMerge}
