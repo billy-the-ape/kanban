@@ -1060,7 +1060,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			return { ok: false, repository: "", policy: null };
 		}
 		const policy = await deps.getAutoMergePolicyStore().loadPolicy(normalized);
-		return { ok: true, repository: normalized, policy: policy ?? null };
+		return { ok: true, repository: normalized, policy };
 	};
 
 	/**
