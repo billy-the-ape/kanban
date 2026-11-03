@@ -1,0 +1,33 @@
+# AM-1: Persist task opt-in and repository-level merge policy
+
+**Status:** planned. **One implementation PR into `main`.** Depends on: none. Read [README.md](./README.md).
+
+## Deliverable
+
+Backend data contracts and dedicated mutations for a new, disabled-by-default task setting `autoMergeWhenApproved`, plus one shared versioned policy per GitHub repository. No GitHub reads or writes and no automatic merge behavior in this PR.
+
+## Decisions
+
+- Place `autoMergeWhenApproved?: boolean` on `RuntimeBoardCard`, alongside `autoAddressComments` and `autoFinishOnMerge`. Missing/legacy values are false. **Do not** silently enable `autoFinishOnMerge`; the operator may elect one or both.
+- Keep this flag server-owned via the existing PR settings mutation and stale whole-board save shielding. Extend `settingsRevision` CAS and responses; a stale client must not overwrite a newer toggle or selected PR.
+- Store the **policy per normalized canonical `owner/repo`**, not as a global unchecked default and not in every task. Use one durable, atomic, revision-checked store under the existing runtime home (or a closely related existing settings store if inspected code clearly offers one). Policy: `requiredChecks: string[]` (nonempty, unique, trimmed, case-sensitive exact GitHub check names), `mergeMethod: "merge" | "squash" | "rebase"` (default `merge`), `revision`, `updatedAt`. No tokens or credentials in this file.
+- A missing or malformed policy is **not armed**. Do not accept `requiredChecks: []`, glob patterns, vague workflow names, or an implicit "all required GitHub checks" fallback. Validate repository identity against the server-resolved selected automation PR. Reject disallowed merge methods when repository metadata later proves the method unavailable.
+- At enable time, bind the task's opt-in to the current policy revision (`armedAutoMergePolicyRevision` or equivalent durable field). A later policy edit invalidates prior arms; require deliberate re-arming to avoid silently broadening an existing opt-in. Changing selected Automation PR or unlinking it disarms auto-merge; editing other PR settings should not.
+- Enforce the existing eligible columns (`in_progress`/`review`), selected-PR resolution, and revision conflicts at the server boundary. Do not trust UI checkboxes or an unvalidated repository string from the client.
+- Choose stable schema/field names after inspecting current conventions, but preserve these behaviors and the independent `autoFinishOnMerge` setting. No new unrestricted whole-board mutation path.
+
+## Expected files
+
+`src/core/api-contract.ts`, `src/core/task-board-mutations.ts`, `src/state/workspace-state.ts`, `src/trpc/pr-tracking-api.ts`; a small `src/pr-tracking/auto-merge-policy-store.ts` or an existing versioned settings store. Extend tests for board save/reload, schema compatibility, race conflicts, selection changes, and auth of policy writes.
+
+## Acceptance tests
+
+1. Upgrading with old cards and no policy displays disabled without migration or crash.
+2. Concurrent settings writes cannot silently flip the new option; stale whole-board saves retain server-owned fields.
+3. A policy created for repository A cannot arm an unrelated selected PR in repository B; malformed/missing/empty check contexts fail closed.
+4. Policy revision updates disarm previous arms; selecting/unlinking a different automation PR disarms. Enabling does not toggle auto-completion.
+5. Tests demonstrate no GitHub merge calls, extra pollers, or runtime execution changes.
+
+## Deployment
+
+No runtime merging becomes possible from AM-1 alone. No environment variable or manual data migration. Persist the policy in the existing runtime-home backup scope; retain policy data across deploys. The AM-5 UI will expose policy configuration and task opt-in.
