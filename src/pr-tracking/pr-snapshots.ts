@@ -116,10 +116,10 @@ export function normalizePrMetadata(raw: unknown, accessScopeId: string, checked
 				: "open";
 	// PRLINK-9: optional display title projected from the same read.
 	const title = asString(pr.title);
-	// PRLINK-9: display details projected from the same read (no second fetch).
 	// AM-2: authoritative merge-evidence facts from the same read.
 	const author = authorInfo(pr.user);
 	const autoMerge = typeof pr.auto_merge === "object" && pr.auto_merge !== null ? pr.auto_merge : null;
+	// PRLINK-9: display details projected from the same read (no second fetch).
 	return {
 		accessScopeId,
 		checkedAt,

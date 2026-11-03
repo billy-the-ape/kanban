@@ -3788,9 +3788,6 @@ export const autoMergeEvidenceEnvelopeSchema = z
 	.passthrough();
 export type AutoMergeEvidenceEnvelope = z.infer<typeof autoMergeEvidenceEnvelopeSchema>;
 
-/** Result of one bounded auto-merge evidence read (always an envelope). */
-export type AutoMergeEvidenceResult = AutoMergeEvidenceEnvelope;
-
 export const runtimeTaskAutomationPrSelectRequestSchema = z.object({
 	taskId: z.string().min(1),
 	/**
