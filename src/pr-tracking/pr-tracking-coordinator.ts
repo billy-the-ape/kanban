@@ -33,7 +33,6 @@ import {
 	createGitHubGhAdapter,
 	type GhAdapterFailure,
 	type GitHubGhAdapter,
-	isGhAdapterFailureCategory,
 } from "./github-gh-adapter";
 import { type PrConsumerRegistry, toInstalledConsumerFlags } from "./pr-consumer-registry";
 import { isTrackingSupportedPr, type ParsedCanonicalPrKey, parseCanonicalPrKey } from "./pr-identity";
@@ -1775,30 +1774,27 @@ export class PrTrackingCoordinator {
 		options: { policyRevision: number; declaredHeadSha?: string | null },
 	): Promise<AutoMergeEvidenceEnvelope> {
 		let evidence: AutoMergeEvidenceEnvelope;
+		let failures: GhAdapterFailure[] = [];
 		try {
-			evidence = await collectAutoMergeEvidence(this.adapter, parsed, scope, {
+			const result = await collectAutoMergeEvidence(this.adapter, parsed, scope, {
 				policyRevision: options.policyRevision,
 				declaredHeadSha: options.declaredHeadSha ?? null,
 				now: this.now,
 			});
+			evidence = result.envelope;
+			failures = result.failures;
 		} catch (error) {
 			evidence = this.failureEvidenceEnvelope(scope.accessScopeId, options.policyRevision, [
 				`internal_error: ${String(error)}`,
 			]);
 		}
-		// Route adapter failure categories through the shared classification
+		// Route the ORIGINAL adapter failures through the shared classification
 		// (auth stops all polls; access stops this poll; rate limits extend
-		// the deadline) so evidence reads and polls stay consistent. Reasons
-		// are already de-duplicated, so each category is handled once.
-		for (const reason of evidence.reasons) {
-			if (!isGhAdapterFailureCategory(reason)) {
-				continue;
-			}
-			this.handleFailure(state, {
-				category: reason,
-				message: `auto-merge evidence read failed (${reason})`,
-				at: this.now(),
-			});
+		// the deadline with the real reset time) so evidence reads and polls
+		// stay consistent. Reconstructing failures from reason tokens would
+		// drop `rateLimitResetAt` and fall back to the 15-minute guess.
+		for (const failure of failures) {
+			this.handleFailure(state, failure);
 		}
 		return evidence;
 	}

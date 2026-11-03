@@ -105,14 +105,12 @@ async function collect(
 	options: { declaredHeadSha?: string; graphqlStdout?: string | ((graphqlCallIndex: number) => string) } = {},
 ) {
 	const { adapter, calls } = adapterFor(handlers, options.graphqlStdout);
-	return {
-		envelope: await collectAutoMergeEvidence(adapter, PARSED, SCOPE, {
-			policyRevision: 7,
-			declaredHeadSha: options.declaredHeadSha ?? null,
-			now: () => NOW,
-		}),
-		calls,
-	};
+	const result = await collectAutoMergeEvidence(adapter, PARSED, SCOPE, {
+		policyRevision: 7,
+		declaredHeadSha: options.declaredHeadSha ?? null,
+		now: () => NOW,
+	});
+	return { envelope: result.envelope, calls };
 }
 
 function prMetadataBody(overrides: Record<string, unknown> = {}, headSha: string = HEAD): string {
@@ -635,7 +633,7 @@ describe("auto-merge-evidence reader", () => {
 		expect(threads1.kind).toBe("ok_threads");
 
 		// The evidence read observes the merged PR without recording digests.
-		const envelope = await collectAutoMergeEvidence(adapter, PARSED, SCOPE, {
+		const { envelope } = await collectAutoMergeEvidence(adapter, PARSED, SCOPE, {
 			policyRevision: 7,
 			declaredHeadSha: null,
 			now: () => NOW,
@@ -821,6 +819,9 @@ describe("pr-tracking-coordinator auto-merge evidence reads", () => {
 	});
 
 	it("reports rate limits and short-circuits subsequent reads (never retries)", async () => {
+		// The reset is well beyond the 15-minute fallback: the deadline must
+		// use the REAL provider reset time, not the guess.
+		const resetAt = Date.now() + 3_600_000;
 		const harness = makeEvidenceHarness({
 			rest: (endpoint) =>
 				endpoint === CHECK_RUNS_ENDPOINT
@@ -829,7 +830,7 @@ describe("pr-tracking-coordinator auto-merge evidence reads", () => {
 								category: "rate_limit",
 								message: "API rate limit exceeded",
 								at: 1,
-								rateLimitResetAt: Date.now() + 900_000,
+								rateLimitResetAt: resetAt,
 							},
 						}
 					: { items: [] },
@@ -840,7 +841,7 @@ describe("pr-tracking-coordinator auto-merge evidence reads", () => {
 		expect(envelope.reasons).toContain("check_runs_incomplete");
 		expect(envelope.reasons).toContain("rate_limit");
 		const deadline = harness.coordinator.getState().polls[0]?.rateLimitDeadline ?? 0;
-		expect(deadline).toBeGreaterThan(Date.now());
+		expect(deadline).toBe(resetAt);
 		const second = await coordinator.readAutoMergeEvidence(PR49, undefined, { policyRevision: 1 });
 		expect(second.complete).toBe(false);
 		expect(second.reasons).toEqual(["rate_limited"]);

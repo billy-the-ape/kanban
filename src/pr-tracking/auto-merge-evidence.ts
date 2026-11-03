@@ -20,6 +20,7 @@ import type {
 	AccessScope,
 	CommitStatusesReadResult,
 	FeedbackReadResult,
+	GhAdapterFailure,
 	GitHubGhAdapter,
 	MetadataReadResult,
 	RawRestListResult,
@@ -207,6 +208,17 @@ export interface AutoMergeEvidenceOptions {
 	now?: () => number;
 }
 
+/**
+ * Result of one evidence collection. `failures` is a non-schema side
+ * channel carrying the ORIGINAL adapter failure objects (in source order),
+ * so consumers retain provider facts — notably `rateLimitResetAt` — that
+ * the envelope's reason tokens discard.
+ */
+export interface AutoMergeEvidenceResult {
+	envelope: AutoMergeEvidenceEnvelope;
+	failures: GhAdapterFailure[];
+}
+
 function baseEnvelope(
 	accessScopeId: string,
 	checkedAt: number,
@@ -264,11 +276,12 @@ export async function collectAutoMergeEvidence(
 	parsed: ParsedCanonicalPrKey,
 	scope: AccessScope,
 	options: AutoMergeEvidenceOptions,
-): Promise<AutoMergeEvidenceEnvelope> {
+): Promise<AutoMergeEvidenceResult> {
 	const now = options.now ?? Date.now;
 	const policyRevision = options.policyRevision;
 	const repo = parsed.repository;
 	const number = parsed.number;
+	const failures: GhAdapterFailure[] = [];
 
 	// Cache-neutral conditional reads: `recordDigest: false` keeps this read
 	// from recording digests into the adapter's shared cache, which the
@@ -278,15 +291,18 @@ export async function collectAutoMergeEvidence(
 		recordDigest: false,
 	});
 	if (initial.kind !== "ok") {
+		if (initial.kind === "failed") {
+			failures.push(initial.failure);
+		}
 		const envelope = baseEnvelope(scope.accessScopeId, now(), policyRevision, options.declaredHeadSha ?? null);
 		addReason(envelope.reasons, initial.kind === "failed" ? initial.failure.category : "metadata_unreadable");
-		return envelope;
+		return { envelope, failures };
 	}
 	const headSha = initial.metadata.headSha;
 	if (headSha === null) {
 		const envelope = baseEnvelope(scope.accessScopeId, now(), policyRevision, null);
 		addReason(envelope.reasons, "head_unknown");
-		return envelope;
+		return { envelope, failures };
 	}
 	const start = {
 		headSha,
@@ -315,7 +331,7 @@ export async function collectAutoMergeEvidence(
 			autoMergePresent: initial.metadata.autoMergePresent ?? null,
 		});
 		addReason(envelope.reasons, "declared_head_mismatch");
-		return envelope;
+		return { envelope, failures };
 	}
 
 	const nodeId = initial.nodeId;
@@ -364,6 +380,9 @@ export async function collectAutoMergeEvidence(
 		}
 	} else {
 		// A failed or 304 re-read cannot re-verify identity: never complete.
+		if (final.kind === "failed") {
+			failures.push(final.failure);
+		}
 		addReason(envelope.reasons, final.kind === "failed" ? final.failure.category : "metadata_unreadable");
 	}
 	envelope.sources.prMetadata = metadataCoherent;
@@ -372,6 +391,7 @@ export async function collectAutoMergeEvidence(
 		envelope.sources.reviews = true;
 		envelope.reviews = normalizeMergeReviews(reviews.items, scope.login);
 	} else if (reviews.kind === "failed") {
+		failures.push(reviews.failure);
 		addReason(envelope.reasons, "reviews_incomplete");
 		addReason(envelope.reasons, reviews.failure.category);
 	}
@@ -379,6 +399,7 @@ export async function collectAutoMergeEvidence(
 		envelope.sources.checkRuns = true;
 		envelope.checks = selectEffectiveCheckRuns(checkRuns.items, headSha);
 	} else if (checkRuns.kind === "failed") {
+		failures.push(checkRuns.failure);
 		addReason(envelope.reasons, "check_runs_incomplete");
 		addReason(envelope.reasons, checkRuns.failure.category);
 	}
@@ -386,6 +407,7 @@ export async function collectAutoMergeEvidence(
 		envelope.sources.commitStatuses = true;
 		envelope.statuses = selectEffectiveCommitStatuses(statuses.statuses, headSha);
 	} else if (statuses.kind === "failed") {
+		failures.push(statuses.failure);
 		addReason(envelope.reasons, "commit_statuses_incomplete");
 		addReason(envelope.reasons, statuses.failure.category);
 	}
@@ -393,6 +415,7 @@ export async function collectAutoMergeEvidence(
 		envelope.sources.reviewThreads = true;
 		envelope.unresolvedActiveThreads = countUnresolvedActiveThreads(threads.threads);
 	} else if (threads.kind === "failed") {
+		failures.push(threads.failure);
 		addReason(envelope.reasons, "review_threads_unknown");
 		addReason(envelope.reasons, threads.failure.category);
 	}
@@ -402,5 +425,5 @@ export async function collectAutoMergeEvidence(
 		addReason(envelope.reasons, "mergeability_unknown");
 	}
 	envelope.complete = envelope.reasons.length === 0;
-	return envelope;
+	return { envelope, failures };
 }
