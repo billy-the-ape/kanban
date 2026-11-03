@@ -23,6 +23,7 @@ Implement the **only** code path allowed to write a GitHub PR merge. Trigger it 
 - Credential changes, repo permissions, dismissed reviews, new commits, draft/closed state, policy changes and user disabling must invalidate pending candidates before write. Cancellation cannot undo a request already accepted by GitHub; surface that limitation accurately.
 - Bound every network call and journal; redact secrets and review bodies. Log evidence SHA and blocker codes, not raw tokens. Preserve existing scheduler-lock behavior and rate-limit backoff. Do not create a general-purpose arbitrary-repo GitHub merge endpoint callable by a browser.
 - If GitHub native auto-merge is enabled on the PR, avoid a competing write and let the ordinary merged observer handle completion.
+- **GitHub enforces additional repository requirements**: a PR can satisfy Kanban's fixed one-approval threshold yet still require two approvals, CODEOWNER review, deployments, or other conditions under GitHub protection/rulesets. Treat a GitHub denial as an actionable blocker, never bypass requirements or repeatedly retry without changed evidence or operator action.
 
 ## Expected files
 
