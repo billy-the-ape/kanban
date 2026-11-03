@@ -11,6 +11,10 @@
 // canonical PR per access scope) and every durable mutation goes through the
 // revision-checked PR record store under the tracking-registry mutex.
 import type {
+	AutoMergePolicyGetRequest,
+	AutoMergePolicyGetResponse,
+	AutoMergePolicyUpdateRequest,
+	AutoMergePolicyUpdateResponse,
 	GitHubPrTaskBinding,
 	GitHubPrTaskIdentity,
 	GitHubPrTrackingRecord,
@@ -44,7 +48,9 @@ import type {
 	RuntimeTaskTrackingStateResponse,
 } from "../core/api-contract";
 import { setTaskSelectedAutomationPr, updateTaskPrSettings } from "../core/task-board-mutations";
+import { type AutoMergePolicyStore, normalizeAutoMergeRepository } from "../pr-tracking/auto-merge-policy-store";
 import type { PrInstalledConsumers } from "../pr-tracking/pr-consumer-registry";
+import { parseCanonicalPrKey } from "../pr-tracking/pr-identity";
 import { evaluatePrLifecycleGate } from "../pr-tracking/pr-lifecycle-gate";
 import {
 	assignRepairOwner,
@@ -65,6 +71,12 @@ import type { RuntimeTrpcWorkspaceScope } from "./app-router";
 export interface CreatePrTrackingApiDependencies {
 	getPrTrackingCoordinator: () => PrTrackingCoordinator | null;
 	getPrTrackingStore: () => PrRecordStoreBase;
+	/**
+	 * AM-1: the durable per-repository auto-merge policy store. Used to
+	 * resolve the CURRENT policy for a task's selected Automation PR before
+	 * the settings mutation arms the card against it.
+	 */
+	getAutoMergePolicyStore: () => AutoMergePolicyStore;
 	listManagedWorkspaceBoards: () => Promise<PrBoardSnapshot[]>;
 	broadcastRuntimeWorkspaceStateUpdated: (scope: RuntimeTrpcWorkspaceScope) => void | Promise<void>;
 	/** B-5.5-style writer liveness probe (drain precondition for repair-owner transfer). */
@@ -206,76 +218,69 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		scope: RuntimeTrpcWorkspaceScope,
 		input: RuntimeTaskPrSettingsRequest,
 	): Promise<RuntimeTaskPrSettingsResponse> => {
+		// AM-1: resolve the CURRENT repository policy for the task's selected
+		// Automation PR BEFORE the locked board write: enabling
+		// autoMergeWhenApproved arms the card against this policy revision.
+		// If the policy edits in the tiny window between this read and the
+		// write, the card is armed at most one revision behind and the
+		// eligibility evaluator (AM-3) fails closed against the stale
+		// revision — the next deliberate re-enable re-arms it.
+		let autoMergePolicy: { repository: string; revision: number } | null = null;
+		if (input.autoMergeWhenApproved === true) {
+			const preCard = await loadScopedCard(scope, input.taskId);
+			const selectedKey = preCard?.card.selectedAutomationPrKey;
+			const parsed = selectedKey ? parseCanonicalPrKey(selectedKey) : null;
+			if (parsed && parsed.provider === "github" && parsed.host === "github.com") {
+				const policy = await deps.getAutoMergePolicyStore().loadPolicy(parsed.repository);
+				if (policy) {
+					autoMergePolicy = { repository: policy.repository, revision: policy.revision };
+				}
+			}
+		}
 		const response = await mutateWorkspaceState<RuntimeTaskPrSettingsResponse>(scope.workspacePath, (state) => {
-			const result = updateTaskPrSettings(state.board, input.taskId, {
-				autoAddressComments: input.autoAddressComments,
-				autoFinishOnMerge: input.autoFinishOnMerge,
-				expectedSettingsRevision: input.expectedSettingsRevision,
+			const result = updateTaskPrSettings(
+				state.board,
+				input.taskId,
+				{
+					autoAddressComments: input.autoAddressComments,
+					autoFinishOnMerge: input.autoFinishOnMerge,
+					autoMergeWhenApproved: input.autoMergeWhenApproved,
+					expectedSettingsRevision: input.expectedSettingsRevision,
+				},
+				Date.now(),
+				{ autoMergePolicy },
+			);
+			const toResponse = (
+				ok: boolean,
+				reason: RuntimeTaskPrSettingsResponse["reason"],
+			): RuntimeTaskPrSettingsResponse => ({
+				ok,
+				taskId: input.taskId,
+				autoAddressComments: result.autoAddressComments,
+				autoFinishOnMerge: result.autoFinishOnMerge,
+				autoMergeWhenApproved: result.autoMergeWhenApproved,
+				armedAutoMergePolicyRevision: result.armedAutoMergePolicyRevision,
+				selectedAutomationPrKey: result.selectedAutomationPrKey,
+				settingsRevision: result.settingsRevision,
+				reason,
+				error: null,
 			});
 			if (result.conflict) {
-				return {
-					value: {
-						ok: false,
-						taskId: input.taskId,
-						autoAddressComments: result.autoAddressComments,
-						autoFinishOnMerge: result.autoFinishOnMerge,
-						selectedAutomationPrKey: result.selectedAutomationPrKey,
-						settingsRevision: result.settingsRevision,
-						reason: "conflict",
-						error: null,
-					},
-					board: state.board,
-					save: false,
-				};
+				return { value: toResponse(false, "conflict"), board: state.board, save: false };
 			}
 			if (!result.updated) {
 				if (result.task === null) {
-					return {
-						value: {
-							ok: false,
-							taskId: input.taskId,
-							autoAddressComments: result.autoAddressComments,
-							autoFinishOnMerge: result.autoFinishOnMerge,
-							selectedAutomationPrKey: result.selectedAutomationPrKey,
-							settingsRevision: result.settingsRevision,
-							reason: "missing_task",
-							error: null,
-						},
-						board: state.board,
-						save: false,
-					};
+					return { value: toResponse(false, "missing_task"), board: state.board, save: false };
 				}
-				// No-op write: both fields absent and nothing changed; the
-				// revision is untouched and this reports success.
-				return {
-					value: {
-						ok: true,
-						taskId: input.taskId,
-						autoAddressComments: result.autoAddressComments,
-						autoFinishOnMerge: result.autoFinishOnMerge,
-						selectedAutomationPrKey: result.selectedAutomationPrKey,
-						settingsRevision: result.settingsRevision,
-						reason: null,
-						error: null,
-					},
-					board: state.board,
-					save: false,
-				};
+				// Auto-merge precondition rejected: no write happened.
+				if (result.reason) {
+					return { value: toResponse(false, result.reason), board: state.board, save: false };
+				}
+				// No-op write: nothing changed; the revision is untouched and
+				// this reports success.
+				return { value: toResponse(true, null), board: state.board, save: false };
 			}
-			return {
-				value: {
-					ok: true,
-					taskId: input.taskId,
-					autoAddressComments: result.autoAddressComments,
-					autoFinishOnMerge: result.autoFinishOnMerge,
-					selectedAutomationPrKey: result.selectedAutomationPrKey,
-					settingsRevision: result.settingsRevision,
-					reason: null,
-					error: null,
-				},
-				board: result.board,
-				save: true,
-			};
+			return { value: toResponse(true, null), board: result.board, save: true };
 		});
 		if (response.value.ok) {
 			await reconcileDemand();
@@ -412,6 +417,8 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 				staleRevision: false,
 				autoAddressComments: false,
 				autoFinishOnMerge: false,
+				autoMergeWhenApproved: false,
+				armedAutoMergePolicyRevision: null,
 				selectedAutomationPrKey: null,
 				eligible: false,
 				legacyCompletionGated: false,
@@ -537,6 +544,8 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 				typeof input.expectedSettingsRevision === "number" && input.expectedSettingsRevision !== settingsRevision,
 			autoAddressComments: card.autoAddressComments === true,
 			autoFinishOnMerge: card.autoFinishOnMerge === true,
+			autoMergeWhenApproved: card.autoMergeWhenApproved === true,
+			armedAutoMergePolicyRevision: card.armedAutoMergePolicyRevision ?? null,
 			selectedAutomationPrKey: resolved.key,
 			eligible,
 			legacyCompletionGated: gate.legacyCompletionGated,
@@ -1036,6 +1045,61 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		return { ok: true, events: result.events, nextCursor: result.nextCursor, error: null };
 	};
 
+	/**
+	 * AM-1: read the auto-merge policy for one GitHub repository. Fails
+	 * closed: an unnormalizable repository or a malformed store reads as
+	 * "no policy" (auto-merge stays disabled). No GitHub access here — this
+	 * is purely the durable policy store.
+	 */
+	const getAutoMergePolicy = async (
+		_scope: RuntimeTrpcWorkspaceScope,
+		input: AutoMergePolicyGetRequest,
+	): Promise<AutoMergePolicyGetResponse> => {
+		const normalized = normalizeAutoMergeRepository(input.repository);
+		if (!normalized) {
+			return { ok: false, repository: "", policy: null };
+		}
+		const policy = await deps.getAutoMergePolicyStore().loadPolicy(normalized);
+		return { ok: true, repository: normalized, policy };
+	};
+
+	/**
+	 * AM-1: create or replace the auto-merge policy for one GitHub
+	 * repository. Revision-checked: a stale `expectedRevision` is a
+	 * conflict, never a silent overwrite. Operator edits are audited.
+	 */
+	const updateAutoMergePolicy = async (
+		scope: RuntimeTrpcWorkspaceScope,
+		input: AutoMergePolicyUpdateRequest,
+	): Promise<AutoMergePolicyUpdateResponse> => {
+		const normalized = normalizeAutoMergeRepository(input.repository);
+		if (!normalized) {
+			// Audited operator action: an unnormalizable repository.
+			deps.warn?.(`Auto-merge policy update refused: invalid repository (workspace ${scope.workspaceId})`);
+			return { ok: false, repository: "", policy: null, reason: "invalid" };
+		}
+		const result = await deps.getAutoMergePolicyStore().updatePolicy(
+			normalized,
+			{
+				requiredChecks: input.requiredChecks,
+				mergeMethod: input.mergeMethod,
+			},
+			input.expectedRevision,
+		);
+		if (!result.ok) {
+			// Audited operator action: a rejected policy write (invalid input,
+			// a stale revision, or a corrupt store file).
+			deps.warn?.(
+				`Auto-merge policy update for ${normalized} refused: ${result.reason} (workspace ${scope.workspaceId})`,
+			);
+			return { ok: false, repository: normalized, policy: null, reason: result.reason };
+		}
+		deps.warn?.(
+			`Auto-merge policy updated for ${normalized}: revision ${result.policy.revision}, ${result.policy.requiredChecks.length} required check(s), method ${result.policy.mergeMethod} (workspace ${scope.workspaceId})`,
+		);
+		return { ok: true, repository: normalized, policy: result.policy, reason: null };
+	};
+
 	return {
 		setTaskPrSettings,
 		selectTaskAutomationPr,
@@ -1045,6 +1109,8 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		refreshTaskPrSnapshot,
 		updateTaskCommentDispatch,
 		updateTaskMergeBinding,
+		getAutoMergePolicy,
+		updateAutoMergePolicy,
 		selectRepairOwner: selectRepairOwnerProcedure,
 		transferRepairOwner: transferRepairOwnerProcedure,
 		reservePrOperation: reservePrOperationProcedure,

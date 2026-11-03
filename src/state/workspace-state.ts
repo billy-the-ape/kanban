@@ -742,7 +742,10 @@ function mergeServerOwnedPullRequests(
  * checkbox nor roll the settings revision back — the dialog's authoritative
  * write is the dedicated setTaskPrSettings mutation). Only completely new
  * cards take the client-supplied values (explicit booleans persist; omitted
- * reads as false).
+ * reads as false). AM-1: `autoMergeWhenApproved` and
+ * `armedAutoMergePolicyRevision` follow the same persisted-wins rule for
+ * existing cards, and new cards NEVER accept client values (arming requires
+ * the server-side policy bind in the settings mutation).
  */
 function mergeServerOwnedPrSettings(clientBoard: RuntimeBoardData, persistedBoard: RuntimeBoardData): RuntimeBoardData {
 	const persistedByTaskId = new Map<string, RuntimeBoardCard>();
@@ -773,6 +776,12 @@ function mergeServerOwnedPrSettings(clientBoard: RuntimeBoardData, persistedBoar
 				if (mergedCard.settingsRevision === undefined) {
 					delete mergedCard.settingsRevision;
 				}
+				if (mergedCard.autoMergeWhenApproved === undefined) {
+					delete mergedCard.autoMergeWhenApproved;
+				}
+				if (mergedCard.armedAutoMergePolicyRevision === undefined) {
+					delete mergedCard.armedAutoMergePolicyRevision;
+				}
 				return mergedCard;
 			}),
 		})),
@@ -782,14 +791,22 @@ function mergeServerOwnedPrSettings(clientBoard: RuntimeBoardData, persistedBoar
 /**
  * Per-card merge for server-owned PR settings. Existing cards keep the
  * persisted values unconditionally; new cards take the client's explicit
- * booleans (omitted reads as false, no revision).
+ * booleans (omitted reads as false, no revision). AM-1: the auto-merge
+ * opt-in is stricter — it is armed only through the dedicated settings
+ * mutation (with a server-side policy bind), so a new card never accepts a
+ * client-supplied `autoMergeWhenApproved` / `armedAutoMergePolicyRevision`.
  */
 function mergeServerOwnedPrCardFields(
 	clientCard: RuntimeBoardCard,
 	persisted: RuntimeBoardCard | undefined,
 ): Pick<
 	RuntimeBoardCard,
-	"autoAddressComments" | "autoFinishOnMerge" | "selectedAutomationPrKey" | "settingsRevision"
+	| "autoAddressComments"
+	| "autoFinishOnMerge"
+	| "selectedAutomationPrKey"
+	| "settingsRevision"
+	| "autoMergeWhenApproved"
+	| "armedAutoMergePolicyRevision"
 > {
 	if (persisted) {
 		return {
@@ -797,6 +814,8 @@ function mergeServerOwnedPrCardFields(
 			autoFinishOnMerge: persisted.autoFinishOnMerge,
 			selectedAutomationPrKey: persisted.selectedAutomationPrKey,
 			settingsRevision: persisted.settingsRevision,
+			autoMergeWhenApproved: persisted.autoMergeWhenApproved,
+			armedAutoMergePolicyRevision: persisted.armedAutoMergePolicyRevision,
 		};
 	}
 	return {
@@ -805,6 +824,8 @@ function mergeServerOwnedPrCardFields(
 		autoFinishOnMerge: typeof clientCard.autoFinishOnMerge === "boolean" ? clientCard.autoFinishOnMerge : undefined,
 		selectedAutomationPrKey: undefined,
 		settingsRevision: undefined,
+		autoMergeWhenApproved: undefined,
+		armedAutoMergePolicyRevision: undefined,
 	};
 }
 

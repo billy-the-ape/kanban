@@ -426,6 +426,112 @@ describe.sequential("workspace-state integration", () => {
 			}
 		});
 	});
+	it("a stale whole-board save cannot arm auto-merge; only the dedicated mutation arms it (AM-1)", async () => {
+		await withTemporaryHome(async () => {
+			const { path: sandboxRoot, cleanup } = createTempDir("kanban-workspace-");
+			try {
+				const workspacePath = join(sandboxRoot, "project-a");
+				mkdirSync(workspacePath, { recursive: true });
+				initGitRepository(workspacePath);
+
+				const initial = await loadWorkspaceState(workspacePath);
+				await saveWorkspaceState(workspacePath, {
+					board: createBoard("Task One"),
+					sessions: {},
+					expectedRevision: initial.revision,
+				});
+
+				// Server-owned recording: a recorded PR link plus the card's
+				// Automation PR selection (what the runtime itself persists).
+				const pullRequest: RuntimeTaskPullRequest = {
+					provider: "github",
+					host: "github.com",
+					repository: "owner/repo",
+					number: 12,
+					url: "https://github.com/owner/repo/pull/12",
+					source: "agent_tool",
+					createdAt: 1000,
+				};
+				await mutateWorkspaceState<null>(workspacePath, (state) => {
+					const linked = addTaskPullRequests(state.board, "task-1", [pullRequest], 1000);
+					if (!linked.added) {
+						throw new Error("Expected the seed pull request to be recorded.");
+					}
+					const linkedTask1 = findCard(linked.board, "task-1");
+					if (linkedTask1 === undefined) {
+						throw new Error("task-1 missing");
+					}
+					linkedTask1.selectedAutomationPrKey = getPullRequestIdentityKey(pullRequest);
+					return { value: null, board: linked.board, save: true };
+				});
+
+				// A whole-board save forges the auto-merge opt-in: the card may
+				// never become armed (arming requires the dedicated mutation's
+				// server-side policy bind).
+				const forgedBoard = createBoard("Forged");
+				const forgedTask1 = findCard(forgedBoard, "task-1");
+				if (forgedTask1 === undefined) {
+					throw new Error("task-1 missing");
+				}
+				forgedTask1.autoMergeWhenApproved = true;
+				forgedTask1.armedAutoMergePolicyRevision = 99;
+				const afterForge = await saveWorkspaceState(workspacePath, {
+					board: forgedBoard,
+					sessions: {},
+					expectedRevision: initial.revision + 2,
+				});
+				const forgedTask1Loaded = findCard(afterForge.board, "task-1");
+				if (forgedTask1Loaded === undefined) {
+					throw new Error("task-1 missing");
+				}
+				expect(forgedTask1Loaded.autoMergeWhenApproved).toBeUndefined();
+				expect(forgedTask1Loaded.armedAutoMergePolicyRevision).toBeUndefined();
+				expect(forgedTask1Loaded.settingsRevision).toBeUndefined();
+
+				// The dedicated mutation arms the card against the resolved policy.
+				await mutateWorkspaceState<null>(workspacePath, (state) => {
+					const result = updateTaskPrSettings(
+						state.board,
+						"task-1",
+						{ autoMergeWhenApproved: true, expectedSettingsRevision: 0 },
+						Date.now(),
+						{ autoMergePolicy: { repository: "owner/repo", revision: 4 } },
+					);
+					return { value: null, board: result.board, save: result.updated };
+				});
+				const armedLoaded = await loadWorkspaceState(workspacePath);
+				const armedTask1 = findCard(armedLoaded.board, "task-1");
+				if (armedTask1 === undefined) {
+					throw new Error("task-1 missing");
+				}
+				expect(armedTask1.autoMergeWhenApproved).toBe(true);
+				expect(armedTask1.armedAutoMergePolicyRevision).toBe(4);
+				expect(armedTask1.settingsRevision).toBe(1);
+
+				// A stale whole-board save cannot disarm or roll the values back.
+				const staleBoard = createBoard("Stale");
+				const staleTask1 = findCard(staleBoard, "task-1");
+				if (staleTask1 === undefined) {
+					throw new Error("task-1 missing");
+				}
+				staleTask1.autoMergeWhenApproved = false;
+				const afterStale = await saveWorkspaceState(workspacePath, {
+					board: staleBoard,
+					sessions: {},
+					expectedRevision: armedLoaded.revision,
+				});
+				const staleTask1Loaded = findCard(afterStale.board, "task-1");
+				if (staleTask1Loaded === undefined) {
+					throw new Error("task-1 missing");
+				}
+				expect(staleTask1Loaded.autoMergeWhenApproved).toBe(true);
+				expect(staleTask1Loaded.armedAutoMergePolicyRevision).toBe(4);
+				expect(staleTask1Loaded.settingsRevision).toBe(1);
+			} finally {
+				cleanup();
+			}
+		});
+	});
 
 	it("lists and removes workspace index entries across multiple projects", async () => {
 		await withTemporaryHome(async () => {

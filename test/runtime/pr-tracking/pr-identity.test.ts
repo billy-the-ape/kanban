@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 import { getPullRequestIdentityKey } from "../../../src/core/pull-request-links";
@@ -8,6 +9,7 @@ import {
 	recordIdentityMatchesKey,
 	toCanonicalPrKey,
 } from "../../../src/pr-tracking/pr-identity";
+import * as prKeyParsing from "../../../src/pr-tracking/pr-key-parsing";
 
 const PR = { provider: "github" as const, host: "github.com", repository: "cline/kanban", number: 49 };
 
@@ -56,5 +58,28 @@ describe("pr-identity", () => {
 		};
 		expect(recordIdentityMatchesKey(record, "github|github.com|cline/kanban|49")).toBe(true);
 		expect(recordIdentityMatchesKey({ ...record, number: 50 }, "github|github.com|cline/kanban|49")).toBe(false);
+	});
+});
+// AM-1: the pure parsing helpers live in a browser-safe module (no `node:`
+// imports) so the web-ui production bundle — which bundles
+// task-board-mutations.ts as `@runtime-task-state` — never pulls
+// node:crypto through pr-identity.
+describe("pr-key-parsing (browser-safe module)", () => {
+	it("exports the same pure helpers that pr-identity re-exports", () => {
+		expect(prKeyParsing.parseCanonicalPrKey).toBe(parseCanonicalPrKey);
+		expect(prKeyParsing.toCanonicalPrKey).toBe(toCanonicalPrKey);
+		expect(prKeyParsing.isTrackingSupportedPr).toBe(isTrackingSupportedPr);
+		expect(prKeyParsing.recordIdentityMatchesKey).toBe(recordIdentityMatchesKey);
+		expect(prKeyParsing.parseCanonicalPrKey("github|github.com|cline/kanban|49")).toEqual({
+			provider: "github",
+			host: "github.com",
+			repository: "cline/kanban",
+			number: 49,
+		});
+	});
+
+	it("keeps the crypto-carrying pr-identity module out of the browser-aliased task-state module", () => {
+		const source = readFileSync(new URL("../../../src/core/task-board-mutations.ts", import.meta.url), "utf8");
+		expect(source).not.toContain("pr-tracking/pr-identity");
 	});
 });

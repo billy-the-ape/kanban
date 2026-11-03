@@ -626,6 +626,23 @@ export const runtimeBoardCardSchema = z
 		 */
 		settingsRevision: z.number().int().nonnegative().optional(),
 		/**
+		 * AM-1: "Auto-merge when CI passes and at least one review approves"
+		 * task opt-in. Optional so old cards read as disabled without
+		 * migration. Server-owned: it is enabled only through the dedicated
+		 * revision-checked PR settings mutation, which binds it to a current
+		 * repository policy, and `saveWorkspaceState` restores the persisted
+		 * value over any client-supplied value (a new card never accepts it).
+		 */
+		autoMergeWhenApproved: z.boolean().optional(),
+		/**
+		 * AM-1: the repository auto-merge policy revision this opt-in was
+		 * armed against. Absent = not armed. Server-owned: a later policy
+		 * revision invalidates prior arms (re-arming requires a deliberate
+		 * re-enable), and changing or unlinking the selected Automation PR
+		 * disarms the setting.
+		 */
+		armedAutoMergePolicyRevision: z.number().int().nonnegative().optional(),
+		/**
 		 * MERGE-1: server-owned marker set when a task is manually reopened
 		 * from Done into In Review. While set, the SAME merged PR (the same
 		 * merge commit already consumed for the task's binding) must not
@@ -3554,6 +3571,13 @@ export const runtimeTaskPrSettingsRequestSchema = z.object({
 	/** undefined = keep current; explicit boolean overwrites. */
 	autoFinishOnMerge: z.boolean().optional(),
 	/**
+	 * AM-1: undefined = keep current; explicit boolean overwrites. Enabling
+	 * requires a selected Automation PR whose repository has a current
+	 * auto-merge policy; the server binds the card to that policy revision
+	 * (client-supplied values are never trusted).
+	 */
+	autoMergeWhenApproved: z.boolean().optional(),
+	/**
 	 * Revision-checked: must equal the card's current `settingsRevision`
 	 * (absent reads as 0). A mismatch is a conflict, never a silent overwrite.
 	 */
@@ -3566,13 +3590,85 @@ export const runtimeTaskPrSettingsResponseSchema = z.object({
 	taskId: z.string(),
 	autoAddressComments: z.boolean(),
 	autoFinishOnMerge: z.boolean(),
+	autoMergeWhenApproved: z.boolean(),
+	/** The repository policy revision the opt-in is armed against (null = not armed). */
+	armedAutoMergePolicyRevision: z.number().nullable(),
 	selectedAutomationPrKey: z.string().nullable(),
 	settingsRevision: z.number().int().nonnegative(),
-	/** "conflict" (stale expectedSettingsRevision) | "missing_task" | "invalid". */
-	reason: z.enum(["conflict", "missing_task", "invalid"]).nullable(),
+	/**
+	 * "conflict" (stale expectedSettingsRevision) | "missing_task" |
+	 * "no_selected_pr" (enabling auto-merge without a resolvable selected
+	 * Automation PR) | "no_policy" (no current auto-merge policy for the
+	 * selected PR's repository) | "invalid".
+	 */
+	reason: z.enum(["conflict", "missing_task", "no_selected_pr", "no_policy", "invalid"]).nullable(),
 	error: z.string().nullable(),
 });
 export type RuntimeTaskPrSettingsResponse = z.infer<typeof runtimeTaskPrSettingsResponseSchema>;
+
+// ── AM-1: per-repository auto-merge policy ───────────────────────────────────
+
+/** Merge methods the GitHub merge API accepts for the policy. */
+export const autoMergePolicyMergeMethodSchema = z.enum(["merge", "squash", "rebase"]);
+export type AutoMergePolicyMergeMethod = z.infer<typeof autoMergePolicyMergeMethodSchema>;
+
+/**
+ * AM-1: the small versioned policy for one normalized canonical GitHub
+ * `owner/repo`. `requiredChecks` is an explicit, nonempty, unique set of
+ * exact (case-sensitive) GitHub check names — never an empty list, never a
+ * glob or vague workflow name, never an implicit "all required checks"
+ * fallback. No tokens or credentials live in this record.
+ */
+export const autoMergePolicySchema = z.object({
+	/** Normalized canonical GitHub `owner/repo` (lowercase). */
+	repository: z.string(),
+	/** Nonempty, unique, trimmed, case-sensitive exact GitHub check names. */
+	requiredChecks: z.array(z.string()).min(1),
+	mergeMethod: autoMergePolicyMergeMethodSchema,
+	revision: z.number().int().nonnegative(),
+	updatedAt: z.number(),
+});
+export type AutoMergePolicy = z.infer<typeof autoMergePolicySchema>;
+
+export const autoMergePolicyGetRequestSchema = z.object({
+	repository: z.string().min(1),
+});
+export type AutoMergePolicyGetRequest = z.infer<typeof autoMergePolicyGetRequestSchema>;
+
+export const autoMergePolicyGetResponseSchema = z.object({
+	ok: z.boolean(),
+	/** Normalized repository key ("" when the input does not normalize). */
+	repository: z.string(),
+	/** Null when the repository has no policy (missing or malformed store). */
+	policy: autoMergePolicySchema.nullable(),
+});
+export type AutoMergePolicyGetResponse = z.infer<typeof autoMergePolicyGetResponseSchema>;
+
+export const autoMergePolicyUpdateRequestSchema = z.object({
+	repository: z.string().min(1),
+	/** Explicit exact GitHub check names; the server trims, rejects malformed entries. */
+	requiredChecks: z.array(z.string()),
+	/** Defaults to "merge" when omitted. */
+	mergeMethod: autoMergePolicyMergeMethodSchema.optional(),
+	/**
+	 * Revision-checked: must equal the stored policy revision (a missing
+	 * policy reads as 0). A mismatch is a conflict, never a silent overwrite.
+	 */
+	expectedRevision: z.number().int().nonnegative().optional(),
+});
+export type AutoMergePolicyUpdateRequest = z.infer<typeof autoMergePolicyUpdateRequestSchema>;
+
+export const autoMergePolicyUpdateResponseSchema = z.object({
+	ok: z.boolean(),
+	repository: z.string(),
+	policy: autoMergePolicySchema.nullable(),
+	/**
+	 * "invalid" (unnormalizable repository or malformed checks) |
+	 * "conflict" (stale expectedRevision) | "malformed" (store file corrupt).
+	 */
+	reason: z.enum(["invalid", "conflict", "malformed"]).nullable(),
+});
+export type AutoMergePolicyUpdateResponse = z.infer<typeof autoMergePolicyUpdateResponseSchema>;
 
 export const runtimeTaskAutomationPrSelectRequestSchema = z.object({
 	taskId: z.string().min(1),
@@ -3666,6 +3762,10 @@ export const runtimeTaskTrackingStateResponseSchema = z.object({
 	staleRevision: z.boolean(),
 	autoAddressComments: z.boolean(),
 	autoFinishOnMerge: z.boolean(),
+	/** AM-1: the task's auto-merge opt-in (absent reads as false). */
+	autoMergeWhenApproved: z.boolean(),
+	/** AM-1: the repository policy revision the opt-in is armed against (null = not armed). */
+	armedAutoMergePolicyRevision: z.number().nullable(),
 	selectedAutomationPrKey: z.string().nullable(),
 	/** Eligible for live PR tracking (active card + selected/sole link + installed enabled consumer). */
 	eligible: z.boolean(),

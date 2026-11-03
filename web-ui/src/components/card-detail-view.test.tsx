@@ -1341,6 +1341,8 @@ describe("TaskPrTrackingPanel (PRs view)", () => {
 			staleRevision: false,
 			autoAddressComments: false,
 			autoFinishOnMerge: true,
+			autoMergeWhenApproved: false,
+			armedAutoMergePolicyRevision: null,
 			selectedAutomationPrKey: null,
 			eligible: false,
 			legacyCompletionGated: false,

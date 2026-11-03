@@ -1,3 +1,4 @@
+import { parseCanonicalPrKey } from "../pr-tracking/pr-key-parsing";
 import type {
 	RuntimeAgentId,
 	RuntimeBoardCard,
@@ -959,6 +960,10 @@ export function removeTaskPullRequest(
 	};
 	if (selectionRemoved) {
 		delete nextTask.selectedAutomationPrKey;
+		// AM-1: unlinking the selected Automation PR disarms the auto-merge
+		// opt-in — the armed revision bound to it is now meaningless.
+		nextTask.autoMergeWhenApproved = false;
+		delete nextTask.armedAutoMergePolicyRevision;
 	}
 	return {
 		board: replaceTaskCard(board, normalizedTaskId, nextTask),
@@ -1186,8 +1191,31 @@ export interface RuntimeTaskPrSettingsInput {
 	autoAddressComments?: boolean;
 	/** undefined = keep current; explicit boolean overwrites. */
 	autoFinishOnMerge?: boolean;
+	/**
+	 * AM-1: undefined = keep current; explicit boolean overwrites. Enabling
+	 * requires the task's selected Automation PR to resolve to a GitHub.com
+	 * link AND the server to supply the current policy for that repository
+	 * (see `RuntimeUpdateTaskPrSettingsOptions`); a missing policy or
+	 * selection rejects the write.
+	 */
+	autoMergeWhenApproved?: boolean;
 	/** Must equal the card's current settingsRevision (absent reads as 0). */
 	expectedSettingsRevision?: number;
+}
+
+/**
+ * AM-1: server-resolved context for the auto-merge half of the settings
+ * mutation. The caller (the trpc API) reads the policy BEFORE the locked
+ * board write; this mutation only re-validates it against the freshly-read
+ * card's selected Automation PR.
+ */
+export interface RuntimeUpdateTaskPrSettingsOptions {
+	/**
+	 * The current auto-merge policy of the card's selected Automation PR's
+	 * repository (`null` = no policy available). Enabling
+	 * `autoMergeWhenApproved` fails closed without it.
+	 */
+	autoMergePolicy?: { repository: string; revision: number } | null;
 }
 
 export interface RuntimeUpdateTaskPrSettingsResult {
@@ -1196,9 +1224,18 @@ export interface RuntimeUpdateTaskPrSettingsResult {
 	updated: boolean;
 	/** True when expectedSettingsRevision did not match the stored revision. */
 	conflict: boolean;
+	/**
+	 * Present when the write was rejected for an auto-merge precondition:
+	 * "no_selected_pr" (no resolvable selected Automation PR to arm against)
+	 * or "no_policy" (no current policy for the selected PR's repository).
+	 */
+	reason?: "no_selected_pr" | "no_policy";
 	settingsRevision: number;
 	autoAddressComments: boolean;
 	autoFinishOnMerge: boolean;
+	autoMergeWhenApproved: boolean;
+	/** The repository policy revision the opt-in is armed against (null = not armed). */
+	armedAutoMergePolicyRevision: number | null;
 	selectedAutomationPrKey: string | null;
 }
 
@@ -1206,12 +1243,20 @@ export interface RuntimeUpdateTaskPrSettingsResult {
  * The dedicated revision-checked settings mutation. Never called from the
  * whole-board save path: `saveWorkspaceState` carries the stored values over,
  * and this mutation is the only writer of the settings block.
+ *
+ * AM-1: enabling `autoMergeWhenApproved` requires the task's selected
+ * Automation PR to resolve to a github.com link that exists on the card AND
+ * the server to have resolved the CURRENT repository policy before this
+ * write (options.autoMergePolicy). The bind is validated against the
+ * freshly-read card inside this mutation, so a concurrent selection change
+ * cannot arm the card against the wrong repository. Disabling always wins.
  */
 export function updateTaskPrSettings(
 	board: RuntimeBoardData,
 	taskId: string,
 	input: RuntimeTaskPrSettingsInput,
 	now: number = Date.now(),
+	options: RuntimeUpdateTaskPrSettingsOptions = {},
 ): RuntimeUpdateTaskPrSettingsResult {
 	const normalizedTaskId = taskId.trim();
 	const found = normalizedTaskId ? findTaskLocation(board, normalizedTaskId) : null;
@@ -1223,6 +1268,8 @@ export function updateTaskPrSettings(
 		settingsRevision: task.settingsRevision ?? 0,
 		autoAddressComments: task.autoAddressComments === true,
 		autoFinishOnMerge: task.autoFinishOnMerge === true,
+		autoMergeWhenApproved: task.autoMergeWhenApproved === true,
+		armedAutoMergePolicyRevision: task.armedAutoMergePolicyRevision ?? null,
 		selectedAutomationPrKey: task.selectedAutomationPrKey ?? null,
 	});
 	if (!found) {
@@ -1234,6 +1281,8 @@ export function updateTaskPrSettings(
 			settingsRevision: 0,
 			autoAddressComments: false,
 			autoFinishOnMerge: false,
+			autoMergeWhenApproved: false,
+			armedAutoMergePolicyRevision: null,
 			selectedAutomationPrKey: null,
 		};
 	}
@@ -1242,18 +1291,70 @@ export function updateTaskPrSettings(
 	if (typeof input.expectedSettingsRevision === "number" && input.expectedSettingsRevision !== currentRevision) {
 		return { ...base(task), conflict: true };
 	}
-	if (input.autoAddressComments === undefined && input.autoFinishOnMerge === undefined) {
+	if (
+		input.autoAddressComments === undefined &&
+		input.autoFinishOnMerge === undefined &&
+		input.autoMergeWhenApproved === undefined
+	) {
 		return base(task);
 	}
+
+	// AM-1: resolve the auto-merge half of the write against the fresh card.
+	let autoMerge: boolean | undefined;
+	let armRevision: number | null = null;
+	if (input.autoMergeWhenApproved === true) {
+		const selectedKey = task.selectedAutomationPrKey;
+		const parsed = selectedKey ? parseCanonicalPrKey(selectedKey) : null;
+		const matchesLink = (task.pullRequests ?? []).some(
+			(pullRequest) => getPullRequestIdentityKey(pullRequest) === selectedKey,
+		);
+		if (parsed === null || parsed.provider !== "github" || parsed.host !== "github.com" || !matchesLink) {
+			return { ...base(task), reason: "no_selected_pr" };
+		}
+		const policy = options.autoMergePolicy;
+		if (policy === undefined || policy === null || policy.repository !== parsed.repository) {
+			// No current policy for this repository, or the selection moved
+			// between the pre-read policy lookup and this locked write:
+			// fail closed rather than arm against an unknown revision.
+			return { ...base(task), reason: "no_policy" };
+		}
+		if (task.autoMergeWhenApproved === true && task.armedAutoMergePolicyRevision === policy.revision) {
+			// Already armed at the current revision: no-op (no revision bump).
+			autoMerge = undefined;
+		} else {
+			autoMerge = true;
+			armRevision = policy.revision;
+		}
+	} else if (input.autoMergeWhenApproved === false) {
+		if (task.autoMergeWhenApproved === true) {
+			autoMerge = false;
+		}
+	}
+
+	// AM-1: re-enabling while already armed at the current policy revision —
+	// or disabling an already-unarmed card — with no other settings changes
+	// is a no-op: the stored values and the settings revision are untouched.
+	if (autoMerge === undefined && input.autoAddressComments === undefined && input.autoFinishOnMerge === undefined) {
+		return base(task);
+	}
+
 	const nextTask: RuntimeBoardCard = {
 		...task,
 		autoAddressComments:
 			input.autoAddressComments === undefined ? task.autoAddressComments === true : input.autoAddressComments,
 		autoFinishOnMerge:
 			input.autoFinishOnMerge === undefined ? task.autoFinishOnMerge === true : input.autoFinishOnMerge,
+		// AM-1: the auto-merge fields are written only when resolved above;
+		// a no-op enable (already armed at the current revision) keeps the
+		// stored values untouched.
+		...(autoMerge === undefined ? {} : { autoMergeWhenApproved: autoMerge }),
+		...(autoMerge === true && armRevision !== null ? { armedAutoMergePolicyRevision: armRevision } : {}),
 		settingsRevision: currentRevision + 1,
 		updatedAt: now,
 	};
+	if (autoMerge === false) {
+		delete nextTask.armedAutoMergePolicyRevision;
+	}
 	return {
 		board: replaceTaskCard(board, normalizedTaskId, nextTask),
 		task: nextTask,
@@ -1262,6 +1363,8 @@ export function updateTaskPrSettings(
 		settingsRevision: nextTask.settingsRevision ?? currentRevision + 1,
 		autoAddressComments: nextTask.autoAddressComments === true,
 		autoFinishOnMerge: nextTask.autoFinishOnMerge === true,
+		autoMergeWhenApproved: nextTask.autoMergeWhenApproved === true,
+		armedAutoMergePolicyRevision: nextTask.armedAutoMergePolicyRevision ?? null,
 		selectedAutomationPrKey: nextTask.selectedAutomationPrKey ?? null,
 	};
 }
@@ -1319,6 +1422,14 @@ export function setTaskSelectedAutomationPr(
 		delete nextTask.selectedAutomationPrKey;
 	} else {
 		nextTask.selectedAutomationPrKey = prKey;
+	}
+	// AM-1: changing (or clearing) the selected Automation PR disarms the
+	// auto-merge opt-in: the armed revision was bound to the previous PR's
+	// repository, so it must not survive a selection change. Other PR
+	// settings edits never disarm.
+	if (nextTask.autoMergeWhenApproved === true || nextTask.armedAutoMergePolicyRevision !== undefined) {
+		nextTask.autoMergeWhenApproved = false;
+		delete nextTask.armedAutoMergePolicyRevision;
 	}
 	nextTask.settingsRevision = currentRevision + 1;
 	nextTask.updatedAt = now;

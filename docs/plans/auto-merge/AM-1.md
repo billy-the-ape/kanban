@@ -1,6 +1,6 @@
 # AM-1: Persist task opt-in and repository-level merge policy
 
-**Status:** planned. **One implementation PR into `main`.** Depends on: none. Read [README.md](./README.md).
+**Status:** implemented. **One implementation PR into `main`.** Depends on: none. Read [README.md](./README.md).
 
 ## Deliverable
 
@@ -32,3 +32,15 @@ Backend data contracts and dedicated mutations for a new, disabled-by-default ta
 ## Deployment
 
 No runtime merging becomes possible from AM-1 alone. No environment variable or manual data migration. Persist the policy in the existing runtime-home backup scope; retain policy data across deploys. The AM-5 UI will expose policy configuration and task opt-in.
+
+## Implementation notes (final state)
+
+- `RuntimeBoardCard` gains `autoMergeWhenApproved?: boolean` and `armedAutoMergePolicyRevision?: number` (both optional; absent = false/unarmed). `settingsRevision` CAS covers the new flag.
+- `updateTaskPrSettings` resolves the auto-merge half against the fresh card: enabling requires a selected Automation PR whose repository has a current server-resolved policy (`options.autoMergePolicy`), binds `armedAutoMergePolicyRevision`, and no-ops (no revision bump) when already armed at that revision; disabling always wins and drops the armed revision. Fail-closed reasons: `no_selected_pr`, `no_policy`.
+- `setTaskSelectedAutomationPr` (select/clear) and `removeTaskPullRequest` disarm auto-merge; other settings edits never do.
+- `saveWorkspaceState` treats the two new fields as server-owned: existing cards keep persisted values; new cards never accept client values.
+- New durable store `src/pr-tracking/auto-merge-policy-store.ts`: `<runtimeHome>/auto-merge/policies.json` (version 1), file-locked, per-repository revision-checked CAS. Missing/malformed/wrong-version stores fail closed (no policy, no migration, corrupt file never overwritten). Repositories normalize to lowercase `owner/repo`; check names are trimmed, deduped, exact (no globs/whitespace).
+- Canonical PR key parsing (`parseCanonicalPrKey` and friends) lives in the browser-safe `src/pr-tracking/pr-key-parsing.ts` (no `node:` imports); `src/pr-tracking/pr-identity.ts` re-exports it and keeps only `prKeyDigest` (`node:crypto`), so the web-ui production bundle (`@runtime-task-state` → `task-board-mutations.ts`) never pulls `node:crypto` in.
+- New trpc procedures `getAutoMergePolicy` / `updateAutoMergePolicy` (audited `deps.warn` on every write outcome) and extended `setTaskPrSettings` / `getTaskTrackingState` responses. The policy store instance lives on the runtime server's PR tracking state.
+- No GitHub reads/writes, no merge execution, no pollers in this PR.
+- Tests: `test/runtime/pr-tracking/auto-merge-policy-store.test.ts` (new), `test/runtime/task-board-mutations.test.ts`, `test/runtime/pr-tracking/pr-tracking-api.test.ts`, `test/integration/workspace-state.integration.test.ts`, `web-ui/src/components/card-detail-view.test.tsx`.
