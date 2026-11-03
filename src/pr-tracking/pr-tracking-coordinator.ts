@@ -230,7 +230,7 @@ export class PrTrackingCoordinator {
 	private readonly polls = new Map<string, PrPollState>();
 	private readonly scopes = new Map<string, AccessScope>();
 	private readonly oneShotInFlight = new Map<string, Promise<OneShotMetadataRefreshResult>>();
-	/** AM-2: coalesced in-flight auto-merge evidence reads per (PR, scope). */
+	/** AM-2: coalesced in-flight auto-merge evidence reads per (PR, scope, options). */
 	private readonly evidenceInFlight = new Map<string, Promise<AutoMergeEvidenceEnvelope>>();
 	private scopeCache: AccessScope | null = null;
 	private scopeFailure: GhAdapterFailure | null = null;

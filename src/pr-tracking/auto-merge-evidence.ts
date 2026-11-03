@@ -372,7 +372,14 @@ export async function collectAutoMergeEvidence(
 		const m = final.metadata;
 		if (m.headSha === start.headSha && m.baseSha === start.baseSha) {
 			metadataCoherent = true;
-			// The final read is the freshest identity truth for the window.
+			// The final read is the freshest identity truth for the window:
+			// state, draft, author, native auto-merge and mergeability can
+			// all flip between the first and final reads while head/base
+			// stay identical, so refresh ALL of them from the final read.
+			envelope.prState = m.state;
+			envelope.draft = m.state === "draft";
+			envelope.authorLogin = m.authorLogin ?? null;
+			envelope.autoMergePresent = m.autoMergePresent ?? null;
 			envelope.mergeable = m.mergeable ?? null;
 			envelope.mergeableState = m.mergeableState ?? null;
 		} else {

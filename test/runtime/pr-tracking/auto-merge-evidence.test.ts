@@ -42,6 +42,7 @@ const PR_ENDPOINT = "repos/cline/kanban/pulls/49";
 const REVIEWS_ENDPOINT = "repos/cline/kanban/pulls/49/reviews";
 const CHECK_RUNS_ENDPOINT = `repos/cline/kanban/commits/${HEAD}/check-runs`;
 const STATUSES_ENDPOINT = `repos/cline/kanban/commits/${HEAD}/status`;
+const RATE_LIMIT_ENDPOINT = "rate_limit";
 
 // --- Scripted gh runner dispatched by endpoint (deterministic under parallel reads) ---
 
@@ -633,6 +634,59 @@ describe("auto-merge-evidence reader", () => {
 		expect(envelope.reasons).toContain("review_threads_unknown");
 		expect(envelope.sources.reviewThreads).toBe(false);
 		expect(envelope.unresolvedActiveThreads).toBeNull();
+	});
+
+	it("refreshes state and auto-merge facts from the final coherent re-read", async () => {
+		const { envelope } = await collect({
+			[PR_ENDPOINT]: (_page, callIndex) => ({
+				stdout: callIndex === 0 ? prMetadataBody() : prMetadataBody({ state: "closed", auto_merge: null }),
+			}),
+			[REVIEWS_ENDPOINT]: () => ({ stdout: "[]" }),
+			[CHECK_RUNS_ENDPOINT]: () => ({ stdout: JSON.stringify({ total_count: 0, check_runs: [] }) }),
+			[STATUSES_ENDPOINT]: () => ({ stdout: JSON.stringify({ state: "success", total_count: 0, statuses: [] }) }),
+		});
+		expect(envelope.complete).toBe(true);
+		expect(envelope.reasons).toEqual([]);
+		// The final read is the freshest identity truth for the window: a
+		// mid-window close and auto-merge toggle with unchanged head/base
+		// must be visible, not the stale initial facts.
+		expect(envelope.prState).toBe("closed");
+		expect(envelope.draft).toBe(false);
+		expect(envelope.autoMergePresent).toBeNull();
+	});
+
+	it("fails closed when the commit-statuses body lacks a statuses array", async () => {
+		const { envelope } = await collect({
+			[PR_ENDPOINT]: () => ({ stdout: prMetadataBody() }),
+			[REVIEWS_ENDPOINT]: () => ({ stdout: "[]" }),
+			[CHECK_RUNS_ENDPOINT]: () => ({ stdout: JSON.stringify({ total_count: 0, check_runs: [] }) }),
+			[STATUSES_ENDPOINT]: () => ({ stdout: JSON.stringify({}) }),
+		});
+		expect(envelope.complete).toBe(false);
+		expect(envelope.sources.commitStatuses).toBe(false);
+		expect(envelope.reasons).toContain("commit_statuses_incomplete");
+		expect(envelope.reasons).toContain("partial_page");
+	});
+
+	it("keeps the rate-limit category and reset time when the limit hits mid-list", async () => {
+		const resetEpochSec = Math.floor(NOW / 1000) + 3600;
+		const fullPage = JSON.stringify(Array.from({ length: 100 }, (_, i) => ({ id: i + 1 })));
+		const { adapter } = adapterFor({
+			[REVIEWS_ENDPOINT]: (_page, callIndex) =>
+				callIndex === 0 ? { stdout: fullPage } : { stderr: "HTTP 429: rate limit exceeded" },
+			[RATE_LIMIT_ENDPOINT]: () => ({
+				stdout: JSON.stringify({ resources: { core: { reset: resetEpochSec } } }),
+			}),
+		});
+		const result = await adapter.readRawRestList(REVIEWS_ENDPOINT);
+		expect(result.kind).toBe("failed");
+		if (result.kind === "failed") {
+			// The real category and reset time must survive the mid-list
+			// relabel, or the shared failure classification never sees the
+			// rate limit and sets no deadline.
+			expect(result.failure.category).toBe("rate_limit");
+			expect(result.failure.rateLimitResetAt).toBe(resetEpochSec * 1000);
+		}
 	});
 
 	it("leaves the poller's conditional-read cache untouched (poll, change, evidence, poll)", async () => {

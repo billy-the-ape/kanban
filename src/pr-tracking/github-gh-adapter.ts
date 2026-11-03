@@ -80,6 +80,21 @@ export interface GhAdapterFailure {
 	rateLimitResetAt?: number;
 }
 
+/**
+ * Relabel a MID-LIST failure as `partial_page` without discarding categories
+ * that carry their own classification semantics: `auth` stops all polls,
+ * `access` stops this poll, and `rate_limit` extends the deadline from
+ * `rateLimitResetAt`. A rate limit or auth failure hitting page 2+ must keep
+ * its category (and reset time) or the shared failure classification never
+ * sees it. Only transient categories are relabeled.
+ */
+function relabelMidListFailure(failure: GhAdapterFailure): GhAdapterFailure {
+	if (failure.category === "auth" || failure.category === "access" || failure.category === "rate_limit") {
+		return failure;
+	}
+	return { ...failure, category: "partial_page" };
+}
+
 export interface AccessScope {
 	/** Opaque hash of host + login + credential source; never token material. */
 	accessScopeId: string;
@@ -639,7 +654,7 @@ export class GitHubGhAdapter {
 			if (outcome.kind === "failure") {
 				return {
 					kind: "failed",
-					failure: page === 1 ? outcome.failure : { ...outcome.failure, category: "partial_page" },
+					failure: page === 1 ? outcome.failure : relabelMidListFailure(outcome.failure),
 				};
 			}
 			// Fail closed on unexpected shapes: never treat a non-array as
@@ -732,7 +747,7 @@ export class GitHubGhAdapter {
 			if (outcome.kind === "failure") {
 				return {
 					kind: "failed",
-					failure: page === 1 ? outcome.failure : { ...outcome.failure, category: "partial_page" },
+					failure: page === 1 ? outcome.failure : relabelMidListFailure(outcome.failure),
 				};
 			}
 			const data =
@@ -751,7 +766,17 @@ export class GitHubGhAdapter {
 			if (typeof data.total_count === "number" && Number.isInteger(data.total_count)) {
 				totalCount = data.total_count;
 			}
-			const pageItems = Array.isArray(data.statuses) ? data.statuses : [];
+			if (!Array.isArray(data.statuses)) {
+				return {
+					kind: "failed",
+					failure: {
+						category: "partial_page",
+						message: `commit statuses response missing statuses array on page ${page}`,
+						at: this.now(),
+					},
+				};
+			}
+			const pageItems = data.statuses;
 			statuses.push(...pageItems);
 			const reachedTotal = totalCount !== null && statuses.length >= totalCount;
 			const shortPage = pageItems.length < REST_LIST_PAGE_SIZE;
