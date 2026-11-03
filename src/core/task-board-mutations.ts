@@ -1212,7 +1212,7 @@ export interface RuntimeTaskPrSettingsInput {
 export interface RuntimeUpdateTaskPrSettingsOptions {
 	/**
 	 * The current auto-merge policy of the card's selected Automation PR's
-	 * repository (`null` = no armed policy available). Enabling
+	 * repository (`null` = no policy available). Enabling
 	 * `autoMergeWhenApproved` fails closed without it.
 	 */
 	autoMergePolicy?: { repository: string; revision: number } | null;

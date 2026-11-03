@@ -3639,7 +3639,7 @@ export const autoMergePolicyGetResponseSchema = z.object({
 	ok: z.boolean(),
 	/** Normalized repository key ("" when the input does not normalize). */
 	repository: z.string(),
-	/** Null when the repository has no armed policy (missing or malformed). */
+	/** Null when the repository has no policy (missing or malformed store). */
 	policy: autoMergePolicySchema.nullable(),
 });
 export type AutoMergePolicyGetResponse = z.infer<typeof autoMergePolicyGetResponseSchema>;
