@@ -14,8 +14,10 @@ import {
 	moveTaskToColumn,
 	removeTaskPullRequest,
 	setPrimaryTaskPullRequest,
+	setTaskSelectedAutomationPr,
 	trashTaskAndGetReadyLinkedTaskIds,
 	updateTask,
+	updateTaskPrSettings,
 	updateTaskPullRequestSnapshot,
 } from "../../src/core/task-board-mutations";
 
@@ -700,5 +702,189 @@ describe("removeTaskPullRequest / updateTaskPullRequestSnapshot (PRLINK-0)", () 
 		const empty = updateTaskPullRequestSnapshot(board, "task-1", identityKey, {});
 		expect(empty.updated).toBe(false);
 		expect(empty.board).toBe(board);
+	});
+});
+// AM-1: auto-merge opt-in — the revision-checked settings mutation arms the
+// card against a server-resolved repository policy, and selection changes
+// or unlinks disarm it.
+describe("updateTaskPrSettings auto-merge (AM-1)", () => {
+	const SELECTED_KEY = "github|github.com|owner/repo|12";
+
+	function armableBoard(): RuntimeBoardData {
+		const withTask = taskWithId(createBoard(), "task-1");
+		const withLink = boardWithTaskPullRequests(withTask, "task-1", [createPullRequest()]);
+		return {
+			...withLink,
+			columns: withLink.columns.map((column) => ({
+				...column,
+				cards: column.cards.map((card) =>
+					card.id === "task-1" ? { ...card, selectedAutomationPrKey: SELECTED_KEY } : card,
+				),
+			})),
+		};
+	}
+
+	function cardOf(board: RuntimeBoardData, taskId: string) {
+		const found = board.columns.find((column) => column.cards.some((card) => card.id === taskId));
+		if (!found) {
+			throw new Error(`missing task ${taskId}`);
+		}
+		const card = found.cards.find((item) => item.id === taskId);
+		if (!card) {
+			throw new Error(`missing task ${taskId}`);
+		}
+		return card;
+	}
+
+	it("cannot enable without a selected Automation PR or a resolved policy", () => {
+		const noSelection = taskWithId(createBoard(), "task-1");
+		const withLink = boardWithTaskPullRequests(noSelection, "task-1", [createPullRequest()]);
+		expect(updateTaskPrSettings(withLink, "task-1", { autoMergeWhenApproved: true }, 2000)).toMatchObject({
+			updated: false,
+			reason: "no_selected_pr",
+		});
+
+		const noPolicy = updateTaskPrSettings(armableBoard(), "task-1", { autoMergeWhenApproved: true }, 2000);
+		expect(noPolicy).toMatchObject({ updated: false, reason: "no_policy" });
+	});
+
+	it("arms at the policy revision when the selection and repository match", () => {
+		const result = updateTaskPrSettings(armableBoard(), "task-1", { autoMergeWhenApproved: true }, 2000, {
+			autoMergePolicy: { repository: "owner/repo", revision: 3 },
+		});
+		expect(result).toMatchObject({
+			updated: true,
+			autoMergeWhenApproved: true,
+			armedAutoMergePolicyRevision: 3,
+			settingsRevision: 1,
+			conflict: false,
+		});
+		expect(cardOf(result.board, "task-1")).toMatchObject({
+			autoMergeWhenApproved: true,
+			armedAutoMergePolicyRevision: 3,
+			autoFinishOnMerge: true,
+		});
+	});
+
+	it("rejects a policy from a different repository", () => {
+		const result = updateTaskPrSettings(armableBoard(), "task-1", { autoMergeWhenApproved: true }, 2000, {
+			autoMergePolicy: { repository: "other/repo", revision: 5 },
+		});
+		expect(result).toMatchObject({ updated: false, reason: "no_policy" });
+	});
+
+	it("re-enabling at the same revision is a no-op (no revision bump)", () => {
+		const armed = updateTaskPrSettings(armableBoard(), "task-1", { autoMergeWhenApproved: true }, 2000, {
+			autoMergePolicy: { repository: "owner/repo", revision: 3 },
+		});
+		const again = updateTaskPrSettings(armed.board, "task-1", { autoMergeWhenApproved: true }, 2500, {
+			autoMergePolicy: { repository: "owner/repo", revision: 3 },
+		});
+		expect(again).toMatchObject({ updated: false, autoMergeWhenApproved: true, armedAutoMergePolicyRevision: 3 });
+		expect(again.settingsRevision).toBe(1);
+	});
+
+	it("disarming always wins and drops the armed revision", () => {
+		const armed = updateTaskPrSettings(armableBoard(), "task-1", { autoMergeWhenApproved: true }, 2000, {
+			autoMergePolicy: { repository: "owner/repo", revision: 3 },
+		});
+		const disarmed = updateTaskPrSettings(armed.board, "task-1", { autoMergeWhenApproved: false }, 2500);
+		expect(disarmed).toMatchObject({
+			updated: true,
+			autoMergeWhenApproved: false,
+			armedAutoMergePolicyRevision: null,
+			settingsRevision: 2,
+		});
+		expect(cardOf(disarmed.board, "task-1")).not.toHaveProperty("armedAutoMergePolicyRevision");
+		// Disabling again is a no-op.
+		const again = updateTaskPrSettings(disarmed.board, "task-1", { autoMergeWhenApproved: false }, 3000);
+		expect(again).toMatchObject({ updated: false, settingsRevision: 2 });
+	});
+
+	it("still honors the settings-revision CAS for the auto-merge write", () => {
+		const result = updateTaskPrSettings(
+			armableBoard(),
+			"task-1",
+			{ autoMergeWhenApproved: true, expectedSettingsRevision: 99 },
+			2000,
+			{ autoMergePolicy: { repository: "owner/repo", revision: 3 } },
+		);
+		expect(result).toMatchObject({ updated: false, conflict: true });
+	});
+});
+
+describe("auto-merge disarming (AM-1)", () => {
+	const SELECTED_KEY = "github|github.com|owner/repo|12";
+
+	function armedBoard(): RuntimeBoardData {
+		const withTask = taskWithId(createBoard(), "task-1");
+		const withLink = boardWithTaskPullRequests(withTask, "task-1", [createPullRequest()]);
+		return {
+			...withLink,
+			columns: withLink.columns.map((column) => ({
+				...column,
+				cards: column.cards.map((card) =>
+					card.id === "task-1"
+						? {
+								...card,
+								selectedAutomationPrKey: SELECTED_KEY,
+								autoMergeWhenApproved: true,
+								armedAutoMergePolicyRevision: 4,
+								settingsRevision: 2,
+							}
+						: card,
+				),
+			})),
+		};
+	}
+
+	function cardOf(board: RuntimeBoardData, taskId: string) {
+		const found = board.columns.find((column) => column.cards.some((card) => card.id === taskId));
+		if (!found) {
+			throw new Error(`missing task ${taskId}`);
+		}
+		const card = found.cards.find((item) => item.id === taskId);
+		if (!card) {
+			throw new Error(`missing task ${taskId}`);
+		}
+		return card;
+	}
+
+	it("changing the selected Automation PR disarms the opt-in", () => {
+		const second = createPullRequest({ number: 13, url: "https://github.com/owner/repo/pull/13" });
+		const withTwo = boardWithTaskPullRequests(armedBoard(), "task-1", [createPullRequest(), second]);
+		const result = setTaskSelectedAutomationPr(withTwo, "task-1", getPullRequestIdentityKey(second), 2, 2000);
+		expect(result).toMatchObject({ changed: true, conflict: false, settingsRevision: 3 });
+		expect(cardOf(result.board, "task-1")).toMatchObject({ autoMergeWhenApproved: false });
+		expect(cardOf(result.board, "task-1")).not.toHaveProperty("armedAutoMergePolicyRevision");
+	});
+
+	it("clearing the selection disarms the opt-in", () => {
+		const result = setTaskSelectedAutomationPr(armedBoard(), "task-1", null, 2, 2000);
+		expect(result).toMatchObject({ changed: true, selectedAutomationPrKey: null, settingsRevision: 3 });
+		expect(cardOf(result.board, "task-1")).toMatchObject({ autoMergeWhenApproved: false });
+		expect(cardOf(result.board, "task-1")).not.toHaveProperty("armedAutoMergePolicyRevision");
+	});
+
+	it("unlinking the selected Automation PR disarms the opt-in", () => {
+		const result = removeTaskPullRequest(armedBoard(), "task-1", SELECTED_KEY, 2000);
+		expect(result.removed).toBe(true);
+		expect(cardOf(result.board, "task-1")).toMatchObject({ autoMergeWhenApproved: false });
+		expect(cardOf(result.board, "task-1")).not.toHaveProperty("armedAutoMergePolicyRevision");
+	});
+
+	it("a non-selection settings edit never disarms", () => {
+		const result = updateTaskPrSettings(
+			armedBoard(),
+			"task-1",
+			{ autoFinishOnMerge: false, expectedSettingsRevision: 2 },
+			2000,
+		);
+		expect(result).toMatchObject({
+			updated: true,
+			autoMergeWhenApproved: true,
+			armedAutoMergePolicyRevision: 4,
+			settingsRevision: 3,
+		});
 	});
 });

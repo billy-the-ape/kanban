@@ -6,6 +6,10 @@ import { initTRPC, TRPCError } from "@trpc/server";
 import { z } from "zod";
 
 import type {
+	AutoMergePolicyGetRequest,
+	AutoMergePolicyGetResponse,
+	AutoMergePolicyUpdateRequest,
+	AutoMergePolicyUpdateResponse,
 	RuntimeBlockedTaskCleanupsResponse,
 	RuntimeClineAccountBalanceResponse,
 	RuntimeClineAccountOrganizationsResponse,
@@ -166,6 +170,10 @@ import type {
 	RuntimeWorktreeEnsureResponse,
 } from "../core/api-contract";
 import {
+	autoMergePolicyGetRequestSchema,
+	autoMergePolicyGetResponseSchema,
+	autoMergePolicyUpdateRequestSchema,
+	autoMergePolicyUpdateResponseSchema,
 	runtimeBlockedTaskCleanupsResponseSchema,
 	runtimeClineAccountBalanceResponseSchema,
 	runtimeClineAccountOrganizationsResponseSchema,
@@ -665,6 +673,15 @@ export interface RuntimeTrpcContext {
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskTrackingStateRequest,
 		) => Promise<RuntimeTaskTrackingStateResponse>;
+		// AM-1: per-repository auto-merge policy (read + revision-checked write).
+		getAutoMergePolicy: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: AutoMergePolicyGetRequest,
+		) => Promise<AutoMergePolicyGetResponse>;
+		updateAutoMergePolicy: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: AutoMergePolicyUpdateRequest,
+		) => Promise<AutoMergePolicyUpdateResponse>;
 		getTaskPrSnapshot: (
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimePrAuthorizedSnapshotRequest,
@@ -1221,6 +1238,19 @@ export const runtimeAppRouter = t.router({
 				.output(runtimeTaskTrackingStateResponseSchema)
 				.query(async ({ ctx, input }) => {
 					return await ctx.prTrackingApi.getTaskTrackingState(ctx.workspaceScope, input);
+				}),
+			// AM-1: per-repository auto-merge policy.
+			getAutoMergePolicy: workspaceProcedure
+				.input(autoMergePolicyGetRequestSchema)
+				.output(autoMergePolicyGetResponseSchema)
+				.query(async ({ ctx, input }) => {
+					return await ctx.prTrackingApi.getAutoMergePolicy(ctx.workspaceScope, input);
+				}),
+			updateAutoMergePolicy: workspaceProcedure
+				.input(autoMergePolicyUpdateRequestSchema)
+				.output(autoMergePolicyUpdateResponseSchema)
+				.mutation(async ({ ctx, input }) => {
+					return await ctx.prTrackingApi.updateAutoMergePolicy(ctx.workspaceScope, input);
 				}),
 			getTaskPrSnapshot: workspaceProcedure
 				.input(runtimePrAuthorizedSnapshotRequestSchema)

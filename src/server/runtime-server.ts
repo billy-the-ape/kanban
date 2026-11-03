@@ -33,6 +33,7 @@ import {
 	isKanbanRemoteHost,
 } from "../core/runtime-endpoint";
 import { completeTaskAndGetReadyLinkedTaskIds } from "../core/task-board-mutations";
+import { AutoMergePolicyStore } from "../pr-tracking/auto-merge-policy-store";
 import { createPrCommentAutomationService } from "../pr-tracking/comment-automation-service";
 import { createGitHubPrClient, resolveGitHubAccessScopeId } from "../pr-tracking/github-pr-client";
 import { PrConsumerRegistry } from "../pr-tracking/pr-consumer-registry";
@@ -312,6 +313,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		coordinator: ReturnType<typeof createPrTrackingCoordinator>;
 		store: PrRecordStore;
 		registry: PrConsumerRegistry;
+		autoMergePolicyStore: AutoMergePolicyStore;
 	} | null = null;
 	/**
 	 * PRTRACK-1: every reconcile trigger (startup, board save, PR-link
@@ -418,6 +420,9 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		if (!prTrackingState) {
 			const store = new PrRecordStore();
 			const registry = new PrConsumerRegistry();
+			// AM-1: the durable per-repository auto-merge policy store lives in
+			// the runtime home; one instance per runtime server.
+			const autoMergePolicyStore = new AutoMergePolicyStore();
 			// MERGE-1: register the merge completion consumer on the
 			// installed-consumer registry BEFORE the coordinator is created,
 			// so every read the coordinator performs already delivers
@@ -534,6 +539,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				}),
 				store,
 				registry,
+				autoMergePolicyStore,
 			};
 		}
 		return prTrackingState;
@@ -749,6 +755,8 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			prTrackingApi: createPrTrackingApi({
 				getPrTrackingCoordinator: () => getPrTrackingState().coordinator,
 				getPrTrackingStore: () => getPrTrackingState().store,
+				// AM-1: durable per-repository auto-merge policies.
+				getAutoMergePolicyStore: () => getPrTrackingState().autoMergePolicyStore,
 				listManagedWorkspaceBoards,
 				broadcastRuntimeWorkspaceStateUpdated: (scope) =>
 					broadcastRuntimeWorkspaceStateUpdatedWithReconcile(scope.workspaceId, scope.workspacePath),

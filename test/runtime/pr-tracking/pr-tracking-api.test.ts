@@ -1,6 +1,9 @@
 // PRTRACK-1: trpc consumer API — diagnostics, settings writes, and operator
 // force-release authorization.
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as WorkspaceState from "../../../src/state/workspace-state";
 
 const workspaceStateMocks = vi.hoisted(() => ({
@@ -23,6 +26,7 @@ import type {
 	RuntimeBoardColumnId,
 	RuntimeBoardData,
 } from "../../../src/core/api-contract";
+import { AutoMergePolicyStore } from "../../../src/pr-tracking/auto-merge-policy-store";
 import { InMemoryPrRecordStore } from "../../../src/pr-tracking/in-memory-pr-record-store";
 import { assignRepairOwner } from "../../../src/pr-tracking/pr-owner-selection";
 import { releasePrOperation, reservePrOperation } from "../../../src/pr-tracking/pr-reservations";
@@ -91,16 +95,40 @@ interface ApiHarness {
 	api: ReturnType<typeof createPrTrackingApi>;
 }
 
+const tempRoots: string[] = [];
+
+function createTempDirSync(): string {
+	return mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "am1-api-test-"));
+}
+
+afterEach(async () => {
+	for (const root of tempRoots.splice(0)) {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
 function createHarness(
 	board: RuntimeBoardData,
-	options: { writerActive?: boolean; effectiveAgentId?: RuntimeAgentId | null } = {},
+	options: {
+		writerActive?: boolean;
+		effectiveAgentId?: RuntimeAgentId | null;
+		policyStore?: AutoMergePolicyStore;
+	} = {},
 ): ApiHarness {
 	const store = new InMemoryPrRecordStore();
 	const coordinator = createPrTrackingCoordinator({ store });
 	const warnings: string[] = [];
+	const policyStore =
+		options.policyStore ??
+		(() => {
+			const tempRoot = createTempDirSync();
+			tempRoots.push(tempRoot);
+			return new AutoMergePolicyStore({ rootPath: tempRoot });
+		})();
 	const api = createPrTrackingApi({
 		getPrTrackingCoordinator: () => coordinator,
 		getPrTrackingStore: () => store,
+		getAutoMergePolicyStore: () => policyStore,
 		listManagedWorkspaceBoards: async () => [{ workspaceId: WORKSPACE_ID, board }],
 		broadcastRuntimeWorkspaceStateUpdated: () => undefined,
 		isTaskWriterActive: () => options.writerActive === true,
@@ -431,5 +459,163 @@ describe("pr-tracking api: operator force release authorization", () => {
 		// superseded observation.
 		expect(current.record.reservation.state).toBe("reserved");
 		expect(current.record.reservation.reservedBy).toEqual(OTHER_TASK);
+	});
+});
+// AM-1: per-repository auto-merge policy procedures.
+describe("pr-tracking api: auto-merge policy (AM-1)", () => {
+	beforeEach(() => {
+		workspaceStateMocks.loadWorkspaceBoardById.mockReset();
+		workspaceStateMocks.mutateWorkspaceState.mockReset();
+	});
+
+	it("reports no policy for an unknown repository", async () => {
+		const board = makeBoard(makeCard());
+		mockWorkspaceState(board);
+		const harness = createHarness(board);
+
+		const result = await harness.api.getAutoMergePolicy(SCOPE, { repository: "org/none" });
+		expect(result).toEqual({ ok: true, repository: "org/none", policy: null });
+	});
+
+	it("normalizes the repository and returns the stored policy", async () => {
+		const board = makeBoard(makeCard());
+		mockWorkspaceState(board);
+		const harness = createHarness(board);
+		const created = await harness.api.updateAutoMergePolicy(SCOPE, {
+			repository: "Cline/Kanban",
+			requiredChecks: ["Build"],
+			mergeMethod: "squash",
+		});
+		expect(created.ok).toBe(true);
+		if (!created.ok) {
+			throw new Error("policy write failed");
+		}
+		const result = await harness.api.getAutoMergePolicy(SCOPE, { repository: "CLINE/kanban" });
+		expect(result).toMatchObject({
+			ok: true,
+			repository: "cline/kanban",
+			policy: { repository: "cline/kanban", requiredChecks: ["Build"], mergeMethod: "squash", revision: 1 },
+		});
+	});
+
+	it("refuses an invalid repository and records an operator warning", async () => {
+		const board = makeBoard(makeCard());
+		mockWorkspaceState(board);
+		const harness = createHarness(board);
+
+		const result = await harness.api.updateAutoMergePolicy(SCOPE, {
+			repository: "github.com/cline/kanban",
+			requiredChecks: ["ci"],
+		});
+		expect(result).toMatchObject({ ok: false, reason: "invalid" });
+		expect(harness.warnings.some((warning) => warning.includes("refused: invalid"))).toBe(true);
+	});
+
+	it("rejects a stale expectedRevision as a conflict", async () => {
+		const board = makeBoard(makeCard());
+		mockWorkspaceState(board);
+		const harness = createHarness(board);
+		await harness.api.updateAutoMergePolicy(SCOPE, { repository: "org/repo", requiredChecks: ["ci"] });
+
+		const result = await harness.api.updateAutoMergePolicy(SCOPE, {
+			repository: "org/repo",
+			requiredChecks: ["ci", "docs"],
+			expectedRevision: 0,
+		});
+		expect(result).toMatchObject({ ok: false, reason: "conflict" });
+		expect(harness.warnings.some((warning) => warning.includes("refused: conflict"))).toBe(true);
+	});
+});
+
+// AM-1: setTaskPrSettings arms the card against the resolved policy.
+describe("pr-tracking api: settings auto-merge (AM-1)", () => {
+	const SELECTED_KEY = PR_KEY;
+
+	beforeEach(() => {
+		workspaceStateMocks.loadWorkspaceBoardById.mockReset();
+		workspaceStateMocks.mutateWorkspaceState.mockReset();
+	});
+
+	function selectedBoard(card: RuntimeBoardCard): RuntimeBoardData {
+		return makeBoard({ ...card, selectedAutomationPrKey: SELECTED_KEY });
+	}
+
+	it("cannot enable without a selected PR or a stored policy", async () => {
+		mockWorkspaceState(makeBoard(makeCard()));
+		const noSelection = createHarness(makeBoard(makeCard()));
+		const noSelectionResult = await noSelection.api.setTaskPrSettings(SCOPE, {
+			taskId: OPERATOR_TASK_ID,
+			autoMergeWhenApproved: true,
+		});
+		expect(noSelectionResult).toMatchObject({ ok: false, reason: "no_selected_pr" });
+
+		mockWorkspaceState(selectedBoard(makeCard()));
+		const noPolicy = createHarness(selectedBoard(makeCard()));
+		const noPolicyResult = await noPolicy.api.setTaskPrSettings(SCOPE, {
+			taskId: OPERATOR_TASK_ID,
+			autoMergeWhenApproved: true,
+		});
+		expect(noPolicyResult).toMatchObject({ ok: false, reason: "no_policy" });
+	});
+
+	it("arms at the policy revision and reports both values", async () => {
+		const board = selectedBoard(makeCard());
+		mockWorkspaceState(board);
+		const harness = createHarness(board);
+		await harness.api.updateAutoMergePolicy(SCOPE, { repository: "cline/kanban", requiredChecks: ["ci"] });
+
+		const result = await harness.api.setTaskPrSettings(SCOPE, {
+			taskId: OPERATOR_TASK_ID,
+			autoMergeWhenApproved: true,
+		});
+		expect(result).toMatchObject({
+			ok: true,
+			autoMergeWhenApproved: true,
+			armedAutoMergePolicyRevision: 1,
+			reason: null,
+		});
+	});
+
+	it("rejects when the policy belongs to a different repository", async () => {
+		const board = selectedBoard(makeCard());
+		mockWorkspaceState(board);
+		const harness = createHarness(board);
+		await harness.api.updateAutoMergePolicy(SCOPE, { repository: "other/repo", requiredChecks: ["ci"] });
+
+		const result = await harness.api.setTaskPrSettings(SCOPE, {
+			taskId: OPERATOR_TASK_ID,
+			autoMergeWhenApproved: true,
+		});
+		expect(result).toMatchObject({ ok: false, reason: "no_policy" });
+	});
+
+	it("disarming drops the armed revision regardless of policies", async () => {
+		const board = selectedBoard(makeCard({ autoMergeWhenApproved: true, armedAutoMergePolicyRevision: 2 }));
+		mockWorkspaceState(board);
+		const harness = createHarness(board);
+
+		const result = await harness.api.setTaskPrSettings(SCOPE, {
+			taskId: OPERATOR_TASK_ID,
+			autoMergeWhenApproved: false,
+		});
+		expect(result).toMatchObject({
+			ok: true,
+			autoMergeWhenApproved: false,
+			armedAutoMergePolicyRevision: null,
+			reason: null,
+		});
+	});
+
+	it("reports the auto-merge state in the tracking diagnostics", async () => {
+		const board = selectedBoard(makeCard({ autoMergeWhenApproved: true, armedAutoMergePolicyRevision: 2 }));
+		mockWorkspaceState(board);
+		const harness = createHarness(board);
+
+		const state = await harness.api.getTaskTrackingState(SCOPE, { taskId: OPERATOR_TASK_ID });
+		expect(state).toMatchObject({
+			ok: true,
+			autoMergeWhenApproved: true,
+			armedAutoMergePolicyRevision: 2,
+		});
 	});
 });
