@@ -11,9 +11,9 @@
 //
 // This module NEVER merges, arms, writes to GitHub, or starts a timer. The
 // coordinator exposes it as a consumer-requested read that coalesces
-// concurrent requests per (PR, scope); unrelated tasks never trigger
-// these reads. The normalization layer is pure and injectable (tests script
-// the adapter's gh runner).
+// concurrent requests per (PR, scope, options); unrelated tasks never
+// trigger these reads. The normalization layer is pure and injectable
+// (tests script the adapter's gh runner).
 import type { AutoMergeCheckEvidence, AutoMergeEvidenceEnvelope, AutoMergeReviewEvidence } from "../core/api-contract";
 import { AUTO_MERGE_EVIDENCE_SCHEMA_VERSION } from "../core/api-contract";
 import type {

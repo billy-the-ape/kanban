@@ -1717,9 +1717,11 @@ export class PrTrackingCoordinator {
 	 *   rotation re-keys and invalidates poll state exactly as for polls).
 	 * - Honors an active rate-limit deadline: report `rate_limited`, never
 	 *   wait and never retry.
-	 * - Coalesces concurrent requests for the same (PR, scope) onto one
-	 *   in-flight collection (the envelope carries its own head SHA, policy
-	 *   revision and checkedAt so callers can verify fit).
+	 * - Coalesces concurrent requests for the same (PR, scope, options)
+	 *   onto one in-flight collection (callers with a different declared
+	 *   head or policy revision get their own collection; the envelope
+	 *   carries its own head SHA, policy revision and checkedAt so
+	 *   callers can verify fit).
 	 * - Bounded through the shared adapter (in-flight cap, timeout,
 	 *   backoff/rate-limit classification); performs no GitHub writes.
 	 * - Read failures route through the same failure classification as
@@ -1752,17 +1754,21 @@ export class PrTrackingCoordinator {
 		if (state.rateLimitDeadline !== null && state.rateLimitDeadline > this.now()) {
 			return this.failureEvidenceEnvelope(scope.accessScopeId, options.policyRevision, ["rate_limited"]);
 		}
-		// Coalesce concurrent evidence requests for this (PR, scope).
-		const inflight = this.evidenceInFlight.get(key);
+		// Coalesce concurrent evidence requests for the same (PR, scope,
+		// options): a caller with a different declared head or policy
+		// revision must never receive another caller's envelope, or the
+		// exact-head guarantee and the echoed policy revision break.
+		const flightKey = `${key}|${options.policyRevision}|${options.declaredHeadSha ?? ""}`;
+		const inflight = this.evidenceInFlight.get(flightKey);
 		if (inflight) {
 			return await inflight;
 		}
 		const job = this.performEvidenceRead(parsed, scope, state, options);
-		this.evidenceInFlight.set(key, job);
+		this.evidenceInFlight.set(flightKey, job);
 		try {
 			return await job;
 		} finally {
-			this.evidenceInFlight.delete(key);
+			this.evidenceInFlight.delete(flightKey);
 		}
 	}
 

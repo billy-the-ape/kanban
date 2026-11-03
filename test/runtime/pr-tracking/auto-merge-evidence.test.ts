@@ -848,6 +848,37 @@ describe("pr-tracking-coordinator auto-merge evidence reads", () => {
 		expect(harness.counts.metadata).toBe(2);
 		expect(harness.counts.rest.filter((endpoint) => endpoint === REVIEWS_ENDPOINT)).toHaveLength(1);
 	});
+	it("does not coalesce concurrent reads with a different declared head", async () => {
+		const harness = makeEvidenceHarness();
+		const coordinator = track(harness.coordinator);
+		const [first, second] = await Promise.all([
+			coordinator.readAutoMergeEvidence(PR49, undefined, { policyRevision: 1 }),
+			coordinator.readAutoMergeEvidence(PR49, undefined, { policyRevision: 2, declaredHeadSha: "stale-head" }),
+		]);
+		expect(first).not.toBe(second);
+		expect(first.complete).toBe(true);
+		expect(first.policyRevision).toBe(1);
+		// The second caller's declared head does not match the live head: it
+		// gets its own envelope and its own policy revision, never a
+		// borrowed complete=true for the first caller's head.
+		expect(second.complete).toBe(false);
+		expect(second.reasons).toContain("declared_head_mismatch");
+		expect(second.policyRevision).toBe(2);
+	});
+
+	it("does not coalesce concurrent reads with a different policy revision", async () => {
+		const harness = makeEvidenceHarness();
+		const coordinator = track(harness.coordinator);
+		const [first, second] = await Promise.all([
+			coordinator.readAutoMergeEvidence(PR49, undefined, { policyRevision: 1 }),
+			coordinator.readAutoMergeEvidence(PR49, undefined, { policyRevision: 7 }),
+		]);
+		expect(first).not.toBe(second);
+		expect(first.complete).toBe(true);
+		expect(first.policyRevision).toBe(1);
+		expect(second.complete).toBe(true);
+		expect(second.policyRevision).toBe(7);
+	});
 
 	it("reports rate limits and short-circuits subsequent reads (never retries)", async () => {
 		// The reset is well beyond the 15-minute fallback: the deadline must
