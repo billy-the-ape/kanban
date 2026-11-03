@@ -10,6 +10,12 @@ After a selected, ready-for-review GitHub PR has a current, valid **APPROVED rev
 
 The opt-in belongs in the task's PR tracking panel beside **Auto complete when the PR merges**. The two settings remain distinct. Runtime-wide repository policy supplies required CI check names and the merge method; configure it once per repository, not once per task.
 
+**V1 checkbox label:** **Auto-merge when CI passes and at least one review approves**.
+
+**V1 helper text:** "Automatically merge the selected PR when all configured CI checks pass and at least one valid approving GitHub review is present. GitHub's repository rules still apply."
+
+**At least one** is the fixed V1 threshold: one valid approval suffices for Kanban, and two or more are also acceptable. No approval-count setting is included in V1.
+
 ## Alternatives and facts checked
 
 - **GitHub native auto-merge is available to public repositories on GitHub Free.** This repository is public, but its `allow_auto_merge` flag is currently false and `main` is unprotected. Native auto-merge requires GitHub-side merge requirements to be configured. See [GitHub native auto-merge](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/automatically-merging-a-pull-request).
@@ -17,6 +23,17 @@ The opt-in belongs in the task's PR tracking panel beside **Auto complete when t
 - An agent-directed merge is possible but unnecessarily nondeterministic. **Build the Kanban-side option requested here**, without disabling native GitHub protections or assuming they exist. Detect native auto-merge if present and do not compete with it.
 
 **Non-negotiable:** `main` currently has no required status checks. A rule of "all GitHub-required checks succeeded" is vacuously true with zero required checks. Never infer merge eligibility from an empty checks list, a green PR summary, a status for an older commit, or a reviewer's prose. Require a user-configured, **nonempty set of check names** in the Kanban repository policy.
+
+## Scope: Kanban trigger versus GitHub merge rules
+
+V1 implements **one explicit policy**, not a configurable replacement for GitHub rules:
+
+- **CI:** every explicitly configured check must be successful on the current PR head; an empty or incomplete check list does not count as passing.
+- **Approval:** at least one effective, submitted, current-head GitHub `APPROVED` review from a non-author. Additional approvals are fine. A currently effective `CHANGES_REQUESTED` review remains a blocker, as do stale/dismissed approvals or prose-only comments.
+- **Safety:** ready-for-review, correct repository and target, mergeable, no unresolved actionable review threads, no concurrent comment repair/writer, and fresh identity checks. These are fixed safeguards, not knobs.
+- **GitHub enforcement:** GitHub branch protection and rulesets remain the final authority. GitHub may require two or more approvals, CODEOWNER review, deployments, or other conditions. A PR satisfying Kanban's one-approval threshold is only a *candidate* for GitHub's merge API. Surface a denied merge as a blocker; never bypass GitHub restrictions or loop on the same denial.
+
+Do not add approval-count options, reviewer-role rules, rule expressions, or a general workflow-policy builder in AM-1 through AM-5.
 
 ## Implementation PRs
 
@@ -40,6 +57,12 @@ Implement in order: **AM-1 → AM-2 → AM-3 → AM-4 → AM-5**. Each PR should
 6. **Exactly once in effect:** persist a bounded attempt/decision journal, reserve by PR and head mapping, freshly re-read all mutable preconditions immediately before write, send GitHub's expected `sha`, then **read back GitHub merge state**. After timeout, never blindly send a second merge; reconcile remote state first. Never move the task to Done from a merge-request result alone.
 7. **Operational UX:** present `off`, `awaiting approval`, `awaiting CI`, `blocked`, `merging`, `merged` and `needs attention` with explicit evidence timestamps and concise reasons. Show auth/permission failures. Operator can disable, re-arm after a policy change, or retry only after fixing and acknowledging a terminal failure.
 8. **Separation of concerns:** comment repair and merge-completion remain independent. Existing `autoFinishOnMerge` stays the sole automatic task-completion and successor-dispatch mechanism. Avoid unrelated changes to model prompts, CI polling by agents, PR creation behavior, task runner or branch protection.
+
+## Possible future extensions (documentation only)
+
+Later iterations **could** support configurable minimum approval counts (e.g. two or three), CODEOWNER/team approvals, human-only reviewer constraints, per-branch policies, repository-rule discovery, deployment/security/label gates, or release windows. These are **not** requirements, commitments, or implementation tasks for AM-1 through AM-5.
+
+Preserve the separation between **GitHub evidence**, **pure eligibility evaluation**, **small versioned repository policy**, and **fenced merge execution** to keep future additions possible. Do not implement a speculative plugin architecture, generic rule language, or policy-editor framework now. Prefer to let GitHub enforce its native policies rather than reproducing every GitHub rule in Kanban.
 
 ## Known code touchpoints
 
