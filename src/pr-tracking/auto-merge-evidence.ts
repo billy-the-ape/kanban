@@ -418,6 +418,9 @@ export async function collectAutoMergeEvidence(
 		failures.push(threads.failure);
 		addReason(envelope.reasons, "review_threads_unknown");
 		addReason(envelope.reasons, threads.failure.category);
+	} else {
+		// A 304 from the thread query cannot supply thread state: never complete.
+		addReason(envelope.reasons, "review_threads_unknown");
 	}
 	// Mergeability that GitHub has not computed is an explicit unknown, never
 	// an assumed green.

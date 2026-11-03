@@ -54,7 +54,11 @@ interface ScriptedCall {
 type RestHandler = (page: number, callIndex: number) => { stdout: string } | { stderr: string };
 type RestHandlers = Record<string, RestHandler>;
 
-function makeScriptedRunner(handlers: RestHandlers, graphqlStdout?: string | ((graphqlCallIndex: number) => string)) {
+function makeScriptedRunner(
+	handlers: RestHandlers,
+	graphqlStdout?: string | ((graphqlCallIndex: number) => string),
+	graphqlFailure?: (graphqlCallIndex: number) => boolean,
+) {
 	const calls: ScriptedCall[] = [];
 	const perEndpoint = new Map<string, number>();
 	const runner = async (args: string[], _cwd: string): Promise<GhRunnerCommandResult> => {
@@ -62,6 +66,9 @@ function makeScriptedRunner(handlers: RestHandlers, graphqlStdout?: string | ((g
 		if (endpointRaw === "graphql") {
 			calls.push({ kind: "graphql", endpoint: null, page: null });
 			const graphqlCallIndex = calls.filter((call) => call.kind === "graphql").length;
+			if (graphqlFailure?.(graphqlCallIndex)) {
+				return { ok: false, stdout: "", stderr: "HTTP 304: Not Modified", exitCode: 1, missingBinary: false };
+			}
 			return {
 				ok: true,
 				stdout:
@@ -92,8 +99,12 @@ function makeScriptedRunner(handlers: RestHandlers, graphqlStdout?: string | ((g
 	return { runner, calls };
 }
 
-function adapterFor(handlers: RestHandlers, graphqlStdout?: string | ((graphqlCallIndex: number) => string)) {
-	const scripted = makeScriptedRunner(handlers, graphqlStdout);
+function adapterFor(
+	handlers: RestHandlers,
+	graphqlStdout?: string | ((graphqlCallIndex: number) => string),
+	graphqlFailure?: (graphqlCallIndex: number) => boolean,
+) {
+	const scripted = makeScriptedRunner(handlers, graphqlStdout, graphqlFailure);
 	return {
 		adapter: createGitHubGhAdapter({ ghRunner: scripted.runner, now: () => NOW, cwd: "/tmp/fake-repo" }),
 		calls: scripted.calls,
@@ -102,9 +113,13 @@ function adapterFor(handlers: RestHandlers, graphqlStdout?: string | ((graphqlCa
 
 async function collect(
 	handlers: RestHandlers,
-	options: { declaredHeadSha?: string; graphqlStdout?: string | ((graphqlCallIndex: number) => string) } = {},
+	options: {
+		declaredHeadSha?: string;
+		graphqlStdout?: string | ((graphqlCallIndex: number) => string);
+		graphqlFailure?: (graphqlCallIndex: number) => boolean;
+	} = {},
 ) {
-	const { adapter, calls } = adapterFor(handlers, options.graphqlStdout);
+	const { adapter, calls } = adapterFor(handlers, options.graphqlStdout, options.graphqlFailure);
 	const result = await collectAutoMergeEvidence(adapter, PARSED, SCOPE, {
 		policyRevision: 7,
 		declaredHeadSha: options.declaredHeadSha ?? null,
@@ -604,6 +619,22 @@ describe("auto-merge-evidence reader", () => {
 		expect(envelope.unresolvedActiveThreads).toBe(0);
 		expect(envelope.sources.reviewThreads).toBe(true);
 	});
+	it("treats a 304 thread read as unknown (never complete)", async () => {
+		const { envelope } = await collect(
+			{
+				[PR_ENDPOINT]: () => ({ stdout: prMetadataBody() }),
+				[REVIEWS_ENDPOINT]: () => ({ stdout: "[]" }),
+				[CHECK_RUNS_ENDPOINT]: () => ({ stdout: JSON.stringify({ total_count: 0, check_runs: [] }) }),
+				[STATUSES_ENDPOINT]: () => ({ stdout: JSON.stringify({ state: "success", total_count: 0, statuses: [] }) }),
+			},
+			{ graphqlFailure: () => true },
+		);
+		expect(envelope.complete).toBe(false);
+		expect(envelope.reasons).toContain("review_threads_unknown");
+		expect(envelope.sources.reviewThreads).toBe(false);
+		expect(envelope.unresolvedActiveThreads).toBeNull();
+	});
+
 	it("leaves the poller's conditional-read cache untouched (poll, change, evidence, poll)", async () => {
 		// Poll 1 reads establish the adapter's conditional digests; then the
 		// provider changes (merged at a new head, new thread data); then an
