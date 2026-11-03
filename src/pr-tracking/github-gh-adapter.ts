@@ -57,6 +57,20 @@ export type GhAdapterFailureCategory =
 	| "buffer_bound"
 	| "partial_page";
 
+/** True when `value` is a known adapter failure category (string guard). */
+export function isGhAdapterFailureCategory(value: string): value is GhAdapterFailureCategory {
+	return (
+		value === "auth" ||
+		value === "rate_limit" ||
+		value === "not_found" ||
+		value === "access" ||
+		value === "network" ||
+		value === "timeout" ||
+		value === "buffer_bound" ||
+		value === "partial_page"
+	);
+}
+
 export interface GhAdapterFailure {
 	category: GhAdapterFailureCategory;
 	/** Sanitized, bounded error detail with a timestamp. */
@@ -64,6 +78,21 @@ export interface GhAdapterFailure {
 	at: number;
 	/** Epoch ms when the API rate limit resets (rate_limit only). */
 	rateLimitResetAt?: number;
+}
+
+/**
+ * Relabel a MID-LIST failure as `partial_page` without discarding categories
+ * that carry their own classification semantics: `auth` stops all polls,
+ * `access` stops this poll, and `rate_limit` extends the deadline from
+ * `rateLimitResetAt`. A rate limit or auth failure hitting page 2+ must keep
+ * its category (and reset time) or the shared failure classification never
+ * sees it. Only transient categories are relabeled.
+ */
+function relabelMidListFailure(failure: GhAdapterFailure): GhAdapterFailure {
+	if (failure.category === "auth" || failure.category === "access" || failure.category === "rate_limit") {
+		return failure;
+	}
+	return { ...failure, category: "partial_page" };
 }
 
 export interface AccessScope {
@@ -84,6 +113,21 @@ export type FeedbackReadResult =
 	| { kind: "ok"; events: GitHubPrNormalizedFeedbackEvent[]; bodyDigest: string }
 	| { kind: "ok_threads"; threads: Map<string, PrThreadInfo> }
 	| { kind: "not_modified" }
+	| { kind: "failed"; failure: GhAdapterFailure };
+
+/**
+ * AM-2: complete raw REST list (every page). A mid-list failure is always a
+ * `partial_page` failure — the list is incomplete, never a truncated success.
+ */
+export type RawRestListResult = { kind: "ok"; items: unknown[] } | { kind: "failed"; failure: GhAdapterFailure };
+
+/**
+ * AM-2: the full commit-statuses object for one commit (all pages).
+ * `aggregateState` is the endpoint's composite `state`; `totalCount` the
+ * provider's `total_count`; `statuses` every status item in order.
+ */
+export type CommitStatusesReadResult =
+	| { kind: "ok"; aggregateState: string | null; totalCount: number | null; statuses: unknown[] }
 	| { kind: "failed"; failure: GhAdapterFailure };
 
 export interface GhRunnerCommandResult {
@@ -462,12 +506,24 @@ export class GitHubGhAdapter {
 		return `${parsed.host}|${parsed.repository}|${parsed.number}|${scope.accessScopeId}|${source}`;
 	}
 
-	private applyConditionalRead(key: string, body: string, fresh: boolean): "changed" | "not_modified" {
+	/**
+	 * Conditional-read bookkeeping. `recordDigest: false` reads the cache but
+	 * never writes it, so cache-neutral readers (e.g. AM-2 evidence reads)
+	 * cannot shadow the poller's own `not_modified` short-circuit.
+	 */
+	private applyConditionalRead(
+		key: string,
+		body: string,
+		fresh: boolean,
+		recordDigest = true,
+	): "changed" | "not_modified" {
 		const digest = sha256Digest(body);
 		if (!fresh && this.bodyDigestCache.get(key) === digest) {
 			return "not_modified";
 		}
-		this.bodyDigestCache.set(key, digest);
+		if (recordDigest) {
+			this.bodyDigestCache.set(key, digest);
+		}
 		return "changed";
 	}
 
@@ -478,7 +534,7 @@ export class GitHubGhAdapter {
 	async readPrMetadata(
 		parsed: ParsedCanonicalPrKey,
 		scope: AccessScope,
-		options?: { fresh?: boolean },
+		options?: { fresh?: boolean; recordDigest?: boolean },
 	): Promise<MetadataReadResult> {
 		const endpoint = `repos/${parsed.repository}/pulls/${parsed.number}`;
 		const outcome = await this.callRest(endpoint);
@@ -492,6 +548,7 @@ export class GitHubGhAdapter {
 			this.conditionalKey(parsed, scope, "metadata"),
 			outcome.stdout,
 			options?.fresh ?? false,
+			options?.recordDigest ?? true,
 		);
 		if (condition === "not_modified") {
 			return { kind: "not_modified" };
@@ -565,6 +622,187 @@ export class GitHubGhAdapter {
 	}
 
 	/**
+	 * Read one paginated REST list source completely, returning the RAW
+	 * provider items (no feedback normalization, no conditional-read
+	 * retention). Evidence reads must always see the full current body —
+	 * a mid-list failure, an unreconstructable 304, or an unexpected
+	 * response shape is a partial-page failure, never a silent truncation.
+	 *
+	 * `itemKey` unwraps object-wrapped list endpoints such as
+	 * `GET /repos/{repo}/commits/{sha}/check-runs` (body:
+	 * `{ total_count, check_runs: [...] }`, NOT a bare array). When the
+	 * unwrapped list has a known `total_count`, pagination completes only
+	 * once that count is reached; a short page below the total is an
+	 * ambiguous (partial) read.
+	 */
+	async readRawRestList(endpointBase: string, itemKey?: string): Promise<RawRestListResult> {
+		const all: unknown[] = [];
+		let totalCount: number | null = null;
+		for (let page = 1; ; page += 1) {
+			const outcome = await this.callRest(`${endpointBase}?per_page=${REST_LIST_PAGE_SIZE}&page=${page}`);
+			if (outcome.kind === "not_modified") {
+				// A 304 cannot reconstruct the full list body.
+				return {
+					kind: "failed",
+					failure: {
+						category: "partial_page",
+						message: `conditional 304 on page ${page}; raw list unreconstructable`,
+						at: this.now(),
+					},
+				};
+			}
+			if (outcome.kind === "failure") {
+				return {
+					kind: "failed",
+					failure: page === 1 ? outcome.failure : relabelMidListFailure(outcome.failure),
+				};
+			}
+			// Fail closed on unexpected shapes: never treat a non-array as
+			// an empty list.
+			let items: unknown[];
+			if (itemKey !== undefined) {
+				const container =
+					typeof outcome.data === "object" && outcome.data !== null
+						? (outcome.data as Record<string, unknown>)
+						: null;
+				const wrapped = container?.[itemKey];
+				if (!Array.isArray(wrapped)) {
+					return {
+						kind: "failed",
+						failure: {
+							category: "partial_page",
+							message: `unexpected response shape for "${itemKey}" on page ${page}`,
+							at: this.now(),
+						},
+					};
+				}
+				items = wrapped;
+				const count = container?.total_count;
+				if (typeof count === "number" && Number.isFinite(count) && count >= 0) {
+					totalCount ??= count;
+				}
+			} else if (Array.isArray(outcome.data)) {
+				items = outcome.data;
+			} else {
+				return {
+					kind: "failed",
+					failure: {
+						category: "partial_page",
+						message: `unexpected response shape (expected array) on page ${page}`,
+						at: this.now(),
+					},
+				};
+			}
+			all.push(...items);
+			const reachedTotal = totalCount !== null && all.length >= totalCount;
+			// Complete pagination: stop on a short (final) page or once the
+			// known total_count is reached.
+			if (reachedTotal || items.length < REST_LIST_PAGE_SIZE) {
+				if (totalCount !== null && all.length < totalCount) {
+					// Short page below a known total: ambiguous completeness.
+					return {
+						kind: "failed",
+						failure: {
+							category: "partial_page",
+							message: `only ${all.length} of ${totalCount} items returned`,
+							at: this.now(),
+						},
+					};
+				}
+				break;
+			}
+			if (page >= 1000) {
+				// Paging cap: unknown completeness, never a truncated success.
+				return {
+					kind: "failed",
+					failure: { category: "partial_page", message: "pagination safety guard reached", at: this.now() },
+				};
+			}
+		}
+		return { kind: "ok", items: all };
+	}
+
+	/**
+	 * Read the full commit-statuses endpoint (`/commits/{sha}/status`) to
+	 * completion: aggregate state, `total_count`, and every status item.
+	 * Pages exhausted before `total_count` is reached are an ambiguous
+	 * status read (partial), never a partial success.
+	 */
+	async readCommitStatuses(endpointBase: string): Promise<CommitStatusesReadResult> {
+		const statuses: unknown[] = [];
+		let aggregateState: string | null = null;
+		let totalCount: number | null = null;
+		for (let page = 1; ; page += 1) {
+			const outcome = await this.callRest(`${endpointBase}?per_page=${REST_LIST_PAGE_SIZE}&page=${page}`);
+			if (outcome.kind === "not_modified") {
+				return {
+					kind: "failed",
+					failure: {
+						category: "partial_page",
+						message: `conditional 304 on page ${page}; statuses unreadable`,
+						at: this.now(),
+					},
+				};
+			}
+			if (outcome.kind === "failure") {
+				return {
+					kind: "failed",
+					failure: page === 1 ? outcome.failure : relabelMidListFailure(outcome.failure),
+				};
+			}
+			const data =
+				typeof outcome.data === "object" && outcome.data !== null
+					? (outcome.data as Record<string, unknown>)
+					: null;
+			if (!data) {
+				return {
+					kind: "failed",
+					failure: { category: "network", message: "unparseable commit status response", at: this.now() },
+				};
+			}
+			if (typeof data.state === "string") {
+				aggregateState = data.state;
+			}
+			if (typeof data.total_count === "number" && Number.isInteger(data.total_count)) {
+				totalCount = data.total_count;
+			}
+			if (!Array.isArray(data.statuses)) {
+				return {
+					kind: "failed",
+					failure: {
+						category: "partial_page",
+						message: `commit statuses response missing statuses array on page ${page}`,
+						at: this.now(),
+					},
+				};
+			}
+			const pageItems = data.statuses;
+			statuses.push(...pageItems);
+			const reachedTotal = totalCount !== null && statuses.length >= totalCount;
+			const shortPage = pageItems.length < REST_LIST_PAGE_SIZE;
+			if (reachedTotal || shortPage) {
+				if (totalCount !== null && statuses.length < totalCount) {
+					return {
+						kind: "failed",
+						failure: {
+							category: "partial_page",
+							message: `status pages exhausted at ${statuses.length}/${totalCount} statuses`,
+							at: this.now(),
+						},
+					};
+				}
+				return { kind: "ok", aggregateState, totalCount, statuses };
+			}
+			if (page >= 1000) {
+				return {
+					kind: "failed",
+					failure: { category: "partial_page", message: "pagination safety guard reached", at: this.now() },
+				};
+			}
+		}
+	}
+
+	/**
 	 * Read review-thread resolution/outdated state via paginated GraphQL.
 	 * The returned map is keyed by BOTH the GraphQL node id and the numeric
 	 * `databaseId` (REST `id` as string) for every comment in the thread, and
@@ -575,7 +813,7 @@ export class GitHubGhAdapter {
 		parsed: ParsedCanonicalPrKey,
 		scope: AccessScope,
 		nodeId: string,
-		options?: { fresh?: boolean },
+		options?: { fresh?: boolean; recordDigest?: boolean },
 	): Promise<FeedbackReadResult> {
 		const key = this.conditionalKey(parsed, scope, "threads");
 		const threads = new Map<string, PrThreadInfo>();
@@ -675,7 +913,7 @@ export class GitHubGhAdapter {
 			after = endCursor;
 		}
 		const body = JSON.stringify([...threads.entries()]);
-		const condition = this.applyConditionalRead(key, body, options?.fresh ?? false);
+		const condition = this.applyConditionalRead(key, body, options?.fresh ?? false, options?.recordDigest ?? true);
 		if (condition === "not_modified") {
 			return { kind: "not_modified" };
 		}

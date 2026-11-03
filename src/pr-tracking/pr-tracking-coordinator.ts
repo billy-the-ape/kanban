@@ -10,21 +10,24 @@
 import { mkdirSync } from "node:fs";
 import * as lockfile from "proper-lockfile";
 
-import type {
-	GitHubPrFeedbackCompleteness,
-	GitHubPrMetadataSnapshot,
-	GitHubPrNormalizedFeedbackEvent,
-	GitHubPrNormalizedSnapshot,
-	GitHubPrTaskBinding,
-	GitHubPrTerminalStopReason,
-	GitHubPrTrackingRecord,
-	RuntimeBoardColumnId,
-	RuntimeBoardData,
-	RuntimePrSnapshotEvent,
+import {
+	AUTO_MERGE_EVIDENCE_SCHEMA_VERSION,
+	type AutoMergeEvidenceEnvelope,
+	type GitHubPrFeedbackCompleteness,
+	type GitHubPrMetadataSnapshot,
+	type GitHubPrNormalizedFeedbackEvent,
+	type GitHubPrNormalizedSnapshot,
+	type GitHubPrTaskBinding,
+	type GitHubPrTerminalStopReason,
+	type GitHubPrTrackingRecord,
+	type RuntimeBoardColumnId,
+	type RuntimeBoardData,
+	type RuntimePrSnapshotEvent,
 } from "../core/api-contract";
 import { getPullRequestIdentityKey } from "../core/pull-request-links";
 import type { LockRequest } from "../fs/locked-file-system";
 import { listWorkspaceIndexEntries, loadWorkspaceBoardById } from "../state/workspace-state";
+import { collectAutoMergeEvidence } from "./auto-merge-evidence";
 import {
 	type AccessScope,
 	createGitHubGhAdapter,
@@ -227,6 +230,8 @@ export class PrTrackingCoordinator {
 	private readonly polls = new Map<string, PrPollState>();
 	private readonly scopes = new Map<string, AccessScope>();
 	private readonly oneShotInFlight = new Map<string, Promise<OneShotMetadataRefreshResult>>();
+	/** AM-2: coalesced in-flight auto-merge evidence reads per (PR, scope, options). */
+	private readonly evidenceInFlight = new Map<string, Promise<AutoMergeEvidenceEnvelope>>();
 	private scopeCache: AccessScope | null = null;
 	private scopeFailure: GhAdapterFailure | null = null;
 	private schedulerLockRelease: (() => Promise<void>) | null = null;
@@ -292,6 +297,9 @@ export class PrTrackingCoordinator {
 			if (state.pollInFlight) {
 				inFlight.push(state.pollInFlight);
 			}
+		}
+		for (const job of this.evidenceInFlight.values()) {
+			inFlight.push(job.then(() => undefined));
 		}
 		await Promise.all(inFlight);
 		if (this.schedulerLockRelease) {
@@ -1697,6 +1705,143 @@ export class PrTrackingCoordinator {
 			this.warn(`One-shot metadata snapshot persistence failed for ${canonicalPrKey}: ${persisted.reason}`);
 		}
 		return { outcome: "refreshed", checkedAt: metadata.checkedAt, metadata, error: null };
+	}
+
+	// --- AM-2: read-only exact-head merge-evidence reads (consumer-requested) ---
+
+	/**
+	 * AM-2: one bounded, READ-ONLY merge-evidence read for a canonical PR.
+	 * Consumer-requested (no new timer, no poll re-arm, no record mutation):
+	 *
+	 * - Resolves the runtime access scope (cached scope is reused; a
+	 *   rotation re-keys and invalidates poll state exactly as for polls).
+	 * - Honors an active rate-limit deadline: report `rate_limited`, never
+	 *   wait and never retry.
+	 * - Coalesces concurrent requests for the same (PR, scope, options)
+	 *   onto one in-flight collection (callers with a different declared
+	 *   head or policy revision get their own collection; the envelope
+	 *   carries its own head SHA, policy revision and checkedAt so
+	 *   callers can verify fit).
+	 * - Bounded through the shared adapter (in-flight cap, timeout,
+	 *   backoff/rate-limit classification); performs no GitHub writes.
+	 * - Read failures route through the same failure classification as
+	 *   polls (auth stops all polls; access stops this (PR, scope);
+	 *   rate limits extend the deadline).
+	 *
+	 * Returns an envelope that is either `complete` or explicitly
+	 * incomplete with stable reason tokens — never a fabricated green.
+	 */
+	async readAutoMergeEvidence(
+		canonicalPrKey: string,
+		accessScopeId: string | undefined,
+		options: { policyRevision: number; declaredHeadSha?: string | null },
+	): Promise<AutoMergeEvidenceEnvelope> {
+		const parsed = parseCanonicalPrKey(canonicalPrKey);
+		if (!parsed) {
+			return this.failureEvidenceEnvelope(accessScopeId, options.policyRevision, ["malformed_key"]);
+		}
+		if (!isTrackingSupportedPr(canonicalPrKey)) {
+			return this.failureEvidenceEnvelope(accessScopeId, options.policyRevision, ["unsupported_host"]);
+		}
+		const scopeResult = await this.ensureScope(accessScopeId);
+		if (!scopeResult.ok) {
+			return this.failureEvidenceEnvelope(accessScopeId, options.policyRevision, [scopeResult.blocker]);
+		}
+		const scope = scopeResult.scope;
+		const key = this.pollKey(canonicalPrKey, scope.accessScopeId);
+		const state = this.getPollState(canonicalPrKey, scope.accessScopeId);
+		// Honor an active rate-limit deadline: report, never wait or retry.
+		if (state.rateLimitDeadline !== null && state.rateLimitDeadline > this.now()) {
+			return this.failureEvidenceEnvelope(scope.accessScopeId, options.policyRevision, ["rate_limited"]);
+		}
+		// Coalesce concurrent evidence requests for the same (PR, scope,
+		// options): a caller with a different declared head or policy
+		// revision must never receive another caller's envelope, or the
+		// exact-head guarantee and the echoed policy revision break.
+		const flightKey = `${key}|${options.policyRevision}|${options.declaredHeadSha ?? ""}`;
+		const inflight = this.evidenceInFlight.get(flightKey);
+		if (inflight) {
+			return await inflight;
+		}
+		const job = this.performEvidenceRead(parsed, scope, state, options);
+		this.evidenceInFlight.set(flightKey, job);
+		try {
+			return await job;
+		} finally {
+			this.evidenceInFlight.delete(flightKey);
+		}
+	}
+
+	/** Run one evidence collection and classify its failures like a poll. */
+	private async performEvidenceRead(
+		parsed: ParsedCanonicalPrKey,
+		scope: AccessScope,
+		state: PrPollState,
+		options: { policyRevision: number; declaredHeadSha?: string | null },
+	): Promise<AutoMergeEvidenceEnvelope> {
+		let evidence: AutoMergeEvidenceEnvelope;
+		let failures: GhAdapterFailure[] = [];
+		try {
+			const result = await collectAutoMergeEvidence(this.adapter, parsed, scope, {
+				policyRevision: options.policyRevision,
+				declaredHeadSha: options.declaredHeadSha ?? null,
+				now: this.now,
+			});
+			evidence = result.envelope;
+			failures = result.failures;
+		} catch (error) {
+			evidence = this.failureEvidenceEnvelope(scope.accessScopeId, options.policyRevision, [
+				`internal_error: ${String(error)}`,
+			]);
+		}
+		// Route the ORIGINAL adapter failures through the shared classification
+		// (auth stops all polls; access stops this poll; rate limits extend
+		// the deadline with the real reset time) so evidence reads and polls
+		// stay consistent. Reconstructing failures from reason tokens would
+		// drop `rateLimitResetAt` and fall back to the 15-minute guess.
+		for (const failure of failures) {
+			this.handleFailure(state, failure);
+		}
+		return evidence;
+	}
+
+	/** Incomplete envelope for pre-read blockers (never a fabricated green). */
+	private failureEvidenceEnvelope(
+		accessScopeId: string | undefined,
+		policyRevision: number,
+		reasons: string[],
+	): AutoMergeEvidenceEnvelope {
+		return {
+			schemaVersion: AUTO_MERGE_EVIDENCE_SCHEMA_VERSION,
+			accessScopeId: accessScopeId ?? "unresolved",
+			checkedAt: this.now(),
+			policyRevision,
+			headSha: null,
+			baseSha: null,
+			baseRepository: null,
+			baseRef: null,
+			headRepository: null,
+			headRef: null,
+			prState: "unknown",
+			draft: false,
+			mergeable: null,
+			mergeableState: null,
+			authorLogin: null,
+			autoMergePresent: null,
+			sources: {
+				prMetadata: false,
+				reviews: false,
+				checkRuns: false,
+				commitStatuses: false,
+				reviewThreads: false,
+			},
+			unresolvedActiveThreads: null,
+			complete: false,
+			reasons,
+			reviews: [],
+			checks: [],
+			statuses: [],
+		};
 	}
 
 	/**
