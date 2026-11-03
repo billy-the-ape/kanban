@@ -1788,13 +1788,12 @@ export class PrTrackingCoordinator {
 		}
 		// Route adapter failure categories through the shared classification
 		// (auth stops all polls; access stops this poll; rate limits extend
-		// the deadline) so evidence reads and polls stay consistent.
-		const seenCategories = new Set<string>();
+		// the deadline) so evidence reads and polls stay consistent. Reasons
+		// are already de-duplicated, so each category is handled once.
 		for (const reason of evidence.reasons) {
-			if (!isGhAdapterFailureCategory(reason) || seenCategories.has(reason)) {
+			if (!isGhAdapterFailureCategory(reason)) {
 				continue;
 			}
-			seenCategories.add(reason);
 			this.handleFailure(state, {
 				category: reason,
 				message: `auto-merge evidence read failed (${reason})`,

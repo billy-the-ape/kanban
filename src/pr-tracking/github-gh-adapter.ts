@@ -597,11 +597,19 @@ export class GitHubGhAdapter {
 	 * Read one paginated REST list source completely, returning the RAW
 	 * provider items (no feedback normalization, no conditional-read
 	 * retention). Evidence reads must always see the full current body —
-	 * a mid-list failure or an unreconstructable 304 is a partial-page
-	 * failure, never a silent truncation.
+	 * a mid-list failure, an unreconstructable 304, or an unexpected
+	 * response shape is a partial-page failure, never a silent truncation.
+	 *
+	 * `itemKey` unwraps object-wrapped list endpoints such as
+	 * `GET /repos/{repo}/commits/{sha}/check-runs` (body:
+	 * `{ total_count, check_runs: [...] }`, NOT a bare array). When the
+	 * unwrapped list has a known `total_count`, pagination completes only
+	 * once that count is reached; a short page below the total is an
+	 * ambiguous (partial) read.
 	 */
-	async readRawRestList(endpointBase: string): Promise<RawRestListResult> {
+	async readRawRestList(endpointBase: string, itemKey?: string): Promise<RawRestListResult> {
 		const all: unknown[] = [];
+		let totalCount: number | null = null;
 		for (let page = 1; ; page += 1) {
 			const outcome = await this.callRest(`${endpointBase}?per_page=${REST_LIST_PAGE_SIZE}&page=${page}`);
 			if (outcome.kind === "not_modified") {
@@ -621,10 +629,58 @@ export class GitHubGhAdapter {
 					failure: page === 1 ? outcome.failure : { ...outcome.failure, category: "partial_page" },
 				};
 			}
-			const items = Array.isArray(outcome.data) ? outcome.data : [];
+			// Fail closed on unexpected shapes: never treat a non-array as
+			// an empty list.
+			let items: unknown[];
+			if (itemKey !== undefined) {
+				const container =
+					typeof outcome.data === "object" && outcome.data !== null
+						? (outcome.data as Record<string, unknown>)
+						: null;
+				const wrapped = container?.[itemKey];
+				if (!Array.isArray(wrapped)) {
+					return {
+						kind: "failed",
+						failure: {
+							category: "partial_page",
+							message: `unexpected response shape for "${itemKey}" on page ${page}`,
+							at: this.now(),
+						},
+					};
+				}
+				items = wrapped;
+				const count = container?.total_count;
+				if (typeof count === "number" && Number.isFinite(count) && count >= 0) {
+					totalCount ??= count;
+				}
+			} else if (Array.isArray(outcome.data)) {
+				items = outcome.data;
+			} else {
+				return {
+					kind: "failed",
+					failure: {
+						category: "partial_page",
+						message: `unexpected response shape (expected array) on page ${page}`,
+						at: this.now(),
+					},
+				};
+			}
 			all.push(...items);
-			// Complete pagination: stop only on a short (final) page.
-			if (items.length < REST_LIST_PAGE_SIZE) {
+			const reachedTotal = totalCount !== null && all.length >= totalCount;
+			// Complete pagination: stop on a short (final) page or once the
+			// known total_count is reached.
+			if (reachedTotal || items.length < REST_LIST_PAGE_SIZE) {
+				if (!reachedTotal && totalCount !== null && all.length < totalCount) {
+					// Short page below a known total: ambiguous completeness.
+					return {
+						kind: "failed",
+						failure: {
+							category: "partial_page",
+							message: `only ${all.length} of ${totalCount} items returned`,
+							at: this.now(),
+						},
+					};
+				}
 				break;
 			}
 			if (page >= 1000) {

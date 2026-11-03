@@ -336,21 +336,42 @@ describe("auto-merge-evidence reader", () => {
 			[REVIEWS_ENDPOINT]: (page) =>
 				page === 1 ? { stdout: JSON.stringify(reviewsPage1Items) } : { stdout: JSON.stringify(reviewsPage2Items) },
 			[CHECK_RUNS_ENDPOINT]: () => ({
-				stdout: JSON.stringify([
-					checkRunItem(1, "ci", HEAD, "completed", "success", "2026-01-01T00:00:00Z", "2026-01-01T00:05:00Z", 10),
-					checkRunItem(2, "ci", HEAD, "completed", "failure", "2026-01-02T00:00:00Z", "2026-01-02T00:05:00Z", 11),
-					// Stale head: never evidence for this head.
-					checkRunItem(
-						3,
-						"ci",
-						"old-sha",
-						"completed",
-						"success",
-						"2026-01-01T00:00:00Z",
-						"2026-01-01T00:06:00Z",
-						12,
-					),
-				]),
+				stdout: JSON.stringify({
+					total_count: 3,
+					check_runs: [
+						checkRunItem(
+							1,
+							"ci",
+							HEAD,
+							"completed",
+							"success",
+							"2026-01-01T00:00:00Z",
+							"2026-01-01T00:05:00Z",
+							10,
+						),
+						checkRunItem(
+							2,
+							"ci",
+							HEAD,
+							"completed",
+							"failure",
+							"2026-01-02T00:00:00Z",
+							"2026-01-02T00:05:00Z",
+							11,
+						),
+						// Stale head: never evidence for this head.
+						checkRunItem(
+							3,
+							"ci",
+							"old-sha",
+							"completed",
+							"success",
+							"2026-01-01T00:00:00Z",
+							"2026-01-01T00:06:00Z",
+							12,
+						),
+					],
+				}),
 			}),
 			[STATUSES_ENDPOINT]: () => ({
 				stdout: JSON.stringify({
@@ -424,7 +445,7 @@ describe("auto-merge-evidence reader", () => {
 			[PR_ENDPOINT]: () => ({ stdout: prMetadataBody() }),
 			[REVIEWS_ENDPOINT]: (page) =>
 				page === 1 ? { stdout: JSON.stringify(reviewsPage1) } : { stderr: "HTTP 502: Bad Gateway" },
-			[CHECK_RUNS_ENDPOINT]: () => ({ stdout: "[]" }),
+			[CHECK_RUNS_ENDPOINT]: () => ({ stdout: JSON.stringify({ total_count: 0, check_runs: [] }) }),
 			[STATUSES_ENDPOINT]: () => ({ stdout: JSON.stringify({ state: "success", total_count: 0, statuses: [] }) }),
 		});
 		expect(envelope.complete).toBe(false);
@@ -439,11 +460,74 @@ describe("auto-merge-evidence reader", () => {
 		expect(endpointCalls(calls, REVIEWS_ENDPOINT)).toBe(2);
 	});
 
+	it("fails closed when the check-runs body is not the wrapped list shape", async () => {
+		// GitHub returns { total_count, check_runs: [...] }; a bare array (or
+		// any other body) must fail closed, never read as an empty list.
+		const { envelope } = await collect({
+			[PR_ENDPOINT]: () => ({ stdout: prMetadataBody() }),
+			[REVIEWS_ENDPOINT]: () => ({ stdout: "[]" }),
+			[CHECK_RUNS_ENDPOINT]: () => ({
+				stdout: JSON.stringify([
+					checkRunItem(1, "ci", HEAD, "completed", "failure", "2026-01-01T00:00:00Z", "2026-01-01T00:05:00Z", 10),
+				]),
+			}),
+			[STATUSES_ENDPOINT]: () => ({ stdout: JSON.stringify({ state: "success", total_count: 0, statuses: [] }) }),
+		});
+		expect(envelope.complete).toBe(false);
+		expect(envelope.sources.checkRuns).toBe(false);
+		expect(envelope.checks).toEqual([]);
+		expect(envelope.reasons).toContain("check_runs_incomplete");
+		expect(envelope.reasons).toContain("partial_page");
+	});
+
+	it("reports a short page below total_count as partial, never complete", async () => {
+		const { envelope } = await collect({
+			[PR_ENDPOINT]: () => ({ stdout: prMetadataBody() }),
+			[REVIEWS_ENDPOINT]: () => ({ stdout: "[]" }),
+			[CHECK_RUNS_ENDPOINT]: () => ({
+				stdout: JSON.stringify({
+					total_count: 5,
+					check_runs: [
+						checkRunItem(
+							1,
+							"ci",
+							HEAD,
+							"completed",
+							"failure",
+							"2026-01-01T00:00:00Z",
+							"2026-01-01T00:05:00Z",
+							10,
+						),
+						checkRunItem(2, "lint", HEAD, "in_progress", null, "2026-01-02T00:00:00Z", null, 11),
+					],
+				}),
+			}),
+			[STATUSES_ENDPOINT]: () => ({ stdout: JSON.stringify({ state: "success", total_count: 0, statuses: [] }) }),
+		});
+		expect(envelope.complete).toBe(false);
+		expect(envelope.sources.checkRuns).toBe(false);
+		expect(envelope.reasons).toContain("check_runs_incomplete");
+		expect(envelope.reasons).toContain("partial_page");
+	});
+
+	it("fails closed when a bare-array list endpoint returns an object body", async () => {
+		const { envelope } = await collect({
+			[PR_ENDPOINT]: () => ({ stdout: prMetadataBody() }),
+			[REVIEWS_ENDPOINT]: () => ({ stdout: JSON.stringify({ not: "a list" }) }),
+			[CHECK_RUNS_ENDPOINT]: () => ({ stdout: JSON.stringify({ total_count: 0, check_runs: [] }) }),
+			[STATUSES_ENDPOINT]: () => ({ stdout: JSON.stringify({ state: "success", total_count: 0, statuses: [] }) }),
+		});
+		expect(envelope.complete).toBe(false);
+		expect(envelope.sources.reviews).toBe(false);
+		expect(envelope.reasons).toContain("reviews_incomplete");
+		expect(envelope.reasons).toContain("partial_page");
+	});
+
 	it("discards evidence when the head or base changes during collection", async () => {
 		const { envelope } = await collect({
 			[PR_ENDPOINT]: (_page, callIndex) => ({ stdout: prMetadataBody({}, callIndex === 0 ? HEAD : "def456") }),
 			[REVIEWS_ENDPOINT]: () => ({ stdout: JSON.stringify([reviewItem(1, "APPROVED", "approver", HEAD, null)]) }),
-			[CHECK_RUNS_ENDPOINT]: () => ({ stdout: "[]" }),
+			[CHECK_RUNS_ENDPOINT]: () => ({ stdout: JSON.stringify({ total_count: 0, check_runs: [] }) }),
 			[STATUSES_ENDPOINT]: () => ({ stdout: JSON.stringify({ state: "success", total_count: 0, statuses: [] }) }),
 		});
 		expect(envelope.complete).toBe(false);
@@ -456,7 +540,7 @@ describe("auto-merge-evidence reader", () => {
 			{
 				[PR_ENDPOINT]: () => ({ stdout: prMetadataBody() }),
 				[REVIEWS_ENDPOINT]: () => ({ stdout: "[]" }),
-				[CHECK_RUNS_ENDPOINT]: () => ({ stdout: "[]" }),
+				[CHECK_RUNS_ENDPOINT]: () => ({ stdout: JSON.stringify({ total_count: 0, check_runs: [] }) }),
 				[STATUSES_ENDPOINT]: () => ({ stdout: JSON.stringify({ state: "success", total_count: 0, statuses: [] }) }),
 			},
 			{ declaredHeadSha: "stale-sha" },
@@ -488,7 +572,7 @@ describe("auto-merge-evidence reader", () => {
 		const { envelope } = await collect({
 			[PR_ENDPOINT]: () => ({ stdout: JSON.stringify(body) }),
 			[REVIEWS_ENDPOINT]: () => ({ stdout: "[]" }),
-			[CHECK_RUNS_ENDPOINT]: () => ({ stdout: "[]" }),
+			[CHECK_RUNS_ENDPOINT]: () => ({ stdout: JSON.stringify({ total_count: 0, check_runs: [] }) }),
 			[STATUSES_ENDPOINT]: () => ({ stdout: JSON.stringify({ state: "success", total_count: 0, statuses: [] }) }),
 		});
 		expect(envelope.complete).toBe(false);
@@ -507,7 +591,7 @@ describe("auto-merge-evidence reader", () => {
 		const { envelope } = await collect({
 			[PR_ENDPOINT]: () => ({ stdout: prMetadataBody() }),
 			[REVIEWS_ENDPOINT]: () => ({ stdout: "[]" }),
-			[CHECK_RUNS_ENDPOINT]: () => ({ stdout: "[]" }),
+			[CHECK_RUNS_ENDPOINT]: () => ({ stdout: JSON.stringify({ total_count: 0, check_runs: [] }) }),
 			[STATUSES_ENDPOINT]: () => ({ stdout: JSON.stringify({ state: "success", total_count: 0, statuses: [] }) }),
 		});
 		expect(envelope.complete).toBe(true);

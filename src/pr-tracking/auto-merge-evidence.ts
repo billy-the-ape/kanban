@@ -267,7 +267,6 @@ export async function collectAutoMergeEvidence(
 ): Promise<AutoMergeEvidenceEnvelope> {
 	const now = options.now ?? Date.now;
 	const policyRevision = options.policyRevision;
-	const _at = now();
 	const repo = parsed.repository;
 	const number = parsed.number;
 
@@ -316,7 +315,7 @@ export async function collectAutoMergeEvidence(
 	const nodeId = initial.nodeId;
 	const [reviews, checkRuns, statuses, threads] = (await Promise.all([
 		adapter.readRawRestList(`repos/${repo}/pulls/${number}/reviews`),
-		adapter.readRawRestList(`repos/${repo}/commits/${headSha}/check-runs`),
+		adapter.readRawRestList(`repos/${repo}/commits/${headSha}/check-runs`, "check_runs"),
 		adapter.readCommitStatuses(`repos/${repo}/commits/${headSha}/status`),
 		nodeId
 			? adapter.readReviewThreads(parsed, scope, nodeId, { fresh: true })
@@ -354,8 +353,9 @@ export async function collectAutoMergeEvidence(
 		} else {
 			addReason(envelope.reasons, "head_changed");
 		}
-	} else if (final.kind === "failed") {
-		addReason(envelope.reasons, final.failure.category);
+	} else {
+		// A failed or 304 re-read cannot re-verify identity: never complete.
+		addReason(envelope.reasons, final.kind === "failed" ? final.failure.category : "metadata_unreadable");
 	}
 	envelope.sources.prMetadata = metadataCoherent;
 
