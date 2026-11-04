@@ -45,6 +45,7 @@ import {
 	type RuntimeBoardCard,
 	type RuntimeBoardColumnId,
 } from "../core/api-contract";
+import { isNewerCheckAttempt } from "./auto-merge-evidence";
 import { PR_CONSUMER_READ_SOURCES, type PrConsumerObservation, type PrConsumerRegistry } from "./pr-consumer-registry";
 import { PR_OWNER_ACTIVE_COLUMNS, type PrBoardSnapshot, resolveCardAutomationPrKey } from "./pr-owner-selection";
 import type { PrRecordStorePort } from "./pr-record-store";
@@ -260,12 +261,12 @@ export function classifyRequiredChecks(
 			verdicts.push({ name, outcome: "missing" });
 			continue;
 		}
-		const effective = candidates.sort((a, b) => {
-			if (a.occurredAt !== b.occurredAt) {
-				return b.occurredAt - a.occurredAt;
-			}
-			return b.runId.localeCompare(a.runId);
-		})[0];
+		// Effective attempt: the AM-2 isNewerCheckAttempt ordering (latest
+		// occurredAt, then numeric run id), so this tie-break agrees exactly
+		// with the evidence collector's own selection.
+		const effective = candidates.reduce((best, candidate) =>
+			isNewerCheckAttempt(candidate, best) ? candidate : best,
+		);
 		verdicts.push({ name, outcome: classifyCheckAttempt(effective) });
 	}
 	return verdicts;

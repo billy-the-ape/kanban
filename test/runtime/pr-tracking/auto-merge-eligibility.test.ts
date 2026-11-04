@@ -444,6 +444,34 @@ describe("AM-3 pure eligibility evaluation", () => {
 			});
 			expect(classifyRequiredChecks(POLICY, envelope)).toEqual([{ name: "ci", outcome: "success" }]);
 		});
+		it("ties identical occurredAt by numeric run id (same rule as the AM-2 collector)", () => {
+			const envelope = makeEnvelope({
+				checks: [
+					{
+						kind: "check_run",
+						name: "ci",
+						sourceId: null,
+						status: "completed",
+						conclusion: "failure",
+						sha: HEAD,
+						runId: "99",
+						occurredAt: NOW - 5_000,
+					},
+					{
+						kind: "check_run",
+						name: "ci",
+						sourceId: null,
+						status: "completed",
+						conclusion: "success",
+						sha: HEAD,
+						runId: "100",
+						occurredAt: NOW - 5_000,
+					},
+				],
+			});
+			// Lexicographic ordering would pick run "99"; numeric picks "100".
+			expect(classifyRequiredChecks(POLICY, envelope)).toEqual([{ name: "ci", outcome: "success" }]);
+		});
 
 		it("a newer pending attempt masks an older success", () => {
 			const envelope = makeEnvelope({
