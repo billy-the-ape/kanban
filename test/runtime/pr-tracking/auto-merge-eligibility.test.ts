@@ -428,6 +428,17 @@ describe("AM-3 pure eligibility evaluation", () => {
 			]);
 		});
 
+		it("a CR with an unknown timestamp never loses to an approval (fail-closed)", () => {
+			const cr = review({ id: "cr-1", state: "CHANGES_REQUESTED", submittedAt: null });
+			const approval = review({ id: "ap-1", submittedAt: NOW - 1_000 });
+			// The ordering between the two decisions is unverifiable: the CR
+			// keeps blocking instead of being superseded.
+			expect(classifyAutoMergeReviews([cr, approval], HEAD, "author")).toMatchObject({
+				approvers: [],
+				blockingChangeRequests: ["reviewer-1"],
+			});
+		});
+
 		it("tied decision timestamps are inconsistent (never guessed)", () => {
 			const cr = review({ id: "cr-1", state: "CHANGES_REQUESTED", submittedAt: NOW - 1_000 });
 			const approval = review({ id: "ap-1", submittedAt: NOW - 1_000 });
@@ -843,6 +854,26 @@ describe("AM-3 pure eligibility evaluation", () => {
 			expect(harness.handoffs).toEqual([]);
 			const loaded = await store.loadRecord(PR_KEY);
 			expect(loaded.ok).toBe(true);
+			expect(loaded.ok ? loaded.record.taskBindings[0]?.autoMerge?.kind : null).toBe("blocked");
+			expect(loaded.ok ? loaded.record.taskBindings[0]?.autoMerge?.codes : []).toContain("ambiguous_claim");
+		});
+		it("counts same-id claimants in other workspaces (task ids are per-board only)", async () => {
+			// A card with the same short id in another workspace must not be
+			// mistaken for the caller's own task: it still claims the PR.
+			const boards = [
+				makeBoard(TASK.workspaceId, [{ columnId: "review", card: makeCard() }]),
+				makeBoard("ws-2", [{ columnId: "review", card: makeCard({ id: TASK.taskId }) }]),
+			];
+			const harness = makeReconcileHarness({ boards });
+			const store = new InMemoryPrRecordStore({ now: () => NOW });
+			await store.createRecord(RECORD_IDENTITY);
+			await store.upsertTaskBinding(PR_KEY, TASK);
+			harness.deps.store = store;
+
+			await reconcileAutoMergeEligibility(harness.observation, harness.deps);
+
+			expect(harness.handoffs).toEqual([]);
+			const loaded = await store.loadRecord(PR_KEY);
 			expect(loaded.ok ? loaded.record.taskBindings[0]?.autoMerge?.kind : null).toBe("blocked");
 			expect(loaded.ok ? loaded.record.taskBindings[0]?.autoMerge?.codes : []).toContain("ambiguous_claim");
 		});

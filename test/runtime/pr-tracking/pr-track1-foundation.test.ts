@@ -436,6 +436,7 @@ describe("pr-track1 task-derived subscription demand", () => {
 			consumers: { comments: true, mergeCompletion: true, autoMerge: false },
 		});
 	});
+
 	it("demands the autoMerge consumer for an armed opt-in card and ignores un-armed opt-ins (AM-3)", () => {
 		const armed = makeCard({
 			id: "t-armed",
@@ -453,9 +454,10 @@ describe("pr-track1 task-derived subscription demand", () => {
 
 		// An un-armed opt-in still yields no demand (the evaluator would
 		// fail closed with not_armed, and demand must not poll for it).
-		const uninstalled = { comments: false, mergeCompletion: false, autoMerge: true };
-		expect(computeTaskSubscriptionDemand(boards, uninstalled)).toHaveLength(1);
-		const demand = computeTaskSubscriptionDemand(boards, uninstalled)[0];
+		const autoMergeOnly = { comments: false, mergeCompletion: false, autoMerge: true };
+		const demands = computeTaskSubscriptionDemand(boards, autoMergeOnly);
+		expect(demands).toHaveLength(1);
+		const demand = demands[0];
 		expect(demand).toMatchObject({
 			taskId: "t-armed",
 			consumers: { comments: false, mergeCompletion: false, autoMerge: true },

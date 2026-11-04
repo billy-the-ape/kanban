@@ -91,9 +91,10 @@ export interface AutoMergeEligibilityInput {
 }
 
 /**
- * Blocker codes with their priority order. `blocked` codes precede
- * `waiting` codes; within each group the order below is fixed and
- * deterministic (used for tests and the persisted summary).
+ * Blocker codes that classify an evaluation as `blocked` (structural,
+ * permission, or configuration problems); any other code only makes it
+ * `waiting`. Membership only: blockers are emitted in evaluation phase
+ * order, not in this array's order.
  */
 export const AUTO_MERGE_BLOCKED_CODES = [
 	"disabled",
@@ -199,7 +200,10 @@ export function classifyAutoMergeReviews(
 			verdict.inconsistent.push(reviewer);
 			continue;
 		}
-		if (latestApproval && (!latestCR || (latestCR.submittedAt ?? -1) < (latestApproval.submittedAt ?? -1))) {
+		if (
+			latestApproval &&
+			(!latestCR || (latestCR.submittedAt !== null && latestCR.submittedAt < (latestApproval.submittedAt ?? -1)))
+		) {
 			verdict.approvers.push(reviewer);
 			continue;
 		}
@@ -276,8 +280,9 @@ export function classifyRequiredChecks(
 
 /**
  * Evaluate auto-merge eligibility for one task against one evidence envelope.
- * Pure: no I/O, deterministic, fail-closed. Blocker order is fixed (blocked
- * codes first, then waiting codes, each in the order documented above).
+ * Pure: no I/O, deterministic, fail-closed. Blockers are emitted in a fixed
+ * phase order (task/policy, evidence identity, PR state, freshness, checks,
+ * reviews, competing operations); blocked vs waiting is decided afterwards.
  */
 export function evaluateAutoMergeEligibility(input: AutoMergeEligibilityInput): AutoMergeEligibilityResult {
 	const { task, policy, envelope, record, now } = input;
@@ -538,13 +543,15 @@ async function countOtherEligibleClaimants(
 ): Promise<number> {
 	const boards = await listBoards();
 	let count = 0;
-	for (const { board } of boards) {
+	for (const { workspaceId, board } of boards) {
 		for (const column of board.columns) {
 			if (!PR_OWNER_ACTIVE_COLUMNS.has(column.id)) {
 				continue;
 			}
 			for (const card of column.cards) {
-				if (card.id === task.taskId) {
+				// Task ids are unique per board only: skip the caller's own task
+				// by (workspace, task) pair, not by task id alone.
+				if (workspaceId === task.workspaceId && card.id === task.taskId) {
 					continue;
 				}
 				if (card.autoMergeWhenApproved !== true || card.armedAutoMergePolicyRevision === undefined) {

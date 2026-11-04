@@ -3449,7 +3449,7 @@ export type AutoMergeEligibilityBlocker = z.infer<typeof autoMergeEligibilityBlo
 export const autoMergeEligibilityResultSchema = z.object({
 	schemaVersion: z.literal(AUTO_MERGE_ELIGIBILITY_SCHEMA_VERSION),
 	kind: autoMergeEligibilityKindSchema,
-	/** Blockers in fixed priority order (empty when eligible). */
+	/** Blockers in fixed evaluation-phase order (empty when eligible). */
 	blockers: z.array(autoMergeEligibilityBlockerSchema),
 	evaluatedAt: z.number(),
 	headSha: z.string().nullable(),
@@ -4198,7 +4198,7 @@ export type RuntimePrOperationReleaseRequest = z.infer<typeof runtimePrOperation
 export const runtimePrSubscriptionRequestSchema = z.object({
 	taskId: z.string().min(1),
 	/** Consumer kind owning the durable replay cursor on the task binding. */
-	consumer: z.enum(["comments", "mergeCompletion", "autoMerge"]).default("comments"),
+	consumer: runtimePrConsumerKindSchema.default("comments"),
 	/**
 	 * Durable replay cursor (per consumer kind, persisted on the task
 	 * binding). Events with seq > fromCursor are returned; the cursor
