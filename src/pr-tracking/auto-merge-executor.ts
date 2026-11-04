@@ -29,9 +29,11 @@
 //      to Done.
 //   7. Persist the durable outcome BEFORE releasing the reservation in
 //      `finally`: precondition drift → `waiting` (ordinary polling resumes),
-//      permission/policy/configuration failure → `needs_attention` (terminal,
-//      operator action), ambiguous outcome → journal stays `attempting`
-//      (unknown outcomes stay blocked until an explicit recovery action).
+//      merge-write permission/policy/configuration failure → journaled
+//      terminal `needs_attention` (operator action), ambiguous outcome →
+//      journal stays `attempting` (unknown outcomes stay blocked until an
+//      explicit recovery action). Eligibility-code `needs_attention` is
+//      outcome-only (no journal entry).
 //
 // Restart safety: durable `attempting` records are reconciled at startup by
 // READING GitHub first — never by repeating the write. A merge GitHub
@@ -144,10 +146,10 @@ export interface AutoMergeExecutor {
 
 /**
  * Eligibility blocker codes that are permission/policy/configuration
- * problems: they persist as terminal `needs_attention` (operator action
- * required). Every other non-eligible re-evaluation is precondition drift
- * and returns to ordinary waiting (the AM-3 consumer resumes its own
- * evaluation and re-arms the handoff when eligible).
+ * problems: they surface as a `needs_attention` outcome (not journaled;
+ * operator action required). Every other non-eligible re-evaluation is
+ * precondition drift and returns to ordinary waiting (the AM-3 consumer
+ * resumes its own evaluation and re-arms the handoff when eligible).
  */
 const NEEDS_ATTENTION_ELIGIBILITY_CODES = new Set<string>([
 	"no_policy",
@@ -190,7 +192,7 @@ function classifyWriteOutcome(write: MergeWriteOutcome): { state: "waiting" | "n
 		return { state: "needs_attention", reason: `merge_call_failed:${write.failure.category}` };
 	}
 	// Timeout / network / rate-limit: transient — ordinary re-evaluation
-	// resumes (and re-reads the remote first via the journal gate).
+	// resumes (the confirm read already checked the remote).
 	return { state: "waiting", reason: `merge_call_failed:${write.failure.category}` };
 }
 
@@ -211,17 +213,22 @@ export function createAutoMergeExecutor(deps: AutoMergeExecutorDeps): AutoMergeE
 	function enqueuePrJob<T>(prKey: string, fn: () => Promise<T>): Promise<T> {
 		const prev = inFlight.get(prKey);
 		const job: Promise<T> = (async () => {
+			// A failed predecessor must not cascade: this job starts on its
+			// own (its own fence attempt, its own outcome).
 			if (prev !== undefined) {
-				await prev;
+				await prev.catch(() => undefined);
 			}
 			return await fn();
 		})();
 		inFlight.set(prKey, job);
-		void job.finally(() => {
+		// Cleanup must run on EITHER settlement; `then(onFulfilled, onRejected)`
+		// keeps the derived promise from rejecting unhandled.
+		const cleanup = (): void => {
 			if (inFlight.get(prKey) === job) {
 				inFlight.delete(prKey);
 			}
-		});
+		};
+		void job.then(cleanup, cleanup);
 		return job;
 	}
 
@@ -596,11 +603,13 @@ export function createAutoMergeExecutor(deps: AutoMergeExecutorDeps): AutoMergeE
 			// for this PR has finished (and released its fence).
 			const result = enqueuePrJob(handoff.canonicalPrKey, () => runExecution(handoff));
 			executing.set(handoff.canonicalPrKey, result);
-			void result.finally(() => {
+			// Cleanup on EITHER settlement; never an unhandled rejection.
+			const cleanupExecuting = (): void => {
 				if (executing.get(handoff.canonicalPrKey) === result) {
 					executing.delete(handoff.canonicalPrKey);
 				}
-			});
+			};
+			void result.then(cleanupExecuting, cleanupExecuting);
 			return result;
 		},
 		async reconcilePending() {
@@ -616,10 +625,16 @@ export function createAutoMergeExecutor(deps: AutoMergeExecutorDeps): AutoMergeE
 					// execute: a live execution for this PR finishes (fence
 					// released) before this reconciliation runs, and any
 					// execution arriving during the reconcile queues behind
-					// it.
-					await enqueuePrJob(record.canonicalPrKey, () =>
-						reconcileOne(record.canonicalPrKey, task, attempt.attemptId),
-					);
+					// it. One PR's failure must not abort the rest.
+					try {
+						await enqueuePrJob(record.canonicalPrKey, () =>
+							reconcileOne(record.canonicalPrKey, task, attempt.attemptId),
+						);
+					} catch (error) {
+						deps.warn?.(
+							`Auto-merge startup reconciliation failed for ${record.canonicalPrKey}: ${String(error)}`,
+						);
+					}
 				}
 			}
 		},

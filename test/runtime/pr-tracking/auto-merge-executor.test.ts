@@ -905,6 +905,119 @@ describe("AM-4 auto-merge executor: startup reconciliation serializes with live 
 		}
 	});
 });
+describe("AM-4 auto-merge executor: rejection resilience (no unhandled rejections, no cascade)", () => {
+	it("a rejected execution settles cleanly and a later handoff re-executes fresh", async () => {
+		const store = await makeStore();
+		let first = true;
+		const harness = makeHarness({
+			card: () => {
+				if (first) {
+					first = false;
+					throw new Error("board read exploded");
+				}
+				return { card: makeCard(), columnId: "review" };
+			},
+		});
+		const executor = makeExecutor(store, harness);
+		// The in-flight execution rejects (store/board calls have no
+		// catch-all). The derived cleanup promises must not reject
+		// unhandled, and the coalescing map must clear.
+		const firstRun = executor.execute(makeHandoff());
+		await expect(firstRun).rejects.toThrow("board read exploded");
+		// A later handoff runs a FRESH execution (not the stale rejected
+		// promise) and succeeds.
+		const result = await executor.execute(makeHandoff());
+		expect(result).toEqual({ action: "merged_confirmed", mergeCommitSha: MERGE_COMMIT });
+		expect(harness.mergeWrites.length).toBe(1);
+		const loaded = await store.loadRecord(PR_KEY);
+		expect(loaded.ok).toBe(true);
+		if (loaded.ok) {
+			expect(loaded.record.reservation.state).toBe("none");
+		}
+	});
+
+	it("a failed reconciliation does not cascade into a queued execution or abort the loop", async () => {
+		const store = await makeStore();
+		// PR 1: a durable `attempting` journal whose record read throws
+		// (simulated lock timeout) — reconcileOne rejects.
+		const attemptId = computeAutoMergeAttemptId(PR_KEY, HEAD, BASE, 1);
+		await store.setAutoMergeAttempt(PR_KEY, TASK, {
+			schemaVersion: AUTO_MERGE_ATTEMPT_SCHEMA_VERSION,
+			attemptId,
+			canonicalPrKey: PR_KEY,
+			headSha: HEAD,
+			baseSha: BASE,
+			policyRevision: 1,
+			mergeMethod: "squash",
+			startedAt: NOW - 5_000,
+			state: "attempting",
+			reason: null,
+			mergeCommitSha: null,
+			finishedAt: null,
+		});
+		// PR 2: a plain `attempting` journal that must still be reconciled
+		// even though PR 1's reconciliation rejects.
+		const OTHER_PR_KEY = "github|github.com|cline/kanban|50";
+		await store.createRecord({
+			canonicalPrKey: OTHER_PR_KEY,
+			provider: "github",
+			host: "github.com",
+			repository: "cline/kanban",
+			number: 50,
+		});
+		await store.setMetadataSnapshot(OTHER_PR_KEY, makeMetadata("open"));
+		await store.upsertTaskBinding(OTHER_PR_KEY, TASK);
+		await store.setAutoMergeAttempt(OTHER_PR_KEY, TASK, {
+			schemaVersion: AUTO_MERGE_ATTEMPT_SCHEMA_VERSION,
+			attemptId: computeAutoMergeAttemptId(OTHER_PR_KEY, HEAD, BASE, 1),
+			canonicalPrKey: OTHER_PR_KEY,
+			headSha: HEAD,
+			baseSha: BASE,
+			policyRevision: 1,
+			mergeMethod: "squash",
+			startedAt: NOW - 5_000,
+			state: "attempting",
+			reason: null,
+			mergeCommitSha: null,
+			finishedAt: null,
+		});
+		// Only the FIRST record read of PR 1 throws (reconcile's read); the
+		// queued execution's later reads succeed.
+		let threw = false;
+		const originalLoadRecord = store.loadRecord.bind(store);
+		store.loadRecord = (canonicalPrKey: string) => {
+			if (canonicalPrKey === PR_KEY && !threw) {
+				threw = true;
+				return Promise.reject(new Error("lock timeout"));
+			}
+			return originalLoadRecord(canonicalPrKey);
+		};
+		const harness = makeHarness();
+		const executor = makeExecutor(store, harness);
+		const reconcile = executor.reconcilePending();
+		// Let reconcilePending enqueue PR 1's job before the handoff, so the
+		// handoff's execution queues BEHIND the failing reconciliation.
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		const execution = executor.execute(makeHandoff());
+		// The loop caught PR 1's failure and kept going.
+		await expect(reconcile).resolves.toBeUndefined();
+		expect(harness.warnings.some((message) => message.includes("lock timeout"))).toBe(true);
+		// PR 2's journal was still reconciled (the loop did not abort).
+		const other = await store.loadRecord(OTHER_PR_KEY);
+		expect(other.ok).toBe(true);
+		if (other.ok) {
+			const otherBinding = other.record.taskBindings.find(
+				(item) => item.workspaceId === TASK.workspaceId && item.taskId === TASK.taskId,
+			);
+			expect(otherBinding?.autoMergeAttempt?.state).toBe("waiting");
+		}
+		// The queued execution did NOT inherit the reconciliation failure:
+		// it ran a fresh, fully re-validated attempt.
+		const result = await execution;
+		expect(result).toEqual({ action: "merged_confirmed", mergeCommitSha: MERGE_COMMIT });
+		expect(harness.mergeWrites.length).toBe(1);
+	});
+});
 
 describe("AM-4 auto-merge executor: the task move belongs to the merge-completion consumer", () => {
 	it("leaves the card in review after a confirmed merge; the merge-completion consumer moves it to Done", async () => {
