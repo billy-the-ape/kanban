@@ -598,7 +598,7 @@ export function createAutoMergeExecutor(deps: AutoMergeExecutorDeps): AutoMergeE
 			}
 			// Conditional write: apply only if the journal is still the
 			// entry reconciled above — never clobber a newer journal entry.
-			// A "invalid" result means the entry was replaced after the
+			// An "invalid" result means the entry was replaced after the
 			// re-read (expected): nothing was written.
 			const write = await deps.store.updateTaskBinding(prKey, task, undefined, (item) => {
 				if (
