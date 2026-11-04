@@ -531,7 +531,12 @@ export interface AutoMergeConsumerDeps {
  * auto-merge (active column + live opt-in + armed + resolvable to this PR).
  * The caller's own task is excluded.
  */
-async function countOtherEligibleClaimants(
+/**
+ * Count the OTHER auto-merge-eligible claimants of this PR across all managed
+ * boards (the ambiguity gate's input). AM-4's executor re-runs this under its
+ * reservation as part of the full eligibility re-validation.
+ */
+export async function countOtherEligibleClaimants(
 	canonicalPrKey: string,
 	task: { workspaceId: string; taskId: string },
 	listBoards: () => Promise<PrBoardSnapshot[]>,

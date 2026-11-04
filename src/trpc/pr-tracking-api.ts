@@ -874,6 +874,17 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		if (!context.ok) {
 			return { ok: false, status: "blocked", reservation: toReservationView(null), error: context.reason };
 		}
+		// AM-4: the fenced merge write is exclusive to the server-side
+		// auto-merge executor; the browser can neither reserve nor trigger an
+		// auto merge.
+		if (input.operation === "auto_merge") {
+			return {
+				ok: false,
+				status: "blocked",
+				reservation: toReservationView(context.record),
+				error: "Auto-merge is reserved exclusively by the server-side auto-merge executor.",
+			};
+		}
 		const result = await reservePrOperation(
 			deps.getPrTrackingStore(),
 			context.prKey,

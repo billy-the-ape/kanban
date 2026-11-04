@@ -34,8 +34,10 @@ import {
 } from "../core/runtime-endpoint";
 import { completeTaskAndGetReadyLinkedTaskIds } from "../core/task-board-mutations";
 import { registerAutoMergeConsumer } from "../pr-tracking/auto-merge-eligibility";
+import { createAutoMergeExecutor } from "../pr-tracking/auto-merge-executor";
 import { AutoMergePolicyStore } from "../pr-tracking/auto-merge-policy-store";
 import { createPrCommentAutomationService } from "../pr-tracking/comment-automation-service";
+import { createGitHubGhAdapter } from "../pr-tracking/github-gh-adapter";
 import { createGitHubPrClient, resolveGitHubAccessScopeId } from "../pr-tracking/github-pr-client";
 import { PrConsumerRegistry } from "../pr-tracking/pr-consumer-registry";
 import { defaultInspectWorktree, registerMergeCompletionConsumer } from "../pr-tracking/pr-merge-completion";
@@ -315,6 +317,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		store: PrRecordStore;
 		registry: PrConsumerRegistry;
 		autoMergePolicyStore: AutoMergePolicyStore;
+		autoMergeExecutor: ReturnType<typeof createAutoMergeExecutor>;
 	} | null = null;
 	/**
 	 * PRTRACK-1: every reconcile trigger (startup, board save, PR-link
@@ -424,6 +427,33 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			// AM-1: the durable per-repository auto-merge policy store lives in
 			// the runtime home; one instance per runtime server.
 			const autoMergePolicyStore = new AutoMergePolicyStore();
+			// AM-4: ONE shared non-interactive gh adapter for the coordinator
+			// (reads) and the auto-merge executor (the single merge writer),
+			// so the in-flight cap, rate-limit state, and body digests are
+			// shared. The executor is the only path that writes a merge.
+			const ghAdapter = createGitHubGhAdapter();
+			const autoMergeExecutor = createAutoMergeExecutor({
+				store,
+				getCoordinator: () => (prTrackingState ? prTrackingState.coordinator : null),
+				getTaskCard: async (workspaceId, taskId) => {
+					const board = await loadWorkspaceBoardById(workspaceId).catch(() => null);
+					if (!board) {
+						return null;
+					}
+					for (const column of board.columns) {
+						const card = column.cards.find((item) => item.id === taskId);
+						if (card) {
+							return { card, columnId: column.id };
+						}
+					}
+					return null;
+				},
+				listBoards: listManagedWorkspaceBoards,
+				loadPolicy: (repository) => autoMergePolicyStore.loadPolicy(repository),
+				isTaskWriterActive: probeTaskWriterActive,
+				adapter: ghAdapter,
+				warn: (message) => deps.warn(`[pr-tracking] ${message}`),
+			});
 			// MERGE-1: register the merge completion consumer on the
 			// installed-consumer registry BEFORE the coordinator is created,
 			// so every read the coordinator performs already delivers
@@ -544,12 +574,16 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				listBoards: listManagedWorkspaceBoards,
 				loadPolicy: (repository) => autoMergePolicyStore.loadPolicy(repository),
 				isTaskWriterActive: probeTaskWriterActive,
-				// AM-3: eligibility is evaluated but no merge happens yet.
-				// AM-4 binds the real merge operation to this handoff.
+				// AM-4: hand off to the fenced merge executor — the only code
+				// path allowed to write a GitHub PR merge.
 				onEligible: (handoff) => {
-					deps.warn(
-						`[pr-tracking] Auto-merge eligibility reached for ${handoff.taskId} (PR ${handoff.canonicalPrKey}); AM-4 will perform the merge.`,
-					);
+					void autoMergeExecutor.execute(handoff).catch((error) => {
+						deps.warn(
+							`[pr-tracking] Auto-merge execution failed for ${handoff.taskId} (PR ${handoff.canonicalPrKey}): ${
+								error instanceof Error ? error.message : String(error)
+							}`,
+						);
+					});
 				},
 				warn: (message) => deps.warn(`[pr-tracking] ${message}`),
 			});
@@ -567,10 +601,13 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 						runPrTrackingReconcilePassShared(canonicalPrKey ? { onlyPr: canonicalPrKey } : {}),
 					warn: (message) => deps.warn(`[pr-tracking] ${message}`),
 					logError: (message) => deps.warn(`[pr-tracking] ${message}`),
+					// AM-4: shared gh adapter (see above).
+					adapter: ghAdapter,
 				}),
 				store,
 				registry,
 				autoMergePolicyStore,
+				autoMergeExecutor,
 			};
 		}
 		return prTrackingState;
@@ -1008,6 +1045,16 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 	void runPrTrackingReconcilePassShared().catch((error) => {
 		deps.warn(`[pr-tracking] Startup reconcile failed: ${error instanceof Error ? error.message : String(error)}`);
 	});
+	// AM-4: startup crash recovery — reconcile durable `attempting`
+	// auto-merge attempts by READING GitHub first (never by repeating the
+	// write). Background; a failure warns and retries at the next startup.
+	void getPrTrackingState()
+		.autoMergeExecutor.reconcilePending()
+		.catch((error) => {
+			deps.warn(
+				`[pr-tracking] Auto-merge startup reconciliation failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		});
 	const activeWorkspaceId = deps.workspaceRegistry.getActiveWorkspaceId();
 	const url = activeWorkspaceId
 		? buildKanbanRuntimeUrl(`/${encodeURIComponent(activeWorkspaceId)}`)

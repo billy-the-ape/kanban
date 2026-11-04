@@ -18,7 +18,11 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
-import type { GitHubPrMetadataSnapshot, GitHubPrNormalizedFeedbackEvent } from "../core/api-contract";
+import type {
+	AutoMergePolicyMergeMethod,
+	GitHubPrMetadataSnapshot,
+	GitHubPrNormalizedFeedbackEvent,
+} from "../core/api-contract";
 import { createGitProcessEnv } from "../core/git-process-env";
 import type { ParsedCanonicalPrKey } from "./pr-identity";
 import { normalizePrMetadata, type PrThreadInfo, sha256Digest } from "./pr-snapshots";
@@ -128,6 +132,19 @@ export type RawRestListResult = { kind: "ok"; items: unknown[] } | { kind: "fail
  */
 export type CommitStatusesReadResult =
 	| { kind: "ok"; aggregateState: string | null; totalCount: number | null; statuses: unknown[] }
+	| { kind: "failed"; failure: GhAdapterFailure };
+
+/**
+ * AM-4: one bounded, non-interactive GitHub merge write. `rejected` carries
+ * the GitHub denial status (403/451 permission, 405 conflicts, 409 head
+ * moved, 422 validation) so the executor can classify it; `failed` is an
+ * adapter-level failure (timeout, network, auth, ...). The caller must
+ * confirm the merged state with a fresh read regardless of this outcome —
+ * a write response alone never confirms the merge.
+ */
+export type MergeWriteOutcome =
+	| { kind: "merged"; mergeCommitSha: string | null }
+	| { kind: "rejected"; status: number | null; detail: string }
 	| { kind: "failed"; failure: GhAdapterFailure };
 
 export interface GhRunnerCommandResult {
@@ -479,6 +496,94 @@ export class GitHubGhAdapter {
 				};
 			}
 			return { ok: true, scope: this.buildAccessScope(data.login) };
+		} finally {
+			this.releaseSlot();
+		}
+	}
+
+	/**
+	 * AM-4: one bounded, non-interactive merge write through
+	 * `gh api --method PUT repos/{owner}/{repo}/pulls/{n}/merge` with the
+	 * verified head SHA (`sha`) and the policy merge method. Never
+	 * force-pushes and never bypasses GitHub rules; the write counts against
+	 * the shared in-flight slot cap like every other gh call.
+	 */
+	async mergePullRequest(
+		parsed: ParsedCanonicalPrKey,
+		options: { expectedHeadSha: string; mergeMethod: AutoMergePolicyMergeMethod },
+	): Promise<MergeWriteOutcome> {
+		const at = this.now();
+		await this.acquireSlot();
+		try {
+			const result = await this.runner(
+				[
+					"api",
+					"--hostname",
+					GITHUB_TRACKING_HOST,
+					"--method",
+					"PUT",
+					`repos/${parsed.repository}/pulls/${parsed.number}/merge`,
+					"-f",
+					`sha=${options.expectedHeadSha}`,
+					"-f",
+					`merge_method=${options.mergeMethod}`,
+				],
+				this.cwd,
+			);
+			const detail = sanitizeErrorDetail(result.stderr);
+			if (result.missingBinary) {
+				return { kind: "failed", failure: { category: "auth", message: "gh CLI is not installed (ENOENT)", at } };
+			}
+			if (result.timeout) {
+				return { kind: "failed", failure: { category: "timeout", message: detail || "request timed out", at } };
+			}
+			if (result.bufferBound) {
+				return {
+					kind: "failed",
+					failure: { category: "buffer_bound", message: detail || "output bound exceeded", at },
+				};
+			}
+			if (result.ok) {
+				try {
+					const data = JSON.parse(result.stdout) as { sha?: unknown };
+					return {
+						kind: "merged",
+						mergeCommitSha: typeof data.sha === "string" && data.sha.length > 0 ? data.sha : null,
+					};
+				} catch {
+					return { kind: "failed", failure: { category: "network", message: "unparseable merge response", at } };
+				}
+			}
+			const statusMatch = /HTTP (\d{3})/.exec(result.stderr);
+			const status = statusMatch ? Number(statusMatch[1]) : null;
+			if (status === 401) {
+				return { kind: "failed", failure: { category: "auth", message: detail, at } };
+			}
+			if (status === 404) {
+				return { kind: "failed", failure: { category: "not_found", message: detail, at } };
+			}
+			if (status === 429) {
+				const resetAt = await this.fetchRateLimitReset();
+				return {
+					kind: "failed",
+					failure: {
+						category: "rate_limit",
+						message: detail,
+						at,
+						...(resetAt !== null ? { rateLimitResetAt: resetAt } : {}),
+					},
+				};
+			}
+			// GitHub denials: permission/rulesets (403/451), merge conflicts
+			// (405), head moved (409), validation (422). The executor
+			// classifies these; none of them is a transient retry.
+			if (status === 403 || status === 451 || status === 405 || status === 409 || status === 422) {
+				return { kind: "rejected", status, detail };
+			}
+			return {
+				kind: "failed",
+				failure: { category: "network", message: detail || `gh exited ${result.exitCode}`, at },
+			};
 		} finally {
 			this.releaseSlot();
 		}

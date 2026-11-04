@@ -1,6 +1,6 @@
 # AM-4: Fenced, audited, restart-safe merge executor
 
-**Status:** planned. **One implementation PR into `main`.** Depends on: AM-3. Read [README.md](./README.md).
+**Status:** implemented. **One implementation PR into `main`.** Depends on: AM-3. Read [README.md](./README.md).
 
 ## Deliverable
 
@@ -41,3 +41,27 @@ New `src/pr-tracking/auto-merge-executor.ts`, extensions in `src/pr-tracking/pr-
 ## Deployment
 
 Existing Kanban server-side `gh` auth must have repo contents **write** permission to use the merge endpoint, plus checks/reviews read. Ensure `gh auth status` is valid in the **running Kanban server's environment**. No paid subscription, additional workflow or new secret is required. No direct admin bypass; GitHub branch/ruleset restrictions still apply. Existing settings remain off, so installing AM-4 must not merge any existing PR. Roll back by disabling auto-merge flags and stopping the executor; do not roll back merged Git commits automatically.
+
+## Final state (implemented)
+
+- **New `src/pr-tracking/auto-merge-executor.ts`** — the only code path that writes a GitHub PR merge:
+  - `computeAutoMergeAttemptId`: one durable attempt per immutable evidence identity (canonical PR key, head SHA, base SHA, policy revision).
+  - `createAutoMergeExecutor({ store, getCoordinator, getTaskCard, listBoards, loadPolicy, isTaskWriterActive, adapter, warn, now })` returns `execute(handoff)` and `reconcilePending()`.
+  - `execute`: treats the AM-3 handoff as a candidate; reserves the durable `auto_merge` gate (short CAS, never held during network work); under the fence re-reads the live card, record, policy, other claimants, and writer liveness; requests the consumer coalesced fresh evidence read and re-runs the AM-3 pure evaluation. Any precondition drift → `waiting`; permission/policy/configuration blocker codes (`no_policy`, `policy_mismatch`, `no_required_checks`, `auth`, `access`, `unsupported_host`, `malformed_key`) → terminal `needs_attention`; any head/base/policy-revision shift since the handoff → `waiting` (never written). The `attempting` journal is persisted BEFORE the single `gh api PUT …/merge` write; the merge commit is confirmed ONLY by a fresh remote read (bounded `confirmReadBudget`); the durable outcome is persisted before the reservation is released in `finally`.
+  - Ambiguous outcomes (write response unconfirmed by the remote read, unresolved reconciliation) leave the journal `attempting` — a later execution or startup reconciliation reads GitHub FIRST, never repeats the write.
+  - `reconcilePending` (startup crash recovery): scans all durable `attempting` attempts; merged on GitHub → `merged_confirmed` (with merge commit), still open → demoted to `waiting`, unresolved → stays blocked with a warning. A wedged `auto_merge` reservation is released only after the durable outcome persists.
+  - Duplicate handoffs for the same PR coalesce onto the in-flight execution (single writer per runtime); the durable reservation serializes distinct runtimes on the same storage root.
+- **`src/pr-tracking/github-gh-adapter.ts`**: `mergePullRequest(parsed, { expectedHeadSha, mergeMethod })` — one bounded, non-interactive `gh api --method PUT repos/{owner}/{repo}/pulls/{n}/merge` with `sha` and `merge_method` fields (no force-push, no rules bypass); counts against the shared in-flight slot cap; returns `MergeWriteOutcome` (`merged` / `rejected` with HTTP status + redacted detail / `failed` with classified failure). Error details are redacted (token patterns) and bounded.
+- **`src/pr-tracking/pr-record-store.ts`**: `setAutoMergeAttempt(prKey, task, attempt)` — version-checked CAS write of the AM-3/AM-4 attempt journal onto the task binding (`autoMergeAttemptSchema`, schema version 1: `attemptId`, identity, `state: attempting | merged_confirmed | waiting | needs_attention`, `reason`, `mergeCommitSha`, `startedAt`, `finishedAt`).
+- **`src/core/api-contract.ts`**: `autoMergeAttemptSchema` (+ `AUTO_MERGE_ATTEMPT_SCHEMA_VERSION = 1`) and `githubPrTaskBindingSchema.autoMergeAttempt` (nullable, optional for older records).
+- **`src/pr-tracking/pr-reservations.ts`**: `auto_merge` operation kind documented against `comment_followup` / `merge_completion` (serialization: the executor waits while another reservation is held; merge-completion reserves only after the auto-merge write finishes).
+- **`src/server/runtime-server.ts`**: ONE shared `createGitHubGhAdapter()` is passed to both the coordinator (reads) and `createAutoMergeExecutor` (the single merge writer), sharing the in-flight cap, rate-limit state, and body digests. The AM-3 `onEligible` callback now hands off to `autoMergeExecutor.execute(handoff)` (fire-and-forget with warning on error). At startup, `autoMergeExecutor.reconcilePending()` runs in the background (a failure warns and retries at the next startup).
+- **`src/trpc/pr-tracking-api.ts`**: `reservePrOperation` refuses `auto_merge` from the browser (`blocked`: reserved exclusively by the server-side executor) — no browser-triggerable GitHub merge endpoint exists.
+- **Tests** (`test/runtime/pr-tracking/auto-merge-executor.test.ts`, 32 cases): success path (one fenced write, verified SHA/method, remote confirmation, write-ahead journal, reservation released, task NOT moved by the executor), duplicate-handoff coalescing, idempotence after merge, every precondition-drift class (CI red, approval withdrawn, stale/incomplete evidence, PR closed/draft, head moved, native auto-merge, disarmed, policy revision mismatch, live writer, ambiguous claim, active comment repair, task off board) asserting no merge call, GitHub 409/405/403/451/422 and adapter timeout/auth/network classification, unresolved remote state keeps `attempting`, serialization against a held `merge_completion` reservation, startup crash recovery before/after the write (never re-writes), and the task move happening only through the merge-completion consumer. All fake adapters, temp HOME; no real merges.
+
+## Implementation notes (deviations worth remembering)
+
+- `execute` maps non-eligible re-evaluation with the fixed needs-attention code set to `needs_attention`; every other blocker (drift) is `waiting` because the AM-3 consumer resumes ordinary evaluation and re-arms the handoff when eligible.
+- A crashed `attempting` journal for the SAME evidence identity does not block re-execution: the executor reconciles the remote first and, if GitHub confirms still-open, proceeds to a fresh fully re-validated attempt (preserving the first `startedAt`). A terminal `needs_attention` journal for the same identity stays terminal without an explicit operator action.
+- The confirm/ reconciliation remote reads are bounded (`confirmReadBudget`, default 3) and only ever READ (`refreshPrMetadataOnce`) — the executor never issues a second merge write.
+

@@ -17,6 +17,7 @@ import { readdir, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
+	type AutoMergeAttempt,
 	type GitHubPrTaskBinding,
 	type GitHubPrTerminalStopReason,
 	type GitHubPrTrackingRecord,
@@ -370,6 +371,8 @@ export abstract class PrRecordStoreBase implements PrRecordStorePort {
 							mergeCompletion: null,
 							// AM-3: no eligibility summary yet.
 							autoMerge: null,
+							// AM-4: no attempt journal yet.
+							autoMergeAttempt: null,
 							replayCursors: emptyReplayCursors(),
 						},
 					];
@@ -419,6 +422,23 @@ export abstract class PrRecordStoreBase implements PrRecordStorePort {
 		return await this.updateTaskBinding(canonicalPrKey, binding, undefined, (item) => ({
 			...item,
 			terminalStop,
+		}));
+	}
+
+	/**
+	 * AM-4: persist (or clear) the auto-merge attempt journal on one task
+	 * binding. The journal is the durable write-ahead marker: it must land
+	 * BEFORE the GitHub merge call, and every outcome write must land before
+	 * the reservation release.
+	 */
+	async setAutoMergeAttempt(
+		canonicalPrKey: string,
+		binding: { workspaceId: string; taskId: string },
+		attempt: AutoMergeAttempt | null,
+	): Promise<PrRecordUpdateResult> {
+		return await this.updateTaskBinding(canonicalPrKey, binding, undefined, (item) => ({
+			...item,
+			autoMergeAttempt: attempt,
 		}));
 	}
 }
