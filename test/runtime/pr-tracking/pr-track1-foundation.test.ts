@@ -70,7 +70,11 @@ function makeBoard(
 describe("pr-track1 consumer registry demand rule", () => {
 	it("registers kinds independently and derives read demand per kind", () => {
 		const registry = new PrConsumerRegistry();
-		expect(toInstalledConsumerFlags(registry)).toEqual({ comments: false, mergeCompletion: false });
+		expect(toInstalledConsumerFlags(registry)).toEqual({
+			comments: false,
+			mergeCompletion: false,
+			autoMerge: false,
+		});
 		expect(registry.requiredReadSources().size).toBe(0);
 
 		registry.registerConsumer("mergeCompletion");
@@ -98,8 +102,8 @@ describe("pr-track1 consumer registry demand rule", () => {
 });
 
 describe("pr-track1 lifecycle gate", () => {
-	const installedBoth = { comments: true, mergeCompletion: true };
-	const installedNone = { comments: false, mergeCompletion: false };
+	const installedBoth = { comments: true, mergeCompletion: true, autoMerge: true };
+	const installedNone = { comments: false, mergeCompletion: false, autoMerge: false };
 
 	it("gates legacy completion only when an installed enabled consumer owns the workflow", () => {
 		const card = makeCard({ autoAddressComments: true, autoFinishOnMerge: true, pullRequests: [LINK] });
@@ -118,7 +122,7 @@ describe("pr-track1 lifecycle gate", () => {
 		expect(
 			evaluatePrLifecycleGate({
 				card: makeCard({ autoAddressComments: true, pullRequests: [LINK] }),
-				installed: { comments: false, mergeCompletion: true },
+				installed: { comments: false, mergeCompletion: true, autoMerge: false },
 			}),
 		).toEqual({ legacyCompletionGated: false, mergeFinishesInReview: false });
 	});
@@ -134,7 +138,7 @@ describe("pr-track1 lifecycle gate", () => {
 });
 
 describe("pr-track1 task-derived subscription demand", () => {
-	const bothInstalled = { comments: true, mergeCompletion: true };
+	const bothInstalled = { comments: true, mergeCompletion: true, autoMerge: true };
 
 	it("demands only for active cards with a resolvable PR and an installed enabled checkbox", () => {
 		const active = makeCard({ id: "t-active", autoAddressComments: true, pullRequests: [LINK] });
@@ -163,15 +167,19 @@ describe("pr-track1 task-derived subscription demand", () => {
 			workspaceId: "ws-1",
 			taskId: "t-active",
 			canonicalPrKey: PR_KEY,
-			consumers: { comments: true, mergeCompletion: false },
+			consumers: { comments: true, mergeCompletion: false, autoMerge: false },
 		});
 	});
 
 	it("creates no demand for an enabled checkbox whose consumer is not installed", () => {
 		const card = makeCard({ id: "t-uninstalled", autoFinishOnMerge: true, pullRequests: [LINK] });
 		const boards = [makeBoard("ws-1", [{ columnId: "review", card }])];
-		expect(computeTaskSubscriptionDemand(boards, { comments: false, mergeCompletion: false })).toEqual([]);
-		expect(computeTaskSubscriptionDemand(boards, { comments: true, mergeCompletion: false })).toEqual([]);
+		expect(
+			computeTaskSubscriptionDemand(boards, { comments: false, mergeCompletion: false, autoMerge: false }),
+		).toEqual([]);
+		expect(
+			computeTaskSubscriptionDemand(boards, { comments: true, mergeCompletion: false, autoMerge: false }),
+		).toEqual([]);
 	});
 
 	it("scopes comment demand to natively servable (Cline) tasks", () => {
@@ -202,7 +210,7 @@ describe("pr-track1 task-derived subscription demand", () => {
 		expect(demands[0]).toMatchObject({
 			workspaceId: "ws-cline",
 			taskId: "t-cline",
-			consumers: { comments: true, mergeCompletion: false },
+			consumers: { comments: true, mergeCompletion: false, autoMerge: false },
 		});
 
 		// An explicit per-card Cline counts even in a non-Cline workspace.
@@ -235,7 +243,7 @@ describe("pr-track1 task-derived subscription demand", () => {
 			taskId: string;
 			canonicalPrKey: string;
 			column: string;
-			consumers: { comments: boolean; mergeCompletion: boolean };
+			consumers: { comments: boolean; mergeCompletion: boolean; autoMerge: boolean };
 		}> = [];
 		const controller: PrSubscriptionController = {
 			async addSubscription(descriptor) {
@@ -307,7 +315,7 @@ describe("pr-track1 task-derived subscription demand", () => {
 			taskId: string;
 			canonicalPrKey: string;
 			column: string;
-			consumers: { comments: boolean; mergeCompletion: boolean };
+			consumers: { comments: boolean; mergeCompletion: boolean; autoMerge: boolean };
 		}> = [];
 		const controller: PrSubscriptionController = {
 			async addSubscription(descriptor) {
@@ -369,7 +377,7 @@ describe("pr-track1 task-derived subscription demand", () => {
 			taskId: string;
 			canonicalPrKey: string;
 			column: string;
-			consumers: { comments: boolean; mergeCompletion: boolean };
+			consumers: { comments: boolean; mergeCompletion: boolean; autoMerge: boolean };
 		}> = [];
 		const controller: PrSubscriptionController = {
 			async addSubscription(descriptor) {
@@ -396,7 +404,7 @@ describe("pr-track1 task-derived subscription demand", () => {
 			async listBoards() {
 				return boards;
 			},
-			installedConsumers: () => ({ comments: true, mergeCompletion: true }),
+			installedConsumers: () => ({ comments: true, mergeCompletion: true, autoMerge: true }),
 		};
 
 		expect(await reconcileTaskSubscriptions(controller, source)).toEqual({
@@ -406,7 +414,7 @@ describe("pr-track1 task-derived subscription demand", () => {
 		});
 		expect(current[0]).toMatchObject({
 			column: "in_progress",
-			consumers: { comments: true, mergeCompletion: false },
+			consumers: { comments: true, mergeCompletion: false, autoMerge: false },
 		});
 
 		// Moved to Review with the merge checkbox enabled: remove + re-add.
@@ -423,7 +431,35 @@ describe("pr-track1 task-derived subscription demand", () => {
 			removed: [],
 			updated: ["ws-1:t-1"],
 		});
-		expect(current[0]).toMatchObject({ column: "review", consumers: { comments: true, mergeCompletion: true } });
+		expect(current[0]).toMatchObject({
+			column: "review",
+			consumers: { comments: true, mergeCompletion: true, autoMerge: false },
+		});
+	});
+	it("demands the autoMerge consumer for an armed opt-in card and ignores un-armed opt-ins (AM-3)", () => {
+		const armed = makeCard({
+			id: "t-armed",
+			autoMergeWhenApproved: true,
+			armedAutoMergePolicyRevision: 1,
+			pullRequests: [LINK],
+		});
+		const unArmed = makeCard({ id: "t-unarmed", autoMergeWhenApproved: true, pullRequests: [LINK] });
+		const boards = [
+			makeBoard("ws-1", [
+				{ columnId: "review", card: armed },
+				{ columnId: "in_progress", card: unArmed },
+			]),
+		];
+
+		// An un-armed opt-in still yields no demand (the evaluator would
+		// fail closed with not_armed, and demand must not poll for it).
+		const uninstalled = { comments: false, mergeCompletion: false, autoMerge: true };
+		expect(computeTaskSubscriptionDemand(boards, uninstalled)).toHaveLength(1);
+		const demand = computeTaskSubscriptionDemand(boards, uninstalled)[0];
+		expect(demand).toMatchObject({
+			taskId: "t-armed",
+			consumers: { comments: false, mergeCompletion: false, autoMerge: true },
+		});
 	});
 });
 

@@ -232,7 +232,7 @@ function descriptor(overrides: Partial<PrTrackingSubscriptionDescriptor> = {}): 
 		taskId: "task-1",
 		canonicalPrKey: "github|github.com|cline/kanban|49",
 		column: "in_progress",
-		consumers: { comments: true, mergeCompletion: false },
+		consumers: { comments: true, mergeCompletion: false, autoMerge: false },
 		...overrides,
 	};
 }
@@ -505,7 +505,10 @@ describe("pr-tracking-coordinator", () => {
 		expect(
 			(
 				await coordinator.addSubscription(
-					descriptor({ taskId: "task-off", consumers: { comments: false, mergeCompletion: false } }),
+					descriptor({
+						taskId: "task-off",
+						consumers: { comments: false, mergeCompletion: false, autoMerge: false },
+					}),
 				)
 			).status,
 		).toBe("active");
@@ -520,8 +523,11 @@ describe("pr-tracking-coordinator", () => {
 		});
 		const coordinator = track(harness.coordinator);
 		expect(
-			(await coordinator.addSubscription(descriptor({ consumers: { comments: false, mergeCompletion: true } })))
-				.status,
+			(
+				await coordinator.addSubscription(
+					descriptor({ consumers: { comments: false, mergeCompletion: true, autoMerge: false } }),
+				)
+			).status,
 		).toBe("active");
 
 		await pollOnce(); // reconciliation read 1
@@ -545,8 +551,11 @@ describe("pr-tracking-coordinator", () => {
 			makeCoordinator({ store: harness.store, schedulerLockPath: join(root, "lock-restart") }).coordinator,
 		);
 		expect(
-			(await restarted.addSubscription(descriptor({ consumers: { comments: false, mergeCompletion: true } })))
-				.status,
+			(
+				await restarted.addSubscription(
+					descriptor({ consumers: { comments: false, mergeCompletion: true, autoMerge: false } }),
+				)
+			).status,
 		).toBe("active");
 		await pollOnce();
 		expect(harness.fake.metadataCalls()).toBe(3);
@@ -575,6 +584,45 @@ describe("pr-tracking-coordinator", () => {
 		const resumed = await restarted.readTaskSnapshotEvents("ws-1", "task-1", "comments");
 		expect(resumed.events.map((event) => event.seq)).toEqual([2]);
 		expect(resumed.nextCursor).toBe(2);
+	});
+
+	it("seeds the in-memory event sequence from the highest persisted cursor across consumers (AM-3)", async () => {
+		const harness = makeCoordinator();
+		const coordinator = track(harness.coordinator);
+		// A fresh binding with a persisted autoMerge replay cursor must
+		// resume above it even if the comments cursor is lower/absent.
+		await harness.store.createRecord({
+			canonicalPrKey: "github|github.com|cline/kanban|49",
+			provider: "github" as const,
+			host: "github.com",
+			repository: "cline/kanban",
+			number: 49,
+		});
+		await harness.store.upsertTaskBinding("github|github.com|cline/kanban|49", {
+			workspaceId: "ws-1",
+			taskId: "task-1",
+		});
+		const seeded = await harness.store.updateTaskBinding(
+			"github|github.com|cline/kanban|49",
+			{ workspaceId: "ws-1", taskId: "task-1" },
+			undefined,
+			(item) => ({
+				...item,
+				replayCursors: {
+					...item.replayCursors,
+					comments: 1,
+					autoMerge: 7,
+				},
+			}),
+		);
+		expect(seeded.ok).toBe(true);
+
+		expect((await coordinator.addSubscription(descriptor())).status).toBe("active");
+		await pollOnce();
+		// The first hint after resume is seq 8 (above the max persisted cursor 7).
+		const events = await coordinator.readTaskSnapshotEvents("ws-1", "task-1", "autoMerge");
+		expect(events.events.map((event) => event.seq)).toEqual([8]);
+		expect(events.nextCursor).toBe(8);
 	});
 
 	it("backs off through the 60/120/240/480/900s ladder on repeated failures", async () => {

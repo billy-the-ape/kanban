@@ -97,7 +97,7 @@ function makeObservation(
 			feedback: null,
 			feedbackCompleteness: null,
 		},
-		installedConsumers: { comments: false, mergeCompletion: true },
+		installedConsumers: { comments: false, mergeCompletion: true, autoMerge: false },
 		now: NOW,
 	};
 }
@@ -589,7 +589,7 @@ describe("pr-merge-completion coordinator delivery", () => {
 			taskId: TASK.taskId,
 			canonicalPrKey: PR_KEY,
 			column: "review",
-			consumers: { comments: false, mergeCompletion: true },
+			consumers: { comments: false, mergeCompletion: true, autoMerge: false },
 		};
 		expect((await coordinator.addSubscription(descriptor)).status).toBe("active");
 
@@ -611,7 +611,7 @@ describe("pr-merge-completion coordinator delivery", () => {
 			taskId: TASK.taskId,
 			canonicalPrKey: PR_KEY,
 			column: "review",
-			consumers: { comments: false, mergeCompletion: true },
+			consumers: { comments: false, mergeCompletion: true, autoMerge: false },
 		};
 		expect((await coordinator.addSubscription(descriptor)).status).toBe("active");
 

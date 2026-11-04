@@ -2151,10 +2151,12 @@ export const runtimeReliableCompletionStatusSchema = z.object({
 export type RuntimeReliableCompletionStatus = z.infer<typeof runtimeReliableCompletionStatusSchema>;
 
 /**
- * Consumer kind. Registration is explicit at runtime; both real consumers stay
- * unregistered until their own PR lands (tests use fake consumers).
+ * Consumer kind. Registration is explicit at runtime; the real consumers
+ * (comment follow-up, merge completion, and the AM-3 auto-merge
+ * eligibility observer) stay unregistered until their own wiring lands
+ * (tests use fake consumers).
  */
-export const runtimePrConsumerKindSchema = z.enum(["comments", "mergeCompletion"]);
+export const runtimePrConsumerKindSchema = z.enum(["comments", "mergeCompletion", "autoMerge"]);
 export type RuntimePrConsumerKind = z.infer<typeof runtimePrConsumerKindSchema>;
 
 /**
@@ -3421,11 +3423,69 @@ export const githubPrOperationReservationSchema = z
 	.passthrough();
 export type GitHubPrOperationReservation = z.infer<typeof githubPrOperationReservationSchema>;
 
+// ── AM-3: auto-merge eligibility (pure evaluation + persisted summary) ──────
+
+export const AUTO_MERGE_ELIGIBILITY_SCHEMA_VERSION = 1;
+
+/**
+ * Machine-readable eligibility outcome. `blocked` is a structural /
+ * permission / configuration problem; `waiting` is a normal pending
+ * condition (checks, approval, threads, in-flight operations).
+ */
+export const autoMergeEligibilityKindSchema = z.enum(["eligible", "waiting", "blocked"]);
+export type AutoMergeEligibilityKind = z.infer<typeof autoMergeEligibilityKindSchema>;
+
+/** One machine-readable blocker with a short human-facing message. */
+export const autoMergeEligibilityBlockerSchema = z.object({
+	code: z.string().min(1),
+	message: z.string().min(1),
+});
+export type AutoMergeEligibilityBlocker = z.infer<typeof autoMergeEligibilityBlockerSchema>;
+
+/**
+ * Transient result of one pure eligibility evaluation (never persisted
+ * whole; a projection is persisted on the task binding).
+ */
+export const autoMergeEligibilityResultSchema = z.object({
+	schemaVersion: z.literal(AUTO_MERGE_ELIGIBILITY_SCHEMA_VERSION),
+	kind: autoMergeEligibilityKindSchema,
+	/** Blockers in fixed priority order (empty when eligible). */
+	blockers: z.array(autoMergeEligibilityBlockerSchema),
+	evaluatedAt: z.number(),
+	headSha: z.string().nullable(),
+	baseSha: z.string().nullable(),
+	/** The policy revision the evaluation targeted (the task's armed revision). */
+	policyRevision: z.number().int().nonnegative(),
+	evidenceCheckedAt: z.number(),
+	evidenceAgeMs: z.number().int().nonnegative(),
+});
+export type AutoMergeEligibilityResult = z.infer<typeof autoMergeEligibilityResultSchema>;
+
+/**
+ * The small eligibility summary/diagnostic persisted on the task binding
+ * (a projection of the full result; at most this summary).
+ */
+export const autoMergeEligibilitySummarySchema = z
+	.object({
+		schemaVersion: z.literal(AUTO_MERGE_ELIGIBILITY_SCHEMA_VERSION),
+		kind: autoMergeEligibilityKindSchema,
+		/** Ordered blocker codes (messages stay transient; codes cap at 10). */
+		codes: z.array(z.string().min(1)).max(10),
+		evaluatedAt: z.number(),
+		headSha: z.string().nullable(),
+		baseSha: z.string().nullable(),
+		policyRevision: z.number().int().nonnegative(),
+		evidenceCheckedAt: z.number(),
+	})
+	.passthrough();
+export type AutoMergeEligibilitySummary = z.infer<typeof autoMergeEligibilitySummarySchema>;
+
 /** Durable replay cursors live on each task binding, per consumer kind. */
 export const githubPrReplayCursorsSchema = z
 	.object({
 		comments: z.number().int().nonnegative().optional(),
 		mergeCompletion: z.number().int().nonnegative().optional(),
+		autoMerge: z.number().int().nonnegative().optional(),
 	})
 	.passthrough();
 export type GitHubPrReplayCursors = z.infer<typeof githubPrReplayCursorsSchema>;
@@ -3471,6 +3531,11 @@ export const githubPrTaskBindingSchema = z
 			.passthrough()
 			.nullable(),
 		mergeCompletion: githubPrMergeCompletionSchema.nullable(),
+		/**
+		 * AM-3: the small persisted auto-merge eligibility summary/diagnostic
+		 * (a projection of the last pure evaluation). Absent on older records.
+		 */
+		autoMerge: autoMergeEligibilitySummarySchema.nullable().optional(),
 		replayCursors: githubPrReplayCursorsSchema,
 	})
 	.passthrough();
@@ -3938,6 +4003,11 @@ export const runtimeTaskTrackingStateResponseSchema = z.object({
 			observedAt: z.number(),
 		})
 		.nullable(),
+	/**
+	 * AM-3: the last persisted auto-merge eligibility summary/diagnostic for
+	 * this task's binding (null until the first evaluation while opted in).
+	 */
+	autoMergeEligibility: autoMergeEligibilitySummarySchema.nullable().optional(),
 	error: z.string().nullable(),
 });
 export type RuntimeTaskTrackingStateResponse = z.infer<typeof runtimeTaskTrackingStateResponseSchema>;
@@ -4128,7 +4198,7 @@ export type RuntimePrOperationReleaseRequest = z.infer<typeof runtimePrOperation
 export const runtimePrSubscriptionRequestSchema = z.object({
 	taskId: z.string().min(1),
 	/** Consumer kind owning the durable replay cursor on the task binding. */
-	consumer: z.enum(["comments", "mergeCompletion"]).default("comments"),
+	consumer: z.enum(["comments", "mergeCompletion", "autoMerge"]).default("comments"),
 	/**
 	 * Durable replay cursor (per consumer kind, persisted on the task
 	 * binding). Events with seq > fromCursor are returned; the cursor

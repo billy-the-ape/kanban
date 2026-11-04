@@ -35,8 +35,17 @@ export function evaluatePrLifecycleGate(input: PrLifecycleGateInput): PrLifecycl
 	const workflowOwned = resolved.key !== null;
 	const commentsOwned = workflowOwned && card.autoAddressComments === true && installed.comments;
 	const mergeOwned = workflowOwned && card.autoFinishOnMerge === true && installed.mergeCompletion;
+	// AM-3: an armed auto-merge opt-in also owns the linked PR workflow —
+	// legacy clean-tree completion must not race the pending auto-merge
+	// (the autoFinishOnMerge half below remains the only automatic
+	// task-completion mechanism).
+	const autoMergeOwned =
+		workflowOwned &&
+		card.autoMergeWhenApproved === true &&
+		card.armedAutoMergePolicyRevision !== undefined &&
+		installed.autoMerge;
 	return {
-		legacyCompletionGated: commentsOwned || mergeOwned,
+		legacyCompletionGated: commentsOwned || mergeOwned || autoMergeOwned,
 		mergeFinishesInReview: mergeOwned,
 	};
 }

@@ -33,6 +33,7 @@ import {
 	isKanbanRemoteHost,
 } from "../core/runtime-endpoint";
 import { completeTaskAndGetReadyLinkedTaskIds } from "../core/task-board-mutations";
+import { registerAutoMergeConsumer } from "../pr-tracking/auto-merge-eligibility";
 import { AutoMergePolicyStore } from "../pr-tracking/auto-merge-policy-store";
 import { createPrCommentAutomationService } from "../pr-tracking/comment-automation-service";
 import { createGitHubPrClient, resolveGitHubAccessScopeId } from "../pr-tracking/github-pr-client";
@@ -337,10 +338,10 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 					// enumerating every workspace.
 					listBoard: (workspaceId) =>
 						loadWorkspaceBoardById(workspaceId).then((board) => ({ workspaceId, board })),
-					// Both PR tracking consumers (comment follow-up and merge
-					// completion) are always installed; the comments half is
-					// further scoped to native-Cline tasks via getSelectedAgentId.
-					installedConsumers: () => ({ comments: true, mergeCompletion: true }),
+					// All three PR tracking consumers (comment follow-up, merge
+					// completion, and the AM-3 auto-merge eligibility observer) are
+					// always installed.
+					installedConsumers: () => ({ comments: true, mergeCompletion: true, autoMerge: true }),
 					getSelectedAgentId: async (workspaceId) => {
 						const workspacePath = deps.workspaceRegistry.getWorkspacePathById(workspaceId);
 						if (!workspacePath) {
@@ -519,6 +520,36 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 								}`,
 							);
 						});
+				},
+				warn: (message) => deps.warn(`[pr-tracking] ${message}`),
+			});
+			registerAutoMergeConsumer(registry, {
+				store,
+				// The coordinator is created just below; the lazy accessor keeps
+				// the consumer registration order registry-first.
+				getCoordinator: () => (prTrackingState ? prTrackingState.coordinator : null),
+				getTaskCard: async (workspaceId, taskId) => {
+					const board = await loadWorkspaceBoardById(workspaceId).catch(() => null);
+					if (!board) {
+						return null;
+					}
+					for (const column of board.columns) {
+						const card = column.cards.find((item) => item.id === taskId);
+						if (card) {
+							return { card, columnId: column.id };
+						}
+					}
+					return null;
+				},
+				listBoards: listManagedWorkspaceBoards,
+				loadPolicy: (repository) => autoMergePolicyStore.loadPolicy(repository),
+				isTaskWriterActive: probeTaskWriterActive,
+				// AM-3: eligibility is evaluated but no merge happens yet.
+				// AM-4 binds the real merge operation to this handoff.
+				onEligible: (handoff) => {
+					deps.warn(
+						`[pr-tracking] Auto-merge eligibility reached for ${handoff.taskId} (PR ${handoff.canonicalPrKey}); AM-4 will perform the merge.`,
+					);
 				},
 				warn: (message) => deps.warn(`[pr-tracking] ${message}`),
 			});

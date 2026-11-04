@@ -1,6 +1,6 @@
 # AM-3: Fail-closed merge eligibility and lifecycle orchestration
 
-**Status:** planned. **One implementation PR into `main`.** Depends on: AM-2. Read [README.md](./README.md).
+**Status:** implemented. **One implementation PR into `main`.** Depends on: AM-2. Read [README.md](./README.md).
 
 ## Deliverable
 
@@ -41,3 +41,22 @@ The evaluator is independent of the UI; return structured `kind`, blocker code(s
 ## Deployment
 
 No new credentials, environment variables or migrations. Existing behavior unchanged until AM-4 binds execution and AM-5 exposes the opt-in control.
+
+## Final state (implemented)
+
+- **New `src/pr-tracking/auto-merge-eligibility.ts`** holds the pure evaluator and the `autoMerge` consumer observer:
+  - `AutoMergeEligibilityResult` (`schemaVersion 1`, `kind: "eligible" | "waiting" | "blocked"`, ordered blocker codes/messages, `evaluatedAt`, `headSha`, `baseSha`, `policyRevision`, `evidenceCheckedAt`, `evidenceAgeMs`). Blocked-vs-waiting is decided by the fixed `AUTO_MERGE_BLOCKED_CODES` set (configuration/identity/auth/evidence-identity problems block; ordinary pending conditions wait).
+  - `classifyAutoMergeReviews` (per-reviewer latest submitted decision; valid current-head non-author approval required; CR blocks until a strictly-later valid approval; tied timestamps → `review_inconsistent`; dismissed reviews contribute nothing — fail-closed) and `classifyRequiredChecks` (exact-name match across check runs + commit statuses; effective attempt is the latest by occurredAt then runId; neutral/skipped conclusions are never success; empty policy check list → `no_required_checks`).
+  - `reconcileAutoMergeEligibility` observes coordinator observations: it re-reads the task's card, requires the opt-in to be live and armed, requires the card's resolved automation PR to match the observation's PR (stale selections are skipped), requests the consumer coalesced evidence read, persists at most the small `autoMerge` summary on the task binding, and calls the injected `onEligible` handoff (AM-4 will bind the real merge) only when eligible. `registerAutoMergeConsumer` wires the kind into the registry (metadata-only read demand).
+- **Contracts** (`src/core/api-contract.ts`): `autoMergeEligibilityResultSchema` / `autoMergeEligibilitySummarySchema` (schema version 1), `runtimePrConsumerKind` gained `"autoMerge"`, `githubPrTaskBindingSchema` gained `autoMerge: summary | null` (schema default null), `runtimePrTrackingStateResponseSchema` gained `autoMergeEligibility` (null until observed), `runtimePrCommentAutomationSettingsResponseSchema` gained the AM-1 opt-in/armed fields, and `autoMergePolicySchema` gained `mergeMethod: "merge" | "squash" | "rebase"` (default `"merge"`, required for AM-4) while keeping `requiredChecks` nonempty in V1.
+- **Subscriber integration**: `PR_CONSUMER_READ_SOURCES.autoMerge = ["metadata"]`; `PrConsumerRegistry` kind is third-party; task demand requires opt-in true **and an armed revision present** and In Progress/In Review; the coordinator seeds the in-memory replay event sequence from the **highest persisted cursor across consumers** on restart; `readTaskSnapshotEvents` accepts the `autoMerge` consumer.
+- **Lifecycle gate** (`src/pr-tracking/pr-lifecycle-gate.ts`): an armed opt-in with the installed consumer gates legacy completion (`legacyCompletionGated`) so clean-tree completion cannot race a pending auto-merge; `mergeFinishesInReview` still reflects only `autoFinishOnMerge`. The CLI `task complete` gate passes the installed consumers accordingly.
+- **Server wiring** (`src/server/runtime-server.ts`): the autoMerge consumer is registered with a lazy coordinator accessor (registry-first ordering), policy reads from the AM-1 policy store, writer admission from `probeTaskWriterActive`, and `onEligible` currently only logs the eligibility handoff (AM-4 performs the merge). No merge path, no GitHub writes, no new timers.
+- **Default binding** gains `autoMerge: null`; the AM-1 arming API and the `prTracking.autoMergePolicy` API surface are unchanged by this PR.
+
+## Implementation notes (deviations worth remembering)
+
+- A dismissed GitHub review's original decision (approval vs CR) is not recoverable from the evidence envelope, so dismissed reviews contribute nothing and an un-dismissed CR keeps blocking (fail-closed), rather than modeling GitHub dismissal of the CR as a supersede.
+- `comment_repair_pending` fires for any non-completed comment-repair dispatch (`queued`/`running`/`failed`): the service clears the pending feedback fingerprint when a dispatch is authorized (running) and again on failure, so the fingerprint must not be part of the guard. A failed dispatch keeps blocking until a later dispatch replaces it.
+- Subscription demand requires the armed revision to exist on the card; the evaluator still enforces the full policy-revision match (`policy_mismatch`) and fails closed on a stale arm.
+
