@@ -57,6 +57,6 @@ No new credentials, environment variables or migrations. Existing behavior uncha
 ## Implementation notes (deviations worth remembering)
 
 - A dismissed GitHub review's original decision (approval vs CR) is not recoverable from the evidence envelope, so dismissed reviews contribute nothing and an un-dismissed CR keeps blocking (fail-closed), rather than modeling GitHub dismissal of the CR as a supersede.
-- `comment_repair_pending` fires when a dispatch other than `completed` is present with a pending feedback fingerprint (dispatch statuses are `queued`/`running`/`completed`/`failed`).
+- `comment_repair_pending` fires for any non-completed comment-repair dispatch (`queued`/`running`/`failed`): the service clears the pending feedback fingerprint when a dispatch is authorized (running) and again on failure, so the fingerprint must not be part of the guard. A failed dispatch keeps blocking until a later dispatch replaces it.
 - Subscription demand requires the armed revision to exist on the card; the evaluator still enforces the full policy-revision match (`policy_mismatch`) and fails closed on a stale arm.
 

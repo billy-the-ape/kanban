@@ -363,7 +363,7 @@ export function evaluateAutoMergeEligibility(input: AutoMergeEligibilityInput): 
 	}
 
 	// Phase D: evidence completeness / freshness.
-	if (reasons.has("head_changed") || reasons.has("declared_head_mismatch")) {
+	if ([...reasons].some((token) => HEAD_CHANGED_REASONS.has(token))) {
 		add("head_changed", "The head moved during evidence collection; a fresh read is pending.");
 	}
 	const incompleteReasons = [...reasons]
@@ -435,13 +435,14 @@ export function evaluateAutoMergeEligibility(input: AutoMergeEligibilityInput): 
 	if (input.writerActive) {
 		add("writer_active", "The task's writer is still active; waiting for it to settle.");
 	}
+	// Any non-completed dispatch blocks: the service clears the pending
+	// feedback fingerprint when a dispatch is authorized (moving to
+	// running) and again when it fails, so the fingerprint must not be
+	// part of this guard. A failed dispatch keeps blocking until a later
+	// dispatch replaces it (fail-closed).
 	const dispatch = record.commentAutomation.dispatch;
-	if (
-		dispatch !== null &&
-		dispatch.status !== "completed" &&
-		record.commentAutomation.pendingFeedbackFingerprint !== null
-	) {
-		add("comment_repair_pending", `A comment-repair dispatch is still ${dispatch.status} with pending feedback.`);
+	if (dispatch !== null && dispatch.status !== "completed") {
+		add("comment_repair_pending", `A comment-repair dispatch is still ${dispatch.status}.`);
 	}
 	const reservation = record.reservation;
 	if (reservation.state === "reserved") {
@@ -484,6 +485,7 @@ export function toAutoMergeEligibilitySummary(result: AutoMergeEligibilityResult
 		evidenceCheckedAt: result.evidenceCheckedAt,
 	};
 }
+
 // ── The auto-merge consumer observer ──────────────────────────────────────────
 
 /**

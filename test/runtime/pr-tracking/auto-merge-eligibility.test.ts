@@ -313,7 +313,46 @@ describe("AM-3 pure eligibility evaluation", () => {
 			},
 		}));
 		expect(codes(evaluateAutoMergeEligibility(makeInput({}, dispatched)))).toContain("comment_repair_pending");
+		// The service clears the fingerprint while a dispatch is in flight,
+		// so a running dispatch with a null fingerprint must still block.
+		const running = await makeRecord((r) => ({
+			...r,
+			commentAutomation: {
+				...r.commentAutomation,
+				dispatch: {
+					dispatchId: "disp-2",
+					attemptedAt: NOW,
+					fingerprint,
+					ownerRevision: 1,
+					status: "running",
+					turnReference: null,
+					error: null,
+				},
+				pendingFeedbackFingerprint: null,
+			},
+		}));
+		expect(codes(evaluateAutoMergeEligibility(makeInput({}, running)))).toContain("comment_repair_pending");
+
+		// A completed dispatch has finished its repair commit: it does not block.
+		const completed = await makeRecord((r) => ({
+			...r,
+			commentAutomation: {
+				...r.commentAutomation,
+				dispatch: {
+					dispatchId: "disp-3",
+					attemptedAt: NOW,
+					fingerprint,
+					ownerRevision: 1,
+					status: "completed",
+					turnReference: null,
+					error: null,
+				},
+				pendingFeedbackFingerprint: null,
+			},
+		}));
+		expect(evaluateAutoMergeEligibility(makeInput({}, completed)).kind).toBe("eligible");
 	});
+
 	// ── Review classification ──────────────────────────────────────────────────────
 
 	function review(overrides: Partial<AutoMergeReviewEvidence> = {}): AutoMergeReviewEvidence {

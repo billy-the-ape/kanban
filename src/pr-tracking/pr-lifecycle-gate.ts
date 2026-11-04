@@ -42,7 +42,7 @@ export function evaluatePrLifecycleGate(input: PrLifecycleGateInput): PrLifecycl
 	const autoMergeOwned =
 		workflowOwned &&
 		card.autoMergeWhenApproved === true &&
-		(card.armedAutoMergePolicyRevision ?? null) !== null &&
+		card.armedAutoMergePolicyRevision !== undefined &&
 		installed.autoMerge;
 	return {
 		legacyCompletionGated: commentsOwned || mergeOwned || autoMergeOwned,
