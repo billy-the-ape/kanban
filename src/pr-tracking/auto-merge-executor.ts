@@ -162,7 +162,7 @@ const NEEDS_ATTENTION_ELIGIBILITY_CODES = new Set<string>([
 function classifyWriteOutcome(write: MergeWriteOutcome): { state: "waiting" | "needs_attention"; reason: string } {
 	if (write.kind === "merged") {
 		// The write reported success but the remote read did not confirm it
-		// (caught as unresolved above; defensive).
+		// (the confirm read shows the PR still open; defensive).
 		return { state: "needs_attention", reason: "unverified: merge reported success but remote is not merged" };
 	}
 	if (write.kind === "rejected") {
@@ -379,7 +379,7 @@ export function createAutoMergeExecutor(deps: AutoMergeExecutorDeps): AutoMergeE
 				workspaceId: task.workspaceId,
 				taskId: task.taskId,
 				column: found.columnId,
-				optIn: card.autoMergeWhenApproved === true,
+				optIn: true, // invariant: the disabled guard above already returned waiting
 				armedPolicyRevision: armedRevision,
 				expectedRepository: freshRecord.record.repository,
 				expectedBaseRef: card.baseRef ?? null,
