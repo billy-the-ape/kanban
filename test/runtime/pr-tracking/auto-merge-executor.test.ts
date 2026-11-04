@@ -202,6 +202,10 @@ interface Harness {
 	evidenceReads: number;
 	/** Metadata reads completed at the moment the merge write fires (ordering proof). */
 	metadataReadsAtWrite: number;
+	/** Optional gate awaited DURING the merge write (ordering/race tests). */
+	mergeGate?: () => Promise<void>;
+	/** Optional hook run before the one-shot metadata read resolves (race tests). */
+	metadataHook?: () => Promise<void>;
 }
 
 function defaultMetadataOutcome(harness: Harness): OneShotMetadataRefreshResult {
@@ -276,6 +280,7 @@ function makeExecutor(store: InMemoryPrRecordStore, harness: Harness): AutoMerge
 		},
 		refreshPrMetadataOnce: async (_prKey: string) => {
 			harness.metadataReads += 1;
+			await harness.metadataHook?.();
 			return harness.metadataOutcome();
 		},
 	};
@@ -284,6 +289,7 @@ function makeExecutor(store: InMemoryPrRecordStore, harness: Harness): AutoMerge
 			harness.mergeWrites.push({ expectedHeadSha: options.expectedHeadSha, mergeMethod: options.mergeMethod });
 			harness.metadataReadsAtWrite = harness.metadataReads;
 			harness.acceptedMerges += 1;
+			await harness.mergeGate?.();
 			return harness.mergeOutcome();
 		},
 	};
@@ -605,6 +611,15 @@ describe("AM-4 auto-merge executor: write outcomes are classified, never guessed
 			"waiting",
 			"merge_call_failed:network",
 		],
+		[
+			"adapter rate limit (secondary throttle)",
+			() => ({
+				kind: "failed" as const,
+				failure: { category: "rate_limit" as const, message: "secondary rate limit", at: NOW },
+			}),
+			"waiting",
+			"merge_call_failed:rate_limit",
+		],
 	])("classifies %s and persists the durable outcome", async (_label, outcome, expectedAction, expectedReason) => {
 		const store = await makeStore();
 		const harness = makeHarness({ mergeOutcome: outcome });
@@ -759,6 +774,135 @@ describe("AM-4 auto-merge executor: startup crash recovery reads the remote firs
 		expect(harness.mergeWrites.length).toBe(0);
 		const after = await loadBinding(store);
 		expect(after.autoMergeAttempt?.state).toBe("attempting");
+	});
+});
+describe("AM-4 auto-merge executor: startup reconciliation serializes with live executions", () => {
+	it("never drops a live execution's fence: reconcile and execute serialize per-PR", async () => {
+		const store = await makeStore();
+		// Simulate a crash: a durable `attempting` journal; GitHub has NOT
+		// merged (the fake remote starts open).
+		const attemptId = computeAutoMergeAttemptId(PR_KEY, HEAD, BASE, 1);
+		await store.setAutoMergeAttempt(PR_KEY, TASK, {
+			schemaVersion: AUTO_MERGE_ATTEMPT_SCHEMA_VERSION,
+			attemptId,
+			canonicalPrKey: PR_KEY,
+			headSha: HEAD,
+			baseSha: BASE,
+			policyRevision: 1,
+			mergeMethod: "squash",
+			startedAt: NOW - 5_000,
+			state: "attempting",
+			reason: null,
+			mergeCommitSha: null,
+			finishedAt: null,
+		});
+		// Gate the merge write and capture the reservation state AT THE WRITE.
+		let releasePut: () => void = () => {};
+		const putGate = new Promise<void>((resolve) => {
+			releasePut = resolve;
+		});
+		const reservationAtWrite: Array<{
+			state: "none" | "reserved";
+			reservedBy: { workspaceId: string; taskId: string } | null;
+		}> = [];
+		const harness = makeHarness({
+			// Gate the write: capture the reservation state AT THE WRITE, then
+			// hold the write until released.
+			mergeGate: async () => {
+				const rec = await store.loadRecord(PR_KEY);
+				if (rec.ok) {
+					reservationAtWrite.push({
+						state: rec.record.reservation.state,
+						reservedBy: rec.record.reservation.reservedBy,
+					});
+				}
+				await putGate;
+			},
+		});
+		const executor = makeExecutor(store, harness);
+		// Startup reconcile and the first poll's handoff race: the reconcile
+		// (queued first) must fully finish, fence released, before the
+		// execution runs — never the other way around.
+		const reconcile = executor.reconcilePending();
+		const execution = executor.execute(makeHandoff());
+		// Wait until the gated PUT is reached (the execution is in flight).
+		while (reservationAtWrite.length === 0) {
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+		// The fence must be HELD by the execution at the write — the old
+		// unfenced reconcile used to release it mid-write.
+		expect(reservationAtWrite[0]?.state).toBe("reserved");
+		expect(reservationAtWrite[0]?.reservedBy).toEqual(TASK);
+		releasePut();
+		const outcome = await execution;
+		await reconcile;
+		expect(outcome.action).toBe("merged_confirmed");
+		expect(harness.mergeWrites.length).toBe(1);
+		const after = await loadBinding(store);
+		expect(after.autoMergeAttempt?.state).toBe("merged_confirmed");
+		expect(after.autoMergeAttempt?.startedAt).toBe(NOW - 5_000);
+		const final = await store.loadRecord(PR_KEY);
+		expect(final.ok).toBe(true);
+		if (final.ok) {
+			expect(final.record.reservation.state).toBe("none");
+		}
+	});
+
+	it("does not clobber a journal entry replaced after the reconcile read (conditional write)", async () => {
+		const store = await makeStore();
+		const seededId = computeAutoMergeAttemptId(PR_KEY, HEAD, BASE, 1);
+		await store.setAutoMergeAttempt(PR_KEY, TASK, {
+			schemaVersion: AUTO_MERGE_ATTEMPT_SCHEMA_VERSION,
+			attemptId: seededId,
+			canonicalPrKey: PR_KEY,
+			headSha: HEAD,
+			baseSha: BASE,
+			policyRevision: 1,
+			mergeMethod: "squash",
+			startedAt: NOW - 5_000,
+			state: "attempting",
+			reason: null,
+			mergeCommitSha: null,
+			finishedAt: null,
+		});
+		// A racing (serialized, later) execution re-journaled a NEW evidence
+		// identity while the reconcile read is in flight: the reconcile must
+		// not overwrite it.
+		const newerId = computeAutoMergeAttemptId(PR_KEY, "headsha2", "basesha2", 2);
+		const harness = makeHarness({
+			// A racing (serialized, later) execution re-journaled a NEW evidence
+			// identity while the reconcile read is in flight: the reconcile
+			// must not overwrite it.
+			metadataHook: async () => {
+				await store.setAutoMergeAttempt(PR_KEY, TASK, {
+					schemaVersion: AUTO_MERGE_ATTEMPT_SCHEMA_VERSION,
+					attemptId: newerId,
+					canonicalPrKey: PR_KEY,
+					headSha: "headsha2",
+					baseSha: "basesha2",
+					policyRevision: 2,
+					mergeMethod: "squash",
+					startedAt: NOW - 1_000,
+					state: "attempting",
+					reason: null,
+					mergeCommitSha: null,
+					finishedAt: null,
+				});
+			},
+			metadataOutcome: () => ({ outcome: "refreshed", checkedAt: NOW, metadata: makeMetadata("open"), error: null }),
+		});
+		const executor = makeExecutor(store, harness);
+		await executor.reconcilePending();
+		const after = await loadBinding(store);
+		// The newer entry survives: the reconcile saw the seeded entry, its
+		// conditional CAS no longer matched, and nothing was written.
+		expect(after.autoMergeAttempt?.attemptId).toBe(newerId);
+		expect(after.autoMergeAttempt?.state).toBe("attempting");
+		const final = await store.loadRecord(PR_KEY);
+		expect(final.ok).toBe(true);
+		if (final.ok) {
+			expect(final.record.reservation.state).toBe("none");
+		}
 	});
 });
 

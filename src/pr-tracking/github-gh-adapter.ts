@@ -574,6 +574,22 @@ export class GitHubGhAdapter {
 					},
 				};
 			}
+			if (status === 403 && /rate limit|abuse|secondary/i.test(result.stderr)) {
+				// GitHub also answers SECONDARY rate limits with 403: a
+				// transient throttle, not a permission denial. Classify it as
+				// rate_limit so the caller treats it as waiting, never a
+				// terminal needs_attention.
+				const resetAt = await this.fetchRateLimitReset();
+				return {
+					kind: "failed",
+					failure: {
+						category: "rate_limit",
+						message: detail,
+						at,
+						...(resetAt !== null ? { rateLimitResetAt: resetAt } : {}),
+					},
+				};
+			}
 			// GitHub denials: permission/rulesets (403/451), merge conflicts
 			// (405), head moved (409), validation (422). The executor
 			// classifies these; none of them is a transient retry.

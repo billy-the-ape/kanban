@@ -282,6 +282,51 @@ describe("github-gh-adapter", () => {
 		}
 		expect(calls.map((call) => call.args[call.args.length - 1])).toContain("rate_limit");
 	});
+	it("sends the bounded non-interactive merge write and classifies the response", async () => {
+		const calls: ScriptedCall[] = [];
+		const adapter = adapterFor([{ kind: "ok", stdout: JSON.stringify({ sha: "mergecommit" }) }], calls);
+		const result = await adapter.mergePullRequest(PARSED, { expectedHeadSha: "headsha1", mergeMethod: "squash" });
+		expect(result).toEqual({ kind: "merged", mergeCommitSha: "mergecommit" });
+		expect(calls).toHaveLength(1);
+		const args = calls[0]?.args ?? [];
+		expect(args).toContain("--method");
+		expect(args).toContain("PUT");
+		expect(args).toContain("repos/cline/kanban/pulls/49/merge");
+		expect(args).toContain("sha=headsha1");
+		expect(args).toContain("merge_method=squash");
+	});
+
+	it("classifies a 403 secondary rate limit on the merge write as rate_limit (transient), not a denial", async () => {
+		const calls: ScriptedCall[] = [];
+		const adapter = adapterFor(
+			[
+				{ kind: "stderr", stderr: "HTTP 403: You have exceeded a secondary rate limit. Please try again later." },
+				{ kind: "ok", stdout: JSON.stringify({ resources: { core: { reset: Math.floor(NOW / 1000) + 1200 } } }) },
+			],
+			calls,
+		);
+		const result = await adapter.mergePullRequest(PARSED, { expectedHeadSha: "headsha1", mergeMethod: "squash" });
+		expect(result.kind).toBe("failed");
+		if (result.kind === "failed") {
+			// The executor maps rate_limit to waiting — never terminal
+			// needs_attention for a transient throttle.
+			expect(result.failure.category).toBe("rate_limit");
+			expect(result.failure.rateLimitResetAt).toBe(NOW + 1_200_000);
+		}
+	});
+
+	it("keeps a 403 permission denial on the merge write as rejected (caller-classified terminal)", async () => {
+		const calls: ScriptedCall[] = [];
+		const adapter = adapterFor(
+			[{ kind: "stderr", stderr: "HTTP 403: Resource not accessible for integration" }],
+			calls,
+		);
+		const result = await adapter.mergePullRequest(PARSED, { expectedHeadSha: "headsha1", mergeMethod: "squash" });
+		expect(result.kind).toBe("rejected");
+		if (result.kind === "rejected") {
+			expect(result.status).toBe(403);
+		}
+	});
 
 	it("caps in-flight reads runtime-wide", async () => {
 		const calls: ScriptedCall[] = [];

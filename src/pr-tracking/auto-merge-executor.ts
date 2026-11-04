@@ -37,7 +37,10 @@
 // READING GitHub first — never by repeating the write. A merge GitHub
 // accepted is recovered as `merged_confirmed`; a merge GitHub did not accept
 // is demoted to `waiting`, so no duplicate write ever happens without a fresh
-// remote read proving the PR is still open.
+// remote read proving the PR is still open. The startup reconciliation runs
+// under the SAME durable reservation as the execution and is serialized
+// per-PR through the in-flight chain, so it can never drop a live
+// execution's fence mid-write.
 import {
 	AUTO_MERGE_ATTEMPT_SCHEMA_VERSION,
 	type AutoMergeAttempt,
@@ -194,7 +197,33 @@ function classifyWriteOutcome(write: MergeWriteOutcome): { state: "waiting" | "n
 export function createAutoMergeExecutor(deps: AutoMergeExecutorDeps): AutoMergeExecutor {
 	const now = deps.now ?? Date.now;
 	const confirmReadBudget = deps.confirmReadBudget ?? 3;
-	const inFlight = new Map<string, Promise<AutoMergeExecutionOutcome>>();
+	/**
+	 * Per-PR job chain: `execute` handoffs and the startup reconciliation
+	 * serialize per canonical PR, so at most ONE job of this runtime holds
+	 * (or releases) the durable `auto_merge` reservation for a PR at a time.
+	 * A queued job starts only after the current job has fully finished,
+	 * fence released.
+	 */
+	const inFlight = new Map<string, Promise<unknown>>();
+	/** The in-flight (or queued) execution per PR: duplicates coalesce onto it. */
+	const executing = new Map<string, Promise<AutoMergeExecutionOutcome>>();
+
+	function enqueuePrJob<T>(prKey: string, fn: () => Promise<T>): Promise<T> {
+		const prev = inFlight.get(prKey);
+		const job: Promise<T> = (async () => {
+			if (prev !== undefined) {
+				await prev;
+			}
+			return await fn();
+		})();
+		inFlight.set(prKey, job);
+		void job.finally(() => {
+			if (inFlight.get(prKey) === job) {
+				inFlight.delete(prKey);
+			}
+		});
+		return job;
+	}
 
 	/** Bounded fresh remote metadata read (never more than confirmReadBudget). */
 	async function readRemotePr(prKey: string): Promise<{
@@ -456,19 +485,123 @@ export function createAutoMergeExecutor(deps: AutoMergeExecutorDeps): AutoMergeE
 		return { action: classified.state, reason: classified.reason };
 	}
 
+	/**
+	 * Reconcile one durable `attempting` attempt (startup crash recovery).
+	 * Runs serialized per-PR through the in-flight chain and under the SAME
+	 * durable `auto_merge` reservation the execution holds, so it can never
+	 * drop a live execution's fence mid-write.
+	 */
+	async function reconcileOne(
+		prKey: string,
+		task: { workspaceId: string; taskId: string },
+		seenAttemptId: string,
+	): Promise<void> {
+		const coordinator = deps.getCoordinator();
+		if (!coordinator) {
+			deps.warn?.("Auto-merge startup reconciliation skipped: coordinator unavailable");
+			return;
+		}
+		const loaded = await deps.store.loadRecord(prKey);
+		if (!loaded.ok) {
+			return;
+		}
+		const binding = loaded.record.taskBindings.find(
+			(item) => item.workspaceId === task.workspaceId && item.taskId === task.taskId,
+		);
+		const attempt = binding?.autoMergeAttempt ?? null;
+		// Only the exact journal entry observed at scan time: a serialized
+		// execution may have resolved (or re-journaled a new identity) since.
+		if (!attempt || attempt.state !== "attempting" || attempt.attemptId !== seenAttemptId) {
+			return;
+		}
+		// Fence: the SAME durable reservation the execution holds. This job
+		// is serialized per-PR through the in-flight chain, so no execution
+		// of this runtime can hold this PR's reservation while we run. A
+		// non-reserved result means another operation (or another runtime)
+		// holds the gate: skip; a later poll/startup retries.
+		const reservation = await reservePrOperation(deps.store, prKey, "auto_merge", task, {
+			requireOwner: false,
+		});
+		if (reservation.status !== "reserved") {
+			deps.warn?.(`Auto-merge startup reconciliation skipped (${reservation.status}) for ${prKey}`);
+			return;
+		}
+		try {
+			// Read GitHub FIRST: never repeat a write from a stale attempt.
+			let result: OneShotMetadataRefreshResult;
+			try {
+				result = await coordinator.refreshPrMetadataOnce(prKey);
+			} catch (error) {
+				result = { outcome: "failed", checkedAt: null, metadata: null, error: String(error) };
+			}
+			let next: AutoMergeAttempt | null = null;
+			if (result.outcome === "refreshed" && result.metadata !== null) {
+				if (result.metadata.state === "merged" && result.metadata.mergeCommitSha !== null) {
+					next = {
+						...attempt,
+						state: "merged_confirmed",
+						reason: `reconciled on startup: merged (merge commit ${result.metadata.mergeCommitSha})`,
+						mergeCommitSha: result.metadata.mergeCommitSha,
+						finishedAt: now(),
+					};
+				} else if (result.metadata.state !== "merged") {
+					next = {
+						...attempt,
+						state: "waiting",
+						reason: "reconciled on startup: PR still open; prior attempt was not accepted",
+						finishedAt: now(),
+					};
+				}
+				// Merged but merge commit unknown: keep `attempting`
+				// (unresolved).
+			}
+			if (next === null) {
+				// Unknown outcome stays blocked until a later reconciliation.
+				deps.warn?.(
+					`Auto-merge startup reconciliation unresolved for ${prKey} (${result.error ?? "unknown"}); attempt stays blocked`,
+				);
+				return;
+			}
+			// Conditional write: apply only if the journal is still the
+			// entry reconciled above — never clobber a newer journal entry.
+			// A "invalid" result means the entry was replaced after the
+			// re-read (expected): nothing was written.
+			const write = await deps.store.updateTaskBinding(prKey, task, undefined, (item) => {
+				if (
+					!item.autoMergeAttempt ||
+					item.autoMergeAttempt.attemptId !== attempt.attemptId ||
+					item.autoMergeAttempt.state !== "attempting"
+				) {
+					return null;
+				}
+				return { ...item, autoMergeAttempt: next };
+			});
+			if (!write.ok && write.reason !== "invalid") {
+				deps.warn?.(`Auto-merge startup reconciliation persist failed for ${prKey}: ${write.reason}`);
+			}
+		} finally {
+			// Release only after the durable outcome (or skip) has landed.
+			await releaseAndWarn(prKey, task);
+		}
+	}
+
 	return {
 		async execute(handoff) {
-			const pending = inFlight.get(handoff.canonicalPrKey);
-			if (pending) {
-				return pending;
+			// Duplicates coalesce onto the in-flight (or queued) execution.
+			const pendingExecute = executing.get(handoff.canonicalPrKey);
+			if (pendingExecute !== undefined) {
+				return pendingExecute;
 			}
-			const job = runExecution(handoff);
-			inFlight.set(handoff.canonicalPrKey, job);
-			try {
-				return await job;
-			} finally {
-				inFlight.delete(handoff.canonicalPrKey);
-			}
+			// Serialized per-PR: runs only after any queued reconcile/execute
+			// for this PR has finished (and released its fence).
+			const result = enqueuePrJob(handoff.canonicalPrKey, () => runExecution(handoff));
+			executing.set(handoff.canonicalPrKey, result);
+			void result.finally(() => {
+				if (executing.get(handoff.canonicalPrKey) === result) {
+					executing.delete(handoff.canonicalPrKey);
+				}
+			});
+			return result;
 		},
 		async reconcilePending() {
 			const { records } = await deps.store.listRecords();
@@ -479,58 +612,14 @@ export function createAutoMergeExecutor(deps: AutoMergeExecutorDeps): AutoMergeE
 						continue;
 					}
 					const task = { workspaceId: binding.workspaceId, taskId: binding.taskId };
-					// Read GitHub FIRST: never repeat a write from a stale
-					// attempt.
-					const coordinator = deps.getCoordinator();
-					if (!coordinator) {
-						deps.warn?.("Auto-merge startup reconciliation skipped: coordinator unavailable");
-						continue;
-					}
-					let result: OneShotMetadataRefreshResult;
-					try {
-						result = await coordinator.refreshPrMetadataOnce(record.canonicalPrKey);
-					} catch (error) {
-						result = { outcome: "failed", checkedAt: null, metadata: null, error: String(error) };
-					}
-					let next: AutoMergeAttempt | null = null;
-					if (result.outcome === "refreshed" && result.metadata !== null) {
-						if (result.metadata.state === "merged" && result.metadata.mergeCommitSha !== null) {
-							next = {
-								...attempt,
-								state: "merged_confirmed",
-								reason: `reconciled on startup: merged (merge commit ${result.metadata.mergeCommitSha})`,
-								mergeCommitSha: result.metadata.mergeCommitSha,
-								finishedAt: now(),
-							};
-						} else if (result.metadata.state !== "merged") {
-							next = {
-								...attempt,
-								state: "waiting",
-								reason: "reconciled on startup: PR still open; prior attempt was not accepted",
-								finishedAt: now(),
-							};
-						}
-						// Merged but merge commit unknown: keep `attempting`
-						// (unresolved).
-					}
-					if (next === null) {
-						// Unknown outcome stays blocked until a later
-						// reconciliation.
-						deps.warn?.(
-							`Auto-merge startup reconciliation unresolved for ${record.canonicalPrKey} (${result.error ?? "unknown"}); attempt stays blocked`,
-						);
-						continue;
-					}
-					const write = await deps.store.setAutoMergeAttempt(record.canonicalPrKey, task, next);
-					if (!write.ok) {
-						deps.warn?.(
-							`Auto-merge startup reconciliation persist failed for ${record.canonicalPrKey}: ${write.reason}`,
-						);
-						continue;
-					}
-					// Only after the durable outcome: release any wedged
-					// `auto_merge` reservation held by this (crashed) task.
-					await releaseAndWarn(record.canonicalPrKey, task);
+					// Serialized per-PR through the SAME in-flight chain as
+					// execute: a live execution for this PR finishes (fence
+					// released) before this reconciliation runs, and any
+					// execution arriving during the reconcile queues behind
+					// it.
+					await enqueuePrJob(record.canonicalPrKey, () =>
+						reconcileOne(record.canonicalPrKey, task, attempt.attemptId),
+					);
 				}
 			}
 		},
