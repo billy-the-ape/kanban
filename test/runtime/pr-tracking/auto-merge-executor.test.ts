@@ -15,6 +15,7 @@ import {
 } from "../../../src/core/api-contract";
 import type { AutoMergeEligibilityHandoff } from "../../../src/pr-tracking/auto-merge-eligibility";
 import {
+	AUTO_MERGE_RETRY_COOLDOWN_MS,
 	type AutoMergeExecutionOutcome,
 	type AutoMergeExecutor,
 	computeAutoMergeAttemptId,
@@ -206,6 +207,8 @@ interface Harness {
 	mergeGate?: () => Promise<void>;
 	/** Optional hook run before the one-shot metadata read resolves (race tests). */
 	metadataHook?: () => Promise<void>;
+	/** Optional controllable clock (retry-cooldown tests). */
+	now?: () => number;
 }
 
 function defaultMetadataOutcome(harness: Harness): OneShotMetadataRefreshResult {
@@ -302,7 +305,7 @@ function makeExecutor(store: InMemoryPrRecordStore, harness: Harness): AutoMerge
 		isTaskWriterActive: () => harness.writerActive,
 		adapter,
 		warn: (message) => harness.warnings.push(message),
-		now: () => NOW,
+		now: harness.now ?? (() => NOW),
 	});
 }
 
@@ -606,6 +609,15 @@ describe("AM-4 auto-merge executor: write outcomes are classified, never guessed
 			"merge_call_failed:auth",
 		],
 		[
+			"adapter 404 (token without write access)",
+			() => ({
+				kind: "failed" as const,
+				failure: { category: "not_found" as const, message: "HTTP 404", at: NOW },
+			}),
+			"needs_attention",
+			"merge_call_failed:not_found",
+		],
+		[
 			"adapter network failure",
 			() => ({ kind: "failed" as const, failure: { category: "network" as const, message: "boom", at: NOW } }),
 			"waiting",
@@ -652,6 +664,48 @@ describe("AM-4 auto-merge executor: write outcomes are classified, never guessed
 		const binding = await loadBinding(store);
 		expect(binding.autoMergeAttempt?.state).toBe("attempting");
 		expect(binding.autoMergeAttempt?.mergeCommitSha ?? null).toBeNull();
+	});
+});
+describe("AM-4 auto-merge executor: same-identity retry cooldown (no blind re-PUT per poll)", () => {
+	it("does not re-issue the merge PUT for the same evidence identity inside the retry cooldown", async () => {
+		const store = await makeStore();
+		// A prior attempt for THIS identity ended in a transient write
+		// failure (a durable `waiting` journal).
+		await store.setAutoMergeAttempt(PR_KEY, TASK, {
+			schemaVersion: AUTO_MERGE_ATTEMPT_SCHEMA_VERSION,
+			attemptId: computeAutoMergeAttemptId(PR_KEY, HEAD, BASE, 1),
+			canonicalPrKey: PR_KEY,
+			headSha: HEAD,
+			baseSha: BASE,
+			policyRevision: 1,
+			mergeMethod: "squash",
+			startedAt: NOW - 5_000,
+			state: "waiting",
+			reason: "merge_call_failed:timeout",
+			mergeCommitSha: null,
+			finishedAt: NOW - 4_000,
+		});
+		let clock = NOW;
+		const harness = makeHarness({
+			now: () => clock,
+			// Keep the fake evidence fresh relative to the advancing clock.
+			envelope: () => makeEnvelope({ checkedAt: clock - 1_000 }),
+		});
+		const executor = makeExecutor(store, harness);
+		// Inside the cooldown: no merge write (the AM-3 consumer re-emits
+		// this handoff every poll; it must not produce a PUT per poll).
+		const blocked = await executor.execute(makeHandoff());
+		expect(blocked).toEqual({ action: "waiting", reason: "same_identity_cooldown" });
+		expect(harness.mergeWrites.length).toBe(0);
+		// After the cooldown: a fresh, fully re-validated attempt merges.
+		clock += AUTO_MERGE_RETRY_COOLDOWN_MS + 1;
+		const result = await executor.execute(makeHandoff());
+		expect(result).toEqual({ action: "merged_confirmed", mergeCommitSha: MERGE_COMMIT });
+		expect(harness.mergeWrites.length).toBe(1);
+		// The journal was rewritten as a fresh attempt for the same identity.
+		const binding = await loadBinding(store);
+		expect(binding.autoMergeAttempt?.state).toBe("merged_confirmed");
+		expect(binding.autoMergeAttempt?.mergeCommitSha ?? null).toBe(MERGE_COMMIT);
 	});
 });
 

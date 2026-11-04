@@ -33,7 +33,10 @@
 //      terminal `needs_attention` (operator action), ambiguous outcome →
 //      journal stays `attempting` (unknown outcomes stay blocked until an
 //      explicit recovery action). Eligibility-code `needs_attention` is
-//      outcome-only (no journal entry).
+//      outcome-only (no journal entry). A journaled `waiting` outcome from a
+//      merge write blocks re-attempts of the SAME evidence identity for a
+//      bounded retry cooldown — never a blind re-PUT on every poll (a new
+//      identity always attempts immediately).
 //
 // Restart safety: durable `attempting` records are reconciled at startup by
 // READING GitHub first — never by repeating the write. A merge GitHub
@@ -74,6 +77,14 @@ export function computeAutoMergeAttemptId(
 ): string {
 	return sha256Digest(`${canonicalPrKey}|${headSha}|${baseSha}|${policyRevision}`);
 }
+
+/**
+ * AM-4: how long a journaled `waiting` outcome blocks a re-attempt of the
+ * SAME evidence identity before a fresh merge write is allowed. Never a
+ * blind re-PUT on every poll; changed evidence (a new attemptId) always
+ * bypasses the cooldown.
+ */
+export const AUTO_MERGE_RETRY_COOLDOWN_MS = 10 * 60 * 1000;
 
 /**
  * The slice of the coordinator the executor uses: consumer-requested fresh
@@ -187,8 +198,14 @@ function classifyWriteOutcome(write: MergeWriteOutcome): { state: "waiting" | "n
 				return { state: "needs_attention", reason: `github_rejected:${write.status ?? "unknown"}` };
 		}
 	}
-	if (write.failure.category === "auth" || write.failure.category === "access") {
-		// Permission problem: terminal until the operator acts.
+	if (
+		write.failure.category === "auth" ||
+		write.failure.category === "access" ||
+		write.failure.category === "not_found"
+	) {
+		// Permission / visibility problem — including a 404 merge PUT on a
+		// fully verified PR path (token without write access): terminal
+		// until the operator acts, never a retry loop.
 		return { state: "needs_attention", reason: `merge_call_failed:${write.failure.category}` };
 	}
 	// Timeout / network / rate-limit: transient — ordinary re-evaluation
@@ -289,6 +306,16 @@ export function createAutoMergeExecutor(deps: AutoMergeExecutorDeps): AutoMergeE
 			}
 			if (existing.state === "needs_attention" && existing.attemptId === attemptId) {
 				return { action: "skipped", reason: "needs_attention" };
+			}
+			// A journaled `waiting` outcome for this SAME evidence identity:
+			// the merge write already ran once for this identity. Never
+			// blind-retry the same merge on every poll — wait for changed
+			// evidence (a new attemptId) or the retry cooldown.
+			if (existing.state === "waiting" && existing.attemptId === attemptId) {
+				const finishedAt = existing.finishedAt ?? existing.startedAt;
+				if (now() - finishedAt < AUTO_MERGE_RETRY_COOLDOWN_MS) {
+					return { action: "waiting", reason: "same_identity_cooldown" };
+				}
 			}
 		}
 		// Fence: durable per-PR / head-ref reservation. A short CAS — the

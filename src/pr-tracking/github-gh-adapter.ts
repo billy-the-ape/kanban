@@ -562,23 +562,11 @@ export class GitHubGhAdapter {
 			if (status === 404) {
 				return { kind: "failed", failure: { category: "not_found", message: detail, at } };
 			}
-			if (status === 429) {
-				const resetAt = await this.fetchRateLimitReset();
-				return {
-					kind: "failed",
-					failure: {
-						category: "rate_limit",
-						message: detail,
-						at,
-						...(resetAt !== null ? { rateLimitResetAt: resetAt } : {}),
-					},
-				};
-			}
-			if (status === 403 && /rate limit|abuse|secondary/i.test(result.stderr)) {
-				// GitHub also answers SECONDARY rate limits with 403: a
-				// transient throttle, not a permission denial. Classify it as
-				// rate_limit so the caller treats it as waiting, never a
-				// terminal needs_attention.
+			if (status === 429 || (status === 403 && /rate limit|abuse|secondary/i.test(result.stderr))) {
+				// 429 is the primary rate limit. GitHub also answers SECONDARY
+				// rate limits with 403: a transient throttle, not a permission
+				// denial. Both are rate_limit so the caller treats them as
+				// waiting, never a terminal needs_attention.
 				const resetAt = await this.fetchRateLimitReset();
 				return {
 					kind: "failed",
