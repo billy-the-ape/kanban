@@ -150,7 +150,7 @@ export function deriveAutoMergeStatus(
 		return {
 			label: "merged",
 			tone: "success",
-			detail: attempt.mergeCommitSha !== null ? `Merged as ${attempt.mergeCommitSha.slice(0, 7)}` : null,
+			detail: attempt.mergeCommitSha !== null ? `Merged as ${shortSha(attempt.mergeCommitSha)}` : null,
 			verifiedAt,
 			headSha,
 		};

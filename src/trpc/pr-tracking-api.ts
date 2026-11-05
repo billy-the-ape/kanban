@@ -1168,7 +1168,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		}): boolean =>
 			entry.conclusion === "success" &&
 			entry.sha === envelope.headSha &&
-			String(entry.runId) !== "0" &&
+			entry.runId !== "0" &&
 			entry.sourceId !== null;
 		for (const entry of envelope.checks) {
 			if (!observed(entry)) {

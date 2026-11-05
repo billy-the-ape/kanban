@@ -13,6 +13,7 @@ import type {
 import { LocalStorageKey } from "@/storage/local-storage-store";
 import { TERMINAL_THEME_COLORS } from "@/terminal/theme-colors";
 import type { BoardCard, BoardColumn, CardSelection } from "@/types";
+import { toCanonicalPrKeyForLink } from "@/utils/pr-tracking";
 
 const trpcClientMocks = vi.hoisted(() => ({
 	addTaskPullRequest: vi.fn(),
@@ -22,6 +23,7 @@ const trpcClientMocks = vi.hoisted(() => ({
 	refreshTaskPullRequestEntry: vi.fn(),
 	refreshLinkedTaskPullRequests: vi.fn(),
 	getTaskTrackingState: vi.fn(),
+	selectTaskAutomationPr: vi.fn(),
 }));
 
 vi.mock("@/runtime/trpc-client", () => ({
@@ -35,6 +37,7 @@ vi.mock("@/runtime/trpc-client", () => ({
 			refreshLinkedTaskPullRequests: { mutate: trpcClientMocks.refreshLinkedTaskPullRequests },
 			prTracking: {
 				getTaskTrackingState: { query: trpcClientMocks.getTaskTrackingState },
+				selectTaskAutomationPr: { mutate: trpcClientMocks.selectTaskAutomationPr },
 			},
 		},
 	}),
@@ -1389,6 +1392,7 @@ describe("TaskPrTrackingPanel (PRs view)", () => {
 		trpcClientMocks.refreshTaskPullRequestEntry.mockReset();
 		trpcClientMocks.refreshLinkedTaskPullRequests.mockReset();
 		trpcClientMocks.getTaskTrackingState.mockReset();
+		trpcClientMocks.selectTaskAutomationPr.mockReset();
 		previousActEnvironment = (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
 			.IS_REACT_ACT_ENVIRONMENT;
 		(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -1433,6 +1437,32 @@ describe("TaskPrTrackingPanel (PRs view)", () => {
 		// scope reads the tracking state and renders the settings block.
 		expect(container.querySelector('[data-testid="task-pr-view-settings-title"]')).not.toBeNull();
 		expect(trpcClientMocks.getTaskTrackingState).toHaveBeenCalledWith({ taskId: "task-1" });
+	});
+
+	it("persists the sole linked PR through the selector while no explicit selection exists", async () => {
+		const link = createTaskPullRequest(12);
+		trpcClientMocks.getTaskTrackingState.mockResolvedValue(createTrackingState());
+		await act(async () => {
+			renderPanel({ pullRequests: [link] });
+		});
+
+		// With no explicit selection, the controlled select starts at the
+		// placeholder (not at the implicitly-resolved sole link), so picking
+		// the linked PR fires a change and persists the selection.
+		const select = container.querySelector('[aria-label="Automation PR"]') as HTMLSelectElement | null;
+		if (select === null) {
+			throw new Error("Automation PR selector is not rendered");
+		}
+		expect(select.value).toBe("");
+		const prKey = toCanonicalPrKeyForLink(link);
+		if (prKey === null) {
+			throw new Error("expected a canonical PR key for the linked PR");
+		}
+		await act(async () => {
+			select.value = prKey;
+			select.dispatchEvent(new Event("change", { bubbles: true }));
+		});
+		expect(trpcClientMocks.selectTaskAutomationPr).toHaveBeenCalledWith({ taskId: "task-1", prKey });
 	});
 
 	it("renders stored links with metadata and order, without a provider round-trip", async () => {
