@@ -3792,6 +3792,46 @@ export const autoMergePolicyUpdateResponseSchema = z.object({
 });
 export type AutoMergePolicyUpdateResponse = z.infer<typeof autoMergePolicyUpdateResponseSchema>;
 
+// ── AM-5: operator-facing check-name suggestions (read-only) ────────────────
+
+/** One observed check name with the evidence sources that reported it. */
+export const autoMergeCheckCandidateSchema = z.object({
+	/** Exact (case-sensitive) GitHub check-run `name` / status `context`. */
+	name: z.string().min(1),
+	/** The effective evidence sources carrying this name (check_run, commit_status). */
+	sources: z.array(z.enum(["check_run", "commit_status"])).min(1),
+});
+export type AutoMergeCheckCandidate = z.infer<typeof autoMergeCheckCandidateSchema>;
+
+export const autoMergeCheckCandidatesRequestSchema = z.object({
+	taskId: z.string().min(1),
+});
+export type AutoMergeCheckCandidatesRequest = z.infer<typeof autoMergeCheckCandidatesRequestSchema>;
+
+/**
+ * AM-5: operator confirmation aid for configuring a repository CI policy.
+ * Suggests the exact check names observed on the task's selected Automation
+ * PR's current head from one bounded, coalesced evidence read. Suggestions
+ * only: the operator must confirm names before saving a policy (no
+ * autofill, no write here).
+ */
+export const autoMergeCheckCandidatesResponseSchema = z.object({
+	ok: z.boolean(),
+	/** Normalized repository of the selected PR (the policy key); null on failure. */
+	repository: z.string().nullable(),
+	/** Suggested names, sorted, deduplicated by exact name. */
+	candidates: z.array(autoMergeCheckCandidateSchema),
+	/** Head SHA the candidates were observed on (null when unknown). */
+	headSha: z.string().nullable(),
+	checkedAt: z.number().nullable(),
+	/**
+	 * "missing_task" | "no_selected_pr" | "ambiguous_selection" |
+	 * "unsupported_host" | "coordinator_unavailable" | "evidence_incomplete".
+	 */
+	error: z.string().nullable(),
+});
+export type AutoMergeCheckCandidatesResponse = z.infer<typeof autoMergeCheckCandidatesResponseSchema>;
+
 // ── AM-2: transient auto-merge evidence envelopes (read-only) ───────────────
 
 /**
@@ -4055,6 +4095,12 @@ export const runtimeTaskTrackingStateResponseSchema = z.object({
 	 * this task's binding (null until the first evaluation while opted in).
 	 */
 	autoMergeEligibility: autoMergeEligibilitySummarySchema.nullable().optional(),
+	/**
+	 * AM-5: the durable AM-4 auto-merge attempt journal for this task's
+	 * binding (null while no attempt was journaled). Read-only: the browser
+	 * never writes the journal; the server-side executor owns it.
+	 */
+	autoMergeAttempt: autoMergeAttemptSchema.nullable().optional(),
 	error: z.string().nullable(),
 });
 export type RuntimeTaskTrackingStateResponse = z.infer<typeof runtimeTaskTrackingStateResponseSchema>;

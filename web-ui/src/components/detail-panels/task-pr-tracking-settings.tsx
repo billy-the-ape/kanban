@@ -14,6 +14,7 @@ import type { RuntimeTaskPullRequest, RuntimeTaskTrackingStateResponse } from "@
 import type { BoardCard } from "@/types";
 import { toCanonicalPrKeyForLink } from "@/utils/pr-tracking";
 import { TaskPrCommentHandlingPanel } from "../task-pr-comment-handling-panel";
+import { TaskPrAutoMergeSettings } from "./task-pr-auto-merge-settings";
 
 function prLabel(link: RuntimeTaskPullRequest): string {
 	return `${link.repository}#${link.number}`;
@@ -173,6 +174,7 @@ export function TaskPrTrackingSettings({
 						)
 					}
 				/>
+				<TaskPrAutoMergeSettings workspaceId={workspaceId} taskId={taskId} tracking={tracking} refetch={refetch} />
 			</div>
 
 			{mergeStatusLine ? <div className="mt-2 text-xs text-text-secondary">{mergeStatusLine}</div> : null}
