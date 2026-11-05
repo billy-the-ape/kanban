@@ -1,6 +1,6 @@
 // AM-5: the repository CI policy affordance for the task's selected
 // Automation PR. Shows the configured required check names, merge method
-// and armed revision; lets the operator configure the durable policy
+// and policy revision; lets the operator configure the durable policy
 // (revision-checked); and suggests the exact check names OBSERVED on the
 // PR's current head from one bounded server-side evidence read.
 // Suggestions only: nothing is saved until the operator confirms.

@@ -156,18 +156,23 @@ describe("deriveAutoMergeStatus", () => {
 		expect(status?.detail).toContain("3333333");
 	});
 
-	it("reports an in-flight fenced merge from the attempting journal", () => {
+	it("reports an in-flight fenced merge from an identity-matched attempting journal", () => {
 		const status = deriveAutoMergeStatus(
-			makeTracking({ autoMergeWhenApproved: true, autoMergeAttempt: makeAttempt("attempting") }),
+			makeTracking({
+				autoMergeWhenApproved: true,
+				autoMergeEligibility: makeSummary("eligible", []),
+				autoMergeAttempt: makeAttempt("attempting"),
+			}),
 			NOW,
 		);
 		expect(status?.label).toBe("merging");
 	});
 
-	it("reports needs attention with the humanized journal reason", () => {
+	it("reports needs attention with the humanized journal reason for the same evidence identity", () => {
 		const status = deriveAutoMergeStatus(
 			makeTracking({
 				autoMergeWhenApproved: true,
+				autoMergeEligibility: makeSummary("blocked", ["github_denied"]),
 				autoMergeAttempt: makeAttempt("needs_attention", { reason: "merge write failed: gh api error" }),
 			}),
 			NOW,
@@ -176,10 +181,57 @@ describe("deriveAutoMergeStatus", () => {
 		expect(status?.detail).toBe("merge write failed: gh api error");
 	});
 
-	it("maps a known journal reason code to operator text", () => {
+	it("ignores a journal entry from an older head in favor of the current summary", () => {
+		const staleAttempt = makeAttempt("needs_attention", {
+			headSha: "9999999999999999999999999999999999999999",
+			reason: "github_denied:http_403",
+		});
 		const status = deriveAutoMergeStatus(
 			makeTracking({
 				autoMergeWhenApproved: true,
+				autoMergeEligibility: makeSummary("waiting", ["check_pending"]),
+				autoMergeAttempt: staleAttempt,
+			}),
+			NOW,
+		);
+		expect(status?.label).toBe("waiting: CI");
+		expect(status?.headSha).toBe(HEAD_SHA);
+	});
+
+	it("ignores a journal entry from an older policy revision in favor of the current summary", () => {
+		const staleAttempt = makeAttempt("waiting", { policyRevision: 2, reason: "head_changed" });
+		const status = deriveAutoMergeStatus(
+			makeTracking({
+				autoMergeWhenApproved: true,
+				autoMergeEligibility: makeSummary("blocked", ["policy_mismatch"]),
+				autoMergeAttempt: staleAttempt,
+			}),
+			NOW,
+		);
+		expect(status?.label).toBe("blocked");
+		expect(status?.detail).toContain("policy changed after arming");
+	});
+
+	it("never shows a stale attempting journal as merging", () => {
+		const staleAttempt = makeAttempt("attempting", {
+			headSha: "9999999999999999999999999999999999999999",
+		});
+		const status = deriveAutoMergeStatus(
+			makeTracking({
+				autoMergeWhenApproved: true,
+				autoMergeEligibility: makeSummary("waiting", ["check_pending"]),
+				autoMergeAttempt: staleAttempt,
+			}),
+			NOW,
+		);
+		expect(status?.label).toBe("waiting: CI");
+	});
+
+	it("maps a known journal reason code to operator text when the identity matches", () => {
+		const status = deriveAutoMergeStatus(
+			makeTracking({
+				autoMergeWhenApproved: true,
+				autoMergeEligibility: makeSummary("waiting", ["check_pending"]),
 				autoMergeAttempt: makeAttempt("waiting", { reason: "head_changed" }),
 			}),
 			NOW,

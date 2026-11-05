@@ -99,7 +99,7 @@ export function TaskPrAutoMergeSettings({
 				: policy === null
 					? "Configure the repository CI policy below first."
 					: mismatch
-						? `The repository policy changed after arming (armed revision ${armedRevision}, current ${policy?.revision ?? "?"}); toggle the checkbox off and on to re-arm.`
+						? `The repository policy changed after arming (armed revision ${armedRevision}, current ${policy.revision}); toggle the checkbox off and on to re-arm.`
 						: null;
 
 	const applyAutoMergeSetting = async (next: boolean): Promise<void> => {
@@ -143,7 +143,10 @@ export function TaskPrAutoMergeSettings({
 				<input
 					type="checkbox"
 					checked={tracking.autoMergeWhenApproved}
-					disabled={!canArm || acting}
+					// Arming preconditions gate turning the setting ON only; a checked
+					// box is always clickable so the operator can disarm and re-arm
+					// even while preconditions (or the armed policy revision) drift.
+					disabled={acting || (!canArm && !tracking.autoMergeWhenApproved)}
 					onChange={(event) => {
 						const next = event.target.checked;
 						if (next) {

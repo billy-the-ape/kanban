@@ -121,12 +121,17 @@ function blockerMessages(codes: readonly string[], limit: number): string {
  * Derive the operator-facing auto-merge status for one tracking state.
  * Returns null when the task has not opted in ("off" is the checkbox state).
  *
- * Precedence (all server-persisted): the AM-4 attempt journal (merged /
- * needs-attention / in-flight write / retry-waiting) > the AM-3 eligibility
- * summary (blocked / waiting-by-category / eligible). An eligible summary
- * older than the evidence budget is never shown as merging: the executor
- * only ever merged from a fresh evaluation, so a stale summary means the
- * next verification is pending.
+ * Precedence (all server-persisted): the AM-4 attempt journal > the AM-3
+ * eligibility summary — but only when the journal belongs to the SAME
+ * evidence identity the summary describes (head SHA, base SHA, policy
+ * revision), exactly as the executor treats `needs_attention`/`waiting`
+ * journal entries as binding only for their own attemptId. A journal entry
+ * left over from an older head/policy revision must never paint the new
+ * evidence red or "merging". `merged_confirmed` is unconditional: once
+ * GitHub confirms the merge for a task, that is the state. An eligible
+ * summary older than the evidence budget is never shown as merging: the
+ * executor only ever merged from a fresh evaluation, so a stale summary
+ * means the next verification is pending.
  */
 export function deriveAutoMergeStatus(
 	tracking: RuntimeTaskTrackingStateResponse,
@@ -150,7 +155,18 @@ export function deriveAutoMergeStatus(
 			headSha,
 		};
 	}
-	if (attempt?.state === "needs_attention") {
+	// A journal entry only overrides the current eligibility summary when it
+	// describes the SAME evidence (head SHA, base SHA, policy revision). The
+	// executor treats needs_attention/waiting entries as binding only for
+	// their own attemptId, so an entry left over from an older head or policy
+	// revision must fall through to the summary.
+	const attemptMatchesCurrentEvidence =
+		attempt !== null &&
+		summary !== null &&
+		attempt.headSha === summary.headSha &&
+		attempt.baseSha === summary.baseSha &&
+		attempt.policyRevision === summary.policyRevision;
+	if (attemptMatchesCurrentEvidence && attempt.state === "needs_attention") {
 		return {
 			label: "needs attention",
 			tone: "danger",
@@ -159,10 +175,10 @@ export function deriveAutoMergeStatus(
 			headSha,
 		};
 	}
-	if (attempt?.state === "attempting") {
+	if (attemptMatchesCurrentEvidence && attempt.state === "attempting") {
 		return { label: "merging", tone: "warning", detail: "The fenced merge write is in flight.", verifiedAt, headSha };
 	}
-	if (attempt?.state === "waiting") {
+	if (attemptMatchesCurrentEvidence && attempt.state === "waiting") {
 		return {
 			label: "waiting",
 			tone: "warning",
