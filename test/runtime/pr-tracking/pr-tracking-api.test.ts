@@ -461,6 +461,108 @@ describe("pr-tracking api: operator force release authorization", () => {
 		expect(current.record.reservation.reservedBy).toEqual(OTHER_TASK);
 	});
 });
+describe("pr-tracking api: the auto-merge fence is exclusive to the server-side executor (AM-4)", () => {
+	beforeEach(() => {
+		workspaceStateMocks.loadWorkspaceBoardById.mockReset();
+		workspaceStateMocks.mutateWorkspaceState.mockReset();
+	});
+
+	async function seedAutoMergeFence(harness: ApiHarness) {
+		await harness.store.createRecord(RECORD_IDENTITY);
+		const loaded = await harness.store.loadRecord(PR_KEY);
+		if (!loaded.ok) {
+			throw new Error("record missing");
+		}
+		await harness.store.updateRecord(PR_KEY, loaded.record.revision, (record) => ({
+			...record,
+			revision: record.revision + 1,
+			updatedAt: 1,
+			snapshots: {
+				"scope-1": {
+					accessScopeId: "scope-1",
+					checkedAt: 1,
+					state: "open" as const,
+					headRepository: "cline/kanban",
+					headRef: "feat/x",
+					baseRepository: "cline/kanban",
+					baseRef: "main",
+					headSha: null,
+					mergedAt: null,
+					mergeCommitSha: null,
+				},
+			},
+		}));
+		// The executor's fence, held by the SAME task the browser caller
+		// uses: without the guard, the non-force `heldByCaller` check would
+		// pass and clear the durable fence mid-merge.
+		const reserved = await reservePrOperation(
+			harness.store,
+			PR_KEY,
+			"auto_merge",
+			{
+				workspaceId: WORKSPACE_ID,
+				taskId: OPERATOR_TASK_ID,
+			},
+			{ requireOwner: false },
+		);
+		if (reserved.status !== "reserved") {
+			throw new Error(`expected auto_merge reservation, got ${reserved.status}: ${reserved.detail ?? ""}`);
+		}
+	}
+
+	it("refuses a non-force browser release of the auto_merge fence", async () => {
+		const board = makeBoard(makeCard());
+		mockWorkspaceState(board);
+		const harness = createHarness(board);
+		await seedAutoMergeFence(harness);
+
+		const result = await harness.api.releasePrOperation(SCOPE, {
+			taskId: OPERATOR_TASK_ID,
+			operation: "auto_merge",
+		});
+		expect(result.ok).toBe(false);
+		expect(result.status).toBe("blocked");
+		// The durable fence is untouched.
+		const current = await harness.store.loadRecord(PR_KEY);
+		expect(current.ok).toBe(true);
+		if (current.ok) {
+			expect(current.record.reservation.state).toBe("reserved");
+			expect(current.record.reservation.reservedBy).toEqual({
+				workspaceId: WORKSPACE_ID,
+				taskId: OPERATOR_TASK_ID,
+			});
+		}
+	});
+
+	it("refuses a force browser release of the auto_merge fence even when the holder looks exited", async () => {
+		const board = makeBoard(makeCard());
+		mockWorkspaceState(board);
+		// writerActive: false — the holder-exit probe would have permitted
+		// the force takeover without the guard.
+		const harness = createHarness(board, { writerActive: false });
+		await seedAutoMergeFence(harness);
+		const loaded = await harness.store.loadRecord(PR_KEY);
+		if (!loaded.ok) {
+			throw new Error("record missing");
+		}
+
+		const result = await harness.api.releasePrOperation(SCOPE, {
+			taskId: OPERATOR_TASK_ID,
+			operation: "auto_merge",
+			force: true,
+			expectedHolder: { workspaceId: WORKSPACE_ID, taskId: OPERATOR_TASK_ID },
+			expectedFencingGeneration: loaded.record.reservation.fencingGeneration,
+		});
+		expect(result.ok).toBe(false);
+		expect(result.status).toBe("blocked");
+		const current = await harness.store.loadRecord(PR_KEY);
+		expect(current.ok).toBe(true);
+		if (current.ok) {
+			expect(current.record.reservation.state).toBe("reserved");
+		}
+	});
+});
+
 // AM-1: per-repository auto-merge policy procedures.
 describe("pr-tracking api: auto-merge policy (AM-1)", () => {
 	beforeEach(() => {

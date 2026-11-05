@@ -106,6 +106,14 @@ function sameTask(a: GitHubPrTaskIdentity | null, b: PrOperationTask): boolean {
  *     this PR (verified at the API layer from the caller's card — the two
  *     consumers are independent, and a merge-only task is never a repair
  *     owner).
+ *   - `auto_merge` (AM-4) is reserved by the fenced merge executor only —
+ *     never via the browser API. It is not repair-owner-gated (the
+ *     eligibility re-validation under the reservation is the gate). The
+ *     held `auto_merge` reservation serializes against `merge_completion`
+ *     through the PR gate: the merge-completion consumer stays pending while
+ *     the merge write is in flight, then reserves its own operation after the
+ *     merge is observed. Distinct PRs on the same remote head branch
+ *     serialize through the head-ref gate.
  *
  * The head-ref write gate is keyed by the RECORD's verified head mapping
  * (`getRecordHeadMapping`), never by caller-supplied values: a record without

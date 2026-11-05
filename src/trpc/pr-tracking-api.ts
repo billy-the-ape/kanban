@@ -874,6 +874,17 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		if (!context.ok) {
 			return { ok: false, status: "blocked", reservation: toReservationView(null), error: context.reason };
 		}
+		// AM-4: the fenced merge write is exclusive to the server-side
+		// auto-merge executor; the browser can neither reserve nor trigger an
+		// auto merge.
+		if (input.operation === "auto_merge") {
+			return {
+				ok: false,
+				status: "blocked",
+				reservation: toReservationView(context.record),
+				error: "Auto-merge is reserved exclusively by the server-side auto-merge executor.",
+			};
+		}
 		const result = await reservePrOperation(
 			deps.getPrTrackingStore(),
 			context.prKey,
@@ -930,6 +941,18 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		const context = await resolveRecordContext(scope, input.taskId);
 		if (!context.ok) {
 			return { ok: false, status: "blocked", reservation: toReservationView(null), error: context.reason };
+		}
+		// AM-4: the `auto_merge` fence is exclusively owned by the
+		// server-side executor: the browser can neither reserve nor release
+		// it (a same-task non-force release would pass `heldByCaller`, and
+		// the force liveness probe cannot see the in-process executor).
+		if (input.operation === "auto_merge") {
+			return {
+				ok: false,
+				status: "blocked",
+				reservation: toReservationView(context.record),
+				error: "Auto-merge is reserved exclusively by the server-side auto-merge executor.",
+			};
 		}
 		const force = input.force === true;
 		if (force) {

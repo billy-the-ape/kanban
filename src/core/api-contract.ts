@@ -3480,6 +3480,52 @@ export const autoMergeEligibilitySummarySchema = z
 	.passthrough();
 export type AutoMergeEligibilitySummary = z.infer<typeof autoMergeEligibilitySummarySchema>;
 
+/** Merge methods the GitHub merge API accepts (AM-1 policy + AM-4 attempt). */
+export const autoMergePolicyMergeMethodSchema = z.enum(["merge", "squash", "rebase"]);
+export type AutoMergePolicyMergeMethod = z.infer<typeof autoMergePolicyMergeMethodSchema>;
+
+// ── AM-4: durable auto-merge attempt journal ─────────────────────────────────
+
+export const AUTO_MERGE_ATTEMPT_SCHEMA_VERSION = 1;
+
+/**
+ * AM-4: attempt states: `attempting` (journal persisted before the GitHub
+ * call; an unknown outcome stays blocked) → `merged_confirmed` (a remote
+ * observation verified the merge) | `waiting` (precondition drift; ordinary
+ * polling resumes) | `needs_attention` (terminal; operator action required).
+ */
+export const autoMergeAttemptStateSchema = z.enum(["attempting", "merged_confirmed", "waiting", "needs_attention"]);
+export type AutoMergeAttemptState = z.infer<typeof autoMergeAttemptStateSchema>;
+
+/**
+ * AM-4: the small durable journal entry persisted on the task binding
+ * BEFORE the merge call. One attempt per immutable evidence identity
+ * (`canonicalPrKey`, head SHA, base SHA, policy revision) — a retry for the
+ * same identity updates this entry instead of appending. Never holds
+ * secrets or review bodies: evidence SHAs and blocker codes only.
+ */
+export const autoMergeAttemptSchema = z
+	.object({
+		schemaVersion: z.literal(AUTO_MERGE_ATTEMPT_SCHEMA_VERSION),
+		/** SHA-256 of `${canonicalPrKey}|${headSha}|${baseSha}|${policyRevision}`. */
+		attemptId: z.string().min(1),
+		canonicalPrKey: z.string().min(1),
+		headSha: z.string().min(1),
+		baseSha: z.string().min(1),
+		policyRevision: z.number().int().nonnegative(),
+		mergeMethod: autoMergePolicyMergeMethodSchema,
+		/** First attempt start for this identity (durable audit timestamp). */
+		startedAt: z.number(),
+		state: autoMergeAttemptStateSchema,
+		/** Blocker code, failure category, or confirmation message. */
+		reason: z.string().nullable(),
+		/** The remote-confirmed merge commit (merged_confirmed only). */
+		mergeCommitSha: z.string().nullable(),
+		finishedAt: z.number().nullable(),
+	})
+	.passthrough();
+export type AutoMergeAttempt = z.infer<typeof autoMergeAttemptSchema>;
+
 /** Durable replay cursors live on each task binding, per consumer kind. */
 export const githubPrReplayCursorsSchema = z
 	.object({
@@ -3536,6 +3582,11 @@ export const githubPrTaskBindingSchema = z
 		 * (a projection of the last pure evaluation). Absent on older records.
 		 */
 		autoMerge: autoMergeEligibilitySummarySchema.nullable().optional(),
+		/**
+		 * AM-4: the durable auto-merge attempt journal for this task binding
+		 * (one entry per immutable evidence identity). Absent on older records.
+		 */
+		autoMergeAttempt: autoMergeAttemptSchema.nullable().optional(),
 		replayCursors: githubPrReplayCursorsSchema,
 	})
 	.passthrough();
@@ -3682,10 +3733,6 @@ export const runtimeTaskPrSettingsResponseSchema = z.object({
 export type RuntimeTaskPrSettingsResponse = z.infer<typeof runtimeTaskPrSettingsResponseSchema>;
 
 // ── AM-1: per-repository auto-merge policy ───────────────────────────────────
-
-/** Merge methods the GitHub merge API accepts for the policy. */
-export const autoMergePolicyMergeMethodSchema = z.enum(["merge", "squash", "rebase"]);
-export type AutoMergePolicyMergeMethod = z.infer<typeof autoMergePolicyMergeMethodSchema>;
 
 /**
  * AM-1: the small versioned policy for one normalized canonical GitHub
@@ -4133,7 +4180,7 @@ export type RuntimePrRepairOwnerResponse = z.infer<typeof runtimePrRepairOwnerRe
 
 // ── Fenced operation reservations ────────────────────────────────────────────
 
-export const runtimePrOperationKindSchema = z.enum(["comment_followup", "merge_completion"]);
+export const runtimePrOperationKindSchema = z.enum(["comment_followup", "merge_completion", "auto_merge"]);
 export type RuntimePrOperationKind = z.infer<typeof runtimePrOperationKindSchema>;
 
 export const runtimePrOperationReservationRequestSchema = z.object({
