@@ -179,7 +179,11 @@ export function TaskPrTrackingSettings({
 
 			{mergeStatusLine ? <div className="mt-2 text-xs text-text-secondary">{mergeStatusLine}</div> : null}
 
-			{selectionCandidates.length > 1 ? (
+			{/* The selector also shows for a single linked PR while there is no
+			explicit selection: persisting it is required before arming
+			auto-merge (a sole link alone does not count as selected). */}
+			{selectionCandidates.length > 1 ||
+			(selectionCandidates.length === 1 && tracking.explicitAutomationPrKey === null) ? (
 				<div className="mt-2 flex items-center gap-2 text-xs text-text-secondary">
 					<span>Automation PR</span>
 					<select

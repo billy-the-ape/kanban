@@ -3817,7 +3817,7 @@ export type AutoMergeCheckCandidatesRequest = z.infer<typeof autoMergeCheckCandi
  */
 export const autoMergeCheckCandidatesResponseSchema = z.object({
 	ok: z.boolean(),
-	/** Normalized repository of the selected PR (the policy key); null on failure. */
+	/** Normalized repository of the selected PR (the policy key); null when the selected PR cannot be resolved. */
 	repository: z.string().nullable(),
 	/** Suggested names, sorted, deduplicated by exact name. */
 	candidates: z.array(autoMergeCheckCandidateSchema),
@@ -4037,6 +4037,15 @@ export const runtimeTaskTrackingStateResponseSchema = z.object({
 	/** AM-1: the repository policy revision the opt-in is armed against (null = not armed). */
 	armedAutoMergePolicyRevision: z.number().nullable(),
 	selectedAutomationPrKey: z.string().nullable(),
+	/**
+	 * AM-5: the card's EXPLICIT Automation PR selection (the raw persisted
+	 * field, validated against the linked PRs). Null when unset or stale —
+	 * a sole linked PR alone does not count as selected. The arming write
+	 * requires an explicit selection, so the UI gates the auto-merge checkbox
+	 * on this (not on `selectedAutomationPrKey`, which also resolves a sole
+	 * link implicitly).
+	 */
+	explicitAutomationPrKey: z.string().nullable(),
 	/** Eligible for live PR tracking (active card + selected/sole link + installed enabled consumer). */
 	eligible: z.boolean(),
 	/**

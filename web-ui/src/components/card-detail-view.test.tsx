@@ -1344,6 +1344,7 @@ describe("TaskPrTrackingPanel (PRs view)", () => {
 			autoMergeWhenApproved: false,
 			armedAutoMergePolicyRevision: null,
 			selectedAutomationPrKey: null,
+			explicitAutomationPrKey: null,
 			eligible: false,
 			legacyCompletionGated: false,
 			mergeFinishesInReview: false,

@@ -19,6 +19,7 @@ function makeTracking(overrides: Partial<RuntimeTaskTrackingStateResponse> = {})
 		autoMergeWhenApproved: false,
 		armedAutoMergePolicyRevision: null,
 		selectedAutomationPrKey: null,
+		explicitAutomationPrKey: null,
 		eligible: false,
 		legacyCompletionGated: false,
 		mergeFinishesInReview: false,

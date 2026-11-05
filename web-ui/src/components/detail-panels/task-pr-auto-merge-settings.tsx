@@ -67,6 +67,11 @@ export function TaskPrAutoMergeSettings({
 	const [armingError, setArmingError] = useState<string | null>(null);
 
 	const selectedKey = tracking.selectedAutomationPrKey;
+	// The arming write requires an EXPLICIT selection (a sole linked PR
+	// alone does not count), so the checkbox gates on the explicit one —
+	// `selectedAutomationPrKey` also resolves a sole link implicitly and
+	// would over-claim when the explicit field is unset.
+	const explicitKey = tracking.explicitAutomationPrKey;
 	const repository = repositoryFromCanonicalPrKey(selectedKey);
 	const ambiguous = tracking.blockers.some((blocker) => blocker.kind === "ambiguous_selection");
 
@@ -89,10 +94,10 @@ export function TaskPrAutoMergeSettings({
 	// explicit re-arm).
 	const policyKnown = workspaceId !== null && repository !== null && !policyQuery.isLoading;
 	const mismatch = policyKnown && policy !== null && armedRevision !== null && armedRevision !== policy.revision;
-	const canArm = selectedKey !== null && !ambiguous && policyKnown && policy !== null && !mismatch;
+	const canArm = explicitKey !== null && !ambiguous && policyKnown && policy !== null && !mismatch;
 	const armingDisabledReason = ambiguous
 		? "Select the Automation PR before enabling auto-merge."
-		: selectedKey === null
+		: explicitKey === null
 			? "Record and select an Automation PR before enabling auto-merge."
 			: !policyKnown
 				? null

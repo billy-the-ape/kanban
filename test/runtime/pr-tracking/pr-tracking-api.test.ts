@@ -271,6 +271,36 @@ describe("pr-tracking api: tracking-state diagnostics", () => {
 		expect(state.owner?.state).toBe("active");
 		expect(state.blockers.some((blocker) => blocker.kind === "owner_deleted")).toBe(false);
 	});
+
+	it("does not treat a sole linked PR as an explicit selection", async () => {
+		// The resolved key falls back to the sole link, but the EXPLICIT
+		// selection stays null — the arming write requires an explicit one.
+		const board = makeBoard(makeCard());
+		mockWorkspaceState(board);
+		const harness = createHarness(board);
+
+		const state = await harness.api.getTaskTrackingState(SCOPE, { taskId: OPERATOR_TASK_ID });
+		expect(state.selectedAutomationPrKey).toBe(PR_KEY);
+		expect(state.explicitAutomationPrKey).toBeNull();
+	});
+
+	it("exposes a valid explicit selection verbatim", async () => {
+		const board = makeBoard(makeCard({ selectedAutomationPrKey: PR_KEY }));
+		mockWorkspaceState(board);
+		const harness = createHarness(board);
+
+		const state = await harness.api.getTaskTrackingState(SCOPE, { taskId: OPERATOR_TASK_ID });
+		expect(state.explicitAutomationPrKey).toBe(PR_KEY);
+	});
+
+	it("treats an explicit selection that no longer matches a link as unset", async () => {
+		const board = makeBoard(makeCard({ selectedAutomationPrKey: "github|github.com|cline/kanban|99" }));
+		mockWorkspaceState(board);
+		const harness = createHarness(board);
+
+		const state = await harness.api.getTaskTrackingState(SCOPE, { taskId: OPERATOR_TASK_ID });
+		expect(state.explicitAutomationPrKey).toBeNull();
+	});
 });
 
 describe("pr-tracking api: settings writes", () => {

@@ -57,6 +57,7 @@ import { evaluatePrLifecycleGate } from "../pr-tracking/pr-lifecycle-gate";
 import {
 	assignRepairOwner,
 	findTaskCard,
+	getCardLinkedPrKeys,
 	listRepairOwnerCandidates,
 	type PrBoardSnapshot,
 	resolveCardAutomationPrKey,
@@ -423,6 +424,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 				autoMergeWhenApproved: false,
 				armedAutoMergePolicyRevision: null,
 				selectedAutomationPrKey: null,
+				explicitAutomationPrKey: null,
 				eligible: false,
 				legacyCompletionGated: false,
 				mergeFinishesInReview: false,
@@ -552,6 +554,10 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			autoMergeWhenApproved: card.autoMergeWhenApproved === true,
 			armedAutoMergePolicyRevision: card.armedAutoMergePolicyRevision ?? null,
 			selectedAutomationPrKey: resolved.key,
+			explicitAutomationPrKey:
+				card.selectedAutomationPrKey && getCardLinkedPrKeys(card).includes(card.selectedAutomationPrKey)
+					? card.selectedAutomationPrKey
+					: null,
 			eligible,
 			legacyCompletionGated: gate.legacyCompletionGated,
 			mergeFinishesInReview: gate.mergeFinishesInReview,
