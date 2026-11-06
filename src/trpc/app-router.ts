@@ -6,6 +6,8 @@ import { initTRPC, TRPCError } from "@trpc/server";
 import { z } from "zod";
 
 import type {
+	AutoMergeCheckCandidatesRequest,
+	AutoMergeCheckCandidatesResponse,
 	AutoMergePolicyGetRequest,
 	AutoMergePolicyGetResponse,
 	AutoMergePolicyUpdateRequest,
@@ -170,6 +172,8 @@ import type {
 	RuntimeWorktreeEnsureResponse,
 } from "../core/api-contract";
 import {
+	autoMergeCheckCandidatesRequestSchema,
+	autoMergeCheckCandidatesResponseSchema,
 	autoMergePolicyGetRequestSchema,
 	autoMergePolicyGetResponseSchema,
 	autoMergePolicyUpdateRequestSchema,
@@ -682,6 +686,11 @@ export interface RuntimeTrpcContext {
 			scope: RuntimeTrpcWorkspaceScope,
 			input: AutoMergePolicyUpdateRequest,
 		) => Promise<AutoMergePolicyUpdateResponse>;
+		// AM-5: operator-facing check-name suggestions for policy configuration.
+		listAutoMergeCheckCandidates: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: AutoMergeCheckCandidatesRequest,
+		) => Promise<AutoMergeCheckCandidatesResponse>;
 		getTaskPrSnapshot: (
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimePrAuthorizedSnapshotRequest,
@@ -1251,6 +1260,13 @@ export const runtimeAppRouter = t.router({
 				.output(autoMergePolicyUpdateResponseSchema)
 				.mutation(async ({ ctx, input }) => {
 					return await ctx.prTrackingApi.updateAutoMergePolicy(ctx.workspaceScope, input);
+				}),
+			// AM-5: operator-facing check-name suggestions for policy configuration.
+			listAutoMergeCheckCandidates: workspaceProcedure
+				.input(autoMergeCheckCandidatesRequestSchema)
+				.output(autoMergeCheckCandidatesResponseSchema)
+				.query(async ({ ctx, input }) => {
+					return await ctx.prTrackingApi.listAutoMergeCheckCandidates(ctx.workspaceScope, input);
 				}),
 			getTaskPrSnapshot: workspaceProcedure
 				.input(runtimePrAuthorizedSnapshotRequestSchema)

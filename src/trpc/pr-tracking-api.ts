@@ -11,6 +11,8 @@
 // canonical PR per access scope) and every durable mutation goes through the
 // revision-checked PR record store under the tracking-registry mutex.
 import type {
+	AutoMergeCheckCandidatesRequest,
+	AutoMergeCheckCandidatesResponse,
 	AutoMergePolicyGetRequest,
 	AutoMergePolicyGetResponse,
 	AutoMergePolicyUpdateRequest,
@@ -55,6 +57,7 @@ import { evaluatePrLifecycleGate } from "../pr-tracking/pr-lifecycle-gate";
 import {
 	assignRepairOwner,
 	findTaskCard,
+	getCardLinkedPrKeys,
 	listRepairOwnerCandidates,
 	type PrBoardSnapshot,
 	resolveCardAutomationPrKey,
@@ -421,6 +424,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 				autoMergeWhenApproved: false,
 				armedAutoMergePolicyRevision: null,
 				selectedAutomationPrKey: null,
+				explicitAutomationPrKey: null,
 				eligible: false,
 				legacyCompletionGated: false,
 				mergeFinishesInReview: false,
@@ -433,6 +437,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 				snapshot: null,
 				terminalStop: null,
 				autoMergeEligibility: null,
+				autoMergeAttempt: null,
 				error: null,
 			};
 		}
@@ -549,6 +554,10 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			autoMergeWhenApproved: card.autoMergeWhenApproved === true,
 			armedAutoMergePolicyRevision: card.armedAutoMergePolicyRevision ?? null,
 			selectedAutomationPrKey: resolved.key,
+			explicitAutomationPrKey:
+				card.selectedAutomationPrKey && getCardLinkedPrKeys(card).includes(card.selectedAutomationPrKey)
+					? card.selectedAutomationPrKey
+					: null,
 			eligible,
 			legacyCompletionGated: gate.legacyCompletionGated,
 			mergeFinishesInReview: gate.mergeFinishesInReview,
@@ -572,6 +581,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 				? { reason: binding.terminalStop.reason, observedAt: binding.terminalStop.observedAt }
 				: null,
 			autoMergeEligibility: binding?.autoMerge ?? null,
+			autoMergeAttempt: binding?.autoMergeAttempt ?? null,
 			error: null,
 		};
 	};
@@ -1072,6 +1082,127 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 	};
 
 	/**
+	 * AM-5: operator confirmation aid for configuring a repository CI policy.
+	 * Suggests the exact check names observed on the task's selected
+	 * Automation PR's current head, from ONE bounded, coalesced evidence
+	 * read (the shared coordinator read — no new poller, no extra reads per
+	 * candidate). Suggestions only: the operator confirms names before
+	 * saving a policy. Unknown evidence yields an empty list, never green.
+	 */
+	const listAutoMergeCheckCandidates = async (
+		scope: RuntimeTrpcWorkspaceScope,
+		input: AutoMergeCheckCandidatesRequest,
+	): Promise<AutoMergeCheckCandidatesResponse> => {
+		const found = await loadScopedCard(scope, input.taskId);
+		if (!found) {
+			return { ok: false, repository: null, candidates: [], headSha: null, checkedAt: null, error: "missing_task" };
+		}
+		const resolved = resolveCardAutomationPrKey(found.card);
+		if (!resolved.key) {
+			return {
+				ok: false,
+				repository: null,
+				candidates: [],
+				headSha: null,
+				checkedAt: null,
+				error: resolved.ambiguous ? "ambiguous_selection" : "no_selected_pr",
+			};
+		}
+		const coordinator = deps.getPrTrackingCoordinator();
+		if (!coordinator) {
+			return {
+				ok: false,
+				repository: null,
+				candidates: [],
+				headSha: null,
+				checkedAt: null,
+				error: "coordinator_unavailable",
+			};
+		}
+		const parsed = parseCanonicalPrKey(resolved.key);
+		if (!parsed || parsed.provider !== "github" || parsed.host !== "github.com") {
+			return {
+				ok: false,
+				repository: parsed?.repository ?? null,
+				candidates: [],
+				headSha: null,
+				checkedAt: null,
+				error: "unsupported_host",
+			};
+		}
+		// Reuse the task's live access scope when one exists (the same scope
+		// the polls and the AM-3 observer evaluate against); the coordinator
+		// resolves a fresh scope otherwise.
+		const subscriptionState = coordinator
+			.listSubscriptions()
+			.find((entry) => entry.workspaceId === scope.workspaceId && entry.taskId === input.taskId);
+		// Coalesce with the AM-3 consumer's evidence reads when the card is
+		// armed (same PR + scope + policy revision key).
+		const policyRevision = found.card.armedAutoMergePolicyRevision ?? 0;
+		const envelope = await coordinator.readAutoMergeEvidence(resolved.key, subscriptionState?.accessScopeId, {
+			policyRevision,
+		});
+		if (!envelope.complete || envelope.headSha === null) {
+			return {
+				ok: false,
+				repository: parsed.repository,
+				candidates: [],
+				headSha: envelope.headSha,
+				checkedAt: envelope.checkedAt,
+				error: "evidence_incomplete",
+			};
+		}
+		// Suggested names: only checks that RAN and PASSED on the exact head,
+		// so the operator is not pointed at in-flight, failed, stale, or
+		// skipped checks (an unknown check name would fail closed forever
+		// once armed). Exact identity is required (runId and reporting
+		// identity); anything unknown is omitted, never guessed.
+		const byName = new Map<string, Set<"check_run" | "commit_status">>();
+		const observed = (entry: {
+			kind: "check_run" | "commit_status";
+			name: string;
+			sourceId: string | null;
+			conclusion: string | null;
+			sha: string;
+			runId: string;
+		}): boolean =>
+			entry.conclusion === "success" &&
+			entry.sha === envelope.headSha &&
+			entry.runId !== "0" &&
+			entry.sourceId !== null;
+		for (const entry of envelope.checks) {
+			if (!observed(entry)) {
+				continue;
+			}
+			const sources = byName.get(entry.name) ?? new Set<"check_run" | "commit_status">();
+			sources.add("check_run");
+			byName.set(entry.name, sources);
+		}
+		for (const entry of envelope.statuses) {
+			if (!observed(entry)) {
+				continue;
+			}
+			const sources = byName.get(entry.name) ?? new Set<"check_run" | "commit_status">();
+			sources.add("commit_status");
+			byName.set(entry.name, sources);
+		}
+		const candidates = [...byName.entries()]
+			.map(([name, sources]) => ({
+				name,
+				sources: [...sources].sort((a, b) => a.localeCompare(b)),
+			}))
+			.sort((a, b) => a.name.localeCompare(b.name));
+		return {
+			ok: true,
+			repository: parsed.repository,
+			candidates,
+			headSha: envelope.headSha,
+			checkedAt: envelope.checkedAt,
+			error: null,
+		};
+	};
+
+	/**
 	 * AM-1: read the auto-merge policy for one GitHub repository. Fails
 	 * closed: an unnormalizable repository or a malformed store reads as
 	 * "no policy" (auto-merge stays disabled). No GitHub access here — this
@@ -1137,6 +1268,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		updateTaskMergeBinding,
 		getAutoMergePolicy,
 		updateAutoMergePolicy,
+		listAutoMergeCheckCandidates,
 		selectRepairOwner: selectRepairOwnerProcedure,
 		transferRepairOwner: transferRepairOwnerProcedure,
 		reservePrOperation: reservePrOperationProcedure,

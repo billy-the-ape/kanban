@@ -21,6 +21,8 @@ vi.mock("../../../src/state/workspace-state.js", async (importOriginal) => {
 });
 
 import type {
+	AutoMergeCheckEvidence,
+	AutoMergeEvidenceEnvelope,
 	RuntimeAgentId,
 	RuntimeBoardCard,
 	RuntimeBoardColumnId,
@@ -30,7 +32,10 @@ import { AutoMergePolicyStore } from "../../../src/pr-tracking/auto-merge-policy
 import { InMemoryPrRecordStore } from "../../../src/pr-tracking/in-memory-pr-record-store";
 import { assignRepairOwner } from "../../../src/pr-tracking/pr-owner-selection";
 import { releasePrOperation, reservePrOperation } from "../../../src/pr-tracking/pr-reservations";
-import { createPrTrackingCoordinator } from "../../../src/pr-tracking/pr-tracking-coordinator";
+import {
+	createPrTrackingCoordinator,
+	type PrTrackingCoordinator,
+} from "../../../src/pr-tracking/pr-tracking-coordinator";
 import type { RuntimeTrpcWorkspaceScope } from "../../../src/trpc/app-router";
 import { createPrTrackingApi } from "../../../src/trpc/pr-tracking-api";
 
@@ -113,10 +118,12 @@ function createHarness(
 		writerActive?: boolean;
 		effectiveAgentId?: RuntimeAgentId | null;
 		policyStore?: AutoMergePolicyStore;
+		/** AM-5: swap in a fake coordinator (stubbed evidence reads); null = absent. */
+		coordinator?: PrTrackingCoordinator | null;
 	} = {},
 ): ApiHarness {
 	const store = new InMemoryPrRecordStore();
-	const coordinator = createPrTrackingCoordinator({ store });
+	const coordinator = options.coordinator !== undefined ? options.coordinator : createPrTrackingCoordinator({ store });
 	const warnings: string[] = [];
 	const policyStore =
 		options.policyStore ??
@@ -263,6 +270,36 @@ describe("pr-tracking api: tracking-state diagnostics", () => {
 		const state = await harness.api.getTaskTrackingState(SCOPE, { taskId: OPERATOR_TASK_ID });
 		expect(state.owner?.state).toBe("active");
 		expect(state.blockers.some((blocker) => blocker.kind === "owner_deleted")).toBe(false);
+	});
+
+	it("does not treat a sole linked PR as an explicit selection", async () => {
+		// The resolved key falls back to the sole link, but the EXPLICIT
+		// selection stays null — the arming write requires an explicit one.
+		const board = makeBoard(makeCard());
+		mockWorkspaceState(board);
+		const harness = createHarness(board);
+
+		const state = await harness.api.getTaskTrackingState(SCOPE, { taskId: OPERATOR_TASK_ID });
+		expect(state.selectedAutomationPrKey).toBe(PR_KEY);
+		expect(state.explicitAutomationPrKey).toBeNull();
+	});
+
+	it("exposes a valid explicit selection verbatim", async () => {
+		const board = makeBoard(makeCard({ selectedAutomationPrKey: PR_KEY }));
+		mockWorkspaceState(board);
+		const harness = createHarness(board);
+
+		const state = await harness.api.getTaskTrackingState(SCOPE, { taskId: OPERATOR_TASK_ID });
+		expect(state.explicitAutomationPrKey).toBe(PR_KEY);
+	});
+
+	it("treats an explicit selection that no longer matches a link as unset", async () => {
+		const board = makeBoard(makeCard({ selectedAutomationPrKey: "github|github.com|cline/kanban|99" }));
+		mockWorkspaceState(board);
+		const harness = createHarness(board);
+
+		const state = await harness.api.getTaskTrackingState(SCOPE, { taskId: OPERATOR_TASK_ID });
+		expect(state.explicitAutomationPrKey).toBeNull();
 	});
 });
 
@@ -719,5 +756,186 @@ describe("pr-tracking api: settings auto-merge (AM-1)", () => {
 			autoMergeWhenApproved: true,
 			armedAutoMergePolicyRevision: 2,
 		});
+	});
+
+	it("reports the durable auto-merge attempt in the tracking diagnostics (AM-4/AM-5)", async () => {
+		const board = selectedBoard(makeCard({ autoMergeWhenApproved: true, armedAutoMergePolicyRevision: 1 }));
+		mockWorkspaceState(board);
+		const harness = createHarness(board);
+		const bindingId = { workspaceId: WORKSPACE_ID, taskId: OPERATOR_TASK_ID };
+		await harness.store.createRecord(RECORD_IDENTITY);
+		await harness.store.upsertTaskBinding(PR_KEY, bindingId);
+		await harness.store.setAutoMergeAttempt(PR_KEY, bindingId, {
+			schemaVersion: 1,
+			attemptId: "a".repeat(64),
+			canonicalPrKey: PR_KEY,
+			headSha: "1111111111111111111111111111111111111111",
+			baseSha: "2222222222222222222222222222222222222222",
+			policyRevision: 1,
+			mergeMethod: "squash",
+			startedAt: 1,
+			state: "merged_confirmed",
+			reason: "confirmed merged (merge commit 3333333333333333333333333333333333333333)",
+			mergeCommitSha: "3333333333333333333333333333333333333333",
+			finishedAt: 2,
+		});
+
+		const state = await harness.api.getTaskTrackingState(SCOPE, { taskId: OPERATOR_TASK_ID });
+		expect(state).toMatchObject({
+			ok: true,
+			autoMergeWhenApproved: true,
+			armedAutoMergePolicyRevision: 1,
+			autoMergeAttempt: {
+				state: "merged_confirmed",
+				headSha: "1111111111111111111111111111111111111111",
+				policyRevision: 1,
+				mergeCommitSha: "3333333333333333333333333333333333333333",
+			},
+		});
+	});
+});
+
+describe("pr-tracking api: auto-merge check candidates (AM-5)", () => {
+	beforeEach(() => {
+		workspaceStateMocks.loadWorkspaceBoardById.mockReset();
+		workspaceStateMocks.mutateWorkspaceState.mockReset();
+	});
+
+	const EVIDENCE_HEAD = "4444444444444444444444444444444444444444";
+	const EVIDENCE_BASE = "5555555555555555555555555555555555555555";
+
+	function checkEvidence(name: string, overrides: Partial<AutoMergeCheckEvidence> = {}): AutoMergeCheckEvidence {
+		return {
+			kind: "check_run",
+			name,
+			sourceId: "123",
+			status: "completed",
+			conclusion: "success",
+			sha: EVIDENCE_HEAD,
+			runId: name,
+			occurredAt: 1000,
+			...overrides,
+		};
+	}
+
+	function makeEnvelope(overrides: Partial<AutoMergeEvidenceEnvelope> = {}): AutoMergeEvidenceEnvelope {
+		return {
+			schemaVersion: 1,
+			accessScopeId: "scope-1",
+			checkedAt: 1000,
+			policyRevision: 1,
+			headSha: EVIDENCE_HEAD,
+			baseSha: EVIDENCE_BASE,
+			baseRepository: "cline/kanban",
+			baseRef: "main",
+			headRepository: "cline/kanban",
+			headRef: "task-branch",
+			prState: "open",
+			draft: false,
+			mergeable: true,
+			mergeableState: "clean",
+			authorLogin: "author-1",
+			autoMergePresent: null,
+			sources: { prMetadata: true, reviews: true, checkRuns: true, commitStatuses: true, reviewThreads: true },
+			unresolvedActiveThreads: 0,
+			complete: true,
+			reasons: [],
+			reviews: [],
+			checks: [],
+			statuses: [],
+			...overrides,
+		};
+	}
+
+	/** The only surface listAutoMergeCheckCandidates uses of the coordinator. */
+	function evidenceCoordinator(envelope: AutoMergeEvidenceEnvelope): PrTrackingCoordinator {
+		return {
+			listSubscriptions: () => [],
+			readAutoMergeEvidence: async () => envelope,
+			refreshPrMetadataOnce: async () => ({ outcome: "refreshed", checkedAt: 1000, metadata: null, error: null }),
+		} as unknown as PrTrackingCoordinator;
+	}
+
+	it("suggests only exact-head passing checks, deduplicated and sorted", async () => {
+		const board = makeBoard(makeCard({ selectedAutomationPrKey: PR_KEY, armedAutoMergePolicyRevision: 1 }));
+		mockWorkspaceState(board);
+		const envelope = makeEnvelope({
+			checks: [
+				checkEvidence("lint"),
+				checkEvidence("ci"),
+				checkEvidence("ci", { runId: "ci-again" }), // duplicate name — deduped
+				checkEvidence("lint", { conclusion: "failure" }), // failed — excluded
+				checkEvidence("stale", { sha: EVIDENCE_BASE }), // not the head — excluded
+				checkEvidence("zero", { runId: "0" }), // no run identity — excluded
+				checkEvidence("ghost", { sourceId: null }), // no reporting identity — excluded
+			],
+			statuses: [checkEvidence("compat", { kind: "commit_status" })],
+		});
+		const harness = createHarness(board, { coordinator: evidenceCoordinator(envelope) });
+
+		const result = await harness.api.listAutoMergeCheckCandidates(SCOPE, { taskId: OPERATOR_TASK_ID });
+		expect(result).toEqual({
+			ok: true,
+			repository: "cline/kanban",
+			candidates: [
+				{ name: "ci", sources: ["check_run"] },
+				{ name: "compat", sources: ["commit_status"] },
+				{ name: "lint", sources: ["check_run"] },
+			],
+			headSha: EVIDENCE_HEAD,
+			checkedAt: 1000,
+			error: null,
+		});
+	});
+
+	it("reports evidence_incomplete instead of guessing when a source is incomplete", async () => {
+		const board = makeBoard(makeCard({ selectedAutomationPrKey: PR_KEY }));
+		mockWorkspaceState(board);
+		const envelope = makeEnvelope({
+			complete: false,
+			reasons: ["check_runs"],
+			sources: { prMetadata: true, reviews: true, checkRuns: false, commitStatuses: true, reviewThreads: true },
+			checks: [checkEvidence("ci")],
+		});
+		const harness = createHarness(board, { coordinator: evidenceCoordinator(envelope) });
+
+		const result = await harness.api.listAutoMergeCheckCandidates(SCOPE, { taskId: OPERATOR_TASK_ID });
+		expect(result).toMatchObject({
+			ok: false,
+			repository: "cline/kanban",
+			candidates: [],
+			error: "evidence_incomplete",
+		});
+	});
+
+	it("reports no_selected_pr when the card has no PR links", async () => {
+		const board = makeBoard(makeCard({ pullRequests: [] }));
+		mockWorkspaceState(board);
+		const harness = createHarness(board);
+
+		const result = await harness.api.listAutoMergeCheckCandidates(SCOPE, { taskId: OPERATOR_TASK_ID });
+		expect(result).toMatchObject({ ok: false, candidates: [], error: "no_selected_pr" });
+	});
+
+	it("reports ambiguous_selection when multiple PR links exist without an explicit selection", async () => {
+		const board = makeBoard(
+			makeCard({
+				pullRequests: [LINK, { ...LINK, number: 50, url: "https://github.com/cline/kanban/pull/50" }],
+			}),
+		);
+		mockWorkspaceState(board);
+		const harness = createHarness(board);
+
+		const result = await harness.api.listAutoMergeCheckCandidates(SCOPE, { taskId: OPERATOR_TASK_ID });
+		expect(result).toMatchObject({ ok: false, candidates: [], error: "ambiguous_selection" });
+	});
+
+	it("reports coordinator_unavailable when the coordinator is not running", async () => {
+		const board = makeBoard(makeCard({ selectedAutomationPrKey: PR_KEY }));
+		mockWorkspaceState(board);
+		const harness = createHarness(board, { coordinator: null });
+
+		const result = await harness.api.listAutoMergeCheckCandidates(SCOPE, { taskId: OPERATOR_TASK_ID });
+		expect(result).toMatchObject({ ok: false, candidates: [], error: "coordinator_unavailable" });
 	});
 });
