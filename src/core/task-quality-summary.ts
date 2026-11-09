@@ -16,7 +16,7 @@
 //   runtime; the summary only reports recorded session spans, reported
 //   usage counters, and structural tool evidence — never active runtime.
 //
-// Deduplication rules (docs/plans/diagnostics-task-quality-summary.md):
+// Deduplication rules (docs/plans/complete/diagnostics-task-quality-summary.md):
 // - Messages dedupe on (role, canonical content, ts, metrics, model info).
 //   Stable ids are a fast path; conflicting id reuse is reported as an
 //   ambiguity, never silently merged.
@@ -965,10 +965,10 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 	 * failed editor call opens an episode for its recorded file; the episode
 	 * ends at the next successful editor call to the same file, at a later
 	 * confirmed editor failure to the same file, or at the end of the
-	 * lineage. Inherited (seeded) copies of an already-considered call never
-	 * open an episode or count toward its between counts; a successful copy
-	 * can still close an open episode at its observed position (it is a real
-	 * observation in the lineage). Success requires a matched non-failed
+	 * lineage. Inherited (seeded/compacted) copies of an already-considered
+	 * call are skipped entirely: they never open an episode, never close one,
+	 * and never count toward its between counts — only the first observed
+	 * position of each distinct call participates. Success requires a matched non-failed
 	 * result — an unmatched editor call proves neither. Elapsed time is
 	 * wall-clock between recorded message timestamps and includes intervening
 	 * work and waits; it is never active runtime.
@@ -1052,7 +1052,7 @@ export function analyzeTaskQualitySummary(input: TaskQualitySummaryInput): TaskQ
 		const file = editorFileOf(observation.arguments);
 		const confirmedRule =
 			call !== null && call.result !== null && call.classified !== null ? call.classified.confirmedRule : null;
-		if (confirmedRule !== null && confirmedRule.startsWith("editor")) {
+		if (confirmedRule?.startsWith("editor")) {
 			// A later failed edit to the same file supersedes the open one.
 			const open = file !== null ? openEpisodesByFile.get(file) : undefined;
 			if (open !== undefined) {

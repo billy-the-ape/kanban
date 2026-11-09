@@ -312,7 +312,24 @@ export async function reconcileMergeCompletion(
 		return { action: "skipped", reason: "preference_off" };
 	}
 	if (found.columnId !== "in_progress" && found.columnId !== "review") {
-		return { action: "skipped", reason: "inactive_column" };
+		// Recovery window: the Done move landed but the completed binding
+		// never persisted (a failed write or a crash between the two steps
+		// below). The plain active-column gate would skip forever from then
+		// on, so the completed binding would never hold and merge-based
+		// dispatch readiness for the children would be lost. Re-run the
+		// idempotent completion for exactly that window; trash cards,
+		// consumed or blocked completions, and human reopen markers still
+		// skip.
+		const recoveringUnpersistedMove =
+			found.columnId === "done" &&
+			!(
+				binding.mergeCompletion?.status === "completed" && binding.mergeCompletion.mergeCommitSha === mergeCommitSha
+			) &&
+			binding.mergeCompletion?.status !== "blocked" &&
+			card.manualReopenAt === undefined;
+		if (!recoveringUnpersistedMove) {
+			return { action: "skipped", reason: "inactive_column" };
+		}
 	}
 	if (mergeCommitSha === null) {
 		// Without the merge commit identity the base-branch check is
@@ -420,12 +437,16 @@ export async function reconcileMergeCompletion(
 				}
 			}
 		}
-		// Board move FIRST, then persist: the move is idempotent (a Done card
-		// is a no-op), so a failed move leaves the binding untouched and the
-		// coordinator's bounded reconciliation reads retry from scratch — no
-		// stranded card. A crash after the persist is recovered by the
-		// manual-reopen guard (active column without manualReopenAt re-runs
-		// this idempotent completion).
+		// Board move FIRST, then persist. The move is idempotent (a Done card
+		// is a no-op that still reports its released dependents), so a failed
+		// move leaves the binding untouched and the next observation retries
+		// from scratch. The window between the move and the persist (write
+		// failure or crash) leaves a Done card without the completed binding;
+		// the recovery gate at the top of this function (Done + no reopen
+		// marker + unconsumed completion) re-runs this idempotent completion
+		// so the binding and the children's dispatch readiness still land.
+		// A crash after the persist is recovered by the manual-reopen guard
+		// (active column without manualReopenAt re-runs this completion).
 		let readyLinkedTaskIds: string[] = [];
 		try {
 			readyLinkedTaskIds = await deps.completeTask(task.workspaceId, task.taskId);

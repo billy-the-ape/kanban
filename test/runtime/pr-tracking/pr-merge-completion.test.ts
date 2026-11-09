@@ -226,6 +226,42 @@ describe("pr-merge-completion consumer", () => {
 		expect(record.taskBindings[0].mergeCompletion).toBeNull();
 	});
 
+	it("recovers when the Done move landed but the completed binding never persisted", async () => {
+		const store = await makeStore();
+		const deps = makeDeps(store, { readyLinkedTaskIds: ["child-1"] });
+		// The crash/write-failure window: the board card is already Done, but
+		// the binding has no completed mergeCompletion. Without the recovery
+		// gate this observation would skip with inactive_column forever and
+		// the children's merge-based readiness would never hold.
+		deps.setBoard({ columnId: "done" });
+		await expect(reconcileMergeCompletion(makeObservation(await loadRecord(store)), deps)).resolves.toEqual({
+			action: "completed",
+		});
+		expect(deps.completeCalls).toEqual([TASK]);
+		const record = await loadRecord(store);
+		expect(record.taskBindings[0].mergeCompletion).toMatchObject({
+			status: "completed",
+			mergeCommitSha: "mergesha1",
+		});
+		// The released dependents are dispatched by the recovery pass too,
+		// and only after the completed binding is persisted.
+		expect(deps.successorCalls).toEqual([
+			{ workspaceId: TASK.workspaceId, taskId: TASK.taskId, readyTaskIds: ["child-1"] },
+		]);
+		// A later observation for the same merge now skips: the persisted
+		// completion closes the recovery window.
+		await expect(reconcileMergeCompletion(makeObservation(await loadRecord(store)), deps)).resolves.toEqual({
+			action: "skipped",
+			reason: "inactive_column",
+		});
+		// A human reopen marker on a Done card also stays skipped.
+		deps.setBoard({ columnId: "done", manualReopenAt: NOW });
+		await expect(reconcileMergeCompletion(makeObservation(await loadRecord(store)), deps)).resolves.toEqual({
+			action: "skipped",
+			reason: "inactive_column",
+		});
+	});
+
 	it("completes again only for a LATER merge (a different merge commit)", async () => {
 		const store = await makeStore();
 		const deps = makeDeps(store);

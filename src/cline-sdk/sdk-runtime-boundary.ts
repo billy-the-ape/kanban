@@ -312,7 +312,7 @@ export function applyProportionalPlanningGuidance(defaultPrompt: string): ApplyP
 	}
 	if (countOccurrences(defaultPrompt, SDK_VERBOSE_INITIAL_PLAN_PARAGRAPH) === 1) {
 		return {
-			prompt: defaultPrompt.replace(SDK_VERBOSE_INITIAL_PLAN_PARAGRAPH, CLINE_PROPORTIONAL_PLANNING_GUIDANCE),
+			prompt: defaultPrompt.replace(SDK_VERBOSE_INITIAL_PLAN_PARAGRAPH, () => CLINE_PROPORTIONAL_PLANNING_GUIDANCE),
 			status: "replaced",
 		};
 	}

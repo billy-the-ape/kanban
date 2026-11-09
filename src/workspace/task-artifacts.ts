@@ -62,8 +62,8 @@ export interface WriteTaskContextArtifactInput {
 	taskId: string;
 	/** Tool call id whose result this artifact preserves (used only for the file name). */
 	toolCallId: string;
-	/** Full, untruncated tool result content (serialized). */
-	content: string;
+	/** Full, untruncated tool result content (serialized). Buffers archive byte-for-byte. */
+	content: string | Buffer;
 	/** Timestamp injection for deterministic file names (tests). */
 	timestampMs?: number;
 	/**
@@ -86,7 +86,11 @@ export interface WriteTaskContextArtifactInput {
 export async function writeTaskContextArtifact(input: WriteTaskContextArtifactInput): Promise<string> {
 	const fileName = buildTaskContextArtifactFileName(input.toolCallId, input.timestampMs ?? Date.now());
 	const path = join(getTaskContextArtifactsDir(input.taskId), fileName);
-	await lockedFileSystem.writeTextFileAtomic(path, input.content);
+	if (Buffer.isBuffer(input.content)) {
+		await lockedFileSystem.writeBufferFileAtomic(path, input.content);
+	} else {
+		await lockedFileSystem.writeTextFileAtomic(path, input.content);
+	}
 	// Record the content classification alongside the file reference so an
 	// export can label the artifact without re-reading it (DIAG-2).
 	try {
@@ -94,7 +98,9 @@ export async function writeTaskContextArtifact(input: WriteTaskContextArtifactIn
 			taskId: input.taskId,
 			toolCallId: input.toolCallId,
 			fileName,
-			contentFormat: classifyTaskArtifactContentFormat(input.content),
+			contentFormat: classifyTaskArtifactContentFormat(
+				Buffer.isBuffer(input.content) ? input.content.toString("utf8") : input.content,
+			),
 		});
 	} catch (error) {
 		input.onIndexWriteError?.(error);

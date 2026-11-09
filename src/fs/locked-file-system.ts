@@ -144,6 +144,35 @@ export class LockedFileSystem {
 		await writeOperation();
 	}
 
+	/**
+	 * Atomic write for arbitrary bytes (no UTF-8 round-trip, no content-dedup
+	 * compare): the written file is byte-for-byte the provided buffer. Used for
+	 * artifact archives whose byte offsets are cursors elsewhere.
+	 */
+	async writeBufferFileAtomic(path: string, content: Buffer, options: AtomicTextWriteOptions = {}): Promise<void> {
+		const lockRequest: LockRequest | null =
+			options.lock === undefined
+				? {
+						path,
+						type: "file" as const,
+					}
+				: options.lock;
+		const writeOperation = async () => {
+			await mkdir(dirname(path), { recursive: true });
+			const tempPath = `${path}.tmp.${process.pid}.${Date.now()}.${randomUUID()}`;
+			await writeFile(tempPath, content);
+			await rename(tempPath, path);
+			if (options.executable) {
+				await chmod(path, 0o755);
+			}
+		};
+		if (lockRequest) {
+			await this.withLock(lockRequest, writeOperation);
+			return;
+		}
+		await writeOperation();
+	}
+
 	async writeJsonFileAtomic(
 		path: string,
 		payload: unknown,

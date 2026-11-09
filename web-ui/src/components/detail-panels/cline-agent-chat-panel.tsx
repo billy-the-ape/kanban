@@ -3,7 +3,6 @@
 // controller hook so multiple surfaces can share the same behavior.
 
 import { AlertTriangle } from "lucide-react";
-import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import React, {
 	type ReactElement,
 	useCallback,
@@ -14,6 +13,7 @@ import React, {
 	useRef,
 	useState,
 } from "react";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { ClineChatComposer } from "@/components/detail-panels/cline-chat-composer";
 import { ClineChatMessageItem } from "@/components/detail-panels/cline-chat-message-item";
 import { getCompletedAssistantMessageId } from "@/components/detail-panels/cline-chat-message-utils";
@@ -242,8 +242,7 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 		const [virtualizedTaskId, setVirtualizedTaskId] = useState<string | null>(null);
 		const [isAutoScrollEnabled, setIsAutoScrollEnabled] = useState(true);
 		const usesVirtualizedMessages =
-			virtualizedTaskId === taskId ||
-			(messages.length >= CHAT_VIRTUALIZATION_THRESHOLD && isAutoScrollEnabled);
+			virtualizedTaskId === taskId || (messages.length >= CHAT_VIRTUALIZATION_THRESHOLD && isAutoScrollEnabled);
 		// TODO: Persist per-task mode immediately when toggled so page refresh restores unsent mode changes.
 		const modeByTaskIdRef = useRef<Map<string, RuntimeTaskSessionMode>>(new Map());
 		const [composerError, setComposerError] = useState<string | null>(null);
@@ -326,10 +325,6 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 			// otherwise streaming can snap the reader back during upward scrolling.
 			return atBottom ? "auto" : false;
 		}, []);
-		const handlePlainExpandedChange = useCallback(
-			(id: string, expanded: boolean) => handleExpandedChange(id, expanded),
-			[handleExpandedChange],
-		);
 		const attachmentWarningMessage =
 			draftImages.length > 0 && selectedModel?.supportsVision === false
 				? "The selected Cline model may not accept image input. Choose a vision-capable model to use these images."
@@ -544,6 +539,7 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 			<div className="flex min-h-0 min-w-0 flex-1 flex-col">
 				{usesVirtualizedMessages ? (
 					<Virtuoso<ClineChatMessage, VirtualChatFooterContext>
+						key={taskId}
 						ref={virtuosoRef}
 						className="min-h-0 min-w-0 flex-1 overflow-x-hidden"
 						data-testid="virtual-chat-list"
@@ -575,7 +571,7 @@ export const ClineAgentChatPanel = React.forwardRef<ClineAgentChatPanelHandle, C
 									expandedMessages.get(message.id) ??
 									(message.role === "reasoning" && message.meta?.hookEventName === "reasoning_delta")
 								}
-								onExpandedChange={(expanded) => handlePlainExpandedChange(message.id, expanded)}
+								onExpandedChange={(expanded) => handleExpandedChange(message.id, expanded)}
 							/>
 						))}
 						{showAgentProgressIndicator ? <ClineThinkingIndicator /> : null}

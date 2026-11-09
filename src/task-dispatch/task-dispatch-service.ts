@@ -550,6 +550,11 @@ export function buildFreshDispatchPrompt(options: {
 			description = `delivered and integrated at ${prereq.integratedSha}${commit}`;
 		} else if (prereq.deliveryStatus === "no_op") {
 			description = "completed with no changes (no-op delivery)";
+		} else if (prereq.mergeCommitSha) {
+			// Merge-completed without a delivery receipt: state that directly
+			// instead of the "delivered (unknown)" placeholder; the merge tail
+			// below carries the landed commit.
+			description = "completed without a delivery record";
 		} else {
 			description = `delivered (${prereq.deliveryStatus ?? "unknown"})`;
 		}

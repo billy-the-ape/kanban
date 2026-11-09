@@ -1139,8 +1139,10 @@ describe("MERGE-1: merge-completion successor handoff", () => {
 		expect(response.dispatchedTaskId).toBe("child");
 		expect(startedTasks).toHaveLength(1);
 		expect(startedTasks[0]?.taskId).toBe("child");
-		// The landed merge commit (not the PR head) is handed off in the prompt.
-		expect(startedTasks[0]?.prompt).toContain("its PR merged at m-parent");
+		// The landed merge commit (not the PR head) is handed off in the prompt,
+		// and the merge-only prerequisite renders without a delivery-status
+		// placeholder.
+		expect(startedTasks[0]?.prompt).toContain("completed without a delivery record; its PR merged at m-parent");
 		// Unrelated backlog cards stay put.
 		expect(
 			getBoard()

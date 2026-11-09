@@ -1,4 +1,4 @@
-import { parseCanonicalPrKey } from "../pr-tracking/pr-key-parsing";
+import { isTrackingSupportedPr, parseCanonicalPrKey } from "../pr-tracking/pr-key-parsing";
 import type {
 	RuntimeAgentId,
 	RuntimeBoardCard,
@@ -470,9 +470,13 @@ export function completeTaskAndGetReadyLinkedTaskIds(
 ): RuntimeTrashTaskResult {
 	const readyTaskIds = getLinkedBacklogTaskIdsReadyAfterTaskCompleted(board, taskId, "done");
 	const movedToDone = moveTaskToColumn(board, taskId, "done", now);
+	// The released dependents are reported even when the card was already in
+	// Done (no-op move): merge-completion recovery re-runs this completion
+	// after a Done move landed without its persisted binding, and its
+	// successor dispatch pass must still see the released cards.
 	return {
 		...movedToDone,
-		readyTaskIds: movedToDone.moved ? readyTaskIds : [],
+		readyTaskIds,
 	};
 }
 
@@ -1308,7 +1312,7 @@ export function updateTaskPrSettings(
 		const matchesLink = (task.pullRequests ?? []).some(
 			(pullRequest) => getPullRequestIdentityKey(pullRequest) === selectedKey,
 		);
-		if (parsed === null || parsed.provider !== "github" || parsed.host !== "github.com" || !matchesLink) {
+		if (parsed === null || !selectedKey || !isTrackingSupportedPr(selectedKey) || !matchesLink) {
 			return { ...base(task), reason: "no_selected_pr" };
 		}
 		const policy = options.autoMergePolicy;

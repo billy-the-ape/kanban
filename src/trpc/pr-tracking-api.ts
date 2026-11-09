@@ -13,6 +13,7 @@
 import type {
 	AutoMergeCheckCandidatesRequest,
 	AutoMergeCheckCandidatesResponse,
+	AutoMergeCheckEvidence,
 	AutoMergePolicyGetRequest,
 	AutoMergePolicyGetResponse,
 	AutoMergePolicyUpdateRequest,
@@ -52,7 +53,7 @@ import type {
 import { setTaskSelectedAutomationPr, updateTaskPrSettings } from "../core/task-board-mutations";
 import { type AutoMergePolicyStore, normalizeAutoMergeRepository } from "../pr-tracking/auto-merge-policy-store";
 import type { PrInstalledConsumers } from "../pr-tracking/pr-consumer-registry";
-import { parseCanonicalPrKey } from "../pr-tracking/pr-identity";
+import { isTrackingSupportedPr, parseCanonicalPrKey } from "../pr-tracking/pr-identity";
 import { evaluatePrLifecycleGate } from "../pr-tracking/pr-lifecycle-gate";
 import {
 	assignRepairOwner,
@@ -234,7 +235,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			const preCard = await loadScopedCard(scope, input.taskId);
 			const selectedKey = preCard?.card.selectedAutomationPrKey;
 			const parsed = selectedKey ? parseCanonicalPrKey(selectedKey) : null;
-			if (parsed && parsed.provider === "github" && parsed.host === "github.com") {
+			if (parsed && selectedKey && isTrackingSupportedPr(selectedKey)) {
 				const policy = await deps.getAutoMergePolicyStore().loadPolicy(parsed.repository);
 				if (policy) {
 					autoMergePolicy = { repository: policy.repository, revision: policy.revision };
@@ -1120,7 +1121,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			};
 		}
 		const parsed = parseCanonicalPrKey(resolved.key);
-		if (!parsed || parsed.provider !== "github" || parsed.host !== "github.com") {
+		if (!parsed || !isTrackingSupportedPr(resolved.key)) {
 			return {
 				ok: false,
 				repository: parsed?.repository ?? null,
@@ -1157,33 +1158,21 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		// skipped checks (an unknown check name would fail closed forever
 		// once armed). Exact identity is required (runId and reporting
 		// identity); anything unknown is omitted, never guessed.
-		const byName = new Map<string, Set<"check_run" | "commit_status">>();
-		const observed = (entry: {
-			kind: "check_run" | "commit_status";
-			name: string;
-			sourceId: string | null;
-			conclusion: string | null;
-			sha: string;
-			runId: string;
-		}): boolean =>
+		type AutoMergeCheckSource = AutoMergeCheckEvidence["kind"];
+		const byName = new Map<string, Set<AutoMergeCheckSource>>();
+		const observed = (entry: AutoMergeCheckEvidence): boolean =>
 			entry.conclusion === "success" &&
 			entry.sha === envelope.headSha &&
 			entry.runId !== "0" &&
 			entry.sourceId !== null;
-		for (const entry of envelope.checks) {
+		// One pass over both sources: each evidence entry carries its own
+		// `kind`, so the check-run and commit-status paths cannot drift.
+		for (const entry of [...envelope.checks, ...envelope.statuses]) {
 			if (!observed(entry)) {
 				continue;
 			}
-			const sources = byName.get(entry.name) ?? new Set<"check_run" | "commit_status">();
-			sources.add("check_run");
-			byName.set(entry.name, sources);
-		}
-		for (const entry of envelope.statuses) {
-			if (!observed(entry)) {
-				continue;
-			}
-			const sources = byName.get(entry.name) ?? new Set<"check_run" | "commit_status">();
-			sources.add("commit_status");
+			const sources = byName.get(entry.name) ?? new Set<AutoMergeCheckSource>();
+			sources.add(entry.kind);
 			byName.set(entry.name, sources);
 		}
 		const candidates = [...byName.entries()]
