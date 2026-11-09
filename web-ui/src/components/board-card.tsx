@@ -326,14 +326,17 @@ export function BoardCard({
 	const isCardInteractive = !isTrashCard && !isDoneCard;
 	const isPreparingInitialStart =
 		initialStartStage !== undefined && INITIAL_START_PREPARING_STAGES.has(initialStartStage);
-	// A paused In Progress card: a real session exists but the agent is not
-	// working (idle/interrupted/failed per the shared display-state rules). A
-	// queued session (state "running" + concurrency_waiting) stays excluded.
+	// A resumable paused In Progress card: a real native-Cline session exists
+	// but the agent is not working (idle/interrupted/failed per the shared
+	// display-state rules). A queued session (state "running" +
+	// concurrency_waiting) stays excluded. Terminal-agent sessions have no
+	// Cline chat re-activation path, so Resume is not offered for them.
 	const isResumablePausedCard =
 		columnId === "in_progress" &&
 		sessionSummary !== undefined &&
 		!isPlaceholderSessionSummary(sessionSummary) &&
-		PAUSED_TASK_SESSION_STATES.has(sessionSummary.state);
+		PAUSED_TASK_SESSION_STATES.has(sessionSummary.state) &&
+		sessionSummary.agentId === "cline";
 	const descriptionWidth = descriptionRect.width > 0 ? descriptionRect.width : descriptionWidthFallback;
 	const rawSessionActivity = useMemo(() => getCardSessionActivity(sessionSummary), [sessionSummary]);
 	const lastSessionActivityRef = useRef<CardSessionActivity | null>(null);
@@ -689,7 +692,7 @@ export function BoardCard({
 									</span>
 								) : null}
 
-								{columnId === "in_progress" && isResumablePausedCard && onResumeTask ? (
+								{isResumablePausedCard && onResumeTask ? (
 									<Tooltip side="bottom" content="Resume task">
 										<Button
 											icon={<Play size={14} />}

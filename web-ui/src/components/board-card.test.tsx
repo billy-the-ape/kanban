@@ -960,6 +960,7 @@ describe("BoardCard", () => {
 		expect(container.textContent).toContain("checking the next file");
 		expect(container.textContent).not.toContain("Agent:");
 	});
+
 	it("shows a resume play button on paused in-progress cards and calls the handler", async () => {
 		const onResumeTask = vi.fn();
 		for (const state of ["idle", "interrupted", "failed"] as const) {
@@ -986,7 +987,7 @@ describe("BoardCard", () => {
 		expect(onResumeTask).toHaveBeenCalledWith("task-1");
 	});
 
-	it("does not show a resume button for running, queued, review, or placeholder sessions", async () => {
+	it("does not show a resume button for running, queued, review, non-Cline, or placeholder sessions", async () => {
 		const onResumeTask = vi.fn();
 		const queuedSummary = createSummary("running", {
 			latestHookActivity: {
@@ -1005,6 +1006,8 @@ describe("BoardCard", () => {
 			createSummary("running"),
 			queuedSummary,
 			createSummary("awaiting_review"),
+			// Terminal-agent sessions have no Cline chat resume path.
+			createSummary("idle", { agentId: "claude" }),
 			placeholderSummary,
 			undefined,
 		];
