@@ -599,6 +599,7 @@ export default function App(): ReactElement {
 		handleDeleteDependency,
 		handleDragEnd,
 		handleStartTask,
+		handleResumeTask,
 		handleStartAllBacklogTasks,
 		handleDetailTaskDragEnd,
 		handleCardSelect,
@@ -634,6 +635,7 @@ export default function App(): ReactElement {
 		startTaskSession,
 		fetchTaskWorkspaceInfo,
 		sendTaskSessionInput,
+		sendTaskChatMessage,
 		readyForReviewNotificationsEnabled,
 		taskGitActionLoadingByTaskId,
 		runAutoReviewGitAction,
@@ -1046,6 +1048,7 @@ export default function App(): ReactElement {
 												onCardSelect={handleCardSelect}
 												onCreateTask={handleOpenCreateTask}
 												onStartTask={handleStartTaskFromBoard}
+												onResumeTask={handleResumeTask}
 												onStartAllTasks={handleStartAllBacklogTasksFromBoard}
 												onClearTrash={handleOpenClearTrash}
 												editingTaskId={editingTaskId}

@@ -72,6 +72,7 @@ const NOOP_STOP_SESSION = async (): Promise<void> => {};
 const NOOP_CLEANUP_WORKSPACE = async (): Promise<null> => null;
 const NOOP_FETCH_WORKSPACE_INFO = async (): Promise<null> => null;
 const NOOP_SEND_TASK_INPUT = async (): Promise<{ ok: boolean }> => ({ ok: true });
+const NOOP_SEND_TASK_CHAT = async (): Promise<{ ok: boolean }> => ({ ok: true });
 const NOOP_RUN_AUTO_REVIEW = async (): Promise<boolean> => false;
 // UPD-0: null simulates a failed status query, which must fall back to the
 // conservative ensure-before-start behavior (keeps legacy tests intact).
@@ -82,6 +83,7 @@ interface HookSnapshot {
 	handleDragEnd: ReturnType<typeof useBoardInteractions>["handleDragEnd"];
 	handleRestoreTaskFromTrash: (taskId: string) => void;
 	handleStartTask: (taskId: string) => void;
+	handleResumeTask: (taskId: string) => void;
 	handleCardSelect: (taskId: string) => void;
 	handleConfirmClearTrash: () => void;
 	initialStartStageByTaskId: Record<string, RuntimeTaskInitialStartStage>;
@@ -107,6 +109,7 @@ function HookHarness({
 	ensureTaskWorkspace,
 	getTaskInitialStartStatus = NOOP_INITIAL_START_STATUS,
 	startTaskSession,
+	sendTaskChatMessage = NOOP_SEND_TASK_CHAT,
 	stopTaskSession = NOOP_STOP_SESSION,
 	cleanupTaskWorkspace = NOOP_CLEANUP_WORKSPACE,
 	selectedCard = null,
@@ -120,6 +123,7 @@ function HookHarness({
 	ensureTaskWorkspace: UseTaskSessionsResult["ensureTaskWorkspace"];
 	getTaskInitialStartStatus?: UseTaskSessionsResult["getTaskInitialStartStatus"];
 	startTaskSession: UseTaskSessionsResult["startTaskSession"];
+	sendTaskChatMessage?: UseTaskSessionsResult["sendTaskChatMessage"];
 	stopTaskSession?: (taskId: string) => Promise<void>;
 	cleanupTaskWorkspace?: (taskId: string) => Promise<RuntimeWorktreeDeleteResponse | null>;
 	selectedCard?: { card: BoardCard; column: { id: "backlog" | "in_progress" | "review" | "trash" } } | null;
@@ -149,6 +153,7 @@ function HookHarness({
 		startTaskSession,
 		fetchTaskWorkspaceInfo: NOOP_FETCH_WORKSPACE_INFO,
 		sendTaskSessionInput: NOOP_SEND_TASK_INPUT,
+		sendTaskChatMessage,
 		readyForReviewNotificationsEnabled: false,
 		taskGitActionLoadingByTaskId: {},
 		runAutoReviewGitAction: NOOP_RUN_AUTO_REVIEW,
@@ -160,6 +165,7 @@ function HookHarness({
 			handleDragEnd: actions.handleDragEnd,
 			handleRestoreTaskFromTrash: actions.handleRestoreTaskFromTrash,
 			handleStartTask: actions.handleStartTask,
+			handleResumeTask: actions.handleResumeTask,
 			handleCardSelect: actions.handleCardSelect,
 			handleConfirmClearTrash: actions.handleConfirmClearTrash,
 			initialStartStageByTaskId: actions.initialStartStageByTaskId,
@@ -171,6 +177,7 @@ function HookHarness({
 		actions.handleConfirmClearTrash,
 		actions.handleRestoreTaskFromTrash,
 		actions.handleStartTask,
+		actions.handleResumeTask,
 		actions.initialStartStageByTaskId,
 		onSnapshot,
 	]);
@@ -284,6 +291,58 @@ describe("useBoardInteractions", () => {
 			else expect(complete).toHaveBeenCalledWith(task.id, "in_progress");
 		},
 	);
+
+	it("resumes a paused in-progress task by sending Resume to its chat and toasts failures", async () => {
+		useProgrammaticCardMovesMock.mockReturnValue({
+			handleProgrammaticCardMoveReady: () => {},
+			setRequestMoveTaskToTrashHandler: () => {},
+			setRequestCompleteTaskHandler: () => {},
+			tryProgrammaticCardMove: () => "unavailable",
+			consumeProgrammaticCardMove: () => ({}),
+			resolvePendingProgrammaticTrashMove: () => {},
+			resolvePendingProgrammaticCompleteMove: () => {},
+			waitForProgrammaticCardMoveAvailability: async () => {},
+			resetProgrammaticCardMoves: () => {},
+			requestMoveTaskToTrashWithAnimation: async () => {},
+			requestCompleteTaskWithAnimation: async () => {},
+			programmaticCardMoveCycle: 0,
+		});
+		useLinkedBacklogTaskActionsMock.mockReturnValue({});
+		const sendTaskChatMessage = vi.fn(
+			async (): Promise<{ ok: boolean; message?: string }> => ({
+				ok: false,
+				message: "Task chat session is not running.",
+			}),
+		);
+		const board = createBoard();
+		const task = createTask("resume-1", "Paused task", 1);
+		board.columns = board.columns.map((column) => ({
+			...column,
+			cards: column.id === "in_progress" ? [task] : [],
+		}));
+		let actions: HookSnapshot | undefined;
+		await act(async () => {
+			root.render(
+				<HookHarness
+					board={board}
+					setBoard={vi.fn()}
+					ensureTaskWorkspace={vi.fn()}
+					startTaskSession={vi.fn()}
+					sendTaskChatMessage={sendTaskChatMessage}
+					onSnapshot={(value) => {
+						actions = value;
+					}}
+				/>,
+			);
+		});
+		await act(async () => {
+			actions?.handleResumeTask(task.id);
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		expect(sendTaskChatMessage).toHaveBeenCalledWith(task.id, "Resume");
+		expect(notifyErrorMock).toHaveBeenCalledWith("Task chat session is not running.");
+	});
 
 	it("moves a running backlog task into In Progress when its session is hydrated", async () => {
 		useProgrammaticCardMovesMock.mockReturnValue({
