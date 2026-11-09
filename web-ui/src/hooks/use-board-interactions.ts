@@ -89,6 +89,8 @@ interface UseBoardInteractionsInput {
 		input: string,
 		options?: SendTerminalInputOptions,
 	) => Promise<{ ok: boolean; message?: string }>;
+	/** Native Cline chat send used to resume a paused In Progress session. */
+	sendTaskChatMessage: UseTaskSessionsResult["sendTaskChatMessage"];
 	readyForReviewNotificationsEnabled: boolean;
 	taskGitActionLoadingByTaskId: Record<string, TaskGitActionLoadingStateLike>;
 	runAutoReviewGitAction: (taskId: string, action: TaskGitAction) => Promise<boolean>;
@@ -110,6 +112,8 @@ export interface UseBoardInteractionsResult {
 	handleDeleteDependency: (dependencyId: string) => void;
 	handleDragEnd: (result: DropResult, options?: { selectDroppedTask?: boolean }) => void;
 	handleStartTask: (taskId: string) => void;
+	/** Sends "Resume" to a paused In Progress task's chat to continue its workload. */
+	handleResumeTask: (taskId: string) => void;
 	handleStartAllBacklogTasks: (taskIds?: string[]) => void;
 	handleDetailTaskDragEnd: (result: DropResult) => void;
 	handleCardSelect: (taskId: string) => void;
@@ -148,6 +152,7 @@ export function useBoardInteractions({
 	startTaskSession,
 	fetchTaskWorkspaceInfo,
 	sendTaskSessionInput,
+	sendTaskChatMessage,
 	readyForReviewNotificationsEnabled,
 	taskGitActionLoadingByTaskId,
 	runAutoReviewGitAction,
@@ -901,6 +906,20 @@ export function useBoardInteractions({
 		[board, maybeRequestNotificationPermissionForTaskStart, startBacklogTaskWithAnimation],
 	);
 
+	// Resuming a paused In Progress task sends "Resume" as a chat prompt on
+	// the task's chat path, which re-activates (or rebinds) its session and
+	// lets the agent continue its existing workload.
+	const handleResumeTask = useCallback(
+		(taskId: string) => {
+			void sendTaskChatMessage(taskId, "Resume").then((result) => {
+				if (!result.ok) {
+					notifyError(result.message ?? "Could not resume task session.");
+				}
+			});
+		},
+		[sendTaskChatMessage],
+	);
+
 	const handleStartAllBacklogTasks = useCallback(
 		(taskIds?: string[]) => {
 			const requestedTaskIds =
@@ -1145,6 +1164,7 @@ export function useBoardInteractions({
 		handleDeleteDependency,
 		handleDragEnd,
 		handleStartTask,
+		handleResumeTask,
 		handleStartAllBacklogTasks,
 		handleDetailTaskDragEnd,
 		handleCardSelect,

@@ -960,6 +960,92 @@ describe("BoardCard", () => {
 		expect(container.textContent).toContain("checking the next file");
 		expect(container.textContent).not.toContain("Agent:");
 	});
+
+	it("shows a resume play button on paused in-progress cards and calls the handler", async () => {
+		const onResumeTask = vi.fn();
+		for (const state of ["idle", "interrupted", "failed"] as const) {
+			await act(async () => {
+				root.render(
+					<TooltipProvider>
+						<BoardCard
+							card={createCard()}
+							index={0}
+							columnId="in_progress"
+							sessionSummary={createSummary(state)}
+							onResumeTask={onResumeTask}
+						/>
+					</TooltipProvider>,
+				);
+			});
+			const resumeButton = container.querySelector<HTMLButtonElement>('button[aria-label="Resume task"]');
+			await act(async () => {
+				resumeButton?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+				resumeButton?.click();
+			});
+		}
+		expect(onResumeTask).toHaveBeenCalledTimes(3);
+		expect(onResumeTask).toHaveBeenCalledWith("task-1");
+	});
+
+	it("does not show a resume button for running, queued, review, non-Cline, or placeholder sessions", async () => {
+		const onResumeTask = vi.fn();
+		const queuedSummary = createSummary("running", {
+			latestHookActivity: {
+				activityText: "Waiting for model capacity",
+				toolName: null,
+				toolInputSummary: null,
+				finalMessage: null,
+				hookEventName: "concurrency_waiting",
+				notificationType: null,
+				source: "cline-sdk",
+				queuePosition: 2,
+			},
+		});
+		const placeholderSummary = createSummary("idle", { startedAt: null, agentId: null });
+		const summaries: Array<RuntimeTaskSessionSummary | undefined> = [
+			createSummary("running"),
+			queuedSummary,
+			createSummary("awaiting_review"),
+			// Terminal-agent sessions have no Cline chat resume path.
+			createSummary("idle", { agentId: "claude" }),
+			placeholderSummary,
+			undefined,
+		];
+		for (const summary of summaries) {
+			await act(async () => {
+				root.render(
+					<TooltipProvider>
+						<BoardCard
+							card={createCard()}
+							index={0}
+							columnId="in_progress"
+							sessionSummary={summary}
+							onResumeTask={onResumeTask}
+						/>
+					</TooltipProvider>,
+				);
+			});
+			expect(container.querySelector('button[aria-label="Resume task"]')).toBeNull();
+		}
+		expect(onResumeTask).not.toHaveBeenCalled();
+	});
+
+	it("does not show a resume button on backlog cards with a paused session", async () => {
+		await act(async () => {
+			root.render(
+				<TooltipProvider>
+					<BoardCard
+						card={createCard()}
+						index={0}
+						columnId="backlog"
+						sessionSummary={createSummary("idle")}
+						onResumeTask={vi.fn()}
+					/>
+				</TooltipProvider>,
+			);
+		});
+		expect(container.querySelector('button[aria-label="Resume task"]')).toBeNull();
+	});
 });
 
 function createPullRequest(overrides?: Partial<RuntimeTaskPullRequest>): RuntimeTaskPullRequest {
