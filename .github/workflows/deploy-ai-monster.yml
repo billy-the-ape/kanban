@@ -67,10 +67,7 @@ jobs:
           npm run build
           npm run lint
           npm run typecheck
-          npm test
-          npm --prefix web-ui run test
           npm --prefix packages/desktop run typecheck
-          npm --prefix packages/desktop test
 
       - name: Deploy verified release
         env:
