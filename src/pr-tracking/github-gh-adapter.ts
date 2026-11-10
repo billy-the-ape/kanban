@@ -35,6 +35,10 @@ export const GH_API_MAX_BUFFER_BYTES = 8 * 1024 * 1024;
 /** Maximum read requests in flight runtime-wide. */
 export const PR_MAX_IN_FLIGHT_READS = 4;
 const REST_LIST_PAGE_SIZE = 100;
+
+/** Upper bound on raw REST pagination pages; hitting the cap is an incomplete read, never a truncated success. */
+const GH_PAGINATION_SAFETY_LIMIT_PAGES = 1000;
+const GH_PAGINATION_SAFETY_LIMIT_MESSAGE = "pagination safety guard reached";
 const ERROR_DETAIL_MAX_CHARS = 500;
 
 /**
@@ -60,20 +64,6 @@ export type GhAdapterFailureCategory =
 	| "timeout"
 	| "buffer_bound"
 	| "partial_page";
-
-/** True when `value` is a known adapter failure category (string guard). */
-export function isGhAdapterFailureCategory(value: string): value is GhAdapterFailureCategory {
-	return (
-		value === "auth" ||
-		value === "rate_limit" ||
-		value === "not_found" ||
-		value === "access" ||
-		value === "network" ||
-		value === "timeout" ||
-		value === "buffer_bound" ||
-		value === "partial_page"
-	);
-}
 
 export interface GhAdapterFailure {
 	category: GhAdapterFailureCategory;
@@ -714,7 +704,7 @@ export class GitHubGhAdapter {
 			if (items.length < REST_LIST_PAGE_SIZE) {
 				break;
 			}
-			if (page >= 1000) {
+			if (page >= GH_PAGINATION_SAFETY_LIMIT_PAGES) {
 				break; // safety guard against runaway pagination
 			}
 		}
@@ -820,11 +810,11 @@ export class GitHubGhAdapter {
 				}
 				break;
 			}
-			if (page >= 1000) {
+			if (page >= GH_PAGINATION_SAFETY_LIMIT_PAGES) {
 				// Paging cap: unknown completeness, never a truncated success.
 				return {
 					kind: "failed",
-					failure: { category: "partial_page", message: "pagination safety guard reached", at: this.now() },
+					failure: { category: "partial_page", message: GH_PAGINATION_SAFETY_LIMIT_MESSAGE, at: this.now() },
 				};
 			}
 		}
@@ -902,10 +892,10 @@ export class GitHubGhAdapter {
 				}
 				return { kind: "ok", aggregateState, totalCount, statuses };
 			}
-			if (page >= 1000) {
+			if (page >= GH_PAGINATION_SAFETY_LIMIT_PAGES) {
 				return {
 					kind: "failed",
-					failure: { category: "partial_page", message: "pagination safety guard reached", at: this.now() },
+					failure: { category: "partial_page", message: GH_PAGINATION_SAFETY_LIMIT_MESSAGE, at: this.now() },
 				};
 			}
 		}

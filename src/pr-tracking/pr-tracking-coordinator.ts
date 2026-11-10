@@ -998,14 +998,22 @@ export class PrTrackingCoordinator {
 			return { subscription: sub, binding, mode: "poll", stopReason: null, blocker: null };
 		}
 		if (prState === "merged") {
-			if (sub.consumers.mergeCompletion && binding?.mergeCompletion?.status !== "completed") {
+			if (sub.consumers.mergeCompletion) {
+				// Keep reconciling until the consumer confirms the episode: the
+				// merged_completed terminal stop - which only the merge-completion
+				// consumer writes, and only after the board move landed - is what
+				// terminates the subscription via the terminal-stop check above.
+				// Stopping on the persisted binding alone is wrong: the binding
+				// persists BEFORE the move, so a failed move would strand the
+				// still-active card with no further delivery and no successor
+				// dispatch.
 				return { subscription: sub, binding, mode: "reconcile", stopReason: null, blocker: null };
 			}
 			return {
 				subscription: sub,
 				binding,
 				mode: "stopped",
-				stopReason: sub.consumers.mergeCompletion ? "merged_completed" : "no_enabled_consumers",
+				stopReason: "no_enabled_consumers",
 				blocker: null,
 			};
 		}
@@ -1442,15 +1450,17 @@ export class PrTrackingCoordinator {
 			return;
 		}
 		if (binding.mergeCompletion?.status === "completed") {
-			if (existing?.reason !== "merged_completed") {
-				await this.store.setTaskTerminalStop(sub.canonicalPrKey, bindingId, {
-					reason: "merged_completed",
-					observedAt: this.now(),
-					reconciliationReads: existing?.reconciliationReads ?? 0,
-				});
-				this.emitTerminalInvalidation(sub, "merged_completed");
+			if (existing?.reason === "merged_completed") {
+				return; // consumer-confirmed: the stop persisted after the move landed.
 			}
-			return;
+			// A completed binding WITHOUT the merged_completed stop is the
+			// move-pending window (the consumer persists the completion before
+			// the board move). The coordinator must NOT stamp merged_completed
+			// here - that terminal stop would stop the subscription before the
+			// move landed and survive restarts, stranding the card. Fall through
+			// to the bounded reconciliation bookkeeping so the consumer's
+			// idempotent re-run keeps receiving observations; the consumer
+			// writes the merged_completed stop itself once the move lands.
 		}
 		const priorReads = existing?.reason === "merged_reconciling" ? existing.reconciliationReads : 0;
 		if (existing?.reason === "merged_unresolved" || priorReads >= PR_TERMINAL_RECONCILIATION_MAX_READS) {

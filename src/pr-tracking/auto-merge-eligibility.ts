@@ -33,6 +33,7 @@
 // AM-4 binds the real merge operation).
 import {
 	AUTO_MERGE_ELIGIBILITY_SCHEMA_VERSION,
+	AUTO_MERGE_ELIGIBILITY_SUMMARY_MAX_CODES,
 	type AutoMergeCheckEvidence,
 	type AutoMergeEligibilityBlocker,
 	type AutoMergeEligibilityKind,
@@ -52,9 +53,7 @@ import type { PrRecordStorePort } from "./pr-record-store";
 import type { PrTrackingCoordinator } from "./pr-tracking-coordinator";
 
 /** Default evidence freshness budget: two poll intervals (60s cadence). */
-export const AUTO_MERGE_MAX_EVIDENCE_AGE_MS = 2 * 60 * 1000;
-/** The persisted summary keeps at most this many blocker codes. */
-export const AUTO_MERGE_SUMMARY_CODE_LIMIT = 10;
+const AUTO_MERGE_MAX_EVIDENCE_AGE_MS = 2 * 60 * 1000;
 
 /** Live task facts the evaluator needs (re-read from the board, never cached). */
 export interface AutoMergeEligibilityTaskFacts {
@@ -71,7 +70,7 @@ export interface AutoMergeEligibilityTaskFacts {
 	expectedBaseRef: string | null;
 }
 
-export interface AutoMergeEligibilityInput {
+interface AutoMergeEligibilityInput {
 	task: AutoMergeEligibilityTaskFacts;
 	/** The CURRENT repository policy (null when the repository has none). */
 	policy: AutoMergePolicy | null;
@@ -95,7 +94,7 @@ export interface AutoMergeEligibilityInput {
  * `waiting` codes; within each group the order below is fixed and
  * deterministic (used for tests and the persisted summary).
  */
-export const AUTO_MERGE_BLOCKED_CODES = [
+const AUTO_MERGE_BLOCKED_CODES = [
 	"disabled",
 	"not_armed",
 	"inactive_task",
@@ -130,7 +129,7 @@ function normalizeRepo(repo: string): string {
 
 // ── Review classification ─────────────────────────────────────────────────────
 
-export interface AutoMergeReviewVerdict {
+interface AutoMergeReviewVerdict {
 	/** Non-author reviewers with an effective current-head approval. */
 	approvers: string[];
 	/** Reviewers whose CHANGES_REQUESTED is not superseded. */
@@ -212,9 +211,9 @@ export function classifyAutoMergeReviews(
 
 // ── Check classification ──────────────────────────────────────────────────────
 
-export type AutoMergeRequiredCheckOutcome = "success" | "pending" | "failed" | "missing";
+type AutoMergeRequiredCheckOutcome = "success" | "pending" | "failed" | "missing";
 
-export interface AutoMergeRequiredCheckVerdict {
+interface AutoMergeRequiredCheckVerdict {
 	/** The policy check name (case-sensitive exact name). */
 	name: string;
 	outcome: AutoMergeRequiredCheckOutcome;
@@ -477,7 +476,7 @@ export function toAutoMergeEligibilitySummary(result: AutoMergeEligibilityResult
 	return {
 		schemaVersion: AUTO_MERGE_ELIGIBILITY_SCHEMA_VERSION,
 		kind: result.kind,
-		codes: result.blockers.map((blocker) => blocker.code).slice(0, AUTO_MERGE_SUMMARY_CODE_LIMIT),
+		codes: result.blockers.map((blocker) => blocker.code).slice(0, AUTO_MERGE_ELIGIBILITY_SUMMARY_MAX_CODES),
 		evaluatedAt: result.evaluatedAt,
 		headSha: result.headSha,
 		baseSha: result.baseSha,
@@ -517,24 +516,19 @@ export interface AutoMergeConsumerDeps {
 	loadPolicy: (repository: string) => Promise<AutoMergePolicy | null>;
 	/** Live writer liveness for the task (defaults to inactive). */
 	isTaskWriterActive?: (workspaceId: string, taskId: string) => Promise<boolean> | boolean;
-	/**
-	 * The AM-4 executor seam. AM-3 installs a no-op recorder; the real merge
-	 * reservation/execution lands with AM-4.
-	 */
+	/** The AM-4 executor seam: the runtime binds this to the fenced auto-merge executor. */
 	onEligible?: (handoff: AutoMergeEligibilityHandoff) => void | Promise<void>;
 	warn?: (message: string) => void;
 	now?: () => number;
 }
 
 /**
- * Count other tasks that currently claim the same canonical PR for
- * auto-merge (active column + live opt-in + armed + resolvable to this PR).
- * The caller's own task is excluded.
- */
-/**
  * Count the OTHER auto-merge-eligible claimants of this PR across all managed
- * boards (the ambiguity gate's input). AM-4's executor re-runs this under its
- * reservation as part of the full eligibility re-validation.
+ * boards (the ambiguity gate's input): active column + live opt-in + armed +
+ * resolvable to this PR. The caller's own task (workspace id AND task id) is
+ * excluded, so a same-id card in a DIFFERENT workspace still counts as a
+ * claimant. AM-4's executor re-runs this under its reservation as part of
+ * the full eligibility re-validation.
  */
 export async function countOtherEligibleClaimants(
 	canonicalPrKey: string,
@@ -543,13 +537,13 @@ export async function countOtherEligibleClaimants(
 ): Promise<number> {
 	const boards = await listBoards();
 	let count = 0;
-	for (const { board } of boards) {
+	for (const { workspaceId, board } of boards) {
 		for (const column of board.columns) {
 			if (!PR_OWNER_ACTIVE_COLUMNS.has(column.id)) {
 				continue;
 			}
 			for (const card of column.cards) {
-				if (card.id === task.taskId) {
+				if (workspaceId === task.workspaceId && card.id === task.taskId) {
 					continue;
 				}
 				if (card.autoMergeWhenApproved !== true || card.armedAutoMergePolicyRevision === undefined) {
@@ -593,9 +587,30 @@ export async function reconcileAutoMergeEligibility(
 	if (resolved.key !== observation.record.canonicalPrKey) {
 		return;
 	}
-	// Disabling is immediate: no evaluation, no record write, no handoff.
-	// The subscription's autoMerge consumer flag drops on the next reconcile.
+	// Disabling is immediate: no evaluation, no handoff. The subscription's
+	// autoMerge consumer flag drops on the next reconcile. The eligibility
+	// summary persisted by the last armed evaluation is cleared here (a real
+	// write, not a skip), so pr-tracking-api never surfaces a stale
+	// "eligible" for a card that opted out or disarmed.
 	if (card.autoMergeWhenApproved !== true || card.armedAutoMergePolicyRevision === undefined) {
+		const binding = observation.record.taskBindings.find(
+			(item) => item.workspaceId === task.workspaceId && item.taskId === task.taskId,
+		);
+		if (binding?.autoMerge) {
+			await deps.store
+				.updateTaskBinding(observation.record.canonicalPrKey, task, undefined, (item) => ({
+					...item,
+					autoMerge: null,
+				}))
+				.then((write) => {
+					if (!write.ok) {
+						deps.warn?.(`Auto-merge eligibility summary clear failed (${write.reason}); will retry`);
+					}
+				})
+				.catch((error: unknown) => {
+					deps.warn?.(`Auto-merge eligibility summary clear failed: ${String(error)}`);
+				});
+		}
 		return;
 	}
 	const coordinator = deps.getCoordinator();

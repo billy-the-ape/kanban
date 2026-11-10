@@ -1,8 +1,8 @@
-import { act, type ReactElement, type ReactNode } from "react";
+import { act, forwardRef, type ReactElement, type ReactNode, useImperativeHandle, useRef, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ClineAgentChatPanel, CHAT_VIRTUALIZATION_THRESHOLD } from "@/components/detail-panels/cline-agent-chat-panel";
+import { CHAT_VIRTUALIZATION_THRESHOLD, ClineAgentChatPanel } from "@/components/detail-panels/cline-agent-chat-panel";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ClineChatMessage } from "@/hooks/use-cline-chat-session";
 
@@ -10,8 +10,7 @@ import type { ClineChatMessage } from "@/hooks/use-cline-chat-session";
 // the window contract and tests that the actual chat panel supplies bounded
 // rows, stable message IDs, and preserved expansion state across unmounts.
 // Real virtualizer geometry requires a browser test.
-vi.mock("react-virtuoso", async () => {
-	const React = await import("react");
+vi.mock("react-virtuoso", () => {
 	type MockProps = {
 		data: ClineChatMessage[];
 		itemContent: (index: number, message: ClineChatMessage) => ReactNode;
@@ -24,43 +23,56 @@ vi.mock("react-virtuoso", async () => {
 		autoscrollToBottom: () => void;
 	};
 	return {
-		Virtuoso: React.forwardRef<MockHandle, MockProps>(function MockVirtuoso(props, ref) {
+		Virtuoso: forwardRef<MockHandle, MockProps>(function MockVirtuoso(props, ref) {
 			const { data, itemContent, atBottomStateChange } = props;
-			const [start, setStart] = React.useState(() => Math.max(0, data.length - 6));
+			const [start, setStart] = useState(() => Math.max(0, data.length - 6));
 			// Model Virtuoso's immediate internal state separately from its delayed
 			// atBottomStateChange event, which exposed the original scroll race.
-			const atBottom = React.useRef(true);
-			React.useImperativeHandle(ref, () => ({
-				scrollToIndex: ({ index }) => setStart(Math.max(0, Math.min(index, data.length - 6))),
-				autoscrollToBottom: () => {
-					if (atBottom.current) setStart(Math.max(0, data.length - 6));
-				},
-			}), [data.length]);
+			const atBottom = useRef(true);
+			useImperativeHandle(
+				ref,
+				() => ({
+					scrollToIndex: ({ index }) => setStart(Math.max(0, Math.min(index, data.length - 6))),
+					autoscrollToBottom: () => {
+						if (atBottom.current) setStart(Math.max(0, data.length - 6));
+					},
+				}),
+				[data.length],
+			);
 			return (
 				<div data-testid="virtual-chat-list" data-initial-index={props.initialTopMostItemIndex.index}>
 					<button
-					type="button"
-					data-testid="show-oldest"
-					onClick={() => { atBottom.current = false; setStart(0); }}
-					>Oldest</button>
+						type="button"
+						data-testid="show-oldest"
+						onClick={() => {
+							atBottom.current = false;
+							setStart(0);
+						}}
+					>
+						Oldest
+					</button>
 					<button
-					type="button"
-					data-testid="show-oldest-notify"
-					onClick={() => {
-						atBottom.current = false;
-						setStart(0);
-						atBottomStateChange?.(false);
-					}}
-					>Scroll up (notify)</button>
+						type="button"
+						data-testid="show-oldest-notify"
+						onClick={() => {
+							atBottom.current = false;
+							setStart(0);
+							atBottomStateChange?.(false);
+						}}
+					>
+						Scroll up (notify)
+					</button>
 					<button
 						type="button"
 						data-testid="show-newest"
-					onClick={() => {
+						onClick={() => {
 							atBottom.current = true;
 							setStart(Math.max(0, data.length - 6));
 							atBottomStateChange?.(true);
 						}}
-					>Newest</button>
+					>
+						Newest
+					</button>
 					{data.slice(start, start + 6).map((message, offset) => (
 						<div key={message.id}>{itemContent(start + offset, message)}</div>
 					))}
@@ -85,7 +97,8 @@ describe("ClineAgentChatPanel long conversations", () => {
 	let previousActEnvironment: boolean | undefined;
 
 	beforeEach(() => {
-		previousActEnvironment = (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT;
+		previousActEnvironment = (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
+			.IS_REACT_ACT_ENVIRONMENT;
 		(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 		container = document.createElement("div");
 		document.body.appendChild(container);
@@ -98,7 +111,8 @@ describe("ClineAgentChatPanel long conversations", () => {
 		if (previousActEnvironment === undefined) {
 			delete (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT;
 		} else {
-			(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+			(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT =
+				previousActEnvironment;
 		}
 	});
 
@@ -112,7 +126,9 @@ describe("ClineAgentChatPanel long conversations", () => {
 	async function click(testId: string): Promise<void> {
 		const button = container.querySelector<HTMLButtonElement>(`[data-testid="${testId}"]`);
 		expect(button).toBeInstanceOf(HTMLButtonElement);
-		await act(async () => { button?.click(); });
+		await act(async () => {
+			button?.click();
+		});
 	}
 
 	it("virtualizes a thousand mixed-size messages and starts at the latest message", async () => {
@@ -120,7 +136,9 @@ describe("ClineAgentChatPanel long conversations", () => {
 		const onLoadMessages = async () => messages;
 		await render(<ClineAgentChatPanel taskId="task-large" summary={null} onLoadMessages={onLoadMessages} />);
 		expect(CHAT_VIRTUALIZATION_THRESHOLD).toBeLessThan(messages.length);
-		expect(container.querySelector('[data-testid="virtual-chat-list"]')?.getAttribute("data-initial-index")).toBe("999");
+		expect(container.querySelector('[data-testid="virtual-chat-list"]')?.getAttribute("data-initial-index")).toBe(
+			"999",
+		);
 		expect(container.querySelectorAll('[data-testid="virtual-chat-message"]')).toHaveLength(6);
 		expect(container.textContent).toContain("Reply 999:");
 		expect(container.textContent).not.toContain("Reply 0:");
@@ -172,8 +190,12 @@ describe("ClineAgentChatPanel long conversations", () => {
 		};
 		const onLoadMessages = async () => messages;
 		await render(<ClineAgentChatPanel taskId="task-threshold" summary={null} onLoadMessages={onLoadMessages} />);
-		const toolToggle = [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("editor"));
-		await act(async () => { toolToggle?.click(); });
+		const toolToggle = [...container.querySelectorAll("button")].find((button) =>
+			button.textContent?.includes("editor"),
+		);
+		await act(async () => {
+			toolToggle?.click();
+		});
 		expect(container.textContent).toContain("Persisted");
 		await render(
 			<ClineAgentChatPanel
@@ -194,14 +216,19 @@ describe("ClineAgentChatPanel long conversations", () => {
 			id: "tool-0",
 			role: "tool",
 			createdAt: 0,
-			content: 'Tool: editor\nInput:\n{"path":"src/app.ts"}\nOutput:\n{"success":true,"result":"Saved successfully"}',
+			content:
+				'Tool: editor\nInput:\n{"path":"src/app.ts"}\nOutput:\n{"success":true,"result":"Saved successfully"}',
 		};
 		const onLoadMessages = async () => messages;
 		await render(<ClineAgentChatPanel taskId="task-tool" summary={null} onLoadMessages={onLoadMessages} />);
 		await click("show-oldest");
-		const toolToggle = [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("editor"));
+		const toolToggle = [...container.querySelectorAll("button")].find((button) =>
+			button.textContent?.includes("editor"),
+		);
 		expect(toolToggle).toBeDefined();
-		await act(async () => { toolToggle?.click(); });
+		await act(async () => {
+			toolToggle?.click();
+		});
 		expect(container.textContent).toContain("Saved successfully");
 		await click("show-newest");
 		expect(container.textContent).not.toContain("Saved successfully");

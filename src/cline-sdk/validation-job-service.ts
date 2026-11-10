@@ -132,7 +132,11 @@ export interface ValidationJobServiceOptions {
 	maxLogBytes?: number;
 	maxReadBytes?: number;
 	/** Artifact writer override (tests); defaults to the task context-artifact writer. */
-	archiveArtifact?: (input: { taskId: string; toolCallId: string; content: string }) => Promise<string | null>;
+	archiveArtifact?: (input: {
+		taskId: string;
+		toolCallId: string;
+		content: string | Buffer;
+	}) => Promise<string | null>;
 }
 
 interface LiveJob {
@@ -276,9 +280,6 @@ export async function listValidationJobRecords(taskId: string): Promise<Validati
 	return records;
 }
 
-/** AR-7: default byte limit of a job-log preview in a quality summary. */
-export const VALIDATION_JOB_LOG_PREVIEW_LIMIT_BYTES = 64 * 1024;
-
 /**
  * AR-7: read-only access to a job's retained log for diagnostics
  * observations. Returns the archived log path when it exists and lives in
@@ -296,34 +297,40 @@ export async function readValidationJobLogReference(record: ValidationJobRecord)
 }
 
 /**
- * AR-7: a bounded preview of the job's retained log (null when no log is
- * available). Reads at most `limitBytes` from the start of the archived log.
- * Never starts, cancels, or reclassifies anything.
+ * Returns the largest byte length <= byteLength that does not cut a multi-byte
+ * UTF-8 sequence at the end of a log page. Paging cursors then always resume
+ * at a character boundary, so a character straddling a page split is decoded
+ * whole by the next page instead of becoming replacement characters on both.
+ * Falls back to `byteLength` when the page is shorter than one incomplete
+ * sequence, so paging always makes progress.
  */
-export async function readValidationJobLogPreview(
-	record: ValidationJobRecord,
-	limitBytes: number = VALIDATION_JOB_LOG_PREVIEW_LIMIT_BYTES,
-): Promise<string | null> {
-	const path = await readValidationJobLogReference(record);
-	if (!path) {
-		return null;
+function alignUtf8PageEnd(buffer: Buffer, byteLength: number): number {
+	let end = byteLength;
+	// Walk back over trailing continuation bytes (10xxxxxx).
+	while (end > 0 && ((buffer[end - 1] ?? 0) & 0xc0) === 0x80) {
+		end -= 1;
 	}
-	const handle = await open(path, "r").catch(() => null);
-	if (!handle) {
-		return null;
+	if (end === 0) {
+		return byteLength;
 	}
-	try {
-		const size = (await handle.stat().catch(() => null))?.size ?? 0;
-		const length = Math.min(Math.max(0, Math.trunc(limitBytes)), size);
-		if (length <= 0) {
-			return "";
-		}
-		const buffer = Buffer.alloc(length);
-		const { bytesRead } = await handle.read(buffer, 0, length, 0);
-		return buffer.subarray(0, bytesRead).toString("utf8");
-	} finally {
-		await handle.close().catch(() => undefined);
+	const lead = buffer[end - 1] ?? 0;
+	let sequenceLength = 1;
+	if ((lead & 0xe0) === 0xc0) {
+		sequenceLength = 2;
+	} else if ((lead & 0xf0) === 0xe0) {
+		sequenceLength = 3;
+	} else if ((lead & 0xf8) === 0xf0) {
+		sequenceLength = 4;
 	}
+	if (byteLength - (end - 1) >= sequenceLength) {
+		// The trailing sequence fits entirely inside the page: keep the whole
+		// page (returning `end` here would cut a complete character).
+		return byteLength;
+	}
+	// The page cuts the lead byte's sequence: drop the lead as well. A page
+	// that is nothing but one incomplete sequence keeps its bytes so paging
+	// still makes progress.
+	return end - 1 === 0 ? byteLength : end - 1;
 }
 
 /**
@@ -342,7 +349,7 @@ export class ValidationJobService {
 	private readonly archiveArtifact: (input: {
 		taskId: string;
 		toolCallId: string;
-		content: string;
+		content: string | Buffer;
 	}) => Promise<string | null>;
 	private readonly jobsDir: string;
 	private readonly receiptByToolCallId = new Map<string, ValidationJobRecord>();
@@ -592,7 +599,12 @@ export class ValidationJobService {
 
 	/**
 	 * Pages the retained log with a byte cursor (bounded to the page limit).
-	 * Never starts or restarts a process. Null when the job is unknown.
+	 * The cursor advances only to UTF-8 character boundaries, so a multi-byte
+	 * character split by the page limit is decoded whole by the next page
+	 * rather than as replacement characters on both pages. Callers must resume
+	 * at the returned `nextOffset` (an arbitrary unaligned `offset` may start
+	 * mid-sequence). Never starts or restarts a process. Null when the job is
+	 * unknown.
 	 */
 	async readJobLog(jobId: string, offset: number = 0, limit?: number): Promise<ValidationJobLogPage | null> {
 		await this.initialize();
@@ -617,17 +629,19 @@ export class ValidationJobService {
 		const safeLimit = Math.max(1, Math.min(Math.trunc(limit ?? this.maxReadBytes), this.maxReadBytes));
 		const length = Math.min(safeLimit, total - safeOffset);
 		let text = "";
+		let consumedBytes = 0;
 		if (length > 0) {
 			const handle = await open(sourcePath, "r");
 			try {
 				const buffer = Buffer.alloc(length);
 				const { bytesRead } = await handle.read(buffer, 0, length, safeOffset);
-				text = buffer.subarray(0, bytesRead).toString("utf8");
+				consumedBytes = alignUtf8PageEnd(buffer, bytesRead);
+				text = buffer.subarray(0, consumedBytes).toString("utf8");
 			} finally {
 				await handle.close().catch(() => undefined);
 			}
 		}
-		const nextOffset = safeOffset + length;
+		const nextOffset = safeOffset + consumedBytes;
 		return {
 			text,
 			offset: safeOffset,
@@ -975,10 +989,16 @@ export class ValidationJobService {
 			let spoolConsumed = false;
 			if (record.logBytesRetained > 0) {
 				try {
-					let content = await readFile(this.spoolPathFor(record.jobId), "utf8");
-					if (record.logTruncated) {
-						content = `${content}\n\n${buildTruncationMarker(record.logBytesOmitted)}`;
-					}
+					// Archive the raw spool bytes (not a UTF-8 round-trip): the
+					// archive is the spool byte-for-byte plus an optional appended
+					// marker, so a log cursor that survives settlement keeps one
+					// coordinate system (non-UTF-8 output bytes or a multi-byte
+					// character split at the spool cap would otherwise shift every
+					// later byte offset when the archive is re-encoded).
+					const raw = await readFile(this.spoolPathFor(record.jobId));
+					const content = record.logTruncated
+						? Buffer.concat([raw, Buffer.from(`\n\n${buildTruncationMarker(record.logBytesOmitted)}`, "utf8")])
+						: raw;
 					artifactPath = await this.archiveArtifact({
 						taskId: record.taskId,
 						toolCallId: record.toolCallId,

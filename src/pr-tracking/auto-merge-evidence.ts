@@ -14,7 +14,12 @@
 // concurrent requests per (PR, scope, options); unrelated tasks never
 // trigger these reads. The normalization layer is pure and injectable
 // (tests script the adapter's gh runner).
-import type { AutoMergeCheckEvidence, AutoMergeEvidenceEnvelope, AutoMergeReviewEvidence } from "../core/api-contract";
+import type {
+	AutoMergeCheckEvidence,
+	AutoMergeEvidenceEnvelope,
+	AutoMergeReviewEvidence,
+	GitHubPrMetadataSnapshot,
+} from "../core/api-contract";
 import { AUTO_MERGE_EVIDENCE_SCHEMA_VERSION } from "../core/api-contract";
 import type {
 	AccessScope,
@@ -219,6 +224,37 @@ export interface AutoMergeEvidenceResult {
 	failures: GhAdapterFailure[];
 }
 
+/**
+ * Copies the identity/PR-state fields shared by every coherent envelope exit
+ * (the declared-head-mismatch early return and the main path), so the two
+ * paths cannot drift apart.
+ */
+function applyCoherentEnvelopeFields(
+	envelope: AutoMergeEvidenceEnvelope,
+	start: {
+		baseSha: string | null | undefined;
+		baseRef: string | null;
+		baseRepository: string | null;
+		headRef: string | null;
+		headRepository: string | null;
+	},
+	metadata: GitHubPrMetadataSnapshot,
+): void {
+	Object.assign(envelope, {
+		baseSha: start.baseSha ?? null,
+		baseRef: start.baseRef,
+		baseRepository: start.baseRepository,
+		headRef: start.headRef,
+		headRepository: start.headRepository,
+		prState: metadata.state,
+		draft: metadata.state === "draft",
+		mergeable: metadata.mergeable ?? null,
+		mergeableState: metadata.mergeableState ?? null,
+		authorLogin: metadata.authorLogin ?? null,
+		autoMergePresent: metadata.autoMergePresent ?? null,
+	});
+}
+
 function baseEnvelope(
 	accessScopeId: string,
 	checkedAt: number,
@@ -317,19 +353,7 @@ export async function collectAutoMergeEvidence(
 		// for the wrong commit. Discard immediately (bounded, no further
 		// reads); the next eligible cycle re-requests with the live head.
 		const envelope = baseEnvelope(scope.accessScopeId, now(), policyRevision, headSha);
-		Object.assign(envelope, {
-			baseSha: start.baseSha ?? null,
-			baseRef: start.baseRef,
-			baseRepository: start.baseRepository,
-			headRef: start.headRef,
-			headRepository: start.headRepository,
-			prState: initial.metadata.state,
-			draft: initial.metadata.state === "draft",
-			mergeable: initial.metadata.mergeable ?? null,
-			mergeableState: initial.metadata.mergeableState ?? null,
-			authorLogin: initial.metadata.authorLogin ?? null,
-			autoMergePresent: initial.metadata.autoMergePresent ?? null,
-		});
+		applyCoherentEnvelopeFields(envelope, start, initial.metadata);
 		addReason(envelope.reasons, "declared_head_mismatch");
 		return { envelope, failures };
 	}
@@ -354,19 +378,7 @@ export async function collectAutoMergeEvidence(
 		recordDigest: false,
 	});
 	const envelope = baseEnvelope(scope.accessScopeId, now(), policyRevision, headSha);
-	Object.assign(envelope, {
-		baseSha: start.baseSha ?? null,
-		baseRef: start.baseRef,
-		baseRepository: start.baseRepository,
-		headRef: start.headRef,
-		headRepository: start.headRepository,
-		prState: initial.metadata.state,
-		draft: initial.metadata.state === "draft",
-		mergeable: initial.metadata.mergeable ?? null,
-		mergeableState: initial.metadata.mergeableState ?? null,
-		authorLogin: initial.metadata.authorLogin ?? null,
-		autoMergePresent: initial.metadata.autoMergePresent ?? null,
-	});
+	applyCoherentEnvelopeFields(envelope, start, initial.metadata);
 	let metadataCoherent = false;
 	if (final.kind === "ok") {
 		const m = final.metadata;

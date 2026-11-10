@@ -1,9 +1,42 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createInMemoryClineSessionRuntime } from "../../../src/cline-sdk/cline-session-runtime";
 import { ClineTurnScheduler } from "../../../src/cline-sdk/cline-turn-scheduler";
 import type { ClineSdkSessionRecord } from "../../../src/cline-sdk/sdk-runtime-boundary";
 import { VALIDATION_JOB_CAPABILITY_TEXT } from "../../../src/cline-sdk/validation-job-tool";
+
+// Local-host session starts construct a ValidationJobService, whose
+// initialize()/start() resolve `~/.cline/worktrees/<taskId>/validation-jobs`
+// through os.homedir(). Redirect HOME (and USERPROFILE for the Windows path)
+// to a temp dir so the suite never reads or writes the real per-task state.
+let tempHome = "";
+let previousHome: string | undefined;
+let previousUserProfile: string | undefined;
+
+beforeEach(() => {
+	tempHome = mkdtempSync(join(tmpdir(), "kanban-session-runtime-test-"));
+	previousHome = process.env.HOME;
+	previousUserProfile = process.env.USERPROFILE;
+	process.env.HOME = tempHome;
+	process.env.USERPROFILE = tempHome;
+});
+
+afterEach(() => {
+	if (previousHome === undefined) {
+		delete process.env.HOME;
+	} else {
+		process.env.HOME = previousHome;
+	}
+	if (previousUserProfile === undefined) {
+		delete process.env.USERPROFILE;
+	} else {
+		process.env.USERPROFILE = previousUserProfile;
+	}
+	rmSync(tempHome, { recursive: true, force: true });
+});
 
 function createNoopMcpRuntimeService() {
 	return {

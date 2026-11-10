@@ -343,6 +343,56 @@ function detectLineEnding(content: string): "lf" | "crlf" | "mixed" {
 }
 
 /**
+ * Outcome of the bounded filesystem phase (realpath → containment → stat →
+ * read). Skip reasons mirror what each step reported before the phase was
+ * bounded as one unit.
+ */
+type BoundedFileOutcome =
+	| { ok: true; content: string; sizeBytes: number }
+	| { ok: false; reason: string; sizeBytes?: number };
+
+/**
+ * Resolves, bounds-checks, and reads one file inside the task worktree. Every
+ * fs call in the phase runs under one shared deadline imposed by the caller's
+ * `withTimeout`, so no single stalled call (realpath, stat, or readFile) can
+ * hang the awaiting tool call.
+ */
+async function readBoundedFile(cwd: string, resolvedPath: string): Promise<BoundedFileOutcome> {
+	let fileReal: string;
+	try {
+		fileReal = await realpath(resolvedPath);
+	} catch {
+		return { ok: false, reason: "file is missing or cannot be resolved" };
+	}
+	const rootReal = await realpath(cwd).catch(() => resolve(cwd));
+	if (fileReal !== rootReal && !fileReal.startsWith(rootReal + sep)) {
+		return { ok: false, reason: "path resolves outside the task worktree (external path or symlink escape)" };
+	}
+	let info: Awaited<ReturnType<typeof stat>>;
+	try {
+		info = await stat(fileReal);
+	} catch {
+		return { ok: false, reason: "file is unreadable" };
+	}
+	if (!info.isFile()) {
+		return { ok: false, reason: "not a regular file" };
+	}
+	if (info.size > CLINE_EDITOR_EVIDENCE_MAX_FILE_BYTES) {
+		return {
+			ok: false,
+			sizeBytes: info.size,
+			reason: `file is ${info.size} bytes, over the ${CLINE_EDITOR_EVIDENCE_MAX_FILE_BYTES} byte evidence limit; read a targeted section instead`,
+		};
+	}
+	try {
+		const content = await readFile(fileReal, "utf8");
+		return { ok: true, content, sizeBytes: info.size };
+	} catch (error) {
+		return { ok: false, reason: `file is unreadable: ${error instanceof Error ? error.message : String(error)}` };
+	}
+}
+
+/**
  * Collects bounded current-source evidence for a failed editor call. Never
  * throws: every read problem is reported as a skip reason on `file`.
  */
@@ -395,61 +445,37 @@ export async function collectEditorEvidence(options: CollectEditorEvidenceOption
 		const resolvedPath = isAbsolute(requestedPath) ? resolve(requestedPath) : resolve(options.cwd, requestedPath);
 		evidence.resolvedPath = resolvedPath;
 
-		let fileReal: string;
+		// One hard timeout covers every filesystem call in the read phase
+		// (realpath, stat, readFile), so a stalled mount cannot hang the
+		// awaiting tool call anywhere in the phase, not only at the read.
+		let read: BoundedFileOutcome;
 		try {
-			fileReal = await realpath(resolvedPath);
-		} catch {
-			evidence.file = { state: "skipped", reason: "file is missing or cannot be resolved" };
-			return evidence;
-		}
-		const rootReal = await realpath(options.cwd).catch(() => resolve(options.cwd));
-		if (fileReal !== rootReal && !fileReal.startsWith(rootReal + sep)) {
-			evidence.file = {
-				state: "skipped",
-				reason: "path resolves outside the task worktree (external path or symlink escape)",
-			};
-			return evidence;
-		}
-		let info: Awaited<ReturnType<typeof stat>>;
-		try {
-			info = await stat(fileReal);
-		} catch {
-			evidence.file = { state: "skipped", reason: "file is unreadable" };
-			return evidence;
-		}
-		if (!info.isFile()) {
-			evidence.file = { state: "skipped", reason: "not a regular file" };
-			return evidence;
-		}
-		if (info.size > CLINE_EDITOR_EVIDENCE_MAX_FILE_BYTES) {
-			evidence.file = {
-				state: "skipped",
-				sizeBytes: info.size,
-				reason: `file is ${info.size} bytes, over the ${CLINE_EDITOR_EVIDENCE_MAX_FILE_BYTES} byte evidence limit; read a targeted section instead`,
-			};
-			return evidence;
-		}
-
-		let content: string;
-		try {
-			content = await withTimeout(readFile(fileReal, "utf8"), EVIDENCE_READ_TIMEOUT_MS);
+			read = await withTimeout(readBoundedFile(options.cwd, resolvedPath), EVIDENCE_READ_TIMEOUT_MS);
 		} catch (error) {
 			evidence.file = {
 				state: "skipped",
-				sizeBytes: info.size,
 				reason: `file is unreadable: ${error instanceof Error ? error.message : String(error)}`,
 			};
 			return evidence;
 		}
+		if (!read.ok) {
+			evidence.file = {
+				state: "skipped",
+				...(read.sizeBytes !== undefined ? { sizeBytes: read.sizeBytes } : {}),
+				reason: read.reason,
+			};
+			return evidence;
+		}
+		const content = read.content;
 		if (content.slice(0, BINARY_PROBE_CHARS).includes("\0")) {
-			evidence.file = { state: "skipped", sizeBytes: info.size, reason: "binary file" };
+			evidence.file = { state: "skipped", sizeBytes: read.sizeBytes, reason: "binary file" };
 			return evidence;
 		}
 
 		const fileLines = content.split("\n");
 		evidence.file = {
 			state: "read",
-			sizeBytes: info.size,
+			sizeBytes: read.sizeBytes,
 			lineCount: fileLines.length,
 			lineEnding: detectLineEnding(content),
 		};

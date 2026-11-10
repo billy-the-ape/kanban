@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CardDetailView } from "@/components/card-detail-view";
 import type { BoardCard, BoardColumn, CardSelection } from "@/types";
+import { createViewportMediaMock } from "@/utils/viewport-media-mock";
 
 /**
  * Regression tests for the initial viewport render of the task detail view.
@@ -15,54 +16,6 @@ import type { BoardCard, BoardColumn, CardSelection } from "@/types";
  * before the media query effect corrected isMobile) even though React 18
  * flushes effects synchronously inside act().
  */
-
-type MediaQueryChangeCallback = (event: Event) => void;
-
-function createViewportMediaMock(initialWidth: number) {
-	const listeners = new Set<MediaQueryChangeCallback>();
-	let viewportWidth = initialWidth;
-
-	const evaluate = (query: string): boolean => {
-		const maxWidth = /\(max-width:\s*([\d.]+)px\)/.exec(query);
-		if (!maxWidth) {
-			return false;
-		}
-		return viewportWidth <= Number(maxWidth[1]);
-	};
-
-	const matchMedia = (query: string): MediaQueryList => ({
-		// Like a real MediaQueryList, `matches` is live and re-evaluated.
-		get matches() {
-			return evaluate(query);
-		},
-		media: query,
-		onchange: null,
-		addListener: () => {},
-		removeListener: () => {},
-		addEventListener: (_type: string, listener: EventListenerOrEventListenerObject | null) => {
-			if (typeof listener === "function") {
-				listeners.add(listener as MediaQueryChangeCallback);
-			}
-		},
-		removeEventListener: (_type: string, listener: EventListenerOrEventListenerObject | null) => {
-			if (typeof listener === "function") {
-				listeners.delete(listener as MediaQueryChangeCallback);
-			}
-		},
-		dispatchEvent: () => true,
-	});
-
-	return {
-		matchMedia,
-		resizeTo(width: number) {
-			viewportWidth = width;
-			const event = new Event("change");
-			listeners.forEach((listener) => {
-				listener(event);
-			});
-		},
-	};
-}
 
 const trpcClientMocks = vi.hoisted(() => ({
 	addTaskPullRequest: vi.fn(),
@@ -174,13 +127,14 @@ function createSelection(): CardSelection {
 		createdAt: 1,
 		updatedAt: 1,
 	};
+	const backlogColumn: BoardColumn = { id: "backlog", title: "Backlog", cards: [card] };
 	const columns: BoardColumn[] = [
-		{ id: "backlog", title: "Backlog", cards: [card] },
+		backlogColumn,
 		{ id: "in_progress", title: "In Progress", cards: [] },
 		{ id: "review", title: "Review", cards: [] },
 		{ id: "trash", title: "Done", cards: [] },
 	];
-	return { card, column: columns[0]!, allColumns: columns };
+	return { card, column: backlogColumn, allColumns: columns };
 }
 
 function findTabButton(container: HTMLElement, label: string): HTMLButtonElement | null {

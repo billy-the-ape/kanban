@@ -16,16 +16,6 @@ import {
 	resolveHomeAgentAppendSystemPrompt,
 } from "../../../src/prompts/append-system-prompt";
 
-function countOccurrences(haystack: string, needle: string): number {
-	let count = 0;
-	let index = haystack.indexOf(needle);
-	while (index !== -1) {
-		count += 1;
-		index = haystack.indexOf(needle, index + needle.length);
-	}
-	return count;
-}
-
 function buildMinimalReviewArtifact() {
 	return {
 		taskId: "task-1",
@@ -66,10 +56,10 @@ describe("AR-4 proportionate planning guidance", () => {
 			providerId: "openai",
 			includePublicationGuidance: true,
 		});
-		expect(countOccurrences(prompt, CLINE_PROPORTIONAL_PLANNING_GUIDANCE)).toBe(1);
+		expect(prompt.split(CLINE_PROPORTIONAL_PLANNING_GUIDANCE).length - 1).toBe(1);
 		expect(prompt).not.toContain("It's OK for this section to be quite long");
 		// The editor recovery/publication guidance stays a separate intact section.
-		expect(countOccurrences(prompt, CLINE_EDITOR_SIZE_GUIDANCE)).toBe(1);
+		expect(prompt.split(CLINE_EDITOR_SIZE_GUIDANCE).length - 1).toBe(1);
 	});
 
 	it("keeps explicit planning requests authoritative", async () => {
@@ -157,7 +147,7 @@ describe("AR-4 proportionate planning guidance", () => {
 			throw new Error("expected a home-agent append system prompt");
 		}
 		const combined = `${base}\n\n${appended}`;
-		expect(countOccurrences(combined, CLINE_PROPORTIONAL_PLANNING_GUIDANCE)).toBe(1);
+		expect(combined.split(CLINE_PROPORTIONAL_PLANNING_GUIDANCE).length - 1).toBe(1);
 		// Re-applying the helper to an already composed prompt is a no-op.
 		const reApplied = applyProportionalPlanningGuidance(base);
 		expect(reApplied.status).toBe("already-present");
@@ -170,6 +160,6 @@ describe("AR-4 proportionate planning guidance", () => {
 		const result = applyProportionalPlanningGuidance(drifted);
 		expect(result.status).toBe("appended");
 		expect(result.prompt).toContain(drifted);
-		expect(countOccurrences(result.prompt, CLINE_PROPORTIONAL_PLANNING_GUIDANCE)).toBe(1);
+		expect(result.prompt.split(CLINE_PROPORTIONAL_PLANNING_GUIDANCE).length - 1).toBe(1);
 	});
 });

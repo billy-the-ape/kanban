@@ -3461,6 +3461,9 @@ export const autoMergeEligibilityResultSchema = z.object({
 });
 export type AutoMergeEligibilityResult = z.infer<typeof autoMergeEligibilityResultSchema>;
 
+/** Cap on the blocker codes persisted in an eligibility summary (shared with the evaluator). */
+export const AUTO_MERGE_ELIGIBILITY_SUMMARY_MAX_CODES = 10;
+
 /**
  * The small eligibility summary/diagnostic persisted on the task binding
  * (a projection of the full result; at most this summary).
@@ -3469,8 +3472,8 @@ export const autoMergeEligibilitySummarySchema = z
 	.object({
 		schemaVersion: z.literal(AUTO_MERGE_ELIGIBILITY_SCHEMA_VERSION),
 		kind: autoMergeEligibilityKindSchema,
-		/** Ordered blocker codes (messages stay transient; codes cap at 10). */
-		codes: z.array(z.string().min(1)).max(10),
+		/** Ordered blocker codes (messages stay transient; capped by the constant above). */
+		codes: z.array(z.string().min(1)).max(AUTO_MERGE_ELIGIBILITY_SUMMARY_MAX_CODES),
 		evaluatedAt: z.number(),
 		headSha: z.string().nullable(),
 		baseSha: z.string().nullable(),

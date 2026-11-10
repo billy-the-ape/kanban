@@ -104,14 +104,19 @@ function buildEditorRecovery(kind: EditorFailureKind, evidence: EditorEvidence |
 		}
 		case "no_match": {
 			const matchCount = evidence?.oldText?.matchCount;
-			const count = typeof matchCount === "number" ? matchCount : 0;
 			if (evidence?.file?.state === "skipped") {
 				return `The submitted anchor did not match the current file. Current-source evidence was skipped: ${evidence.file.reason ?? "unknown reason"}. Read a targeted section of the current file with read_files, then copy a short exact anchor from that fresh read. Do not repeat unchanged arguments or guess whitespace.`;
 			}
-			if (evidence?.candidates && evidence.candidates.windows.length > 0) {
-				return `The submitted anchor matched ${count} time${count === 1 ? "" : "s"} in the current file. The nearby source below is diagnostic evidence, not an automatically corrected anchor. Copy a short exact anchor from current source and include enough context to make it unique. Let the repository formatter handle indentation introduced by your edit.`;
+			if (typeof matchCount !== "number") {
+				// No current-source measurement was taken (e.g. a hook built
+				// without a cwd): never claim a match count that was never
+				// observed.
+				return "The submitted anchor did not match the current file, and no current-source measurement was available to confirm it. Read a targeted section of the current file with read_files, then copy a short exact anchor from that fresh read. Do not repeat unchanged arguments or guess whitespace.";
 			}
-			return `The submitted anchor matched ${count} time${count === 1 ? "" : "s"} in the current file. No nearby candidate could be located. Read a targeted section of the current file with read_files, then copy a short exact anchor from that fresh read. Do not repeat unchanged arguments or guess whitespace.`;
+			if (evidence?.candidates && evidence.candidates.windows.length > 0) {
+				return `The submitted anchor matched ${matchCount} time${matchCount === 1 ? "" : "s"} in the current file. The nearby source below is diagnostic evidence, not an automatically corrected anchor. Copy a short exact anchor from current source and include enough context to make it unique. Let the repository formatter handle indentation introduced by your edit.`;
+			}
+			return `The submitted anchor matched ${matchCount} time${matchCount === 1 ? "" : "s"} in the current file. No nearby candidate could be located. Read a targeted section of the current file with read_files, then copy a short exact anchor from that fresh read. Do not repeat unchanged arguments or guess whitespace.`;
 		}
 		case "ambiguous_match": {
 			const matchCount = evidence?.oldText?.matchCount;

@@ -18,6 +18,7 @@
 // fragments). No credentials, headers, prompts, or unrelated responses are
 // stored. Logging failures never affect the stream or the task.
 import { appendEditorTraceRecord } from "./cline-editor-trace";
+import { SDK_DEFAULT_PROVIDER_ID } from "./sdk-provider-boundary";
 
 export const EDITOR_TRANSPORT_CAPTURE_SCHEMA_VERSION = 1;
 
@@ -385,7 +386,6 @@ function hostMatchesTracked(url: string, trackedHosts: ReadonlySet<string>): str
 
 /** Default base URL of the SDK's managed "cline" provider (host match only). */
 const DEFAULT_CLINE_PROVIDER_BASE_URL = "https://api.cline.bot";
-const SDK_DEFAULT_PROVIDER_ID_VALUE = "cline";
 
 /**
  * Resolves the provider host (host:port) that a session's model requests are
@@ -402,7 +402,7 @@ export function resolveEditorTransportHost(baseUrl: string | null | undefined, p
 			return null;
 		}
 	}
-	if (providerId === SDK_DEFAULT_PROVIDER_ID_VALUE) {
+	if (providerId === SDK_DEFAULT_PROVIDER_ID) {
 		try {
 			return new URL(DEFAULT_CLINE_PROVIDER_BASE_URL).host;
 		} catch {

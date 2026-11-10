@@ -524,12 +524,13 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				},
 				// Move the task to Done through the server-owned board
 				// mutation (idempotent), broadcast + reconcile, and return
-				// the released ready linked task ids. Called BEFORE the
-				// completion is persisted, so a failure leaves the binding
-				// untouched and the bounded reconciliation reads retry. The
-				// successor dispatch pass itself is fired by the consumer
-				// only AFTER the binding is persisted (dispatchSuccessors
-				// below).
+				// the released ready linked task ids. Called AFTER the
+				// completion binding is persisted, so a failure here leaves
+				// the card in an active column (still subscribed) with the
+				// completed binding, and the next observation's idempotent
+				// re-run lands the move. The successor dispatch pass itself
+				// is fired by the consumer only after BOTH land
+				// (dispatchSuccessors below).
 				completeTask: async (workspaceId, taskId) => {
 					const workspacePath = deps.workspaceRegistry.getWorkspacePathById(workspaceId);
 					if (!workspacePath) {

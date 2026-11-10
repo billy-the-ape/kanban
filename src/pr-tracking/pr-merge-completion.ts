@@ -19,9 +19,11 @@
 //     merge_completion reservation is held by another task;
 //   - never rearm once a completion or a block is persisted (the binding's
 //     mergeCompletion + terminalStop markers survive restarts); a crash
-//     cannot strand a card because the idempotent board move lands before
-//     the completion persist, so any pre-persist crash is simply retried
-//     from scratch on the next observation;
+//     cannot strand a card because the completion persist lands BEFORE the
+//     idempotent board move, so every window leaves the card in an active
+//     column where its still-live subscription retries (from scratch on a
+//     failed write, or through the defensive idempotency re-run when only
+//     the move is missing);
 //   - a task that was manually reopened from Done after a merge (server-
 //     derived manualReopenAt marker) is not sent back to Done by the SAME
 //     merge commit — only a later merge (a different merge commit) completes
@@ -29,8 +31,8 @@
 //
 // The observation flow per merged PR read:
 //   idempotency checks -> card eligibility -> writer check -> reservation ->
-//   worktree checks -> complete the task (board move) ->
-//   persist completion (binding) -> fire the successor dispatch pass ->
+//   worktree checks -> persist completion (binding) ->
+//   complete the task (board move) -> fire the successor dispatch pass ->
 //   persist the terminal stop.
 import type { GitHubPrMergeCompletion, RuntimeBoardCard, RuntimeBoardColumnId } from "../core/api-contract";
 import { GITHUB_PR_TRACKING_RECORD_SCHEMA_VERSION } from "../core/api-contract";
@@ -312,6 +314,10 @@ export async function reconcileMergeCompletion(
 		return { action: "skipped", reason: "preference_off" };
 	}
 	if (found.columnId !== "in_progress" && found.columnId !== "review") {
+		// Active-column only: subscription demand covers In Progress/In Review
+		// cards, so a Done/Trash card is never observed again. Completion is
+		// therefore persisted BEFORE the board move below - the reverse window
+		// (Done card without a completed binding) would be unrecoverable.
 		return { action: "skipped", reason: "inactive_column" };
 	}
 	if (mergeCommitSha === null) {
@@ -324,9 +330,9 @@ export async function reconcileMergeCompletion(
 	// consumed for this binding and the card is in an active column (Done/
 	// Trash skip above). The server-derived manualReopenAt marker means a
 	// human reopened it from Done — do not send it back. Without the marker
-	// a persisted completion and an active column should not coexist (the
-	// move precedes the persist); fall through and re-run the idempotent
-	// completion defensively.
+	// a persisted completion with an active column is the crash window
+	// between the persist and the move below; fall through and re-run the
+	// idempotent completion defensively.
 	const prior = binding.mergeCompletion;
 	if (
 		prior !== null &&
@@ -420,19 +426,18 @@ export async function reconcileMergeCompletion(
 				}
 			}
 		}
-		// Board move FIRST, then persist: the move is idempotent (a Done card
-		// is a no-op), so a failed move leaves the binding untouched and the
-		// coordinator's bounded reconciliation reads retry from scratch — no
-		// stranded card. A crash after the persist is recovered by the
-		// manual-reopen guard (active column without manualReopenAt re-runs
-		// this idempotent completion).
-		let readyLinkedTaskIds: string[] = [];
-		try {
-			readyLinkedTaskIds = await deps.completeTask(task.workspaceId, task.taskId);
-		} catch (error) {
-			warn(`PR merge completion move failed for ${task.taskId}: ${String(error)}`);
-			return { action: "pending", reason: "complete_move_failed" };
-		}
+		// Persist FIRST, then move the card. Subscription demand only covers
+		// active columns, so a Done card is never observed again: every failure
+		// window must leave the card ACTIVE to stay recoverable. A failed write
+		// leaves the card in place with an untouched binding and the next
+		// observation retries the episode from scratch; a crash between the
+		// persist and the move leaves an active-column card with a persisted
+		// completion, which the idempotency guard above re-runs defensively
+		// (the persist is idempotent, then the move lands). The subscription
+		// keeps receiving observations through that window because the terminal
+		// stop below - not the completed binding - is what stops tracking, and
+		// the coordinator never stamps merged_completed itself. Moving first
+		// would strand a Done card whose completion never persisted.
 		const write = await deps.store.updateTaskBinding(prKey, task, undefined, (item) => ({
 			...item,
 			mergeCompletion: buildMergeCompletion({
@@ -446,11 +451,19 @@ export async function reconcileMergeCompletion(
 			warn(`PR merge completion write failed (${write.reason}); will retry`);
 			return { action: "pending", reason: "completion_write_failed" };
 		}
-		// The successor dispatch pass runs only now, after the completed
-		// binding is persisted: merge-based dispatch readiness reads the
-		// binding from the store, so a pass fired before this write could
+		let readyLinkedTaskIds: string[] = [];
+		try {
+			readyLinkedTaskIds = await deps.completeTask(task.workspaceId, task.taskId);
+		} catch (error) {
+			warn(`PR merge completion move failed for ${task.taskId}: ${String(error)}`);
+			return { action: "pending", reason: "complete_move_failed" };
+		}
+		// The successor dispatch pass runs only after the completed binding is
+		// persisted AND the move landed: merge-based dispatch readiness reads
+		// the binding from the store, so a pass fired before this write could
 		// not see the merge evidence and would silently drop the released
-		// children.
+		// children; on a failed move the episode stays pending and its retry
+		// dispatches once the move lands.
 		if (deps.dispatchSuccessors) {
 			await deps.dispatchSuccessors(task.workspaceId, task.taskId, readyLinkedTaskIds).catch((error) => {
 				warn(`PR merge completion successor dispatch failed for ${task.taskId}: ${String(error)}`);
