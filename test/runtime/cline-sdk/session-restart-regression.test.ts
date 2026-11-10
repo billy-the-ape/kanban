@@ -108,15 +108,17 @@ describe("legacy sessions without saved launch configuration", () => {
 		const record = [...first.store.records.values()][0];
 		if (!record) throw new Error("Missing fixture record");
 		delete record.metadata?.[TASK_LAUNCH_CONFIG_METADATA_KEY];
-		const resolver = vi.fn(async (overrides: { providerIdOverride?: string; modelIdOverride?: string }) => ({
-			providerId: overrides.providerIdOverride ?? "unused",
-			modelId: overrides.modelIdOverride ?? "unused",
-			apiKey: "fresh-key-canary",
-			baseUrl: "http://localhost:1234/v1",
-			contextWindowTokens: 200_000,
-			maxTokens: 4_096,
-			contextWindowSource: "fallback" as const,
-		}));
+		const resolver = vi.fn(
+			async (overrides: { taskId?: string; providerIdOverride?: string; modelIdOverride?: string }) => ({
+				providerId: overrides.providerIdOverride ?? "unused",
+				modelId: overrides.modelIdOverride ?? "unused",
+				apiKey: "fresh-key-canary",
+				baseUrl: "http://localhost:1234/v1",
+				contextWindowTokens: 200_000,
+				maxTokens: 4_096,
+				contextWindowSource: "fallback" as const,
+			}),
+		);
 		const after = createTaskSessionServiceHarness({ store: first.store, resolveClineLaunchConfig: resolver });
 		services.push(after);
 		return { after, record, cwd, resolver };
@@ -129,7 +131,11 @@ describe("legacy sessions without saved launch configuration", () => {
 		await after.service.sendTaskSessionInput(RESTART_TASK_ID, "Address review comments");
 		await vi.waitFor(() => expect(after.host.sentPrompts).toHaveLength(1));
 		expect(after.host.sentPrompts[0]?.prompt).toBe("Address review comments");
-		expect(resolver).toHaveBeenCalledWith({ providerIdOverride: record.provider, modelIdOverride: record.model });
+		expect(resolver).toHaveBeenCalledWith({
+			taskId: RESTART_TASK_ID,
+			providerIdOverride: record.provider,
+			modelIdOverride: record.model,
+		});
 		expect(after.host.startedConfigs[0]).toMatchObject({
 			cwd,
 			providerId: record.provider,

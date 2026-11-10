@@ -11,6 +11,7 @@ import {
 	createClineReviewSessionService,
 } from "../cline-sdk/cline-review-session-service";
 import type { ClineTaskExportSnapshot } from "../cline-sdk/cline-task-export-snapshot";
+import { createTaskScopedClineLaunchConfigResolver } from "../cline-sdk/cline-task-scoped-launch-config";
 import {
 	type ClineTaskSessionService,
 	createInMemoryClineTaskSessionService,
@@ -136,8 +137,21 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				watcherRegistry: clineWatcherRegistry,
 				// B-2.8: restarts re-resolve the launch config (context limit,
 				// compaction policy, credentials) from the current provider
-				// settings instead of replaying the start-time snapshot.
-				resolveClineLaunchConfig: (overrides) => clineProviderService.resolveLaunchConfig(overrides),
+				// settings instead of replaying the start-time snapshot. The
+				// task-scoped wrapper additionally resolves the card's
+				// CURRENT clineSettings for card-backed sessions, so a model
+				// saved on the card while a task is paused takes effect when
+				// the task resumes (fresh-launch precedence). Sessions
+				// without card ownership (home agent, or review/repair roles
+				// which run on the separate review service) keep the pinned
+				// saved provider/model.
+				resolveClineLaunchConfig: createTaskScopedClineLaunchConfigResolver({
+					resolveLaunchConfig: (launchOverrides) => clineProviderService.resolveLaunchConfig(launchOverrides),
+					loadTaskCard: async (taskId) => {
+						const board = await loadWorkspaceBoardById(scope.workspaceId);
+						return board.columns.flatMap((column) => column.cards).find((card) => card.id === taskId) ?? null;
+					},
+				}),
 				// PRLINK-1: open UIs pick up server-side card writes (Cline PR
 				// recording) without a reload; only fired when the card changed.
 				broadcastWorkspaceStateUpdated: (workspacePath) =>
