@@ -130,8 +130,6 @@ describe("B-2.8 — restart policy re-resolution", () => {
 			strategy: "basic",
 			summarizer: { providerId: "openrouter", modelId: "local/test-model" },
 		});
-		// Re-resolution is pinned to the saved provider/model so the
-		// conversation continues with the same model.
 		// Re-resolution carries task identity so card-backed sessions can pick
 		// up the card's current model; these harnesses resolve by the pin.
 		expect(resolveClineLaunchConfig).toHaveBeenCalledWith({
