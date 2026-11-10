@@ -240,10 +240,12 @@ Implemented in `feat/merge-tracking` (single PR, per the boundary above):
   worktree inspection (base branch must contain the merge commit; no clean local
   commits ahead of base — the ahead count excludes the merged PR head so
   squash/rebase merges do not read as local work), hard reset of a dirty worktree
-  to the base branch, then moves the task to Done BEFORE persisting
-  `mergeCompletion: completed` + terminal stop `merged_completed` (the move is
-  idempotent, so a failed move leaves the binding untouched and the bounded
-  reconciliation reads retry from scratch — no stranded card). Blocks persist
+  to the base branch, then persists `mergeCompletion: completed` BEFORE the
+  board move, and only then moves the task to Done and persists terminal stop
+  `merged_completed` (subscription demand covers only active columns, so every
+  window must leave the card active: a failed write retries the episode from
+  scratch, and a crash between the persist and the move is re-run by the
+  idempotency guard — no stranded Done card). Blocks persist
   `blocked` + `merged_unresolved` (needs human); busy writer/reservation or
   unverifiable states (unfetched merge commit / PR head, unfetchable base,
   failing writes) stay pending and retry on the next read, bounded by the
@@ -281,8 +283,9 @@ Implemented in `feat/merge-tracking` (single PR, per the boundary above):
 - **Tests** `test/runtime/pr-tracking/pr-merge-completion.test.ts`: completion,
   idempotency + later-merge re-completion, preference/column/task-missing skips,
   writer-active pending, reservation contention + release, both block reasons,
-  failing inspection pending, failed board move pending (binding untouched),
-  crash-straggler recovery, dirty-worktree reset failure pending, plus
+  failing inspection pending, failed board move pending (completion already
+  persisted; the active-column retry lands the move), crash-straggler
+  recovery, Done cards never re-completed, dirty-worktree reset failure pending, plus
   coordinator delivery (observation delivered to the installed consumer during a
   real poll cycle; no completion when no consumer is installed).
   `test/runtime/pr-tracking/pr-merge-worktree-inspection.test.ts` exercises

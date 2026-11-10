@@ -222,44 +222,30 @@ describe("pr-merge-completion consumer", () => {
 			reason: "completion_write_failed",
 		});
 		expect(deps.successorCalls.length).toBe(0);
+		// The persist lands BEFORE the move, so a failed write never moves the
+		// card: it stays in an active column (still subscribed) for the retry.
+		expect(deps.completeCalls.length).toBe(0);
 		const record = await loadRecord(store);
 		expect(record.taskBindings[0].mergeCompletion).toBeNull();
 	});
 
-	it("recovers when the Done move landed but the completed binding never persisted", async () => {
+	it("never re-runs completion for a Done card (a manual drag to Done stays Done)", async () => {
 		const store = await makeStore();
 		const deps = makeDeps(store, { readyLinkedTaskIds: ["child-1"] });
-		// The crash/write-failure window: the board card is already Done, but
-		// the binding has no completed mergeCompletion. Without the recovery
-		// gate this observation would skip with inactive_column forever and
-		// the children's merge-based readiness would never hold.
+		// A card a human dragged to Done (no completion persisted, no reopen
+		// marker) must NOT be re-completed: demand only covers active columns,
+		// so any recovery gate here would be unreachable anyway - completion
+		// instead persists BEFORE the move, which keeps every failure window
+		// on an active (still-subscribed) card.
 		deps.setBoard({ columnId: "done" });
 		await expect(reconcileMergeCompletion(makeObservation(await loadRecord(store)), deps)).resolves.toEqual({
-			action: "completed",
+			action: "skipped",
+			reason: "inactive_column",
 		});
-		expect(deps.completeCalls).toEqual([TASK]);
+		expect(deps.completeCalls.length).toBe(0);
+		expect(deps.successorCalls.length).toBe(0);
 		const record = await loadRecord(store);
-		expect(record.taskBindings[0].mergeCompletion).toMatchObject({
-			status: "completed",
-			mergeCommitSha: "mergesha1",
-		});
-		// The released dependents are dispatched by the recovery pass too,
-		// and only after the completed binding is persisted.
-		expect(deps.successorCalls).toEqual([
-			{ workspaceId: TASK.workspaceId, taskId: TASK.taskId, readyTaskIds: ["child-1"] },
-		]);
-		// A later observation for the same merge now skips: the persisted
-		// completion closes the recovery window.
-		await expect(reconcileMergeCompletion(makeObservation(await loadRecord(store)), deps)).resolves.toEqual({
-			action: "skipped",
-			reason: "inactive_column",
-		});
-		// A human reopen marker on a Done card also stays skipped.
-		deps.setBoard({ columnId: "done", manualReopenAt: NOW });
-		await expect(reconcileMergeCompletion(makeObservation(await loadRecord(store)), deps)).resolves.toEqual({
-			action: "skipped",
-			reason: "inactive_column",
-		});
+		expect(record.taskBindings[0].mergeCompletion).toBeNull();
 	});
 
 	it("completes again only for a LATER merge (a different merge commit)", async () => {
@@ -271,7 +257,7 @@ describe("pr-merge-completion consumer", () => {
 		expect(deps.completeCalls.length).toBe(1);
 
 		// The same merge commit again (e.g. a redelivered read after restart):
-		// the card is already Done (the move lands before the persist), so
+		// the card is already Done (the completed persist precedes the move), so
 		// there is nothing to do.
 		const second = makeObservation(await loadRecord(store));
 		await expect(reconcileMergeCompletion(second, deps)).resolves.toEqual({
@@ -295,9 +281,10 @@ describe("pr-merge-completion consumer", () => {
 		expect(deps.completeCalls.length).toBe(2);
 	});
 
-	it("a failed board move stays pending and leaves the binding untouched (retry from scratch)", async () => {
+	it("a failed board move stays pending with the completion persisted and recovers on the next read", async () => {
 		const store = await makeStore();
 		const deps = makeDeps(store, {
+			readyLinkedTaskIds: ["child-1"],
 			completeTask: async () => {
 				throw new Error("board save failed");
 			},
@@ -307,23 +294,38 @@ describe("pr-merge-completion consumer", () => {
 			reason: "complete_move_failed",
 		});
 		const record = await loadRecord(store);
-		expect(record.taskBindings[0].mergeCompletion).toBeNull();
+		// Persist-first: the completed binding is durable, the card is still in
+		// an active column (still subscribed), no terminal stop was set, and no
+		// successors were dispatched (the move did not land).
+		expect(record.taskBindings[0].mergeCompletion).toMatchObject({
+			status: "completed",
+			mergeCommitSha: "mergesha1",
+		});
 		expect(record.taskBindings[0].terminalStop).toBeNull();
 		expect(record.reservation.state).toBe("none");
-		expect(deps.completeCalls.length).toBe(0);
-		// The next read retries the whole flow from scratch.
-		const deps2 = makeDeps(store);
+		expect(deps.successorCalls.length).toBe(0);
+		// The next observation (the card is active, so it keeps arriving) re-runs
+		// the idempotent completion: the move lands, then the successor pass
+		// fires and the terminal stop persists.
+		const deps2 = makeDeps(store, { readyLinkedTaskIds: ["child-1"] });
 		await expect(reconcileMergeCompletion(makeObservation(await loadRecord(store)), deps2)).resolves.toEqual({
 			action: "completed",
 		});
+		expect(deps2.completeCalls).toEqual([TASK]);
+		expect(deps2.successorCalls).toEqual([
+			{ workspaceId: TASK.workspaceId, taskId: TASK.taskId, readyTaskIds: ["child-1"] },
+		]);
+		const after = await loadRecord(store);
+		expect(after.taskBindings[0].terminalStop?.reason).toBe("merged_completed");
 	});
 
 	it("recovers a crash straggler: completion persisted but the board move never landed", async () => {
 		const store = await makeStore();
-		// Simulate a crash after the completion + terminal stop persisted but
-		// before the board move landed: the binding records the consumed
-		// merge commit, the card is still In Review, and no manual-reopen
-		// marker exists.
+		// Simulate a crash after the completion persisted but before the board
+		// move landed (persist-first ordering: the terminal stop lands only
+		// after the move, so it is absent here): the binding records the
+		// consumed merge commit, the card is still In Review, and no
+		// manual-reopen marker exists.
 		await store.updateTaskBinding(PR_KEY, TASK, undefined, (item) => ({
 			...item,
 			mergeCompletion: {
@@ -343,12 +345,6 @@ describe("pr-merge-completion consumer", () => {
 				error: null,
 			},
 		}));
-		await store.setTaskTerminalStop(PR_KEY, TASK, {
-			reason: "merged_completed",
-			observedAt: NOW,
-			reconciliationReads: 0,
-		});
-
 		const deps = makeDeps(store);
 		await expect(reconcileMergeCompletion(makeObservation(await loadRecord(store)), deps)).resolves.toEqual({
 			action: "completed",
@@ -356,6 +352,8 @@ describe("pr-merge-completion consumer", () => {
 		expect(deps.completeCalls).toEqual([TASK]);
 		const record = await loadRecord(store);
 		expect(record.taskBindings[0].mergeCompletion?.mergeCommitSha).toBe("mergesha1");
+		// The recovered episode completes the sequence: terminal stop now set.
+		expect(record.taskBindings[0].terminalStop?.reason).toBe("merged_completed");
 	});
 
 	it("skips when the preference is off, the task is missing, or the task is in an inactive column", async () => {
