@@ -251,12 +251,22 @@ export interface ClineSessionRuntime {
 }
 
 /**
- * B-2.8: re-resolves the launch config for a restart. The provider and model
- * are pinned to the saved start request so the conversation continues with
- * the same model; credentials, context limit, and compaction policy come
- * from the provider settings in force at restart time.
+ * B-2.8: re-resolves the launch config for a restart. Credentials, context
+ * limit, and compaction policy always come from the provider settings in
+ * force at restart time. Provider/model resolution depends on session
+ * ownership: when `taskId` names a task-card-backed session, the task-scoped
+ * wrapper (`createTaskScopedClineLaunchConfigResolver`) resolves the task's
+ * CURRENT card settings with the same precedence as a fresh task launch, so
+ * pausing a task, saving a new model on the card, and resuming runs the next
+ * inference on the new model. Sessions without card ownership (home-agent
+ * sidebar, review/verification-repair roles) fall back to the pinned
+ * provider/model overrides from the saved start request, so their
+ * conversations continue on the same model.
  */
 export type ClineLaunchConfigResolver = (overrides: {
+	/** Session whose restart is being resolved; used for task-card lookup. */
+	taskId?: string;
+	/** Pin fallback: provider/model recorded on the session's saved start request. */
 	providerIdOverride?: string;
 	modelIdOverride?: string;
 }) => Promise<ResolvedClineLaunchConfig>;
@@ -271,7 +281,7 @@ export type ClineLaunchConfigResolver = (overrides: {
 export type ClineWorkspaceRuntimeResolver = (input: {
 	taskId: string;
 	cwd: string;
-	/** Only legacy recovery needs to regenerate the missing prompt. */
+	/** Legacy recovery regenerates a missing prompt; restarts rebuild it when the resolved provider changed. */
 	rebuildSystemPromptForProvider?: string;
 }) => Promise<ClineRestoredWorkspaceRuntime | null> | ClineRestoredWorkspaceRuntime | null;
 
@@ -829,7 +839,17 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			return null;
 		}
 		const launchPolicy = await this.resolveRestartedLaunchPolicy(lastStartRequest);
-		return { ...lastStartRequest, ...launchPolicy };
+		const restartRequest: ClineSessionRestartStartRequest = { ...lastStartRequest, ...launchPolicy };
+		if (restartRequest.providerId && restartRequest.providerId !== lastStartRequest.providerId) {
+			// The resolved config changed provider (task-card ownership). The saved system
+			// prompt embeds provider-specific instructions, so rebuild it for the new
+			// provider instead of running a different model family on a stale prompt.
+			restartRequest.systemPrompt = await this.rebuildRestartSystemPrompt(
+				lastStartRequest,
+				restartRequest.providerId,
+			);
+		}
+		return restartRequest;
 	}
 
 	/**
@@ -952,9 +972,13 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 	 * settings instead of cache-and-replay of the start-time snapshot —
 	 * credentials may have rotated (OAuth refresh) and the context limit +
 	 * compaction config must reflect the settings in force at restart time.
-	 * The provider and model stay pinned to the saved request so the
-	 * conversation continues with the same model. Without a resolver the
-	 * stored snapshot is replayed unchanged (unit tests, embedded hosts).
+	 * The saved provider/model are passed as pin fallbacks: the task-scoped
+	 * resolver wrapper re-resolves them from the task card's current settings
+	 * when the restarting session is card-backed (so a model saved on the
+	 * card while paused takes effect on resume), and keeps them pinned for
+	 * sessions without card ownership (home agent, review roles). Without a
+	 * resolver the stored snapshot is replayed unchanged (unit tests,
+	 * embedded hosts).
 	 */
 	private async resolveRestartedLaunchPolicy(
 		lastStartRequest: Omit<StartClineSessionRuntimeRequest, "prompt" | "images" | "initialMessages">,
@@ -963,6 +987,7 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			return {};
 		}
 		const launchConfig = await this.resolveClineLaunchConfig({
+			taskId: lastStartRequest.taskId,
 			providerIdOverride: lastStartRequest.providerId,
 			modelIdOverride: lastStartRequest.modelId ?? undefined,
 		});
@@ -971,12 +996,41 @@ export class InMemoryClineSessionRuntime implements ClineSessionRuntime {
 			modelId: launchConfig.modelId ?? lastStartRequest.modelId,
 			apiKey: launchConfig.apiKey,
 			baseUrl: launchConfig.baseUrl,
-			reasoningEffort: launchConfig.reasoningEffort ?? lastStartRequest.reasoningEffort,
+			// An explicit reasoningEffort on the resolved config (including a
+			// null from clearing the card override) wins; only an unreported
+			// value retains the saved effort.
+			reasoningEffort:
+				launchConfig.reasoningEffort !== undefined
+					? launchConfig.reasoningEffort
+					: lastStartRequest.reasoningEffort,
 			contextWindowTokens: launchConfig.contextWindowTokens,
 			contextWindowSource: launchConfig.contextWindowSource,
 			compaction: buildClineCompactionConfig({ launchConfig }),
 			compactionSafetyMarginTokens: launchConfig.compactionSettings?.safetyMarginTokens,
 		};
+	}
+
+	/**
+	 * Rebuild provider-dependent instructions when the restart resolved a
+	 * different provider than the saved session ran on. Surfaces the failure
+	 * instead of running the new provider with a stale system prompt.
+	 */
+	private async rebuildRestartSystemPrompt(
+		lastStartRequest: Omit<StartClineSessionRuntimeRequest, "prompt" | "images" | "initialMessages">,
+		providerId: string,
+	): Promise<string> {
+		const workspaceRuntime = await this.resolveWorkspaceRuntime?.({
+			taskId: lastStartRequest.taskId,
+			cwd: lastStartRequest.cwd,
+			rebuildSystemPromptForProvider: providerId,
+		});
+		const systemPrompt = workspaceRuntime?.systemPrompt?.trim();
+		if (!systemPrompt) {
+			throw new Error(
+				`Cline session recovery unavailable: workspace instructions could not be rebuilt for provider ${providerId}. Check the provider configuration and resume again.`,
+			);
+		}
+		return systemPrompt;
 	}
 
 	/**
