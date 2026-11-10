@@ -635,6 +635,64 @@ describe("pr-merge-completion coordinator delivery", () => {
 		expect(record.taskBindings[0].mergeCompletion?.status).toBe("completed");
 	});
 
+	it("re-delivers after a failed board move until the move lands", async () => {
+		const store = await makeStore();
+		const registry = new PrConsumerRegistry();
+		const completeCalls: Array<{ workspaceId: string; taskId: string }> = [];
+		let moveFails = true;
+		registerMergeCompletionConsumer(registry, {
+			store,
+			getTaskCard: async () => ({ card: makeCard(), columnId: "review" }),
+			isTaskWriterActive: async () => false,
+			completeTask: async (workspaceId, taskId) => {
+				completeCalls.push({ workspaceId, taskId });
+				if (moveFails) {
+					throw new Error("board save failed");
+				}
+				return [];
+			},
+			now: () => NOW,
+		});
+		const coordinator = makeCoordinator(store, registry, () => mergedMetadataResult);
+		const descriptor: PrTrackingSubscriptionDescriptor = {
+			workspaceId: TASK.workspaceId,
+			taskId: TASK.taskId,
+			canonicalPrKey: PR_KEY,
+			column: "review",
+			consumers: { comments: false, mergeCompletion: true, autoMerge: false },
+		};
+		expect((await coordinator.addSubscription(descriptor)).status).toBe("active");
+
+		// Cycles 1-2: the completed binding persists, the board move throws.
+		// The subscription must stay in reconcile mode through the whole
+		// window: the coordinator must never stamp the merged_completed
+		// terminal stop before the move lands (only the consumer writes it,
+		// as the episode's final step), otherwise polling stops and the
+		// active-column card is stranded with a completed merge forever.
+		await vi.advanceTimersByTimeAsync(POLL_MS);
+		await settle();
+		expect(completeCalls.length).toBe(1);
+		let record = await loadRecord(store);
+		expect(record.taskBindings[0].mergeCompletion?.status).toBe("completed");
+		expect(record.taskBindings[0].terminalStop?.reason).not.toBe("merged_completed");
+		await vi.advanceTimersByTimeAsync(POLL_MS);
+		await settle();
+		expect(completeCalls.length).toBe(2);
+		record = await loadRecord(store);
+		expect(record.taskBindings[0].terminalStop?.reason).not.toBe("merged_completed");
+
+		// Cycle 3: the move succeeds, the episode completes, and only NOW the
+		// consumer-persisted merged_completed terminal stop holds (which then
+		// stops the subscription through the terminal-stop check).
+		moveFails = false;
+		await vi.advanceTimersByTimeAsync(POLL_MS);
+		await settle();
+		expect(completeCalls.length).toBe(3);
+		record = await loadRecord(store);
+		expect(record.taskBindings[0].mergeCompletion?.status).toBe("completed");
+		expect(record.taskBindings[0].terminalStop?.reason).toBe("merged_completed");
+	});
+
 	it("does not complete when no consumer is installed", async () => {
 		const store = await makeStore();
 		const registry = new PrConsumerRegistry();

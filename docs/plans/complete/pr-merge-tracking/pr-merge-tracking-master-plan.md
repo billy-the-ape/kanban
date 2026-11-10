@@ -249,7 +249,12 @@ Implemented in `feat/merge-tracking` (single PR, per the boundary above):
   `blocked` + `merged_unresolved` (needs human); busy writer/reservation or
   unverifiable states (unfetched merge commit / PR head, unfetchable base,
   failing writes) stay pending and retry on the next read, bounded by the
-  coordinator's reconciliation read budget. `registerMergeCompletionConsumer`
+  coordinator's reconciliation read budget. The `merged_completed` terminal
+  stop is owned by the consumer alone (written after the board move landed):
+  the coordinator never stamps it from the persisted binding itself, and
+  `evaluateSubscription` keeps the subscription in reconcile mode while the
+  stop is absent — stopping on the binding would strand a failed move on an
+  active-column card. `registerMergeCompletionConsumer`
   installs the single consumer with `requiredReadSources = [metadata]`.
 - **Observation delivery** `src/pr-tracking/pr-consumer-registry.ts` +
   `src/pr-tracking/pr-tracking-coordinator.ts`: the coordinator accepts an
@@ -287,7 +292,9 @@ Implemented in `feat/merge-tracking` (single PR, per the boundary above):
   persisted; the active-column retry lands the move), crash-straggler
   recovery, Done cards never re-completed, dirty-worktree reset failure pending, plus
   coordinator delivery (observation delivered to the installed consumer during a
-  real poll cycle; no completion when no consumer is installed).
+  real poll cycle; no completion when no consumer is installed; a failed board
+  move keeps re-delivering until the move lands — the coordinator never stamps
+  `merged_completed` before that).
   `test/runtime/pr-tracking/pr-merge-worktree-inspection.test.ts` exercises
   `defaultInspectWorktree` against real local git repositories: merge-commit,
   squash and rebase landed merges (the PR work is never counted as local

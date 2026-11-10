@@ -433,8 +433,11 @@ export async function reconcileMergeCompletion(
 		// observation retries the episode from scratch; a crash between the
 		// persist and the move leaves an active-column card with a persisted
 		// completion, which the idempotency guard above re-runs defensively
-		// (the persist is idempotent, then the move lands). Moving first would
-		// strand a Done card whose completion never persisted.
+		// (the persist is idempotent, then the move lands). The subscription
+		// keeps receiving observations through that window because the terminal
+		// stop below - not the completed binding - is what stops tracking, and
+		// the coordinator never stamps merged_completed itself. Moving first
+		// would strand a Done card whose completion never persisted.
 		const write = await deps.store.updateTaskBinding(prKey, task, undefined, (item) => ({
 			...item,
 			mergeCompletion: buildMergeCompletion({

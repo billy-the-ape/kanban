@@ -471,9 +471,8 @@ export function completeTaskAndGetReadyLinkedTaskIds(
 	const readyTaskIds = getLinkedBacklogTaskIdsReadyAfterTaskCompleted(board, taskId, "done");
 	const movedToDone = moveTaskToColumn(board, taskId, "done", now);
 	// The released dependents are reported even when the card was already in
-	// Done (no-op move): merge-completion recovery re-runs this completion
-	// after a Done move landed without its persisted binding, and its
-	// successor dispatch pass must still see the released cards.
+	// Done (no-op move): merge-completion re-runs this idempotent completion
+	// and its successor dispatch pass must still see the released cards.
 	return {
 		...movedToDone,
 		readyTaskIds,
