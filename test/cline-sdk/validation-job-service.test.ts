@@ -315,6 +315,48 @@ describe("ValidationJobService log paging", () => {
 		expect(tail.complete).toBe(true);
 		expect(tail.text).toBe("");
 	});
+	it("never splits a multi-byte character across log pages", async () => {
+		// 'A' (1 byte) + '\u20AC' (3 bytes) + 'B' (1 byte) = 5 bytes total.
+		const service = createService({ maxReadBytes: 4 });
+		const started = await service.start({
+			toolCallId: "call-utf8-1",
+			command: process.execPath,
+			args: '-e "process.stdout.write(`A\u20ACB`)"',
+		});
+		if (started.kind !== "started") {
+			throw new Error("expected started");
+		}
+		const jobId = started.record.jobId;
+		await waitForState(service, jobId, "exited");
+		// A page ending exactly after the euro sign's final continuation byte
+		// keeps the WHOLE character (a naive boundary trim would cut it and
+		// emit U+FFFD on both pages).
+		const full = await service.readJobLog(jobId, 0, 4);
+		if (!full) {
+			throw new Error("expected a log page");
+		}
+		expect(full.text).toBe("A\u20AC");
+		expect(full.nextOffset).toBe(4);
+		const after = await service.readJobLog(jobId, full.nextOffset);
+		if (!after) {
+			throw new Error("expected a second log page");
+		}
+		expect(after.text).toBe("B");
+		// A page ending mid-sequence defers the whole character to the next
+		// page instead of decoding a partial one.
+		const split = await service.readJobLog(jobId, 0, 3);
+		if (!split) {
+			throw new Error("expected a split log page");
+		}
+		expect(split.text).toBe("A");
+		expect(split.nextOffset).toBe(1);
+		const resumed = await service.readJobLog(jobId, split.nextOffset);
+		if (!resumed) {
+			throw new Error("expected a resumed log page");
+		}
+		expect(resumed.text).toBe("\u20ACB");
+		expect(resumed.nextOffset).toBe(5);
+	});
 });
 
 describe("ValidationJobService crash adoption", () => {

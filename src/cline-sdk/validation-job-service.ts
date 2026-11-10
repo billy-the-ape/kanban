@@ -322,11 +322,15 @@ function alignUtf8PageEnd(buffer: Buffer, byteLength: number): number {
 	} else if ((lead & 0xf8) === 0xf0) {
 		sequenceLength = 4;
 	}
-	if (byteLength - (end - 1) < sequenceLength) {
-		// The page cuts the lead byte's sequence: drop the lead as well.
-		end -= 1;
+	if (byteLength - (end - 1) >= sequenceLength) {
+		// The trailing sequence fits entirely inside the page: keep the whole
+		// page (returning `end` here would cut a complete character).
+		return byteLength;
 	}
-	return end === 0 ? byteLength : end;
+	// The page cuts the lead byte's sequence: drop the lead as well. A page
+	// that is nothing but one incomplete sequence keeps its bytes so paging
+	// still makes progress.
+	return end - 1 === 0 ? byteLength : end - 1;
 }
 
 /**
