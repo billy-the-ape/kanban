@@ -101,6 +101,39 @@ Repairs paused by the former `Task worktree is on a detached HEAD` blocker need 
 manual reconciliation: Resume once after deployment. Feedback handled manually while
 paused may be reassessed, since that failed batch was never dispatched.
 
+## Publication identity capture
+
+In addition to full API responses and GitHub comment/review web URLs, capture
+recognizes a filtered REST response such as `--jq '{id, url}'`:
+
+```json
+{"id": 123, "url": "https://api.github.com/repos/owner/repo/issues/comments/123"}
+```
+
+This fallback requires one detected `gh api` write that explicitly names the
+linked repository and PR number, one response object from that write's output,
+and an HTTPS `api.github.com` URL whose repository, feedback kind and database id
+match the write and response. Conversation comments, inline replies/comments,
+and reviews are supported; review URLs must also match the PR number. Additional
+filtered fields such as `in_reply_to_id` or `user` do not prevent capture. Numeric
+output preceding the single JSON object (for example, a printed body length) is
+not mistaken for the published id.
+
+Multiple writes sharing a response, multiple response objects, mismatched ids,
+repositories or feedback kinds, and command text/read-only output remain
+insufficient evidence. Full responses with contradictory target fields cannot
+use the reduced-response fallback. Captured identities retain the existing
+durable exclusion from later feedback; this does not exclude every comment by
+the same account.
+
+Deploy the updated server using the normal release process; there are no new
+settings, environment variables, dependencies or record migrations. On startup,
+existing unresolved captures can be recovered from their original saved tool
+input/output without re-running a publication. If the original result is absent,
+or Resume already acknowledged and cleared the capture, this change does not
+guess ownership or retroactively scan all historical comments. Such earlier
+unrecorded comments may still appear in a feedback batch.
+
 ## Bounded feedback and later changes
 
 The prompt tells the agent to assess only the supplied feedback versions, inspect
