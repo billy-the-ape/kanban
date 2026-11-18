@@ -14,6 +14,24 @@ are not a mergeability verdict; auto-merge and merge-candidate UI are outside th
 
 ## Queuing and execution
 
+Feedback reads use a 30-second timeout and an explicit **8 MiB stdout/stderr
+buffer per `gh api` page**, including inline comments and their diff context.
+Other GitHub operations retain their existing 1 MiB default. A response beyond
+the comment-fetch bound is rejected, never truncated into a usable snapshot.
+
+Polling failures (including buffer overflow, authentication, malformed responses,
+and incomplete pagination) appear in the comment-handling status and the task's
+`prCommentHandling` diagnostics, even before any feedback has been queued. The
+status includes a bounded source/page error and indicates automatic retries.
+The server logs a warning when the failure reason changes. Polling retains its
+existing backoff; failures neither consume feedback nor create a failed repair
+requiring Resume. The live warning clears after the next complete snapshot is
+persisted. It is re-derived on the next failed poll after a server restart.
+
+No environment variables, settings, dependencies, or record migrations are needed.
+Deploy the updated server and let tracking retry; tasks stuck at "Watching for
+review comments" because of the old output limit need no manual Resume.
+
 An unsent intent has status `queued` and `attemptedAt: null`. Once its deadline
 passes, it waits only for actual runtime or provider prerequisites; it is not in
 the model-capacity queue yet. Terminal summaries restored from disk count as

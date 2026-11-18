@@ -188,6 +188,7 @@ function makeService(
 	const sent: Array<{ scope: { workspaceId: string; workspacePath: string }; body: RuntimeTaskChatSendRequest }> = [];
 	const snapshotCalls: string[] = [];
 	const preparations: ClineTurnPreparation[] = [];
+	const warnings: string[] = [];
 	const service = createPrCommentAutomationService({
 		listManagedWorkspaces: () => workspaces,
 		loadWorkspaceState:
@@ -235,9 +236,9 @@ function makeService(
 			},
 		},
 		now: overrides.now ?? (() => NOW),
-		warn: () => undefined,
+		warn: (message) => warnings.push(message),
 	});
-	return { service, sent, workspaces, workspaceStates, snapshotCalls, preparations };
+	return { service, sent, workspaces, workspaceStates, snapshotCalls, preparations, warnings };
 }
 
 describe("applyPrPollOutcome", () => {
@@ -482,6 +483,61 @@ describe("applyPrPollOutcome", () => {
 });
 
 describe("PrCommentAutomationService", () => {
+	it.each([false, true])("shows poll failures with existing record=%s and recovers without Resume", async (seed) => {
+		let now = NOW;
+		const event = makeEvent({ providerId: "inline-new" });
+		const snapshot = makeSnapshot({
+			complete: false,
+			error: "Inline comments page 1: ERR_CHILD_PROCESS_STDIO_MAXBUFFER: stdout maxBuffer length exceeded",
+			events: [event],
+		});
+		const harness = makeService({
+			now: () => now,
+			snapshot,
+			workspaceStates: new Map([
+				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })])],
+			]),
+		});
+		if (seed) {
+			await upsertSeed((record) => record);
+		}
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		const blocked = (await harness.service.getTaskPrTrackingState(scope, "t1")).state;
+		expect(blocked.blocker).toContain("ERR_CHILD_PROCESS_STDIO_MAXBUFFER");
+		expect(blocked.blocker).toContain("Retrying automatically");
+		expect(blocked.pendingCount).toBe(0);
+		expect(blocked.resumable).toBe(false);
+		expect(harness.sent).toHaveLength(0);
+		expect(harness.warnings).toHaveLength(1);
+
+		// Failed/partial snapshots never consume feedback, and ticks honor backoff.
+		now += 10_000;
+		await harness.service.runTick();
+		expect(harness.snapshotCalls).toHaveLength(1);
+		now += 10 * 60_000;
+		await harness.service.runTick();
+		expect(harness.warnings).toHaveLength(1);
+		const failedRecord = await loadPrTrackingRecord(KEY);
+		if (failedRecord.status === "ok") {
+			expect(failedRecord.record.commentAutomation.lastDispatchedFeedbackFingerprint).toBeNull();
+		}
+
+		snapshot.complete = true;
+		delete snapshot.error;
+		now += 10 * 60_000;
+		await harness.service.runTick();
+		const recovered = (await harness.service.getTaskPrTrackingState(scope, "t1")).state;
+		expect(recovered.blocker).toBeNull();
+		// The feedback's quiet window already elapsed while reads failed.
+		expect(recovered.dispatch?.status).toBe("running");
+		expect(harness.sent).toHaveLength(1);
+		now += 121_000;
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(1);
+		await harness.service.dispose();
+	});
+
 	const scope = { workspaceId: "w1", workspacePath: "/w1" };
 
 	it("recovers an overdue unsent repair after restart despite a stale terminal running summary", async () => {

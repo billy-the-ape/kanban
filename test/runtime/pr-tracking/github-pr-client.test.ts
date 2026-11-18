@@ -222,6 +222,7 @@ describe("github pr client", () => {
 		]);
 		const snapshot = await clientWith(runner).fetchSnapshot(PR, "/repo", "scope");
 		expect(snapshot.complete).toBe(false);
+		expect(snapshot.error).toContain(`${inlineBase} page 1: boom`);
 	});
 
 	it("paginates complete sources and stops on a short final page", async () => {

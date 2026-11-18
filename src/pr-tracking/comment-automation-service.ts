@@ -84,6 +84,8 @@ interface PrSubscriptionState {
 	nextPollAt: number;
 	dispatchRetryAt: number | null;
 	consecutiveFailures: number;
+	/** Last poll failure, surfaced even before a first successful snapshot. */
+	pollError: string | null;
 	pollInFlight: boolean;
 	settleInFlight: boolean;
 }
@@ -684,6 +686,7 @@ export class PrCommentAutomationService {
 						nextPollAt: 0,
 						dispatchRetryAt: null,
 						consecutiveFailures: 0,
+						pollError: null,
 						pollInFlight: false,
 						settleInFlight: false,
 					} satisfies PrSubscriptionState);
@@ -788,20 +791,24 @@ export class PrCommentAutomationService {
 			this.subscriptions.delete(sub.key);
 			return;
 		}
-		let accessScopeId: string;
-		try {
-			accessScopeId = await this.deps.getGitHubAccessScopeId();
-		} catch (_error) {
-			// Visible auth blocker: back off, never hot-loop or auto-login.
-			sub.consecutiveFailures += 1;
-			sub.nextPollAt = nowMs + backoffMs(sub.consecutiveFailures);
-			return;
-		}
-		const scope = this.firstCandidateScope(sub);
-		const backOff = (): void => {
+		const backOff = (reason: string): void => {
+			const message = `Cannot refresh PR feedback: ${reason.slice(0, 1000)}. Retrying automatically.`;
+			if (sub.pollError !== message) {
+				this.warn(`${sub.key}: ${message}`);
+			}
+			sub.pollError = message;
 			sub.consecutiveFailures += 1;
 			sub.nextPollAt = nowMs + backoffMs(sub.consecutiveFailures);
 		};
+		let accessScopeId: string;
+		try {
+			accessScopeId = await this.deps.getGitHubAccessScopeId();
+		} catch (error) {
+			// Visible auth blocker: back off, never hot-loop or auto-login.
+			backOff(error instanceof Error ? error.message : String(error));
+			return;
+		}
+		const scope = this.firstCandidateScope(sub);
 		try {
 			const snapshot = await this.deps.ghClient.fetchSnapshot(
 				{ host: sub.pr.host, repository: sub.pr.repository, number: sub.pr.number },
@@ -810,7 +817,7 @@ export class PrCommentAutomationService {
 			);
 			if (!snapshot.complete) {
 				// Partial failures cannot dispatch: back off and retry later.
-				backOff();
+				backOff(snapshot.error ?? snapshot.authError ?? "GitHub returned an incomplete snapshot");
 				return;
 			}
 			const candidates = [...sub.candidates.values()];
@@ -820,9 +827,10 @@ export class PrCommentAutomationService {
 		} catch (error) {
 			// A throwing fetch or record write (malformed record, disk error)
 			// must back off too; otherwise every tick re-polls GitHub.
-			backOff();
-			throw error;
+			backOff(error instanceof Error ? error.message : String(error));
+			return;
 		}
+		sub.pollError = null;
 		sub.consecutiveFailures = 0;
 		sub.nextPollAt = nowMs + POLL_INTERVAL_MS + Math.floor(Math.random() * POLL_JITTER_MS);
 	}
@@ -977,7 +985,11 @@ export class PrCommentAutomationService {
 			accessScopeId,
 		);
 		if (!snapshot.complete) {
-			await this.holdDispatch(sub, "snapshot_incomplete", "Waiting for a complete fresh GitHub feedback snapshot.");
+			await this.holdDispatch(
+				sub,
+				"snapshot_incomplete",
+				snapshot.error ?? snapshot.authError ?? "Waiting for a complete fresh GitHub feedback snapshot.",
+			);
 			return;
 		}
 		if (snapshot.prState !== "open") {
@@ -1290,7 +1302,9 @@ export class PrCommentAutomationService {
 			const capturedAt = reuseSnapshot ? input.capturedAt : this.nowMs();
 			if (!snapshot.complete)
 				throw new Error(
-					snapshot.authError ?? "Cannot refresh complete PR feedback; Resume when GitHub is reachable.",
+					snapshot.error ??
+						snapshot.authError ??
+						"Cannot refresh complete PR feedback; Resume when GitHub is reachable.",
 				);
 			if (snapshot.prState !== "open") return skip();
 			const events = excludePublishedEvents(snapshot.events, automation.publication.published);
@@ -2177,6 +2191,7 @@ export class PrCommentAutomationService {
 		}
 		const pr = prs[0];
 		const key = getPullRequestIdentityKey(pr);
+		const sub = this.subscriptions.get(key);
 		const loaded = await loadPrTrackingRecord(key);
 		if (loaded.status === "malformed") {
 			return {
@@ -2190,11 +2205,10 @@ export class PrCommentAutomationService {
 			};
 		}
 		if (loaded.status === "missing") {
-			return { ok: true, state: { ...neutral, enabled: true, pr } };
+			return { ok: true, state: { ...neutral, enabled: true, pr, blocker: sub?.pollError ?? null } };
 		}
 		const record = loaded.record;
 		const automation = record.commentAutomation;
-		const sub = this.subscriptions.get(key);
 		const nowMs = this.nowMs();
 		// A stale start-phase capture (result never arrived) surfaces as the
 		// same blocker/resume flow as an explicit uncertainty.
@@ -2236,7 +2250,7 @@ export class PrCommentAutomationService {
 					? RATE_LIMIT_PAUSED_REASON
 					: sub !== undefined && sub.candidates.size > 1 && automation.repairOwner === null
 						? `Multiple tasks have comment handling enabled for this pull request. Choose one repair owner.`
-						: null;
+						: (sub?.pollError ?? null);
 		return {
 			ok: true,
 			state: {
@@ -2382,7 +2396,11 @@ export class PrCommentAutomationService {
 			accessScopeId,
 		);
 		if (!snapshot.complete) {
-			return { ok: false, error: `Cannot reach GitHub right now; try again.`, dispatched: false };
+			return {
+				ok: false,
+				error: snapshot.error ?? snapshot.authError ?? "Cannot reach GitHub right now; try again.",
+				dispatched: false,
+			};
 		}
 		if (snapshot.prState !== "open") {
 			return { ok: false, error: `The pull request is no longer open.`, dispatched: false };

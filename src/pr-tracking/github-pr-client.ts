@@ -2,7 +2,7 @@
 //
 // Reads go through direct `gh api --hostname github.com` (never an
 // interactive shell), with the service's existing gh auth/environment, cwd at
-// the owning repository, a 30-second timeout, and the existing 8 MiB output
+// the owning repository, a 30-second timeout, and an explicit 8 MiB output
 // bound per page. Published review bodies, inline review feedback, and
 // conversation comments are fetched with complete pagination; a snapshot is
 // only complete when every page succeeds (a partial API failure cannot
@@ -33,6 +33,8 @@ export interface GitHubPrSnapshot {
 	complete: boolean;
 	/** Visible auth-blocker reason when gh/credentials are unavailable. */
 	authError: string | null;
+	/** Bounded source/read failure detail for incomplete snapshots. */
+	error?: string;
 	prState: "open" | "closed" | "merged" | null;
 	headSha: string | null;
 	headRef?: string | null;
@@ -50,9 +52,16 @@ const PER_PAGE = 100;
 /** Hard page cap per source; a longer source is treated as incomplete. */
 const MAX_PAGES = 20;
 const REST_PATH_TIMEOUT_MS = 30_000;
+const COMMENT_FETCH_MAX_BUFFER_BYTES = 8 * 1024 * 1024;
 
 function defaultRunner(args: string[], cwd: string) {
-	return runGhCommand(args, cwd, REST_PATH_TIMEOUT_MS);
+	return runGhCommand(args, cwd, REST_PATH_TIMEOUT_MS, COMMENT_FETCH_MAX_BUFFER_BYTES);
+}
+
+function commandFailure(result: Awaited<ReturnType<GitHubPrCommandRunner>>): string {
+	return result.missingBinary
+		? "gh CLI is not installed"
+		: (result.stderr.trim() || `gh exited with code ${result.exitCode}`).slice(0, 500);
 }
 
 /**
@@ -139,7 +148,7 @@ async function fetchAllPages<T>(
 	runner: GitHubPrCommandRunner,
 	basePath: string,
 	cwd: string,
-): Promise<{ items: T[]; complete: boolean }> {
+): Promise<{ items: T[]; complete: boolean; error?: string }> {
 	const items: T[] = [];
 	for (let page = 1; page <= MAX_PAGES; page += 1) {
 		const result = await runner(
@@ -147,23 +156,23 @@ async function fetchAllPages<T>(
 			cwd,
 		);
 		if (!result.ok) {
-			return { items, complete: false };
+			return { items, complete: false, error: `${basePath} page ${page}: ${commandFailure(result)}` };
 		}
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(result.stdout);
 		} catch {
-			return { items, complete: false };
+			return { items, complete: false, error: `${basePath} page ${page}: invalid JSON response` };
 		}
 		if (!Array.isArray(parsed)) {
-			return { items, complete: false };
+			return { items, complete: false, error: `${basePath} page ${page}: expected a JSON array` };
 		}
 		items.push(...(parsed as T[]));
 		if (parsed.length < PER_PAGE) {
 			return { items, complete: true };
 		}
 	}
-	return { items, complete: false };
+	return { items, complete: false, error: `${basePath}: exceeded the ${MAX_PAGES}-page limit` };
 }
 
 /**
@@ -174,10 +183,10 @@ async function fetchResolvedInlineCommentIds(
 	runner: GitHubPrCommandRunner,
 	pr: GitHubPrIdentity,
 	cwd: string,
-): Promise<{ ids: Set<number>; complete: boolean }> {
+): Promise<{ ids: Set<number>; complete: boolean; error?: string }> {
 	const [owner, ...nameParts] = pr.repository.split("/");
 	if (!owner || nameParts.length === 0) {
-		return { ids: new Set(), complete: false };
+		return { ids: new Set(), complete: false, error: "Review threads: invalid repository identity" };
 	}
 	const name = nameParts.join("/");
 	const query = [
@@ -197,6 +206,7 @@ async function fetchResolvedInlineCommentIds(
 	].join("\n");
 	const ids = new Set<number>();
 	let complete = true;
+	let error: string | undefined;
 	let cursor: string | null = null;
 	for (let page = 0; page < MAX_PAGES; page += 1) {
 		const args: string[] = [
@@ -218,15 +228,13 @@ async function fetchResolvedInlineCommentIds(
 		}
 		const result = await runner(args, cwd);
 		if (!result.ok) {
-			complete = false;
-			break;
+			return { ids, complete: false, error: `Review threads page ${page + 1}: ${commandFailure(result)}` };
 		}
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(result.stdout);
 		} catch {
-			complete = false;
-			break;
+			return { ids, complete: false, error: `Review threads page ${page + 1}: invalid JSON response` };
 		}
 		const data = parsed as {
 			data?: {
@@ -247,7 +255,9 @@ async function fetchResolvedInlineCommentIds(
 			} | null;
 		};
 		const reviewThreads = data?.data?.repository?.pullRequest?.reviewThreads;
-		if (!reviewThreads?.pageInfo) return { ids, complete: false };
+		if (!reviewThreads?.pageInfo) {
+			return { ids, complete: false, error: `Review threads page ${page + 1}: missing pagination data` };
+		}
 		const threads = reviewThreads.nodes ?? [];
 		for (const thread of threads) {
 			if (!thread?.isResolved) {
@@ -257,6 +267,7 @@ async function fetchResolvedInlineCommentIds(
 			// comments looking unresolved: never report that as complete.
 			if (thread.comments?.pageInfo?.hasNextPage) {
 				complete = false;
+				error = "Review threads: a resolved thread exceeds the 100-comment limit";
 			}
 			for (const comment of thread.comments?.nodes ?? []) {
 				if (typeof comment?.databaseId === "number") {
@@ -266,12 +277,12 @@ async function fetchResolvedInlineCommentIds(
 		}
 		const pageInfo = data?.data?.repository?.pullRequest?.reviewThreads?.pageInfo;
 		if (!pageInfo?.hasNextPage || !pageInfo.endCursor) {
-			return { ids, complete };
+			return { ids, complete, error };
 		}
 		cursor = pageInfo.endCursor;
 	}
 	// Loop exited on a failure, or the page cap was hit with more threads.
-	return { ids, complete: false };
+	return { ids, complete: false, error: `Review threads: exceeded the ${MAX_PAGES}-page limit` };
 }
 
 function mapReviews(entries: ReviewEntry[]): PrFeedbackEvent[] {
@@ -454,6 +465,7 @@ export function createGitHubPrClient(
 				return {
 					complete: false,
 					authError: null,
+					error: `PR metadata: ${commandFailure(metadataResult)}`,
 					prState: null,
 					headSha: null,
 					htmlUrl: null,
@@ -464,7 +476,15 @@ export function createGitHubPrClient(
 			try {
 				metadata = JSON.parse(metadataResult.stdout) as PullMetadataEntry;
 			} catch {
-				return { complete: false, authError: null, prState: null, headSha: null, htmlUrl: null, events: [] };
+				return {
+					complete: false,
+					authError: null,
+					error: "PR metadata: invalid JSON response",
+					prState: null,
+					headSha: null,
+					htmlUrl: null,
+					events: [],
+				};
 			}
 			const normalizedState = typeof metadata.state === "string" ? metadata.state.toUpperCase() : "";
 			const prState =
@@ -491,6 +511,7 @@ export function createGitHubPrClient(
 			return {
 				complete: reviews.complete && inlineComments.complete && conversationComments.complete && resolved.complete,
 				authError: null,
+				error: reviews.error ?? inlineComments.error ?? conversationComments.error ?? resolved.error,
 				prState,
 				headSha: typeof metadata.head?.sha === "string" ? metadata.head.sha : null,
 				headRef: typeof metadata.head?.ref === "string" ? metadata.head.ref : null,
