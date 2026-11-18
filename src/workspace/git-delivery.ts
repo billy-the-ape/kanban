@@ -95,12 +95,17 @@ export interface GhCommandResult {
 }
 
 /** Runs the gh CLI directly (never an interactive shell) with bounded buffer. */
-export async function runGhCommand(args: string[], cwd: string, timeoutMs?: number): Promise<GhCommandResult> {
+export async function runGhCommand(
+	args: string[],
+	cwd: string,
+	timeoutMs?: number,
+	maxBufferBytes = DELIVERY_GH_MAX_BUFFER_BYTES,
+): Promise<GhCommandResult> {
 	try {
 		const { stdout, stderr } = await execFileAsync("gh", args, {
 			cwd,
 			encoding: "utf8",
-			maxBuffer: DELIVERY_GH_MAX_BUFFER_BYTES,
+			maxBuffer: maxBufferBytes,
 			env: createGitProcessEnv(),
 			...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
 		});
@@ -122,7 +127,9 @@ export async function runGhCommand(args: string[], cwd: string, timeoutMs?: numb
 		return {
 			ok: false,
 			stdout: String(candidate.stdout ?? "").trim(),
-			stderr: String(candidate.stderr ?? "").trim(),
+			stderr:
+				String(candidate.stderr ?? "").trim() ||
+				`${typeof candidate.code === "string" ? `${candidate.code}: ` : ""}${message}`,
 			exitCode: typeof candidate.code === "number" ? candidate.code : -1,
 			missingBinary: candidate.code === "ENOENT" || /ENOENT/.test(message),
 		};

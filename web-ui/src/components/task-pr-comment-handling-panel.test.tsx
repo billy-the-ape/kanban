@@ -152,6 +152,19 @@ describe("TaskPrCommentHandlingPanel", () => {
 		expect(pending?.textContent).toContain("Waiting to address 2 new comments");
 		expect(document.querySelector('[data-testid="task-pr-comment-status-blocked"]')).toBeNull();
 	});
+	it("shows a polling failure before any pending feedback without requiring Resume", () => {
+		render(
+			makeState({
+				blocker:
+					"Cannot refresh PR feedback: inline comments page 1: stdout maxBuffer length exceeded. Retrying automatically.",
+			}),
+		);
+		const blocked = document.querySelector('[data-testid="task-pr-comment-status-blocked"]');
+		expect(blocked?.textContent).toContain("stdout maxBuffer length exceeded");
+		expect(blocked?.textContent).toContain("Retrying automatically");
+		expect(container.textContent).not.toContain("Watching for review comments");
+		expect(document.querySelector('[data-testid="task-pr-comment-resume-button"]')).toBeNull();
+	});
 	it("shows the dispatch hold and wait duration instead of shortly", () => {
 		const now = Date.now();
 		render(
