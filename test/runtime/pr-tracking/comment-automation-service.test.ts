@@ -1382,6 +1382,39 @@ describe("COMMENT-0 publication capture", () => {
 			},
 		}));
 
+	it.each([
+		["conversation", "issues/42/comments", "issues/comments/9"],
+		["inline", "pulls/42/comments", "pulls/comments/9"],
+	] as const)("captures a filtered %s response and excludes it from repair feedback", async (kind, endpoint, path) => {
+		const reviewer = makeEvent({ providerId: "conversation-1", updatedAt: NOW - 471_000 });
+		const ownReply = makeEvent({ kind, providerId: `${kind}-9`, updatedAt: NOW - 100_000 });
+		const harness = makeService({ workspaceStates: cardState(), snapshot: { events: [reviewer, ownReply] } });
+		const commands = [`gh api repos/octo/repo/${endpoint} --input body.json --jq '{id, url}'`];
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.recordPrPublicationToolEvent(toolEvent({ phase: "started", commands }));
+		expect((await load()).commentAutomation.publication.pending).toHaveLength(1);
+		await harness.service.recordPrPublicationToolEvent(
+			toolEvent({
+				commands,
+				output: JSON.stringify([
+					{
+						query: commands[0],
+						result: `4593\n${JSON.stringify({ id: 9, url: `https://api.github.com/repos/octo/repo/${path}` })}\n`,
+						success: true,
+					},
+				]),
+			}),
+		);
+		const record = await load();
+		expect(record.commentAutomation.publication.pending).toEqual([]);
+		expect(record.commentAutomation.publication.published).toEqual([{ kind, id: 9 }]);
+		expect((await harness.service.getTaskPrTrackingState(scope, "t1")).state.blocker).toBeNull();
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(1);
+		expect((await load()).commentAutomation.lastDispatchedFeedbackFingerprint).toEqual(fingerprintOf([reviewer]));
+		await harness.service.dispose();
+	});
+
 	it("excludes recorded implementation replies from pending feedback and sends once", async () => {
 		const reviewer = makeEvent({ providerId: "conversation-1", updatedAt: NOW - 471_000 });
 		const reply = makeEvent({ providerId: "conversation-9", updatedAt: NOW - 100_000 });
@@ -2173,6 +2206,76 @@ describe("COMMENT-0 publication capture", () => {
 		// The recorded identity survives and the edit opened no capture.
 		expect(record.commentAutomation.publication.published).toEqual([{ kind: "inline", id: 99 }]);
 		expect(record.commentAutomation.publication.pending).toHaveLength(0);
+	});
+
+	it("recovers a previously uncertain filtered response on restart without replaying publication", async () => {
+		const command = "gh api repos/octo/repo/issues/42/comments --input body.json --jq '{id, url}'";
+		await seedOwner();
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			commentAutomation: {
+				...record.commentAutomation,
+				publication: {
+					published: [],
+					pending: [
+						{
+							captureId: "call-filtered",
+							taskId: "t1",
+							workspaceId: "w1",
+							operation: "gh api",
+							kind: "conversation",
+							target: { host: "github.com", repository: "octo/repo", number: 42 },
+							startedAt: NOW - 5_000,
+							uncertain: true,
+							uncertainReason: "The publication output did not include the comment or review identity.",
+						},
+					],
+				},
+			},
+		}));
+		const messages = [
+			{
+				id: "m-filtered",
+				role: "tool",
+				content: [
+					"Tool: run_commands",
+					"Input:",
+					JSON.stringify({ commands: [command] }),
+					"Output:",
+					JSON.stringify([
+						{
+							query: command,
+							result: '4593\n{"id":9,"url":"https://api.github.com/repos/octo/repo/issues/comments/9"}\n',
+							success: true,
+						},
+					]),
+					"Duration: 1200ms",
+				].join("\n"),
+				createdAt: NOW,
+				meta: { toolName: "run_commands", hookEventName: "tool_call_end", toolCallId: "call-filtered" },
+			},
+		];
+		const harness = makeService({
+			workspaceStates: cardState(),
+			snapshot: { events: [makeEvent({ providerId: "conversation-9" })] },
+			getClineTaskSessionService: async () =>
+				({
+					...idleCline,
+					loadTaskSessionMessages: async () => messages,
+				}) as unknown as ClineTaskSessionService,
+		});
+		try {
+			await harness.service.start();
+			const record = await load();
+			expect(record.commentAutomation.publication.pending).toEqual([]);
+			expect(record.commentAutomation.publication.published).toEqual([{ kind: "conversation", id: 9 }]);
+			await harness.service.runTick();
+			expect(harness.sent).toHaveLength(0);
+			expect((await harness.service.getTaskPrTrackingState(scope, "t1")).state.blocker).toBeNull();
+		} finally {
+			await harness.service.dispose();
+		}
 	});
 
 	it("recovers a bare-id capture from the transcript on restart and keeps the ids excluded", async () => {

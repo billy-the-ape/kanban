@@ -799,6 +799,64 @@ function mapApiResponseIdentity(
 }
 
 /**
+ * A filtered REST response can retain only {id, url}. Comment API URLs do
+ * not carry the PR number, so require one explicit, target-matching REST
+ * write as well as a matching response repository, kind and database id.
+ * Full responses with contradictory target fields must not use this fallback.
+ */
+function mapFilteredApiResponseIdentity(
+	object: Record<string, unknown>,
+	operations: PrPublicationOperation[],
+	target: PrPublicationTarget | null,
+): PrPublishedIdentity | null {
+	if (target === null || target.host !== "github.com" || operations.length !== 1) {
+		return null;
+	}
+	const operation = operations[0];
+	if (
+		operation.operation !== "gh api" ||
+		operation.kind === null ||
+		operation.explicitRepository?.toLowerCase() !== target.repository.toLowerCase() ||
+		operation.explicitNumber !== target.number ||
+		["html_url", "issue_url", "pull_request_url"].some((key) => key in object)
+	) {
+		return null;
+	}
+	const id = readPositiveInt(object, "id");
+	const rawUrl = readString(object, "url");
+	if (id === null || rawUrl === null) {
+		return null;
+	}
+	let url: URL;
+	try {
+		url = new URL(rawUrl);
+	} catch {
+		return null;
+	}
+	if (
+		url.protocol !== "https:" ||
+		url.host !== "api.github.com" ||
+		url.username ||
+		url.password ||
+		url.search ||
+		url.hash
+	) {
+		return null;
+	}
+	const match = /^\/repos\/([^/]+)\/([^/]+)\/(.+)$/.exec(url.pathname);
+	if (!match || `${match[1]}/${match[2]}`.toLowerCase() !== target.repository.toLowerCase()) {
+		return null;
+	}
+	const expectedPath =
+		operation.kind === "conversation"
+			? `issues/comments/${id}`
+			: operation.kind === "inline"
+				? `pulls/comments/${id}`
+				: `pulls/${target.number}/reviews/${id}`;
+	return match[3] === expectedPath ? { kind: operation.kind, id } : null;
+}
+
+/**
  * Returns comment/review URLs printed by `gh pr comment` / `gh pr review`,
  * validated against the target PR. The fragment anchors are the GitHub
  * database ids (`#issuecomment-<issue comment id>`, `#discussion_r<review
@@ -988,10 +1046,12 @@ export function resolvePublicationOutput(input: {
 	let sawError = false;
 	let identityObjects = 0;
 	let totalObjects = 0;
+	let responseObject: Record<string, unknown> | null = null;
 	for (const candidate of candidateTexts) {
 		const objects = extractJsonObjects(candidate);
 		totalObjects += objects.length;
 		for (const object of objects) {
+			responseObject = object;
 			const mapped = mapApiResponseIdentity(object, input.target);
 			if (mapped.kind === "error") {
 				sawError = true;
@@ -1058,6 +1118,13 @@ export function resolvePublicationOutput(input: {
 		// the URL fallback (a listing's URLs are not the write's).
 		if (totalObjects > 1) {
 			return { status: "uncertain", identities: [], reason: MULTI_OBJECT_UNCERTAINTY_REASON };
+		}
+		const filteredIdentity =
+			responseObject === null || sawError || evidenceEntries.some((entry) => entry.success === false)
+				? null
+				: mapFilteredApiResponseIdentity(responseObject, scopedOperations, input.target);
+		if (filteredIdentity !== null) {
+			return { status: "published", identities: [filteredIdentity], reason: null };
 		}
 		for (const candidate of candidateTexts) {
 			collected.push(...extractUrlIdentities(candidate, input.operations, input.target));

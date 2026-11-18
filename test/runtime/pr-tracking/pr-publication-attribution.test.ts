@@ -10,6 +10,135 @@ import {
 
 const TARGET: PrPublicationTarget = { host: "github.com", repository: "octo/repo", number: 42 };
 
+describe("filtered REST publication responses", () => {
+	const command = "gh api repos/octo/repo/issues/42/comments --input body.json --jq '{id, url}'";
+	const response = { id: 77, url: "https://api.github.com/repos/octo/repo/issues/comments/77" };
+	const analyze = (output: unknown, commands = [command]) =>
+		analyzePrPublication({
+			toolName: "run_commands",
+			commands,
+			output: typeof output === "string" ? output : JSON.stringify(output),
+			error: null,
+			linkedPullRequests: [TARGET],
+		});
+
+	it.each([
+		["issues/42/comments", "issues/comments/77", "conversation"],
+		["pulls/42/comments", "pulls/comments/77", "inline"],
+		["pulls/42/comments/9/replies", "pulls/comments/77", "inline"],
+		["pulls/42/reviews", "pulls/42/reviews/77", "review"],
+	])("attributes %s from its single reduced response", (endpoint, path, kind) => {
+		const result = analyze({ id: 77, url: `https://api.github.com/repos/octo/repo/${path}` }, [
+			`gh api repos/octo/repo/${endpoint} --input body.json --jq '{id, url}'`,
+		]);
+		expect(result.status).toBe("published");
+		expect(result.identities).toEqual([{ kind, id: 77 }]);
+	});
+
+	it("matches repository names case-insensitively", () => {
+		expect(analyze({ ...response, url: "https://api.github.com/repos/OCTO/Repo/issues/comments/77" }).status).toBe(
+			"published",
+		);
+	});
+
+	it.each([
+		{ id: 78 },
+		{ id: "77" },
+		{ id: 0 },
+		{ id: Number.MAX_SAFE_INTEGER + 1 },
+		{ url: "https://api.github.com/repos/other/repo/issues/comments/77" },
+		{ url: "https://api.github.com/repos/octo/repo/issues/comments/78" },
+		{ url: "https://api.github.com/repos/octo/repo/pulls/comments/77" },
+		{ url: "http://api.github.com/repos/octo/repo/issues/comments/77" },
+		{ url: "https://api.github.com.evil.test/repos/octo/repo/issues/comments/77" },
+		{ url: "https://api.github.com/repos/octo/repo/issues/comments/77?other=42" },
+		{ url: "https://api.github.com/repos/octo/repo/issues/comments/77#fragment" },
+		{ url: "https://user@api.github.com/repos/octo/repo/issues/comments/77" },
+		{ url: "not a URL" },
+		{ issue_url: "https://api.github.com/repos/octo/repo/issues/43" },
+		{ pull_request_url: "https://api.github.com/repos/octo/repo/pulls/43" },
+	])("does not infer an identity from mismatched or invalid evidence: %j", (override) => {
+		const result = analyze({ ...response, ...override });
+		expect(result.status).toBe("uncertain");
+		expect(result.identities).toEqual([]);
+	});
+
+	it("requires the review URL's PR number to match the write", () => {
+		expect(
+			analyze({ id: 77, url: "https://api.github.com/repos/octo/repo/pulls/43/reviews/77" }, [
+				"gh api repos/octo/repo/pulls/42/reviews --input body.json",
+			]).status,
+		).toBe("uncertain");
+	});
+
+	it.each([
+		"gh api repos/{owner}/{repo}/issues/42/comments --input body.json",
+		"gh api repos/octo/repo/pulls/comments/9/replies --input body.json",
+		"gh pr comment 42 --repo octo/repo --body-file body.md",
+	])("does not use a reduced API object without an explicit REST repository and PR: %s", (fragment) => {
+		expect(analyze(response, [fragment]).status).not.toBe("published");
+		expect(analyze(response, [fragment]).identities).toEqual([]);
+	});
+
+	it("rejects multiple response objects and multiple writes sharing one response", () => {
+		expect(analyze([response, { ...response, id: 78 }]).status).toBe("uncertain");
+		expect(analyze(response, [command, command.replace("body.json", "other-body.json")]).status).toBe("uncertain");
+	});
+
+	it("takes evidence only from the matched write result, not a separate read", () => {
+		const read = "gh api repos/octo/repo/issues/42/comments";
+		const output = [
+			{ query: read, result: JSON.stringify(response), success: true },
+			{ query: command, result: "", success: true },
+		];
+		expect(analyze(output, [read, command]).status).toBe("uncertain");
+		output[1].result = `4593\n${JSON.stringify(response)}\n`;
+		expect(analyze(output, [read, command]).identities).toEqual([{ kind: "conversation", id: 77 }]);
+	});
+
+	it("does not treat an echoed response in command text as output evidence", () => {
+		const fragment = `echo '${JSON.stringify(response)}' >/tmp/body.json; ${command}`;
+		expect(analyze([{ query: fragment, result: "", success: true }], [fragment]).status).toBe("uncertain");
+	});
+
+	it("does not capture a failed structured command result", () => {
+		expect(analyze([{ query: command, result: JSON.stringify(response), success: false }]).status).toBe("failed");
+	});
+});
+
+describe("note-taker publication output regressions", () => {
+	// Exact reduced outputs from task kkmu8, including the numeric prelude
+	// printed while creating the body file. Only publication evidence is kept.
+	it.each([
+		[4617019538, 4616617483, 3851],
+		[4617057478, 4616617504, 1407],
+		[4617061927, 4616617533, 1314],
+		[4617065468, 4616617556, 800],
+		[6984166171, null, 4593],
+	])("captures publication %s without requiring full API JSON", (id, parent, length) => {
+		const inline = parent !== null;
+		const endpoint = inline ? "pulls/1/comments" : "issues/1/comments";
+		const fragment = `python3 -c 'print("body")' | gh api repos/billy-the-ape/note-taker/${endpoint} --input - --jq '{id, url}'`;
+		const response = {
+			id,
+			...(inline ? { in_reply_to_id: parent } : {}),
+			url: `https://api.github.com/repos/billy-the-ape/note-taker/${inline ? "pulls" : "issues"}/comments/${id}`,
+		};
+		const result = analyzePrPublication({
+			toolName: "run_commands",
+			commands: [fragment],
+			phase: "finished",
+			output: JSON.stringify([
+				{ query: fragment, result: `${length}\n${JSON.stringify(response)}\n`, success: true },
+			]),
+			error: null,
+			linkedPullRequests: [{ host: "github.com", repository: "billy-the-ape/note-taker", number: 1 }],
+		});
+		expect(result.status).toBe("published");
+		expect(result.identities).toEqual([{ kind: inline ? "inline" : "conversation", id }]);
+	});
+});
+
 describe("detectPublicationOperations gh api value flags", () => {
 	it("treats the -q jq filter value as a flag value, not the endpoint", () => {
 		const fragment = "gh api -q .html_url -X POST repos/octo/repo/issues/5/comments -f body='addressing'";
