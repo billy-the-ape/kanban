@@ -4,8 +4,8 @@
 // one access scope, and one exact head SHA: authoritative PR metadata
 // (state/draft/base/head/mergeable/author/native-auto-merge), ALL pages of
 // submitted reviews with raw state/actor/commit-id facts, check runs and
-// commit statuses for the exact head, and review-thread resolution (raw
-// bodies never leave the provider). The collection is coherent: metadata is
+// commit statuses for the exact head. Conversation-resolution requirements
+// remain GitHub's merge-time rules. The collection is coherent: metadata is
 // re-read after the sources, and any head/base identity change discards the
 // evidence (retry next eligible cycle).
 //
@@ -24,7 +24,6 @@ import { AUTO_MERGE_EVIDENCE_SCHEMA_VERSION } from "../core/api-contract";
 import type {
 	AccessScope,
 	CommitStatusesReadResult,
-	FeedbackReadResult,
 	GhAdapterFailure,
 	GitHubGhAdapter,
 	MetadataReadResult,
@@ -358,18 +357,11 @@ export async function collectAutoMergeEvidence(
 		return { envelope, failures };
 	}
 
-	const nodeId = initial.nodeId;
-	const [reviews, checkRuns, statuses, threads] = (await Promise.all([
+	const [reviews, checkRuns, statuses] = (await Promise.all([
 		adapter.readRawRestList(`repos/${repo}/pulls/${number}/reviews`),
 		adapter.readRawRestList(`repos/${repo}/commits/${headSha}/check-runs`, "check_runs"),
 		adapter.readCommitStatuses(`repos/${repo}/commits/${headSha}/status`),
-		nodeId
-			? adapter.readReviewThreads(parsed, scope, nodeId, { fresh: true, recordDigest: false })
-			: Promise.resolve<FeedbackReadResult>({
-					kind: "failed",
-					failure: { category: "network", message: "missing PR node id", at: now() },
-				}),
-	])) as [RawRestListResult, RawRestListResult, CommitStatusesReadResult, FeedbackReadResult];
+	])) as [RawRestListResult, RawRestListResult, CommitStatusesReadResult];
 
 	// Coherent-snapshot check: re-read the authoritative identity and discard
 	// if ANY of head/base changed while the sources were being collected.
@@ -430,17 +422,8 @@ export async function collectAutoMergeEvidence(
 		addReason(envelope.reasons, "commit_statuses_incomplete");
 		addReason(envelope.reasons, statuses.failure.category);
 	}
-	if (threads.kind === "ok_threads") {
-		envelope.sources.reviewThreads = true;
-		envelope.unresolvedActiveThreads = countUnresolvedActiveThreads(threads.threads);
-	} else if (threads.kind === "failed") {
-		failures.push(threads.failure);
-		addReason(envelope.reasons, "review_threads_unknown");
-		addReason(envelope.reasons, threads.failure.category);
-	} else {
-		// A 304 from the thread query cannot supply thread state: never complete.
-		addReason(envelope.reasons, "review_threads_unknown");
-	}
+	// Legacy thread fields stay false/null in the envelope for compatibility.
+	// Neither thread counts nor GraphQL availability gate auto-merge.
 	// Mergeability that GitHub has not computed is an explicit unknown, never
 	// an assumed green.
 	if (envelope.mergeable === null) {

@@ -177,6 +177,48 @@ describe("AM-3 pure eligibility evaluation", () => {
 		expect(result.evidenceAgeMs).toBe(10_000);
 	});
 
+	it.each([1, 9, null])(
+		"does not add a thread-resolution gate to an approved PR (%s threads)",
+		async (unresolvedActiveThreads) => {
+			const record = await makeRecord();
+			const result = evaluateAutoMergeEligibility(
+				makeInput({ envelope: makeEnvelope({ unresolvedActiveThreads }) }, record),
+			);
+			expect(result.kind).toBe("eligible");
+			expect(codes(result)).toEqual([]);
+		},
+	);
+
+	it("keeps a blocking change request effective even when another reviewer approves with open threads", async () => {
+		const envelope = makeEnvelope({
+			unresolvedActiveThreads: 1,
+			reviews: [
+				{
+					id: "approval",
+					authorLogin: "approver",
+					authorKind: "human",
+					isOwnAccount: false,
+					state: "APPROVED",
+					commitId: HEAD,
+					submittedAt: NOW - 2000,
+				},
+				{
+					id: "blocker",
+					authorLogin: "other-reviewer",
+					authorKind: "human",
+					isOwnAccount: false,
+					state: "CHANGES_REQUESTED",
+					commitId: HEAD,
+					submittedAt: NOW - 1000,
+				},
+			],
+		});
+		const result = evaluateAutoMergeEligibility(makeInput({ envelope }, await makeRecord()));
+		expect(result.kind).toBe("waiting");
+		expect(codes(result)).toContain("changes_requested");
+		expect(codes(result)).not.toContain("unresolved_threads");
+	});
+
 	it("blocks (not waits) on configuration and identity problems", async () => {
 		const record = await makeRecord();
 		expect(codes(evaluateAutoMergeEligibility(makeInput({ task: makeTask({ optIn: false }) }, record)))).toContain(

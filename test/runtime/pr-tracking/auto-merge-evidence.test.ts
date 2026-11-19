@@ -417,7 +417,7 @@ describe("auto-merge-evidence reader", () => {
 			reviews: true,
 			checkRuns: true,
 			commitStatuses: true,
-			reviewThreads: true,
+			reviewThreads: false,
 		});
 		expect(envelope.policyRevision).toBe(7);
 		expect(envelope.accessScopeId).toBe("scope-1");
@@ -432,7 +432,7 @@ describe("auto-merge-evidence reader", () => {
 		expect(envelope.mergeable).toBe(true);
 		expect(envelope.authorLogin).toBe("author-1");
 		expect(envelope.autoMergePresent).toBe(true);
-		expect(envelope.unresolvedActiveThreads).toBe(1);
+		expect(envelope.unresolvedActiveThreads).toBeNull();
 		// 103 reviews in provider order, authoritative facts preserved.
 		expect(envelope.reviews).toHaveLength(103);
 		const currentApprovals = envelope.reviews.filter(
@@ -447,12 +447,12 @@ describe("auto-merge-evidence reader", () => {
 		// Commit statuses per context.
 		expect(envelope.statuses).toHaveLength(2);
 		// Bounded reads: two metadata reads (start + coherent re-read), two review
-		// pages, one check-run page, one status page, one threads query.
+		// pages, one check-run page, one status page; no threads query.
 		expect(endpointCalls(calls, PR_ENDPOINT)).toBe(2);
 		expect(endpointCalls(calls, REVIEWS_ENDPOINT)).toBe(2);
 		expect(endpointCalls(calls, CHECK_RUNS_ENDPOINT)).toBe(1);
 		expect(endpointCalls(calls, STATUSES_ENDPOINT)).toBe(1);
-		expect(calls.filter((call) => call.kind === "graphql")).toHaveLength(1);
+		expect(calls.filter((call) => call.kind === "graphql")).toHaveLength(0);
 	});
 
 	it("reports incomplete (never truncated) when a later reviews page fails", async () => {
@@ -474,7 +474,7 @@ describe("auto-merge-evidence reader", () => {
 		// The other sources still read to completion.
 		expect(envelope.sources.checkRuns).toBe(true);
 		expect(envelope.sources.commitStatuses).toBe(true);
-		expect(envelope.sources.reviewThreads).toBe(true);
+		expect(envelope.sources.reviewThreads).toBe(false);
 		expect(endpointCalls(calls, REVIEWS_ENDPOINT)).toBe(2);
 	});
 
@@ -601,7 +601,7 @@ describe("auto-merge-evidence reader", () => {
 			reviews: true,
 			checkRuns: true,
 			commitStatuses: true,
-			reviewThreads: true,
+			reviewThreads: false,
 		});
 	});
 
@@ -617,11 +617,11 @@ describe("auto-merge-evidence reader", () => {
 		expect(envelope.reviews).toEqual([]);
 		expect(envelope.checks).toEqual([]);
 		expect(envelope.statuses).toEqual([]);
-		expect(envelope.unresolvedActiveThreads).toBe(0);
-		expect(envelope.sources.reviewThreads).toBe(true);
+		expect(envelope.unresolvedActiveThreads).toBeNull();
+		expect(envelope.sources.reviewThreads).toBe(false);
 	});
-	it("treats a 304 thread read as unknown (never complete)", async () => {
-		const { envelope } = await collect(
+	it("does not consult thread resolution when collecting merge evidence", async () => {
+		const { envelope, calls } = await collect(
 			{
 				[PR_ENDPOINT]: () => ({ stdout: prMetadataBody() }),
 				[REVIEWS_ENDPOINT]: () => ({ stdout: "[]" }),
@@ -630,8 +630,9 @@ describe("auto-merge-evidence reader", () => {
 			},
 			{ graphqlFailure: () => true },
 		);
-		expect(envelope.complete).toBe(false);
-		expect(envelope.reasons).toContain("review_threads_unknown");
+		expect(envelope.complete).toBe(true);
+		expect(envelope.reasons).toEqual([]);
+		expect(calls.some((call) => call.kind === "graphql")).toBe(false);
 		expect(envelope.sources.reviewThreads).toBe(false);
 		expect(envelope.unresolvedActiveThreads).toBeNull();
 	});
@@ -881,7 +882,7 @@ describe("pr-tracking-coordinator auto-merge evidence reads", () => {
 			reviews: true,
 			checkRuns: true,
 			commitStatuses: true,
-			reviewThreads: true,
+			reviewThreads: false,
 		});
 		expect(harness.counts.scope).toBe(1);
 		expect(harness.counts.metadata).toBe(2);

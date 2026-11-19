@@ -149,7 +149,12 @@ function makeHarness(root: string): Harness {
 		resolveAccessScope: async (): Promise<AccessScopeResult> => ({ ok: true, scope: SCOPE }),
 		readPrMetadata: async (): Promise<MetadataReadResult> => makeMetadata(remote.merged),
 		readRestListSource: async (): Promise<FeedbackReadResult> => ({ kind: "ok", events: [], bodyDigest: "empty" }),
-		readReviewThreads: async (): Promise<FeedbackReadResult> => ({ kind: "ok_threads", threads: new Map() }),
+		// The reviewer approved while leaving a nonblocking, unresolved nit.
+		// Comment tracking may read it; auto-merge must not add its own gate.
+		readReviewThreads: async (): Promise<FeedbackReadResult> => ({
+			kind: "ok_threads",
+			threads: new Map([["nit-1", { resolved: false, outdated: false }]]),
+		}),
 		readRawRestList: async (
 			endpointBase: string,
 		): Promise<{ kind: "ok"; items: unknown[] } | { kind: "failed"; failure: unknown }> => {

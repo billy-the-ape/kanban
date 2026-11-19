@@ -730,6 +730,34 @@ function readPositiveInt(record: Record<string, unknown>, key: string): number |
 }
 
 /**
+ * A truncated REST reply can retain its complete identity header before a
+ * large diff_hunk is cut mid-string. Read only complete, leading scalar
+ * header fields; never scan quoted bodies, nested objects, or arrays for ids.
+ */
+function readTruncatedApiResponseHeader(text: string): Record<string, unknown> | null {
+	const trimmed = text.trim();
+	if (!trimmed.startsWith("{") || findBalancedBrace(trimmed, 0) >= 0) return null;
+	const header: Record<string, unknown> = {};
+	const allowed = new Set(["url", "id", "pull_request_review_id", "node_id"]);
+	let rest = trimmed.slice(1);
+	for (let index = 0; index <= allowed.size; index++) {
+		// Both key and value must be complete JSON scalars followed by a comma.
+		const field = /^\s*("(?:[^"\\]|\\.)*")\s*:\s*("(?:[^"\\]|\\.)*"|[0-9]+)\s*,/.exec(rest);
+		if (!field) break;
+		try {
+			const key: unknown = JSON.parse(field[1] ?? "null");
+			if (typeof key !== "string" || !allowed.has(key)) break;
+			if (Object.hasOwn(header, key)) return null;
+			header[key] = JSON.parse(field[2] ?? "null");
+		} catch {
+			return null;
+		}
+		rest = rest.slice(field[0].length);
+	}
+	return readPositiveInt(header, "id") !== null && readString(header, "url") !== null ? header : null;
+}
+
+/**
  * Maps one attributable GitHub API response object to published identities.
  * The object must carry the target repository/PR in its URL fields; error
  * responses (`{"message": ...}` with no id) are recognized as failures.
@@ -1112,6 +1140,19 @@ export function resolvePublicationOutput(input: {
 			// or empty (no evidence lines): fall through to the URL fallback
 			// and failure checks below.
 		}
+	}
+	if (
+		collected.length === 0 &&
+		totalObjects === 0 &&
+		candidateTexts.length === 1 &&
+		(entries.length === 0 || matched.length === 1) &&
+		!sawError &&
+		input.error === null &&
+		!evidenceEntries.some((entry) => entry.success === false)
+	) {
+		const header = readTruncatedApiResponseHeader(candidateTexts[0] ?? "");
+		const identity = header === null ? null : mapFilteredApiResponseIdentity(header, scopedOperations, input.target);
+		if (identity) return { status: "published", identities: [identity], reason: null };
 	}
 	if (collected.length === 0) {
 		// A multi-object output that yielded no identities is not safe for

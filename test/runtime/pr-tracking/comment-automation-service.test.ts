@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -2301,6 +2302,80 @@ describe("COMMENT-0 publication capture", () => {
 			const record = await load();
 			expect(record.commentAutomation.publication.pending).toEqual([]);
 			expect(record.commentAutomation.publication.published).toEqual([{ kind: "conversation", id: 9 }]);
+			await harness.service.runTick();
+			expect(harness.sent).toHaveLength(0);
+			expect((await harness.service.getTaskPrTrackingState(scope, "t1")).state.blocker).toBeNull();
+		} finally {
+			await harness.service.dispose();
+		}
+	});
+
+	it("recovers a previously uncertain truncated reply on restart without replaying publication", async () => {
+		const fixture = JSON.parse(
+			readFileSync(new URL("../../fixtures/pr-publication/truncated-inline-reply.json", import.meta.url), "utf8"),
+		) as { query: string; result: string; success: boolean };
+		const command = fixture.query;
+		const output = fixture.result;
+		await seedOwner();
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			commentAutomation: {
+				...record.commentAutomation,
+				publication: {
+					published: [],
+					pending: [
+						{
+							captureId: "call-filtered",
+							taskId: "t1",
+							workspaceId: "w1",
+							operation: "gh api",
+							kind: "inline",
+							target: { host: "github.com", repository: "octo/repo", number: 42 },
+							startedAt: NOW - 5_000,
+							uncertain: true,
+							uncertainReason: "The publication output did not include the comment or review identity.",
+						},
+					],
+				},
+			},
+		}));
+		const messages = [
+			{
+				id: "m-filtered",
+				role: "tool",
+				content: [
+					"Tool: run_commands",
+					"Input:",
+					JSON.stringify({ commands: [command] }),
+					"Output:",
+					JSON.stringify([
+						{
+							query: command,
+							result: output,
+							success: true,
+						},
+					]),
+					"Duration: 1200ms",
+				].join("\n"),
+				createdAt: NOW,
+				meta: { toolName: "run_commands", hookEventName: "tool_call_end", toolCallId: "call-filtered" },
+			},
+		];
+		const harness = makeService({
+			workspaceStates: cardState(),
+			snapshot: { events: [makeEvent({ providerId: "inline-77" })] },
+			getClineTaskSessionService: async () =>
+				({
+					...idleCline,
+					loadTaskSessionMessages: async () => messages,
+				}) as unknown as ClineTaskSessionService,
+		});
+		try {
+			await harness.service.start();
+			const record = await load();
+			expect(record.commentAutomation.publication.pending).toEqual([]);
+			expect(record.commentAutomation.publication.published).toEqual([{ kind: "inline", id: 77 }]);
 			await harness.service.runTick();
 			expect(harness.sent).toHaveLength(0);
 			expect((await harness.service.getTaskPrTrackingState(scope, "t1")).state.blocker).toBeNull();
