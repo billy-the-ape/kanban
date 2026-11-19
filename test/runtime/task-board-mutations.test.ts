@@ -736,16 +736,21 @@ describe("updateTaskPrSettings auto-merge (AM-1)", () => {
 		return card;
 	}
 
-	it("cannot enable without a selected Automation PR or a resolved policy", () => {
+	it("saves an enabled preference before PR selection or CI policy setup", () => {
 		const noSelection = taskWithId(createBoard(), "task-1");
 		const withLink = boardWithTaskPullRequests(noSelection, "task-1", [createPullRequest()]);
 		expect(updateTaskPrSettings(withLink, "task-1", { autoMergeWhenApproved: true }, 2000)).toMatchObject({
-			updated: false,
-			reason: "no_selected_pr",
+			updated: true,
+			autoMergeWhenApproved: true,
+			armedAutoMergePolicyRevision: null,
 		});
 
 		const noPolicy = updateTaskPrSettings(armableBoard(), "task-1", { autoMergeWhenApproved: true }, 2000);
-		expect(noPolicy).toMatchObject({ updated: false, reason: "no_policy" });
+		expect(noPolicy).toMatchObject({
+			updated: true,
+			autoMergeWhenApproved: true,
+			armedAutoMergePolicyRevision: null,
+		});
 	});
 
 	it("arms at the policy revision when the selection and repository match", () => {

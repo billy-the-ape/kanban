@@ -679,14 +679,18 @@ describe("pr-tracking api: settings auto-merge (AM-1)", () => {
 		return makeBoard({ ...card, selectedAutomationPrKey: SELECTED_KEY });
 	}
 
-	it("cannot enable without a selected PR or a stored policy", async () => {
+	it("saves enabled preferences before PR selection or CI policy setup", async () => {
 		mockWorkspaceState(makeBoard(makeCard()));
 		const noSelection = createHarness(makeBoard(makeCard()));
 		const noSelectionResult = await noSelection.api.setTaskPrSettings(SCOPE, {
 			taskId: OPERATOR_TASK_ID,
 			autoMergeWhenApproved: true,
 		});
-		expect(noSelectionResult).toMatchObject({ ok: false, reason: "no_selected_pr" });
+		expect(noSelectionResult).toMatchObject({
+			ok: true,
+			autoMergeWhenApproved: true,
+			armedAutoMergePolicyRevision: null,
+		});
 
 		mockWorkspaceState(selectedBoard(makeCard()));
 		const noPolicy = createHarness(selectedBoard(makeCard()));
@@ -694,11 +698,15 @@ describe("pr-tracking api: settings auto-merge (AM-1)", () => {
 			taskId: OPERATOR_TASK_ID,
 			autoMergeWhenApproved: true,
 		});
-		expect(noPolicyResult).toMatchObject({ ok: false, reason: "no_policy" });
+		expect(noPolicyResult).toMatchObject({
+			ok: true,
+			autoMergeWhenApproved: true,
+			armedAutoMergePolicyRevision: null,
+		});
 	});
 
-	it("arms at the policy revision and reports both values", async () => {
-		const board = selectedBoard(makeCard());
+	it("arms a sole linked PR without requiring explicit selection", async () => {
+		const board = makeBoard(makeCard());
 		mockWorkspaceState(board);
 		const harness = createHarness(board);
 		await harness.api.updateAutoMergePolicy(SCOPE, { repository: "cline/kanban", requiredChecks: ["ci"] });
@@ -715,7 +723,7 @@ describe("pr-tracking api: settings auto-merge (AM-1)", () => {
 		});
 	});
 
-	it("rejects when the policy belongs to a different repository", async () => {
+	it("keeps an enabled preference unarmed when only another repository has a policy", async () => {
 		const board = selectedBoard(makeCard());
 		mockWorkspaceState(board);
 		const harness = createHarness(board);
@@ -725,7 +733,7 @@ describe("pr-tracking api: settings auto-merge (AM-1)", () => {
 			taskId: OPERATOR_TASK_ID,
 			autoMergeWhenApproved: true,
 		});
-		expect(result).toMatchObject({ ok: false, reason: "no_policy" });
+		expect(result).toMatchObject({ ok: true, autoMergeWhenApproved: true, armedAutoMergePolicyRevision: null });
 	});
 
 	it("disarming drops the armed revision regardless of policies", async () => {

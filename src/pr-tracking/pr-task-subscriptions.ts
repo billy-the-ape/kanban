@@ -21,6 +21,8 @@ export interface PrTaskSubscriptionSource {
 	 */
 	listBoard?: (workspaceId: string) => Promise<PrBoardSnapshot | null>;
 	installedConsumers(): PrInstalledConsumers;
+	/** Bind enabled preferences once a linked PR and repository policy exist. */
+	prepareBoard?: (snapshot: PrBoardSnapshot) => Promise<PrBoardSnapshot>;
 	/**
 	 * Optional: the workspace's selected agent id, used to resolve an unset
 	 * card agentId for comment demand (comment follow-up only serves
@@ -171,7 +173,8 @@ export async function reconcileTaskSubscriptions(
 			subs.map((sub) => sub.workspaceId),
 		);
 		for (const sub of subs) {
-			const snapshot = source.listBoard ? await source.listBoard(sub.workspaceId) : null;
+			let snapshot = source.listBoard ? await source.listBoard(sub.workspaceId) : null;
+			if (snapshot && source.prepareBoard) snapshot = await source.prepareBoard(snapshot);
 			const demand = snapshot
 				? computeTaskSubscriptionDemand([snapshot], installed, commentsAgents ?? undefined).find(
 						(d) => d.taskId === sub.taskId,
@@ -199,6 +202,11 @@ export async function reconcileTaskSubscriptions(
 		demands = [];
 	} else {
 		const boards = await source.listBoards();
+		if (source.prepareBoard) {
+			for (let index = 0; index < boards.length; index++) {
+				boards[index] = await source.prepareBoard(boards[index]);
+			}
+		}
 		const commentsAgents = await resolveCommentsAgents(
 			source,
 			boards.map((snapshot) => snapshot.workspaceId),

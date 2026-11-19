@@ -34,6 +34,7 @@ import {
 	isKanbanRemoteHost,
 } from "../core/runtime-endpoint";
 import { completeTaskAndGetReadyLinkedTaskIds } from "../core/task-board-mutations";
+import { prepareAutoMergeArming } from "../pr-tracking/auto-merge-arming";
 import { registerAutoMergeConsumer } from "../pr-tracking/auto-merge-eligibility";
 import { createAutoMergeExecutor } from "../pr-tracking/auto-merge-executor";
 import { AutoMergePolicyStore } from "../pr-tracking/auto-merge-policy-store";
@@ -351,6 +352,19 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				state.coordinator,
 				{
 					listBoards: listManagedWorkspaceBoards,
+					prepareBoard: async (snapshot) => {
+						const path = deps.workspaceRegistry.getWorkspacePathById(snapshot.workspaceId);
+						if (!path) return snapshot;
+						const arm = await prepareAutoMergeArming(snapshot.board, (repository) =>
+							state.autoMergePolicyStore.loadPolicy(repository),
+						);
+						if (!arm) return snapshot;
+						const result = await mutateWorkspaceState(path, (current) => {
+							const board = arm(current.board);
+							return { value: board, board, save: board !== current.board };
+						});
+						return { ...snapshot, board: result.value };
+					},
 					// Poll-time backstop reads each task's own board instead of
 					// enumerating every workspace.
 					listBoard: (workspaceId) =>

@@ -1760,7 +1760,7 @@ describe("COMMENT-0 publication capture", () => {
 		expect(harness.sent).toHaveLength(0);
 		const record = await load();
 		expect(record.commentAutomation.dispatch?.status).toBe("failed");
-		expect(record.commentAutomation.dispatch?.error).toContain("restart interrupted");
+		expect(record.commentAutomation.dispatch?.error).toContain("outcome could not be verified");
 	});
 
 	it("advances the dispatched watermark when restart reconciliation completes an attempted dispatch", async () => {
@@ -1993,6 +1993,37 @@ describe("COMMENT-0 publication capture", () => {
 		expect(record.commentAutomation.dispatch?.status).toBe("failed");
 		expect(record.commentAutomation.dispatch?.error).toContain("old_text is required");
 		expect(harness.sent).toHaveLength(0);
+	});
+
+	it("does not overwrite a dispatch completed while startup is resolving its session", async () => {
+		await seedRunningDispatch(fingerprintOf([makeEvent({ providerId: "conversation-1", updatedAt: NOW })]));
+		let advanced = false;
+		const state = makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })]);
+		const harness = makeService({
+			loadWorkspaceState: async () => {
+				if (!advanced) {
+					advanced = true;
+					await upsertSeed((record) => ({
+						...record,
+						revision: record.revision + 1,
+						commentAutomation: {
+							...record.commentAutomation,
+							dispatch: record.commentAutomation.dispatch
+								? { ...record.commentAutomation.dispatch, status: "completed", error: null }
+								: null,
+						},
+					}));
+				}
+				return state;
+			},
+		});
+		await harness.service.start();
+		try {
+			expect((await load()).commentAutomation.dispatch).toMatchObject({ status: "completed", error: null });
+			expect(harness.sent).toHaveLength(0);
+		} finally {
+			await harness.service.dispose();
+		}
 	});
 
 	it("completes a restart-surviving dispatch with post-dispatch live evidence", async () => {

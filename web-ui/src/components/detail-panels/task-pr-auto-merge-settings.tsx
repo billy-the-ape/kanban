@@ -1,23 +1,8 @@
-// AM-5: the auto-merge opt-in surface. The checkbox arms/disarms the
-// server-owned opt-in (arming requires a selected Automation PR, a stored
-// repository policy and no policy revision drift); enabling asks for an
-// explicit confirmation of the merge consequence. The status line mirrors
-// the server-persisted facts only (AM-3 eligibility summary + AM-4 attempt
-// journal) and never renders stale evidence as green. The repository CI
-// policy affordance lives in TaskPrAutoMergePolicyPanel.
+// Auto-merge preference and execution status are separate: setup blockers
+// never prevent saving the preference. The server binds ready tasks to CI policy.
 
 import { useCallback, useState } from "react";
 import { cn } from "@/components/ui/cn";
-import {
-	AlertDialog,
-	AlertDialogAction,
-	AlertDialogBody,
-	AlertDialogCancel,
-	AlertDialogDescription,
-	AlertDialogFooter,
-	AlertDialogHeader,
-	AlertDialogTitle,
-} from "@/components/ui/dialog";
 import { getRuntimeTrpcClient } from "@/runtime/trpc-client";
 import type { AutoMergePolicy, RuntimeTaskTrackingStateResponse } from "@/runtime/types";
 import { useTrpcQuery } from "@/runtime/use-trpc-query";
@@ -48,7 +33,7 @@ function formatVerifiedAt(timestamp: number | null): string | null {
 
 /** The operator-facing help text for the auto-merge opt-in. */
 const AUTO_MERGE_HINT =
-	"Enables merging when all repository required checks pass, at least one non-author review approves, and the PR is mergeable — using the repository CI policy. GitHub branch protections and rulesets may still require additional approvals or deployment checks.";
+	"Merges the linked PR after the configured CI checks pass and a non-author approves the current commit. GitHub branch protections and rulesets still apply.";
 
 export function TaskPrAutoMergeSettings({
 	workspaceId,
@@ -63,15 +48,9 @@ export function TaskPrAutoMergeSettings({
 }): React.ReactElement {
 	const client = getRuntimeTrpcClient(workspaceId);
 	const [acting, setActing] = useState(false);
-	const [confirmOpen, setConfirmOpen] = useState(false);
 	const [armingError, setArmingError] = useState<string | null>(null);
 
 	const selectedKey = tracking.selectedAutomationPrKey;
-	// The arming write requires an EXPLICIT selection (a sole linked PR
-	// alone does not count), so the checkbox gates on the explicit one —
-	// `selectedAutomationPrKey` also resolves a sole link implicitly and
-	// would over-claim when the explicit field is unset.
-	const explicitKey = tracking.explicitAutomationPrKey;
 	const repository = repositoryFromCanonicalPrKey(selectedKey);
 	const ambiguous = tracking.blockers.some((blocker) => blocker.kind === "ambiguous_selection");
 
@@ -88,24 +67,21 @@ export function TaskPrAutoMergeSettings({
 	const policy = policyQuery.data ?? null;
 
 	const armedRevision = tracking.armedAutoMergePolicyRevision ?? null;
-	// Arming is disabled (with a reason) until the server-side preconditions
-	// hold: a selected Automation PR, a stored policy for its repository,
-	// and no armed-vs-current revision drift (a changed policy requires an
-	// explicit re-arm).
 	const policyKnown = workspaceId !== null && repository !== null && !policyQuery.isLoading;
 	const mismatch = policyKnown && policy !== null && armedRevision !== null && armedRevision !== policy.revision;
-	const canArm = explicitKey !== null && !ambiguous && policyKnown && policy !== null && !mismatch;
-	const armingDisabledReason = ambiguous
-		? "Select the Automation PR before enabling auto-merge."
-		: explicitKey === null
-			? "Record and select an Automation PR before enabling auto-merge."
+	const setupReason = ambiguous
+		? "Waiting: select which linked PR should auto-merge."
+		: selectedKey === null
+			? "Waiting: link a PR. A sole linked PR is selected automatically."
 			: !policyKnown
-				? null
+				? "Loading repository CI policy…"
 				: policy === null
-					? "Configure the repository CI policy below first."
+					? "Waiting: configure the required CI checks below. Auto-merge will start after setup."
 					: mismatch
-						? `The repository policy changed after arming (armed revision ${armedRevision}, current ${policy.revision}); toggle the checkbox off and on to re-arm.`
-						: null;
+						? "The CI policy changed. Turn auto-merge off and on to accept the updated policy."
+						: armedRevision === null
+							? "Waiting for the server to activate auto-merge."
+							: null;
 
 	const applyAutoMergeSetting = async (next: boolean): Promise<void> => {
 		setActing(true);
@@ -142,33 +118,22 @@ export function TaskPrAutoMergeSettings({
 			<label
 				className={cn(
 					"flex items-start gap-2 text-xs text-text-secondary",
-					canArm && !acting && "cursor-pointer hover:text-text-primary",
+					!acting && "cursor-pointer hover:text-text-primary",
 				)}
 			>
 				<input
 					type="checkbox"
 					checked={tracking.autoMergeWhenApproved}
-					// Arming preconditions gate turning the setting ON only; a checked
-					// box is always clickable so the operator can disarm and re-arm
-					// even while preconditions (or the armed policy revision) drift.
-					disabled={acting || (!canArm && !tracking.autoMergeWhenApproved)}
-					onChange={(event) => {
-						const next = event.target.checked;
-						if (next) {
-							// Enabling is a real-merge commitment: confirm first.
-							setConfirmOpen(true);
-						} else {
-							void applyAutoMergeSetting(false);
-						}
-					}}
+					disabled={acting || workspaceId === null}
+					onChange={(event) => void applyAutoMergeSetting(event.target.checked)}
 					className="mt-0.5 h-3.5 w-3.5 accent-(--color-accent)"
 					aria-label="Auto-merge when CI passes and at least one review approves"
 				/>
 				<span className="leading-tight">
 					Auto-merge when CI passes and at least one review approves
 					<span className="block text-text-tertiary">{AUTO_MERGE_HINT}</span>
-					{armingDisabledReason !== null ? (
-						<span className="block text-status-orange">{armingDisabledReason}</span>
+					{tracking.autoMergeWhenApproved && setupReason !== null ? (
+						<span className="block text-status-orange">{setupReason}</span>
 					) : null}
 					{tracking.autoMergeWhenApproved && armedRevision !== null ? (
 						<span className="block text-text-tertiary">
@@ -179,7 +144,7 @@ export function TaskPrAutoMergeSettings({
 				</span>
 			</label>
 
-			{status !== null ? (
+			{status !== null && setupReason === null ? (
 				<div
 					className={cn("ml-5 text-[11px] leading-tight", TONE_CLASSES[status.tone])}
 					data-testid="task-pr-auto-merge-status"
@@ -215,36 +180,6 @@ export function TaskPrAutoMergeSettings({
 					}}
 				/>
 			) : null}
-
-			<AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
-				<AlertDialogHeader>
-					<AlertDialogTitle>Enable auto-merge?</AlertDialogTitle>
-				</AlertDialogHeader>
-				<AlertDialogBody>
-					<AlertDialogDescription>
-						This actually merges the Automation PR into its target base with the repository CI policy's merge
-						method once all required checks pass and at least one non-author review approves — it does not only
-						mark the card Done.
-						{tracking.autoFinishOnMerge
-							? " The card moves to Done when GitHub confirms the merge."
-							: " “Auto complete when the PR merges” is off, so the card stays in In Review even after the PR merges."}{" "}
-						GitHub branch protections and rulesets may still require additional approvals or deployment checks
-						that Kanban does not override.
-					</AlertDialogDescription>
-				</AlertDialogBody>
-				<AlertDialogFooter>
-					<AlertDialogCancel disabled={acting}>Cancel</AlertDialogCancel>
-					<AlertDialogAction
-						disabled={acting}
-						onClick={() => {
-							setConfirmOpen(false);
-							void applyAutoMergeSetting(true);
-						}}
-					>
-						Enable auto-merge
-					</AlertDialogAction>
-				</AlertDialogFooter>
-			</AlertDialog>
 		</div>
 	);
 }

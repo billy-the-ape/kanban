@@ -233,7 +233,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		let autoMergePolicy: { repository: string; revision: number } | null = null;
 		if (input.autoMergeWhenApproved === true) {
 			const preCard = await loadScopedCard(scope, input.taskId);
-			const selectedKey = preCard?.card.selectedAutomationPrKey;
+			const selectedKey = preCard ? resolveCardAutomationPrKey(preCard.card).key : null;
 			const parsed = selectedKey ? parseCanonicalPrKey(selectedKey) : null;
 			if (parsed && selectedKey && isTrackingSupportedPr(selectedKey)) {
 				const policy = await deps.getAutoMergePolicyStore().loadPolicy(parsed.repository);
@@ -552,7 +552,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 				typeof input.expectedSettingsRevision === "number" && input.expectedSettingsRevision !== settingsRevision,
 			autoAddressComments: card.autoAddressComments === true,
 			autoFinishOnMerge: card.autoFinishOnMerge === true,
-			autoMergeWhenApproved: card.autoMergeWhenApproved === true,
+			autoMergeWhenApproved: card.autoMergeWhenApproved !== false,
 			armedAutoMergePolicyRevision: card.armedAutoMergePolicyRevision ?? null,
 			selectedAutomationPrKey: resolved.key,
 			explicitAutomationPrKey:
@@ -1243,6 +1243,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		deps.warn?.(
 			`Auto-merge policy updated for ${normalized}: revision ${result.policy.revision}, ${result.policy.requiredChecks.length} required check(s), method ${result.policy.mergeMethod} (workspace ${scope.workspaceId})`,
 		);
+		await reconcileDemand();
 		return { ok: true, repository: normalized, policy: result.policy, reason: null };
 	};
 
