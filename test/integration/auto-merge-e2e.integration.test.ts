@@ -18,6 +18,7 @@ import type {
 	RuntimeBoardData,
 	RuntimeTaskPullRequest,
 } from "../../src/core/api-contract";
+import { prepareAutoMergeArming } from "../../src/pr-tracking/auto-merge-arming";
 import { registerAutoMergeConsumer } from "../../src/pr-tracking/auto-merge-eligibility";
 import { createAutoMergeExecutor } from "../../src/pr-tracking/auto-merge-executor";
 import type {
@@ -33,11 +34,8 @@ import { PrConsumerRegistry } from "../../src/pr-tracking/pr-consumer-registry";
 import { type PrMergeCompletionDeps, registerMergeCompletionConsumer } from "../../src/pr-tracking/pr-merge-completion";
 import type { PrBoardSnapshot } from "../../src/pr-tracking/pr-owner-selection";
 import { normalizePrMetadata } from "../../src/pr-tracking/pr-snapshots";
-import {
-	createPrTrackingCoordinator,
-	type PrTrackingCoordinator,
-	type PrTrackingSubscriptionDescriptor,
-} from "../../src/pr-tracking/pr-tracking-coordinator";
+import { reconcileTaskSubscriptions } from "../../src/pr-tracking/pr-task-subscriptions";
+import { createPrTrackingCoordinator, type PrTrackingCoordinator } from "../../src/pr-tracking/pr-tracking-coordinator";
 
 const BASE_TIME = 1_700_000_000_000;
 const POLL_MS = 60_000;
@@ -78,10 +76,7 @@ function makeCard(): RuntimeBoardCard {
 		autoFinishOnMerge: true,
 		createdAt: BASE_TIME - 2_000_000,
 		updatedAt: BASE_TIME - 2_000_000,
-		autoMergeWhenApproved: true,
-		armedAutoMergePolicyRevision: POLICY.revision,
 		pullRequests: [PR_LINK],
-		selectedAutomationPrKey: PR_KEY,
 	};
 }
 
@@ -105,6 +100,7 @@ interface Harness {
 	completeTaskCalls: Array<{ workspaceId: string; taskId: string }>;
 	dispatchCalls: Array<{ workspaceId: string; taskId: string; readyTaskIds: string[] }>;
 	warnings: string[];
+	subscribe: () => Promise<void>;
 }
 
 function makeMetadata(merged: boolean): MetadataReadResult {
@@ -146,7 +142,7 @@ function makeHarness(root: string): Harness {
 	const dispatchCalls: Array<{ workspaceId: string; taskId: string; readyTaskIds: string[] }> = [];
 	const warnings: string[] = [];
 	const store = new InMemoryPrRecordStore({ now: () => Date.now() });
-	const card = makeCard();
+	let card = makeCard();
 	const boards: PrBoardSnapshot[] = [{ workspaceId: WORKSPACE_ID, board: makeBoard(card) }];
 
 	const fakeAdapter = {
@@ -296,6 +292,19 @@ function makeHarness(root: string): Harness {
 		completeTaskCalls,
 		dispatchCalls,
 		warnings,
+		subscribe: async () => {
+			await reconcileTaskSubscriptions(coordinator, {
+				listBoards: async () => boards,
+				installedConsumers: () => ({ comments: true, mergeCompletion: true, autoMerge: true }),
+				prepareBoard: async (snapshot) => {
+					const arm = await prepareAutoMergeArming(snapshot.board, async () => POLICY);
+					const board = arm?.(snapshot.board) ?? snapshot.board;
+					const ready = board.columns.flatMap((column) => column.cards).find((item) => item.id === TASK_ID);
+					if (ready) card = ready;
+					return { ...snapshot, board };
+				},
+			});
+		},
 	};
 }
 
@@ -366,23 +375,12 @@ function findBinding(record: GitHubPrTrackingRecord): GitHubPrTaskBinding | unde
 	return record.taskBindings.find((item) => item.workspaceId === WORKSPACE_ID && item.taskId === TASK_ID);
 }
 
-function descriptor(overrides: Partial<PrTrackingSubscriptionDescriptor> = {}): PrTrackingSubscriptionDescriptor {
-	return {
-		workspaceId: WORKSPACE_ID,
-		taskId: TASK_ID,
-		canonicalPrKey: PR_KEY,
-		column: "review",
-		consumers: { comments: false, mergeCompletion: true, autoMerge: true },
-		...overrides,
-	};
-}
-
 describe("AM-5: full auto-merge lifecycle (fake GitHub)", () => {
-	it("poll -> eligibility -> fenced merge -> remote confirmation -> task Done -> successor release", async () => {
+	it("default-on sole linked PR -> policy arming -> fenced merge -> task Done -> successor release", async () => {
 		const harness = makeHarness(root);
 		const coordinator = harness.coordinator;
 		try {
-			expect((await coordinator.addSubscription(descriptor())).status).toBe("active");
+			await harness.subscribe();
 
 			// Poll 1: the PR is open. The auto-merge consumer evaluates the
 			// fresh evidence (approved + green "ci"), becomes eligible and

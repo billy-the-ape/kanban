@@ -2049,7 +2049,11 @@ export class PrCommentAutomationService {
 						{ accessScopeId: record.accessScopeId, pr: record.pr },
 						(current) => {
 							const currentDispatch = current.commentAutomation.dispatch;
-							if (currentDispatch === null || currentDispatch.dispatchId !== dispatch.dispatchId) {
+							if (
+								current.revision !== record.revision ||
+								currentDispatch === null ||
+								currentDispatch.dispatchId !== dispatch.dispatchId
+							) {
 								return current;
 							}
 							return {
@@ -2086,7 +2090,11 @@ export class PrCommentAutomationService {
 				{ accessScopeId: record.accessScopeId, pr: record.pr },
 				(current) => {
 					const currentDispatch = current.commentAutomation.dispatch;
-					if (currentDispatch === null || currentDispatch.dispatchId !== dispatch.dispatchId) {
+					if (
+						current.revision !== record.revision ||
+						currentDispatch === null ||
+						currentDispatch.dispatchId !== dispatch.dispatchId
+					) {
 						return current;
 					}
 					return {
@@ -2117,7 +2125,7 @@ export class PrCommentAutomationService {
 								status: completed ? "completed" : "failed",
 								error: completed
 									? null
-									: `A restart interrupted comment handling and the outcome is unknown; resume manually.`,
+									: `The comment-handling outcome could not be verified; resume manually.`,
 							},
 						},
 					};

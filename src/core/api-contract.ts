@@ -626,12 +626,9 @@ export const runtimeBoardCardSchema = z
 		 */
 		settingsRevision: z.number().int().nonnegative().optional(),
 		/**
-		 * AM-1: "Auto-merge when CI passes and at least one review approves"
-		 * task opt-in. Optional so old cards read as disabled without
-		 * migration. Server-owned: it is enabled only through the dedicated
-		 * revision-checked PR settings mutation, which binds it to a current
-		 * repository policy, and `saveWorkspaceState` restores the persisted
-		 * value over any client-supplied value (a new card never accepts it).
+		 * Auto-merge preference. Missing defaults to on; explicit false persists.
+		 * Server-owned: execution additionally requires a policy revision bound
+		 * by the settings mutation or server subscription reconciliation.
 		 */
 		autoMergeWhenApproved: z.boolean().optional(),
 		/**
@@ -3700,10 +3697,9 @@ export const runtimeTaskPrSettingsRequestSchema = z.object({
 	/** undefined = keep current; explicit boolean overwrites. */
 	autoFinishOnMerge: z.boolean().optional(),
 	/**
-	 * AM-1: undefined = keep current; explicit boolean overwrites. Enabling
-	 * requires a selected Automation PR whose repository has a current
-	 * auto-merge policy; the server binds the card to that policy revision
-	 * (client-supplied values are never trusted).
+	 * Undefined = keep current; explicit boolean saves the preference.
+	 * The server binds ready tasks to the selected/sole PR repository policy;
+	 * missing setup leaves the preference enabled but execution unarmed.
 	 */
 	autoMergeWhenApproved: z.boolean().optional(),
 	/**
@@ -4035,18 +4031,14 @@ export const runtimeTaskTrackingStateResponseSchema = z.object({
 	staleRevision: z.boolean(),
 	autoAddressComments: z.boolean(),
 	autoFinishOnMerge: z.boolean(),
-	/** AM-1: the task's auto-merge opt-in (absent reads as false). */
+	/** The task's auto-merge preference (absent defaults to on). */
 	autoMergeWhenApproved: z.boolean(),
 	/** AM-1: the repository policy revision the opt-in is armed against (null = not armed). */
 	armedAutoMergePolicyRevision: z.number().nullable(),
 	selectedAutomationPrKey: z.string().nullable(),
 	/**
-	 * AM-5: the card's EXPLICIT Automation PR selection (the raw persisted
-	 * field, validated against the linked PRs). Null when unset or stale —
-	 * a sole linked PR alone does not count as selected. The arming write
-	 * requires an explicit selection, so the UI gates the auto-merge checkbox
-	 * on this (not on `selectedAutomationPrKey`, which also resolves a sole
-	 * link implicitly).
+	 * The card's explicit Automation PR selection, validated against its links.
+	 * A sole linked PR also suffices for auto-merge via selectedAutomationPrKey.
 	 */
 	explicitAutomationPrKey: z.string().nullable(),
 	/** Eligible for live PR tracking (active card + selected/sole link + installed enabled consumer). */

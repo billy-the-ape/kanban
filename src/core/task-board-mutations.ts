@@ -1,3 +1,4 @@
+import { resolveCardAutomationPrKey } from "../pr-tracking/pr-card-selection";
 import { isTrackingSupportedPr, parseCanonicalPrKey } from "../pr-tracking/pr-key-parsing";
 import type {
 	RuntimeAgentId,
@@ -919,6 +920,14 @@ export function addTaskPullRequests(
 		return { board, task, added: false };
 	}
 	const nextTask: RuntimeBoardCard = { ...task, pullRequests: nextPullRequests, updatedAt: now };
+	if (
+		task.armedAutoMergePolicyRevision !== undefined &&
+		resolveCardAutomationPrKey(task).key !== resolveCardAutomationPrKey(nextTask).key
+	) {
+		nextTask.autoMergeWhenApproved = false;
+		delete nextTask.armedAutoMergePolicyRevision;
+		nextTask.settingsRevision = (task.settingsRevision ?? 0) + 1;
+	}
 	return {
 		board: replaceTaskCard(board, normalizedTaskId, nextTask),
 		task: nextTask,
@@ -961,8 +970,12 @@ export function removeTaskPullRequest(
 			: {}),
 		updatedAt: now,
 	};
-	if (selectionRemoved) {
-		delete nextTask.selectedAutomationPrKey;
+	const implicitTargetChanged =
+		task.armedAutoMergePolicyRevision !== undefined &&
+		resolveCardAutomationPrKey(task).key !== resolveCardAutomationPrKey(nextTask).key;
+	if (selectionRemoved || implicitTargetChanged) {
+		if (selectionRemoved) delete nextTask.selectedAutomationPrKey;
+		nextTask.settingsRevision = (task.settingsRevision ?? 0) + 1;
 		// AM-1: unlinking the selected Automation PR disarms the auto-merge
 		// opt-in — the armed revision bound to it is now meaningless.
 		nextTask.autoMergeWhenApproved = false;
@@ -1195,11 +1208,9 @@ export interface RuntimeTaskPrSettingsInput {
 	/** undefined = keep current; explicit boolean overwrites. */
 	autoFinishOnMerge?: boolean;
 	/**
-	 * AM-1: undefined = keep current; explicit boolean overwrites. Enabling
-	 * requires the task's selected Automation PR to resolve to a GitHub.com
-	 * link AND the server to supply the current policy for that repository
-	 * (see `RuntimeUpdateTaskPrSettingsOptions`); a missing policy or
-	 * selection rejects the write.
+	 * Undefined keeps the preference; explicit booleans persist. Enabling
+	 * can precede setup. Execution requires a selected/sole GitHub PR and
+	 * a server-resolved repository CI policy revision.
 	 */
 	autoMergeWhenApproved?: boolean;
 	/** Must equal the card's current settingsRevision (absent reads as 0). */
@@ -1215,8 +1226,8 @@ export interface RuntimeTaskPrSettingsInput {
 export interface RuntimeUpdateTaskPrSettingsOptions {
 	/**
 	 * The current auto-merge policy of the card's selected Automation PR's
-	 * repository (`null` = no policy available). Enabling
-	 * `autoMergeWhenApproved` fails closed without it.
+	 * repository (`null` = no policy available). The preference can be
+	 * enabled without it, but remains unarmed until setup is complete.
 	 */
 	autoMergePolicy?: { repository: string; revision: number } | null;
 }
@@ -1245,12 +1256,11 @@ export interface RuntimeUpdateTaskPrSettingsResult {
 /**
  * The dedicated revision-checked settings mutation. Never called from the
  * whole-board save path: `saveWorkspaceState` carries the stored values over,
- * and this mutation is the only writer of the settings block.
+ * and reconciliation uses this same mutation when arming default-on tasks.
  *
- * AM-1: enabling `autoMergeWhenApproved` requires the task's selected
- * Automation PR to resolve to a github.com link that exists on the card AND
- * the server to have resolved the CURRENT repository policy before this
- * write (options.autoMergePolicy). The bind is validated against the
+ * Arming requires the selected/sole Automation PR to resolve to a github.com
+ * link and the server to supply the current repository policy before this
+ * write. The enabled preference can be saved before setup. The bind is validated against the
  * freshly-read card inside this mutation, so a concurrent selection change
  * cannot arm the card against the wrong repository. Disabling always wins.
  */
@@ -1271,7 +1281,7 @@ export function updateTaskPrSettings(
 		settingsRevision: task.settingsRevision ?? 0,
 		autoAddressComments: task.autoAddressComments === true,
 		autoFinishOnMerge: task.autoFinishOnMerge === true,
-		autoMergeWhenApproved: task.autoMergeWhenApproved === true,
+		autoMergeWhenApproved: task.autoMergeWhenApproved !== false,
 		armedAutoMergePolicyRevision: task.armedAutoMergePolicyRevision ?? null,
 		selectedAutomationPrKey: task.selectedAutomationPrKey ?? null,
 	});
@@ -1306,30 +1316,24 @@ export function updateTaskPrSettings(
 	let autoMerge: boolean | undefined;
 	let armRevision: number | null = null;
 	if (input.autoMergeWhenApproved === true) {
-		const selectedKey = task.selectedAutomationPrKey;
+		const selectedKey = resolveCardAutomationPrKey(task).key;
 		const parsed = selectedKey ? parseCanonicalPrKey(selectedKey) : null;
-		const matchesLink = (task.pullRequests ?? []).some(
-			(pullRequest) => getPullRequestIdentityKey(pullRequest) === selectedKey,
-		);
-		if (parsed === null || !selectedKey || !isTrackingSupportedPr(selectedKey) || !matchesLink) {
-			return { ...base(task), reason: "no_selected_pr" };
-		}
 		const policy = options.autoMergePolicy;
-		if (policy === undefined || policy === null || policy.repository !== parsed.repository) {
-			// No current policy for this repository, or the selection moved
-			// between the pre-read policy lookup and this locked write:
-			// fail closed rather than arm against an unknown revision.
+		if (policy && parsed && policy.repository !== parsed.repository) {
 			return { ...base(task), reason: "no_policy" };
 		}
-		if (task.autoMergeWhenApproved === true && task.armedAutoMergePolicyRevision === policy.revision) {
-			// Already armed at the current revision: no-op (no revision bump).
-			autoMerge = undefined;
-		} else {
+		const revision = parsed && selectedKey && isTrackingSupportedPr(selectedKey) && policy ? policy.revision : null;
+		// Save the preference even before a PR or CI policy exists. Execution
+		// still requires a server-bound revision; reconciliation arms it later.
+		if (
+			task.autoMergeWhenApproved !== true ||
+			(revision !== null && task.armedAutoMergePolicyRevision !== revision)
+		) {
 			autoMerge = true;
-			armRevision = policy.revision;
+			armRevision = revision;
 		}
 	} else if (input.autoMergeWhenApproved === false) {
-		if (task.autoMergeWhenApproved === true) {
+		if (task.autoMergeWhenApproved !== false || task.armedAutoMergePolicyRevision !== undefined) {
 			autoMerge = false;
 		}
 	}
@@ -1366,7 +1370,7 @@ export function updateTaskPrSettings(
 		settingsRevision: nextTask.settingsRevision ?? currentRevision + 1,
 		autoAddressComments: nextTask.autoAddressComments === true,
 		autoFinishOnMerge: nextTask.autoFinishOnMerge === true,
-		autoMergeWhenApproved: nextTask.autoMergeWhenApproved === true,
+		autoMergeWhenApproved: nextTask.autoMergeWhenApproved !== false,
 		armedAutoMergePolicyRevision: nextTask.armedAutoMergePolicyRevision ?? null,
 		selectedAutomationPrKey: nextTask.selectedAutomationPrKey ?? null,
 	};
