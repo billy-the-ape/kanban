@@ -3924,7 +3924,7 @@ export const autoMergeEvidenceEnvelopeSchema = z
 		authorLogin: z.string().nullable(),
 		autoMergePresent: z.boolean().nullable(),
 		sources: autoMergeEvidenceSourcesSchema,
-		/** Unresolved, non-outdated review threads; null = unknown. */
+		/** Legacy thread diagnostic; current merge evidence leaves it null (not a merge gate). */
 		unresolvedActiveThreads: z.number().int().nonnegative().nullable(),
 		complete: z.boolean(),
 		/** Stable reason tokens (empty when complete). */

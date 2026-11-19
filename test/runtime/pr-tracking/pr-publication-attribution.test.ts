@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
 	analyzePrPublication,
@@ -937,5 +938,72 @@ describe("resolvePublicationOutput bare numeric id support", () => {
 		expect(resolution.status).toBe("uncertain");
 		expect(resolution.identities).toEqual([]);
 		expect(resolution.reason).toContain("bare numeric output");
+	});
+});
+
+describe("truncated REST reply responses", () => {
+	// Synthetic reproduction of a successful response truncated by head -c:
+	// its JSON ends inside diff_hunk after the complete API URL and database id.
+	const fixture = JSON.parse(
+		readFileSync(new URL("../../fixtures/pr-publication/truncated-inline-reply.json", import.meta.url), "utf8"),
+	) as { query: string; result: string; success: boolean };
+	const target = { host: "github.com", repository: "octo/repo", number: 42 };
+	const analyze = (output: unknown, commands = [fixture.query]) =>
+		analyzePrPublication({
+			toolName: "run_commands",
+			commands,
+			output: typeof output === "string" ? output : JSON.stringify(output),
+			error: null,
+			linkedPullRequests: [target],
+		});
+	it("captures a truncated reply whose complete identity header survives", () => {
+		expect(() => JSON.parse(fixture.result)).toThrow();
+		expect(analyze([fixture])).toMatchObject({
+			status: "published",
+			identities: [{ kind: "inline", id: 77 }],
+		});
+		expect(analyze(fixture.result)).toMatchObject({
+			status: "published",
+			identities: [{ kind: "inline", id: 77 }],
+		});
+	});
+	it.each([
+		'{"url":"https://api.github.com/repos/other/repo/pulls/comments/77","id":77,"diff_hunk":"cut',
+		'{"url":"https://api.github.com/repos/octo/repo/pulls/comments/99","id":77,"diff_hunk":"cut',
+		'{"url":"https://api.github.com/repos/octo/repo/issues/comments/77","id":77,"body":"cut',
+		'{"url":"https://api.github.com/repos/octo/repo/pulls/comments/77","id":7',
+		'{"url":"https://api.github.com/repos/octo/repo/pulls/comments/77","id":77,"id":99,"diff_hunk":"cut',
+	])("rejects incomplete or conflicting identity headers: %s", (result) => {
+		expect(analyze([{ ...fixture, result }]).identities).toEqual([]);
+	});
+	it("does not infer ids from a nested object, array, echoed query, or failed result", () => {
+		for (const result of [
+			`[${fixture.result}`,
+			`{ "data": ${fixture.result}`,
+			`{ "body": ${JSON.stringify(fixture.result)}, "tail":"cut`,
+		]) {
+			expect(analyze([{ ...fixture, result }]).identities).toEqual([]);
+		}
+		expect(analyze([{ query: fixture.query + fixture.result, result: "", success: true }]).identities).toEqual([]);
+		expect(analyze([{ ...fixture, success: false }]).status).toBe("failed");
+	});
+	it("requires one explicit matching write and scopes the output to that write", () => {
+		const read = "gh api repos/octo/repo/pulls/42/comments";
+		expect(
+			analyze(
+				[
+					{ query: read, result: fixture.result, success: true },
+					{ ...fixture, result: "" },
+				],
+				[read, fixture.query],
+			).identities,
+		).toEqual([]);
+		expect(analyze([{ query: read, result: fixture.result, success: true }]).identities).toEqual([]);
+		expect(
+			analyze(fixture.result, [fixture.query, fixture.query.replace("in_reply_to=12", "in_reply_to=13")]).identities,
+		).toEqual([]);
+		expect(
+			analyze(fixture.result, ["gh api repos/{owner}/{repo}/pulls/42/comments -f body=reply"]).identities,
+		).toEqual([]);
 	});
 });

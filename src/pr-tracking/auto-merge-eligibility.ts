@@ -412,7 +412,8 @@ export function evaluateAutoMergeEligibility(input: AutoMergeEligibilityInput): 
 		}
 	}
 
-	// Phase F: reviews and threads.
+	// Phase F: review decisions. Nonblocking threads do not revoke an approval;
+	// GitHub enforces conversation-resolution rules when performing the merge.
 	const reviewVerdict = classifyAutoMergeReviews(envelope.reviews, envelope.headSha, envelope.authorLogin);
 	if (reviewVerdict.inconsistent.length > 0) {
 		add("review_inconsistent", `Review ordering is inconsistent for: ${reviewVerdict.inconsistent.join(", ")}.`);
@@ -425,9 +426,6 @@ export function evaluateAutoMergeEligibility(input: AutoMergeEligibilityInput): 
 	}
 	if (reviewVerdict.approvers.length === 0) {
 		add("no_approval", "No effective current-head approval from a non-author reviewer yet.");
-	}
-	if (envelope.unresolvedActiveThreads !== null && envelope.unresolvedActiveThreads > 0) {
-		add("unresolved_threads", `${envelope.unresolvedActiveThreads} unresolved review thread(s) remain.`);
 	}
 
 	// Phase G: competing operations on the record.

@@ -1,0 +1,5 @@
+{
+  "query": "gh api repos/octo/repo/pulls/42/comments -f body=Addressed -F in_reply_to=12 --method POST | head -c 200",
+  "result": "{\"url\":\"https://api.github.com/repos/octo/repo/pulls/comments/77\",\"pull_request_review_id\":88,\"id\":77,\"node_id\":\"PRRC_test\",\"diff_hunk\":\"@@ -1 +1 @@\\n+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n",
+  "success": true
+}

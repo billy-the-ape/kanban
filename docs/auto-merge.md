@@ -21,6 +21,9 @@ as a successful pipeline.
 
 Execution still verifies fresh CI results, a non-author approval of the current
 head, mergeability, GitHub repository rules, and no active writer/comment repair.
+Unresolved review threads do not independently block an approved PR. Outstanding
+change requests still block; if GitHub requires resolving conversations, GitHub
+enforces that rule during the merge.
 Changing a configured policy requires turning an already armed task off and back
 on. Changing or removing its Automation PR disarms it; this also applies to a sole
 linked PR whose identity changes. Turning auto-merge off persists across reloads
@@ -36,3 +39,9 @@ Existing tasks with no saved auto-merge preference now default to on and may mer
 when their repository CI policy is configured and all execution requirements pass.
 Explicitly disabled tasks remain disabled. Existing GitHub credentials still need
 permission to merge into the target repository.
+
+On startup, Kanban rechecks stored uncertain comment-publication captures against
+their original tool results. A REST reply truncated after its complete ID and API
+URL can be recovered when it matches one explicit write to the tracked PR. The
+reply is recorded as already published and is not posted again. Captures without
+enough matching evidence still require manual Resume.
