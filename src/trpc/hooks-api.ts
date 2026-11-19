@@ -6,6 +6,7 @@ import type {
 } from "../core/api-contract";
 import { parseHookIngestRequest } from "../core/api-validation";
 import { loadWorkspaceContextById } from "../state/workspace-state";
+import { isStaleHookAttempt } from "../terminal/hook-runtime-context";
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { fireReviewPullRequestLookup } from "../workspace/task-pull-request-lookup";
 import { type RecordHookPullRequestsInput, recordHookPullRequests } from "../workspace/task-pull-requests";
@@ -71,6 +72,17 @@ export function createHooksApi(deps: CreateHooksApiDependencies): RuntimeTrpcCon
 					return {
 						ok: false,
 						error: `Task "${taskId}" not found in workspace "${workspaceId}"`,
+					} satisfies RuntimeHookIngestResponse;
+				}
+
+				// AA-S1: the summary's current launch attempt owns this card's events.
+				// An event with a different token comes from a superseded attempt (a
+				// stale child process, a leftover plugin) and must never move the card,
+				// so it is acknowledged and dropped. A session or integration without a
+				// token has nothing to compare against and keeps working unchanged.
+				if (isStaleHookAttempt({ eventAttemptId: body.attemptId, sessionAttemptId: summary.launchAttemptId })) {
+					return {
+						ok: true,
 					} satisfies RuntimeHookIngestResponse;
 				}
 

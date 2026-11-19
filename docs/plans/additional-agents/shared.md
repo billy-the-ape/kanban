@@ -1,6 +1,8 @@
 # Additional agents: shared groundwork and benchmark evidence
 
-Status: planned. Documentation only; no agent is enabled by this PR.
+Status: AA-S1 implemented in this repository (shared agent contracts, launch provenance,
+attempt-scoped events). AA-O1 (OpenCode), AA-P1 (Pi) and AA-E1 (evaluation) remain planned;
+no additional agent is enabled by this change.
 Research and repository inspection date: 2026-11-19.
 Inspected Kanban main: `e7b2097af06364b01410c6b69d353d52d22a6aa4`.
 Re-read current code and applicable AGENTS.md before implementation.
@@ -14,7 +16,7 @@ for task ownership, worktree preparation, verification, review, and publication.
 
 | Order | Implementation PR | Deliverable |
 | --- | --- | --- |
-| 1 | AA-S1: shared agent contracts and lifecycle groundwork | Explicit capabilities, configuration provenance, task-scoped event ownership, regression coverage |
+| 1 | AA-S1 (implemented): shared agent contracts and lifecycle groundwork | Explicit capabilities, configuration provenance, task-scoped event ownership, regression coverage |
 | 2 | [AA-O1: OpenCode](./opencode.md) | Repair existing dormant adapter and enable supported, tested versions |
 | 3 | [AA-P1: Pi](./pi.md) | Add Pi identity, terminal adapter, task-scoped extension, configuration and lifecycle support |
 | 4 | AA-E1: comparative evaluation | Run the same frozen local-Qwen task suite across available runners; publish results separately |
@@ -141,6 +143,62 @@ link, fence, whitespace and scope checks rather than an unrelated formatter.
 Acceptance: new capability/config fields are backward compatible; unavailable features
 are visibly unavailable; task-scoped events cannot affect another attempt; existing
 agents pass regression tests; no settings silently select a different model.
+
+### Implementation status (AA-S1)
+
+Landed in this repository; AA-O1 and AA-P1 build on it without changing it.
+
+- Capability table: `src/core/agent-capabilities.ts` is the exhaustive, typed description of
+  terminal presentation, explicit resume, images, plan mode, approval mode, completion
+  signal and automated delivery, plus where each agent's model is configured
+  (`kanban-settings`, `agent-native` or `unknown`) and that configuration's locations. Only
+  Cline reports Kanban-owned model settings and card-backed session resume; every other
+  agent is agent-native and resumes "the most recent session", never the session Kanban
+  started.
+- Response surface: `runtimeAgentDefinitionSchema` in `src/core/api-contract.ts` carries
+  `capabilities`, `modelConfiguration` and `installUrl`, filled by
+  `buildRuntimeAgentDefinition` in `src/terminal/agent-registry.ts`. Previously persisted
+  project and global configuration still loads because no existing field changed meaning.
+- Unsupported operations: `getUnsupportedAgentLaunchOperations` classifies what an agent
+  cannot honor (for example autonomous mode on OpenCode, or explicit resume on any
+  CLI-launched agent) and `formatUnsupportedAgentLaunchError` names the agent and the
+  operation. A missing binary yields `formatMissingAgentInstallError` with the catalog
+  install URL, so no phantom session is created.
+- Attempt ownership: `createLaunchAttemptId` mints one token per launch, the adapter hands
+  it to the agent as `KANBAN_HOOK_ATTEMPT_ID_ENV`, the session summary stores it as
+  `launchAttemptId`, and `createHooksApi().ingest` refuses card mutations and activity
+  writes for an event whose token differs from the running attempt while still answering the
+  hook with `{ ok: true }`. An event without a token cannot be proven stale and stays
+  accepted, which keeps older integrations working.
+- Scoped generated resources: the session adapters write settings, plugins and hook scripts
+  under `~/.cline/kanban/hooks/<agent>/<workspace>/<task>/<attempt>` instead of a shared
+  per-agent directory, point the agent at exactly that path, and delete only that directory
+  on exit through the new `PreparedAgentLaunch.cleanup` hook. Kiro keeps its own
+  agent-definition directory but now uses a per-task agent name. Sessions with no workspace
+  context (the home agent) keep the previous shared path because they never addressed a
+  generated file.
+- Launch provenance: `src/terminal/launch-provenance.ts` records agent, binary, requested
+  model (read back from launch arguments), observed model and version only when the agent
+  actually reports them, model configuration source and locations, effective cwd, and
+  task/workspace/attempt identity. The configuration fingerprint keeps configuration-shaped
+  arguments and environment values, drops prompt text, drops credentials entirely, ignores
+  hook identity tokens, and normalizes home, temp and attempt-scoped paths so a plain
+  restart is not reported as a configuration change. `didLaunchConfigurationChange` provides
+  the resume-after-change signal that a session's previous attempt fingerprint feeds.
+- Test coverage: `test/runtime/core/agent-capabilities.test.ts` and
+  `test/runtime/terminal/launch-provenance.test.ts` are new;
+  `test/runtime/terminal/agent-session-adapters.test.ts`,
+  `test/runtime/terminal/hook-runtime-context.test.ts` and
+  `test/runtime/trpc/hooks-api.test.ts` now cover per-attempt scoping and teardown, two
+  parallel tasks in one workspace, two attempts of one task, stale and unowned events,
+  credential-free fingerprints and the capability table. Web fixtures that only exercise the
+  pre-AA-S1 fields spread `agentDefinitionTestDefaults` from
+  `web-ui/src/runtime/agent-definition-test-defaults.ts`.
+- Still out of scope here: the AA-E1 benchmark protocol, rendering per-agent capability rows
+  in the settings dialog (the existing rows already surface install links and not-installed
+  state from the same catalog), and enabling automated delivery for terminal agents -
+  `automatedDelivery` and the `hook` completion signal describe what a runner can report,
+  not reliable-completion support.
 
 ## Existing benchmark evidence
 

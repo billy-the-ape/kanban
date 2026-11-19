@@ -37,6 +37,12 @@ interface HooksIngestArgs {
 	payload?: Record<string, unknown> | null;
 	/** Canonical PR URLs detected from the hook payload (max 10). */
 	pullRequestUrls?: string[];
+	/**
+	 * AA-S1: launch attempt token from the agent environment. It identifies
+	 * which attempt owns this event, so a stale child or plugin cannot move the
+	 * card. Never logged or persisted as event content.
+	 */
+	attemptId?: string;
 }
 
 interface HookCommandMetadataOptionValues {
@@ -428,6 +434,7 @@ function parseHooksIngestArgs(
 		event,
 		taskId: context.taskId,
 		workspaceId: context.workspaceId,
+		...(context.attemptId ? { attemptId: context.attemptId } : {}),
 		metadata,
 		payload,
 		pullRequestUrls,
@@ -454,6 +461,7 @@ async function ingestHookEvent(args: HooksIngestArgs): Promise<void> {
 			event: args.event,
 			metadata: args.metadata,
 			pullRequestUrls: args.pullRequestUrls,
+			...(args.attemptId ? { attemptId: args.attemptId } : {}),
 		}),
 		3000,
 		"kanban hooks ingest",

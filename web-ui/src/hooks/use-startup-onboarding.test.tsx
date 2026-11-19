@@ -3,6 +3,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { type UseStartupOnboardingResult, useStartupOnboarding } from "@/hooks/use-startup-onboarding";
+import { agentDefinitionTestDefaults } from "@/runtime/agent-definition-test-defaults";
 import type { RuntimeConfigResponse } from "@/runtime/types";
 import { LocalStorageKey } from "@/storage/local-storage-store";
 
@@ -33,6 +34,7 @@ function createRuntimeConfigResponse(selectedAgentId: RuntimeConfigResponse["sel
 				defaultArgs: [],
 				installed: true,
 				configured: selectedAgentId === "codex",
+				...agentDefinitionTestDefaults,
 			},
 		],
 		shortcuts: [],

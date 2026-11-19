@@ -3,6 +3,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { type UseGitActionsResult, useGitActions } from "@/hooks/use-git-actions";
+import { agentDefinitionTestDefaults } from "@/runtime/agent-definition-test-defaults";
 import type { RuntimeConfigResponse, RuntimeTaskWorkspaceInfoResponse } from "@/runtime/types";
 import { clearTaskWorkspaceInfo, clearTaskWorkspaceSnapshot } from "@/stores/workspace-metadata-store";
 import type { BoardData } from "@/types";
@@ -114,6 +115,7 @@ function createRuntimeConfig(selectedAgentId: RuntimeConfigResponse["selectedAge
 				defaultArgs: [],
 				installed: true,
 				configured: true,
+				...agentDefinitionTestDefaults,
 			},
 		],
 		shortcuts: [],

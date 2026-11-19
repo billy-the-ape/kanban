@@ -817,6 +817,96 @@ export const runtimeTaskTurnCheckpointSchema = z.object({
 });
 export type RuntimeTaskTurnCheckpoint = z.infer<typeof runtimeTaskTurnCheckpointSchema>;
 
+// ── AA-S1: shared agent capability + provenance contracts ───────────────────
+//
+// The smallest typed capability description these integrations need. Callers
+// check capabilities instead of branching on agent ids, so an unsupported
+// operation is a useful error rather than a silent fall through to Cline
+// behavior. See docs/plans/additional-agents/shared.md.
+/**
+ * How an agent expresses an interactive mode (plan/review, approval bypass):
+ * `cli-flag` = documented command-line switch, `config-file` = generated or
+ * user settings file, `prompt` = instructions only (nothing enforced),
+ * `none` = unsupported.
+ */
+export const runtimeAgentModeExpressionSchema = z.enum(["cli-flag", "config-file", "prompt", "none"]);
+export type RuntimeAgentModeExpression = z.infer<typeof runtimeAgentModeExpressionSchema>;
+
+export const runtimeAgentCompletionSignalCapabilitySchema = z.enum(["hook", "exit-only"]);
+export type RuntimeAgentCompletionSignalCapability = z.infer<typeof runtimeAgentCompletionSignalCapabilitySchema>;
+
+export const runtimeAgentCapabilitiesSchema = z.object({
+	/** Renders a usable TUI in the Kanban PTY terminal (presentation only). */
+	terminalPresentation: z.boolean(),
+	/** Kanban can resume the exact persisted external session, not "the latest one". */
+	explicitSessionResume: z.boolean(),
+	/** Image attachments actually reach the agent. */
+	images: z.boolean(),
+	/** Plan/review-style read-only mode. */
+	planMode: runtimeAgentModeExpressionSchema,
+	/** How an approval-bypass (autonomous) request is expressed, if at all. */
+	approvalMode: runtimeAgentModeExpressionSchema,
+	/** How a normal end-of-turn is observed. Process exit alone is never completion. */
+	completionSignal: runtimeAgentCompletionSignalCapabilitySchema,
+	/** Kanban's commit/PR prompts and review gates can drive this agent end to end. */
+	automatedDelivery: z.boolean(),
+});
+export type RuntimeAgentCapabilities = z.infer<typeof runtimeAgentCapabilitiesSchema>;
+
+/** A start/follow-up option that can be requested and may be unsupported. */
+export const runtimeAgentLaunchOperationSchema = z.enum([
+	"plan-mode",
+	"image-attachment",
+	"autonomous-mode",
+	"explicit-resume",
+]);
+export type RuntimeAgentLaunchOperation = z.infer<typeof runtimeAgentLaunchOperationSchema>;
+
+/**
+ * Where the model actually used by an agent is configured. Cline's Kanban
+ * provider settings are never presented as the model source of another agent.
+ */
+export const runtimeAgentModelSourceSchema = z.enum(["kanban-settings", "agent-native", "unknown"]);
+export type RuntimeAgentModelSource = z.infer<typeof runtimeAgentModelSourceSchema>;
+
+export const runtimeAgentModelConfigurationSchema = z.object({
+	source: runtimeAgentModelSourceSchema,
+	/** Operator-facing locations, `~`-relative when under the home directory. */
+	configLocations: z.array(z.string()),
+	note: z.string(),
+});
+export type RuntimeAgentModelConfiguration = z.infer<typeof runtimeAgentModelConfigurationSchema>;
+
+/**
+ * AA-S1: launch provenance snapshotted with the task session. Requested and
+ * observed settings are distinct facts; unknown values stay null instead of
+ * being filled in from another agent's configuration.
+ */
+export const runtimeTaskLaunchProvenanceSchema = z.object({
+	/** Opaque per-launch token; also the hook event ownership token. */
+	attemptId: z.string(),
+	agentId: runtimeAgentIdSchema.nullable(),
+	agentLabel: z.string().nullable(),
+	binary: z.string(),
+	/** Version observed at launch. Unknown stays null and is never guessed. */
+	agentVersion: z.string().nullable(),
+	/** Model Kanban asked this agent to use (from launch arguments). */
+	requestedModel: z.string().nullable(),
+	/** Model the agent itself reported using. Never inferred; unknown stays null. */
+	observedModel: z.string().nullable(),
+	modelSource: runtimeAgentModelSourceSchema,
+	configLocations: z.array(z.string()),
+	/** `sha256:` over launch arguments and non-secret environment keys. */
+	configFingerprint: z.string(),
+	/** Prior launch fingerprint when a deliberate resume changed the configuration. */
+	previousConfigFingerprint: z.string().nullable(),
+	cwd: z.string(),
+	taskId: z.string(),
+	workspaceId: z.string().nullable(),
+	startedAt: z.number(),
+});
+export type RuntimeTaskLaunchProvenance = z.infer<typeof runtimeTaskLaunchProvenanceSchema>;
+
 export const runtimeTaskSessionSummarySchema = z.object({
 	taskId: z.string(),
 	state: runtimeTaskSessionStateSchema,
@@ -834,6 +924,15 @@ export const runtimeTaskSessionSummarySchema = z.object({
 	warningMessage: z.string().nullable().optional(),
 	latestTurnCheckpoint: runtimeTaskTurnCheckpointSchema.nullable().optional(),
 	previousTurnCheckpoint: runtimeTaskTurnCheckpointSchema.nullable().optional(),
+	/**
+	 * AA-S1: ownership token for the current launch attempt, echoed by hook
+	 * integrations through the environment. Optional so persisted summaries
+	 * from before AA-S1 keep loading; a summary without one cannot reject an
+	 * event, only accept it.
+	 */
+	launchAttemptId: z.string().nullable().optional(),
+	/** AA-S1: provenance snapshot of the settings this session was launched with. */
+	launchProvenance: runtimeTaskLaunchProvenanceSchema.nullable().optional(),
 });
 export type RuntimeTaskSessionSummary = z.infer<typeof runtimeTaskSessionSummarySchema>;
 
@@ -1661,6 +1760,12 @@ export const runtimeAgentDefinitionSchema = z.object({
 	defaultArgs: z.array(z.string()),
 	installed: z.boolean(),
 	configured: z.boolean(),
+	/** AA-S1: what Kanban may ask this agent to do. */
+	capabilities: runtimeAgentCapabilitiesSchema,
+	/** AA-S1: where this agent's own model/provider settings live. */
+	modelConfiguration: runtimeAgentModelConfigurationSchema,
+	/** AA-S1: where to install the CLI when `installed` is false. */
+	installUrl: z.string(),
 });
 export type RuntimeAgentDefinition = z.infer<typeof runtimeAgentDefinitionSchema>;
 
@@ -2746,6 +2851,12 @@ export const runtimeHookIngestRequestSchema = z.object({
 	workspaceId: z.string(),
 	event: runtimeHookEventSchema,
 	metadata: runtimeTaskHookActivitySchema.partial().optional(),
+	/**
+	 * AA-S1: launch attempt token echoed from the agent environment. Absent
+	 * for integrations predating AA-S1; a mismatch means the event belongs to
+	 * a superseded attempt and must not move the card.
+	 */
+	attemptId: z.string().min(1).max(200).optional(),
 	/** Canonical PR URLs detected by the hook CLI (re-parsed server-side; max 10). */
 	pullRequestUrls: z.array(z.string().min(1).max(2048)).max(10).optional(),
 });

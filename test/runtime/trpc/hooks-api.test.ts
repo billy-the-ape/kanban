@@ -417,4 +417,80 @@ describe("createHooksApi review lookup trigger (PRLINK-5)", () => {
 			taskId: "task-1",
 		});
 	});
+	describe("launch attempt ownership (AA-S1)", () => {
+		function createAttemptManager(launchAttemptId: string | null) {
+			const reviewedSummary: RuntimeTaskSessionSummary = {
+				...createSummary({ state: "awaiting_review", reviewReason: "hook" }),
+				launchAttemptId,
+			};
+			const manager = {
+				getSummary: vi.fn(() => createSummary({ state: "running", launchAttemptId })),
+				transitionToReview: vi.fn(() => reviewedSummary),
+				transitionToRunning: vi.fn(),
+				applyHookActivity: vi.fn(),
+				applyTurnCheckpoint: vi.fn(),
+			};
+			const deps = {
+				getWorkspacePathById: vi.fn(() => "/tmp/repo"),
+				ensureTerminalManagerForWorkspace: vi.fn(async () => manager as unknown as TerminalSessionManager),
+				broadcastRuntimeWorkspaceStateUpdated: vi.fn(),
+				broadcastTaskReadyForReview: vi.fn(),
+				captureTaskTurnCheckpoint: vi.fn(async () => ({
+					turn: 1,
+					ref: "refs/kanban/checkpoints/task-1/turn/1",
+					commit: "1111111",
+					createdAt: 1,
+				})),
+				deleteTaskTurnCheckpointRef: vi.fn(async () => undefined),
+			};
+			return { manager, deps, api: createHooksApi(deps) };
+		}
+
+		it("drops an event owned by a superseded attempt without touching the card", async () => {
+			const { manager, deps, api } = createAttemptManager("attempt-2");
+
+			// The hook is still acknowledged so the agent's own hook run does
+			// not fail; only the card mutation is refused.
+			const response = await api.ingest({
+				taskId: "task-1",
+				workspaceId: "workspace-1",
+				event: "to_review",
+				attemptId: "attempt-1",
+				metadata: { source: "claude", activityText: "Waiting for review" },
+			});
+
+			expect(response).toEqual({ ok: true });
+			expect(manager.transitionToReview).not.toHaveBeenCalled();
+			expect(manager.applyHookActivity).not.toHaveBeenCalled();
+			expect(deps.broadcastRuntimeWorkspaceStateUpdated).not.toHaveBeenCalled();
+			expect(deps.broadcastTaskReadyForReview).not.toHaveBeenCalled();
+		});
+
+		it("applies an event from the attempt that is currently running", async () => {
+			const { manager, api } = createAttemptManager("attempt-2");
+
+			const response = await api.ingest({
+				taskId: "task-1",
+				workspaceId: "workspace-1",
+				event: "to_review",
+				attemptId: "attempt-2",
+			});
+
+			expect(response).toEqual({ ok: true });
+			expect(manager.transitionToReview).toHaveBeenCalledWith("task-1", "hook");
+		});
+
+		it("still accepts events from an integration that sends no token", async () => {
+			const { manager, api } = createAttemptManager("attempt-2");
+
+			const response = await api.ingest({
+				taskId: "task-1",
+				workspaceId: "workspace-1",
+				event: "to_review",
+			});
+
+			expect(response).toEqual({ ok: true });
+			expect(manager.transitionToReview).toHaveBeenCalledWith("task-1", "hook");
+		});
+	});
 });
