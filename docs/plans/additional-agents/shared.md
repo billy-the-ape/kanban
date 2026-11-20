@@ -183,8 +183,11 @@ Landed in this repository; AA-O1 and AA-P1 build on it without changing it.
   task/workspace/attempt identity. The configuration fingerprint keeps configuration-shaped
   arguments and environment values, drops prompt text, drops credentials entirely, ignores
   hook identity tokens, and normalizes home, temp and attempt-scoped paths so a plain
-  restart is not reported as a configuration change. `didLaunchConfigurationChange` provides
-  the resume-after-change signal that a session's previous attempt fingerprint feeds.
+  restart is not reported as a configuration change. Both the current and the previous
+  launch fingerprint are stored on the session summary, and the exported
+  `didLaunchConfigurationChange` turns them into one change fact; showing that change to
+  a user is deliberately left to the agent slice that needs it, so AA-S1 records the
+  difference without inventing a settings-screen banner no agent has asked for yet.
 - Test coverage: `test/runtime/core/agent-capabilities.test.ts` and
   `test/runtime/terminal/launch-provenance.test.ts` are new;
   `test/runtime/terminal/agent-session-adapters.test.ts`,

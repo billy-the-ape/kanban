@@ -230,8 +230,14 @@ export function createLaunchProvenance(input: CreateLaunchProvenanceInput): Runt
 }
 
 /**
- * A configuration change is only reported when both attempts have a
- * fingerprint; the first launch of a task has nothing to compare against.
+ * Turn the two fingerprints a session records into one change fact. A change is
+ * only reported when both launches have a fingerprint; the first launch of a
+ * task has nothing to compare against.
+ *
+ * AA-S1 records both fingerprints on the session summary; nothing in a shipped
+ * surface renders this comparison yet. AA-O1/AA-P1 call it to display the
+ * resume-after-configuration-change notice required for their agents instead of
+ * re-deriving what counts as a configuration difference.
  */
 export function didLaunchConfigurationChange(
 	previous: RuntimeTaskLaunchProvenance | null | undefined,
