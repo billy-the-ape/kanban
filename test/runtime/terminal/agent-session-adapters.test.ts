@@ -380,6 +380,7 @@ describe("prepareAgentLaunch hook strategies", () => {
 			cwd: "/tmp",
 			prompt: "",
 			workspaceId: "workspace-1",
+			attemptId: "attempt-1",
 		});
 
 		expect(launch.env.KANBAN_HOOK_TASK_ID).toBe("task-1");
@@ -389,6 +390,11 @@ describe("prepareAgentLaunch hook strategies", () => {
 		expect(settingsArgIndex).toBeGreaterThanOrEqual(0);
 		const settingsPath = launch.args[settingsArgIndex + 1];
 		expect(settingsPath).toBeDefined();
+		expectAttemptScopedPath(settingsPath, "droid", {
+			workspaceId: "workspace-1",
+			taskId: "task-1",
+			attemptId: "attempt-1",
+		});
 
 		const settings = JSON.parse(readFileSync(settingsPath ?? "", "utf8")) as {
 			autonomyMode?: string;
