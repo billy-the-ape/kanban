@@ -1,6 +1,7 @@
-import { access, readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { access, readFile, rm } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import type {
@@ -38,6 +39,12 @@ export interface AgentAdapterLaunchInput {
 	resumeFromTrash?: boolean;
 	env?: Record<string, string | undefined>;
 	workspaceId?: string;
+	/**
+	 * AA-S1: token for this launch attempt, minted by the session manager. It
+	 * scopes generated integration resources and is echoed back through the
+	 * hook environment so events from a superseded attempt can be rejected.
+	 */
+	attemptId?: string;
 }
 
 export type AgentOutputTransitionDetector = (
@@ -60,6 +67,8 @@ export interface PreparedAgentLaunch {
 interface HookContext {
 	taskId: string;
 	workspaceId: string;
+	/** AA-S1: scopes generated resources and owns the events this attempt emits. */
+	attemptId?: string | undefined;
 }
 
 interface HookCommandMetadata {
@@ -86,9 +95,11 @@ function resolveHookContext(input: AgentAdapterLaunchInput): HookContext | null 
 	if (!workspaceId) {
 		return null;
 	}
+	const attemptId = input.attemptId?.trim();
 	return {
 		taskId: input.taskId,
 		workspaceId,
+		...(attemptId ? { attemptId } : {}),
 	};
 }
 
@@ -568,10 +579,101 @@ function getHookAgentDirectory(agentId: RuntimeAgentId): string {
 	return join(getRuntimeHomePath(), "hooks", agentId);
 }
 
-const KIRO_KANBAN_AGENT_NAME = "kanban";
+/** AA-S1: bounded, collision-resistant path segment for a generated resource. */
+function toResourceScopeSegment(value: string): string {
+	const hash = createHash("sha256").update(value).digest("hex").slice(0, 10);
+	const readable = value
+		.normalize("NFKD")
+		.replaceAll(/[^A-Za-z0-9._-]+/g, "-")
+		.replaceAll(/^[-.]+|[-.]+$/g, "")
+		.slice(0, 48);
+	return `${readable.length > 0 ? readable : "scope"}-${hash}`;
+}
 
-function getKiroAgentConfigPath(): string {
-	return join(homedir(), ".kiro", "agents", `${KIRO_KANBAN_AGENT_NAME}.json`);
+/**
+ * AA-S1: generated integration resources are scoped by workspace, task and
+ * launch attempt. A stale plugin, a second task on the same agent, or a
+ * restarted attempt never reads or overwrites another attempt's files.
+ * Sessions without a workspace (the home agent) keep the shared agent
+ * directory, which is all they ever addressed.
+ */
+function getScopedHookAgentDirectory(agentId: RuntimeAgentId, hooks: HookContext | null): string {
+	const base = getHookAgentDirectory(agentId);
+	if (!hooks) {
+		return base;
+	}
+	return join(
+		base,
+		toResourceScopeSegment(hooks.workspaceId),
+		toResourceScopeSegment(hooks.taskId),
+		toResourceScopeSegment(hooks.attemptId ?? "launch"),
+	);
+}
+
+/**
+ * Removes one attempt-scoped resource directory on teardown. Refuses anything
+ * that is not inside Kanban's own hooks root, so a cleanup can never reach
+ * durable state or a user-owned file.
+ */
+function createHookResourceCleanup(directory: string): () => Promise<void> {
+	return async () => {
+		const hooksRoot = join(getRuntimeHomePath(), "hooks");
+		const relativePath = relative(hooksRoot, directory);
+		if (!relativePath || relativePath.startsWith("..") || isAbsolute(relativePath)) {
+			return;
+		}
+		await rm(directory, { recursive: true, force: true }).catch(() => {
+			// Best effort: a leftover generated file is never worth failing a teardown.
+		});
+	};
+}
+
+interface ScopedHookResources {
+	/** Directory holding this attempt's generated integration files. */
+	directory: string;
+	/** Tear-down hook that removes only this attempt's directory. */
+	cleanup: () => Promise<void>;
+}
+
+function createScopedHookResources(agentId: RuntimeAgentId, hooks: HookContext): ScopedHookResources {
+	const directory = getScopedHookAgentDirectory(agentId, hooks);
+	return { directory, cleanup: createHookResourceCleanup(directory) };
+}
+
+/**
+ * Kiro keeps its agent definitions in a directory Kiro owns, so its generated
+ * file cannot live in the per-attempt directory and is removed individually.
+ * The path is re-checked against that directory before anything is deleted.
+ */
+function createKiroAgentFileCleanup(configPath: string): () => Promise<void> {
+	return async () => {
+		const kiroAgentsDir = join(homedir(), ".kiro", "agents");
+		const relativePath = relative(kiroAgentsDir, configPath);
+		if (
+			!relativePath ||
+			relativePath.startsWith("..") ||
+			isAbsolute(relativePath) ||
+			!relativePath.endsWith(".json")
+		) {
+			return;
+		}
+		await rm(configPath, { force: true }).catch(() => {
+			// Best effort: Kiro may keep the file for its own housekeeping.
+		});
+	};
+}
+
+/**
+ * Kiro owns its agent-file directory, so Kanban's generated file cannot live
+ * under the runtime home. It is still named per task, so two tasks on the same
+ * machine no longer overwrite each other's `--agent` definition.
+ */
+function getKiroKanbanAgentName(taskId: string): string {
+	return `kanban-${toResourceScopeSegment(taskId)}`;
+}
+
+function getKiroAgentConfigPath(taskId: string): string {
+	return join(homedir(), ".kiro", "agents", `${getKiroKanbanAgentName(taskId)}.json`);
 }
 
 async function ensureTextFile(filePath: string, content: string, executable = false): Promise<void> {
@@ -633,8 +735,9 @@ const claudeAdapter: AgentSessionAdapter = {
 		}
 
 		const hooks = resolveHookContext(input);
-		if (hooks) {
-			const settingsPath = join(getHookAgentDirectory("claude"), "settings.json");
+		const resources = hooks ? createScopedHookResources("claude", hooks) : null;
+		if (hooks && resources) {
+			const settingsPath = join(resources.directory, "settings.json");
 			const hooksSettings = {
 				hooks: {
 					Stop: [{ hooks: [{ type: "command", command: buildHookCommand("to_review", { source: "claude" }) }] }],
@@ -684,13 +787,7 @@ const claudeAdapter: AgentSessionAdapter = {
 			};
 			await ensureTextFile(settingsPath, JSON.stringify(hooksSettings, null, 2));
 			args.push("--settings", settingsPath);
-			Object.assign(
-				env,
-				createHookRuntimeEnv({
-					taskId: hooks.taskId,
-					workspaceId: hooks.workspaceId,
-				}),
-			);
+			Object.assign(env, createHookRuntimeEnv(hooks));
 		}
 
 		if (
@@ -708,6 +805,7 @@ const claudeAdapter: AgentSessionAdapter = {
 				...withPromptLaunch.env,
 				...env,
 			},
+			...(resources ? { cleanup: resources.cleanup } : {}),
 		};
 	},
 };
@@ -765,13 +863,7 @@ const codexAdapter: AgentSessionAdapter = {
 		const hooks = resolveHookContext(input);
 		if (hooks) {
 			configureCodexHooks(codexArgs);
-			Object.assign(
-				env,
-				createHookRuntimeEnv({
-					taskId: hooks.taskId,
-					workspaceId: hooks.workspaceId,
-				}),
-			);
+			Object.assign(env, createHookRuntimeEnv(hooks));
 		}
 
 		const trimmed = input.prompt.trim();
@@ -822,8 +914,9 @@ const geminiAdapter: AgentSessionAdapter = {
 		}
 
 		const hooks = resolveHookContext(input);
-		if (hooks) {
-			const configPath = join(getHookAgentDirectory("gemini"), "settings.json");
+		const resources = hooks ? createScopedHookResources("gemini", hooks) : null;
+		if (hooks && resources) {
+			const configPath = join(resources.directory, "settings.json");
 			const geminiHookCommand = buildHooksCommand(["gemini-hook"]);
 
 			const config = {
@@ -856,28 +949,25 @@ const geminiAdapter: AgentSessionAdapter = {
 				},
 			};
 			await ensureTextFile(configPath, JSON.stringify(config, null, 2));
-			Object.assign(
-				env,
-				createHookRuntimeEnv({
-					taskId: hooks.taskId,
-					workspaceId: hooks.workspaceId,
-				}),
-			);
+			Object.assign(env, createHookRuntimeEnv(hooks));
 			env.GEMINI_CLI_SYSTEM_SETTINGS_PATH = configPath;
 		}
 
+		const cleanup = resources ? { cleanup: resources.cleanup } : {};
 		const trimmed = input.prompt.trim();
 		if (trimmed) {
 			args.push("-i", trimmed);
 			return {
 				args,
 				env,
+				...cleanup,
 			};
 		}
 
 		return {
 			args,
 			env,
+			...cleanup,
 		};
 	},
 };
@@ -1126,9 +1216,10 @@ const opencodeAdapter: AgentSessionAdapter = {
 		}
 
 		const hooks = resolveHookContext(input);
-		if (hooks) {
-			const pluginPath = join(getHookAgentDirectory("opencode"), "kanban.js");
-			const configPath = join(getHookAgentDirectory("opencode"), "opencode.json");
+		const resources = hooks ? createScopedHookResources("opencode", hooks) : null;
+		if (hooks && resources) {
+			const pluginPath = join(resources.directory, "kanban.js");
+			const configPath = join(resources.directory, "opencode.json");
 
 			const pluginContent = buildOpenCodePluginContent(
 				buildHookCommand("to_review", { source: "opencode" }),
@@ -1141,13 +1232,7 @@ const opencodeAdapter: AgentSessionAdapter = {
 				plugin: [pluginFileUrl],
 			};
 			await ensureTextFile(configPath, JSON.stringify(config));
-			Object.assign(
-				env,
-				createHookRuntimeEnv({
-					taskId: hooks.taskId,
-					workspaceId: hooks.workspaceId,
-				}),
-			);
+			Object.assign(env, createHookRuntimeEnv(hooks));
 			env.OPENCODE_CONFIG = configPath;
 		}
 
@@ -1160,18 +1245,21 @@ const opencodeAdapter: AgentSessionAdapter = {
 			}
 		}
 
+		const cleanup = resources ? { cleanup: resources.cleanup } : {};
 		const trimmed = input.prompt.trim();
 		if (trimmed) {
 			args.push("--prompt", trimmed);
 			return {
 				args,
 				env,
+				...cleanup,
 			};
 		}
 
 		return {
 			args,
 			env,
+			...cleanup,
 		};
 	},
 };
@@ -1186,9 +1274,12 @@ const droidAdapter: AgentSessionAdapter = {
 		}
 
 		const hooks = resolveHookContext(input);
+		const resources = hooks ? createScopedHookResources("droid", hooks) : null;
 		const shouldWriteSettings = Boolean(hooks) || input.startInPlanMode || input.autonomousModeEnabled !== undefined;
 		if (shouldWriteSettings) {
-			const settingsPath = join(getHookAgentDirectory("droid"), "settings.json");
+			// Without a workspace there is no attempt to scope, so this stays the
+			// shared home-agent settings file it always was.
+			const settingsPath = join(getScopedHookAgentDirectory("droid", hooks), "settings.json");
 			const settings: Record<string, unknown> = {
 				autonomyMode: input.startInPlanMode ? "spec" : input.autonomousModeEnabled ? "auto-high" : "normal",
 			};
@@ -1223,13 +1314,7 @@ const droidAdapter: AgentSessionAdapter = {
 					UserPromptSubmit: [{ hooks: [{ type: "command", command: inProgressNotifyCommand }] }],
 				};
 
-				Object.assign(
-					env,
-					createHookRuntimeEnv({
-						taskId: hooks.taskId,
-						workspaceId: hooks.workspaceId,
-					}),
-				);
+				Object.assign(env, createHookRuntimeEnv(hooks));
 			}
 
 			await ensureTextFile(settingsPath, JSON.stringify(settings, null, 2));
@@ -1254,6 +1339,7 @@ const droidAdapter: AgentSessionAdapter = {
 				...withPromptLaunch.env,
 				...env,
 			},
+			...(resources ? { cleanup: resources.cleanup } : {}),
 		};
 	},
 };
@@ -1273,10 +1359,16 @@ const kiroAdapter: AgentSessionAdapter = {
 
 		const hooks = resolveHookContext(input);
 		const appendedSystemPrompt = resolveHomeAgentAppendSystemPrompt(input.taskId);
+		// Kiro has no flag for a planning or autonomous mode (the read-only
+		// behaviour below is instructed, not enforced), and its agent definitions live
+		// in a directory Kiro owns. The generated file is still named per task so two
+		// tasks cannot overwrite each other's `--agent` definition.
+		const agentName = getKiroKanbanAgentName(input.taskId);
+		const configPath = getKiroAgentConfigPath(input.taskId);
+		const cleanup = hooks ? { cleanup: createKiroAgentFileCleanup(configPath) } : {};
 		if (hooks || appendedSystemPrompt) {
-			const configPath = getKiroAgentConfigPath();
 			const config: Record<string, unknown> = {
-				name: KIRO_KANBAN_AGENT_NAME,
+				name: agentName,
 				description: "Kanban-managed Kiro agent with hook forwarding.",
 				tools: ["*"],
 			};
@@ -1331,13 +1423,7 @@ const kiroAdapter: AgentSessionAdapter = {
 						},
 					],
 				};
-				Object.assign(
-					env,
-					createHookRuntimeEnv({
-						taskId: hooks.taskId,
-						workspaceId: hooks.workspaceId,
-					}),
-				);
+				Object.assign(env, createHookRuntimeEnv(hooks));
 			}
 
 			if (appendedSystemPrompt) {
@@ -1346,7 +1432,7 @@ const kiroAdapter: AgentSessionAdapter = {
 
 			await ensureTextFile(configPath, JSON.stringify(config, null, 2));
 			if (!hasCliOption(args, "--agent")) {
-				args.push("--agent", KIRO_KANBAN_AGENT_NAME);
+				args.push("--agent", agentName);
 			}
 		}
 
@@ -1368,6 +1454,7 @@ const kiroAdapter: AgentSessionAdapter = {
 				...withPromptLaunch.env,
 				...env,
 			},
+			...cleanup,
 		};
 	},
 };
@@ -1390,8 +1477,9 @@ const clineAdapter: AgentSessionAdapter = {
 		}
 
 		const hooks = resolveHookContext(input);
-		if (hooks) {
-			const hooksDir = getHookAgentDirectory("cline");
+		const resources = hooks ? createScopedHookResources("cline", hooks) : null;
+		if (hooks && resources) {
+			const hooksDir = resources.directory;
 			const notificationHookPath = getClineHookScriptPath(hooksDir, "Notification");
 			const taskCompleteHookPath = getClineHookScriptPath(hooksDir, "TaskComplete");
 			const userPromptSubmitHookPath = getClineHookScriptPath(hooksDir, "UserPromptSubmit");
@@ -1409,13 +1497,7 @@ const clineAdapter: AgentSessionAdapter = {
 				args.push("--hooks-dir", hooksDir);
 			}
 
-			Object.assign(
-				env,
-				createHookRuntimeEnv({
-					taskId: hooks.taskId,
-					workspaceId: hooks.workspaceId,
-				}),
-			);
+			Object.assign(env, createHookRuntimeEnv(hooks));
 		}
 
 		const withPromptLaunch = withPrompt(args, input.prompt, "append");
@@ -1425,6 +1507,7 @@ const clineAdapter: AgentSessionAdapter = {
 				...withPromptLaunch.env,
 				...env,
 			},
+			...(resources ? { cleanup: resources.cleanup } : {}),
 		};
 	},
 };

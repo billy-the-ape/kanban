@@ -22,6 +22,8 @@ import {
 	WORKSPACE_TRUST_CONFIRM_DELAY_MS,
 } from "./claude-workspace-trust";
 import { hasCodexWorkspaceTrustPrompt, shouldAutoConfirmCodexWorkspaceTrust } from "./codex-workspace-trust";
+import { createLaunchAttemptId } from "./hook-runtime-context";
+import { createLaunchProvenance } from "./launch-provenance";
 import { stripAnsi } from "./output-utils";
 import { PtySession } from "./pty-session";
 import { reduceSessionTransition, type SessionTransitionEvent } from "./session-state-machine";
@@ -123,6 +125,8 @@ function createDefaultSummary(taskId: string): RuntimeTaskSessionSummary {
 		warningMessage: null,
 		latestTurnCheckpoint: null,
 		previousTurnCheckpoint: null,
+		launchAttemptId: null,
+		launchProvenance: null,
 	};
 }
 
@@ -330,6 +334,13 @@ export class TerminalSessionManager implements TerminalSessionService {
 			},
 		});
 
+		// AA-S1: each start mints a fresh launch attempt token. Hook events
+		// carrying an older token belong to a superseded attempt and are
+		// rejected at the hook boundary instead of moving this card.
+		const launchAttemptId = createLaunchAttemptId();
+		// AA-S1: a deliberate resume records the fingerprint it changed from. A
+		// first launch for this card has no previous attempt, so it stays null.
+		const previousConfigFingerprint = entry.summary.launchProvenance?.configFingerprint ?? null;
 		const launch = await prepareAgentLaunch({
 			taskId: request.taskId,
 			agentId: request.agentId,
@@ -343,7 +354,12 @@ export class TerminalSessionManager implements TerminalSessionService {
 			resumeFromTrash: request.resumeFromTrash,
 			env: request.env,
 			workspaceId: request.workspaceId,
+			attemptId: launchAttemptId,
 		});
+		const launchEnvForProvenance: Record<string, string | undefined> = {
+			...request.env,
+			...launch.env,
+		};
 
 		const env = buildTerminalEnvironment(request.env, launch.env);
 
@@ -508,6 +524,9 @@ export class TerminalSessionManager implements TerminalSessionService {
 				latestHookActivity: null,
 				latestTurnCheckpoint: null,
 				previousTurnCheckpoint: null,
+				// No live attempt to own hook events after a failed spawn.
+				launchAttemptId: null,
+				launchProvenance: null,
 			});
 			this.emitSummary(summary);
 			throw new Error(formatSpawnFailure(commandBinary, error));
@@ -539,6 +558,22 @@ export class TerminalSessionManager implements TerminalSessionService {
 		entry.terminalStateMirror = terminalStateMirror;
 
 		const startedAt = now();
+		// AA-S1: pin the running process to the settings it started with. A
+		// deliberate resume after a configuration change records the fingerprint
+		// it changed from; the first launch has nothing to compare against.
+		const launchProvenance = createLaunchProvenance({
+			attemptId: launchAttemptId,
+			agentId: request.agentId,
+			binary: commandBinary,
+			args: commandArgs,
+			env: launchEnvForProvenance,
+			prompt: request.prompt,
+			cwd: request.cwd,
+			taskId: request.taskId,
+			workspaceId: request.workspaceId ?? null,
+			startedAt,
+			previousConfigFingerprint,
+		});
 		updateSummary(entry, {
 			state: request.resumeFromTrash ? "awaiting_review" : "running",
 			agentId: request.agentId,
@@ -553,6 +588,8 @@ export class TerminalSessionManager implements TerminalSessionService {
 			warningMessage: null,
 			latestTurnCheckpoint: null,
 			previousTurnCheckpoint: null,
+			launchAttemptId,
+			launchProvenance,
 		});
 		this.emitSummary(entry.summary);
 
@@ -705,6 +742,9 @@ export class TerminalSessionManager implements TerminalSessionService {
 			warningMessage: null,
 			latestTurnCheckpoint: null,
 			previousTurnCheckpoint: null,
+			// A plain shell is not an agent attempt: nothing may move the card.
+			launchAttemptId: null,
+			launchProvenance: null,
 		});
 		this.emitSummary(entry.summary);
 

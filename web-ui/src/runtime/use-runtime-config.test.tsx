@@ -2,6 +2,7 @@ import { act, useEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { agentDefinitionTestDefaults } from "@/runtime/agent-definition-test-defaults";
 import type { RuntimeConfigResponse } from "@/runtime/types";
 import { type UseRuntimeConfigResult, useRuntimeConfig } from "@/runtime/use-runtime-config";
 
@@ -33,6 +34,7 @@ function createRuntimeConfigResponse(selectedAgentId: RuntimeConfigResponse["sel
 				defaultArgs: [],
 				installed: selectedAgentId === "claude",
 				configured: selectedAgentId === "claude",
+				...agentDefinitionTestDefaults,
 			},
 			{
 				id: "codex",
@@ -42,6 +44,7 @@ function createRuntimeConfigResponse(selectedAgentId: RuntimeConfigResponse["sel
 				defaultArgs: [],
 				installed: selectedAgentId === "codex",
 				configured: selectedAgentId === "codex",
+				...agentDefinitionTestDefaults,
 			},
 		],
 		shortcuts: [],

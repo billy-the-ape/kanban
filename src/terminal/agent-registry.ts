@@ -1,4 +1,5 @@
 import type { RuntimeConfigState } from "../config/runtime-config";
+import { getRuntimeAgentCapabilities, getRuntimeAgentModelConfiguration } from "../core/agent-capabilities";
 import { getRuntimeLaunchSupportedAgentCatalog, RUNTIME_AGENT_CATALOG } from "../core/agent-catalog";
 import type {
 	RuntimeAgentDefinition,
@@ -77,6 +78,12 @@ function getCuratedDefinitions(runtimeConfig: RuntimeConfigState, detected: stri
 			defaultArgs,
 			installed: isInstalled,
 			configured: runtimeConfig.selectedAgentId === entry.id,
+			// AA-S1: the UI reads these instead of branching on agent ids, so an
+			// unsupported operation is visibly unavailable instead of silently
+			// falling through to Cline behaviour.
+			capabilities: getRuntimeAgentCapabilities(entry.id),
+			modelConfiguration: getRuntimeAgentModelConfiguration(entry.id),
+			installUrl: entry.installUrl,
 		};
 	});
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-
+import { agentDefinitionTestDefaults } from "@/runtime/agent-definition-test-defaults";
 import {
 	getTaskAgentNavbarHint,
 	isClineProviderAuthenticated,
@@ -32,6 +32,7 @@ function createRuntimeConfigResponse(
 				defaultArgs: [],
 				installed: false,
 				configured: true,
+				...agentDefinitionTestDefaults,
 			},
 			{
 				id: "claude",
@@ -41,6 +42,7 @@ function createRuntimeConfigResponse(
 				defaultArgs: [],
 				installed: true,
 				configured: true,
+				...agentDefinitionTestDefaults,
 			},
 		],
 		shortcuts: [],
@@ -117,6 +119,7 @@ describe("native-agent helpers", () => {
 					defaultArgs: [],
 					installed: true,
 					configured: true,
+					...agentDefinitionTestDefaults,
 				},
 			],
 			clineProviderSettings: {
@@ -145,6 +148,7 @@ describe("native-agent helpers", () => {
 					defaultArgs: [],
 					installed: true,
 					configured: true,
+					...agentDefinitionTestDefaults,
 				},
 				{
 					id: "codex",
@@ -154,6 +158,7 @@ describe("native-agent helpers", () => {
 					defaultArgs: [],
 					installed: true,
 					configured: false,
+					...agentDefinitionTestDefaults,
 				},
 			],
 			clineProviderSettings: {
@@ -186,6 +191,7 @@ describe("native-agent helpers", () => {
 					defaultArgs: [],
 					installed: true,
 					configured: true,
+					...agentDefinitionTestDefaults,
 				},
 			],
 			clineProviderSettings: {
@@ -248,6 +254,7 @@ describe("native-agent helpers", () => {
 				defaultArgs: [],
 				installed: true,
 				configured: false,
+				...agentDefinitionTestDefaults,
 			},
 		];
 		expect(isTaskAgentSetupSatisfied(config)).toBe(false);

@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -27,6 +27,50 @@ function setKanbanProcessContext(): void {
 		configurable: true,
 		value: "/usr/local/bin/node",
 	});
+}
+
+function getCliFlagValue(args: string[], flag: string): string | null {
+	const index = args.indexOf(flag);
+	return index >= 0 ? (args[index + 1] ?? null) : null;
+}
+
+/**
+ * AA-S1: generated integration resources are scoped by workspace, task and
+ * launch attempt, so a test resolves them from what the adapter handed the
+ * agent rather than from a machine-shared path. This asserts the file sits in
+ * `<home>/.cline/kanban/hooks/<agent>/<workspace>/<task>/<attempt>/`.
+ */
+function expectAttemptScopedDirectory(
+	directoryValue: string | null | undefined,
+	agentDir: string,
+	scope: { workspaceId: string; taskId: string; attemptId: string },
+): string {
+	if (!directoryValue) {
+		throw new Error(`expected a generated resource below hooks/${agentDir}`);
+	}
+	const relativePath = relative(join(homedir(), ".cline", "kanban", "hooks", agentDir), directoryValue);
+	expect(relativePath.startsWith("..") || isAbsolute(relativePath)).toBe(false);
+	const scopeSegments = relativePath.split(sep).filter((segment) => segment.length > 0);
+	// Each segment is `<readable>-<hash>`, so the readable prefix is compared.
+	expect(scopeSegments).toEqual([
+		expect.stringContaining(`${scope.workspaceId}-`),
+		expect.stringContaining(`${scope.taskId}-`),
+		expect.stringContaining(`${scope.attemptId}-`),
+	]);
+	return directoryValue;
+}
+
+/** Same check for a generated file written inside the attempt directory. */
+function expectAttemptScopedPath(
+	pathValue: string | null | undefined,
+	agentDir: string,
+	scope: { workspaceId: string; taskId: string; attemptId: string },
+): string {
+	if (!pathValue) {
+		throw new Error(`expected a generated resource below hooks/${agentDir}`);
+	}
+	expectAttemptScopedDirectory(dirname(pathValue), agentDir, scope);
+	return pathValue;
 }
 
 function getCodexConfigOverrideValues(args: string[], key: string): string[] {
@@ -189,7 +233,7 @@ describe("prepareAgentLaunch hook strategies", () => {
 
 	it("writes Claude settings with explicit permission hook", async () => {
 		setupTempHome();
-		await prepareAgentLaunch({
+		const launch = await prepareAgentLaunch({
 			taskId: "task-1",
 			agentId: "claude",
 			binary: "claude",
@@ -197,9 +241,15 @@ describe("prepareAgentLaunch hook strategies", () => {
 			cwd: "/tmp",
 			prompt: "",
 			workspaceId: "workspace-1",
+			attemptId: "attempt-1",
 		});
 
-		const settingsPath = join(homedir(), ".cline", "kanban", "hooks", "claude", "settings.json");
+		expect(launch.env.KANBAN_HOOK_ATTEMPT_ID).toBe("attempt-1");
+		const settingsPath = expectAttemptScopedPath(getCliFlagValue(launch.args, "--settings"), "claude", {
+			workspaceId: "workspace-1",
+			taskId: "task-1",
+			attemptId: "attempt-1",
+		});
 		const settings = JSON.parse(readFileSync(settingsPath, "utf8")) as {
 			hooks?: Record<string, unknown>;
 		};
@@ -211,7 +261,7 @@ describe("prepareAgentLaunch hook strategies", () => {
 
 	it("writes Gemini settings with AfterTool mapped to to_in_progress", async () => {
 		setupTempHome();
-		await prepareAgentLaunch({
+		const launch = await prepareAgentLaunch({
 			taskId: "task-1",
 			agentId: "gemini",
 			binary: "gemini",
@@ -219,22 +269,27 @@ describe("prepareAgentLaunch hook strategies", () => {
 			cwd: "/tmp",
 			prompt: "",
 			workspaceId: "workspace-1",
+			attemptId: "attempt-1",
 		});
 
-		const settingsPath = join(homedir(), ".cline", "kanban", "hooks", "gemini", "settings.json");
+		const settingsPath = expectAttemptScopedPath(launch.env.GEMINI_CLI_SYSTEM_SETTINGS_PATH, "gemini", {
+			workspaceId: "workspace-1",
+			taskId: "task-1",
+			attemptId: "attempt-1",
+		});
 		const settings = JSON.parse(readFileSync(settingsPath, "utf8")) as {
 			hooks?: Record<string, Array<{ hooks?: Array<{ command?: string }> }>>;
 		};
 		const afterToolCommand = settings.hooks?.AfterTool?.[0]?.hooks?.[0]?.command;
 		expect(afterToolCommand).toContain("hooks");
 		expect(afterToolCommand).toContain("gemini-hook");
-		const hookScriptPath = join(homedir(), ".cline", "kanban", "hooks", "gemini", "gemini-hook.mjs");
-		expect(existsSync(hookScriptPath)).toBe(false);
+		// The adapter never writes a wrapper script, not even into its own scope.
+		expect(existsSync(join(dirname(settingsPath), "gemini-hook.mjs"))).toBe(false);
 	});
 
 	it("writes OpenCode plugin with root-session filtering and permission hooks", async () => {
 		setupTempHome();
-		await prepareAgentLaunch({
+		const launch = await prepareAgentLaunch({
 			taskId: "task-1",
 			agentId: "opencode",
 			binary: "opencode",
@@ -242,9 +297,15 @@ describe("prepareAgentLaunch hook strategies", () => {
 			cwd: "/tmp",
 			prompt: "",
 			workspaceId: "workspace-1",
+			attemptId: "attempt-1",
 		});
 
-		const pluginPath = join(homedir(), ".cline", "kanban", "hooks", "opencode", "kanban.js");
+		const configPath = expectAttemptScopedPath(launch.env.OPENCODE_CONFIG, "opencode", {
+			workspaceId: "workspace-1",
+			taskId: "task-1",
+			attemptId: "attempt-1",
+		});
+		const pluginPath = join(dirname(configPath), "kanban.js");
 		const plugin = readFileSync(pluginPath, "utf8");
 		expect(plugin).toContain("parentID");
 		expect(plugin).toContain('"permission.ask"');
@@ -319,6 +380,7 @@ describe("prepareAgentLaunch hook strategies", () => {
 			cwd: "/tmp",
 			prompt: "",
 			workspaceId: "workspace-1",
+			attemptId: "attempt-1",
 		});
 
 		expect(launch.env.KANBAN_HOOK_TASK_ID).toBe("task-1");
@@ -328,6 +390,11 @@ describe("prepareAgentLaunch hook strategies", () => {
 		expect(settingsArgIndex).toBeGreaterThanOrEqual(0);
 		const settingsPath = launch.args[settingsArgIndex + 1];
 		expect(settingsPath).toBeDefined();
+		expectAttemptScopedPath(settingsPath, "droid", {
+			workspaceId: "workspace-1",
+			taskId: "task-1",
+			attemptId: "attempt-1",
+		});
 
 		const settings = JSON.parse(readFileSync(settingsPath ?? "", "utf8")) as {
 			autonomyMode?: string;
@@ -364,18 +431,24 @@ describe("prepareAgentLaunch hook strategies", () => {
 			prompt: "Investigate deployment drift",
 			startInPlanMode: true,
 			workspaceId: "workspace-1",
+			attemptId: "attempt-1",
 		});
 
 		expect(launch.env.KANBAN_HOOK_TASK_ID).toBe("task-kiro-1");
 		expect(launch.env.KANBAN_HOOK_WORKSPACE_ID).toBe("workspace-1");
+		expect(launch.env.KANBAN_HOOK_ATTEMPT_ID).toBe("attempt-1");
 		expect(launch.args).toContain("--agent");
-		expect(launch.args[launch.args.indexOf("--agent") + 1]).toBe("kanban");
+		// Kiro owns the agent-file directory, so the generated definition is
+		// named per task instead of shared under a fixed name (AA-S1).
+		const agentName = getCliFlagValue(launch.args, "--agent");
+		expect(agentName).not.toBe("kanban");
+		expect(agentName ?? "").toContain("task-kiro-1-");
 		expect(launch.args).toContain("--trust-all-tools");
 		const initialPrompt = launch.args.at(-1) ?? "";
 		expect(initialPrompt).toContain("Do not modify files");
 		expect(initialPrompt).toContain("Task:\nInvestigate deployment drift");
 
-		const configPath = join(homedir(), ".kiro", "agents", "kanban.json");
+		const configPath = join(homedir(), ".kiro", "agents", `${agentName}.json`);
 		const config = JSON.parse(readFileSync(configPath, "utf8")) as {
 			tools?: string[];
 			hooks?: Record<string, Array<{ command?: string }>>;
@@ -465,9 +538,14 @@ describe("prepareAgentLaunch hook strategies", () => {
 			cwd: "/tmp",
 			prompt: "",
 			workspaceId: "workspace-1",
+			attemptId: "attempt-1",
 		});
 
-		const hooksDir = join(homedir(), ".cline", "kanban", "hooks", "cline");
+		const hooksDir = expectAttemptScopedDirectory(getCliFlagValue(launch.args, "--hooks-dir"), "cline", {
+			workspaceId: "workspace-1",
+			taskId: "task-1",
+			attemptId: "attempt-1",
+		});
 		const notificationHookPath =
 			process.platform === "win32" ? join(hooksDir, "Notification.ps1") : join(hooksDir, "Notification");
 		const taskCompleteHookPath =
@@ -523,6 +601,110 @@ describe("prepareAgentLaunch hook strategies", () => {
 		expect(postToolUseScript).toContain("to_in_progress");
 		expect(postToolUseScript).toContain("ask_followup_question");
 		expect(postToolUseScript).toContain("plan_mode_respond");
+	});
+
+	it("scopes generated agent resources to one launch attempt and removes them on teardown", async () => {
+		setupTempHome();
+		const firstAttempt = await prepareAgentLaunch({
+			taskId: "task-scope",
+			agentId: "claude",
+			binary: "claude",
+			args: [],
+			cwd: "/tmp",
+			prompt: "",
+			workspaceId: "workspace-1",
+			attemptId: "attempt-1",
+		});
+		const secondAttempt = await prepareAgentLaunch({
+			taskId: "task-scope",
+			agentId: "claude",
+			binary: "claude",
+			args: [],
+			cwd: "/tmp",
+			prompt: "",
+			workspaceId: "workspace-1",
+			// A restart of the same card mints a fresh token, so the previous
+			// attempt's generated files are never re-read or overwritten.
+			attemptId: "attempt-2",
+		});
+
+		const firstSettingsPath = getCliFlagValue(firstAttempt.args, "--settings");
+		const secondSettingsPath = getCliFlagValue(secondAttempt.args, "--settings");
+		if (!firstSettingsPath || !secondSettingsPath) {
+			throw new Error("expected both Claude launches to pass --settings");
+		}
+		expect(firstSettingsPath).not.toBe(secondSettingsPath);
+		expect(existsSync(firstSettingsPath)).toBe(true);
+		expect(existsSync(secondSettingsPath)).toBe(true);
+
+		// Tearing down one attempt only removes that attempt's directory.
+		await firstAttempt.cleanup?.();
+		expect(existsSync(firstSettingsPath)).toBe(false);
+		expect(existsSync(secondSettingsPath)).toBe(true);
+	});
+
+	it("gives two parallel tasks in one workspace their own resources and tokens", async () => {
+		setupTempHome();
+		const [left, right] = await Promise.all([
+			prepareAgentLaunch({
+				taskId: "task-left",
+				agentId: "claude",
+				binary: "claude",
+				args: [],
+				cwd: "/tmp",
+				prompt: "",
+				workspaceId: "workspace-1",
+				attemptId: "attempt-left",
+			}),
+			prepareAgentLaunch({
+				taskId: "task-right",
+				agentId: "claude",
+				binary: "claude",
+				args: [],
+				cwd: "/tmp",
+				prompt: "",
+				workspaceId: "workspace-1",
+				attemptId: "attempt-right",
+			}),
+		]);
+
+		expect(left.env.KANBAN_HOOK_ATTEMPT_ID).toBe("attempt-left");
+		expect(right.env.KANBAN_HOOK_ATTEMPT_ID).toBe("attempt-right");
+
+		const leftSettingsPath = expectAttemptScopedPath(getCliFlagValue(left.args, "--settings"), "claude", {
+			workspaceId: "workspace-1",
+			taskId: "task-left",
+			attemptId: "attempt-left",
+		});
+		const rightSettingsPath = expectAttemptScopedPath(getCliFlagValue(right.args, "--settings"), "claude", {
+			workspaceId: "workspace-1",
+			taskId: "task-right",
+			attemptId: "attempt-right",
+		});
+		expect(leftSettingsPath).not.toBe(rightSettingsPath);
+		expect(existsSync(leftSettingsPath)).toBe(true);
+		expect(existsSync(rightSettingsPath)).toBe(true);
+	});
+
+	it("keeps workspace-less sessions on the shared agent directory without an attempt token", async () => {
+		setupTempHome();
+		setKanbanProcessContext();
+		const launch = await prepareAgentLaunch({
+			taskId: "__home_agent__:workspace-1:claude",
+			agentId: "claude",
+			binary: "claude",
+			args: [],
+			cwd: "/tmp",
+			prompt: "",
+			attemptId: "attempt-home",
+		});
+
+		// The home agent never addressed a generated file, so it keeps the
+		// pre-AA-S1 behaviour: no hook environment and nothing to clean up.
+		expect(launch.env.KANBAN_HOOK_ATTEMPT_ID).toBeUndefined();
+		expect(launch.env.KANBAN_HOOK_TASK_ID).toBeUndefined();
+		expect(launch.cleanup).toBeUndefined();
+		expect(launch.args).not.toContain("--settings");
 	});
 
 	it("adds resume flags for each agent", async () => {

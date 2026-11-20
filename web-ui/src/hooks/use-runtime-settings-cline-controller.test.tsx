@@ -3,6 +3,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useRuntimeSettingsClineController } from "@/hooks/use-runtime-settings-cline-controller";
+import { agentDefinitionTestDefaults } from "@/runtime/agent-definition-test-defaults";
 import type {
 	RuntimeClineProviderModel,
 	RuntimeClineReasoningEffort,
@@ -101,6 +102,7 @@ function createRuntimeConfigResponse(
 				defaultArgs: [],
 				installed: true,
 				configured: true,
+				...agentDefinitionTestDefaults,
 			},
 		],
 		shortcuts: [],
