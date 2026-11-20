@@ -1279,7 +1279,7 @@ const droidAdapter: AgentSessionAdapter = {
 		if (shouldWriteSettings) {
 			// Without a workspace there is no attempt to scope, so this stays the
 			// shared home-agent settings file it always was.
-			const settingsPath = join(resources ? resources.directory : getHookAgentDirectory("droid"), "settings.json");
+			const settingsPath = join(getScopedHookAgentDirectory("droid", hooks), "settings.json");
 			const settings: Record<string, unknown> = {
 				autonomyMode: input.startInPlanMode ? "spec" : input.autonomousModeEnabled ? "auto-high" : "normal",
 			};

@@ -896,9 +896,18 @@ export const runtimeTaskLaunchProvenanceSchema = z.object({
 	observedModel: z.string().nullable(),
 	modelSource: runtimeAgentModelSourceSchema,
 	configLocations: z.array(z.string()),
-	/** `sha256:` over launch arguments and non-secret environment keys. */
+	/**
+	 * `sha256:` over the agent id, binary, launch arguments, configuration-shaped
+	 * environment values and configuration locations, with machine paths and
+	 * per-attempt scopes normalized away. Prompt text is excluded and credentials
+	 * contribute nothing, so a plain restart keeps the same fingerprint.
+	 */
 	configFingerprint: z.string(),
-	/** Prior launch fingerprint when a deliberate resume changed the configuration. */
+	/**
+	 * Fingerprint of this task's previous launch, or null on a first launch. A
+	 * relaunch always records it; compare with `configFingerprint` to tell whether
+	 * the configuration actually changed.
+	 */
 	previousConfigFingerprint: z.string().nullable(),
 	cwd: z.string(),
 	taskId: z.string(),

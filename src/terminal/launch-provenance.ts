@@ -88,10 +88,12 @@ function isConfigLikeEnvKey(key: string): boolean {
 }
 
 /**
- * Fingerprint inputs: launch arguments plus the configuration-shaped part of
- * the environment. Secret-looking values are replaced with a placeholder, and
- * values that are not configuration-shaped are left out entirely, so the
- * fingerprint never encodes a credential or the whole process environment.
+ * Fingerprint inputs: the agent and binary, the launch arguments (flag values
+ * included, prompt text excluded), the configuration-shaped part of the
+ * environment and the configuration locations. Values that are not
+ * configuration-shaped are left out entirely, and so is every credential - its
+ * name as well as its value - so the fingerprint never encodes a secret or the
+ * whole process environment.
  */
 export function collectLaunchConfigFingerprintParts(input: {
 	agentId: RuntimeAgentId | null;
@@ -127,10 +129,10 @@ export function collectLaunchConfigFingerprintParts(input: {
 			continue;
 		}
 		const value = input.env?.[key];
+		// Credentials never reach this loop (see `isConfigLikeEnvKey`), so the only
+		// placeholder case is a configuration variable that is declared but unset.
 		parts.push(
-			value === undefined || isSecretLikeEnvKey(key)
-				? `env=${key}=${REDACTED_PLACEHOLDER}`
-				: `env=${key}=${normalizeFingerprintValue(value)}`,
+			value === undefined ? `env=${key}=${REDACTED_PLACEHOLDER}` : `env=${key}=${normalizeFingerprintValue(value)}`,
 		);
 	}
 	for (const location of [...(input.configLocations ?? [])].sort()) {
@@ -190,7 +192,7 @@ export interface CreateLaunchProvenanceInput {
 	agentVersion?: string | null | undefined;
 	/** Model the agent reported using; never inferred. */
 	observedModel?: string | null | undefined;
-	/** Fingerprint of the previous attempt, when one is known. */
+	/** The previous launch's fingerprint, or null on a first launch for this task. */
 	previousConfigFingerprint?: string | null | undefined;
 }
 
