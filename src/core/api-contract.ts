@@ -71,7 +71,17 @@ export const runtimeSlashCommandsResponseSchema = z.object({
 });
 export type RuntimeSlashCommandsResponse = z.infer<typeof runtimeSlashCommandsResponseSchema>;
 
-export const runtimeAgentIdSchema = z.enum(["claude", "codex", "gemini", "opencode", "droid", "kiro", "cline"]);
+export const runtimeAgentIdSchema = z.enum([
+	"claude",
+	"codex",
+	"gemini",
+	"opencode",
+	"droid",
+	"kiro",
+	// AA-P1: Pi (`pi` CLI from @earendil-works/pi-coding-agent).
+	"pi",
+	"cline",
+]);
 export type RuntimeAgentId = z.infer<typeof runtimeAgentIdSchema>;
 
 // Board columns are split into a distinct "done" column (completed work,

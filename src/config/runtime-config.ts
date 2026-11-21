@@ -19,6 +19,7 @@ import type {
 	RuntimeVerificationConfig,
 	RuntimeVerificationConfigSave,
 } from "../core/api-contract";
+import { runtimeAgentIdSchema } from "../core/api-contract";
 import { type LockRequest, lockedFileSystem } from "../fs/locked-file-system";
 import { PR_CI_HANDOFF_GUIDANCE } from "../prompts/pr-ci-handoff";
 import { detectInstalledCommands } from "../terminal/agent-registry";
@@ -172,17 +173,11 @@ function getRuntimeHomePath(): string {
 }
 
 function normalizeAgentId(agentId: RuntimeAgentId | string | null | undefined): RuntimeAgentId {
-	if (
-		(agentId === "claude" ||
-			agentId === "codex" ||
-			agentId === "gemini" ||
-			agentId === "opencode" ||
-			agentId === "droid" ||
-			agentId === "kiro" ||
-			agentId === "cline") &&
-		isRuntimeAgentLaunchSupported(agentId)
-	) {
-		return agentId;
+	// Catalog-driven, so adding an agent never means editing this list. An
+	// unknown id, or one Kanban cannot launch, still falls back to the default.
+	const parsed = runtimeAgentIdSchema.safeParse(agentId);
+	if (parsed.success && isRuntimeAgentLaunchSupported(parsed.data)) {
+		return parsed.data;
 	}
 	return DEFAULT_AGENT_ID;
 }

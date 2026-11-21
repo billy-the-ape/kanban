@@ -86,6 +86,21 @@ const RUNTIME_AGENT_CAPABILITIES: Record<RuntimeAgentId, RuntimeAgentCapabilitie
 		completionSignal: "hook",
 		automatedDelivery: true,
 	},
+	pi: {
+		terminalPresentation: true,
+		// Pi is started with `--session-dir` and a Kanban-minted `--session-id`,
+		// so a restart resumes the exact session Kanban created for the card.
+		explicitSessionResume: true,
+		images: true,
+		// Pi has no planning switch and Kanban refuses the request rather than
+		// pretending a normal Act run is a plan.
+		planMode: "none",
+		// Pi executes tool calls without an approval prompt, so there is no
+		// switch to turn: the UI must not advertise an approval policy here.
+		approvalMode: "none",
+		completionSignal: "hook",
+		automatedDelivery: true,
+	},
 };
 
 /**
@@ -128,6 +143,11 @@ const RUNTIME_AGENT_MODEL_CONFIGURATION: Record<RuntimeAgentId, RuntimeAgentMode
 		source: "agent-native",
 		configLocations: ["~/.gemini/settings.json"],
 		note: "Gemini CLI selects its own provider and model; Kanban does not pass a model flag.",
+	},
+	pi: {
+		source: "agent-native",
+		configLocations: ["~/.pi/agent/settings.json", "~/.pi/agent/models.json"],
+		note: "Pi owns its provider and model in ~/.pi/agent (auth.json holds its credentials, which Kanban never reads) and runs tool calls without an approval prompt. Kanban only forwards Pi's own defaultProvider/defaultModel and never falls back to a hosted provider.",
 	},
 };
 

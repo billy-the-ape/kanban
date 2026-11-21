@@ -1,8 +1,9 @@
 # Additional agents: shared groundwork and benchmark evidence
 
 Status: AA-S1 implemented in this repository (shared agent contracts, launch provenance,
-attempt-scoped events). AA-O1 (OpenCode), AA-P1 (Pi) and AA-E1 (evaluation) remain planned;
-no additional agent is enabled by this change.
+attempt-scoped events), and [AA-P1: Pi](./pi.md) implemented (terminal launch, exact-session
+resume and task-scoped lifecycle events for the `pi` CLI). AA-O1 (OpenCode) and AA-E1
+(evaluation) remain planned; enabling Pi changes no other agent's defaults.
 Research and repository inspection date: 2026-11-19.
 Inspected Kanban main: `e7b2097af06364b01410c6b69d353d52d22a6aa4`.
 Re-read current code and applicable AGENTS.md before implementation.
