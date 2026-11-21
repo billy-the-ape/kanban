@@ -189,6 +189,7 @@ describe("Kanban Pi hook extension", () => {
 				"tool_execution_end",
 				"model_select",
 				"ui_prompt_start",
+				"ui_prompt_end",
 				"agent_settled",
 				"session_before_switch",
 				"session_before_fork",
@@ -221,6 +222,96 @@ describe("Kanban Pi hook extension", () => {
 			pi_agent_version: "1.5.2",
 			final_message: "Fixed the flaky test.",
 		});
+	});
+	it("moves a recovered tool failure on to review instead of stalling the card", async () => {
+		const harness = await createPiExtensionHarness({ sessionId: "kanban-task-1" });
+		const ctx = makeCtx("kanban-task-1");
+
+		await harness.invoke("agent_start", {}, ctx);
+		// A red test run is routine, so it must not decide how the turn ends.
+		await harness.invoke(
+			"tool_execution_end",
+			{ toolName: "bash", args: { command: "npm test" }, result: { output: "1 failed" }, isError: true },
+			ctx,
+		);
+		await harness.invoke("message_end", { message: assistantMessage({ text: "Green again after the fix." }) }, ctx);
+		await harness.invoke("agent_settled", { aborted: false }, ctx);
+
+		const records = await harness.notifications(3);
+		expect(records).toHaveLength(3);
+		const settled = findByHookEvent(records, "agent_settled");
+		expect(settled.event).toBe("to_review");
+		expect(settled.flags["--final-message"]).toBe("Green again after the fix.");
+		expect(settled.payload).not.toHaveProperty("pi_error");
+		// The failure stays visible as metadata without becoming the turn outcome.
+		expect(findByHookEvent(records, "tool_execution_end").flags["--notification-type"]).toBe("error");
+	});
+
+	it("still reports a turn that stops on a failed tool call as an error", async () => {
+		const harness = await createPiExtensionHarness({ sessionId: "kanban-task-1" });
+		const ctx = makeCtx("kanban-task-1");
+
+		await harness.invoke("agent_start", {}, ctx);
+		await harness.invoke(
+			"tool_execution_end",
+			{ toolName: "bash", args: { command: "npm run build" }, result: { output: "exit 2" }, isError: true },
+			ctx,
+		);
+		// Nothing recovered the run, so the failure is still how it ended.
+		await harness.invoke("agent_settled", { aborted: false }, ctx);
+
+		const records = await harness.notifications(3);
+		expect(records).toHaveLength(3);
+		const settled = findByHookEvent(records, "agent_settled");
+		expect(settled.event).toBe("activity");
+		expect(settled.flags["--notification-type"]).toBe("error");
+		expect(settled.payload).toMatchObject({ pi_error: expect.stringContaining("bash") });
+		expect(records.some((record) => record.event === "to_review")).toBe(false);
+	});
+
+	it("brings the card back to In Progress when the extension dialog closes", async () => {
+		const harness = await createPiExtensionHarness({ sessionId: "kanban-task-1" });
+		const ctx = makeCtx("kanban-task-1");
+
+		await harness.invoke("agent_start", {}, ctx);
+		await harness.invoke("ui_prompt_start", { reason: "custom", kind: "select", title: "Pick a migration" }, ctx);
+		await harness.invoke("ui_prompt_end", { reason: "custom" }, ctx);
+
+		const records = await harness.notifications(3);
+		expect(records).toHaveLength(3);
+		expect(findByHookEvent(records, "ui_prompt_start").event).toBe("to_review");
+		const resumed = findByHookEvent(records, "ui_prompt_end");
+		expect(resumed.event).toBe("to_in_progress");
+		expect(resumed.flags["--source"]).toBe("pi");
+
+		// The run continues, so the eventual settle still owns the review move.
+		await harness.invoke(
+			"message_end",
+			{ message: assistantMessage({ text: "Applied the second migration." }) },
+			ctx,
+		);
+		await harness.invoke("agent_settled", { aborted: false }, ctx);
+		const all = await harness.notifications(4);
+		expect(all).toHaveLength(4);
+		expect(findByHookEvent(all, "agent_settled").event).toBe("to_review");
+	});
+
+	it("never moves the card for a dialog this run never opened", async () => {
+		const harness = await createPiExtensionHarness({ sessionId: "kanban-task-1" });
+		const ctx = makeCtx("kanban-task-1");
+
+		await harness.invoke("agent_start", {}, ctx);
+		await harness.invoke("ui_prompt_end", { reason: "custom" }, ctx);
+		await new Promise((resolve) => setTimeout(resolve, 250));
+		expect(await harness.recorded()).toHaveLength(1);
+
+		// A close after the turn settled belongs to no turn either.
+		await harness.invoke("ui_prompt_start", { reason: "custom", kind: "select", title: "Pick one" }, ctx);
+		await harness.invoke("agent_settled", { aborted: false }, ctx);
+		await harness.invoke("ui_prompt_end", { reason: "custom" }, ctx);
+		const records = await harness.notifications(3);
+		expect(records).toHaveLength(3);
+		expect(records.some((record) => record.flags["--hook-event-name"] === "ui_prompt_end")).toBe(false);
 	});
 
 	it("keeps a failed turn as activity instead of pretending completion", async () => {

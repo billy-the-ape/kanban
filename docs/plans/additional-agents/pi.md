@@ -67,7 +67,7 @@ task/session store was created.
 | `src/prompts/append-system-prompt.ts` | Pi in the append-prompt agent list plus its own Linear MCP guidance line (`pi mcp add linear --url ...`, then `pi mcp login linear`) |
 | `web-ui/src/components/runtime-settings-dialog.tsx` | Pi in the settings agent order and a model-configuration line under each agent-native row |
 | `web-ui/src/components/task-start-agent-onboarding-carousel.tsx` | Pi in the onboarding agent order with install copy that names its own `~/.pi/agent` configuration |
-| Tests | `test/runtime/pi-hook-events.test.ts` (6), `test/runtime/terminal/pi-session-adapter.test.ts` (16), `test/runtime/terminal/pi-hook-extension.test.ts` (7, runs the generated extension against a recorder stand-in for `kanban hooks notify`), updated `test/runtime/core/agent-capabilities.test.ts` and `test/runtime/terminal/agent-registry.test.ts` (exhaustive identity coverage, catalog-sized PATH probe count) |
+| Tests | `test/runtime/pi-hook-events.test.ts` (6), `test/runtime/terminal/pi-session-adapter.test.ts` (16), `test/runtime/terminal/pi-hook-extension.test.ts` (11, runs the generated extension against a recorder stand-in for `kanban hooks notify`, including a recovered tool error and the dialog round-trip), updated `test/runtime/core/agent-capabilities.test.ts` and `test/runtime/terminal/agent-registry.test.ts` (exhaustive identity coverage, catalog-sized PATH probe count) |
 
 ### Launch contract actually implemented
 
@@ -88,11 +88,23 @@ task/session store was created.
   `--model Y`. Pi's documented rule that `--provider` requires `--model` is respected, no
   Kanban-side provider name is invented, and no credential ever enters argv, env, board
   state or a generated file.
-- Completion: the extension reports `agent_settled` as end-of-turn, distinguishes an
-  aborted run and a queued continuation from a finished one, treats `tool_execution_end`
-  with `isError` plus a following settle as an error rather than a finished turn, and
-  refuses `session_before_switch` / `session_before_fork` so the card keeps following the
-  session it owns.
+- Completion: `agent_settled` is the only end-of-turn signal, and only when no
+  continuation is queued. A failed tool call is never the turn outcome by itself — a red
+  test run, an empty grep or a retried edit stays activity metadata, and the next
+  assistant message without an error signal clears it. Only a failure still standing when
+  the run settles (an assistant message with `stopReason: "error"` or `error`, or a turn
+  that stops immediately after a failed tool call) is reported as an error.
+- A blocking extension dialog (`ui_prompt_start` / `ui_prompt_end`) moves the card to
+  Review while the terminal waits for the user and back to In Progress when it closes,
+  because Pi does not fire `agent_start` again mid-run. A close with no matching start, or
+  one that arrives after the turn already settled, moves nothing.
+- An errored or aborted turn deliberately stays In Progress instead of moving to Review:
+  `to_review` through the hook boundary is always `reviewReason: "hook"`, which fires the
+  review-ready notification and captures a review checkpoint, so it would advertise failed
+  work as ready to review. The failure is reported as activity with
+  `notification-type: error` and the reason instead. Showing "needs you, but is not
+  review-ready" would require a review reason in the hook contract, which affects every
+  agent and is outside AA-P1.
 
 ### Deliberately not implemented
 
@@ -123,8 +135,8 @@ task/session store was created.
   `-na/--no-approve`, `--provider`, `--model` and the `pi mcp add --url` form in
   `packages/coding-agent/docs/cli.md`, and the events `session_start`,
   `session_before_switch`, `session_before_fork`, `agent_start`, `agent_settled`,
-  `message_end`, `tool_execution_end`, `model_select`, `ui_prompt_start` in
-  `packages/coding-agent/docs/extensions.md`.
+  `message_end`, `tool_execution_end`, `model_select`, `ui_prompt_start`, `ui_prompt_end`
+  in `packages/coding-agent/docs/extensions.md`.
 - **Not performed here:** the manual smoke table below. No `pi` binary is installed in the
   implementation environment, so every Pi assertion above is exercised by unit tests
   against a recorder stand-in or an in-process fake, not by a live Pi process. Run the

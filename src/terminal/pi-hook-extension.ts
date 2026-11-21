@@ -56,6 +56,9 @@ let rootSessionId = KANBAN_SESSION_ID;
 let ownsTaskEvents = true;
 let turnFailure = null;
 let lastAssistantText = null;
+// True while a blocking extension dialog holds the run, so only the matching
+// close moves the card back and a stray event never does.
+let waitingOnPrompt = false;
 
 function clipText(value, limit) {
 	if (typeof value !== "string") {
@@ -289,6 +292,7 @@ export default function kanbanPiHooks(pi) {
 			return;
 		}
 		turnFailure = null;
+		waitingOnPrompt = false;
 		notifyKanban(
 			"to_in_progress",
 			[
@@ -304,6 +308,9 @@ export default function kanbanPiHooks(pi) {
 			return;
 		}
 		const message = event && event.message;
+		if (!message || message.role !== "assistant") {
+			return;
+		}
 		const text = assistantText(message);
 		if (text) {
 			lastAssistantText = text;
@@ -311,7 +318,13 @@ export default function kanbanPiHooks(pi) {
 		const failure = assistantFailure(message);
 		if (failure) {
 			turnFailure = failure;
+			return;
 		}
+		// A failed tool call is routine (a red test run, a grep with no match, a
+		// retried edit), so it never decides how the turn ends on its own. Once the
+		// model speaks again without an error signal, the run has recovered, and the
+		// stale failure must not swallow the review transition.
+		turnFailure = null;
 	});
 
 	pi.on("tool_execution_end", async (event, ctx) => {
@@ -366,11 +379,12 @@ export default function kanbanPiHooks(pi) {
 	});
 
 	// Pi has no tool-approval prompts, but an extension dialog blocks the run
-	// until the user answers it in the terminal.
+	// until the user answers it in the terminal, so the card waits with it.
 	pi.on("ui_prompt_start", async (event, ctx) => {
 		if (!ownsSession(ctx)) {
 			return;
 		}
+		waitingOnPrompt = true;
 		const payload = basePayload(ctx, "ui_prompt_start");
 		payload.notification_type = "permission_prompt";
 		notifyKanban(
@@ -384,6 +398,28 @@ export default function kanbanPiHooks(pi) {
 		);
 	});
 
+	// Answering the dialog resumes the same run and Pi does not fire agent_start
+	// again, so this is the only event that can take the card out of Review. With
+	// no matching start there is nothing waiting, and a stray event must never
+	// pull a genuinely reviewed card back into In Progress.
+	pi.on("ui_prompt_end", async (_event, ctx) => {
+		if (!waitingOnPrompt) {
+			return;
+		}
+		waitingOnPrompt = false;
+		if (!ownsSession(ctx)) {
+			return;
+		}
+		notifyKanban(
+			"to_in_progress",
+			[
+				["--hook-event-name", "ui_prompt_end"],
+				["--activity-text", "Pi resumed the turn after the terminal prompt"],
+			],
+			basePayload(ctx, "ui_prompt_end"),
+		);
+	});
+
 	// Only a fully settled run may look like completion: Pi fires this after
 	// automatic retries, compaction and queued continuations are done.
 	pi.on("agent_settled", async (event, ctx) => {
@@ -393,6 +429,8 @@ export default function kanbanPiHooks(pi) {
 		if (hasQueuedContinuation(ctx)) {
 			return;
 		}
+		// The run is over, so a dialog closing afterwards belongs to no turn.
+		waitingOnPrompt = false;
 		const payload = basePayload(ctx, "agent_settled");
 		if (event && event.aborted === true) {
 			turnFailure = null;
