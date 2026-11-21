@@ -912,6 +912,28 @@ describe("prepareAgentLaunch hook strategies", () => {
 		// The bridge pins the same session instead of adopting the first it sees.
 		expect(launch.env.KANBAN_OPENCODE_SESSION_ID).toBe("ses_08f7c2a9b1eF4d");
 	});
+	it("keeps a recorded session id from pinning a fresh OpenCode launch", async () => {
+		setupTempHome();
+		// A card that already reported a session can be launched again without a
+		// resume (start over, or relaunch after the process exited). OpenCode opens a
+		// new conversation there, so a bridge pinned to the old id would reject every
+		// event from the session actually running and strand the card in running.
+		const launch = await prepareAgentLaunch({
+			taskId: "task-opencode-fresh",
+			agentId: "opencode",
+			binary: "opencode",
+			args: [],
+			cwd: setupEmptyWorkspace(),
+			prompt: "",
+			workspaceId: "workspace-1",
+			attemptId: "attempt-1",
+			externalSessionId: "ses_08f7c2a9b1eF4d",
+		});
+		expect(launch.args).not.toContain("--session");
+		// Unpinned, the bridge adopts the new session and reports its id, which is
+		// what the next resume needs.
+		expect(launch.env.KANBAN_OPENCODE_SESSION_ID).toBeUndefined();
+	});
 
 	it("drops --continue from an OpenCode command saved before exact resume", async () => {
 		setupTempHome();

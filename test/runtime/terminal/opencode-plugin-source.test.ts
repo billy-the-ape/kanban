@@ -262,6 +262,15 @@ describe("generated OpenCode bridge (AA-O1)", () => {
 		await emit(hooks, { type: "session.idle", properties: { sessionID: "ses_root01" } });
 		expect(readCalls().map((call) => call.sessionId)).toEqual(["ses_root01", "ses_root01"]);
 	});
+	it("goes silent when pinned to a session that is no longer running", async () => {
+		// This is why a fresh launch must not pin a recorded id: OpenCode started a
+		// new conversation, so a bridge pinned to the previous id ignores every event
+		// from it and the card would never leave running.
+		const hooks = await setupBridge({ pinnedSessionId: "ses_old00000" });
+		await emit(hooks, { type: "session.busy", properties: { sessionID: "ses_new00001" } });
+		await emit(hooks, { type: "session.idle", properties: { sessionID: "ses_new00001" } });
+		expect(readCalls()).toEqual([]);
+	});
 
 	it("reports a failed turn without marking the task complete", async () => {
 		const hooks = await setupBridge();

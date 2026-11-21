@@ -262,9 +262,12 @@ anything that starts like a flag.
 | `permission.ask` with `status: "ask"` | review with `notification_type: "permission.asked"` → attention reason; the following idle is not completion |
 | `session.error` | review with `notification_type: "error"` → error reason, deduplicated per turn |
 
-Ownership: with `KANBAN_OPENCODE_SESSION_ID` the bridge only answers for that session;
-without it the first non-child session becomes the root and child sessions
-(`session.parentID`) contribute nothing. Every notification carries
+Ownership: `KANBAN_OPENCODE_SESSION_ID` is set **only for a resume**, because a fresh
+launch starts a new conversation and a bridge pinned to the previous id would reject
+every event from the running one. When it is set the bridge answers only for that
+session; otherwise the first non-child session becomes the root and child sessions
+(`session.parentID`) contribute nothing. A non-resume start therefore clears the stored
+`externalSessionId` and lets the bridge report the new id. Every notification carries
 `source: "opencode"`, the session id, and a base64 payload, and is best-effort with a
 20s kill so a bridge failure can never break a session.
 
@@ -272,8 +275,8 @@ without it the first non-child session becomes the root and child sessions
 
 - `KANBAN_OPENCODE_MODEL` (optional, read by Kanban only): `provider/model` override for
   the current user's launches.
-- `KANBAN_OPENCODE_SESSION_ID` (Kanban-owned, per launch): pins the root session for the
-  generated bridge.
+- `KANBAN_OPENCODE_SESSION_ID` (Kanban-owned, resume launches only): pins the root
+  session for the generated bridge.
 - `OPENCODE_CONFIG` and `OPENCODE_DISABLE_AUTOUPDATE` (Kanban-owned, per launch): additive
   overlay and no auto-update during a task.
 - Settings shows OpenCode with its binary, config locations

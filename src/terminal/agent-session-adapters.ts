@@ -783,10 +783,12 @@ const opencodeAdapter: AgentSessionAdapter = {
 			// A task launch must never download a different OpenCode build behind
 			// the version check that just passed.
 			env.OPENCODE_DISABLE_AUTOUPDATE = "1";
-			if (externalSessionId) {
-				// The bridge pins its root session instead of adopting whichever
-				// session appears first, so another task's activity can never park
-				// or finish this card.
+			if (input.resumeFromTrash && externalSessionId) {
+				// Only a real resume pins its root session: OpenCode starts a fresh
+				// conversation with a new id, and a bridge pinned to the id from the
+				// previous conversation would reject every event from the running one.
+				// Without a pin the bridge adopts the new session and reports its id,
+				// so another task's activity can still never move this card.
 				env[KANBAN_OPENCODE_SESSION_ID_ENV] = externalSessionId;
 			}
 		}

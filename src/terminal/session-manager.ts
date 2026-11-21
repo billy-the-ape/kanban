@@ -356,8 +356,9 @@ export class TerminalSessionManager implements TerminalSessionService {
 			workspaceId: request.workspaceId,
 			attemptId: launchAttemptId,
 			// AA-O1a: the session id this card's own agent reported earlier. Only
-			// adapters with exact resume use it, and only for resume intent.
-			externalSessionId: entry.summary.externalSessionId ?? null,
+			// adapters with exact resume use it, and only for resume intent: a fresh
+			// launch starts a new conversation, so a stale id must not reach it.
+			externalSessionId: request.resumeFromTrash ? (entry.summary.externalSessionId ?? null) : null,
 		});
 		const launchEnvForProvenance: Record<string, string | undefined> = {
 			...request.env,
@@ -593,6 +594,10 @@ export class TerminalSessionManager implements TerminalSessionService {
 			latestTurnCheckpoint: null,
 			previousTurnCheckpoint: null,
 			launchAttemptId,
+			// A fresh launch is a new conversation, so the session id reported for the
+			// previous one stops describing this card until the integration reports the
+			// new id; a resume keeps the id it resumed with.
+			externalSessionId: request.resumeFromTrash ? (entry.summary.externalSessionId ?? null) : null,
 			launchProvenance,
 		});
 		this.emitSummary(entry.summary);
