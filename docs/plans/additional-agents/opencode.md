@@ -295,6 +295,33 @@ captured from a recorder script), the OpenCode block in
 assertions in `test/runtime/terminal/agent-registry.test.ts`, and session-identity and
 review-reason cases in `test/runtime/trpc/hooks-api.test.ts`.
 
+### Verified against the installed CLI (1.19.6)
+
+These were checked by running the pinned release (`opencode-linux-x64` 1.19.6) with a
+throwaway `HOME` and an empty project, through Kanban's own `probeOpenCodeVersion` /
+`verifyOpenCodeSession` and the overlay Kanban generates:
+
+- `opencode --version` prints `1.19.6`; Kanban's probe parses it and the compatibility
+  gate reports `supported` with no remediation.
+- `opencode --help` documents every flag the adapter passes to the interactive form:
+  `-s, --session` (session id to continue), `--prompt`, `--agent`, `--auto`
+  (“auto-approve permissions that are not explicitly denied (dangerous!)”) and
+  `-m, --model` (“model to use in the format of provider/model”), alongside
+  `-c, --continue`, which the adapter strips.
+- `opencode session list` is a real command and prints nothing for a project with no
+  sessions (exit 0), so the exact-resume probe correctly answers "does not exist" there.
+- Configuration really is additive: one run logs the global config paths **and** the
+  `OPENCODE_CONFIG` overlay. With the newer `plugins` key the CLI logs
+  `level=WARN … kind=unsupported action="Omitted native setting that cannot be
+  represented in V1"` and loads nothing; with `plugin: ["<absolute directory>"]` the
+  bridge module is loaded; a `plugin` entry naming a single `.js` file never loads.
+- Cost of loading a local plugin directory: the first run took ~5s against a ~1s control
+  and settled to ~1s afterwards, so a card's first OpenCode launch starts a few seconds
+  slower. Separate first loads contended long enough to exceed 15s each, which is why
+  concurrent first OpenCode launches on one machine can start slowly.
+- Not covered: the positive path of the session probe (creating a session requires a
+  provider) and a real model turn.
+
 ### Known limitations
 
 - Image attachments are refused with a message (`images: false`): only OpenCode's
@@ -309,6 +336,10 @@ review-reason cases in `test/runtime/trpc/hooks-api.test.ts`.
   OpenCode 1.19.6 installed.
 - The first-run onboarding carousel keeps its original curated list; OpenCode is
   selectable in Settings and the task-start picker.
+- A card's first OpenCode launch on a machine starts a few seconds late, because loading
+  a configured local plugin directory costs ~4s on top of the CLI's ~1s startup and
+  settles to ~1s afterwards; parallel first loads can contend further. Nothing is
+  installed per launch and `OPENCODE_DISABLE_AUTOUPDATE=1` keeps the version fixed.
 - `--session` resume requires the id the bridge reported. A card created before AA-O1
   (or a session OpenCode has since dropped) fails with an explicit "start a new session"
   message instead of attaching to another conversation.
