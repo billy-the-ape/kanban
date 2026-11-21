@@ -44,6 +44,7 @@ import { previewThemeId, readStoredThemeId, saveThemeId, THEME_GROUPS, THEMES, t
 import { useLayoutCustomizations } from "@/resize/layout-customizations";
 import { openFileOnHost } from "@/runtime/runtime-config-query";
 import type {
+	RuntimeAgentDefinition,
 	RuntimeAgentId,
 	RuntimeClineMcpServerAuthStatus,
 	RuntimeConfigResponse,
@@ -64,6 +65,23 @@ interface RuntimeSettingsAgentRowModel {
 	binary: string;
 	command: string;
 	installed: boolean | null;
+	/**
+	 * AA-P1: where this agent actually gets its provider and model from. Only
+	 * agent-native agents have one; Cline's model comes from Kanban's own
+	 * settings, which the Cline section already documents.
+	 */
+	modelNote: string | null;
+}
+
+function buildModelConfigurationNote(agent: RuntimeAgentDefinition): string | null {
+	if (agent.modelConfiguration.source !== "agent-native") {
+		return null;
+	}
+	const locations = agent.modelConfiguration.configLocations.filter((location) => location.trim().length > 0);
+	if (locations.length === 0) {
+		return agent.modelConfiguration.note;
+	}
+	return `${agent.modelConfiguration.note} Config: ${locations.join(", ")}.`;
 }
 
 function quoteCommandPartForDisplay(part: string): string {
@@ -92,7 +110,7 @@ const GIT_PROMPT_VARIANT_OPTIONS: Array<{ value: TaskGitAction; label: string }>
 
 export type RuntimeSettingsSection = "shortcuts";
 
-const SETTINGS_AGENT_ORDER: readonly RuntimeAgentId[] = ["cline", "claude", "codex", "droid", "kiro"];
+const SETTINGS_AGENT_ORDER: readonly RuntimeAgentId[] = ["cline", "claude", "codex", "droid", "kiro", "pi"];
 
 type SettingsNavId = "general" | "cline" | "git-prompts" | "notifications" | "appearance" | "project";
 
@@ -200,6 +218,7 @@ function AgentRow({
 					{agent.command ? (
 						<p className="text-text-secondary font-mono text-xs mt-0.5 m-0">{agent.command}</p>
 					) : null}
+					{agent.modelNote ? <p className="text-text-tertiary text-xs mt-0.5 m-0">{agent.modelNote}</p> : null}
 				</div>
 			</div>
 			{!isNativeCline && agent.installed === false && installUrl ? (
@@ -419,12 +438,16 @@ export function RuntimeSettingsDialog({
 				label: agent.label,
 				binary: agent.binary,
 				installed: agent.id === "cline" ? true : agent.installed,
+				modelNote: agent.id === "cline" ? null : buildModelConfigurationNote(agent),
 			})) ??
 			getRuntimeLaunchSupportedAgentCatalog().map((agent) => ({
 				id: agent.id,
 				label: agent.label,
 				binary: agent.binary,
 				installed: agent.id === "cline" ? true : null,
+				// The local catalog has no model configuration, so nothing is
+				// claimed about it until the runtime config arrives.
+				modelNote: null,
 			}));
 		const orderIndexByAgentId = new Map(SETTINGS_AGENT_ORDER.map((agentId, index) => [agentId, index] as const));
 		const orderedAgents = [...agents].sort((left, right) => {

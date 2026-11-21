@@ -4,6 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { RuntimeSettingsDialog } from "@/components/runtime-settings-dialog";
+import { agentDefinitionTestDefaults } from "@/runtime/agent-definition-test-defaults";
 import type { RuntimeConfigResponse } from "@/runtime/types";
 
 /*
@@ -188,6 +189,7 @@ const savedClineOauthConfig = {
 			binary: "cline",
 			command: "cline",
 			installed: true,
+			...agentDefinitionTestDefaults,
 		},
 		{
 			id: "claude",
@@ -195,6 +197,7 @@ const savedClineOauthConfig = {
 			binary: "claude",
 			command: "claude",
 			installed: true,
+			...agentDefinitionTestDefaults,
 		},
 	],
 	clineProviderSettings: {

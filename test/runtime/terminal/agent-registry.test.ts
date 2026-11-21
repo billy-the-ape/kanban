@@ -9,6 +9,7 @@ vi.mock("../../../src/terminal/command-discovery.js", () => ({
 }));
 
 import type { RuntimeConfigState } from "../../../src/config/runtime-config";
+import { RUNTIME_AGENT_CATALOG } from "../../../src/core/agent-catalog";
 import {
 	buildRuntimeConfigResponse,
 	detectInstalledCommands,
@@ -47,7 +48,10 @@ describe("agent-registry", () => {
 		const detected = detectInstalledCommands();
 
 		expect(detected).toEqual(["claude"]);
-		expect(commandDiscoveryMocks.isBinaryAvailableOnPath).toHaveBeenCalledTimes(8);
+		// Every catalogued agent is probed on PATH (plus the `npx` shell-only
+		// candidate), so adding one (AA-P1: `pi`) must not silently leave a
+		// binary undiscovered.
+		expect(commandDiscoveryMocks.isBinaryAvailableOnPath).toHaveBeenCalledTimes(RUNTIME_AGENT_CATALOG.length + 1);
 	});
 
 	it("treats shell-only agents as unavailable", () => {
@@ -78,13 +82,22 @@ describe("buildRuntimeConfigResponse", () => {
 		});
 
 		expect(response.agentAutonomousModeEnabled).toBe(true);
-		expect(response.agents.map((agent) => agent.id)).toEqual(["claude", "codex", "cline", "droid", "kiro"]);
+		expect(response.agents.map((agent) => agent.id)).toEqual(["claude", "codex", "cline", "droid", "kiro", "pi"]);
 		expect(response.agents.find((agent) => agent.id === "claude")?.defaultArgs).toEqual([]);
 		expect(response.agents.find((agent) => agent.id === "codex")?.defaultArgs).toEqual([]);
 		expect(response.agents.find((agent) => agent.id === "cline")?.defaultArgs).toEqual([]);
 		expect(response.agents.find((agent) => agent.id === "droid")?.defaultArgs).toEqual([]);
 		expect(response.agents.find((agent) => agent.id === "kiro")?.defaultArgs).toEqual(["chat"]);
 		expect(response.agents.find((agent) => agent.id === "cline")?.installed).toBe(true);
+
+		// AA-P1: Pi owns its model and has no plan or approval switch, so the
+		// API must not describe Kanban as configuring either for it.
+		const pi = response.agents.find((agent) => agent.id === "pi");
+		expect(pi?.defaultArgs).toEqual([]);
+		expect(pi?.command).toBe("pi");
+		expect(pi?.modelConfiguration.source).toBe("agent-native");
+		expect(pi?.capabilities.planMode).toBe("none");
+		expect(pi?.capabilities.approvalMode).toBe("none");
 	});
 
 	it("omits autonomous flags from curated agent commands when disabled", () => {
@@ -106,7 +119,7 @@ describe("buildRuntimeConfigResponse", () => {
 		});
 
 		expect(response.agentAutonomousModeEnabled).toBe(false);
-		expect(response.agents.map((agent) => agent.id)).toEqual(["claude", "codex", "cline", "droid", "kiro"]);
+		expect(response.agents.map((agent) => agent.id)).toEqual(["claude", "codex", "cline", "droid", "kiro", "pi"]);
 		expect(response.agents.find((agent) => agent.id === "claude")?.defaultArgs).toEqual([]);
 		expect(response.agents.find((agent) => agent.id === "codex")?.defaultArgs).toEqual([]);
 		expect(response.agents.find((agent) => agent.id === "cline")?.defaultArgs).toEqual([]);

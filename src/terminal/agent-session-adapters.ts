@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { access, readFile, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative } from "node:path";
@@ -10,11 +9,18 @@ import type {
 	RuntimeTaskImage,
 	RuntimeTaskSessionSummary,
 } from "../core/api-contract";
-import { buildKanbanCommandParts } from "../core/kanban-command";
 import { quoteShellArg } from "../core/shell";
-import { lockedFileSystem } from "../fs/locked-file-system";
 import { resolveHomeAgentAppendSystemPrompt } from "../prompts/append-system-prompt";
-import { getRuntimeHomePath } from "../state/workspace-state";
+import {
+	buildHooksCommandParts,
+	createScopedHookResources,
+	ensureTextFile,
+	getScopedHookAgentDirectory,
+	hasCliOption,
+	resolveHookContext,
+	toResourceScopeSegment,
+	withPrompt,
+} from "./agent-launch-helpers";
 import { configureCodexHooks, hasCodexConfigOverride } from "./codex-hook-config";
 import { createHookRuntimeEnv } from "./hook-runtime-context";
 import {
@@ -23,6 +29,7 @@ import {
 	getOpenCodeModelStatePathCandidates,
 } from "./opencode-paths";
 import { stripAnsi } from "./output-utils";
+import { piAdapter } from "./pi-session-adapter";
 import type { SessionTransitionEvent } from "./session-state-machine";
 import { prepareTaskPromptWithImages } from "./task-image-prompt";
 
@@ -64,13 +71,6 @@ export interface PreparedAgentLaunch {
 	shouldInspectOutputForTransition?: AgentOutputTransitionInspectionPredicate;
 }
 
-interface HookContext {
-	taskId: string;
-	workspaceId: string;
-	/** AA-S1: scopes generated resources and owns the events this attempt emits. */
-	attemptId?: string | undefined;
-}
-
 interface HookCommandMetadata {
 	source?: string;
 	activityText?: string;
@@ -78,7 +78,7 @@ interface HookCommandMetadata {
 	notificationType?: string;
 }
 
-interface AgentSessionAdapter {
+export interface AgentSessionAdapter {
 	prepare(input: AgentAdapterLaunchInput): Promise<PreparedAgentLaunch>;
 }
 
@@ -88,19 +88,6 @@ function escapeForTemplateLiteral(value: string): string {
 
 function powerShellQuote(value: string): string {
 	return `"${value.replaceAll("`", "``").replaceAll('"', '`"')}"`;
-}
-
-function resolveHookContext(input: AgentAdapterLaunchInput): HookContext | null {
-	const workspaceId = input.workspaceId?.trim();
-	if (!workspaceId) {
-		return null;
-	}
-	const attemptId = input.attemptId?.trim();
-	return {
-		taskId: input.taskId,
-		workspaceId,
-		...(attemptId ? { attemptId } : {}),
-	};
 }
 
 function buildHookCommand(event: RuntimeHookEvent, metadata?: HookCommandMetadata): string {
@@ -120,22 +107,8 @@ function buildHookCommand(event: RuntimeHookEvent, metadata?: HookCommandMetadat
 	return parts.map(quoteShellArg).join(" ");
 }
 
-function buildHooksCommandParts(args: string[]): string[] {
-	return buildKanbanCommandParts(["hooks", ...args]);
-}
-
 function buildHooksCommand(args: string[]): string {
 	return buildHooksCommandParts(args).map(quoteShellArg).join(" ");
-}
-
-function hasCliOption(args: string[], optionName: string): boolean {
-	for (let i = 0; i < args.length; i += 1) {
-		const arg = args[i];
-		if (arg === optionName || arg.startsWith(`${optionName}=`)) {
-			return true;
-		}
-	}
-	return false;
 }
 
 function getClineHookScriptPath(
@@ -575,71 +548,6 @@ function buildOpenCodePluginContent(
 `;
 }
 
-function getHookAgentDirectory(agentId: RuntimeAgentId): string {
-	return join(getRuntimeHomePath(), "hooks", agentId);
-}
-
-/** AA-S1: bounded, collision-resistant path segment for a generated resource. */
-function toResourceScopeSegment(value: string): string {
-	const hash = createHash("sha256").update(value).digest("hex").slice(0, 10);
-	const readable = value
-		.normalize("NFKD")
-		.replaceAll(/[^A-Za-z0-9._-]+/g, "-")
-		.replaceAll(/^[-.]+|[-.]+$/g, "")
-		.slice(0, 48);
-	return `${readable.length > 0 ? readable : "scope"}-${hash}`;
-}
-
-/**
- * AA-S1: generated integration resources are scoped by workspace, task and
- * launch attempt. A stale plugin, a second task on the same agent, or a
- * restarted attempt never reads or overwrites another attempt's files.
- * Sessions without a workspace (the home agent) keep the shared agent
- * directory, which is all they ever addressed.
- */
-function getScopedHookAgentDirectory(agentId: RuntimeAgentId, hooks: HookContext | null): string {
-	const base = getHookAgentDirectory(agentId);
-	if (!hooks) {
-		return base;
-	}
-	return join(
-		base,
-		toResourceScopeSegment(hooks.workspaceId),
-		toResourceScopeSegment(hooks.taskId),
-		toResourceScopeSegment(hooks.attemptId ?? "launch"),
-	);
-}
-
-/**
- * Removes one attempt-scoped resource directory on teardown. Refuses anything
- * that is not inside Kanban's own hooks root, so a cleanup can never reach
- * durable state or a user-owned file.
- */
-function createHookResourceCleanup(directory: string): () => Promise<void> {
-	return async () => {
-		const hooksRoot = join(getRuntimeHomePath(), "hooks");
-		const relativePath = relative(hooksRoot, directory);
-		if (!relativePath || relativePath.startsWith("..") || isAbsolute(relativePath)) {
-			return;
-		}
-		await rm(directory, { recursive: true, force: true }).catch(() => {
-			// Best effort: a leftover generated file is never worth failing a teardown.
-		});
-	};
-}
-
-interface ScopedHookResources {
-	/** Directory holding this attempt's generated integration files. */
-	directory: string;
-	/** Tear-down hook that removes only this attempt's directory. */
-	cleanup: () => Promise<void>;
-}
-
-function createScopedHookResources(agentId: RuntimeAgentId, hooks: HookContext): ScopedHookResources {
-	const directory = getScopedHookAgentDirectory(agentId, hooks);
-	return { directory, cleanup: createHookResourceCleanup(directory) };
-}
-
 /**
  * Kiro keeps its agent definitions in a directory Kiro owns, so its generated
  * file cannot live in the per-attempt directory and is removed individually.
@@ -674,31 +582,6 @@ function getKiroKanbanAgentName(taskId: string): string {
 
 function getKiroAgentConfigPath(taskId: string): string {
 	return join(homedir(), ".kiro", "agents", `${getKiroKanbanAgentName(taskId)}.json`);
-}
-
-async function ensureTextFile(filePath: string, content: string, executable = false): Promise<void> {
-	await lockedFileSystem.writeTextFileAtomic(filePath, content, {
-		executable,
-	});
-}
-
-function withPrompt(args: string[], prompt: string, mode: "append" | "flag", flag?: string): PreparedAgentLaunch {
-	const trimmed = prompt.trim();
-	if (!trimmed) {
-		return {
-			args,
-			env: {},
-		};
-	}
-	if (mode === "flag" && flag) {
-		args.push(flag, trimmed);
-	} else {
-		args.push(trimmed);
-	}
-	return {
-		args,
-		env: {},
-	};
 }
 
 function toBracketedPasteSubmission(command: string): string {
@@ -1519,6 +1402,7 @@ const ADAPTERS: Record<RuntimeAgentId, AgentSessionAdapter> = {
 	opencode: opencodeAdapter,
 	droid: droidAdapter,
 	kiro: kiroAdapter,
+	pi: piAdapter,
 	cline: clineAdapter,
 };
 

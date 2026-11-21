@@ -1,7 +1,10 @@
 # Add Pi to Kanban
 
-Status: planned; documentation only.
-Depends on [AA-S1 in shared.md](./shared.md). Inspection baseline:
+Status: AA-P1 implemented in this repository (terminal launch, exact-session resume,
+task-scoped lifecycle extension, capability and configuration contracts, settings and
+onboarding surface). Pi's JSON/RPC mode remains deferred; see
+“Future RPC integration boundary”.
+Depends on [AA-S1 in shared.md](./shared.md). Planning inspection baseline:
 `e7b2097af06364b01410c6b69d353d52d22a6aa4`, 2026-11-19.
 Benchmark context and evaluation protocol are in [shared.md](./shared.md).
 
@@ -39,12 +42,113 @@ ADAPTERS map. Initial additions touch these surfaces:
 | `web-ui/src/components/runtime-settings-dialog.tsx` | Explicit Pi order and clear agent-native configuration instructions |
 | Existing terminal/session/settings tests | Add Pi cases and retain exhaustive identity coverage |
 
-Proposed new modules, names to align during implementation:
-`src/terminal/pi-session-adapter.ts`, `pi-paths.ts` and
-`pi-hook-extension.ts`. Do not enlarge the monolithic adapter file with the full
-extension source or create a parallel task/session store.
+New modules shipped as `src/terminal/pi-session-options.ts` (paths, session identity and
+launch arguments; this is what the plan sketched as `pi-paths.ts`),
+`src/terminal/pi-session-adapter.ts` and `src/terminal/pi-hook-extension.ts`, with the
+shared launch helpers extracted into `src/terminal/agent-launch-helpers.ts`. The
+monolithic adapter file keeps only the exhaustive `ADAPTERS` registration, and no parallel
+task/session store was created.
+
+## Implementation status (AA-P1)
+
+### What shipped
+
+| Surface | Owned behaviour |
+| --- | --- |
+| `src/core/api-contract.ts` | `pi` added to `runtimeAgentIdSchema` (ordered before `cline`), so persisted cards, board state and API validation accept it |
+| `src/core/agent-catalog.ts` | Pi entry (`label: "Pi"`, `binary: "pi"`, empty `baseArgs`, empty `autonomousArgs` because Pi has no bypass flag, upstream install URL) and membership in `RUNTIME_LAUNCH_SUPPORTED_AGENT_IDS`, which is what makes it selectable and launchable |
+| `src/core/agent-capabilities.ts` | Pi capability row (terminal presentation, explicit session resume, images, `planMode: "none"`, `approvalMode: "none"`, hook completion, automated delivery) and the agent-native model configuration (locations `~/.pi/agent/settings.json`, `~/.pi/agent/auth.json`, `~/.pi/agent/models.json`; note that Pi owns its model and runs tool calls without an approval prompt) |
+| `src/config/runtime-config.ts` | `normalizeAgentId` is now schema-driven instead of a hand-maintained `||` chain, so adding an agent never means editing that list |
+| `src/terminal/pi-session-options.ts` | Pi session id derivation, Kanban-owned session directory, launch-argument builder, Pi-settings default provider/model read, durable session-record read |
+| `src/terminal/pi-session-adapter.ts` | `preparePiLaunch` (plan-mode refusal, exact-session flags, generated extension, forwarded model, attempt-scoped teardown) and `piAdapter` |
+| `src/terminal/agent-session-adapters.ts`, `src/terminal/agent-launch-helpers.ts` | Pi registered in the exhaustive `ADAPTERS` map; the shared launch helpers (`resolveHookContext`, `createScopedHookResources`, `ensureTextFile`, `withPrompt`, `hasCliOption`, `toResourceScopeSegment`) moved out of the monolithic adapter file so the Pi module does not enlarge it |
+| `src/terminal/pi-hook-extension.ts` | The Kanban-owned extension source, generated per launch attempt and loaded with `--extension` |
+| `src/commands/hook-events/pi-hook-events.ts`, `src/commands/hooks.ts` | `normalizePiHookMetadata` for `source: "pi"` notifications, so Pi wording is owned by the Pi normalizer instead of shared heuristics |
+| `src/prompts/append-system-prompt.ts` | Pi in the append-prompt agent list plus its own Linear MCP guidance line (`pi mcp add linear --url ...`, then `pi mcp login linear`) |
+| `web-ui/src/components/runtime-settings-dialog.tsx` | Pi in the settings agent order and a model-configuration line under each agent-native row |
+| `web-ui/src/components/task-start-agent-onboarding-carousel.tsx` | Pi in the onboarding agent order with install copy that names its own `~/.pi/agent` configuration |
+| Tests | `test/runtime/pi-hook-events.test.ts` (7), `test/runtime/terminal/pi-session-adapter.test.ts` (16), `test/runtime/terminal/pi-hook-extension.test.ts` (11, runs the generated extension against a recorder stand-in for `kanban hooks notify`, including a recovered tool error and the dialog round-trip), updated `test/runtime/core/agent-capabilities.test.ts` and `test/runtime/terminal/agent-registry.test.ts` (exhaustive identity coverage, catalog-sized PATH probe count) |
+
+### Launch contract actually implemented
+
+- Session: `derivePiSessionId` mints `kanban-<hex>` from workspace + task, which satisfies
+  the documented `--session-id` charset (letters, numbers, `.`, `_`, `-`, starting and
+  ending alphanumeric). Sessions live in a Kanban-owned directory per workspace/task,
+  passed with `--session-dir`; Kanban never uses `--continue`/`--resume` and never
+  rewrites `PI_CODING_AGENT_SESSION_DIR`.
+- A user-supplied session selection (`--session`, `--continue`, `--resume`), trust choice
+  or model choice is left untouched, because `--session-id` cannot legally be combined
+  with those session flags.
+- `--no-approve` is the default so an unattended run cannot trust project-local `.pi`
+  resources inside a worktree; `--approve` from the user wins.
+- The task prompt is appended as a positional message after `--`, so a task that starts
+  with a dash cannot be read as an option.
+- Model: only Pi's own `defaultProvider`/`defaultModel` from its settings (or
+  `PI_CODING_AGENT_DIR`) are forwarded, and only as `--provider X --model Y` or bare
+  `--model Y`. Pi's documented rule that `--provider` requires `--model` is respected, no
+  Kanban-side provider name is invented, and no credential ever enters argv, env, board
+  state or a generated file.
+- Completion: `agent_settled` is the only end-of-turn signal, and only when no
+  continuation is queued. A failed tool call is never the turn outcome by itself — a red
+  test run, an empty grep or a retried edit stays activity metadata, and the next
+  assistant message without an error signal clears it. Only a failure still standing when
+  the run settles (an assistant message with `stopReason: "error"` or `error`, or a turn
+  that stops immediately after a failed tool call) is reported as an error.
+- A blocking extension dialog (`ui_prompt_start` / `ui_prompt_end`) moves the card to
+  Review while the terminal waits for the user and back to In Progress when it closes,
+  because Pi does not fire `agent_start` again mid-run. A close with no matching start, or
+  one that arrives after the turn already settled, moves nothing.
+- An errored or aborted turn deliberately stays In Progress instead of moving to Review:
+  `to_review` through the hook boundary is always `reviewReason: "hook"`, which fires the
+  review-ready notification and captures a review checkpoint, so it would advertise failed
+  work as ready to review. The failure is reported as activity with
+  `notification-type: error` and the reason instead. Showing "needs you, but is not
+  review-ready" would require a review reason in the hook contract, which affects every
+  agent and is outside AA-P1.
+
+### Deliberately not implemented
+
+- No Pi version is pinned or claimed. The generated extension emits
+  `pi_agent_version: null` because Kanban does not shell out to `pi --version` per launch;
+  unknown usage stays unknown.
+- No isolated `models.json`/provider config is generated for the local endpoint. An
+  endpoint is Pi's own configuration, so Kanban reads Pi's decision instead of writing
+  Pi's files (this replaces the earlier "isolated agent dir" sketch: no
+  `getPiIsolatedAgentDir` / `buildPiIsolatedModelConfig` exists).
+- Kanban's global "bypass permissions" setting is not translated into a Pi flag. Pi has
+  none; the absence is disclosed in the capabilities note and in the model-configuration
+  line shown under the Pi row in settings.
+- JSON/RPC mode, structured chat and native tool cards stay deferred (see below).
+- AA-E1 benchmark work is not part of this change.
+
+### Verification actually performed
+
+- `npm run typecheck`, `npm run lint` (Biome) and `web-ui` `npm run typecheck` are clean.
+  `npx vitest run test/runtime test/utilities` reports 1988 passing tests and `web-ui`
+  `npx vitest run` reports 792. The only failure in this environment was the known
+  environment-dependent `test/runtime/server/middleware.test.ts` host/origin case (it
+  compares against the ambient runtime host and port); the live-fetch
+  `test/runtime/cline-sdk/cline-editor-transport-capture.test.ts` case is an intermittent
+  loaded-runner flake. Neither is Pi-related.
+- Upstream facts were re-checked against `earendil-works/pi` documentation
+  (2026-11-21): the flags `--session-dir`, `--session-id`, `-e/--extension`,
+  `-na/--no-approve`, `--provider`, `--model` and the `pi mcp add --url` form in
+  `packages/coding-agent/docs/cli.md`, and the events `session_start`,
+  `session_before_switch`, `session_before_fork`, `agent_start`, `agent_settled`,
+  `message_end`, `tool_execution_end`, `model_select`, `ui_prompt_start`, `ui_prompt_end`
+  in `packages/coding-agent/docs/extensions.md`.
+- **Not performed here:** the manual smoke table below. No `pi` binary is installed in the
+  implementation environment, so every Pi assertion above is exercised by unit tests
+  against a recorder stand-in or an in-process fake, not by a live Pi process. Run the
+  smoke list on a host with Pi installed (and one local endpoint) before describing Pi as
+  verified end to end.
+
 
 ## Implementation slices
+
+Implemented as designed, except where “Deliberately not implemented” above records a
+deviation: no release was pinned (AA-P1a step 1) and no isolated Pi configuration
+directory is generated (AA-P1a step 3), because Pi's own configuration is the contract.
 
 ### AA-P1a: version contract, identity and configuration
 
