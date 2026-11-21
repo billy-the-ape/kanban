@@ -67,7 +67,7 @@ task/session store was created.
 | `src/prompts/append-system-prompt.ts` | Pi in the append-prompt agent list plus its own Linear MCP guidance line (`pi mcp add linear --url ...`, then `pi mcp login linear`) |
 | `web-ui/src/components/runtime-settings-dialog.tsx` | Pi in the settings agent order and a model-configuration line under each agent-native row |
 | `web-ui/src/components/task-start-agent-onboarding-carousel.tsx` | Pi in the onboarding agent order with install copy that names its own `~/.pi/agent` configuration |
-| Tests | `test/runtime/pi-hook-events.test.ts` (6), `test/runtime/terminal/pi-session-adapter.test.ts` (16), `test/runtime/terminal/pi-hook-extension.test.ts` (11, runs the generated extension against a recorder stand-in for `kanban hooks notify`, including a recovered tool error and the dialog round-trip), updated `test/runtime/core/agent-capabilities.test.ts` and `test/runtime/terminal/agent-registry.test.ts` (exhaustive identity coverage, catalog-sized PATH probe count) |
+| Tests | `test/runtime/pi-hook-events.test.ts` (7), `test/runtime/terminal/pi-session-adapter.test.ts` (16), `test/runtime/terminal/pi-hook-extension.test.ts` (11, runs the generated extension against a recorder stand-in for `kanban hooks notify`, including a recovered tool error and the dialog round-trip), updated `test/runtime/core/agent-capabilities.test.ts` and `test/runtime/terminal/agent-registry.test.ts` (exhaustive identity coverage, catalog-sized PATH probe count) |
 
 ### Launch contract actually implemented
 

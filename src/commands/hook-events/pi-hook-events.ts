@@ -55,6 +55,8 @@ function inferPiActivityText(args: {
 		}
 		case "ui_prompt_start":
 			return "Pi is waiting for input in the terminal";
+		case "ui_prompt_end":
+			return "Pi resumed the turn after the terminal prompt";
 		case "agent_settled": {
 			if (notificationType === "aborted") {
 				return "Pi stopped before finishing the turn";

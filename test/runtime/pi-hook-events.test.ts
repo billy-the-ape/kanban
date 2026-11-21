@@ -86,6 +86,31 @@ describe("normalizePiHookMetadata", () => {
 		});
 	});
 
+	it("labels both halves of a blocking terminal dialog", () => {
+		const waiting = normalizePiHookMetadata({
+			event: "to_review",
+			sourceHint: "pi",
+			flagMetadata: {},
+			payload: { hook_event_name: "ui_prompt_start", notification_type: "permission_prompt" },
+		});
+		const resumed = normalizePiHookMetadata({
+			event: "to_in_progress",
+			sourceHint: "pi",
+			flagMetadata: {},
+			payload: { hook_event_name: "ui_prompt_end" },
+		});
+
+		expect(waiting).toMatchObject({
+			hookEventName: "ui_prompt_start",
+			notificationType: "permission_prompt",
+			activityText: "Pi is waiting for input in the terminal",
+		});
+		expect(resumed).toMatchObject({
+			hookEventName: "ui_prompt_end",
+			activityText: "Pi resumed the turn after the terminal prompt",
+		});
+	});
+
 	it("never repeats raw Pi payload text it cannot label", () => {
 		const metadata = normalizePiHookMetadata({
 			event: "activity",
