@@ -1,8 +1,7 @@
 import { createHash } from "node:crypto";
-import { access, readFile, rm } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative } from "node:path";
-import { pathToFileURL } from "node:url";
 
 import type {
 	RuntimeAgentId,
@@ -18,10 +17,18 @@ import { getRuntimeHomePath } from "../state/workspace-state";
 import { configureCodexHooks, hasCodexConfigOverride } from "./codex-hook-config";
 import { createHookRuntimeEnv } from "./hook-runtime-context";
 import {
-	getOpenCodeAuthPathCandidates,
-	getOpenCodeConfigPathCandidates,
-	getOpenCodeModelStatePathCandidates,
-} from "./opencode-paths";
+	buildOpenCodeOverlayConfigContent,
+	buildOpenCodePluginManifestContent,
+	describeOpenCodeCompatibility,
+	formatOpenCodeVersion,
+	getOpenCodeOverlayLayout,
+	isOpenCodeSessionSelector,
+	KANBAN_OPENCODE_SESSION_ID_ENV,
+	probeOpenCodeVersion,
+	resolveOpenCodeModelSelection,
+	verifyOpenCodeSession,
+} from "./opencode-integration";
+import { buildOpenCodePluginSource } from "./opencode-plugin-source";
 import { stripAnsi } from "./output-utils";
 import type { SessionTransitionEvent } from "./session-state-machine";
 import { prepareTaskPromptWithImages } from "./task-image-prompt";
@@ -45,6 +52,13 @@ export interface AgentAdapterLaunchInput {
 	 * hook environment so events from a superseded attempt can be rejected.
 	 */
 	attemptId?: string;
+	/**
+	 * AA-O1a: the external session id Kanban recorded for this card from the
+	 * agent's own events. A resume-intent launch must name this session instead
+	 * of relying on the CLI's "most recent session" behaviour; adapters that
+	 * cannot resume exactly what they are given say so with `explicitSessionResume`.
+	 */
+	externalSessionId?: string | null;
 }
 
 export type AgentOutputTransitionDetector = (
@@ -62,6 +76,11 @@ export interface PreparedAgentLaunch {
 	deferredStartupInput?: string;
 	detectOutputTransition?: AgentOutputTransitionDetector;
 	shouldInspectOutputForTransition?: AgentOutputTransitionInspectionPredicate;
+	/**
+	 * A request the adapter could not fully honor, surfaced on the session
+	 * summary instead of being dropped in silence.
+	 */
+	warningMessage?: string;
 }
 
 interface HookContext {
@@ -80,10 +99,6 @@ interface HookCommandMetadata {
 
 interface AgentSessionAdapter {
 	prepare(input: AgentAdapterLaunchInput): Promise<PreparedAgentLaunch>;
-}
-
-function escapeForTemplateLiteral(value: string): string {
-	return value.replaceAll("\\", "\\\\").replaceAll("`", "\\`");
 }
 
 function powerShellQuote(value: string): string {
@@ -273,305 +288,6 @@ if printf '%s' "$INPUT" | grep -Eq '"(toolName|tool)"[[:space:]]*:[[:space:]]*"(
   printf '%s' "$INPUT" | ${inProgress} >/dev/null 2>&1 || true
 fi
 echo '{"cancel":false}'
-`;
-}
-
-function buildOpenCodePluginContent(
-	reviewCommand: string,
-	toInProgressCommand: string,
-	activityCommand: string,
-): string {
-	const reviewCmd = escapeForTemplateLiteral(reviewCommand);
-	const toInProgressCmd = escapeForTemplateLiteral(toInProgressCommand);
-	const activityCmd = escapeForTemplateLiteral(activityCommand);
-	return `export const KanbanPlugin = async ({ $, client }) => {
-  if (globalThis.__kanbanOpencodePluginV3) return {};
-  globalThis.__kanbanOpencodePluginV3 = true;
-
-  if (!process?.env?.KANBAN_HOOK_TASK_ID) return {};
-
-  let currentState = "idle";
-  let rootSessionID = null;
-  const childSessionCache = new Map();
-  const messageRoleByID = new Map();
-  const assistantTextByMessageID = new Map();
-  const latestAssistantBySessionID = new Map();
-  const toolInputByCallID = new Map();
-
-  const asRecord = (value) => {
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      return null;
-    }
-    return value;
-  };
-
-  const getMessageKey = (sessionID, messageID) => String(sessionID) + ":" + String(messageID);
-  const getToolCallKey = (sessionID, callID) => String(sessionID) + ":" + String(callID);
-
-  const encodePayload = (payload) => {
-    if (!payload || typeof payload !== "object") {
-      return "";
-    }
-    try {
-      return Buffer.from(JSON.stringify(payload), "utf8").toString("base64");
-    } catch {
-      return "";
-    }
-  };
-
-	const notify = async (kind, payload) => {
-		try {
-			const encoded = encodePayload(payload);
-			if (kind === "review") {
-				if (encoded) {
-					await $\`${reviewCmd} --metadata-base64 \${encoded}\`;
-				} else {
-					await $\`${reviewCmd}\`;
-				}
-				return;
-			}
-			if (kind === "in_progress") {
-				if (encoded) {
-					await $\`${toInProgressCmd} --metadata-base64 \${encoded}\`;
-				} else {
-					await $\`${toInProgressCmd}\`;
-				}
-				return;
-			}
-			if (encoded) {
-				await $\`${activityCmd} --metadata-base64 \${encoded}\`;
-			} else {
-				await $\`${activityCmd}\`;
-			}
-		} catch {
-			// Best effort: hook errors should never break OpenCode event handling.
-		}
-	};
-
-  const notifyReview = async (sessionID, payload = {}) => {
-    const mergedPayload = {
-      ...payload,
-      last_assistant_message:
-        typeof payload.last_assistant_message === "string"
-          ? payload.last_assistant_message
-          : (latestAssistantBySessionID.get(sessionID) ?? undefined),
-    };
-		await notify("review", mergedPayload);
-  };
-
-  const notifyInProgress = async (payload = {}) => {
-		await notify("in_progress", payload);
-  };
-
-  const notifyActivity = async (payload = {}) => {
-		await notify("activity", payload);
-  };
-
-  const isChildSession = async (sessionID) => {
-    if (!sessionID) return true;
-    if (!client?.session?.list) return true;
-    if (childSessionCache.has(sessionID)) {
-      return childSessionCache.get(sessionID);
-    }
-    try {
-      const sessions = await client.session.list();
-      const session = sessions.data?.find((candidate) => candidate.id === sessionID);
-      const isChild = !!session?.parentID;
-      childSessionCache.set(sessionID, isChild);
-      return isChild;
-    } catch {
-      return true;
-    }
-  };
-
-  const handleBusy = async (sessionID) => {
-    if (!sessionID) {
-      return;
-    }
-    if (!rootSessionID) {
-      rootSessionID = sessionID;
-    }
-    if (sessionID !== rootSessionID) {
-      return;
-    }
-    if (currentState === "idle") {
-      currentState = "busy";
-      await notifyInProgress({
-        hook_event_name: "session.status",
-      });
-    }
-  };
-
-  const handleReview = async (sessionID, payload = {}, force = false) => {
-    if (!sessionID) {
-      return;
-    }
-    if (!rootSessionID) {
-      rootSessionID = sessionID;
-    }
-    if (rootSessionID && sessionID !== rootSessionID) {
-      return;
-    }
-
-    const shouldNotify = force || currentState === "busy";
-    if (shouldNotify) {
-      currentState = "idle";
-      await notifyReview(sessionID, payload);
-      rootSessionID = null;
-    }
-  };
-
-  return {
-    event: async ({ event }) => {
-      if (event.type === "message.updated") {
-        const info = asRecord(event.properties?.info);
-        const sessionID = typeof info?.sessionID === "string" ? info.sessionID : null;
-        if (await isChildSession(sessionID)) {
-          return;
-        }
-
-        const messageID = typeof info?.id === "string" ? info.id : null;
-        const role = typeof info?.role === "string" ? info.role : null;
-        if (messageID && role) {
-          messageRoleByID.set(getMessageKey(sessionID, messageID), role);
-          if (role === "assistant" && !assistantTextByMessageID.has(getMessageKey(sessionID, messageID))) {
-            assistantTextByMessageID.set(getMessageKey(sessionID, messageID), "");
-          }
-        }
-        return;
-      }
-
-      if (event.type === "message.part.updated") {
-        const part = asRecord(event.properties?.part);
-        if (!part) {
-          return;
-        }
-
-        const sessionID = typeof part.sessionID === "string" ? part.sessionID : null;
-        if (await isChildSession(sessionID)) {
-          return;
-        }
-
-        if (part.type !== "text") {
-          return;
-        }
-
-        const messageID = typeof part.messageID === "string" ? part.messageID : null;
-        if (!messageID) {
-          return;
-        }
-
-        const messageKey = getMessageKey(sessionID, messageID);
-        if (messageRoleByID.get(messageKey) !== "assistant") {
-          return;
-        }
-
-        const delta = typeof event.properties?.delta === "string" ? event.properties.delta : "";
-        const fullText = typeof part.text === "string" ? part.text : "";
-        const previousText = assistantTextByMessageID.get(messageKey) ?? "";
-        const nextText = delta ? previousText + delta : (fullText || previousText);
-        const normalized = nextText.trim();
-        if (!normalized) {
-          return;
-        }
-
-        assistantTextByMessageID.set(messageKey, normalized);
-        latestAssistantBySessionID.set(sessionID, normalized);
-        return;
-      }
-
-      const sessionID = event.properties?.sessionID;
-      if (await isChildSession(sessionID)) {
-        return;
-      }
-
-      if (event.type === "session.status") {
-        const status = event.properties?.status;
-        if (status?.type === "busy") {
-          await handleBusy(sessionID);
-        } else if (status?.type === "idle") {
-          await handleReview(sessionID, {
-            hook_event_name: "session.status",
-          });
-        }
-      }
-
-      if (event.type === "session.busy") {
-        await handleBusy(sessionID);
-      }
-      if (event.type === "session.idle") {
-        await handleReview(sessionID, {
-          hook_event_name: "session.idle",
-        });
-      }
-      if (event.type === "session.error") {
-        await handleReview(
-          sessionID,
-          {
-            hook_event_name: "session.error",
-          },
-          true,
-        );
-      }
-    },
-    "tool.execute.before": async (input, output) => {
-      const sessionID = typeof input?.sessionID === "string" ? input.sessionID : null;
-      if (await isChildSession(sessionID)) {
-        return;
-      }
-
-      await handleBusy(sessionID);
-
-      const toolName = typeof input?.tool === "string" ? input.tool : undefined;
-      const callID = typeof input?.callID === "string" ? input.callID : "";
-      const toolInput = asRecord(output?.args);
-      if (callID) {
-        toolInputByCallID.set(getToolCallKey(sessionID, callID), toolInput);
-      }
-
-      await notifyActivity({
-        hook_event_name: "BeforeTool",
-        tool_name: toolName,
-        tool_input: toolInput ?? undefined,
-      });
-    },
-    "tool.execute.after": async (input) => {
-      const sessionID = typeof input?.sessionID === "string" ? input.sessionID : null;
-      if (await isChildSession(sessionID)) {
-        return;
-      }
-
-      const toolName = typeof input?.tool === "string" ? input.tool : undefined;
-      const callID = typeof input?.callID === "string" ? input.callID : "";
-      const toolInput = callID ? toolInputByCallID.get(getToolCallKey(sessionID, callID)) : null;
-      if (callID) {
-        toolInputByCallID.delete(getToolCallKey(sessionID, callID));
-      }
-
-      await notifyActivity({
-        hook_event_name: "AfterTool",
-        tool_name: toolName,
-        tool_input: toolInput ?? undefined,
-      });
-    },
-    "permission.ask": async (_permission, output) => {
-      if (output?.status === "ask") {
-        const sessionID = typeof _permission?.sessionID === "string" ? _permission.sessionID : null;
-        if (await isChildSession(sessionID)) {
-          return;
-        }
-        await handleReview(
-          sessionID,
-          {
-            hook_event_name: "PermissionRequest",
-            notification_type: "permission.asked",
-          },
-          true,
-        );
-      }
-    },
-  };
-};
 `;
 }
 
@@ -972,294 +688,140 @@ const geminiAdapter: AgentSessionAdapter = {
 	},
 };
 
-async function resolveOpenCodeBaseConfigPath(explicitPath: string | undefined): Promise<string | null> {
-	const candidates = getOpenCodeConfigPathCandidates({ explicitPath });
-	for (const candidate of candidates) {
-		try {
-			await access(candidate);
-			return candidate;
-		} catch {
-			// Keep searching.
-		}
-	}
-	return null;
-}
+/** AA-O1a: Kanban drives the interactive TUI, so the command is the CLI itself. */
+const OPENCODE_DEFAULT_BINARY = "opencode";
 
-function hasOpenCodeModelArg(args: string[]): boolean {
-	for (const arg of args) {
-		if (arg === "--model" || arg === "-m") {
-			return true;
-		}
-		if (arg.startsWith("--model=") || arg.startsWith("-m=")) {
-			return true;
-		}
-	}
-	return false;
-}
-
-function hasOpenCodeAgentArg(args: string[]): boolean {
-	for (const arg of args) {
-		if (arg === "--agent") {
-			return true;
-		}
-		if (arg.startsWith("--agent=")) {
-			return true;
-		}
-	}
-	return false;
-}
-
-function normalizeOpenCodeModel(providerId: string, modelId: string): string {
-	if (modelId.startsWith(`${providerId}/`)) {
-		return modelId;
-	}
-	return `${providerId}/${modelId}`;
-}
-
-function stripJsonComments(input: string): string {
-	let output = "";
-	let inString = false;
-	let escaped = false;
-	let inLineComment = false;
-	let inBlockComment = false;
-
-	for (let i = 0; i < input.length; i += 1) {
-		const current = input[i];
-		const next = i + 1 < input.length ? input[i + 1] : "";
-
-		if (inLineComment) {
-			if (current === "\n") {
-				inLineComment = false;
-				output += current;
-			}
-			continue;
-		}
-		if (inBlockComment) {
-			if (current === "*" && next === "/") {
-				inBlockComment = false;
-				i += 1;
-			}
-			continue;
-		}
-		if (!inString && current === "/" && next === "/") {
-			inLineComment = true;
-			i += 1;
-			continue;
-		}
-		if (!inString && current === "/" && next === "*") {
-			inBlockComment = true;
-			i += 1;
-			continue;
-		}
-
-		output += current;
-		if (inString) {
-			if (escaped) {
-				escaped = false;
-			} else if (current === "\\") {
-				escaped = true;
-			} else if (current === '"') {
-				inString = false;
-			}
-			continue;
-		}
-		if (current === '"') {
-			inString = true;
-		}
-	}
-	return output;
-}
-
-function tryExtractOpenCodeModelFromConfig(rawConfig: string): string | null {
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(rawConfig);
-	} catch {
-		try {
-			parsed = JSON.parse(stripJsonComments(rawConfig));
-		} catch {
-			return null;
-		}
-	}
-	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-		return null;
-	}
-	const root = parsed as Record<string, unknown>;
-
-	const directModel = root.model;
-	if (typeof directModel === "string" && directModel.trim()) {
-		return directModel.trim();
-	}
-
-	const mode = root.mode;
-	if (mode && typeof mode === "object" && !Array.isArray(mode)) {
-		const build = (mode as Record<string, unknown>).build;
-		if (build && typeof build === "object" && !Array.isArray(build)) {
-			const model = (build as Record<string, unknown>).model;
-			if (typeof model === "string" && model.trim()) {
-				return model.trim();
-			}
-		}
-	}
-
-	const agent = root.agent;
-	if (agent && typeof agent === "object" && !Array.isArray(agent)) {
-		const build = (agent as Record<string, unknown>).build;
-		if (build && typeof build === "object" && !Array.isArray(build)) {
-			const model = (build as Record<string, unknown>).model;
-			if (typeof model === "string" && model.trim()) {
-				return model.trim();
-			}
-		}
-	}
-
-	return null;
-}
-
-async function resolveOpenCodePreferredModelArg(configPath: string | null): Promise<string | null> {
-	if (configPath) {
-		try {
-			const rawConfig = await readFile(configPath, "utf8");
-			const modelFromConfig = tryExtractOpenCodeModelFromConfig(rawConfig);
-			if (modelFromConfig) {
-				return modelFromConfig;
-			}
-		} catch {
-			// Fall through to state-based fallback.
-		}
-	}
-
-	const modelStateCandidates = getOpenCodeModelStatePathCandidates();
-	let recentModels: Array<{ providerID?: unknown; modelID?: unknown }> = [];
-	for (const modelStatePath of modelStateCandidates) {
-		try {
-			const raw = await readFile(modelStatePath, "utf8");
-			const parsed = JSON.parse(raw) as { recent?: Array<{ providerID?: unknown; modelID?: unknown }> };
-			if (Array.isArray(parsed.recent)) {
-				recentModels = parsed.recent;
-				break;
-			}
-		} catch {
-			// Keep searching through candidate state paths.
-		}
-	}
-	if (recentModels.length === 0) {
-		return null;
-	}
-
-	const configuredProviders = new Set<string>();
-	for (const authPath of getOpenCodeAuthPathCandidates()) {
-		try {
-			const raw = await readFile(authPath, "utf8");
-			const parsed = JSON.parse(raw) as Record<string, unknown>;
-			for (const [provider, value] of Object.entries(parsed)) {
-				if (!value || typeof value !== "object" || Array.isArray(value)) {
-					continue;
-				}
-				const key = (value as Record<string, unknown>).key;
-				if (typeof key === "string" && key.trim()) {
-					configuredProviders.add(provider);
-				}
-			}
-			break;
-		} catch {
-			// Keep searching through candidate auth paths.
-		}
-	}
-
-	const candidates: Array<{ providerId: string; model: string }> = [];
-	for (const entry of recentModels) {
-		const providerId = typeof entry.providerID === "string" ? entry.providerID.trim() : "";
-		const modelId = typeof entry.modelID === "string" ? entry.modelID.trim() : "";
-		if (!providerId || !modelId) {
-			continue;
-		}
-		candidates.push({ providerId, model: normalizeOpenCodeModel(providerId, modelId) });
-	}
-	if (candidates.length === 0) {
-		return null;
-	}
-
-	const preferredProviderOrder = ["openrouter", "anthropic", "openai", "opencode", "google", "amazon-bedrock"];
-	for (const providerId of preferredProviderOrder) {
-		const match = candidates.find((candidate) => candidate.providerId === providerId);
-		if (!match) {
-			continue;
-		}
-		if (configuredProviders.size === 0 || configuredProviders.has(providerId)) {
-			return match.model;
-		}
-	}
-
-	const configuredMatch = candidates.find((candidate) => configuredProviders.has(candidate.providerId));
-	if (configuredMatch) {
-		return configuredMatch.model;
-	}
-
-	return candidates[0].model;
-}
-
+/**
+ * AA-O1: OpenCode launch policy for the pinned release.
+ *
+ * The flags below are the ones `opencode --help` documents for 1.19.6:
+ * `--session <id>` continues one exact session, `--agent plan` selects the
+ * built-in read-only agent, `--auto` is the autonomous switch, and `--prompt`
+ * seeds the first message. `--continue` is deliberately absent: it follows
+ * whichever session OpenCode touched last, which is a different conversation
+ * than this card owns as soon as two OpenCode tasks run in the same project.
+ */
 const opencodeAdapter: AgentSessionAdapter = {
 	async prepare(input) {
 		const args = [...input.args];
 		const env: Record<string, string | undefined> = {};
-		const baseConfigPath = await resolveOpenCodeBaseConfigPath(input.env?.OPENCODE_CONFIG);
-		if (input.resumeFromTrash && !hasCliOption(args, "--continue")) {
-			args.push("--continue");
+		const binary = input.binary?.trim() || OPENCODE_DEFAULT_BINARY;
+		const warnings: string[] = [];
+
+		// Refuse an unsupported release before any session exists, so no card can
+		// be launched on flags or a plugin contract this adapter does not
+		// describe. An unreadable version stays allowed: install guidance beats
+		// blocking a CLI whose only crime is printing an unexpected version line.
+		const version = await probeOpenCodeVersion(binary, { cwd: input.cwd, env: input.env });
+		const compatibility = describeOpenCodeCompatibility(formatOpenCodeVersion(version));
+		if (compatibility.remediation) {
+			throw new Error(compatibility.remediation);
 		}
 
-		if (input.startInPlanMode) {
-			env.OPENCODE_EXPERIMENTAL_PLAN_MODE = "true";
-			if (!hasOpenCodeAgentArg(args)) {
-				args.push("--agent", "plan");
+		// AA-O1a: a resumed card names the session Kanban recorded from the
+		// agent's own events. Without that id there is nothing safe to resume, so
+		// the launch fails with the alternative instead of guessing.
+		const externalSessionId = input.externalSessionId?.trim() ?? "";
+		if (input.resumeFromTrash) {
+			if (!isOpenCodeSessionSelector(externalSessionId)) {
+				throw new Error(
+					`OpenCode cannot resume this card: Kanban has no OpenCode session id stored for it, and continuing the most recent session could attach the card to another task's conversation. Start a new OpenCode session for this card instead${compatibility.version ? ` (OpenCode ${formatOpenCodeVersion(compatibility.version)})` : ""}.`,
+				);
 			}
+			const sessionExists = await verifyOpenCodeSession(externalSessionId, {
+				binary,
+				cwd: input.cwd,
+				env: input.env,
+			});
+			if (sessionExists === false) {
+				throw new Error(
+					`OpenCode session ${externalSessionId} is not available in this workspace, so Kanban will not continue an unrelated session in its place. Start a new OpenCode session for this card.`,
+				);
+			}
+			args.push("--session", externalSessionId);
+		} else if (hasCliOption(args, "--continue")) {
+			// A command saved before AA-O1 can still carry `--continue`. Drop it:
+			// "most recent session" is not a per-card fact, and a card that needs
+			// its own conversation says so with `--session`.
+			const withoutContinue = args.filter((arg) => arg !== "--continue");
+			args.length = 0;
+			args.push(...withoutContinue);
+			warnings.push(
+				"Removed OpenCode's --continue flag from this launch: it follows the most recent session, which is not this card's session. Kanban resumes the recorded session id instead.",
+			);
+		}
+
+		if (input.startInPlanMode && !hasCliOption(args, "--agent")) {
+			// `plan` is a primary agent in this release, so the read-only start is
+			// one documented flag and no experimental configuration.
+			args.push("--agent", "plan");
+		}
+		if (input.autonomousModeEnabled && !hasCliOption(args, "--auto")) {
+			args.push("--auto");
 		}
 
 		const hooks = resolveHookContext(input);
 		const resources = hooks ? createScopedHookResources("opencode", hooks) : null;
 		if (hooks && resources) {
-			const pluginPath = join(resources.directory, "kanban.js");
-			const configPath = join(resources.directory, "opencode.json");
-
-			const pluginContent = buildOpenCodePluginContent(
-				buildHookCommand("to_review", { source: "opencode" }),
-				buildHookCommand("to_in_progress", { source: "opencode" }),
-				buildHookCommand("activity", { source: "opencode" }),
+			const overlay = getOpenCodeOverlayLayout(resources.directory);
+			await ensureTextFile(
+				overlay.entryPointPath,
+				buildOpenCodePluginSource({
+					reviewArgv: buildHooksCommandParts(["ingest", "--event", "to_review"]),
+					inProgressArgv: buildHooksCommandParts(["ingest", "--event", "to_in_progress"]),
+					activityArgv: buildHooksCommandParts(["ingest", "--event", "activity"]),
+				}),
 			);
-			await ensureTextFile(pluginPath, pluginContent);
-			const pluginFileUrl = pathToFileURL(pluginPath).href;
-			const config = {
-				plugin: [pluginFileUrl],
-			};
-			await ensureTextFile(configPath, JSON.stringify(config));
+			await ensureTextFile(overlay.manifestPath, buildOpenCodePluginManifestContent());
+			await ensureTextFile(overlay.configPath, buildOpenCodeOverlayConfigContent(overlay));
 			Object.assign(env, createHookRuntimeEnv(hooks));
-			env.OPENCODE_CONFIG = configPath;
-		}
-
-		// Workaround: with --prompt, OpenCode can pick an unexpected provider/model.
-		// Explicitly pass the user's preferred model so prompt runs stay on their usual provider.
-		if (!hasOpenCodeModelArg(args)) {
-			const preferredModel = await resolveOpenCodePreferredModelArg(baseConfigPath);
-			if (preferredModel) {
-				args.push("--model", preferredModel);
+			// The pinned release merges OPENCODE_CONFIG as an additional source, so
+			// pointing it at the overlay leaves the user's global and project
+			// configuration (providers, credentials, agents, MCP servers,
+			// instructions) in force; the overlay only adds the bridge.
+			env.OPENCODE_CONFIG = overlay.configPath;
+			// A task launch must never download a different OpenCode build behind
+			// the version check that just passed.
+			env.OPENCODE_DISABLE_AUTOUPDATE = "1";
+			if (input.resumeFromTrash && externalSessionId) {
+				// Only a real resume pins its root session: OpenCode starts a fresh
+				// conversation with a new id, and a bridge pinned to the id from the
+				// previous conversation would reject every event from the running one.
+				// Without a pin the bridge adopts the new session and reports its id,
+				// so another task's activity can still never move this card.
+				env[KANBAN_OPENCODE_SESSION_ID_ENV] = externalSessionId;
 			}
 		}
 
-		const cleanup = resources ? { cleanup: resources.cleanup } : {};
+		if (!hasCliOption(args, "--model") && !hasCliOption(args, "-m")) {
+			// AA-O1a: only an explicit selection is passed. That is the model the
+			// user selected in their own OpenCode configuration (or
+			// KANBAN_OPENCODE_MODEL); Kanban never derives one from a credential
+			// store or prefers a hosted provider. Without a selection OpenCode
+			// applies its own default, and a bad selector fails loudly in the CLI
+			// rather than silently switching provider.
+			const selection = await resolveOpenCodeModelSelection({ cwd: input.cwd, env: input.env });
+			if (selection.model) {
+				args.push("--model", selection.model);
+			}
+			if (selection.warning) {
+				warnings.push(selection.warning);
+			}
+		}
+
 		const trimmed = input.prompt.trim();
 		if (trimmed) {
+			// One argv element, so a multi-line or unicode prompt cannot be
+			// re-split by a shell. Kanban keeps the TUI rather than
+			// `run --format json` because the card must accept follow-up input.
 			args.push("--prompt", trimmed);
-			return {
-				args,
-				env,
-				...cleanup,
-			};
 		}
 
 		return {
 			args,
 			env,
-			...cleanup,
+			...(warnings.length > 0 ? { warningMessage: warnings.join(" ") } : {}),
+			...(resources ? { cleanup: resources.cleanup } : {}),
 		};
 	},
 };

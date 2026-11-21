@@ -9,6 +9,7 @@ import { prepareAgentLaunch } from "../../../src/terminal/agent-session-adapters
 const originalHome = process.env.HOME;
 const originalAppData = process.env.APPDATA;
 const originalLocalAppData = process.env.LOCALAPPDATA;
+const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
 let tempHome: string | null = null;
 const originalArgv = [...process.argv];
 const originalExecArgv = [...process.execArgv];
@@ -32,6 +33,14 @@ function setKanbanProcessContext(): void {
 function getCliFlagValue(args: string[], flag: string): string | null {
 	const index = args.indexOf(flag);
 	return index >= 0 ? (args[index + 1] ?? null) : null;
+}
+
+/**
+ * An empty workspace, so OpenCode model discovery cannot pick up a stray
+ * `opencode.json` left in a shared directory by another suite.
+ */
+function setupEmptyWorkspace(): string {
+	return mkdtempSync(join(tmpdir(), "kanban-opencode-workspace-"));
 }
 
 /**
@@ -115,6 +124,11 @@ afterEach(() => {
 		delete process.env.LOCALAPPDATA;
 	} else {
 		process.env.LOCALAPPDATA = originalLocalAppData;
+	}
+	if (originalXdgConfigHome === undefined) {
+		delete process.env.XDG_CONFIG_HOME;
+	} else {
+		process.env.XDG_CONFIG_HOME = originalXdgConfigHome;
 	}
 	process.argv = [...originalArgv];
 	process.execArgv = [...originalExecArgv];
@@ -287,7 +301,7 @@ describe("prepareAgentLaunch hook strategies", () => {
 		expect(existsSync(join(dirname(settingsPath), "gemini-hook.mjs"))).toBe(false);
 	});
 
-	it("writes OpenCode plugin with root-session filtering and permission hooks", async () => {
+	it("points OpenCode at a generated overlay plugin without touching user config", async () => {
 		setupTempHome();
 		const launch = await prepareAgentLaunch({
 			taskId: "task-1",
@@ -305,21 +319,38 @@ describe("prepareAgentLaunch hook strategies", () => {
 			taskId: "task-1",
 			attemptId: "attempt-1",
 		});
-		const pluginPath = join(dirname(configPath), "kanban.js");
-		const plugin = readFileSync(pluginPath, "utf8");
-		expect(plugin).toContain("parentID");
-		expect(plugin).toContain('"permission.ask"');
-		expect(plugin).toContain('"tool.execute.before"');
-		expect(plugin).toContain('"tool.execute.after"');
-		expect(plugin).toContain("session.status");
-		expect(plugin).toContain("message.part.updated");
-		expect(plugin).toContain("last_assistant_message");
-		expect(plugin).toContain("--metadata-base64");
-		expect(plugin).toContain('if (kind === "review")');
-		expect(plugin).toContain('currentState = "idle"');
+		// `OPENCODE_CONFIG` is merged as an extra source by the pinned release, so
+		// the overlay only has to add the bridge: it must not carry a model, agent
+		// or any other setting that would outrank the user's own configuration.
+		const overlay = JSON.parse(readFileSync(configPath, "utf8")) as { plugin?: unknown };
+		expect(Object.keys(overlay).sort()).toEqual(["$schema", "plugin"]);
+		const pluginDirectory = (overlay.plugin as string[])[0];
+		expect(pluginDirectory).toBeTypeOf("string");
+		const manifest = JSON.parse(readFileSync(join(pluginDirectory, "package.json"), "utf8")) as {
+			type?: string;
+			main?: string;
+		};
+		expect(manifest.type).toBe("module");
+		expect(manifest.main).toBe("./index.js");
+
+		const plugin = readFileSync(join(pluginDirectory, "index.js"), "utf8");
+		// The events the pinned release actually emits, and nothing else.
+		expect(plugin).toContain('"session.idle"');
+		expect(plugin).toContain('"session.error"');
+		expect(plugin).toContain('"permission.asked"');
+		expect(plugin).toContain('"message.part.updated"');
+		// AA-O1a: the bridge reports the session id it observed, so a later launch
+		// resumes this exact conversation.
+		expect(plugin).toContain("--session-id");
+		// AA-O1a: approval stays with the human - the bridge never answers a
+		// permission, it only parks the card.
+		expect(plugin).not.toContain("reply:");
+		expect(plugin).not.toContain('"always"');
+		// A task launch must not fetch another build behind the version check.
+		expect(launch.env.OPENCODE_DISABLE_AUTOUPDATE).toBe("1");
 	});
 
-	it("loads OpenCode preferred model from LOCALAPPDATA state and auth paths", async () => {
+	it("leaves the OpenCode model alone when only state and auth files exist", async () => {
 		const homePath = setupTempHome();
 		const localAppDataPath = join(homePath, "AppData", "Local");
 		process.env.LOCALAPPDATA = localAppDataPath;
@@ -355,18 +386,86 @@ describe("prepareAgentLaunch hook strategies", () => {
 			"utf8",
 		);
 
+		// AA-O1a: OpenCode's stored model state and credential files are not a
+		// selection the user made for this card. Inferring one here used to bill a
+		// hosted provider the local model design never chose, so Kanban now leaves
+		// the model to OpenCode instead of guessing.
 		const launch = await prepareAgentLaunch({
 			taskId: "task-opencode-model",
 			agentId: "opencode",
 			binary: "opencode",
 			args: [],
-			cwd: "/tmp",
+			cwd: setupEmptyWorkspace(),
 			prompt: "",
 		});
 
-		const modelIndex = launch.args.indexOf("--model");
-		expect(modelIndex).toBeGreaterThan(-1);
-		expect(launch.args[modelIndex + 1]).toBe("openai/gpt-4o");
+		expect(launch.args).not.toContain("--model");
+	});
+
+	it("passes an explicit OpenCode model selection and nothing invented", async () => {
+		setupTempHome();
+		const homePath = process.env.HOME;
+		const workspaceDir = setupEmptyWorkspace();
+		const configDir = join(homePath ?? "/tmp", ".config", "opencode");
+		// The variable outranks the `~/.config` default, so the test pins it to the
+		// temp home instead of the machine's real config directory.
+		process.env.XDG_CONFIG_HOME = join(homePath ?? "/tmp", ".config");
+		mkdirSync(configDir, { recursive: true });
+		writeFileSync(
+			join(configDir, "opencode.json"),
+			JSON.stringify({ model: "openrouter/anthropic/claude-sonnet-4.5" }, null, 2),
+			"utf8",
+		);
+
+		const fromAgentConfig = await prepareAgentLaunch({
+			taskId: "task-opencode-config-model",
+			agentId: "opencode",
+			binary: "opencode",
+			args: [],
+			cwd: workspaceDir,
+			prompt: "",
+		});
+		// A model the user selected in their own OpenCode config is honored as-is.
+		expect(getCliFlagValue(fromAgentConfig.args, "--model")).toBe("openrouter/anthropic/claude-sonnet-4.5");
+
+		// An operator override outranks it, so a fleet can pin a local endpoint.
+		const override = await prepareAgentLaunch({
+			taskId: "task-opencode-env-model",
+			agentId: "opencode",
+			binary: "opencode",
+			args: [],
+			cwd: workspaceDir,
+			prompt: "",
+			env: { KANBAN_OPENCODE_MODEL: "local/qwen3-coder" },
+		});
+		expect(getCliFlagValue(override.args, "--model")).toBe("local/qwen3-coder");
+
+		// A malformed override is reported, not repaired: falling back to a
+		// guessed provider is exactly what the AA-O1a policy refuses to do.
+		const invalid = await prepareAgentLaunch({
+			taskId: "task-opencode-invalid-model",
+			agentId: "opencode",
+			binary: "opencode",
+			args: [],
+			cwd: workspaceDir,
+			prompt: "",
+			env: { KANBAN_OPENCODE_MODEL: "qwen3-coder" },
+		});
+		expect(invalid.args).not.toContain("--model");
+		expect(invalid.warningMessage ?? "").toContain("KANBAN_OPENCODE_MODEL");
+		expect(invalid.warningMessage ?? "").toContain("not provider/model");
+
+		// A user-supplied flag always wins over anything Kanban would add.
+		const explicit = await prepareAgentLaunch({
+			taskId: "task-opencode-explicit-model",
+			agentId: "opencode",
+			binary: "opencode",
+			args: ["--model", "own/provider-model"],
+			cwd: workspaceDir,
+			prompt: "",
+			env: { KANBAN_OPENCODE_MODEL: "local/qwen3-coder" },
+		});
+		expect(getCliFlagValue(explicit.args, "--model")).toBe("own/provider-model");
 	});
 
 	it("writes Droid settings with hook transitions and runtime autonomy mode", async () => {
@@ -743,16 +842,20 @@ describe("prepareAgentLaunch hook strategies", () => {
 		});
 		expect(geminiLaunch.args).toEqual(expect.arrayContaining(["--resume", "latest"]));
 
-		const opencodeLaunch = await prepareAgentLaunch({
-			taskId: "task-opencode",
-			agentId: "opencode",
-			binary: "opencode",
-			args: [],
-			cwd: "/tmp",
-			prompt: "",
-			resumeFromTrash: true,
-		});
-		expect(opencodeLaunch.args).toContain("--continue");
+		// AA-O1a: OpenCode is refused rather than pointed at whichever session it
+		// touched last, which could be another card's conversation. Exact resume
+		// with a recorded session id is covered by its own test below.
+		await expect(
+			prepareAgentLaunch({
+				taskId: "task-opencode",
+				agentId: "opencode",
+				binary: "opencode",
+				args: [],
+				cwd: "/tmp",
+				prompt: "",
+				resumeFromTrash: true,
+			}),
+		).rejects.toThrow(/Start a new OpenCode session/);
 
 		const droidLaunch = await prepareAgentLaunch({
 			taskId: "task-droid",
@@ -786,6 +889,118 @@ describe("prepareAgentLaunch hook strategies", () => {
 			resumeFromTrash: true,
 		});
 		expect(clineLaunch.args).toContain("--continue");
+	});
+
+	it("resumes the OpenCode session Kanban recorded for the card", async () => {
+		setupTempHome();
+		const launch = await prepareAgentLaunch({
+			taskId: "task-opencode-resume",
+			agentId: "opencode",
+			binary: "opencode",
+			args: [],
+			cwd: setupEmptyWorkspace(),
+			prompt: "",
+			resumeFromTrash: true,
+			workspaceId: "workspace-1",
+			attemptId: "attempt-1",
+			externalSessionId: "ses_08f7c2a9b1eF4d",
+		});
+		// AA-O1a: the pinned release takes an exact session, so a resumed card
+		// names its own conversation instead of the most recent one.
+		expect(getCliFlagValue(launch.args, "--session")).toBe("ses_08f7c2a9b1eF4d");
+		expect(launch.args).not.toContain("--continue");
+		// The bridge pins the same session instead of adopting the first it sees.
+		expect(launch.env.KANBAN_OPENCODE_SESSION_ID).toBe("ses_08f7c2a9b1eF4d");
+	});
+	it("keeps a recorded session id from pinning a fresh OpenCode launch", async () => {
+		setupTempHome();
+		// A card that already reported a session can be launched again without a
+		// resume (start over, or relaunch after the process exited). OpenCode opens a
+		// new conversation there, so a bridge pinned to the old id would reject every
+		// event from the session actually running and strand the card in running.
+		const launch = await prepareAgentLaunch({
+			taskId: "task-opencode-fresh",
+			agentId: "opencode",
+			binary: "opencode",
+			args: [],
+			cwd: setupEmptyWorkspace(),
+			prompt: "",
+			workspaceId: "workspace-1",
+			attemptId: "attempt-1",
+			externalSessionId: "ses_08f7c2a9b1eF4d",
+		});
+		expect(launch.args).not.toContain("--session");
+		// Unpinned, the bridge adopts the new session and reports its id, which is
+		// what the next resume needs.
+		expect(launch.env.KANBAN_OPENCODE_SESSION_ID).toBeUndefined();
+	});
+
+	it("drops --continue from an OpenCode command saved before exact resume", async () => {
+		setupTempHome();
+		const prompt = "Fix the flaky test\nand keep the unicode ✓";
+		const launch = await prepareAgentLaunch({
+			taskId: "task-opencode-continue",
+			agentId: "opencode",
+			binary: "opencode",
+			args: ["--continue", "--model", "local/qwen3-coder"],
+			cwd: setupEmptyWorkspace(),
+			prompt,
+		});
+		expect(launch.args).not.toContain("--continue");
+		// The card still launches, so the removal has to be visible to the user.
+		expect(launch.warningMessage ?? "").toContain("--continue");
+		// One argv element keeps a multi-line prompt from being re-split by a shell.
+		expect(launch.args.at(-1)).toBe(prompt);
+		expect(launch.args[launch.args.length - 2]).toBe("--prompt");
+	});
+
+	it("passes OpenCode planning and autonomy as documented flags", async () => {
+		setupTempHome();
+		const launch = await prepareAgentLaunch({
+			taskId: "task-opencode-flags",
+			agentId: "opencode",
+			binary: "opencode",
+			args: [],
+			autonomousModeEnabled: true,
+			startInPlanMode: true,
+			cwd: setupEmptyWorkspace(),
+			prompt: "",
+		});
+		expect(getCliFlagValue(launch.args, "--agent")).toBe("plan");
+		expect(launch.args.filter((arg) => arg === "--auto")).toHaveLength(1);
+
+		// A flag the user already put in the command wins, and is never duplicated.
+		const user = await prepareAgentLaunch({
+			taskId: "task-opencode-user-flags",
+			agentId: "opencode",
+			binary: "opencode",
+			args: ["--agent", "build", "--auto"],
+			startInPlanMode: true,
+			autonomousModeEnabled: true,
+			cwd: setupEmptyWorkspace(),
+			prompt: "",
+		});
+		expect(getCliFlagValue(user.args, "--agent")).toBe("build");
+		expect(user.args.filter((arg) => arg === "--auto")).toHaveLength(1);
+	});
+
+	it("refuses an OpenCode release Kanban has no contract for", async () => {
+		setupTempHome();
+		// The version probe runs the requested binary, so a fixture script stands in
+		// for an old release instead of depending on what this machine has installed.
+		const workspaceDir = setupEmptyWorkspace();
+		const fixturePath = join(workspaceDir, "opencode-old.sh");
+		writeFileSync(fixturePath, "#!/bin/sh\necho 1.2.3\n", { mode: 0o755 });
+		await expect(
+			prepareAgentLaunch({
+				taskId: "task-opencode-old",
+				agentId: "opencode",
+				binary: fixturePath,
+				args: [],
+				cwd: workspaceDir,
+				prompt: "",
+			}),
+		).rejects.toThrow(/too old for Kanban/);
 	});
 
 	it("places Codex hook config before the resume subcommand", async () => {

@@ -43,6 +43,12 @@ interface HooksIngestArgs {
 	 * card. Never logged or persisted as event content.
 	 */
 	attemptId?: string;
+	/**
+	 * AA-O1a: the agent's own session id, reported by integrations that can
+	 * observe it. Kanban stores it on the session summary so the next launch can
+	 * resume this exact conversation.
+	 */
+	sessionId?: string;
 }
 
 interface HookCommandMetadataOptionValues {
@@ -53,6 +59,7 @@ interface HookCommandMetadataOptionValues {
 	hookEventName?: string;
 	notificationType?: string;
 	metadataBase64?: string;
+	sessionId?: string;
 }
 
 interface CodexWrapperArgs {
@@ -435,6 +442,7 @@ function parseHooksIngestArgs(
 		taskId: context.taskId,
 		workspaceId: context.workspaceId,
 		...(context.attemptId ? { attemptId: context.attemptId } : {}),
+		...(options.sessionId?.trim() ? { sessionId: options.sessionId.trim() } : {}),
 		metadata,
 		payload,
 		pullRequestUrls,
@@ -462,6 +470,7 @@ async function ingestHookEvent(args: HooksIngestArgs): Promise<void> {
 			metadata: args.metadata,
 			pullRequestUrls: args.pullRequestUrls,
 			...(args.attemptId ? { attemptId: args.attemptId } : {}),
+			...(args.sessionId ? { sessionId: args.sessionId } : {}),
 		}),
 		3000,
 		"kanban hooks ingest",
@@ -818,6 +827,7 @@ export function registerHooksCommand(program: Command): void {
 		.option("--hook-event-name <name>", "Original hook event name.")
 		.option("--notification-type <type>", "Notification type.")
 		.option("--metadata-base64 <base64>", "Base64-encoded JSON metadata payload.")
+		.option("--session-id <id>", "Agent-reported session id to record for exact resume.")
 		.action(
 			async (
 				payload: string | undefined,
@@ -838,6 +848,7 @@ export function registerHooksCommand(program: Command): void {
 		.option("--hook-event-name <name>", "Original hook event name.")
 		.option("--notification-type <type>", "Notification type.")
 		.option("--metadata-base64 <base64>", "Base64-encoded JSON metadata payload.")
+		.option("--session-id <id>", "Agent-reported session id to record for exact resume.")
 		.action(
 			async (
 				payload: string | undefined,
