@@ -208,6 +208,9 @@ function makeService(
 		sendTaskChatMessage: async (scope, body, prepare) => {
 			if (prepare) {
 				preparations.push(prepare);
+				// Deferred execution models task-service-owned turns. The synchronous
+				// harness retains summary settlement for legacy/recovery scenarios.
+				if (overrides.deferPreparation) prepare.onQueued?.();
 				if (!overrides.deferPreparation && !overrides.send) {
 					const text = await prepare({ cwd: "/task-worktree", signal: new AbortController().signal });
 					if (text !== null) body = { ...body, text };
@@ -2979,6 +2982,173 @@ describe("PR repair execution freshness", () => {
 		return loaded.record.commentAutomation;
 	}
 
+	it.each(["idle", "awaiting_review", "interrupted"] as const)(
+		"does not infer cancellation from an unrelated %s summary while waiting",
+		async (state) => {
+			const live = makeSummary({ state, lastOutputAt: NOW + 1 });
+			const sessions = { getSummary: () => live, listSummaries: () => [live] } as unknown as ClineTaskSessionService;
+			const harness = makeService({
+				deferPreparation: true,
+				workspaceStates: states(),
+				snapshot: { events: [first] },
+				getClineTaskSessionService: async () => sessions,
+			});
+			await harness.service.refreshWorkspace(scope);
+			await harness.service.runTick();
+			await harness.service.runTick();
+			expect((await record()).dispatch).toMatchObject({ status: "waiting", error: null });
+			expect((await record()).lastDispatchedFeedbackFingerprint).toBeNull();
+			expect(harness.sent).toHaveLength(1);
+			expect(await harness.preparations[0]?.(context())).toContain("Fix first");
+		},
+	);
+
+	it("protects the durable waiting write while chat admission is still in flight", async () => {
+		const live = makeSummary({ state: "awaiting_review" });
+		const sessions = { getSummary: () => live, listSummaries: () => [live] } as unknown as ClineTaskSessionService;
+		let resolveSend: (value: RuntimeTaskChatSendResponse) => void = () => undefined;
+		const response = new Promise<RuntimeTaskChatSendResponse>((resolve) => {
+			resolveSend = resolve;
+		});
+		const harness = makeService({
+			workspaceStates: states(),
+			snapshot: { events: [first] },
+			getClineTaskSessionService: async () => sessions,
+			send: () => response,
+		});
+		await harness.service.refreshWorkspace(scope);
+		const sending = harness.service.runTick();
+		await vi.waitFor(() => expect(harness.sent).toHaveLength(1));
+		await harness.service.runTick();
+		expect((await record()).dispatch?.status).toBe("waiting");
+		resolveSend({ ok: true, summary: null, message: null });
+		await sending;
+	});
+
+	it("settles the exact accepted turn despite unrelated completed task summaries", async () => {
+		const live = makeSummary({ state: "awaiting_review", lastOutputAt: NOW + 1 });
+		const sessions = { getSummary: () => live, listSummaries: () => [live] } as unknown as ClineTaskSessionService;
+		const harness = makeService({
+			deferPreparation: true,
+			workspaceStates: states(),
+			snapshot: { events: [first] },
+			getClineTaskSessionService: async () => sessions,
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		const prepare = harness.preparations[0];
+		prepare?.onQueued?.();
+		await harness.service.runTick();
+		expect((await record()).dispatch?.status).toBe("waiting");
+		await prepare?.(context());
+		await harness.service.runTick();
+		expect((await record()).dispatch?.status).toBe("running");
+		await prepare?.onSettled?.({ status: "completed" });
+		expect((await record()).dispatch?.status).toBe("completed");
+	});
+
+	it.each(["failed", "canceled"] as const)(
+		"surfaces actual %s turns and ignores their late callbacks after Resume",
+		async (status) => {
+			const harness = makeService({
+				deferPreparation: true,
+				workspaceStates: states(),
+				snapshot: { events: [first] },
+			});
+			await harness.service.refreshWorkspace(scope);
+			await harness.service.runTick();
+			const prepare = harness.preparations[0];
+			prepare?.onQueued?.();
+			await prepare?.onSettled?.({ status, error: "Actual turn failure" });
+			expect((await record()).dispatch).toMatchObject({
+				status: "failed",
+				error: expect.stringContaining("Actual turn failure"),
+			});
+			expect((await record()).lastDispatchedFeedbackFingerprint).toBeNull();
+			await harness.service.runTick();
+			expect(harness.sent).toHaveLength(1);
+			expect(await harness.service.resumeCommentHandling(scope, "t1")).toEqual({ ok: true, dispatched: true });
+			harness.preparations[1]?.onQueued?.();
+			const replacement = (await record()).dispatch?.dispatchId;
+			await prepare?.onSettled?.({ status: "completed" });
+			expect((await record()).dispatch).toMatchObject({ dispatchId: replacement, status: "waiting" });
+			expect(await harness.preparations[1]?.(context())).toContain("Fix first");
+			await harness.preparations[1]?.onSettled?.({ status: "completed" });
+			expect((await record()).dispatch?.status).toBe("completed");
+		},
+	);
+
+	it("keeps an admitted repair waiting while Git preparation is still in progress", async () => {
+		const live = makeSummary({ state: "awaiting_review", lastOutputAt: NOW + 1 });
+		const sessions = { getSummary: () => live, listSummaries: () => [live] } as unknown as ClineTaskSessionService;
+		let finishGit: (sha: string) => void = () => undefined;
+		const git = new Promise<string>((resolve) => {
+			finishGit = resolve;
+		});
+		const refreshGit = vi.fn(() => git);
+		const harness = makeService({
+			deferPreparation: true,
+			workspaceStates: states(),
+			snapshot: { events: [first] },
+			getClineTaskSessionService: async () => sessions,
+			refreshGit,
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		const preparing = harness.preparations[0]?.(context());
+		try {
+			await vi.waitFor(() => expect(refreshGit).toHaveBeenCalledOnce());
+			await harness.service.runTick();
+			expect((await record()).dispatch?.status).toBe("waiting");
+			expect((await record()).lastDispatchedFeedbackFingerprint).toBeNull();
+		} finally {
+			finishGit("abc");
+		}
+		expect(await preparing).toContain("Fix first");
+		expect((await record()).dispatch?.status).toBe("running");
+	});
+
+	it("pauses an unowned waiting repair when its workspace loads after startup without replaying it", async () => {
+		const previous = makeService({
+			deferPreparation: true,
+			workspaceStates: states(),
+			snapshot: { events: [first] },
+		});
+		await previous.service.refreshWorkspace(scope);
+		await previous.service.runTick();
+		const current = makeService({ workspaceStates: states(), snapshot: { events: [first] } });
+		await current.service.refreshWorkspace(scope);
+		await current.service.runTick();
+		expect(current.sent).toHaveLength(0);
+		expect((await record()).dispatch).toMatchObject({
+			status: "failed",
+			error: expect.stringContaining("could not be verified"),
+		});
+		expect((await record()).lastDispatchedFeedbackFingerprint).toBeNull();
+	});
+
+	it("does not overwrite a preparation blocker when the turn reports failure", async () => {
+		const harness = makeService({
+			deferPreparation: true,
+			workspaceStates: states(),
+			snapshot: { events: [first] },
+			refreshGit: async () => {
+				throw new Error("Dirty worktree");
+			},
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		const prepare = harness.preparations[0];
+		prepare?.onQueued?.();
+		await expect(prepare?.(context())).rejects.toThrow("Git refresh blocked");
+		await prepare?.onSettled?.({ status: "failed", error: "Generic turn failure" });
+		expect((await record()).dispatch).toMatchObject({
+			status: "failed",
+			errorCode: "git_refresh_blocked",
+			error: expect.stringContaining("Dirty worktree"),
+		});
+	});
+
 	it("sends an oversized refreshed batch by file and retains later/edited feedback for another turn", async () => {
 		let clock = NOW;
 		const oversized = { ...first, body: "feedback".repeat(MAX_COMMENT_PROMPT_CHARS), bodyDigest: "long" };
@@ -3167,6 +3337,7 @@ describe("PR repair execution freshness", () => {
 			await harness.preparations[0]?.(context());
 			expect((await record()).lastDispatchedFeedbackFingerprint).not.toBeNull();
 			live = { ...makeSummary({ state: "awaiting_review", lastOutputAt: NOW + 10 }), reviewReason: "error" };
+			await harness.preparations[0]?.onSettled?.({ status: "failed", error: "The repair turn failed." });
 			await harness.service.runTick();
 			expect((await record()).dispatch?.status).toBe("failed");
 			expect((await record()).lastDispatchedFeedbackFingerprint).toBeNull();
