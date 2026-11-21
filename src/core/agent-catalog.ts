@@ -39,8 +39,11 @@ export const RUNTIME_AGENT_CATALOG: RuntimeAgentCatalogEntry[] = [
 		label: "OpenCode",
 		binary: "opencode",
 		baseArgs: [],
-		autonomousArgs: [],
-		installUrl: "https://github.com/sst/opencode",
+		// AA-O1a: `--auto` is the documented autonomous switch in the pinned
+		// release (1.19.6), so autonomous mode does not depend on answering
+		// every permission prompt.
+		autonomousArgs: ["--auto"],
+		installUrl: "https://opencode.ai/docs/",
 	},
 	{
 		id: "droid",
@@ -68,15 +71,16 @@ export const RUNTIME_AGENT_CATALOG: RuntimeAgentCatalogEntry[] = [
 	},
 ];
 
-// Temporarily keep launch support scoped to the core agent set.
-// Re-enable additional CLIs by uncommenting entries below when ready.
+// Launch support is opt-in per CLI: an entry stays commented out until its
+// adapter, capability row and lifecycle tests describe the release Kanban
+// actually launches. OpenCode joined in AA-O1 against 1.19.6; Gemini stays off.
 export const RUNTIME_LAUNCH_SUPPORTED_AGENT_IDS: readonly RuntimeAgentId[] = [
 	"cline",
 	"claude",
 	"codex",
 	"droid",
 	"kiro",
-	// "opencode",
+	"opencode",
 	// "gemini",
 ];
 

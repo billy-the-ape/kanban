@@ -355,6 +355,9 @@ export class TerminalSessionManager implements TerminalSessionService {
 			env: request.env,
 			workspaceId: request.workspaceId,
 			attemptId: launchAttemptId,
+			// AA-O1a: the session id this card's own agent reported earlier. Only
+			// adapters with exact resume use it, and only for resume intent.
+			externalSessionId: entry.summary.externalSessionId ?? null,
 		});
 		const launchEnvForProvenance: Record<string, string | undefined> = {
 			...request.env,
@@ -585,7 +588,8 @@ export class TerminalSessionManager implements TerminalSessionService {
 			exitCode: null,
 			lastHookAt: null,
 			latestHookActivity: null,
-			warningMessage: null,
+			// An adapter that could not honor part of the request says so here.
+			warningMessage: launch.warningMessage ?? null,
 			latestTurnCheckpoint: null,
 			previousTurnCheckpoint: null,
 			launchAttemptId,
@@ -913,6 +917,36 @@ export class TerminalSessionManager implements TerminalSessionService {
 			lastHookAt: now(),
 			latestHookActivity: next,
 		});
+		if (entry.active) {
+			for (const listener of entry.listeners.values()) {
+				listener.onState?.(cloneSummary(summary));
+			}
+		}
+		this.emitSummary(summary);
+		return cloneSummary(summary);
+	}
+
+	/**
+	 * AA-O1a: remember the session id the agent reported for this card, so the
+	 * next launch can name that exact conversation instead of whichever session
+	 * the CLI touched last. Only a real change is recorded, and the value is
+	 * bounded so a misbehaving integration cannot grow the state file. Like the
+	 * rest of the session record it lives in the workspace state file and is not
+	 * treated as a secret.
+	 */
+	applyExternalSessionId(taskId: string, sessionId: string): RuntimeTaskSessionSummary | null {
+		const entry = this.entries.get(taskId);
+		if (!entry) {
+			return null;
+		}
+		const trimmed = sessionId.trim();
+		if (!trimmed || trimmed.length > 200) {
+			return cloneSummary(entry.summary);
+		}
+		if (entry.summary.externalSessionId === trimmed) {
+			return cloneSummary(entry.summary);
+		}
+		const summary = updateSummary(entry, { externalSessionId: trimmed });
 		if (entry.active) {
 			for (const listener of entry.listeners.values()) {
 				listener.onState?.(cloneSummary(summary));

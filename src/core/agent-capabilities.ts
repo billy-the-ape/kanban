@@ -50,11 +50,18 @@ const RUNTIME_AGENT_CAPABILITIES: Record<RuntimeAgentId, RuntimeAgentCapabilitie
 	},
 	opencode: {
 		terminalPresentation: true,
-		explicitSessionResume: false,
-		images: true,
+		// AA-O1a: the pinned release accepts an exact session with `--session`,
+		// so a resumed card names its own conversation instead of whichever
+		// session OpenCode happened to touch last.
+		explicitSessionResume: true,
+		// Kanban launches the interactive TUI, and only the one-shot `run` form
+		// has an attachment flag, so attachments are refused with a clear
+		// message instead of being silently dropped.
+		images: false,
 		planMode: "cli-flag",
-		// OpenCode has no approval-bypass switch; the plugin answers permissions.
-		approvalMode: "none",
+		// AA-O1a: `--auto` is this release's documented autonomous switch, so
+		// autonomous mode no longer depends on answering every permission.
+		approvalMode: "cli-flag",
 		completionSignal: "hook",
 		automatedDelivery: true,
 	},
@@ -111,8 +118,11 @@ const RUNTIME_AGENT_MODEL_CONFIGURATION: Record<RuntimeAgentId, RuntimeAgentMode
 	},
 	opencode: {
 		source: "agent-native",
-		configLocations: ["~/.config/opencode/opencode.json", "~/.local/state/opencode/model.json"],
-		note: "OpenCode owns its providers; when Kanban passes --model it is re-read from OpenCode's own stored state.",
+		configLocations: ["~/.config/opencode/opencode.json", "<project>/.opencode/opencode.json"],
+		note:
+			"OpenCode owns its providers. Kanban passes --model only from the model you selected in your own " +
+			"OpenCode config (or KANBAN_OPENCODE_MODEL); it never reads OpenCode's auth store or prefers a " +
+			"hosted provider.",
 	},
 	droid: {
 		source: "agent-native",

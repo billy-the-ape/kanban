@@ -494,3 +494,105 @@ describe("createHooksApi review lookup trigger (PRLINK-5)", () => {
 		});
 	});
 });
+describe("createHooksApi agent session identity (AA-O1a)", () => {
+	function createIdentityManager(options: { launchAttemptId?: string | null } = {}) {
+		const launchAttemptId = options.launchAttemptId ?? "attempt-2";
+		const reviewedSummary: RuntimeTaskSessionSummary = {
+			...createSummary({ state: "awaiting_review", reviewReason: "hook" }),
+			launchAttemptId,
+		};
+		const manager = {
+			getSummary: vi.fn(() => createSummary({ state: "running", agentId: "opencode", launchAttemptId })),
+			transitionToReview: vi.fn(() => reviewedSummary),
+			transitionToRunning: vi.fn(),
+			applyHookActivity: vi.fn(),
+			applyTurnCheckpoint: vi.fn(),
+			applyExternalSessionId: vi.fn(),
+		};
+		const deps = {
+			getWorkspacePathById: vi.fn(() => "/tmp/repo"),
+			ensureTerminalManagerForWorkspace: vi.fn(async () => manager as unknown as TerminalSessionManager),
+			broadcastRuntimeWorkspaceStateUpdated: vi.fn(),
+			broadcastTaskReadyForReview: vi.fn(),
+			captureTaskTurnCheckpoint: vi.fn(async () => ({
+				turn: 1,
+				ref: "refs/kanban/checkpoints/task-1/turn/1",
+				commit: "1111111",
+				createdAt: 1,
+			})),
+			deleteTaskTurnCheckpointRef: vi.fn(async () => undefined),
+		};
+		return { manager, api: createHooksApi(deps) };
+	}
+
+	it("remembers the session id for exact resume", async () => {
+		const { manager, api } = createIdentityManager();
+
+		await api.ingest({
+			taskId: "task-1",
+			workspaceId: "workspace-1",
+			event: "to_review",
+			attemptId: "attempt-2",
+			sessionId: "ses_08f7c2a9b1eF4d",
+			metadata: { source: "opencode", hookEventName: "session.idle" },
+		});
+		// Plain activity carries the id too, so a card that never reached a review
+		// still knows which conversation to resume.
+		await api.ingest({
+			taskId: "task-1",
+			workspaceId: "workspace-1",
+			event: "activity",
+			attemptId: "attempt-2",
+			sessionId: "ses_08f7c2a9b1eF4d",
+			metadata: { source: "opencode", hookEventName: "BeforeTool", toolName: "bash" },
+		});
+
+		expect(manager.applyExternalSessionId).toHaveBeenCalledTimes(2);
+		expect(manager.applyExternalSessionId).toHaveBeenLastCalledWith("task-1", "ses_08f7c2a9b1eF4d");
+	});
+
+	it("refuses a superseded attempt's session id", async () => {
+		const { manager, api } = createIdentityManager();
+
+		const response = await api.ingest({
+			taskId: "task-1",
+			workspaceId: "workspace-1",
+			event: "to_review",
+			attemptId: "attempt-1",
+			sessionId: "ses_aabbccddeeff",
+			metadata: { source: "opencode" },
+		});
+
+		// A stale event would otherwise rebind the card to another task's chat.
+		expect(response).toEqual({ ok: true });
+		expect(manager.applyExternalSessionId).not.toHaveBeenCalled();
+	});
+
+	it("parks a failed turn with the error reason instead of finishing it", async () => {
+		const { manager, api } = createIdentityManager();
+
+		await api.ingest({
+			taskId: "task-1",
+			workspaceId: "workspace-1",
+			event: "to_review",
+			attemptId: "attempt-2",
+			metadata: { source: "opencode", hookEventName: "session.error", notificationType: "error" },
+		});
+
+		expect(manager.transitionToReview).toHaveBeenCalledWith("task-1", "error");
+	});
+
+	it("marks a waiting approval as attention rather than completion", async () => {
+		const { manager, api } = createIdentityManager();
+
+		await api.ingest({
+			taskId: "task-1",
+			workspaceId: "workspace-1",
+			event: "to_review",
+			attemptId: "attempt-2",
+			metadata: { source: "opencode", hookEventName: "PermissionRequest", notificationType: "permission.asked" },
+		});
+
+		expect(manager.transitionToReview).toHaveBeenCalledWith("task-1", "attention");
+	});
+});

@@ -78,12 +78,23 @@ describe("buildRuntimeConfigResponse", () => {
 		});
 
 		expect(response.agentAutonomousModeEnabled).toBe(true);
-		expect(response.agents.map((agent) => agent.id)).toEqual(["claude", "codex", "cline", "droid", "kiro"]);
+		expect(response.agents.map((agent) => agent.id)).toEqual([
+			"claude",
+			"codex",
+			"cline",
+			"opencode",
+			"droid",
+			"kiro",
+		]);
 		expect(response.agents.find((agent) => agent.id === "claude")?.defaultArgs).toEqual([]);
 		expect(response.agents.find((agent) => agent.id === "codex")?.defaultArgs).toEqual([]);
 		expect(response.agents.find((agent) => agent.id === "cline")?.defaultArgs).toEqual([]);
 		expect(response.agents.find((agent) => agent.id === "droid")?.defaultArgs).toEqual([]);
 		expect(response.agents.find((agent) => agent.id === "kiro")?.defaultArgs).toEqual(["chat"]);
+		// AA-O1a: OpenCode joins the launchable set with no base arguments of its
+		// own; `--auto` is added per launch, not baked into the default command.
+		expect(response.agents.find((agent) => agent.id === "opencode")?.defaultArgs).toEqual([]);
+		expect(response.agents.find((agent) => agent.id === "opencode")?.capabilities.explicitSessionResume).toBe(true);
 		expect(response.agents.find((agent) => agent.id === "cline")?.installed).toBe(true);
 	});
 
@@ -106,7 +117,14 @@ describe("buildRuntimeConfigResponse", () => {
 		});
 
 		expect(response.agentAutonomousModeEnabled).toBe(false);
-		expect(response.agents.map((agent) => agent.id)).toEqual(["claude", "codex", "cline", "droid", "kiro"]);
+		expect(response.agents.map((agent) => agent.id)).toEqual([
+			"claude",
+			"codex",
+			"cline",
+			"opencode",
+			"droid",
+			"kiro",
+		]);
 		expect(response.agents.find((agent) => agent.id === "claude")?.defaultArgs).toEqual([]);
 		expect(response.agents.find((agent) => agent.id === "codex")?.defaultArgs).toEqual([]);
 		expect(response.agents.find((agent) => agent.id === "cline")?.defaultArgs).toEqual([]);
@@ -117,6 +135,10 @@ describe("buildRuntimeConfigResponse", () => {
 		expect(response.agents.find((agent) => agent.id === "codex")?.command).toBe("codex");
 		expect(response.agents.find((agent) => agent.id === "droid")?.command).toBe("droid");
 		expect(response.agents.find((agent) => agent.id === "kiro")?.command).toBe("kiro-cli chat");
+		// OpenCode's autonomous `--auto` comes from the launch, so the settings
+		// command stays the bare binary either way.
+		expect(response.agents.find((agent) => agent.id === "opencode")?.command).toBe("opencode");
+		expect(response.agents.find((agent) => agent.id === "opencode")?.installed).toBe(false);
 	});
 
 	it("sets debug mode from runtime environment variables", () => {

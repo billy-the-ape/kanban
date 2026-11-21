@@ -1,6 +1,7 @@
 import type {
 	RuntimeHookEvent,
 	RuntimeHookIngestResponse,
+	RuntimeTaskSessionReviewReason,
 	RuntimeTaskSessionSummary,
 	RuntimeTaskTurnCheckpoint,
 } from "../core/api-contract";
@@ -41,6 +42,23 @@ function canTransitionTaskForHookEvent(summary: RuntimeTaskSessionSummary, event
 		summary.state === "awaiting_review" &&
 		(summary.reviewReason === "attention" || summary.reviewReason === "hook" || summary.reviewReason === "error")
 	);
+}
+
+/**
+ * AA-O1a: why a hook-driven review happened. An integration reports what kind of
+ * pause it is through the notification type, so a failed model call parks the
+ * card with the error reason instead of reading as a finished turn, and a parked
+ * approval uses the attention reason because the agent is blocked on the human
+ * rather than done with the work.
+ */
+export function hookReviewReason(notificationType: string | null | undefined): RuntimeTaskSessionReviewReason {
+	if (notificationType === "error") {
+		return "error";
+	}
+	if (notificationType === "permission.asked") {
+		return "attention";
+	}
+	return "hook";
 }
 
 export function createHooksApi(deps: CreateHooksApiDependencies): RuntimeTrpcContext["hooksApi"] {
@@ -86,6 +104,15 @@ export function createHooksApi(deps: CreateHooksApiDependencies): RuntimeTrpcCon
 					} satisfies RuntimeHookIngestResponse;
 				}
 
+				// AA-O1a: remember which agent conversation this card is in, so a
+				// later launch can name this exact session. Recorded before the
+				// transition early return because plain activity events carry the id
+				// too, and only after the attempt check so a superseded attempt
+				// cannot rewrite what the live session reported.
+				if (body.sessionId) {
+					manager.applyExternalSessionId(taskId, body.sessionId);
+				}
+
 				// PRLINK-2: record hook-detected PRs before the transition early
 				// return so recording is independent of column transitions.
 				// Fire-and-forget by contract: a slow workspace lock must not
@@ -111,7 +138,9 @@ export function createHooksApi(deps: CreateHooksApiDependencies): RuntimeTrpcCon
 				}
 
 				const transitionedSummary =
-					event === "to_review" ? manager.transitionToReview(taskId, "hook") : manager.transitionToRunning(taskId);
+					event === "to_review"
+						? manager.transitionToReview(taskId, hookReviewReason(body.metadata?.notificationType))
+						: manager.transitionToRunning(taskId);
 				if (!transitionedSummary) {
 					return {
 						ok: false,
