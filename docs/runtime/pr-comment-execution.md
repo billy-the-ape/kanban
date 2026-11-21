@@ -60,7 +60,10 @@ when available, so a tool failure is not hidden behind the generic lifecycle err
 1. Polling collects feedback about every 60 seconds. The existing 120-second quiet
    window (600-second maximum from first pending feedback) schedules one repair intent.
 2. Task chat accepts a placeholder. Dispatch status `waiting` means the turn has not
-   acquired model capacity. Its feedback is not yet marked dispatched.
+   completed preparation after acquiring model capacity. Its feedback is not yet marked
+   dispatched. The task service tracks the exact accepted repair through task queuing,
+   capacity waiting, preparation, and completion. An idle, interrupted, or completed
+   task summary alone does not prove this queued repair was canceled.
 3. After both the task queue and shared model queue, an internal preparation callback
    validates ownership, task/link/settings, and authentication. A complete PR snapshot
    younger than 30 seconds is reused; otherwise PR status and all feedback are refreshed.
@@ -70,6 +73,17 @@ when available, so a tool failure is not hidden behind the generic lifecycle err
    timestamps, URLs, and inline file/line/diff context when available (inline or via
    the complete local snapshot described below). The dispatched
    fingerprint advances only at this execution boundary.
+
+Accepted repairs settle from their own completion/failure/cancellation callback, bound
+to the dispatch ID. Earlier task turns and late callbacks from a previous repair cannot
+settle a newer repair. Failures before preparation retain the undispatched feedback
+boundary and expose the actual error for explicit Resume; preparation blockers keep
+their more specific error. Restart recovery still pauses attempted repairs whose
+outcome cannot be verified and never automatically replays them.
+
+Deploy the updated server; no new configuration or migration is required. For cards
+already showing the old cancellation error, use Resume beside **Handle PR comments**
+once after deployment. A general task-chat Resume does not retry the failed repair.
 
 Git verification always runs on admission, even when the PR snapshot is fresh. It
 requires a clean worktree, no in-progress Git operation, and a configured GitHub remote

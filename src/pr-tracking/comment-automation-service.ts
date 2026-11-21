@@ -24,7 +24,7 @@
 
 import { randomUUID } from "node:crypto";
 import type { ClineTaskSessionService } from "../cline-sdk/cline-task-session-service";
-import type { ClineTurnPreparation } from "../cline-sdk/cline-turn-preparation";
+import type { ClineTurnOutcome, ClineTurnPreparation } from "../cline-sdk/cline-turn-preparation";
 import { extractCommandStrings } from "../cline-sdk/review-tool-policy";
 import type {
 	RuntimeAgentId,
@@ -456,6 +456,8 @@ export class PrCommentAutomationService {
 	private readonly captureBlocked = new Set<string>();
 	/** PR keys with a send in progress (between the `attemptedAt` write and the outcome write). */
 	private readonly sendsInFlight = new Set<string>();
+	/** Exact turns accepted by this runtime; task-wide summaries cannot settle them. */
+	private readonly liveDispatches = new Map<string, string>();
 	private timer: NodeJS.Timeout | null = null;
 	private started = false;
 	private disposed = false;
@@ -849,6 +851,9 @@ export class PrCommentAutomationService {
 	 * after a fresh successful re-read.
 	 */
 	private async settleDispatch(sub: PrSubscriptionState): Promise<void> {
+		// The durable waiting write precedes chat admission. Never interpret the
+		// previous task summary as evidence about that in-flight send.
+		if (this.sendsInFlight.has(sub.key)) return;
 		const nowMs = this.nowMs();
 		const loaded = await loadPrTrackingRecord(sub.key);
 		if (loaded.status === "missing") {
@@ -866,23 +871,36 @@ export class PrCommentAutomationService {
 		await this.markStalePendingCaptures(sub.key, record);
 		const dispatch = automation.dispatch;
 		const owner = automation.repairOwner;
+		if (this.sendsInFlight.has(sub.key)) return;
+		if (dispatch && this.liveDispatches.get(sub.key) === dispatch.dispatchId) return;
 
 		if (dispatch?.status === "waiting") {
 			const candidate = owner ? sub.candidates.get(`${owner.workspaceId}/${owner.taskId}`) : undefined;
-			const session = candidate ? await this.resolveLiveSessionSummary(candidate, candidate.taskId) : null;
-			if (!candidate || (session && session.state !== "running")) {
-				await this.setDispatchFailed(sub, "The queued PR repair was canceled before execution; Resume to retry.");
+			if (!candidate) {
+				await this.setDispatchFailed(sub, "The repair owner is unavailable; Resume to retry.", dispatch.dispatchId);
+			} else {
+				await this.setDispatchFailed(
+					sub,
+					"The queued PR repair has no live turn in this runtime; its outcome could not be verified. Resume to retry.",
+					dispatch.dispatchId,
+				);
 			}
+			// No live turn or send owns this attempted intent (for example a
+			// workspace loaded after startup). Do not guess cancellation or replay.
 			return;
 		}
 		if (dispatch !== null && dispatch.status === "running") {
 			if (!owner) {
-				await this.setDispatchFailed(sub, `The repair owner is unavailable; resume manually.`);
+				await this.setDispatchFailed(sub, `The repair owner is unavailable; resume manually.`, dispatch.dispatchId);
 				return;
 			}
 			const candidate = sub.candidates.get(`${owner.workspaceId}/${owner.taskId}`);
 			if (!candidate) {
-				await this.setDispatchFailed(sub, `The repair owner task is no longer enabled; resume manually.`);
+				await this.setDispatchFailed(
+					sub,
+					`The repair owner task is no longer enabled; resume manually.`,
+					dispatch.dispatchId,
+				);
 				return;
 			}
 			const session = await this.resolveLiveSessionSummary(candidate, owner.taskId);
@@ -906,15 +924,20 @@ export class PrCommentAutomationService {
 				await this.setDispatchFailed(
 					sub,
 					`The comment-handling turn ended without completion.${detail ? ` ${detail.slice(0, 2000)}` : ""}`,
+					dispatch.dispatchId,
 				);
 				return;
 			}
 			if (session.state === "idle" || session.state === "awaiting_review") {
-				await this.setDispatchCompleted(sub);
+				await this.setDispatchCompleted(sub, dispatch.dispatchId);
 				return;
 			}
 			// Unknown turn state: do not guess; require an explicit resume.
-			await this.setDispatchFailed(sub, `The turn state could not be determined; resume manually.`);
+			await this.setDispatchFailed(
+				sub,
+				`The turn state could not be determined; resume manually.`,
+				dispatch.dispatchId,
+			);
 			return;
 		}
 
@@ -927,7 +950,11 @@ export class PrCommentAutomationService {
 			dispatch.attemptedAt !== null &&
 			!this.sendsInFlight.has(sub.key)
 		) {
-			await this.setDispatchFailed(sub, `A previous send attempt's outcome is unknown; resume manually.`);
+			await this.setDispatchFailed(
+				sub,
+				`A previous send attempt's outcome is unknown; resume manually.`,
+				dispatch.dispatchId,
+			);
 			return;
 		}
 		// A failed dispatch is sticky: only an explicit Resume can retry it.
@@ -1185,6 +1212,14 @@ export class PrCommentAutomationService {
 				baseline: preAutomation.lastDispatchedFeedbackFingerprint,
 				...context,
 			});
+		prepare.onQueued = () => this.liveDispatches.set(sub.key, dispatchId);
+		prepare.onSettled = async (outcome) => {
+			try {
+				await this.settlePreparedDispatch(sub, dispatchId, outcome);
+			} finally {
+				if (this.liveDispatches.get(sub.key) === dispatchId) this.liveDispatches.delete(sub.key);
+			}
+		};
 		const response = await this.deps.sendTaskChatMessage(
 			scope,
 			{
@@ -1210,6 +1245,7 @@ export class PrCommentAutomationService {
 			return { status: "sent" };
 		}
 		const error = response.error ?? `Could not send the comment-handling instruction.`;
+		if (this.liveDispatches.get(sub.key) === dispatchId) this.liveDispatches.delete(sub.key);
 		await upsertPrTrackingRecord(sub.key, identity, (record) => {
 			const dispatch = record.commentAutomation.dispatch;
 			if (dispatch === null || dispatch.dispatchId !== dispatchId) {
@@ -1282,6 +1318,7 @@ export class PrCommentAutomationService {
 			const automation = loaded.record.commentAutomation;
 			if (
 				automation.dispatch?.dispatchId !== dispatchId ||
+				(automation.dispatch.status !== "waiting" && automation.dispatch.status !== "running") ||
 				automation.repairOwner?.revision !== owner.revision ||
 				automation.repairOwner.taskId !== owner.taskId ||
 				automation.repairOwner.workspaceId !== owner.workspaceId
@@ -1379,14 +1416,40 @@ export class PrCommentAutomationService {
 		}
 	}
 
-	private async setDispatchCompleted(sub: PrSubscriptionState): Promise<void> {
+	private async settlePreparedDispatch(
+		sub: PrSubscriptionState,
+		dispatchId: string,
+		outcome: ClineTurnOutcome,
+	): Promise<void> {
+		const loaded = await loadPrTrackingRecord(sub.key);
+		if (loaded.status !== "ok") return;
+		const dispatch = loaded.record.commentAutomation.dispatch;
+		if (dispatch?.dispatchId !== dispatchId || (dispatch.status !== "waiting" && dispatch.status !== "running"))
+			return;
+		if (outcome.status === "completed" && dispatch.status === "running") {
+			await this.setDispatchCompleted(sub, dispatchId);
+		} else {
+			const detail = "error" in outcome ? outcome.error : "The turn ended without executing its prepared feedback.";
+			await this.setDispatchFailed(
+				sub,
+				`The PR repair ${dispatch.status === "waiting" ? "ended before execution" : "ended without completion"}: ${detail.slice(0, 2000)} Resume to retry.`,
+				dispatchId,
+			);
+		}
+	}
+
+	private async setDispatchCompleted(sub: PrSubscriptionState, expectedDispatchId?: string): Promise<void> {
 		const loaded = await loadPrTrackingRecord(sub.key);
 		if (loaded.status !== "ok") {
 			return;
 		}
 		const record = loaded.record;
 		const dispatch = record.commentAutomation.dispatch;
-		if (dispatch === null || dispatch.status !== "running") {
+		if (
+			dispatch === null ||
+			dispatch.status !== "running" ||
+			(expectedDispatchId && dispatch.dispatchId !== expectedDispatchId)
+		) {
 			return;
 		}
 		await upsertPrTrackingRecord(sub.key, { accessScopeId: record.accessScopeId, pr: record.pr }, (current) => {
@@ -1409,7 +1472,11 @@ export class PrCommentAutomationService {
 		});
 	}
 
-	private async setDispatchFailed(sub: PrSubscriptionState, error: string): Promise<void> {
+	private async setDispatchFailed(
+		sub: PrSubscriptionState,
+		error: string,
+		expectedDispatchId?: string,
+	): Promise<void> {
 		const loaded = await loadPrTrackingRecord(sub.key);
 		if (loaded.status !== "ok") {
 			return;
@@ -1418,13 +1485,18 @@ export class PrCommentAutomationService {
 		const dispatch = record.commentAutomation.dispatch;
 		if (
 			dispatch === null ||
+			(expectedDispatchId !== undefined && dispatch.dispatchId !== expectedDispatchId) ||
 			(dispatch.status !== "running" && dispatch.status !== "waiting" && dispatch.status !== "queued")
 		) {
 			return;
 		}
 		await upsertPrTrackingRecord(sub.key, { accessScopeId: record.accessScopeId, pr: record.pr }, (current) => {
 			const currentDispatch = current.commentAutomation.dispatch;
-			if (currentDispatch === null || currentDispatch.dispatchId !== dispatch.dispatchId) {
+			if (
+				currentDispatch === null ||
+				currentDispatch.dispatchId !== dispatch.dispatchId ||
+				currentDispatch.status !== dispatch.status
+			) {
 				return current;
 			}
 			return {
