@@ -130,6 +130,8 @@ export interface ClineTaskSessionService {
 	onSummary(listener: (summary: RuntimeTaskSessionSummary) => void): () => void;
 	onMessage(listener: (taskId: string, message: ClineTaskMessage) => void): () => void;
 	startTaskSession(request: StartClineTaskSessionRequest): Promise<RuntimeTaskSessionSummary>;
+	/** True only when a live, in-memory restart, or durable SDK session exists. */
+	hasRecoverableTaskSession(taskId: string): Promise<boolean>;
 	resetUnstartedQueuedTask(taskId: string, reset: (withdraw: () => Promise<boolean>) => Promise<void>): Promise<void>;
 	stopTaskSession(taskId: string): Promise<RuntimeTaskSessionSummary | null>;
 	abortTaskSession(taskId: string): Promise<RuntimeTaskSessionSummary | null>;
@@ -785,6 +787,13 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		}
 		const compacted = compactClineConversationMessages(persistedMessages, targetTokens);
 		return compacted;
+	}
+
+	async hasRecoverableTaskSession(taskId: string): Promise<boolean> {
+		if (this.sessionRuntime.getTaskSessionId(taskId) || this.sessionRuntime.canRestartTaskSession(taskId)) {
+			return true;
+		}
+		return (await this.sessionRuntime.readPersistedTaskSession(taskId)) !== null;
 	}
 
 	async startTaskSession(request: StartClineTaskSessionRequest): Promise<RuntimeTaskSessionSummary> {
