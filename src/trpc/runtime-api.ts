@@ -119,7 +119,7 @@ import type { TerminalSessionManager } from "../terminal/session-manager";
 import { createVerificationRunner } from "../verification/verification-service";
 import { evaluateDependentsUnlock, getGitDeliveryService, readTaskDeliveryReceipt } from "../workspace/git-delivery";
 import { resolveTaskChatPrLinking } from "../workspace/task-chat-pr-linking";
-import { getTaskInitialStartStatus as readTaskInitialStartStatus } from "../workspace/task-initial-start";
+import { getTaskInitialStartStatus as readTaskInitialStartStatus, readTaskInitialStartRecord } from "../workspace/task-initial-start";
 import { clearTaskLastPrompt, recordTaskLastPrompt } from "../workspace/task-last-prompt";
 import { readTaskPreservationRecord } from "../workspace/task-preservation";
 import { resetUnstartedQueuedWorktree } from "../workspace/task-queued-reset";
@@ -462,6 +462,61 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			effectiveContextWindow = null;
 		}
 		return buildRuntimeConfigResponse(runtimeConfig, clineProviderSettings, { effectiveContextWindow });
+	};
+
+	// A pause while the SDK start is still queued leaves a prepared worktree
+	// but no session record. Recover on explicit user input, not on startup.
+	const unstartedRecoveryByTaskId = new Map<string, Promise<RuntimeTaskSessionSummary | null>>();
+	const recoverUnstartedClineTask = async (
+		workspaceScope: RuntimeTrpcWorkspaceScope,
+		taskId: string,
+		instruction: string,
+	): Promise<RuntimeTaskSessionSummary | null> => {
+		const cline = await deps.getScopedClineTaskSessionService(workspaceScope);
+		if (await cline.hasRecoverableTaskSession(taskId)) return null;
+		const current = cline.getSummary(taskId);
+		if (current?.state === "running" || current?.state === "awaiting_review") return null;
+		const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
+		const card = board.columns.flatMap((column) => column.cards).find((entry) => entry.id === taskId);
+		if (!card || !card.prompt.trim()) return null;
+		const baseline = await readTaskInitialStartRecord(taskId);
+		if (!baseline || baseline.state !== "prepared" || !baseline.baselineSha) return null;
+		const work = await getTaskPreservationInfo({ repoPath: workspaceScope.workspacePath, taskId });
+		// No silent reset/replay if there is any evidence of actual task work.
+		if (
+			!work.ok || !work.worktreeExists || work.headCommit !== baseline.baselineSha ||
+			work.dirty || work.commitsAheadOfBase !== 0 || work.preservation ||
+			(await readTaskDeliveryReceipt(taskId)) !== null ||
+			cline.listMessages(taskId).some((message) => message.role === "assistant")
+		) return null;
+		const existing = unstartedRecoveryByTaskId.get(taskId);
+		if (existing) return await existing;
+		const recovery = (async () => {
+			// Preserve additional user instructions, but do not replace the
+			// original task with a generic Resume/Continue command.
+			const normalized = instruction.trim();
+			const prompt = /^(resume|continue|go ahead|proceed)[.!\\s]*$/i.test(normalized)
+				? card.prompt
+				: normalized
+					? `${card.prompt}\\n\\nAdditional instruction on resuming: ${normalized}`
+					: card.prompt;
+			const started = await startTaskSession(workspaceScope, {
+				taskId, prompt, taskTitle: card.title, images: card.images,
+				startInPlanMode: card.startInPlanMode, baseRef: card.baseRef,
+				updateBaseRefBeforeStart: card.updateBaseRefBeforeStart !== false,
+				agentId: card.agentId, clineSettings: card.clineSettings,
+			});
+			if (!started.ok || !started.summary) {
+				throw new Error(started.error ?? "Unstarted Cline task recovery failed.");
+			}
+			return started.summary;
+		})();
+		unstartedRecoveryByTaskId.set(taskId, recovery);
+		try {
+			return await recovery;
+		} finally {
+			if (unstartedRecoveryByTaskId.get(taskId) === recovery) unstartedRecoveryByTaskId.delete(taskId);
+		}
 	};
 
 	const returningTaskIds = new Set<string>();
@@ -2062,6 +2117,14 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			let body: ReturnType<typeof parseTaskChatSendRequest>;
 			try {
 				body = parseTaskChatSendRequest(input);
+			} catch (error) {
+				return { ok: false, summary: null, error: error instanceof Error ? error.message : String(error) };
+			}
+			try {
+				if (!isHomeAgentSessionId(body.taskId) && !isClineClearSlashCommand(body.text)) {
+					const recovered = await recoverUnstartedClineTask(workspaceScope, body.taskId, body.text);
+					if (recovered) return { ok: true, summary: recovered, message: null };
+				}
 			} catch (error) {
 				return { ok: false, summary: null, error: error instanceof Error ? error.message : String(error) };
 			}
