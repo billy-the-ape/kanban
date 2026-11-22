@@ -1607,6 +1607,7 @@ describe("createRuntimeApi startTaskSession", () => {
 					taskId: "d6953",
 					prompt: "Implement the feature",
 					cwd: "/tmp/existing-worktree",
+					resumeFromPersistence: true,
 				}),
 			);
 			expect(cline.sendTaskSessionInput).not.toHaveBeenCalled();
