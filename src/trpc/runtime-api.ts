@@ -467,38 +467,48 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 	// A pause while the SDK start is still queued leaves a prepared worktree
 	// but no session record. Recover on explicit user input, not on startup.
 	const unstartedRecoveryByTaskId = new Map<string, Promise<RuntimeTaskSessionSummary | null>>();
-	const recoverUnstartedClineTask = async (
+	const recoverUnstartedClineTask = (
 		workspaceScope: RuntimeTrpcWorkspaceScope,
 		taskId: string,
 		instruction: string,
 	): Promise<RuntimeTaskSessionSummary | null> => {
 		const pending = unstartedRecoveryByTaskId.get(taskId);
-		if (pending) return await pending;
-		const cline = await deps.getScopedClineTaskSessionService(workspaceScope);
-		if (!cline.hasRecoverableTaskSession || (await cline.hasRecoverableTaskSession(taskId))) return null;
-		const current = cline.getSummary(taskId);
-		if (current?.state === "running" || (current?.state === "awaiting_review" && current.reviewReason !== "error")) return null;
-		const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
-		const card = board.columns.flatMap((column) => column.cards).find((entry) => entry.id === taskId);
-		if (!card || !card.prompt.trim()) return null;
-		const configuredAgent = card.agentId ?? (await deps.loadScopedRuntimeConfig(workspaceScope)).selectedAgentId;
-		if (configuredAgent !== "cline") return null;
-		const baseline = await readTaskInitialStartRecord(taskId);
-		if (!baseline || baseline.state !== "prepared" || !baseline.baselineSha) return null;
-		const work = await getTaskPreservationInfo({ repoPath: workspaceScope.workspacePath, taskId });
-		// No silent reset/replay if there is any evidence of actual task work.
-		if (
-			!work.ok || !work.worktreeExists || work.headCommit !== baseline.baselineSha ||
-			work.dirty || work.commitsAheadOfBase !== 0 ||
-			(work.preservation !== null && work.preservation.startingCommit !== baseline.baselineSha) ||
-			(await readTaskDeliveryReceipt(taskId)) !== null ||
-			cline.listMessages(taskId).some((message) => message.role === "assistant")
-		) return null;
-		const existing = unstartedRecoveryByTaskId.get(taskId);
-		if (existing) return await existing;
-		const recovery = (async () => {
-			// Preserve additional user instructions, but do not replace the
-			// original task with a generic Resume/Continue command.
+		if (pending) return pending;
+		const recovery = (async (): Promise<RuntimeTaskSessionSummary | null> => {
+			const cline = await deps.getScopedClineTaskSessionService(workspaceScope);
+			if (!cline.hasRecoverableTaskSession || (await cline.hasRecoverableTaskSession(taskId))) return null;
+			const current = cline.getSummary(taskId);
+			if (
+				current?.state === "running" ||
+				(current?.state === "awaiting_review" && current.reviewReason !== "error")
+			) {
+				return null;
+			}
+			const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
+			const card = board.columns.flatMap((column) => column.cards).find((entry) => entry.id === taskId);
+			if (!card || !card.prompt.trim()) return null;
+			const configuredAgent = card.agentId ?? (await deps.loadScopedRuntimeConfig(workspaceScope)).selectedAgentId;
+			if (configuredAgent !== "cline") return null;
+
+			const baseline = await readTaskInitialStartRecord(taskId);
+			if (!baseline || baseline.state !== "prepared" || !baseline.baselineSha) return null;
+			const work = await getTaskPreservationInfo({ repoPath: workspaceScope.workspacePath, taskId });
+			// Missing SDK state must never erase changes or replay already delivered work.
+			if (
+				!work.ok ||
+				!work.worktreeExists ||
+				work.headCommit !== baseline.baselineSha ||
+				work.dirty ||
+				work.commitsAheadOfBase !== 0 ||
+				(work.preservation !== null && work.preservation.startingCommit !== baseline.baselineSha) ||
+				(await readTaskDeliveryReceipt(taskId)) !== null ||
+				cline.listMessages(taskId).some((message) => message.role === "assistant")
+			) {
+				return null;
+			}
+
+			// Preserve additional user instructions without turning a generic
+			// Resume action into the only task prompt.
 			const normalized = instruction.trim();
 			const prompt = /^(resume|continue|go ahead|proceed)[.!\s]*$/i.test(normalized)
 				? card.prompt
@@ -506,10 +516,15 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					? `${card.prompt}\n\nAdditional instruction on resuming: ${normalized}`
 					: card.prompt;
 			const started = await startTaskSession(workspaceScope, {
-				taskId, prompt, taskTitle: card.title, images: card.images,
-				startInPlanMode: card.startInPlanMode, baseRef: card.baseRef,
+				taskId,
+				prompt,
+				taskTitle: card.title,
+				images: card.images,
+				startInPlanMode: card.startInPlanMode,
+				baseRef: card.baseRef,
 				updateBaseRefBeforeStart: card.updateBaseRefBeforeStart !== false,
-				agentId: card.agentId, clineSettings: card.clineSettings,
+				agentId: card.agentId,
+				clineSettings: card.clineSettings,
 			});
 			if (!started.ok || !started.summary) {
 				throw new Error(started.error ?? "Unstarted Cline task recovery failed.");
@@ -517,11 +532,15 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			return started.summary;
 		})();
 		unstartedRecoveryByTaskId.set(taskId, recovery);
-		try {
-			return await recovery;
-		} finally {
-			if (unstartedRecoveryByTaskId.get(taskId) === recovery) unstartedRecoveryByTaskId.delete(taskId);
-		}
+		void recovery.then(
+			() => {
+				if (unstartedRecoveryByTaskId.get(taskId) === recovery) unstartedRecoveryByTaskId.delete(taskId);
+			},
+			() => {
+				if (unstartedRecoveryByTaskId.get(taskId) === recovery) unstartedRecoveryByTaskId.delete(taskId);
+			},
+		);
+		return recovery;
 	};
 
 	const returningTaskIds = new Set<string>();
