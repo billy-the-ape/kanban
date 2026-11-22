@@ -9,6 +9,7 @@ import type {
 	RuntimeBoardData,
 	RuntimeTaskDiagnosticsResponse,
 	RuntimeTaskPrTrackingStateResponse,
+	RuntimeTaskPreservationInfoResponse,
 	RuntimeTaskSessionSummary,
 	RuntimeWorkspaceStateResponse,
 } from "../../../src/core/api-contract";
@@ -22,7 +23,7 @@ const taskWorktreeMocks = vi.hoisted(() => ({
 	prepareInitialTaskWorktree: vi.fn(),
 	resolveTaskCwd: vi.fn(),
 	taskWorktreeExists: vi.fn(async () => false),
-	getTaskPreservationInfo: vi.fn(async () => ({
+	getTaskPreservationInfo: vi.fn(async (): Promise<RuntimeTaskPreservationInfoResponse> => ({
 		ok: true,
 		worktreeExists: false,
 		worktreePath: "/tmp/worktree",
