@@ -485,7 +485,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				return null;
 			}
 			const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
-			const card = board.columns.flatMap((column) => column.cards).find((entry) => entry.id === taskId);
+			const card = board?.columns.flatMap((column) => column.cards).find((entry) => entry.id === taskId);
 			if (!card || !card.prompt.trim()) return null;
 			const configuredAgent = card.agentId ?? (await deps.loadScopedRuntimeConfig(workspaceScope)).selectedAgentId;
 			if (configuredAgent !== "cline") return null;
