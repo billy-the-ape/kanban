@@ -103,6 +103,13 @@ const TICK_INTERVAL_MS = 10_000;
 const DEBOUNCE_MS = 120_000;
 const MAX_PENDING_MS = 600_000;
 const DISPATCH_RETRY_MS = 30_000;
+/**
+ * A live session summary can briefly report a failure while its terminal
+ * outcome and final hook are still being reconciled. The task-service
+ * onSettled callback remains authoritative and reports actual failures
+ * immediately; only the polling fallback waits for this grace period.
+ */
+const TERMINAL_FAILURE_CONFIRM_MS = 30_000;
 /** How long dispose() waits for already-running work before giving up on it. */
 const DISPOSE_GRACE_MS = 3_000;
 const BACKOFF_SCHEDULE_MS = [60_000, 120_000, 240_000, 480_000, 900_000];
@@ -920,6 +927,13 @@ export class PrCommentAutomationService {
 				return;
 			}
 			if (session.state === "failed" || session.state === "interrupted" || session.reviewReason === "error") {
+				// A summary is an observation, not the settled turn outcome. Give
+				// the terminal owner time to publish its final hook/summary before
+				// making a sticky failure that only a manual Resume can clear.
+				if (nowMs - session.updatedAt < TERMINAL_FAILURE_CONFIRM_MS) {
+					sub.dispatchRetryAt = nowMs + DISPATCH_RETRY_MS;
+					return;
+				}
 				const detail = session.warningMessage ?? session.latestHookActivity?.finalMessage;
 				await this.setDispatchFailed(
 					sub,
