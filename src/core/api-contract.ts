@@ -2361,6 +2361,8 @@ export const runtimeTaskSessionStartRequestSchema = z.object({
 	startInPlanMode: z.boolean().optional(),
 	mode: runtimeTaskSessionModeSchema.optional(),
 	resumeFromTrash: z.boolean().optional(),
+	/** Internal recovery: replace an unstarted failed Cline entry, never a live SDK session. */
+	recoverUnstartedSession: z.boolean().optional(),
 	baseRef: z.string(),
 	/**
 	 * UPD-0: optional client-side copy of the card's persisted policy. The
