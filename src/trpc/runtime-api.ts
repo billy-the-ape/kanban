@@ -119,8 +119,12 @@ import type { TerminalSessionManager } from "../terminal/session-manager";
 import { createVerificationRunner } from "../verification/verification-service";
 import { evaluateDependentsUnlock, getGitDeliveryService, readTaskDeliveryReceipt } from "../workspace/git-delivery";
 import { resolveTaskChatPrLinking } from "../workspace/task-chat-pr-linking";
-import { getTaskInitialStartStatus as readTaskInitialStartStatus, readTaskInitialStartRecord } from "../workspace/task-initial-start";
+import {
+	getTaskInitialStartStatus as readTaskInitialStartStatus,
+	readTaskInitialStartRecord,
+} from "../workspace/task-initial-start";
 import { clearTaskLastPrompt, recordTaskLastPrompt } from "../workspace/task-last-prompt";
+import { findTaskPatch } from "../workspace/task-patch";
 import { readTaskPreservationRecord } from "../workspace/task-preservation";
 import { resetUnstartedQueuedWorktree } from "../workspace/task-queued-reset";
 import { findTaskBaseRef, readReviewOutcome } from "../workspace/task-review-handoff";
@@ -502,6 +506,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				work.commitsAheadOfBase !== 0 ||
 				(work.preservation !== null && work.preservation.startingCommit !== baseline.baselineSha) ||
 				(await readTaskDeliveryReceipt(taskId)) !== null ||
+				(await findTaskPatch(taskId)) !== null ||
 				cline.listMessages(taskId).some((message) => message.role === "assistant")
 			) {
 				return null;
