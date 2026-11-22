@@ -1549,7 +1549,7 @@ describe("createRuntimeApi startTaskSession", () => {
 			failure: null,
 			updatedAt: Date.now(),
 		});
-		taskWorktreeMocks.getTaskPreservationInfo.mockResolvedValue({
+		taskWorktreeMocks.getTaskPreservationInfo.mockResolvedValueOnce({
 			ok: true,
 			worktreeExists: true,
 			worktreePath: "/tmp/existing-worktree",
