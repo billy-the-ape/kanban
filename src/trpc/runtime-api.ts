@@ -479,6 +479,12 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		const pending = unstartedRecoveryByTaskId.get(taskId);
 		if (pending) return pending;
 		const recovery = (async (): Promise<RuntimeTaskSessionSummary | null> => {
+			// Reject non-Cline cards before probing the SDK session host.
+			const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
+			const card = board?.columns.find((column) => column.id === "in_progress")?.cards.find((entry) => entry.id === taskId);
+			if (!card || !card.prompt.trim()) return null;
+			const configuredAgent = card.agentId ?? (await deps.loadScopedRuntimeConfig(workspaceScope)).selectedAgentId;
+			if (configuredAgent !== "cline") return null;
 			const cline = await deps.getScopedClineTaskSessionService(workspaceScope);
 			if (!cline.hasRecoverableTaskSession || (await cline.hasRecoverableTaskSession(taskId))) return null;
 			const current = cline.getSummary(taskId);
@@ -488,11 +494,6 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			) {
 				return null;
 			}
-			const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
-			const card = board?.columns.find((column) => column.id === "in_progress")?.cards.find((entry) => entry.id === taskId);
-			if (!card || !card.prompt.trim()) return null;
-			const configuredAgent = card.agentId ?? (await deps.loadScopedRuntimeConfig(workspaceScope)).selectedAgentId;
-			if (configuredAgent !== "cline") return null;
 
 			const baseline = await readTaskInitialStartRecord(taskId);
 			if (!baseline || baseline.state !== "prepared" || !baseline.baselineSha) return null;
@@ -523,6 +524,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			const started = await startTaskSession(workspaceScope, {
 				taskId,
 				prompt,
+				recoverUnstartedSession: true,
 				taskTitle: card.title,
 				images: card.images,
 				startInPlanMode: card.startInPlanMode,
@@ -685,6 +687,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					taskTitle: resolvedClineTitle.length > 0 ? resolvedClineTitle : undefined,
 					images: body.images,
 					resumeFromTrash: body.resumeFromTrash,
+					resumeFromPersistence: body.recoverUnstartedSession === true,
 					providerId: clineLaunchConfig.providerId,
 					modelId: clineLaunchConfig.modelId,
 					mode: requestedClineTaskMode,
@@ -1881,8 +1884,6 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				const body = parseTaskSessionInputRequest(input);
 				const payloadText = body.appendNewline ? `${body.text}\n` : body.text;
 				const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
-				const recovered = await recoverUnstartedClineTask(workspaceScope, body.taskId, body.text);
-				if (recovered) return { ok: true, summary: recovered };
 				const clineSummary = await clineTaskSessionService.sendTaskSessionInput(body.taskId, payloadText);
 				if (clineSummary) {
 					return {
