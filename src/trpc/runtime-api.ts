@@ -477,7 +477,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		const cline = await deps.getScopedClineTaskSessionService(workspaceScope);
 		if (!cline.hasRecoverableTaskSession || (await cline.hasRecoverableTaskSession(taskId))) return null;
 		const current = cline.getSummary(taskId);
-		if (current?.state === "running" || current?.state === "awaiting_review") return null;
+		if (current?.state === "running" || (current?.state === "awaiting_review" && current.reviewReason !== "error")) return null;
 		const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
 		const card = board.columns.flatMap((column) => column.cards).find((entry) => entry.id === taskId);
 		if (!card || !card.prompt.trim()) return null;
