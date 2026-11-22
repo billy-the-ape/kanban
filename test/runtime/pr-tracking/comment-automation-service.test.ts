@@ -3003,6 +3003,68 @@ describe("PR repair execution freshness", () => {
 		},
 	);
 
+	it("does not permanently fail an admitted repair on a transient terminal error summary", async () => {
+		let clock = NOW;
+		let live = makeSummary({ state: "idle" });
+		const sessions = { getSummary: () => live, listSummaries: () => [live] } as unknown as ClineTaskSessionService;
+		const harness = makeService({
+			deferPreparation: true,
+			workspaceStates: states(),
+			snapshot: { events: [first] },
+			getClineTaskSessionService: async () => sessions,
+			now: () => clock,
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		await harness.preparations[0]?.(context());
+		live = {
+			...makeSummary({ state: "interrupted", lastOutputAt: NOW + 1 }),
+			updatedAt: NOW,
+			reviewReason: "error",
+		};
+		await harness.service.runTick();
+		expect((await record()).dispatch?.status).toBe("running");
+		// A late final hook reconciles the transient summary before the
+		// poller can publish an irreversible failure.
+		clock += 31_000;
+		live = {
+			...makeSummary({ state: "awaiting_review", lastOutputAt: clock }),
+			updatedAt: clock,
+		};
+		await harness.service.runTick();
+		expect((await record()).dispatch).toMatchObject({ status: "completed", error: null });
+		expect(harness.sent).toHaveLength(1);
+	});
+
+	it("still fails a persistent terminal error after the confirmation window", async () => {
+		let clock = NOW;
+		let live = makeSummary({ state: "idle" });
+		const sessions = { getSummary: () => live, listSummaries: () => [live] } as unknown as ClineTaskSessionService;
+		const harness = makeService({
+			deferPreparation: true,
+			workspaceStates: states(),
+			snapshot: { events: [first] },
+			getClineTaskSessionService: async () => sessions,
+			now: () => clock,
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		await harness.preparations[0]?.(context());
+		live = {
+			...makeSummary({ state: "failed", lastOutputAt: NOW + 1 }),
+			updatedAt: NOW,
+		};
+		await harness.service.runTick();
+		expect((await record()).dispatch?.status).toBe("running");
+		clock += 31_000;
+		await harness.service.runTick();
+		expect((await record()).dispatch).toMatchObject({
+			status: "failed",
+			error: expect.stringContaining("ended without completion"),
+		});
+		expect((await record()).lastDispatchedFeedbackFingerprint).toBeNull();
+	});
+
 	it("protects the durable waiting write while chat admission is still in flight", async () => {
 		const live = makeSummary({ state: "awaiting_review" });
 		const sessions = { getSummary: () => live, listSummaries: () => [live] } as unknown as ClineTaskSessionService;
