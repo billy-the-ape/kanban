@@ -479,13 +479,16 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
 		const card = board.columns.flatMap((column) => column.cards).find((entry) => entry.id === taskId);
 		if (!card || !card.prompt.trim()) return null;
+		const configuredAgent = card.agentId ?? (await deps.loadScopedRuntimeConfig(workspaceScope)).selectedAgentId;
+		if (configuredAgent !== "cline") return null;
 		const baseline = await readTaskInitialStartRecord(taskId);
 		if (!baseline || baseline.state !== "prepared" || !baseline.baselineSha) return null;
 		const work = await getTaskPreservationInfo({ repoPath: workspaceScope.workspacePath, taskId });
 		// No silent reset/replay if there is any evidence of actual task work.
 		if (
 			!work.ok || !work.worktreeExists || work.headCommit !== baseline.baselineSha ||
-			work.dirty || work.commitsAheadOfBase !== 0 || work.preservation ||
+			work.dirty || work.commitsAheadOfBase !== 0 ||
+			(work.preservation !== null && work.preservation.startingCommit !== baseline.baselineSha) ||
 			(await readTaskDeliveryReceipt(taskId)) !== null ||
 			cline.listMessages(taskId).some((message) => message.role === "assistant")
 		) return null;
@@ -495,10 +498,10 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			// Preserve additional user instructions, but do not replace the
 			// original task with a generic Resume/Continue command.
 			const normalized = instruction.trim();
-			const prompt = /^(resume|continue|go ahead|proceed)[.!\\s]*$/i.test(normalized)
+			const prompt = /^(resume|continue|go ahead|proceed)[.!\s]*$/i.test(normalized)
 				? card.prompt
 				: normalized
-					? `${card.prompt}\\n\\nAdditional instruction on resuming: ${normalized}`
+					? `${card.prompt}\n\nAdditional instruction on resuming: ${normalized}`
 					: card.prompt;
 			const started = await startTaskSession(workspaceScope, {
 				taskId, prompt, taskTitle: card.title, images: card.images,
@@ -1852,6 +1855,8 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				const body = parseTaskSessionInputRequest(input);
 				const payloadText = body.appendNewline ? `${body.text}\n` : body.text;
 				const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
+				const recovered = await recoverUnstartedClineTask(workspaceScope, body.taskId, body.text);
+				if (recovered) return { ok: true, summary: recovered };
 				const clineSummary = await clineTaskSessionService.sendTaskSessionInput(body.taskId, payloadText);
 				if (clineSummary) {
 					return {
