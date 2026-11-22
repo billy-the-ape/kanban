@@ -472,8 +472,10 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		taskId: string,
 		instruction: string,
 	): Promise<RuntimeTaskSessionSummary | null> => {
+		const pending = unstartedRecoveryByTaskId.get(taskId);
+		if (pending) return await pending;
 		const cline = await deps.getScopedClineTaskSessionService(workspaceScope);
-		if (await cline.hasRecoverableTaskSession(taskId)) return null;
+		if (!cline.hasRecoverableTaskSession || (await cline.hasRecoverableTaskSession(taskId))) return null;
 		const current = cline.getSummary(taskId);
 		if (current?.state === "running" || current?.state === "awaiting_review") return null;
 		const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
