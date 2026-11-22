@@ -1349,6 +1349,34 @@ describe("InMemoryClineTaskSessionService", () => {
 			);
 		});
 	});
+	it("reinitializes an errored unstarted task when recovered from persistence", async () => {
+		const { service, runtime } = createTrackedService();
+		runtime.startTaskSessionMock.mockRejectedValueOnce(new Error("Queued start was interrupted"));
+		await service.startTaskSession({
+			taskId: "task-1",
+			cwd: "/tmp/worktree",
+			prompt: "Original task",
+		});
+		await vi.waitFor(() => {
+			expect(service.getSummary("task-1")?.state).toBe("awaiting_review");
+		});
+		expect(runtime.startTaskSessionMock).toHaveBeenCalledTimes(1);
+
+		const recovered = await service.startTaskSession({
+			taskId: "task-1",
+			cwd: "/tmp/worktree",
+			prompt: "Original task",
+			resumeFromPersistence: true,
+		});
+		expect(recovered.state).toBe("running");
+		await vi.waitFor(() => {
+			expect(runtime.startTaskSessionMock).toHaveBeenCalledTimes(2);
+		});
+		expect(runtime.startTaskSessionMock).toHaveBeenLastCalledWith(
+			expect.objectContaining({ taskId: "task-1", prompt: "resolved:Original task" }),
+		);
+	});
+
 	it("marks session interrupted when stopped", async () => {
 		const { service } = createTrackedService();
 		await service.startTaskSession({
