@@ -979,6 +979,69 @@ describe("InMemoryClineTaskSessionService", () => {
 		expect(runtime.sendTaskSessionInputMock).not.toHaveBeenCalled();
 	});
 
+	it("reports acceptance immediately and settles only after the exact prepared turn finishes", async () => {
+		const { service, runtime } = createTrackedService();
+		await service.startTaskSession({ taskId: "task-1", cwd: "/tmp/worktree", prompt: "Start" });
+		await vi.waitFor(() => expect(runtime.startTaskSessionMock).toHaveBeenCalledOnce());
+		const sent = createDeferred<unknown>();
+		runtime.sendTaskSessionInputMock.mockImplementationOnce(() => sent.promise);
+		const prepare: ClineTurnPreparation = vi.fn(async () => "Captured feedback");
+		prepare.onQueued = vi.fn();
+		prepare.onSettled = vi.fn(async () => {});
+		await service.sendTaskSessionInput("task-1", "Queued repair", "act", undefined, prepare);
+		expect(prepare.onQueued).toHaveBeenCalledOnce();
+		await vi.waitFor(() => expect(runtime.sendTaskSessionInputMock).toHaveBeenCalledOnce());
+		expect(prepare.onSettled).not.toHaveBeenCalled();
+		sent.resolve({ text: "Fixed" });
+		await vi.waitFor(() => expect(prepare.onSettled).toHaveBeenCalledExactlyOnceWith({ status: "completed" }));
+	});
+
+	it("reports cancellation before preparation when a queued turn is invalidated", async () => {
+		const { service, runtime } = createTrackedService();
+		const first = createDeferred<StartClineSessionRuntimeResult>();
+		runtime.startTaskSessionMock.mockImplementationOnce(() => first.promise);
+		await service.startTaskSession({ taskId: "task-1", cwd: "/tmp/worktree", prompt: "Start" });
+		await vi.waitFor(() => expect(runtime.startTaskSessionMock).toHaveBeenCalledOnce());
+		const prepare: ClineTurnPreparation = vi.fn(async () => "Captured feedback");
+		prepare.onQueued = vi.fn();
+		prepare.onSettled = vi.fn(async () => {});
+		await service.sendTaskSessionInput("task-1", "Queued repair", "act", undefined, prepare);
+		await service.cancelTaskTurn("task-1");
+		first.resolve({ sessionId: runtime.getTaskSessionId("task-1") ?? "old-session", result: {} });
+		await vi.waitFor(() =>
+			expect(prepare.onSettled).toHaveBeenCalledExactlyOnceWith({
+				status: "canceled",
+				error: expect.stringContaining("canceled or superseded"),
+			}),
+		);
+		expect(prepare).not.toHaveBeenCalled();
+		expect(runtime.sendTaskSessionInputMock).not.toHaveBeenCalled();
+	});
+
+	it.each(["skipped", "failed", "returned failure"])("reports a %s prepared turn once", async (kind) => {
+		const { service, runtime } = createTrackedService();
+		await service.startTaskSession({ taskId: "task-1", cwd: "/tmp/worktree", prompt: "Start" });
+		await vi.waitFor(() => expect(runtime.startTaskSessionMock).toHaveBeenCalledOnce());
+		const prepare: ClineTurnPreparation = async () => {
+			if (kind === "failed") throw new Error("Preparation failed");
+			return kind === "skipped" ? null : "Feedback";
+		};
+		if (kind === "returned failure")
+			runtime.sendTaskSessionInputMock.mockResolvedValueOnce({ finishReason: "error", text: "Model failed" });
+		prepare.onSettled = vi.fn(async () => {});
+		await service.sendTaskSessionInput("task-1", "Queued repair", "act", undefined, prepare);
+		await vi.waitFor(() =>
+			expect(prepare.onSettled).toHaveBeenCalledExactlyOnceWith(
+				kind === "skipped"
+					? { status: "skipped" }
+					: {
+							status: "failed",
+							error: kind === "failed" ? "Preparation failed" : "Model failed",
+						},
+			),
+		);
+	});
+
 	it("reuses the current task mode when follow-up input does not provide a mode override", async () => {
 		const { service, runtime } = createTrackedService();
 

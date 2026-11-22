@@ -67,7 +67,7 @@ import {
 	type ClineTaskExportSnapshot,
 	type ClineTaskExportSnapshotOptions,
 } from "./cline-task-export-snapshot";
-import { CLINE_TURN_SKIPPED, type ClineTurnPreparation } from "./cline-turn-preparation";
+import { CLINE_TURN_SKIPPED, type ClineTurnOutcome, type ClineTurnPreparation } from "./cline-turn-preparation";
 import {
 	type ClineRuntimeSetupLease,
 	type ClineWatcherRegistry,
@@ -1117,6 +1117,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			}
 		}
 		{
+			preparePrompt?.onQueued?.();
 			const message = createMessage(taskId, "user", normalized, images);
 			entry.messages.push(message);
 			this.emitMessage(taskId, message);
@@ -1142,6 +1143,7 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 			this.emitSummary(waitingSummary);
 			const turnGeneration = this.turnGenerationByTaskId.get(taskId) ?? 0;
 			let assistantCountBeforeSend = 0;
+			let outcome: ClineTurnOutcome = { status: "completed" };
 			void this.enqueueTaskTurn(taskId, () =>
 				this.ensureRuntimeSetup(entry.summary.workspacePath ?? "")
 					.then(async (runtimeSetup) => {
@@ -1222,13 +1224,22 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 					})
 					.then(({ result, warnings }) => {
 						if ((this.turnGenerationByTaskId.get(taskId) ?? 0) !== turnGeneration) {
+							outcome = { status: "canceled", error: "The queued turn was canceled or superseded." };
 							return;
 						}
 						if (result === CLINE_TURN_SKIPPED) {
+							outcome = { status: "skipped" };
 							this.emitSummary(updateSummary(entry, { state: "idle", reviewReason: null, lastOutputAt: now() }));
 							return;
 						}
-						if (this.emitReturnedTaskFailure(taskId, entry, "send", result)) return;
+						const returnedFailure = this.emitReturnedTaskFailure(taskId, entry, "send", result);
+						if (returnedFailure || entry.summary.reviewReason === "error") {
+							outcome = {
+								status: "failed",
+								error: entry.summary.warningMessage ?? "The repair turn ended with an error.",
+							};
+						}
+						if (returnedFailure) return;
 						const warningMessage = formatStartWarnings(warnings);
 						if (warningMessage) {
 							this.emitSummary(
@@ -1252,8 +1263,21 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 						}
 					})
 					.catch((error: unknown) => {
+						outcome = {
+							status: (this.turnGenerationByTaskId.get(taskId) ?? 0) === turnGeneration ? "failed" : "canceled",
+							error: error instanceof Error ? error.message : String(error),
+						};
 						if ((this.turnGenerationByTaskId.get(taskId) ?? 0) === turnGeneration) {
 							this.emitTaskFailure(taskId, entry, "send", error);
+						}
+					})
+					.finally(async () => {
+						try {
+							await preparePrompt?.onSettled?.(outcome);
+						} catch (error) {
+							process.stderr.write(
+								`[cline-task-session] Could not settle automatic turn for ${taskId}: ${String(error)}\n`,
+							);
 						}
 					}),
 			);

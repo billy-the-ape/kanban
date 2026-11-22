@@ -19,6 +19,7 @@ import {
 import { enrichDroidReviewMetadata } from "./hook-events/droid-hook-events";
 import { asRecord, normalizeWhitespace, readNestedString, readStringField } from "./hook-events/hook-utils";
 import { normalizeKiroHookMetadata } from "./hook-events/kiro-hook-events";
+import { normalizePiHookMetadata } from "./hook-events/pi-hook-events";
 
 export {
 	createCodexWatcherState,
@@ -380,6 +381,19 @@ function normalizeHookMetadata(
 		});
 		if (kiroMetadata) {
 			return kiroMetadata;
+		}
+	}
+	if (sourceHint?.toLowerCase() === "pi") {
+		// AA-P1: Kanban's own Pi extension reports structured fields, so the Pi
+		// normalizer owns the wording instead of the shared heuristics.
+		const piMetadata = normalizePiHookMetadata({
+			event,
+			payload,
+			flagMetadata,
+			sourceHint,
+		});
+		if (piMetadata) {
+			return piMetadata;
 		}
 	}
 

@@ -31,17 +31,21 @@ describe("agent capabilities (AA-S1)", () => {
 		}
 	});
 
-	it("only claims an exact previous session where the CLI really takes one", () => {
-		// Cline resumes the stored task session, and AA-O1a added OpenCode
-		// because its release publishes `--session <id>` for exactly that.
-		// Everything else resumes “the most recent session”, which is not the
-		// session Kanban started for this card.
-		const exactResumeAgents = CATALOG_AGENT_IDS.filter(
-			(agentId) => getRuntimeAgentCapabilities(agentId).explicitSessionResume,
-		);
-		expect(exactResumeAgents.sort()).toEqual(["cline", "opencode"]);
-		expect(getRuntimeAgentCapabilities("claude").explicitSessionResume).toBe(false);
-		expect(getRuntimeAgentCapabilities("codex").explicitSessionResume).toBe(false);
+	it("only claims an exact session resume when the launch itself names the session", () => {
+		for (const agentId of CATALOG_AGENT_IDS) {
+			// Cline is started with a session id, AA-O1a's OpenCode launch names the
+			// session its own bridge reported (`--session <id>`), and AA-P1's Pi
+			// launch names the session Kanban created (`--session-dir` plus
+			// `--session-id`). Every other CLI resumes “the most recent session”,
+			// which is not the session Kanban started for this card.
+			if (agentId === "cline" || agentId === "opencode" || agentId === "pi") {
+				continue;
+			}
+			expect(getRuntimeAgentCapabilities(agentId).explicitSessionResume).toBe(false);
+		}
+		expect(getRuntimeAgentCapabilities("cline").explicitSessionResume).toBe(true);
+		expect(getRuntimeAgentCapabilities("opencode").explicitSessionResume).toBe(true);
+		expect(getRuntimeAgentCapabilities("pi").explicitSessionResume).toBe(true);
 	});
 
 	it("only presents Cline's provider settings as Kanban-owned model configuration", () => {
@@ -113,5 +117,15 @@ describe("agent capabilities (AA-S1)", () => {
 		const message = formatMissingAgentInstallError(agentId satisfies RuntimeAgentId);
 		expect(message).toContain("droid");
 		expect(message).toContain(RUNTIME_AGENT_CATALOG.find((entry) => entry.id === "droid")?.installUrl ?? "");
+	});
+
+	it("refuses Pi's missing switches instead of faking them", () => {
+		expect(getRuntimeAgentCapabilities("pi").planMode).toBe("none");
+		// Pi has no approval prompt to bypass, so the settings UI must not
+		// advertise an approval policy for it either.
+		expect(getRuntimeAgentCapabilities("pi").approvalMode).toBe("none");
+		expect(getUnsupportedAgentLaunchOperations("pi", { startInPlanMode: true })).toEqual(["plan-mode"]);
+		expect(getUnsupportedAgentLaunchOperations("pi", {})).toEqual([]);
+		expect(formatUnsupportedAgentLaunchError("pi", ["plan-mode"])).toContain("Pi");
 	});
 });

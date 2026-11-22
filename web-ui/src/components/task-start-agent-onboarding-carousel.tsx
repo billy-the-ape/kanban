@@ -83,7 +83,7 @@ export const TASK_START_ONBOARDING_SLIDES: OnboardingSlide[] = [
 	},
 ];
 
-const ONBOARDING_AGENT_IDS: readonly RuntimeAgentId[] = ["cline", "claude", "codex", "droid", "kiro"];
+const ONBOARDING_AGENT_IDS: readonly RuntimeAgentId[] = ["cline", "claude", "codex", "droid", "kiro", "pi"];
 const FALLBACK_ONBOARDING_SLIDE: OnboardingSlide = {
 	kind: "agent-selection",
 	title: "",
@@ -304,6 +304,9 @@ function resolveInstallInstructions(agentId: RuntimeAgentId): string {
 	}
 	if (agentId === "kiro") {
 		return "Amazon's coding agent with access to the latest frontier models.";
+	}
+	if (agentId === "pi") {
+		return "Minimal open-source coding agent CLI. It runs the provider you configure in its own ~/.pi/agent directory.";
 	}
 	return "Install from the official docs.";
 }

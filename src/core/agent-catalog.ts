@@ -69,6 +69,16 @@ export const RUNTIME_AGENT_CATALOG: RuntimeAgentCatalogEntry[] = [
 		autonomousArgs: ["--yolo"],
 		installUrl: "https://github.com/google-gemini/gemini-cli",
 	},
+	{
+		// AA-P1: Pi runs tool calls without an approval prompt, so there is no
+		// bypass flag to add; the autonomous toggle maps to no arguments.
+		id: "pi",
+		label: "Pi",
+		binary: "pi",
+		baseArgs: [],
+		autonomousArgs: [],
+		installUrl: "https://github.com/earendil-works/pi/tree/main/packages/coding-agent#installation",
+	},
 ];
 
 // Launch support is opt-in per CLI: an entry stays commented out until its
@@ -81,6 +91,8 @@ export const RUNTIME_LAUNCH_SUPPORTED_AGENT_IDS: readonly RuntimeAgentId[] = [
 	"droid",
 	"kiro",
 	"opencode",
+	// AA-P1: launched with an exact Pi session plus a task-scoped extension.
+	"pi",
 	// "gemini",
 ];
 
