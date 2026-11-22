@@ -1540,22 +1540,43 @@ describe("createRuntimeApi startTaskSession", () => {
 	it("recovers a paused, never-started Cline task from its original prompt after an SDK send error", async () => {
 		const baselineSha = "052739f929e4e956162fef2f333422c9ac7c31f6";
 		initialStartMocks.readTaskInitialStartRecord.mockResolvedValue({
-			taskId: "d6953", baseRef: "main", updateBaseRefBeforeStart: true,
-			state: "prepared", baselineSha, failure: null, updatedAt: Date.now(),
+			taskId: "d6953",
+			baseRef: "main",
+			updateBaseRefBeforeStart: true,
+			state: "prepared",
+			baselineSha,
+			failure: null,
+			updatedAt: Date.now(),
 		});
 		taskWorktreeMocks.getTaskPreservationInfo.mockResolvedValue({
-			ok: true, worktreeExists: true, worktreePath: "/tmp/existing-worktree",
-			headCommit: baselineSha, dirty: false, commitsAheadOfBase: 0,
-			changedFiles: [], preservation: null,
+			ok: true,
+			worktreeExists: true,
+			worktreePath: "/tmp/existing-worktree",
+			headCommit: baselineSha,
+			dirty: false,
+			commitsAheadOfBase: 0,
+			changedFiles: [],
+			preservation: null,
 		});
 		taskWorktreeMocks.resolveTaskCwd.mockResolvedValue("/tmp/existing-worktree");
 		setSelectedProviderSettings({ provider: "anthropic", model: "claude-sonnet-4-6", apiKey: "test-key" });
 		const board = {
-			columns: [{
-				id: "in_progress", title: "In Progress",
-				cards: [{ id: "d6953", title: "Original task", prompt: "Implement the feature",
-					baseRef: "main", updateBaseRefBeforeStart: true, agentId: "cline" }],
-			}],
+			columns: [
+				{
+					id: "in_progress",
+					title: "In Progress",
+					cards: [
+						{
+							id: "d6953",
+							title: "Original task",
+							prompt: "Implement the feature",
+							baseRef: "main",
+							updateBaseRefBeforeStart: true,
+							agentId: "cline",
+						},
+					],
+				},
+			],
 		} as RuntimeBoardData;
 		const boardSpy = vi.spyOn(workspaceState, "loadWorkspaceBoardById").mockResolvedValue(board);
 		try {
@@ -1566,7 +1587,8 @@ describe("createRuntimeApi startTaskSession", () => {
 			const api = createTestRuntimeApi({
 				getActiveWorkspaceId: vi.fn(() => "workspace-1"),
 				loadScopedRuntimeConfig: vi.fn(async () => ({
-					...createRuntimeConfigState(), selectedAgentId: "cline" as const,
+					...createRuntimeConfigState(),
+					selectedAgentId: "cline" as const,
 				})),
 				setActiveRuntimeConfig: vi.fn(),
 				getScopedTerminalManager: vi.fn(async () => ({ getSummary: vi.fn(() => null) }) as never),
@@ -1579,10 +1601,13 @@ describe("createRuntimeApi startTaskSession", () => {
 				{ taskId: "d6953", text: "continue" },
 			);
 			expect(response.ok).toBe(true);
-			expect(cline.startTaskSession).toHaveBeenCalledWith(expect.objectContaining({
-				taskId: "d6953", prompt: "Implement the feature",
-				cwd: "/tmp/existing-worktree",
-			}));
+			expect(cline.startTaskSession).toHaveBeenCalledWith(
+				expect.objectContaining({
+					taskId: "d6953",
+					prompt: "Implement the feature",
+					cwd: "/tmp/existing-worktree",
+				}),
+			);
 			expect(cline.sendTaskSessionInput).not.toHaveBeenCalled();
 		} finally {
 			boardSpy.mockRestore();
