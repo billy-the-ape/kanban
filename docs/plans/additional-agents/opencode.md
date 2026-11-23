@@ -405,6 +405,10 @@ throwaway `HOME` and an empty project, through Kanban's own `probeOpenCodeVersio
   required pre-rollout smoke run under **Deployment and rollback** is still outstanding on
   a host with OpenCode 1.19.6 and a real local provider: the event contract, the approval
   resume and the per-turn summary are fixture-verified only.
+- Ingest is ordered per call, not per card: two `hooks ingest` processes from one session can
+  land in the opposite order (a turn that ends in well under a second makes that likelier), so
+  a `to_in_progress` may be dropped as a no-op and the following `to_review` park the card one
+  beat late. The next busy event moves it back; nothing is lost permanently.
 - The first-run onboarding carousel keeps its original curated list; OpenCode is
   selectable in Settings and the task-start picker.
 - A card's first OpenCode launch on a machine starts a few seconds late, because loading
