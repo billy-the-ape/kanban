@@ -470,33 +470,42 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 
 	// A pause while the SDK start is still queued leaves a prepared worktree
 	// but no session record. Recover on explicit user input, not on startup.
-	const unstartedRecoveryByTaskId = new Map<string, Promise<RuntimeTaskSessionSummary | null>>();
-	const recoverUnstartedClineTask = (
+	// Only a failed start is surfaced to the caller: every other outcome —
+	// including a pre-check that could not run — falls through to the ordinary
+	// chat sender, so recovery never breaks a send that would otherwise work.
+	type UnstartedRecoveryOutcome =
+		| { status: "not_applicable" }
+		| { status: "recovered"; summary: RuntimeTaskSessionSummary }
+		| { status: "failed"; error: string };
+	const unstartedRecoveryByTaskId = new Map<string, Promise<UnstartedRecoveryOutcome>>();
+	const notApplicableRecovery = (): UnstartedRecoveryOutcome => ({ status: "not_applicable" });
+	const runUnstartedClineRecovery = async (
 		workspaceScope: RuntimeTrpcWorkspaceScope,
 		taskId: string,
 		body: RuntimeTaskChatSendRequest,
-	): Promise<RuntimeTaskSessionSummary | null> => {
-		const pending = unstartedRecoveryByTaskId.get(taskId);
-		if (pending) return pending;
-		const recovery = (async (): Promise<RuntimeTaskSessionSummary | null> => {
+	): Promise<UnstartedRecoveryOutcome> => {
+		try {
 			// Reject non-Cline cards before probing the SDK session host.
 			const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
-			const card = board?.columns.find((column) => column.id === "in_progress")?.cards.find((entry) => entry.id === taskId);
-			if (!card || !card.prompt.trim()) return null;
+			const card = board?.columns
+				.find((column) => column.id === "in_progress")
+				?.cards.find((entry) => entry.id === taskId);
+			if (!card || !card.prompt.trim()) return notApplicableRecovery();
 			const configuredAgent = card.agentId ?? (await deps.loadScopedRuntimeConfig(workspaceScope)).selectedAgentId;
-			if (configuredAgent !== "cline") return null;
+			if (configuredAgent !== "cline") return notApplicableRecovery();
 			const cline = await deps.getScopedClineTaskSessionService(workspaceScope);
-			if (!cline.hasRecoverableTaskSession || (await cline.hasRecoverableTaskSession(taskId))) return null;
+			if (!cline.hasRecoverableTaskSession || (await cline.hasRecoverableTaskSession(taskId)))
+				return notApplicableRecovery();
 			const current = cline.getSummary(taskId);
 			if (
 				current?.state === "running" ||
 				(current?.state === "awaiting_review" && current.reviewReason !== "error")
 			) {
-				return null;
+				return notApplicableRecovery();
 			}
 
 			const baseline = await readTaskInitialStartRecord(taskId);
-			if (!baseline || baseline.state !== "prepared" || !baseline.baselineSha) return null;
+			if (!baseline || baseline.state !== "prepared" || !baseline.baselineSha) return notApplicableRecovery();
 			const work = await getTaskPreservationInfo({ repoPath: workspaceScope.workspacePath, taskId });
 			// Missing SDK state must never erase changes or replay already delivered work.
 			if (
@@ -510,7 +519,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				(await findTaskPatch(taskId)) !== null ||
 				cline.listMessages(taskId).some((message) => message.role === "assistant")
 			) {
-				return null;
+				return notApplicableRecovery();
 			}
 
 			// Preserve additional user instructions without turning a generic
@@ -535,16 +544,71 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				clineSettings: card.clineSettings,
 			});
 			if (!started.ok || !started.summary) {
-				throw new Error(started.error ?? "Unstarted Cline task recovery failed.");
+				// The recovery took over this send, so a failed start is the answer.
+				return { status: "failed", error: started.error ?? "Unstarted Cline task recovery failed." };
 			}
-			return started.summary;
-		})();
+			return { status: "recovered", summary: started.summary };
+		} catch {
+			// Every guard above is a best-effort pre-check over persisted state and
+			// the session host. A failed lookup must never turn an ordinary chat
+			// send into an error, so fall back to the pre-recovery send path.
+			return notApplicableRecovery();
+		}
+	};
+
+	const recoverUnstartedClineTask = (
+		workspaceScope: RuntimeTrpcWorkspaceScope,
+		taskId: string,
+		body: RuntimeTaskChatSendRequest,
+	): Promise<UnstartedRecoveryOutcome> => {
+		const pending = unstartedRecoveryByTaskId.get(taskId);
+		if (pending) {
+			// Another send already owns this task's recovery. Order this one behind
+			// it and then fall through to the ordinary sender, so its own text is
+			// delivered to the recovered session instead of being reported as
+			// delivered and silently dropped.
+			return pending.then(notApplicableRecovery, notApplicableRecovery);
+		}
+		const recovery = runUnstartedClineRecovery(workspaceScope, taskId, body);
 		unstartedRecoveryByTaskId.set(taskId, recovery);
 		const clearRecovery = () => {
 			if (unstartedRecoveryByTaskId.get(taskId) === recovery) unstartedRecoveryByTaskId.delete(taskId);
 		};
 		void recovery.then(clearRecovery, clearRecovery);
 		return recovery;
+	};
+
+	// Bookkeeping shared with a successful native chat send after a recovery
+	// start: record the accepted prompt preview and classify PR links. Neither
+	// hook may turn an accepted recovery into a failure, so both stay defensive.
+	const recordUnstartedRecoverySend = async (
+		workspaceScope: RuntimeTrpcWorkspaceScope,
+		body: RuntimeTaskChatSendRequest,
+	): Promise<RuntimeTaskChatPrLinking | undefined> => {
+		let pullRequestLinking: RuntimeTaskChatPrLinking | undefined;
+		try {
+			if (body.text.trim()) {
+				await recordTaskLastPrompt({
+					workspaceId: workspaceScope.workspaceId,
+					workspacePath: workspaceScope.workspacePath,
+					taskId: body.taskId,
+					text: body.text,
+					acceptedAt: Date.now(),
+					broadcast: deps.broadcastRuntimeWorkspaceStateUpdated,
+				});
+			}
+			pullRequestLinking = await resolveTaskChatPrLinking({
+				workspaceId: workspaceScope.workspaceId,
+				workspacePath: workspaceScope.workspacePath,
+				taskId: body.taskId,
+				text: body.text,
+				hasImages: Boolean(body.images?.length),
+				broadcast: deps.broadcastRuntimeWorkspaceStateUpdated,
+			});
+		} catch {
+			// Best-effort preview and PR-link classification only.
+		}
+		return pullRequestLinking;
 	};
 
 	const returningTaskIds = new Set<string>();
@@ -675,6 +739,23 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 						: {}),
 				});
 				const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
+				// Recovery bypasses the service's live-entry short-circuit, so re-check
+				// session presence at launch: a live or durable session that appeared
+				// while the recovery pre-checks ran is never replaced. An unreadable
+				// session host fails closed.
+				if (body.recoverUnstartedSession === true) {
+					const hasRecoverableSession = await clineTaskSessionService
+						.hasRecoverableTaskSession(body.taskId)
+						.catch(() => true);
+					if (hasRecoverableSession) {
+						return {
+							ok: false,
+							summary: null,
+							error: "A Cline session now exists for this task, so recovery was canceled.",
+							initialStart,
+						};
+					}
+				}
 				const resolvedClineTitle = resolveTaskTitle(body.taskTitle?.trim(), body.prompt);
 				assertLaunchCurrent();
 				const summary = await clineTaskSessionService.startTaskSession({
@@ -2149,41 +2230,31 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			} catch (error) {
 				return { ok: false, summary: null, error: error instanceof Error ? error.message : String(error) };
 			}
-			try {
-				if (!isHomeAgentSessionId(body.taskId) && body.source !== "automated" && !isClineClearSlashCommand(body.text)) {
-					const recovered = await recoverUnstartedClineTask(workspaceScope, body.taskId, body);
-					if (recovered) {
-						// Match successful native chat sends: update the user prompt preview
-						// and classify PR links, without replaying the instruction twice.
-						if (body.text.trim()) {
-							await recordTaskLastPrompt({
-								workspaceId: workspaceScope.workspaceId,
-								workspacePath: workspaceScope.workspacePath,
-								taskId: body.taskId,
-								text: body.text,
-								acceptedAt: Date.now(),
-								broadcast: deps.broadcastRuntimeWorkspaceStateUpdated,
-							});
-						}
-						const pullRequestLinking = await resolveTaskChatPrLinking({
-							workspaceId: workspaceScope.workspaceId,
-							workspacePath: workspaceScope.workspacePath,
-							taskId: body.taskId,
-							text: body.text,
-							hasImages: Boolean(body.images?.length),
-							broadcast: deps.broadcastRuntimeWorkspaceStateUpdated,
-						});
-						return {
-							ok: true,
-							summary: recovered,
-							message: null,
-							...(pullRequestLinking ? { pullRequestLinking } : {}),
-						};
-					}
+			// A queued task whose SDK start was canceled before a session existed is
+			// recovered from the saved card instead of replaying through the missing
+			// session. Every other outcome (including a failed pre-check) keeps the
+			// ordinary send path below.
+			if (
+				!isHomeAgentSessionId(body.taskId) &&
+				body.source !== "automated" &&
+				!isClineClearSlashCommand(body.text)
+			) {
+				const recovery = await recoverUnstartedClineTask(workspaceScope, body.taskId, body);
+				if (recovery.status === "failed") {
+					// Recovery took over this send, so its start failure is the answer.
+					return { ok: false, summary: null, error: recovery.error };
 				}
-			} catch (error) {
-				return { ok: false, summary: null, error: error instanceof Error ? error.message : String(error) };
+				if (recovery.status === "recovered") {
+					const pullRequestLinking = await recordUnstartedRecoverySend(workspaceScope, body);
+					return {
+						ok: true,
+						summary: recovery.summary,
+						message: null,
+						...(pullRequestLinking ? { pullRequestLinking } : {}),
+					};
+				}
 			}
+
 			return await sendTaskChatMessageCore(workspaceScope, body);
 		},
 		// --- COMMENT-0: PR comment automation --------------------------------
