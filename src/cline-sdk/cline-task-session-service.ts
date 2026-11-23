@@ -130,7 +130,7 @@ export interface ClineTaskSessionService {
 	onSummary(listener: (summary: RuntimeTaskSessionSummary) => void): () => void;
 	onMessage(listener: (taskId: string, message: ClineTaskMessage) => void): () => void;
 	startTaskSession(request: StartClineTaskSessionRequest): Promise<RuntimeTaskSessionSummary>;
-	/** True only when a live, in-memory restart, or durable SDK session exists. */
+	/** True when a live session, an in-memory restartable session, or a persisted SDK session exists for the task. */
 	hasRecoverableTaskSession(taskId: string): Promise<boolean>;
 	resetUnstartedQueuedTask(taskId: string, reset: (withdraw: () => Promise<boolean>) => Promise<void>): Promise<void>;
 	stopTaskSession(taskId: string): Promise<RuntimeTaskSessionSummary | null>;
