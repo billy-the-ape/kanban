@@ -52,6 +52,7 @@ import type {
 	RuntimeTaskQualitySummaryResponse,
 	RuntimeTaskReviewInfoResponse,
 	RuntimeTaskSessionStartRequest,
+	RuntimeTaskSessionStartResponse,
 	RuntimeTaskSessionSummary,
 	RuntimeTaskWriterActivity,
 	RuntimeUpdateStatusResponse,
@@ -612,6 +613,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		return pullRequestLinking;
 	};
 
+	const restoringDetachedSessions = new Map<string, Promise<RuntimeTaskSessionStartResponse>>();
 	const returningTaskIds = new Set<string>();
 	const taskLaunchVersions = new Map<string, number>();
 	// Shared by the tRPC handler (manual starts) and the B-9 dispatch queue, so
@@ -622,6 +624,34 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		let initialStart: RuntimeTaskInitialStartOutcome | null = null;
 		try {
 			const body = parseTaskSessionStartRequest(input);
+			if (body.restoreDetachedSession) {
+				if (body.prompt.trim() || body.resumeFromTrash || body.images?.length ||
+					body.startInPlanMode || (body.agentId !== undefined && body.agentId !== "pi")) {
+					throw new Error("Pi session restoration cannot run a prompt or change execution options.");
+				}
+				if (isHomeAgentSessionId(body.taskId)) throw new Error("Home sessions cannot be auto-restored.");
+				const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
+				const card = board.columns
+					.filter((column) => column.id === "review" || column.id === "in_progress")
+					.flatMap((column) => column.cards).find((item) => item.id === body.taskId);
+				if (!card) throw new Error("Only active or Review tasks can be restored.");
+				const manager = await deps.getScopedTerminalManager(workspaceScope);
+				const saved = manager.getSummary(body.taskId);
+				if (manager.hasActiveProcess(body.taskId)) return { ok: true, summary: saved, initialStart: null };
+				if (saved?.agentId !== "pi" ||
+					!(saved.state === "running" || saved.state === "interrupted" || saved.state === "awaiting_review") ||
+					(saved.reviewReason === "exit" && saved.pid === null)) {
+					throw new Error("No interrupted Pi process exists; refusing to launch a new conversation.");
+				}
+				const piScope = { workspaceId: workspaceScope.workspaceId, taskId: body.taskId };
+				const record = await readPiSessionRecord({
+					sessionId: derivePiSessionId(piScope), sessionDir: getPiTaskSessionDir(piScope),
+				});
+				if (!record.found) throw new Error("The exact Pi conversation is unavailable.");
+				if (!(await taskWorktreeExists(workspaceScope.workspacePath, body.taskId))) {
+					throw new Error("The original worktree is missing; refusing to create a new one.");
+				}
+			}
 			const launchVersion = taskLaunchVersions.get(body.taskId) ?? 0;
 			const assertLaunchCurrent = () => {
 				if (returningTaskIds.has(body.taskId) || launchVersion !== (taskLaunchVersions.get(body.taskId) ?? 0)) {
@@ -692,7 +722,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					initialStart = prepared.initialStart;
 				}
 			}
-			const shouldCaptureTurnCheckpoint = !body.resumeFromTrash && !isHomeAgentSessionId(body.taskId);
+			const shouldCaptureTurnCheckpoint = !body.resumeFromTrash && !body.restoreDetachedSession && !isHomeAgentSessionId(body.taskId);
 			const terminalManager = await deps.getScopedTerminalManager(workspaceScope);
 
 			// Per-task config source-of-truth precedence:
@@ -708,7 +738,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			//   session-level persistence for these;
 			//   if the user changes the model on the card, the next session launch
 			//   (including trash-restore) uses the updated values.
-			const previousTerminalAgentId = body.resumeFromTrash
+			const previousTerminalAgentId = body.resumeFromTrash || body.restoreDetachedSession
 				? (terminalManager.getSummary(body.taskId)?.agentId ?? null)
 				: null;
 			const effectiveAgentId = previousTerminalAgentId ?? body.agentId ?? scopedRuntimeConfig.selectedAgentId;
@@ -827,6 +857,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				images: body.images,
 				startInPlanMode: body.startInPlanMode,
 				resumeFromTrash: body.resumeFromTrash,
+				restoreDetachedSession: body.restoreDetachedSession,
 				cols: body.cols,
 				rows: body.rows,
 				workspaceId: workspaceScope.workspaceId,
@@ -1396,6 +1427,18 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			return response;
 		},
 		startTaskSession: async (workspaceScope, input) => {
+			if (input.restoreDetachedSession) {
+				const restoreKey = `${workspaceScope.workspaceId}:${input.taskId}`;
+				const existing = restoringDetachedSessions.get(restoreKey);
+				if (existing) return await existing;
+				const restore = startTaskSession(workspaceScope, input);
+				restoringDetachedSessions.set(restoreKey, restore);
+				try {
+					return await restore;
+				} finally {
+					restoringDetachedSessions.delete(restoreKey);
+				}
+			}
 			const launchVersion = taskLaunchVersions.get(input.taskId) ?? 0;
 			if (returningTaskIds.has(input.taskId))
 				return { ok: false, summary: null, initialStart: null, error: "Task is returning to Backlog." };

@@ -2370,6 +2370,8 @@ export const runtimeTaskSessionStartRequestSchema = z.object({
 	resumeFromTrash: z.boolean().optional(),
 	/** Internal recovery: replace an unstarted failed Cline entry, never a live SDK session. */
 	recoverUnstartedSession: z.boolean().optional(),
+	/** Reattach a saved Pi session without submitting a turn or changing Review status. */
+	restoreDetachedSession: z.boolean().optional(),
 	baseRef: z.string(),
 	/**
 	 * UPD-0: optional client-side copy of the card's persisted policy. The

@@ -811,6 +811,7 @@ export function CardDetailView({
 		<AgentTerminalPanel
 			taskId={selection.card.id}
 			workspaceId={currentProjectId}
+			baseRef={selection.card.baseRef}
 			terminalEnabled={isTaskTerminalEnabled}
 			summary={sessionSummary}
 			onSummary={onSessionSummary}

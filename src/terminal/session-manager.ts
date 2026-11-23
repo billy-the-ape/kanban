@@ -87,6 +87,8 @@ export interface StartTaskSessionRequest {
 	images?: RuntimeTaskImage[];
 	startInPlanMode?: boolean;
 	resumeFromTrash?: boolean;
+	/** Reattach a saved Pi conversation but do not begin a model turn. */
+	restoreDetachedSession?: boolean;
 	cols?: number;
 	rows?: number;
 	env?: Record<string, string | undefined>;
@@ -306,6 +308,7 @@ export class TerminalSessionManager implements TerminalSessionService {
 
 	async startTaskSession(request: StartTaskSessionRequest): Promise<RuntimeTaskSessionSummary> {
 		const entry = this.ensureEntry(request.taskId);
+		const summaryBeforeRestore = entry.summary;
 		entry.restartRequest = {
 			kind: "task",
 			request: cloneStartTaskSessionRequest(request),
@@ -578,25 +581,30 @@ export class TerminalSessionManager implements TerminalSessionService {
 			previousConfigFingerprint,
 		});
 		updateSummary(entry, {
-			state: request.resumeFromTrash ? "awaiting_review" : "running",
+			state: request.restoreDetachedSession
+				? summaryBeforeRestore.state === "awaiting_review" ? "awaiting_review" : "interrupted"
+				: request.resumeFromTrash ? "awaiting_review" : "running",
 			agentId: request.agentId,
 			workspacePath: request.cwd,
 			pid: session.pid,
 			startedAt,
-			lastOutputAt: null,
-			reviewReason: request.resumeFromTrash ? "attention" : null,
+			lastOutputAt: request.restoreDetachedSession ? summaryBeforeRestore.lastOutputAt : null,
+			reviewReason: request.restoreDetachedSession
+				? summaryBeforeRestore.state === "awaiting_review" ? summaryBeforeRestore.reviewReason : "interrupted"
+				: request.resumeFromTrash ? "attention" : null,
 			exitCode: null,
 			lastHookAt: null,
 			latestHookActivity: null,
 			// An adapter that could not honor part of the request says so here.
 			warningMessage: launch.warningMessage ?? null,
-			latestTurnCheckpoint: null,
-			previousTurnCheckpoint: null,
+			latestTurnCheckpoint: request.restoreDetachedSession ? summaryBeforeRestore.latestTurnCheckpoint : null,
+			previousTurnCheckpoint: request.restoreDetachedSession ? summaryBeforeRestore.previousTurnCheckpoint : null,
 			launchAttemptId,
 			// A fresh launch is a new conversation, so the session id reported for the
 			// previous one stops describing this card until the integration reports the
 			// new id; a resume keeps the id it resumed with.
-			externalSessionId: request.resumeFromTrash ? (entry.summary.externalSessionId ?? null) : null,
+			externalSessionId: request.resumeFromTrash || request.restoreDetachedSession
+				? (summaryBeforeRestore.externalSessionId ?? null) : null,
 			launchProvenance,
 		});
 		this.emitSummary(entry.summary);
