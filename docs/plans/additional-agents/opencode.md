@@ -279,8 +279,8 @@ anything that starts like a flag.
 | Observation | Kanban behavior |
 | --- | --- |
 | `session.busy` / `session.status{busy}` | card back to in progress, once per turn |
-| `session.idle` / `session.status{idle}` while busy | one review per turn (`activity_text: "OpenCode finished the turn"`, `final_message` = latest assistant text) |
-| `tool.execute.before/after` | bounded activity with `tool_name` and `tool_input_summary` |
+| `session.idle` / `session.status{idle}` while busy | one review per turn (`activity_text: "OpenCode finished the turn"`, `final_message` = the assistant text **of this turn**; a genuinely new turn forgets the previous turn's text, so a tool-only or empty follow-up reports none instead of repeating a read summary) |
+| `tool.execute.before/after` | bounded activity with `tool_name` and `tool_input_summary`; the summary is read before the call is forgotten, so the after-event carries the same detail as the before-event |
 | `permission.ask` with `status: "ask"` | review with `notification_type: "permission.asked"` → attention reason; the following idle is not completion |
 | `session.error` | review with `notification_type: "error"` → error reason, deduplicated per turn |
 
@@ -344,7 +344,10 @@ throwaway `HOME` and an empty project, through Kanban's own `probeOpenCodeVersio
   slower. Separate first loads contended long enough to exceed 15s each, which is why
   concurrent first OpenCode launches on one machine can start slowly.
 - Not covered: the positive path of the session probe (creating a session requires a
-  provider) and a real model turn.
+  provider) and a real model turn. Which events 1.19.6 really emits, in which order and
+  with which payload keys, is therefore verified against fixtures and the CLI's own help
+  output only; a run against a real provider is still required before this contract can
+  be called confirmed (see Known limitations).
 
 ### Known limitations
 

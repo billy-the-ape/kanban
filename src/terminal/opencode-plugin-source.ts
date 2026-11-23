@@ -28,7 +28,11 @@
  * with `notification_type: "error"` so Kanban marks the card with the error
  * review reason instead of an ordinary completion. An approval is asked inside
  * the tool, so the approved tool finishing is what resumes the parked turn: it
- * returns to busy, and that turn still gets its one completion review.
+ * returns to busy, and that turn still gets its one completion review. Each turn
+ * also owns its assistant text: a genuinely new turn forgets what the previous turn
+ * said, so a tool-only or empty follow-up cannot repeat a summary the human already
+ * read, while work that resumes after an approval or error pause keeps the text of
+ * the turn it belongs to.
  */
 
 const PLUGIN_PLACEHOLDERS = {
@@ -264,6 +268,11 @@ const PLUGIN_SOURCE = `const kanbanOpenCodeBridge = async ({ client }) => {
     if (!continuingTurn) {
       turn += 1;
       lastReviewKey = null;
+      // A new turn must not inherit the previous turn's assistant text: a
+      // tool-only or empty follow-up would otherwise finish with the summary the
+      // human already read. Only a genuinely new turn clears it, so text that
+      // resumes after an approval or error pause still belongs to its own turn.
+      latestAssistantText.delete(sessionID);
     }
     lastErrorKey = null;
     lastReviewWasCompletion = false;
@@ -343,12 +352,18 @@ const PLUGIN_SOURCE = `const kanbanOpenCodeBridge = async ({ client }) => {
     const toolName = clip(input && input.tool) || undefined;
     const callID = input && typeof input.callID === "string" ? input.callID : "";
     const callKey = callID ? pairKey(sessionID, callID) : "";
+    // The summarized input belongs to the call, so it has to be read before the
+    // after-phase forgets it. Reading it afterwards always produced an empty
+    // summary, so the card lost the detail the before-event carried.
+    let toolInputSummary;
     if (phase === "before") {
       if (callKey) {
-        toolInputByCall.set(callKey, summarizeToolArgs(output && output.args) || undefined);
+        toolInputSummary = summarizeToolArgs(output && output.args) || undefined;
+        toolInputByCall.set(callKey, toolInputSummary);
       }
       await markBusy(sessionID, "BeforeTool");
     } else {
+      toolInputSummary = callKey ? toolInputByCall.get(callKey) || undefined : undefined;
       if (callKey) {
         toolInputByCall.delete(callKey);
       }
@@ -366,7 +381,7 @@ const PLUGIN_SOURCE = `const kanbanOpenCodeBridge = async ({ client }) => {
     await notify(activityArgv, sessionID, {
       hookEventName: phase === "before" ? "BeforeTool" : "AfterTool",
       toolName,
-      toolInputSummary: callKey ? toolInputByCall.get(callKey) || undefined : undefined,
+      toolInputSummary,
     });
   };
 

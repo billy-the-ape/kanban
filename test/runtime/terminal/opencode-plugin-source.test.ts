@@ -311,8 +311,58 @@ describe("generated OpenCode bridge (AA-O1)", () => {
 		expect(activity.map((call) => call.payload.hook_event_name)).toEqual(["BeforeTool", "AfterTool"]);
 		expect(activity[0]?.payload.tool_name).toBe("bash");
 		expect(activity[0]?.payload.tool_input_summary).toBe("command=ls -la");
+		// The after-event is read before the call is forgotten, so the finished tool
+		// still reports what it ran instead of an empty summary.
+		expect(activity[1]?.payload.tool_input_summary).toBe("command=ls -la");
 		// The busy turn was already reported, so the tool does not reopen it.
 		expect(readCalls().filter((call) => call.event === "to_in_progress")).toHaveLength(1);
+	});
+
+	it("does not repeat the previous turn's text when a new turn has none", async () => {
+		const hooks = await setupBridge();
+		// Turn one: an ordinary answer that ends with a summary.
+		await emit(hooks, { type: "session.busy", properties: { sessionID: "ses_root01" } });
+		await emit(hooks, {
+			type: "message.updated",
+			properties: { info: { id: "msg_1", role: "assistant", sessionID: "ses_root01" } },
+		});
+		await emit(hooks, {
+			type: "message.part.updated",
+			properties: {
+				part: { type: "text", messageID: "msg_1", sessionID: "ses_root01", text: "Fixed the flaky test." },
+			},
+		});
+		await emit(hooks, { type: "session.idle", properties: { sessionID: "ses_root01" } });
+
+		// Turn two: the human follows up and this turn produces no assistant text,
+		// only a tool call. Its review must be empty rather than repeating the
+		// summary the human already read.
+		await emit(hooks, { type: "session.busy", properties: { sessionID: "ses_root01" } });
+		await hooks["tool.execute.before"]?.(
+			{ sessionID: "ses_root01", tool: "bash", callID: "call_2" },
+			{ args: { command: "npm test" } },
+		);
+		await hooks["tool.execute.after"]?.({ sessionID: "ses_root01", tool: "bash", callID: "call_2" });
+		await emit(hooks, { type: "session.idle", properties: { sessionID: "ses_root01" } });
+
+		const reviews = readCalls().filter((call) => call.event === "to_review");
+		expect(reviews).toHaveLength(2);
+		expect(reviews[0]?.payload.final_message).toBe("Fixed the flaky test.");
+		expect(reviews[1]?.payload.final_message).toBeUndefined();
+		// A turn that does produce text still reports its own.
+		await emit(hooks, { type: "session.busy", properties: { sessionID: "ses_root01" } });
+		await emit(hooks, {
+			type: "message.updated",
+			properties: { info: { id: "msg_3", role: "assistant", sessionID: "ses_root01" } },
+		});
+		await emit(hooks, {
+			type: "message.part.updated",
+			properties: { part: { type: "text", messageID: "msg_3", sessionID: "ses_root01", text: "12 tests pass." } },
+		});
+		await emit(hooks, { type: "session.idle", properties: { sessionID: "ses_root01" } });
+		const latestReviews = readCalls().filter((call) => call.event === "to_review");
+		expect(latestReviews).toHaveLength(3);
+		expect(latestReviews[2]?.payload.final_message).toBe("12 tests pass.");
 	});
 
 	it("resumes the turn when a permission is answered inside the tool", async () => {
