@@ -4,7 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { type UseGitActionsResult, useGitActions } from "@/hooks/use-git-actions";
 import { agentDefinitionTestDefaults } from "@/runtime/agent-definition-test-defaults";
-import type { RuntimeConfigResponse, RuntimeTaskWorkspaceInfoResponse } from "@/runtime/types";
+import type {
+	RuntimeAgentId,
+	RuntimeConfigResponse,
+	RuntimeTaskSessionSummary,
+	RuntimeTaskWorkspaceInfoResponse,
+} from "@/runtime/types";
 import { clearTaskWorkspaceInfo, clearTaskWorkspaceSnapshot } from "@/stores/workspace-metadata-store";
 import type { BoardData } from "@/types";
 
@@ -71,7 +76,7 @@ function createGitHistoryResult(): UseGitActionsResult["gitHistory"] {
 	};
 }
 
-function createBoard(): BoardData {
+function createBoard(agentId?: RuntimeAgentId): BoardData {
 	return {
 		columns: [
 			{
@@ -81,6 +86,7 @@ function createBoard(): BoardData {
 					{
 						id: "task-1",
 						title: "Ship it",
+						...(agentId ? { agentId } : {}),
 						prompt: "Ship it",
 						startInPlanMode: false,
 						autoReviewEnabled: false,
@@ -167,16 +173,23 @@ function HookHarness({
 	onSnapshot,
 	sendTaskSessionInput,
 	sendTaskChatMessage,
+	selectedAgentId = "cline",
+	taskAgentId,
+	taskSessions = {},
 }: {
 	onSnapshot: (snapshot: HookSnapshot) => void;
 	sendTaskSessionInput: Parameters<typeof useGitActions>[0]["sendTaskSessionInput"];
 	sendTaskChatMessage: Parameters<typeof useGitActions>[0]["sendTaskChatMessage"];
+	selectedAgentId?: RuntimeAgentId;
+	taskAgentId?: RuntimeAgentId;
+	taskSessions?: Record<string, RuntimeTaskSessionSummary>;
 }): null {
 	const gitActions = useGitActions({
 		currentProjectId: "project-1",
-		board: createBoard(),
+		board: createBoard(taskAgentId),
 		selectedCard: null,
-		runtimeProjectConfig: createRuntimeConfig("cline"),
+		runtimeProjectConfig: createRuntimeConfig(selectedAgentId),
+		taskSessions,
 		sendTaskSessionInput,
 		sendTaskChatMessage,
 		fetchTaskWorkspaceInfo: async () => createWorkspaceInfo(),
@@ -269,6 +282,96 @@ describe("useGitActions", () => {
 		});
 		expect(sendTaskSessionInput).not.toHaveBeenCalled();
 		expect(showAppToastMock).not.toHaveBeenCalled();
+	});
+
+	it("routes a Pi task through its terminal when the workspace default is Cline", async () => {
+		const sendTaskSessionInput = vi.fn(async () => ({ ok: true }));
+		const sendTaskChatMessage = vi.fn(async () => ({ ok: true }));
+		let snapshot: HookSnapshot | null = null;
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					taskAgentId="pi"
+					selectedAgentId="cline"
+					sendTaskSessionInput={sendTaskSessionInput}
+					sendTaskChatMessage={sendTaskChatMessage}
+					onSnapshot={(next) => {
+						snapshot = next;
+					}}
+				/>,
+			);
+			await Promise.resolve();
+		});
+
+		await act(async () => {
+			snapshot?.handleAgentCommitTask("task-1");
+			await new Promise<void>((resolve) => window.setTimeout(resolve, 250));
+		});
+
+		expect(sendTaskChatMessage).not.toHaveBeenCalled();
+		expect(sendTaskSessionInput).toHaveBeenCalledWith("task-1", "commit", {
+			appendNewline: false,
+			mode: "paste",
+		});
+		expect(sendTaskSessionInput).toHaveBeenCalledWith("task-1", "\r", { appendNewline: false });
+		expect(showAppToastMock).not.toHaveBeenCalled();
+	});
+
+	it("prefers the persisted task agent over both card and workspace selections", async () => {
+		const sendTaskSessionInput = vi.fn(async () => ({ ok: true }));
+		const sendTaskChatMessage = vi.fn(async () => ({ ok: true }));
+		let snapshot: HookSnapshot | null = null;
+		const taskSessions = {
+			"task-1": {
+				taskId: "task-1",
+				state: "awaiting_review",
+				agentId: "cline",
+				workspacePath: "/tmp/task-1",
+				pid: null,
+				startedAt: 1,
+				updatedAt: 2,
+				lastOutputAt: 2,
+				reviewReason: "hook",
+				exitCode: null,
+				lastHookAt: null,
+				latestHookActivity: null,
+				latestTurnCheckpoint: null,
+				previousTurnCheckpoint: null,
+				warningMessage: null,
+				launchAttemptId: null,
+				launchProvenance: null,
+			},
+		} satisfies Record<string, RuntimeTaskSessionSummary>;
+
+		await act(async () => {
+			root.render(
+				<HookHarness
+					taskAgentId="pi"
+					selectedAgentId="pi"
+					taskSessions={taskSessions}
+					sendTaskSessionInput={sendTaskSessionInput}
+					sendTaskChatMessage={sendTaskChatMessage}
+					onSnapshot={(next) => {
+						snapshot = next;
+					}}
+				/>,
+			);
+			await Promise.resolve();
+		});
+
+		await act(async () => {
+			snapshot?.handleAgentCommitTask("task-1");
+			await Promise.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+
+		expect(sendTaskChatMessage).toHaveBeenCalledWith("task-1", "commit", {
+			mode: "act",
+			source: "automated",
+		});
+		expect(sendTaskSessionInput).not.toHaveBeenCalled();
 	});
 
 	describe("AUTOGIT: git-action prompt dedupe", () => {
