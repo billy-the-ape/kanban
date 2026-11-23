@@ -76,6 +76,22 @@ describe("TerminalSessionManager", () => {
 		expect(manager.transitionToReview("task-1", "hook")?.reviewReason).toBe("hook");
 	});
 
+	it("records only a new bounded external session id", () => {
+		const manager = new TerminalSessionManager();
+		manager.hydrateFromRecord({ "task-1": createSummary({ state: "running" }) });
+
+		expect(manager.applyExternalSessionId("task-1", " ses_08f7c2a9b1eF4d ")?.externalSessionId).toBe(
+			"ses_08f7c2a9b1eF4d",
+		);
+
+		// Re-reporting the same conversation is a no-op, and so is anything unusable:
+		// a misbehaving integration must not grow the state file or blank the session
+		// the card resumes by.
+		for (const unusableId of ["ses_08f7c2a9b1eF4d", "   ", "x".repeat(201)]) {
+			expect(manager.applyExternalSessionId("task-1", unusableId)?.externalSessionId).toBe("ses_08f7c2a9b1eF4d");
+		}
+	});
+
 	it("builds shell kickoff command lines with quoted arguments", () => {
 		const commandLine = buildShellCommandLine("cline", ["--auto-approve-all", "hello world"]);
 		expect(commandLine).toContain("cline");
