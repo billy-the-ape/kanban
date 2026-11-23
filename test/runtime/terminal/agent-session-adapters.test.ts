@@ -10,6 +10,7 @@ const originalHome = process.env.HOME;
 const originalAppData = process.env.APPDATA;
 const originalLocalAppData = process.env.LOCALAPPDATA;
 const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
+const originalOpenCodeConfig = process.env.OPENCODE_CONFIG;
 let tempHome: string | null = null;
 const originalArgv = [...process.argv];
 const originalExecArgv = [...process.execArgv];
@@ -129,6 +130,11 @@ afterEach(() => {
 		delete process.env.XDG_CONFIG_HOME;
 	} else {
 		process.env.XDG_CONFIG_HOME = originalXdgConfigHome;
+	}
+	if (originalOpenCodeConfig === undefined) {
+		delete process.env.OPENCODE_CONFIG;
+	} else {
+		process.env.OPENCODE_CONFIG = originalOpenCodeConfig;
 	}
 	process.argv = [...originalArgv];
 	process.execArgv = [...originalExecArgv];
@@ -392,6 +398,42 @@ describe("prepareAgentLaunch hook strategies", () => {
 		expect(pluginEntries.at(-1)).toBe(join(dirname(launch.env.OPENCODE_CONFIG ?? ""), "plugin"));
 		// The same selection is what the model policy passes, not a guessed one.
 		expect(getCliFlagValue(launch.args, "--model")).toBe("ollama/qwen2.5-coder:32b");
+		expect(launch.warningMessage).toBeUndefined();
+	});
+
+	it("finds an exported OPENCODE_CONFIG even though a task launch carries no env", async () => {
+		const homePath = setupTempHome();
+		const workspace = setupEmptyWorkspace();
+		const userConfigPath = join(homePath, "exported-opencode.json");
+		process.env.OPENCODE_CONFIG = userConfigPath;
+		writeFileSync(
+			userConfigPath,
+			JSON.stringify({ model: "ollama/qwen2.5-coder:32b", mcp: { browser: { url: "http://127.0.0.1:9222" } } }),
+			"utf8",
+		);
+
+		// A real task launch reaches the adapter with no env of its own: the runtime
+		// starts terminal sessions without one and the process environment is merged
+		// only later, when the PTY is built. Reading just the request env left an
+		// exported config unseen, and the launch then repointed the variable at the
+		// overlay - dropping the user's providers, agents and MCP servers silently.
+		const launch = await prepareAgentLaunch({
+			taskId: "task-opencode-exported-config",
+			agentId: "opencode",
+			binary: "opencode",
+			args: [],
+			cwd: workspace,
+			prompt: "",
+			workspaceId: "workspace-1",
+			attemptId: "attempt-1",
+		});
+
+		expect(launch.env.OPENCODE_CONFIG).not.toBe(userConfigPath);
+		const overlay = JSON.parse(readFileSync(launch.env.OPENCODE_CONFIG ?? "", "utf8")) as Record<string, unknown>;
+		expect(overlay.model).toBe("ollama/qwen2.5-coder:32b");
+		expect(overlay.mcp).toEqual({ browser: { url: "http://127.0.0.1:9222" } });
+		// The bridge still rides along, so the card keeps moving itself to review.
+		expect((overlay.plugin as string[]).at(-1)).toBe(join(dirname(launch.env.OPENCODE_CONFIG ?? ""), "plugin"));
 		expect(launch.warningMessage).toBeUndefined();
 	});
 

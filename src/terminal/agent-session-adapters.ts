@@ -32,6 +32,7 @@ import {
 	KANBAN_OPENCODE_SESSION_ID_ENV,
 	probeOpenCodeVersion,
 	readOpenCodeUserConfig,
+	readOpenCodeUserConfigPath,
 	resolveOpenCodeModelSelection,
 	verifyOpenCodeSession,
 } from "./opencode-integration";
@@ -653,8 +654,10 @@ const opencodeAdapter: AgentSessionAdapter = {
 			// A user who exports `OPENCODE_CONFIG` points it at their own file, and
 			// the pinned release reads that file instead of the ones Kanban would
 			// otherwise add, so repointing the variable has to carry their
-			// configuration into the overlay rather than replace it.
-			const userConfigPath = input.env?.OPENCODE_CONFIG?.trim() || null;
+			// configuration into the overlay rather than replace it. A task launch
+			// has no env of its own here, so this reads the environment Kanban was
+			// started with as every other OpenCode lookup does.
+			const userConfigPath = readOpenCodeUserConfigPath(input.env);
 			const userConfig = userConfigPath ? await readOpenCodeUserConfig(userConfigPath) : null;
 			Object.assign(env, createHookRuntimeEnv(hooks));
 			if (userConfigPath && !userConfig) {

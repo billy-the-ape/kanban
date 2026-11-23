@@ -390,11 +390,9 @@ export function parseOpenCodeUserConfig(raw: string, configDirectory: string): O
 	const rawPlugin = (parsed as { plugin?: unknown }).plugin;
 	const userPlugins = Array.isArray(rawPlugin) ? rawPlugin : rawPlugin === undefined ? [] : [rawPlugin];
 	for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-		if (key === "plugin") {
-			continue;
-		}
+		// `plugin` is rebuilt from the user's own entries plus Kanban's bridge, and
 		// `$schema` describes the file Kanban generates, not the user's.
-		if (key === "$schema") {
+		if (key === "plugin" || key === "$schema") {
 			continue;
 		}
 		settings[key] = value;
@@ -425,6 +423,21 @@ export async function readOpenCodeUserConfig(configPath: string): Promise<OpenCo
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * The file a user's exported `OPENCODE_CONFIG` points at, or null when they did not
+ * export one.
+ *
+ * A task launch arrives with no env of its own: `runtime-api.ts` starts terminal
+ * sessions without an `env`, and the process environment is only merged later, when
+ * the PTY is built. So this uses the same ambient fallback every other OpenCode
+ * lookup uses, or an exported config would be invisible here and Kanban would
+ * repoint the variable at its own overlay - silently dropping the user's providers,
+ * agents and MCP servers, which is exactly what the merge exists to prevent.
+ */
+export function readOpenCodeUserConfigPath(env?: Record<string, string | undefined>): string | null {
+	return readEnvValue(env, "OPENCODE_CONFIG");
 }
 
 /**

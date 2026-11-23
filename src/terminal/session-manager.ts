@@ -4,7 +4,6 @@
 import type {
 	RuntimeTaskHookActivity,
 	RuntimeTaskImage,
-	RuntimeTaskSessionReviewReason,
 	RuntimeTaskSessionState,
 	RuntimeTaskSessionSummary,
 	RuntimeTaskTurnCheckpoint,
@@ -26,7 +25,7 @@ import { createLaunchAttemptId } from "./hook-runtime-context";
 import { createLaunchProvenance } from "./launch-provenance";
 import { stripAnsi } from "./output-utils";
 import { PtySession } from "./pty-session";
-import { reduceSessionTransition, type SessionTransitionEvent } from "./session-state-machine";
+import { type HookReviewReason, reduceSessionTransition, type SessionTransitionEvent } from "./session-state-machine";
 import {
 	createTerminalProtocolFilterState,
 	disableOscColorQueryIntercept,
@@ -849,16 +848,17 @@ export class TerminalSessionManager implements TerminalSessionService {
 		return true;
 	}
 
-	transitionToReview(taskId: string, reason: RuntimeTaskSessionReviewReason): RuntimeTaskSessionSummary | null {
+	transitionToReview(taskId: string, reason: HookReviewReason): RuntimeTaskSessionSummary | null {
 		const entry = this.entries.get(taskId);
 		if (!entry) {
 			return null;
 		}
-		if (reason !== "hook") {
-			return cloneSummary(entry.summary);
-		}
+		// AA-O1: the reason reaches the reducer, so an approval pause and a failed
+		// turn park the card as `attention`/`error` rather than every hook review
+		// claiming an ordinary finished turn. Dropping the reason here would make
+		// those integrations silent no-ops.
 		const before = entry.summary;
-		const summary = this.applySessionEvent(entry, { type: "hook.to_review" });
+		const summary = this.applySessionEvent(entry, { type: "hook.to_review", reason });
 		if (summary !== before && entry.active) {
 			for (const listener of entry.listeners.values()) {
 				listener.onState?.(cloneSummary(summary));
@@ -945,10 +945,7 @@ export class TerminalSessionManager implements TerminalSessionService {
 			return null;
 		}
 		const trimmed = sessionId.trim();
-		if (!trimmed || trimmed.length > 200) {
-			return cloneSummary(entry.summary);
-		}
-		if (entry.summary.externalSessionId === trimmed) {
+		if (!trimmed || trimmed.length > 200 || entry.summary.externalSessionId === trimmed) {
 			return cloneSummary(entry.summary);
 		}
 		const summary = updateSummary(entry, { externalSessionId: trimmed });

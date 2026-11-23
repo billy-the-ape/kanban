@@ -275,6 +275,15 @@ unreadable version stays launchable (guidance beats a false block), and a missin
 never produces a phantom live session. Tested on Linux (CI fixtures + the sandbox
 host); macOS/Windows rely on the same argv and env contract.
 
+Two contract details are easy to break from the outside and are enforced in code, not just in
+prose. A hook review carries its reason (`attention`, `error`, `hook`) all the way into the
+session summary: the state machine used to hard-code `hook`, which turned the approval and
+error paths into silent no-ops one layer below the API that named them. And the user's
+exported `OPENCODE_CONFIG` is resolved from the environment Kanban runs in, never from the
+launch request alone, because task launches arrive with no env — reading only the request
+would let Kanban repoint the variable at its own overlay and drop the user's providers,
+agents and MCP servers without a word.
+
 ### Files
 
 | Path | Role |
@@ -284,8 +293,9 @@ host); macOS/Windows rely on the same argv and env contract.
 | `src/terminal/agent-session-adapters.ts` | `opencodeAdapter`: version gate, exact `--session` resume, `--continue` removal, `--agent plan`, `--auto`, overlay wiring, `--model`, single-element `--prompt`. |
 | `src/commands/hooks.ts`, `src/core/api-validation.ts`, `src/core/api-contract.ts` | `--session-id` on `hooks ingest` and `externalSessionId` on the session summary. |
 | `src/commands/hook-events/opencode-hook-events.ts` | normalizes the bridge payload (final text, activity sentence, tool detail) into the shared activity metadata; chosen by `--source opencode`, like the Pi normalizer. |
-| `src/trpc/hooks-api.ts` | records the reported session id and maps the notification type to the review reason (`error`, `attention`, `hook`). |
-| `src/terminal/session-manager.ts` | `applyExternalSessionId`, passes the stored id into the next launch, surfaces adapter `warningMessage`. |
+| `src/trpc/hooks-api.ts` | records the reported session id and maps the notification type to the review reason (`error`, `attention`, `hook`), returned as the narrowed `HookReviewReason` so only what a hook may claim reaches the session. |
+| `src/terminal/session-state-machine.ts` | `hook.to_review` carries that reason into the summary instead of labelling every hook review `hook`. Without it an approval pause and a failed turn never left `running`, so the card never parked and the follow-up `to_in_progress` was rejected as well. |
+| `src/terminal/session-manager.ts` | `applyExternalSessionId`, passes the stored id into the next launch, surfaces adapter `warningMessage`, and forwards the hook review reason to the reducer. |
 | `src/core/agent-catalog.ts`, `src/core/agent-capabilities.ts` | launch-supported entry, `--auto` autonomous args, capability row, agent-native model note and config locations. |
 | `web-ui/src/components/runtime-settings-dialog.tsx` | settings agent order includes OpenCode. |
 
@@ -327,7 +337,10 @@ session; otherwise the first non-child session becomes the root and child sessio
 - `KANBAN_OPENCODE_SESSION_ID` (Kanban-owned, resume launches only): pins the root
   session for the generated bridge.
 - `OPENCODE_CONFIG` and `OPENCODE_DISABLE_AUTOUPDATE` (Kanban-owned, per launch): additive
-  overlay and no auto-update during a task.
+  overlay and no auto-update during a task. A user's exported value is read from the
+  environment Kanban itself runs in, because a task launch reaches the adapter with no env
+  of its own (the runtime starts terminal sessions without one and merges the process
+  environment later, when the PTY is built); anything else silently replaces their config.
 - Settings shows OpenCode with its binary, config locations
   (`~/.config/opencode/opencode.json`, `<project>/.opencode/opencode.json`) and the
   model note above; Cline-only provider/reasoning controls stay Cline-only.
@@ -344,7 +357,11 @@ permission answered inside the tool), the OpenCode block in
 `test/runtime/terminal/agent-session-adapters.test.ts`, capability rows in
 `test/runtime/core/agent-capabilities.test.ts`, id list plus capability/command
 assertions in `test/runtime/terminal/agent-registry.test.ts`, and session-identity and
-review-reason cases in `test/runtime/trpc/hooks-api.test.ts`.
+review-reason cases in `test/runtime/trpc/hooks-api.test.ts`. The reason and the exported
+`OPENCODE_CONFIG` are also covered against a **real** `TerminalSessionManager`
+(`test/runtime/terminal/session-manager.test.ts`, plus a hooks-api suite that injects one):
+a stubbed manager is exactly what let a reason accepted at the API edge and dropped one layer
+further down keep every test green.
 
 ### Verified against the installed CLI (1.19.6)
 

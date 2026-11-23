@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { RuntimeTaskSessionSummary } from "../../../src/core/api-contract";
 import { buildShellCommandLine } from "../../../src/core/shell";
 import { TerminalSessionManager } from "../../../src/terminal/session-manager";
+import type { HookReviewReason } from "../../../src/terminal/session-state-machine";
 
 function createSummary(overrides: Partial<RuntimeTaskSessionSummary> = {}): RuntimeTaskSessionSummary {
 	return {
@@ -36,12 +37,43 @@ describe("TerminalSessionManager", () => {
 		};
 		const applySessionEvent = (
 			manager as unknown as {
-				applySessionEvent: (sessionEntry: unknown, event: { type: "hook.to_review" }) => RuntimeTaskSessionSummary;
+				applySessionEvent: (
+					sessionEntry: unknown,
+					event: { type: "hook.to_review"; reason: HookReviewReason },
+				) => RuntimeTaskSessionSummary;
 			}
 		).applySessionEvent;
-		const nextSummary = applySessionEvent(entry, { type: "hook.to_review" });
+		const nextSummary = applySessionEvent(entry, { type: "hook.to_review", reason: "hook" });
 		expect(nextSummary.state).toBe("awaiting_review");
+		expect(nextSummary.reviewReason).toBe("hook");
 		expect(entry.active.workspaceTrustBuffer).toBe("");
+	});
+
+	it("parks a hook review with the reason the integration reported", () => {
+		const manager = new TerminalSessionManager();
+		manager.hydrateFromRecord({ "task-1": createSummary({ state: "running" }) });
+
+		// A parked approval and a failed turn are different things to the human, and
+		// both have to leave the running state. Accepting the reason at the door and
+		// then dropping it made these two calls silent no-ops, so the card kept
+		// reading as a working task while the agent waited or had already failed.
+		const attention = manager.transitionToReview("task-1", "attention");
+		expect(attention?.state).toBe("awaiting_review");
+		expect(attention?.reviewReason).toBe("attention");
+
+		// Answering the approval has to be able to move the card again, and that only
+		// works while the recorded reason is one a paused turn may return from.
+		const resumed = manager.transitionToRunning("task-1");
+		expect(resumed?.state).toBe("running");
+		expect(resumed?.reviewReason).toBeNull();
+
+		const failed = manager.transitionToReview("task-1", "error");
+		expect(failed?.state).toBe("awaiting_review");
+		expect(failed?.reviewReason).toBe("error");
+
+		// An ordinary finished turn keeps the reason it always had.
+		manager.transitionToRunning("task-1");
+		expect(manager.transitionToReview("task-1", "hook")?.reviewReason).toBe("hook");
 	});
 
 	it("builds shell kickoff command lines with quoted arguments", () => {

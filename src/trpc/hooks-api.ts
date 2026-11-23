@@ -1,7 +1,6 @@
 import type {
 	RuntimeHookEvent,
 	RuntimeHookIngestResponse,
-	RuntimeTaskSessionReviewReason,
 	RuntimeTaskSessionSummary,
 	RuntimeTaskTurnCheckpoint,
 } from "../core/api-contract";
@@ -9,6 +8,7 @@ import { parseHookIngestRequest } from "../core/api-validation";
 import { loadWorkspaceContextById } from "../state/workspace-state";
 import { isStaleHookAttempt } from "../terminal/hook-runtime-context";
 import type { TerminalSessionManager } from "../terminal/session-manager";
+import type { HookReviewReason } from "../terminal/session-state-machine";
 import { fireReviewPullRequestLookup } from "../workspace/task-pull-request-lookup";
 import { type RecordHookPullRequestsInput, recordHookPullRequests } from "../workspace/task-pull-requests";
 import { captureTaskTurnCheckpoint, deleteTaskTurnCheckpointRef } from "../workspace/turn-checkpoints";
@@ -49,9 +49,12 @@ function canTransitionTaskForHookEvent(summary: RuntimeTaskSessionSummary, event
  * pause it is through the notification type, so a failed model call parks the
  * card with the error reason instead of reading as a finished turn, and a parked
  * approval uses the attention reason because the agent is blocked on the human
- * rather than done with the work.
+ * rather than done with the work. The narrowed return type is what makes the
+ * reason survive: `transitionToReview` accepts only what a hook may report, and
+ * the session summary carries it, so the card parks with the reason the
+ * integration actually claimed.
  */
-function hookReviewReason(notificationType: string | null | undefined): RuntimeTaskSessionReviewReason {
+function hookReviewReason(notificationType: string | null | undefined): HookReviewReason {
 	if (notificationType === "error") {
 		return "error";
 	}
