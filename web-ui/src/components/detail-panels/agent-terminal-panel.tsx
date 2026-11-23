@@ -1,6 +1,6 @@
 import "@xterm/xterm/css/xterm.css";
 
-import { Command, Maximize2, MessageSquare, Minimize2, X } from "lucide-react";
+import { CircleStop, Command, Maximize2, MessageSquare, Minimize2, X } from "lucide-react";
 import type { MutableRefObject, ReactElement } from "react";
 import { useMemo } from "react";
 
@@ -40,6 +40,8 @@ export interface AgentTerminalPanelProps {
 	showMoveToTrash?: boolean;
 	showComplete?: boolean;
 	showSessionToolbar?: boolean;
+	/** Render the Stop action inline instead of the full session toolbar, for views that hide it. */
+	showStopControl?: boolean;
 	onClose?: () => void;
 	autoFocus?: boolean;
 	minimalHeaderTitle?: string;
@@ -163,6 +165,7 @@ function AgentTerminalPanelLayout({
 	showMoveToTrash,
 	showComplete,
 	showSessionToolbar = true,
+	showStopControl = false,
 	onClose,
 	autoFocus: _autoFocus = false,
 	minimalHeaderTitle = "Terminal",
@@ -190,6 +193,30 @@ function AgentTerminalPanelLayout({
 		return normalizedCommand.split(/\s+/)[0] ?? null;
 	}, [agentCommand]);
 
+	const statusTag = (
+		<span
+			className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${statusTagColors[statusTagStyle]}`}
+		>
+			{statusLabel}
+		</span>
+	);
+	// The full session toolbar owns the labelled Stop button. Views that hide it can opt
+	// into this compact equivalent so stopping an active session stays reachable.
+	const stopControl = showStopControl ? (
+		<Tooltip side="top" content={canStop ? "Stop session" : null}>
+			<Button
+				icon={isStopping ? <Spinner size={12} /> : <CircleStop size={14} />}
+				variant="ghost"
+				size="sm"
+				onClick={() => {
+					void stopTerminal();
+				}}
+				disabled={!canStop || isStopping}
+				aria-label="Stop session"
+			/>
+		</Tooltip>
+	) : null;
+
 	return (
 		<div
 			style={{
@@ -212,13 +239,7 @@ function AgentTerminalPanelLayout({
 							padding: "8px 12px",
 						}}
 					>
-						<div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-							<span
-								className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${statusTagColors[statusTagStyle]}`}
-							>
-								{statusLabel}
-							</span>
-						</div>
+						<div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>{statusTag}</div>
 						<div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
 							<Button variant="default" size="sm" onClick={clearTerminal}>
 								Clear
@@ -237,7 +258,7 @@ function AgentTerminalPanelLayout({
 					</div>
 					<div className="h-px bg-border" />
 				</>
-			) : onClose ? (
+			) : onClose || showStopControl ? (
 				<div
 					style={{
 						display: "flex",
@@ -248,18 +269,25 @@ function AgentTerminalPanelLayout({
 					}}
 				>
 					<div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
-						<span className="text-text-secondary" style={{ fontSize: 12 }}>
-							{minimalHeaderTitle}
-						</span>
-						{minimalHeaderSubtitle ? (
-							<span
-								className="truncate font-mono text-text-secondary"
-								style={{ fontSize: 10 }}
-								title={minimalHeaderSubtitle}
-							>
-								{minimalHeaderSubtitle}
-							</span>
-						) : null}
+						{onClose ? (
+							<>
+								<span className="text-text-secondary" style={{ fontSize: 12 }}>
+									{minimalHeaderTitle}
+								</span>
+								{minimalHeaderSubtitle ? (
+									<span
+										className="truncate font-mono text-text-secondary"
+										style={{ fontSize: 10 }}
+										title={minimalHeaderSubtitle}
+									>
+										{minimalHeaderSubtitle}
+									</span>
+								) : null}
+							</>
+						) : (
+							/* With no close button this row is the panel's only header, so it shows the status. */
+							statusTag
+						)}
 					</div>
 					<div style={{ display: "flex", alignItems: "center", gap: 2, marginRight: "-6px" }}>
 						{agentLabel && onSendAgentCommand ? (
@@ -273,6 +301,7 @@ function AgentTerminalPanelLayout({
 								/>
 							</Tooltip>
 						) : null}
+						{stopControl}
 						{onToggleExpand ? (
 							<Tooltip
 								side="top"
@@ -298,13 +327,15 @@ function AgentTerminalPanelLayout({
 								/>
 							</Tooltip>
 						) : null}
-						<Button
-							icon={<X size={14} />}
-							variant="ghost"
-							size="sm"
-							onClick={onClose}
-							aria-label="Close terminal"
-						/>
+						{onClose ? (
+							<Button
+								icon={<X size={14} />}
+								variant="ghost"
+								size="sm"
+								onClick={onClose}
+								aria-label="Close terminal"
+							/>
+						) : null}
 					</div>
 				</div>
 			) : null}

@@ -171,6 +171,7 @@ function BottomTerminalSection({
 					summary={summary}
 					onSummary={onSummary}
 					showSessionToolbar={false}
+					showStopControl
 					autoFocus
 					onClose={onClose}
 					minimalHeaderTitle="Terminal"
@@ -819,6 +820,7 @@ export function CardDetailView({
 			isCommitLoading={agentCommitTaskLoadingById?.[selection.card.id] ?? false}
 			isOpenPrLoading={agentOpenPrTaskLoadingById?.[selection.card.id] ?? false}
 			showSessionToolbar={false}
+			showStopControl={isTaskTerminalEnabled}
 			autoFocus
 			showMoveToTrash={showMoveToTrashActions}
 			onMoveToTrash={onMoveToTrash}

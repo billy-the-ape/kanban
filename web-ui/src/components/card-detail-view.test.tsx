@@ -194,6 +194,21 @@ function getLastMockFirstArg<T>(mockFn: { mock: { calls: unknown[][] } }): T {
 	return lastCall?.[0] as T;
 }
 
+type MockedTerminalPanelProps = {
+	taskId?: string;
+	/** The card detail keeps the session toolbar hidden, so Stop is opted in through this flag. */
+	showStopControl?: boolean;
+};
+
+function findTerminalPanelProps(taskId: string): MockedTerminalPanelProps {
+	const calls = mockAgentTerminalPanel.mock.calls as unknown as Array<[MockedTerminalPanelProps | undefined]>;
+	const props = calls.map((call) => call[0]).find((call) => call?.taskId === taskId);
+	if (!props) {
+		throw new Error(`Expected an AgentTerminalPanel render for ${taskId}.`);
+	}
+	return props;
+}
+
 function requireResizeSeparator(container: HTMLElement): HTMLElement {
 	const separator = container.querySelector('[aria-label="Resize agent and diff panels"]');
 	if (!(separator instanceof HTMLElement)) {
@@ -666,6 +681,81 @@ describe("CardDetailView", () => {
 			panelBackgroundColor: "var(--color-surface-0)",
 			terminalBackgroundColor: TERMINAL_THEME_COLORS.surfacePrimary,
 		});
+	});
+
+	it("enables the compact stop control on the detail terminal panel", async () => {
+		const selection = createSelection();
+		selection.column = { ...selection.column, id: "in_progress" };
+
+		await act(async () => {
+			root.render(
+				<CardDetailView
+					selection={selection}
+					currentProjectId="workspace-1"
+					selectedAgentId="claude"
+					sessionSummary={null}
+					taskSessions={{}}
+					onSessionSummary={() => {}}
+					onCardSelect={() => {}}
+					onTaskDragEnd={() => {}}
+					onMoveToTrash={() => {}}
+					bottomTerminalOpen={false}
+					bottomTerminalTaskId={null}
+					bottomTerminalSummary={null}
+					onBottomTerminalClose={() => {}}
+				/>,
+			);
+		});
+
+		expect(findTerminalPanelProps("task-1").showStopControl).toBe(true);
+	});
+
+	it("omits the compact stop control when the task terminal is disabled", async () => {
+		await act(async () => {
+			root.render(
+				<CardDetailView
+					selection={createSelection()}
+					currentProjectId="workspace-1"
+					selectedAgentId="claude"
+					sessionSummary={null}
+					taskSessions={{}}
+					onSessionSummary={() => {}}
+					onCardSelect={() => {}}
+					onTaskDragEnd={() => {}}
+					onMoveToTrash={() => {}}
+					bottomTerminalOpen={false}
+					bottomTerminalTaskId={null}
+					bottomTerminalSummary={null}
+					onBottomTerminalClose={() => {}}
+				/>,
+			);
+		});
+
+		expect(findTerminalPanelProps("task-1").showStopControl).toBe(false);
+	});
+
+	it("enables the compact stop control on the detail bottom terminal", async () => {
+		await act(async () => {
+			root.render(
+				<CardDetailView
+					selection={createSelection()}
+					currentProjectId="workspace-1"
+					selectedAgentId="cline"
+					sessionSummary={null}
+					taskSessions={{}}
+					onSessionSummary={() => {}}
+					onCardSelect={() => {}}
+					onTaskDragEnd={() => {}}
+					onMoveToTrash={() => {}}
+					bottomTerminalOpen={true}
+					bottomTerminalTaskId="__detail_terminal__:task-1"
+					bottomTerminalSummary={null}
+					onBottomTerminalClose={() => {}}
+				/>,
+			);
+		});
+
+		expect(findTerminalPanelProps("__detail_terminal__:task-1").showStopControl).toBe(true);
 	});
 
 	it("queues Add diff comments into the cline composer without sending them", async () => {
