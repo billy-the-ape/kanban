@@ -284,7 +284,7 @@ describe("AR-2 bounded editor failure evidence", () => {
 
 	it("keeps a multi-line long-line candidate span within the per-window budget", async () => {
 		const path = join(cwd, "span.txt");
-		const longLine = "A".repeat(199) + " ";
+		const longLine = `${"A".repeat(199)} `;
 		const lines: string[] = ["start", ...Array.from({ length: 16 }, () => longLine), "end"];
 		await writeFile(path, lines.join("\n"));
 		// The submitted span differs from the file only by a trailing space per line,
@@ -308,8 +308,8 @@ describe("AR-2 bounded editor failure evidence", () => {
 
 	it("never drops candidate span lines when surrounding context is asymmetric", async () => {
 		const path = join(cwd, "top.txt");
-		const spanLine = "B".repeat(199) + " ";
-		const fillLine = "C".repeat(199) + " ";
+		const spanLine = `${"B".repeat(199)} `;
+		const fillLine = `${"C".repeat(199)} `;
 		// A 16-line candidate span at the top of the file, followed by more lines:
 		// no leading context exists, so trimming must only remove trailing context.
 		const lines: string[] = [

@@ -258,9 +258,7 @@ describe("useClineChatSession", () => {
 			content: "Old transcript",
 			createdAt: 1,
 		};
-		const onLoadMessages = vi.fn()
-			.mockResolvedValueOnce([beforeClear])
-			.mockResolvedValueOnce([]);
+		const onLoadMessages = vi.fn().mockResolvedValueOnce([beforeClear]).mockResolvedValueOnce([]);
 		const onSendMessage = vi.fn(async () => ({ ok: true, chatMessage: null }));
 		const snapshots: HookSnapshot[] = [];
 
