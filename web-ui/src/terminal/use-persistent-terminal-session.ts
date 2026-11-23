@@ -188,7 +188,7 @@ export function usePersistentTerminalSession({
 			});
 		return () => { cancelled = true; };
 	}, [enabled, workspaceId, taskId, baseRef, sessionSummary?.agentId,
-		sessionSummary?.state, sessionSummary?.pid, sessionSummary?.startedAt]);
+		sessionSummary?.state, sessionSummary?.pid]);
 
 	useEffect(() => {
 		return registerTerminalController(taskId, {
