@@ -19,6 +19,7 @@
 // serializer lives in task-diagnostics-export-stream.ts (artifacts are streamed
 // one at a time and never held as a second huge JSON string).
 
+import { basename } from "node:path";
 import type { TaskEditorCallEvidence } from "../cline-sdk/cline-editor-call-evidence";
 import type {
 	ClineTaskExportKind,
@@ -101,9 +102,11 @@ export interface TaskDiagnosticsExportSession {
 	taskId: string;
 	listingTruncated: boolean;
 	transcript: { status: TaskDiagnosticsExportTranscriptStatus; reason: string | null };
-	/** The session summary for terminal agent sessions (no structured transcript). */
+	/** The session summary for terminal agent sessions. */
 	summary: RuntimeTaskSessionSummary | null;
 	segments: TaskDiagnosticsExportSegment[];
+	/** Internal streaming source: the host path is never serialized into the export. */
+	nativeTranscript?: { format: "pi-jsonl"; fileName: string; filePath: string };
 }
 
 export interface TaskDiagnosticsExportV3Plan {
@@ -131,6 +134,8 @@ export interface BuildTaskDiagnosticsExportV3Input {
 	/** Source of the task's current session, if any. */
 	sessionSource: "cline" | "terminal" | null;
 	sessionSummary: RuntimeTaskSessionSummary | null;
+	/** Verified task-scoped Pi JSONL file (header id matches the requested task). */
+	piSessionFile?: string | null;
 	capturedAt: number;
 	exportedAt: string;
 	/**
@@ -377,32 +382,50 @@ export async function buildTaskDiagnosticsExportV3(
 		});
 	}
 
-	// Decision 9: terminal agent sessions have no structured transcript; the
-	// session summary travels alongside the explicit availability status.
+	// Preserve the existing summary-only behavior for other terminal agents.
+	// Pi additionally exports its native, unmodified task-scoped JSONL history.
 	const terminal = isTerminalAgentSession(input.sessionSource);
 	if (terminal) {
+		const isPi = input.sessionSummary?.agentId === "pi";
+		const piSessionFile = isPi ? (input.piSessionFile ?? null) : null;
+		const missingReason = isPi
+			? "Pi session JSONL was not found for this task"
+			: "terminal agent session; no structured transcript recorded";
 		sessions.push({
 			kind: "task",
 			taskId: input.taskId,
 			listingTruncated: false,
 			transcript: {
-				status: "unavailable",
-				reason: "terminal agent session; no structured transcript recorded",
+				status: piSessionFile ? "complete" : "unavailable",
+				reason: piSessionFile ? null : missingReason,
 			},
 			summary: input.sessionSummary,
 			segments: [],
+			...(piSessionFile
+				? {
+						nativeTranscript: {
+							format: "pi-jsonl" as const,
+							fileName: basename(piSessionFile),
+							filePath: piSessionFile,
+						},
+					}
+				: {}),
 		});
-		reasons.push("terminal agent session; no structured transcript recorded");
+		if (!piSessionFile) {
+			reasons.push(missingReason);
+		}
 	}
 
-	// No transcript source at all: operational diagnostics still export, the
-	// transcript is explicitly unavailable.
-	const hasAnySegments = sessions.some((session) => session.segments.length > 0);
-	if (!hasAnySegments && !terminal) {
+	// A task may have Cline segments or a native Pi transcript. Other
+	// terminal agents still report an explicit missing transcript.
+	const hasAnyTranscript = sessions.some(
+		(session) => session.segments.length > 0 || session.nativeTranscript !== undefined,
+	);
+	if (!hasAnyTranscript && !terminal) {
 		reasons.push("no Cline session transcript is recorded for this task");
 	}
 
-	const status: TaskDiagnosticsExportCompleteness["status"] = !hasAnySegments
+	const status: TaskDiagnosticsExportCompleteness["status"] = !hasAnyTranscript
 		? "unavailable"
 		: reasons.length > 0
 			? "partial"

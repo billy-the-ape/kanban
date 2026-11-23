@@ -115,6 +115,7 @@ import {
 	type TaskDispatchDeps,
 } from "../task-dispatch/task-dispatch-service";
 import { buildRuntimeConfigResponse, resolveAgentCommand } from "../terminal/agent-registry";
+import { derivePiSessionId, getPiTaskSessionDir, readPiSessionRecord } from "../terminal/pi-session-options";
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { createVerificationRunner } from "../verification/verification-service";
 import { evaluateDependentsUnlock, getGitDeliveryService, readTaskDeliveryReceipt } from "../workspace/git-delivery";
@@ -1776,6 +1777,19 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 						reviewSnapshotError: message,
 					};
 				});
+			// Pi owns a durable task-scoped JSONL transcript. Resolve only this
+			// workspace/task's deterministic session id, never a global "latest"
+			// session or a file path supplied by the caller.
+			const piScope = { workspaceId: workspaceScope.workspaceId, taskId };
+			const piSessionFile =
+				snapshot.session.source === "terminal" && snapshot.session.summary?.agentId === "pi"
+					? (
+							await readPiSessionRecord({
+								sessionId: derivePiSessionId(piScope),
+								sessionDir: getPiTaskSessionDir(piScope),
+							})
+						).sessionFile
+					: null;
 			return await buildTaskDiagnosticsExportV3({
 				taskId,
 				diagnostics,
@@ -1792,6 +1806,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				],
 				sessionSource: snapshot.session.source,
 				sessionSummary: snapshot.session.summary,
+				piSessionFile,
 				capturedAt: Date.now(),
 				exportedAt: new Date().toISOString(),
 			});

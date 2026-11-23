@@ -354,6 +354,37 @@ describe("buildTaskDiagnosticsExportV3", () => {
 		expect(plan.completeness.status).toBe("unavailable");
 	});
 
+	it("marks a Pi session complete when its native JSONL is available", async () => {
+		const summary = createSummary({ agentId: "pi" });
+		const filePath = "/home/operator/.cline/kanban/pi/sessions/work/task/session.jsonl";
+		const plan = await buildTaskDiagnosticsExportV3(
+			baseInput({ sessionSource: "terminal", sessionSummary: summary, piSessionFile: filePath }),
+		);
+		expect(plan.sessions).toEqual([
+			{
+				kind: "task",
+				taskId: "task-1",
+				listingTruncated: false,
+				transcript: { status: "complete", reason: null },
+				summary,
+				segments: [],
+				nativeTranscript: { format: "pi-jsonl", fileName: "session.jsonl", filePath },
+			},
+		]);
+		expect(plan.completeness).toEqual({ status: "complete", reasons: [], warnings: [] });
+	});
+
+	it("reports a missing Pi JSONL without treating an unrelated terminal session as complete", async () => {
+		const plan = await buildTaskDiagnosticsExportV3(
+			baseInput({ sessionSource: "terminal", sessionSummary: createSummary({ agentId: "pi" }) }),
+		);
+		expect(plan.sessions[0]?.transcript).toEqual({
+			status: "unavailable",
+			reason: "Pi session JSONL was not found for this task",
+		});
+		expect(plan.completeness.status).toBe("unavailable");
+	});
+
 	it("carries snapshot-class read failures as explicit completeness gaps (Decision 5)", async () => {
 		const plan = await buildTaskDiagnosticsExportV3(
 			baseInput({

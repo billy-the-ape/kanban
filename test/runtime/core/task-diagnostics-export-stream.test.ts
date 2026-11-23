@@ -204,6 +204,35 @@ describe("streamTaskDiagnosticsExportV3", () => {
 		expect(parsed).toEqual(plan);
 	});
 
+	it("streams Pi's exact JSONL history without exporting its host path", async () => {
+		const rawJsonl = '{"type":"session"}\n{"type":"message","message":{"role":"assistant","content":"quoted \\" and 行"}}\n';
+		const filePath = join(tempDir, "pi-session.jsonl");
+		writeFileSync(filePath, rawJsonl, "utf8");
+		const plan = createPlan({
+			sessions: [
+				{
+					kind: "task",
+					taskId: "task-1",
+					listingTruncated: false,
+					transcript: { status: "complete", reason: null },
+					summary: null,
+					segments: [],
+					nativeTranscript: { format: "pi-jsonl", fileName: "pi-session.jsonl", filePath },
+				},
+			],
+		});
+		const output = await streamPlan(plan);
+		const parsed = JSON.parse(output) as {
+			sessions: Array<{ nativeTranscript: { format: string; fileName: string; content: string } }>;
+		};
+		expect(parsed.sessions[0]?.nativeTranscript).toEqual({
+			format: "pi-jsonl",
+			fileName: "pi-session.jsonl",
+			content: rawJsonl,
+		});
+		expect(output).not.toContain(filePath);
+	});
+
 	it("streams the resolved artifact file content exactly (multi-byte, newlines, quotes)", async () => {
 		const content = 'line one "quoted"\nsecond 行\ntrailing backslash \\ \u0001 control';
 		const artifactPath = join(tempDir, "t1.txt");
