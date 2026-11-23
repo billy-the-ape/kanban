@@ -242,7 +242,9 @@ export const ClineChatMessageItem = memo(function ClineChatMessageItem({
 		return <ToolMessageBlock message={message} controlledExpanded={expanded} onExpandedChange={onExpandedChange} />;
 	}
 	if (message.role === "reasoning") {
-		return <ReasoningMessageBlock message={message} controlledExpanded={expanded} onExpandedChange={onExpandedChange} />;
+		return (
+			<ReasoningMessageBlock message={message} controlledExpanded={expanded} onExpandedChange={onExpandedChange} />
+		);
 	}
 	if (message.role === "user") {
 		const hasText = message.content.trim().length > 0;

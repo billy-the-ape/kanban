@@ -213,8 +213,7 @@ async function startSession(taskId: string): Promise<void> {
 	await activeService.startTaskSession({
 		taskId,
 		cwd: probeDir,
-		prompt:
-			`Use the editor tool to replace 'beta' with 'beta-replaced' in ${targetFilePath} using old_text 'beta'.`,
+		prompt: `Use the editor tool to replace 'beta' with 'beta-replaced' in ${targetFilePath} using old_text 'beta'.`,
 		providerId: "ollama",
 		modelId: "probe-model",
 		apiKey: "sk-test-key",

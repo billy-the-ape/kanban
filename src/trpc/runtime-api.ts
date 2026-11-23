@@ -121,8 +121,8 @@ import { createVerificationRunner } from "../verification/verification-service";
 import { evaluateDependentsUnlock, getGitDeliveryService, readTaskDeliveryReceipt } from "../workspace/git-delivery";
 import { resolveTaskChatPrLinking } from "../workspace/task-chat-pr-linking";
 import {
-	getTaskInitialStartStatus as readTaskInitialStartStatus,
 	readTaskInitialStartRecord,
+	getTaskInitialStartStatus as readTaskInitialStartStatus,
 } from "../workspace/task-initial-start";
 import { clearTaskLastPrompt, recordTaskLastPrompt } from "../workspace/task-last-prompt";
 import { findTaskPatch } from "../workspace/task-patch";

@@ -88,6 +88,13 @@ interface PrSubscriptionState {
 	pollError: string | null;
 	pollInFlight: boolean;
 	settleInFlight: boolean;
+	/**
+	 * First polling observation of a terminal failure summary for the currently
+	 * running dispatch. Anchors the confirmation window: a summary is rewritten
+	 * for many reasons (warning message, hook activity), so its `updatedAt` must
+	 * never move the deadline that publishes the sticky failure.
+	 */
+	terminalFailureObservation: { dispatchId: string; observedAt: number } | null;
 }
 
 /**
@@ -103,6 +110,16 @@ const TICK_INTERVAL_MS = 10_000;
 const DEBOUNCE_MS = 120_000;
 const MAX_PENDING_MS = 600_000;
 const DISPATCH_RETRY_MS = 30_000;
+/**
+ * A live session summary can briefly report a failure while its terminal
+ * outcome and final hook are still being reconciled. The task-service
+ * onSettled callback remains authoritative and reports actual failures
+ * immediately; only the polling fallback waits for this grace period. The
+ * window is anchored on the first observation of the terminal state (see
+ * `PrSubscriptionState.terminalFailureObservation`), never on the summary's
+ * `updatedAt`, so a summary that keeps being rewritten cannot postpone it.
+ */
+const TERMINAL_FAILURE_CONFIRM_MS = 30_000;
 /** How long dispose() waits for already-running work before giving up on it. */
 const DISPOSE_GRACE_MS = 3_000;
 const BACKOFF_SCHEDULE_MS = [60_000, 120_000, 240_000, 480_000, 900_000];
@@ -691,6 +708,7 @@ export class PrCommentAutomationService {
 						pollError: null,
 						pollInFlight: false,
 						settleInFlight: false,
+						terminalFailureObservation: null,
 					} satisfies PrSubscriptionState);
 				if (!existing) {
 					this.subscriptions.set(key, sub);
@@ -738,6 +756,25 @@ export class PrCommentAutomationService {
 			return;
 		}
 		await this.track(this.pollAndSettle());
+	}
+
+	/**
+	 * Read-only view of the in-memory scheduling for one PR key so a caller can
+	 * tell an armed retry or an open terminal-failure confirmation window from a
+	 * dispatch that is actually stuck. Never exposes durable record state;
+	 * returns null when the PR has no live subscription.
+	 */
+	peekDispatchScheduling(
+		key: string,
+	): { dispatchRetryAt: number | null; terminalFailureObservedAt: number | null } | null {
+		const sub = this.subscriptions.get(key);
+		if (!sub) {
+			return null;
+		}
+		return {
+			dispatchRetryAt: sub.dispatchRetryAt,
+			terminalFailureObservedAt: sub.terminalFailureObservation?.observedAt ?? null,
+		};
 	}
 
 	private async pollAndSettle(): Promise<void> {
@@ -846,6 +883,26 @@ export class PrCommentAutomationService {
 	}
 
 	/**
+	 * Decides whether a terminal failure summary observed by the polling
+	 * fallback is confirmed yet. Records the first observation for the running
+	 * dispatch and keeps deferring the sticky failure - re-arming the dispatch
+	 * retry no later than the moment the window closes - until the observation
+	 * is TERMINAL_FAILURE_CONFIRM_MS old, then clears it so the caller may fail
+	 * the dispatch. Returns true while the caller must keep waiting.
+	 */
+	private withinTerminalFailureWindow(sub: PrSubscriptionState, dispatchId: string, nowMs: number): boolean {
+		const previous = sub.terminalFailureObservation;
+		const observedAt = previous === null || previous.dispatchId !== dispatchId ? nowMs : previous.observedAt;
+		sub.terminalFailureObservation = { dispatchId, observedAt };
+		if (nowMs - observedAt >= TERMINAL_FAILURE_CONFIRM_MS) {
+			sub.terminalFailureObservation = null;
+			return false;
+		}
+		sub.dispatchRetryAt = Math.min(nowMs + DISPATCH_RETRY_MS, observedAt + TERMINAL_FAILURE_CONFIRM_MS);
+		return true;
+	}
+
+	/**
 	 * Settles dispatch lifecycle for one subscription: completes/fails
 	 * running turns from session state, and attempts due queued dispatches
 	 * after a fresh successful re-read.
@@ -904,6 +961,16 @@ export class PrCommentAutomationService {
 				return;
 			}
 			const session = await this.resolveLiveSessionSummary(candidate, owner.taskId);
+			// Not a terminal failure observation (still running, recovered, or no
+			// summary at all): any earlier observation is stale, so a later failure
+			// must start a fresh confirmation window.
+			if (
+				session === null ||
+				(session.state !== "failed" && session.state !== "interrupted" && session.reviewReason !== "error")
+			) {
+				sub.terminalFailureObservation = null;
+			}
+
 			if (session?.state === "running") {
 				return;
 			}
@@ -920,6 +987,14 @@ export class PrCommentAutomationService {
 				return;
 			}
 			if (session.state === "failed" || session.state === "interrupted" || session.reviewReason === "error") {
+				// A summary is an observation, not the settled turn outcome: give the
+				// terminal owner time to publish its final hook/summary before making
+				// a sticky failure that only a manual Resume can clear. The window is
+				// anchored on the first observation of the terminal state, so a
+				// summary that keeps being refreshed cannot postpone it.
+				if (this.withinTerminalFailureWindow(sub, dispatch.dispatchId, nowMs)) {
+					return;
+				}
 				const detail = session.warningMessage ?? session.latestHookActivity?.finalMessage;
 				await this.setDispatchFailed(
 					sub,

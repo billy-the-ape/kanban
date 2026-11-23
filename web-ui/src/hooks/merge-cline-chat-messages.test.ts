@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { mergeClineChatMessages, type ClineChatMessage } from "@/hooks/use-cline-chat-session";
+import { type ClineChatMessage, mergeClineChatMessages } from "@/hooks/use-cline-chat-session";
 
 function message(id: string, content = id): ClineChatMessage {
 	return { id, role: "assistant", content, createdAt: 1 };

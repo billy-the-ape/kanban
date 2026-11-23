@@ -67,9 +67,10 @@ function areMessagesEqual(left: ClineChatMessage, right: ClineChatMessage): bool
 function upsertMessage(currentMessages: ClineChatMessage[], nextMessage: ClineChatMessage): ClineChatMessage[] {
 	// Streaming usually updates the final message; avoid a history scan per token.
 	const lastIndex = currentMessages.length - 1;
-	const existingIndex = currentMessages[lastIndex]?.id === nextMessage.id
-		? lastIndex
-		: currentMessages.findIndex((message) => message.id === nextMessage.id);
+	const existingIndex =
+		currentMessages[lastIndex]?.id === nextMessage.id
+			? lastIndex
+			: currentMessages.findIndex((message) => message.id === nextMessage.id);
 	if (existingIndex < 0) {
 		return [...currentMessages, nextMessage];
 	}
