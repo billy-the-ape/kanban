@@ -6,6 +6,21 @@ import type { TerminalSessionManager } from "../../../src/terminal/session-manag
 
 const PI_PASTE_SETTLE_TEST_MS = 200;
 
+function piActivity(
+	hookEventName: string,
+	notificationType: string | null = null,
+): NonNullable<RuntimeTaskSessionSummary["latestHookActivity"]> {
+	return {
+		activityText: null,
+		toolName: null,
+		toolInputSummary: null,
+		finalMessage: null,
+		hookEventName,
+		notificationType,
+		source: "pi",
+	};
+}
+
 function createPiManager() {
 	let summary: RuntimeTaskSessionSummary = {
 		taskId: "pi-task", state: "awaiting_review", agentId: "pi",
@@ -36,7 +51,6 @@ function createPiManager() {
 			for (const listener of listeners) listener(summary);
 		},
 		setActive: (value: boolean) => { active = value; },
-		latest: () => summary,
 		listeners,
 	};
 }
@@ -69,7 +83,22 @@ describe("sendPreparedPiRepair", () => {
 		expect(settled).not.toHaveBeenCalled();
 		pi.emit({ state: "running", reviewReason: null });
 		expect(settled).not.toHaveBeenCalled();
+		pi.emit({
+			state: "awaiting_review",
+			reviewReason: "attention",
+			lastHookAt: Date.now(),
+			latestHookActivity: piActivity("ui_prompt_start", "permission_prompt"),
+		});
+		expect(settled).not.toHaveBeenCalled();
+		pi.emit({ state: "running", reviewReason: null });
 		pi.emit({ state: "awaiting_review", reviewReason: "hook" });
+		expect(settled).not.toHaveBeenCalled();
+		pi.emit({
+			state: "awaiting_review",
+			reviewReason: "hook",
+			lastHookAt: Date.now(),
+			latestHookActivity: piActivity("agent_settled"),
+		});
 		expect(settled).toHaveBeenCalledExactlyOnceWith({ status: "completed" });
 		pi.emit({ state: "awaiting_review", reviewReason: "hook" });
 		expect(settled).toHaveBeenCalledTimes(1);
@@ -234,7 +263,25 @@ describe("sendPreparedPiRepair", () => {
 			restoreSavedSession: async () => ({ ok: true }),
 		});
 		expect(result.ok).toBe(false);
-		expect(result.error).toContain("not idle");
+		expect(result.error).toContain("not in Review");
+		expect(queued).not.toHaveBeenCalled();
+		expect(pi.writes).toEqual([]);
+	});
+
+	it("does not inject a repair into a Pi extension dialog", async () => {
+		const pi = createPiManager();
+		pi.emit({
+			state: "awaiting_review",
+			reviewReason: "attention",
+			lastHookAt: Date.now(),
+			latestHookActivity: piActivity("ui_prompt_start", "permission_prompt"),
+		});
+		const { prepare, queued } = createPreparation();
+		const result = await sendPreparedPiRepair({
+			manager: pi.manager, taskId: "pi-task", prepare,
+			restoreSavedSession: async () => ({ ok: true }),
+		});
+		expect(result.ok).toBe(false);
 		expect(queued).not.toHaveBeenCalled();
 		expect(pi.writes).toEqual([]);
 	});
