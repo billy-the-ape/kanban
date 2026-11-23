@@ -1,17 +1,14 @@
-import { execFile } from "node:child_process";
 import { access, lstat, mkdir, readdir, readFile, rm } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import { promisify } from "node:util";
 
 import type { RuntimeTaskPreservationRecord } from "../core/api-contract";
 import { runtimeTaskPreservationRecordSchema } from "../core/api-contract";
 import { lockedFileSystem } from "../fs/locked-file-system";
 import { getRuntimeHomePath } from "../state/workspace-state";
 import { runGit } from "./git-utils";
+import { runTaskArchive } from "./task-archive";
 import { applyTaskPatch, captureTaskPatch, deleteTaskPatchFiles, findTaskPatch } from "./task-patch";
 import { normalizeTaskIdForWorktreePath } from "./task-worktree-path";
-
-const execFileAsync = promisify(execFile);
 
 const KANBAN_TASK_PRESERVATION_DIR_NAME = "task-preservation";
 const TASK_PRESERVATION_MANIFEST_FILENAME = "manifest.json";
@@ -79,21 +76,14 @@ async function writeTaskWorktreeArchive(worktreePath: string, taskId: string): P
 	await rm(archivePath, { force: true });
 	// Full snapshot of the worktree (tracked, untracked, and binary content).
 	// .git is a pointer file for linked worktrees and must not be archived.
-	await execFileAsync("tar", [
-		"czf",
-		archivePath,
-		"--exclude=.git",
-		"-C",
-		dirname(worktreePath),
-		basename(worktreePath),
-	]);
+	await runTaskArchive(["czf", archivePath, "--exclude=.git", "-C", dirname(worktreePath), basename(worktreePath)]);
 	return archivePath;
 }
 
 export async function extractTaskWorktreeArchive(archivePath: string, worktreePath: string): Promise<void> {
 	// The archive stores a top-level directory named after the worktree, so
 	// extract into the parent to merge contents into the existing worktree.
-	await execFileAsync("tar", ["xzf", archivePath, "-C", dirname(worktreePath)]);
+	await runTaskArchive(["xzf", archivePath, "-C", dirname(worktreePath)]);
 }
 
 /**
@@ -305,8 +295,8 @@ export async function applyPreservedWorktreeContent(options: {
 				try {
 					await extractTaskWorktreeArchive(options.archivePath, options.worktreePath);
 					return undefined;
-				} catch {
-					// Fall through to the error message below.
+				} catch (archiveError) {
+					return `Preserved task changes and snapshot could not be restored automatically. Patch: ${toErrorMessage(error)} Archive: ${toErrorMessage(archiveError)}`;
 				}
 			}
 			return `Preserved task changes could not be reapplied automatically. ${toErrorMessage(error)}`;

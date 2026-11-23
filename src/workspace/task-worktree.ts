@@ -379,6 +379,21 @@ async function prepareNewTaskWorktree(repoPath: string, worktreePath: string): P
 	}
 }
 
+/** A failed restore must not leave a valid HEAD that a subsequent start can mistake for recovered work. */
+async function restorePreservedContentOrThrow(
+	repoPath: string,
+	options: Parameters<typeof applyPreservedWorktreeContent>[0],
+): Promise<void> {
+	const warning = await applyPreservedWorktreeContent(options);
+	if (!warning) return;
+	try {
+		await removeTaskWorktreeInternal(repoPath, options.worktreePath);
+	} catch (error) {
+		throw new Error(`${warning} Could not remove the incomplete checkout: ${getGitCommandErrorMessage(error)}`);
+	}
+	throw new Error(warning);
+}
+
 async function removeTaskWorktreeInternal(repoPath: string, worktreePath: string): Promise<boolean> {
 	const existed = await pathExists(worktreePath);
 	const removeResult = await runGit(repoPath, ["worktree", "remove", "--force", worktreePath]);
@@ -561,7 +576,7 @@ export async function ensureTaskWorktreeIfDoesntExist(options: {
 				]);
 				if (restoreAddResult.ok) {
 					await prepareNewTaskWorktree(context.repoPath, worktreePath);
-					const preserveWarning = await applyPreservedWorktreeContent({
+					await restorePreservedContentOrThrow(context.repoPath, {
 						taskId,
 						worktreePath,
 						checkedOutCommit: restoreTarget.commit,
@@ -581,7 +596,6 @@ export async function ensureTaskWorktreeIfDoesntExist(options: {
 						baseRef: requestedBaseRef,
 						baseCommit: restoreTarget.commit,
 						restoredFromPreservation: true,
-						warning: preserveWarning,
 					};
 				}
 				// The preserved commit may no longer exist (e.g. gc'd objects).
@@ -1150,7 +1164,7 @@ async function restorePreservedOrPatchedWorktree(options: {
 				sha: restoreTarget.commit,
 			});
 			if (restored.ok) {
-				const preserveWarning = await applyPreservedWorktreeContent({
+				await restorePreservedContentOrThrow(options.repoPath, {
 					taskId: options.taskId,
 					worktreePath: options.worktreePath,
 					checkedOutCommit: restoreTarget.commit,
@@ -1169,7 +1183,6 @@ async function restorePreservedOrPatchedWorktree(options: {
 					path: options.worktreePath,
 					baseCommit: restoreTarget.commit,
 					restoredFromPreservation: true,
-					...(preserveWarning ? { warning: preserveWarning } : {}),
 				};
 			}
 			// The preserved commit may no longer exist (e.g. gc'd objects).
@@ -1454,7 +1467,7 @@ export async function recoverTaskWorktree(options: {
 			}
 
 			await prepareNewTaskWorktree(options.repoPath, worktreePath);
-			const warning = await applyPreservedWorktreeContent({
+			await restorePreservedContentOrThrow(options.repoPath, {
 				taskId,
 				worktreePath,
 				checkedOutCommit: restoreTarget.commit,
@@ -1474,7 +1487,6 @@ export async function recoverTaskWorktree(options: {
 				restored: true,
 				path: worktreePath,
 				headCommit: restoredHead,
-				warning,
 			};
 		});
 	} catch (error) {
