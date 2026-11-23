@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import { normalizeHookMetadata } from "../../../src/commands/hooks";
 import { buildOpenCodePluginSource } from "../../../src/terminal/opencode-plugin-source";
 
 type BridgeHooks = {
@@ -17,6 +18,7 @@ type BridgeHooks = {
 interface BridgeCall {
 	event: string;
 	sessionId: string | null;
+	source: string | null;
 	payload: Record<string, unknown>;
 }
 
@@ -60,10 +62,12 @@ async function setupBridge(
 	const pluginPath = join(directory, "plugin", "index.js");
 	writeFileSync(
 		pluginPath,
+		// The same argv the adapter generates, so a test can prove the flags that
+		// select the metadata normalizer really reach the Kanban CLI.
 		buildOpenCodePluginSource({
-			reviewArgv: ["/bin/sh", recorderPath, "--event", "to_review"],
-			inProgressArgv: ["/bin/sh", recorderPath, "--event", "to_in_progress"],
-			activityArgv: ["/bin/sh", recorderPath, "--event", "activity"],
+			reviewArgv: ["/bin/sh", recorderPath, "--event", "to_review", "--source", "opencode"],
+			inProgressArgv: ["/bin/sh", recorderPath, "--event", "to_in_progress", "--source", "opencode"],
+			activityArgv: ["/bin/sh", recorderPath, "--event", "activity", "--source", "opencode"],
 		}),
 		"utf8",
 	);
@@ -89,12 +93,15 @@ function readCalls(): BridgeCall[] {
 		if (lines.length === 0) {
 			continue;
 		}
-		const parsed: BridgeCall = { event: "", sessionId: null, payload: {} };
+		const parsed: BridgeCall = { event: "", sessionId: null, source: null, payload: {} };
 		for (let index = 0; index < lines.length; index += 1) {
 			const flag = lines[index] ?? "";
 			const value = lines[index + 1] ?? "";
 			if (flag === "--event") {
 				parsed.event = value;
+				index += 1;
+			} else if (flag === "--source") {
+				parsed.source = value;
 				index += 1;
 			} else if (flag === "--session-id") {
 				parsed.sessionId = value;
@@ -306,5 +313,111 @@ describe("generated OpenCode bridge (AA-O1)", () => {
 		expect(activity[0]?.payload.tool_input_summary).toBe("command=ls -la");
 		// The busy turn was already reported, so the tool does not reopen it.
 		expect(readCalls().filter((call) => call.event === "to_in_progress")).toHaveLength(1);
+	});
+
+	it("resumes the turn when a permission is answered inside the tool", async () => {
+		const hooks = await setupBridge();
+		// This release checks the permission inside the running tool, so this is the
+		// real order once the human approves: no second `before` and no
+		// `session.busy` between the approval and the tool finishing. If the parked
+		// turn is not resumed here, the card stays in attention and the turn's final
+		// idle is dropped as a duplicate.
+		await hooks["tool.execute.before"]?.(
+			{ sessionID: "ses_root01", tool: "bash", callID: "call_1" },
+			{ args: { command: "npm test" } },
+		);
+		await hooks["permission.ask"]?.(
+			{ sessionID: "ses_root01", permission: "bash", pattern: "npm test" },
+			{ status: "ask" },
+		);
+		await hooks["tool.execute.after"]?.({ sessionID: "ses_root01", tool: "bash", callID: "call_1" });
+		await emit(hooks, {
+			type: "message.updated",
+			properties: { info: { id: "msg_9", role: "assistant", sessionID: "ses_root01" } },
+		});
+		await emit(hooks, {
+			type: "message.part.updated",
+			properties: {
+				part: { type: "text", messageID: "msg_9", sessionID: "ses_root01", text: "All 12 tests pass." },
+			},
+		});
+		await emit(hooks, { type: "session.idle", properties: { sessionID: "ses_root01" } });
+
+		const calls = readCalls();
+		expect(calls.map((call) => [call.event, call.payload.hook_event_name])).toEqual([
+			["to_in_progress", "BeforeTool"],
+			["activity", "BeforeTool"],
+			["to_review", "PermissionRequest"],
+			["to_in_progress", "AfterTool"],
+			["activity", "AfterTool"],
+			["to_review", "session.idle"],
+		]);
+		const completion = calls[calls.length - 1];
+		expect(completion?.event).toBe("to_review");
+		// The finished turn is an ordinary completion, not a second approval.
+		expect(completion?.payload.notification_type).toBeUndefined();
+		expect(completion?.payload.final_message).toBe("All 12 tests pass.");
+	});
+
+	it("lets a turn that errored finish once work continues", async () => {
+		const hooks = await setupBridge();
+		await emit(hooks, { type: "session.busy", properties: { sessionID: "ses_root01" } });
+		await emit(hooks, {
+			type: "session.error",
+			properties: { sessionID: "ses_root01", error: { data: { message: "429 rate limited" } } },
+		});
+		// The human types again, a tool finishes, and the turn reaches idle: the
+		// error card has to be able to close, not sit parked forever.
+		await hooks["tool.execute.after"]?.({ sessionID: "ses_root01", tool: "bash", callID: "call_9" });
+		await emit(hooks, { type: "session.idle", properties: { sessionID: "ses_root01" } });
+
+		expect(readCalls().map((call) => [call.event, call.payload.notification_type])).toEqual([
+			["to_in_progress", undefined],
+			["to_review", "error"],
+			["to_in_progress", undefined],
+			["activity", undefined],
+			["to_review", undefined],
+		]);
+	});
+
+	it("reports the text the card shows through the real ingest parsing", async () => {
+		const hooks = await setupBridge();
+		await hooks["tool.execute.before"]?.(
+			{ sessionID: "ses_root01", tool: "edit", callID: "call_1" },
+			{ args: { filePath: "src/a.ts" } },
+		);
+		await emit(hooks, {
+			type: "message.updated",
+			properties: { info: { id: "msg_5", role: "assistant", sessionID: "ses_root01" } },
+		});
+		await emit(hooks, {
+			type: "message.part.updated",
+			properties: {
+				part: { type: "text", messageID: "msg_5", sessionID: "ses_root01", text: "Rewrote the ingest path." },
+			},
+		});
+		await emit(hooks, { type: "session.idle", properties: { sessionID: "ses_root01" } });
+
+		const calls = readCalls();
+		const activity = calls.find((call) => call.event === "activity" && call.payload.hook_event_name === "BeforeTool");
+		const review = calls.find((call) => call.event === "to_review");
+		if (!activity || !review) {
+			throw new Error("expected the bridge to report both the tool and the review");
+		}
+		// The argv the adapter generates names its source, and the OpenCode
+		// normalizer reads the bridge's own payload keys. Running both through the
+		// real ingest parsing is what proves the text reaches the card; asserting on
+		// the argv alone is how this stayed invisible.
+		expect(activity.source).toBe("opencode");
+		expect(review.source).toBe("opencode");
+		const activityMetadata = normalizeHookMetadata("activity", activity.payload, { source: activity.source });
+		expect(activityMetadata?.source).toBe("opencode");
+		expect(activityMetadata?.toolName).toBe("edit");
+		expect(activityMetadata?.toolInputSummary).toBe("filePath=src/a.ts");
+		expect(activityMetadata?.activityText).toContain("edit");
+		const reviewMetadata = normalizeHookMetadata("to_review", review.payload, { source: review.source });
+		expect(reviewMetadata?.source).toBe("opencode");
+		expect(reviewMetadata?.finalMessage).toBe("Rewrote the ingest path.");
+		expect(reviewMetadata?.activityText).toBe("OpenCode finished the turn");
 	});
 });

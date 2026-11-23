@@ -51,7 +51,7 @@ function canTransitionTaskForHookEvent(summary: RuntimeTaskSessionSummary, event
  * approval uses the attention reason because the agent is blocked on the human
  * rather than done with the work.
  */
-export function hookReviewReason(notificationType: string | null | undefined): RuntimeTaskSessionReviewReason {
+function hookReviewReason(notificationType: string | null | undefined): RuntimeTaskSessionReviewReason {
 	if (notificationType === "error") {
 		return "error";
 	}

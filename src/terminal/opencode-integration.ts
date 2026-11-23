@@ -205,7 +205,7 @@ export function isOpenCodeVersionSupported(version: OpenCodeVersion | null): boo
 }
 
 export function describeOpenCodeCompatibility(rawVersion: string | null | undefined): OpenCodeCompatibility {
-	const version = parseOpenCodeVersion(rawVersion ?? null);
+	const version = parseOpenCodeVersion(rawVersion);
 	if (!version) {
 		return {
 			status: "unknown",
@@ -255,7 +255,7 @@ export async function verifyOpenCodeSession(
 	options: OpenCodeLaunchProbeOptions & { binary: string },
 ): Promise<boolean | null> {
 	const trimmed = sessionId.trim();
-	if (!OPENCODE_SESSION_ID_PATTERN.test(trimmed)) {
+	if (!isOpenCodeSessionSelector(trimmed)) {
 		return false;
 	}
 	const binary = options.binary.trim();

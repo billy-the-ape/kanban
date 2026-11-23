@@ -56,6 +56,14 @@ Treat old snapshots under `.plan/docs/CLI References/` as historical.
   single-file paths are skipped, so the directory ships with a
   `package.json` (`"type": "module"`, `main: "./index.js"`) for the `export default`
   entry point.
+- **Bridge text reaching the card.** Every ingest call carries `--source opencode`,
+  which selects `normalizeOpenCodeHookMetadata`
+  (`src/commands/hook-events/opencode-hook-events.ts`): it owns the bridge's own
+  payload keys (`final_message`, `activity_text`, `tool_input_summary`, `tool_name`,
+  `hook_event_name`, `notification_type`) and clips the text to the shared bounds. On
+  the shared parser that payload is unidentified, so the card would move and the text
+  would be dropped; the plugin suite therefore drives the emitted argv and payload
+  through the real `normalizeHookMetadata` rather than asserting on the argv alone.
 - **A user who exports `OPENCODE_CONFIG` themselves.** That file is a source only
   because of the variable, so repointing it would silently discard the user's
   providers, agents and MCP servers. Kanban parses it (JSONC), carries every
@@ -74,8 +82,9 @@ Treat old snapshots under `.plan/docs/CLI References/` as historical.
   (`opencode.json`/`opencode.jsonc` in the XDG/legacy global dirs, the project dir, or
   `OPENCODE_CONFIG`) and never the auth store or the saved-model state file.
 - **`--continue`.** No longer emitted. A saved command that still carries it is
-  rewritten and the launch records a warning, because "most recent session" is not a
-  per-card fact.
+  rewritten on every path — a fresh launch, and a resume, where it would otherwise sit
+  next to the pinned `--session` and leave the CLI to choose — and the launch records a
+  warning, because "most recent session" is not a per-card fact.
 - **Explicit agent lists.** The launch gate, the capability row, the registry
   assertions and the settings ordering all moved together; the registry test now pins
   the launchable id list, so adding a CLI without its capability row fails there.
@@ -148,7 +157,10 @@ events, and retain the final assistant text and observed PR URLs within existing
 Publish PR observations through existing recorders, not a second polling subsystem.
 
 When an approval/question is answered in the terminal, clear attention only on observed
-continuation. Clean generated resources on all exit paths. Persist resume metadata and
+continuation, and the bridge reports that continuation itself: this release answers a
+permission inside the running tool, so the approved tool finishing is what returns the
+turn to busy and lets its final idle complete the card. Clean generated resources on all
+exit paths. Persist resume metadata and
 sanitized diagnostics before teardown. Two tasks must never share a root-session cache
 or a hook resource that can be overwritten by the other.
 
@@ -244,6 +256,7 @@ host); macOS/Windows rely on the same argv and env contract.
 | `src/terminal/opencode-plugin-source.ts` | generates the per-attempt bridge (`index.js` + `package.json`) for the pinned event/hook API. |
 | `src/terminal/agent-session-adapters.ts` | `opencodeAdapter`: version gate, exact `--session` resume, `--continue` removal, `--agent plan`, `--auto`, overlay wiring, `--model`, single-element `--prompt`. |
 | `src/commands/hooks.ts`, `src/core/api-validation.ts`, `src/core/api-contract.ts` | `--session-id` on `hooks ingest` and `externalSessionId` on the session summary. |
+| `src/commands/hook-events/opencode-hook-events.ts` | normalizes the bridge payload (final text, activity sentence, tool detail) into the shared activity metadata; chosen by `--source opencode`, like the Pi normalizer. |
 | `src/trpc/hooks-api.ts` | records the reported session id and maps the notification type to the review reason (`error`, `attention`, `hook`). |
 | `src/terminal/session-manager.ts` | `applyExternalSessionId`, passes the stored id into the next launch, surfaces adapter `warningMessage`. |
 | `src/core/agent-catalog.ts`, `src/core/agent-capabilities.ts` | launch-supported entry, `--auto` autonomous args, capability row, agent-native model note and config locations. |
@@ -298,7 +311,9 @@ session; otherwise the first non-child session becomes the root and child sessio
 config discovery that never touches auth/state, JSONC parsing, overlay shape,
 fixture-script session probes), `test/runtime/terminal/opencode-plugin-source.test.ts`
 (the generated file is imported and driven with a fake client; Kanban calls are
-captured from a recorder script), the OpenCode block in
+captured from a recorder script, and the captured argv plus payload are then run through
+the real `normalizeHookMetadata` so the card text is verified end to end, including a
+permission answered inside the tool), the OpenCode block in
 `test/runtime/terminal/agent-session-adapters.test.ts`, capability rows in
 `test/runtime/core/agent-capabilities.test.ts`, id list plus capability/command
 assertions in `test/runtime/terminal/agent-registry.test.ts`, and session-identity and
@@ -358,9 +373,3 @@ throwaway `HOME` and an empty project, through Kanban's own `probeOpenCodeVersio
   rather than the file it came from. A card whose variable points at something Kanban
   cannot parse runs without the bridge, so it never moves itself to review; the launch
   warning names the file.
-- Review findings from the second round that are **not** fixed by this branch and stay
-  open: the bridge's `final_message`/`activity_text`/`tool_input_summary` still need a
-  normalizer plus `--source opencode` before that text reaches a card; a saved
-  `--continue` is stripped only on a fresh launch, so a resume can still carry it next to
-  `--session`; and after an approved permission the bridge never returns the turn to
-  `busy`, so the turn's final idle is dropped and the card stays parked in attention.

@@ -342,6 +342,10 @@ describe("prepareAgentLaunch hook strategies", () => {
 		// AA-O1a: the bridge reports the session id it observed, so a later launch
 		// resumes this exact conversation.
 		expect(plugin).toContain("--session-id");
+		// AA-O1: every ingest call names its source, and that flag is what selects
+		// the normalizer reading the bridge's payload keys. Drop it and the assistant
+		// text, the approval summary and the tool detail are accepted and discarded.
+		expect(plugin.match(/"--source",\s*"opencode"/g)?.length).toBe(3);
 		// AA-O1a: approval stays with the human - the bridge never answers a
 		// permission, it only parks the card.
 		expect(plugin).not.toContain("reply:");
@@ -1021,6 +1025,28 @@ describe("prepareAgentLaunch hook strategies", () => {
 		// One argv element keeps a multi-line prompt from being re-split by a shell.
 		expect(launch.args.at(-1)).toBe(prompt);
 		expect(launch.args[launch.args.length - 2]).toBe("--prompt");
+	});
+
+	it("drops --continue from a resumed OpenCode command too", async () => {
+		setupTempHome();
+		// A command saved before AA-O1 carries `--continue` into a resume as well,
+		// where it would sit next to the exact session this launch pins and leave it
+		// to the CLI to decide which one wins.
+		const launch = await prepareAgentLaunch({
+			taskId: "task-opencode-resume-continue",
+			agentId: "opencode",
+			binary: "opencode",
+			args: ["--continue"],
+			cwd: setupEmptyWorkspace(),
+			prompt: "",
+			resumeFromTrash: true,
+			workspaceId: "workspace-1",
+			attemptId: "attempt-1",
+			externalSessionId: "ses_08f7c2a9b1eF4d",
+		});
+		expect(launch.args).not.toContain("--continue");
+		expect(getCliFlagValue(launch.args, "--session")).toBe("ses_08f7c2a9b1eF4d");
+		expect(launch.warningMessage ?? "").toContain("--continue");
 	});
 
 	it("passes OpenCode planning and autonomy as documented flags", async () => {

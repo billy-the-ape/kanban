@@ -26,7 +26,9 @@
  * review at most once per turn, a duplicate idle after a review is ignored, a
  * pending permission suppresses the completion review, and an error is recorded
  * with `notification_type: "error"` so Kanban marks the card with the error
- * review reason instead of an ordinary completion.
+ * review reason instead of an ordinary completion. An approval is asked inside
+ * the tool, so the approved tool finishing is what resumes the parked turn: it
+ * returns to busy, and that turn still gets its one completion review.
  */
 
 const PLUGIN_PLACEHOLDERS = {
@@ -332,20 +334,34 @@ const PLUGIN_SOURCE = `const kanbanOpenCodeBridge = async ({ client }) => {
   };
 
   const recordTool = async (phase, input, output) => {
-    const sessionID = typeof input && typeof input.sessionID === "string" ? input.sessionID : null;
+    // A typeof check alone is always truthy, so the object itself has to be
+    // checked before a property is read off it.
+    const sessionID = input && typeof input.sessionID === "string" ? input.sessionID : null;
     if (!(await owns(sessionID))) {
       return;
     }
     const toolName = clip(input && input.tool) || undefined;
-    const callID = typeof input && typeof input.callID === "string" ? input.callID : "";
+    const callID = input && typeof input.callID === "string" ? input.callID : "";
     const callKey = callID ? pairKey(sessionID, callID) : "";
     if (phase === "before") {
       if (callKey) {
         toolInputByCall.set(callKey, summarizeToolArgs(output && output.args) || undefined);
       }
       await markBusy(sessionID, "BeforeTool");
-    } else if (callKey) {
-      toolInputByCall.delete(callKey);
+    } else {
+      if (callKey) {
+        toolInputByCall.delete(callKey);
+      }
+      // OpenCode runs the permission check inside the tool, so once the human
+      // approves there is no further before-event for that call: the approved
+      // tool simply finishes. Without this the turn stays parked as a review and
+      // its final idle is dropped as a duplicate, leaving the card stuck waiting
+      // on an approval that was already answered. Work that resumes a parked
+      // approval, or follows an error, continues the turn rather than starting a
+      // new one, which is what markBusy decides.
+      if ((state === "review" && !lastReviewWasCompletion) || state === "error") {
+        await markBusy(sessionID, "AfterTool");
+      }
     }
     await notify(activityArgv, sessionID, {
       hookEventName: phase === "before" ? "BeforeTool" : "AfterTool",
@@ -365,12 +381,12 @@ const PLUGIN_SOURCE = `const kanbanOpenCodeBridge = async ({ client }) => {
 
       if (type === "message.updated") {
         const info = asRecord(properties.info);
-        const sessionID = typeof info && typeof info.sessionID === "string" ? info.sessionID : null;
+        const sessionID = info && typeof info.sessionID === "string" ? info.sessionID : null;
         if (!(await owns(sessionID))) {
           return;
         }
-        const messageID = typeof info && typeof info.id === "string" ? info.id : null;
-        const role = typeof info && typeof info.role === "string" ? info.role : null;
+        const messageID = info && typeof info.id === "string" ? info.id : null;
+        const role = info && typeof info.role === "string" ? info.role : null;
         if (messageID && role) {
           messageRoleByKey.set(pairKey(sessionID, messageID), role);
           if (role === "assistant" && !assistantTextByMessage.has(pairKey(sessionID, messageID))) {
@@ -444,12 +460,11 @@ const PLUGIN_SOURCE = `const kanbanOpenCodeBridge = async ({ client }) => {
     },
 
     "permission.ask": async (permission, output) => {
-      const status = typeof output && typeof output.status === "string" ? output.status : "";
+      const status = output && typeof output.status === "string" ? output.status : "";
       if (status !== "ask") {
         return;
       }
-      const sessionID =
-        typeof permission && typeof permission.sessionID === "string" ? permission.sessionID : null;
+      const sessionID = permission && typeof permission.sessionID === "string" ? permission.sessionID : null;
       if (!(await owns(sessionID))) {
         return;
       }

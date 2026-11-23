@@ -623,10 +623,12 @@ const opencodeAdapter: AgentSessionAdapter = {
 				);
 			}
 			args.push("--session", externalSessionId);
-		} else if (hasCliOption(args, "--continue")) {
-			// A command saved before AA-O1 can still carry `--continue`. Drop it:
-			// "most recent session" is not a per-card fact, and a card that needs
-			// its own conversation says so with `--session`.
+		}
+		if (hasCliOption(args, "--continue")) {
+			// A command saved before AA-O1 can still carry `--continue`. Drop it on
+			// every path: "most recent session" is not a per-card fact, and on a
+			// resume it would sit next to the `--session` this launch just pinned,
+			// leaving the CLI to decide which one wins.
 			const withoutContinue = args.filter((arg) => arg !== "--continue");
 			args.length = 0;
 			args.push(...withoutContinue);
@@ -665,10 +667,19 @@ const opencodeAdapter: AgentSessionAdapter = {
 			} else {
 				await ensureTextFile(
 					overlay.entryPointPath,
+					// `--source opencode` selects the OpenCode normalizer, which is what
+					// reads the bridge's own payload keys. Without it the generic
+					// parser would accept the call and drop the text it carries.
 					buildOpenCodePluginSource({
-						reviewArgv: buildHooksCommandParts(["ingest", "--event", "to_review"]),
-						inProgressArgv: buildHooksCommandParts(["ingest", "--event", "to_in_progress"]),
-						activityArgv: buildHooksCommandParts(["ingest", "--event", "activity"]),
+						reviewArgv: buildHooksCommandParts(["ingest", "--event", "to_review", "--source", "opencode"]),
+						inProgressArgv: buildHooksCommandParts([
+							"ingest",
+							"--event",
+							"to_in_progress",
+							"--source",
+							"opencode",
+						]),
+						activityArgv: buildHooksCommandParts(["ingest", "--event", "activity", "--source", "opencode"]),
 					}),
 				);
 				await ensureTextFile(overlay.manifestPath, buildOpenCodePluginManifestContent());
@@ -682,7 +693,9 @@ const opencodeAdapter: AgentSessionAdapter = {
 			// A task launch must never download a different OpenCode build behind
 			// the version check that just passed.
 			env.OPENCODE_DISABLE_AUTOUPDATE = "1";
-			if (input.resumeFromTrash && externalSessionId) {
+			// A resume already failed above unless Kanban holds a valid id, so this
+			// only has to ask whether this launch is that resume.
+			if (input.resumeFromTrash) {
 				// Only a real resume pins its root session: OpenCode starts a fresh
 				// conversation with a new id, and a bridge pinned to the id from the
 				// previous conversation would reject every event from the running one.

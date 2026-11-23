@@ -19,6 +19,7 @@ import {
 import { enrichDroidReviewMetadata } from "./hook-events/droid-hook-events";
 import { asRecord, normalizeWhitespace, readNestedString, readStringField } from "./hook-events/hook-utils";
 import { normalizeKiroHookMetadata } from "./hook-events/kiro-hook-events";
+import { normalizeOpenCodeHookMetadata } from "./hook-events/opencode-hook-events";
 import { normalizePiHookMetadata } from "./hook-events/pi-hook-events";
 
 export {
@@ -365,7 +366,13 @@ export function inferHookSourceFromPayload(payload: Record<string, unknown> | nu
 	return null;
 }
 
-function normalizeHookMetadata(
+/**
+ * Turns one hook call (CLI flags plus the agent payload) into the bounded
+ * activity metadata the card shows. Exported so a test can run this real ingest
+ * parsing over the argv and payload a generated integration produces, instead
+ * of asserting on the argv alone.
+ */
+export function normalizeHookMetadata(
 	event: RuntimeHookEvent,
 	payload: Record<string, unknown> | null,
 	flagMetadata: Partial<RuntimeTaskHookActivity>,
@@ -394,6 +401,21 @@ function normalizeHookMetadata(
 		});
 		if (piMetadata) {
 			return piMetadata;
+		}
+	}
+	if (sourceHint?.toLowerCase() === "opencode") {
+		// AA-O1: the generated bridge reports the assistant text, the approval
+		// summary and the tool detail under its own keys, so its normalizer owns
+		// them. Left on the shared heuristics the transition would land and the
+		// text it carries would be dropped.
+		const openCodeMetadata = normalizeOpenCodeHookMetadata({
+			event,
+			payload,
+			flagMetadata,
+			sourceHint,
+		});
+		if (openCodeMetadata) {
+			return openCodeMetadata;
 		}
 	}
 
