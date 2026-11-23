@@ -4,7 +4,6 @@
 import type {
 	RuntimeTaskHookActivity,
 	RuntimeTaskImage,
-	RuntimeTaskSessionReviewReason,
 	RuntimeTaskSessionState,
 	RuntimeTaskSessionSummary,
 	RuntimeTaskTurnCheckpoint,
@@ -26,7 +25,7 @@ import { createLaunchAttemptId } from "./hook-runtime-context";
 import { createLaunchProvenance } from "./launch-provenance";
 import { stripAnsi } from "./output-utils";
 import { PtySession } from "./pty-session";
-import { reduceSessionTransition, type SessionTransitionEvent } from "./session-state-machine";
+import { type HookReviewReason, reduceSessionTransition, type SessionTransitionEvent } from "./session-state-machine";
 import {
 	createTerminalProtocolFilterState,
 	disableOscColorQueryIntercept,
@@ -355,6 +354,10 @@ export class TerminalSessionManager implements TerminalSessionService {
 			env: request.env,
 			workspaceId: request.workspaceId,
 			attemptId: launchAttemptId,
+			// AA-O1a: the session id this card's own agent reported earlier. Only
+			// adapters with exact resume use it, and only for resume intent: a fresh
+			// launch starts a new conversation, so a stale id must not reach it.
+			externalSessionId: request.resumeFromTrash ? (entry.summary.externalSessionId ?? null) : null,
 		});
 		const launchEnvForProvenance: Record<string, string | undefined> = {
 			...request.env,
@@ -585,10 +588,15 @@ export class TerminalSessionManager implements TerminalSessionService {
 			exitCode: null,
 			lastHookAt: null,
 			latestHookActivity: null,
-			warningMessage: null,
+			// An adapter that could not honor part of the request says so here.
+			warningMessage: launch.warningMessage ?? null,
 			latestTurnCheckpoint: null,
 			previousTurnCheckpoint: null,
 			launchAttemptId,
+			// A fresh launch is a new conversation, so the session id reported for the
+			// previous one stops describing this card until the integration reports the
+			// new id; a resume keeps the id it resumed with.
+			externalSessionId: request.resumeFromTrash ? (entry.summary.externalSessionId ?? null) : null,
 			launchProvenance,
 		});
 		this.emitSummary(entry.summary);
@@ -840,16 +848,17 @@ export class TerminalSessionManager implements TerminalSessionService {
 		return true;
 	}
 
-	transitionToReview(taskId: string, reason: RuntimeTaskSessionReviewReason): RuntimeTaskSessionSummary | null {
+	transitionToReview(taskId: string, reason: HookReviewReason): RuntimeTaskSessionSummary | null {
 		const entry = this.entries.get(taskId);
 		if (!entry) {
 			return null;
 		}
-		if (reason !== "hook") {
-			return cloneSummary(entry.summary);
-		}
+		// AA-O1: the reason reaches the reducer, so an approval pause and a failed
+		// turn park the card as `attention`/`error` rather than every hook review
+		// claiming an ordinary finished turn. Dropping the reason here would make
+		// those integrations silent no-ops.
 		const before = entry.summary;
-		const summary = this.applySessionEvent(entry, { type: "hook.to_review" });
+		const summary = this.applySessionEvent(entry, { type: "hook.to_review", reason });
 		if (summary !== before && entry.active) {
 			for (const listener of entry.listeners.values()) {
 				listener.onState?.(cloneSummary(summary));
@@ -913,6 +922,33 @@ export class TerminalSessionManager implements TerminalSessionService {
 			lastHookAt: now(),
 			latestHookActivity: next,
 		});
+		if (entry.active) {
+			for (const listener of entry.listeners.values()) {
+				listener.onState?.(cloneSummary(summary));
+			}
+		}
+		this.emitSummary(summary);
+		return cloneSummary(summary);
+	}
+
+	/**
+	 * AA-O1a: remember the session id the agent reported for this card, so the
+	 * next launch can name that exact conversation instead of whichever session
+	 * the CLI touched last. Only a real change is recorded, and the value is
+	 * bounded so a misbehaving integration cannot grow the state file. Like the
+	 * rest of the session record it lives in the workspace state file and is not
+	 * treated as a secret.
+	 */
+	applyExternalSessionId(taskId: string, sessionId: string): RuntimeTaskSessionSummary | null {
+		const entry = this.entries.get(taskId);
+		if (!entry) {
+			return null;
+		}
+		const trimmed = sessionId.trim();
+		if (!trimmed || trimmed.length > 200 || entry.summary.externalSessionId === trimmed) {
+			return cloneSummary(entry.summary);
+		}
+		const summary = updateSummary(entry, { externalSessionId: trimmed });
 		if (entry.active) {
 			for (const listener of entry.listeners.values()) {
 				listener.onState?.(cloneSummary(summary));

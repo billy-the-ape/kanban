@@ -33,16 +33,18 @@ describe("agent capabilities (AA-S1)", () => {
 
 	it("only claims an exact session resume when the launch itself names the session", () => {
 		for (const agentId of CATALOG_AGENT_IDS) {
-			// Cline is started with a session id, and AA-P1's Pi launch names the
-			// session Kanban created (`--session-dir` plus `--session-id`). Every
-			// other CLI resumes “the most recent session”, which is not the
-			// session Kanban started for this card.
-			if (agentId === "cline" || agentId === "pi") {
+			// Cline is started with a session id, AA-O1a's OpenCode launch names the
+			// session its own bridge reported (`--session <id>`), and AA-P1's Pi
+			// launch names the session Kanban created (`--session-dir` plus
+			// `--session-id`). Every other CLI resumes “the most recent session”,
+			// which is not the session Kanban started for this card.
+			if (agentId === "cline" || agentId === "opencode" || agentId === "pi") {
 				continue;
 			}
 			expect(getRuntimeAgentCapabilities(agentId).explicitSessionResume).toBe(false);
 		}
 		expect(getRuntimeAgentCapabilities("cline").explicitSessionResume).toBe(true);
+		expect(getRuntimeAgentCapabilities("opencode").explicitSessionResume).toBe(true);
 		expect(getRuntimeAgentCapabilities("pi").explicitSessionResume).toBe(true);
 	});
 
@@ -57,16 +59,33 @@ describe("agent capabilities (AA-S1)", () => {
 		}
 	});
 
+	it("keeps OpenCode model selection inside OpenCode's own configuration", () => {
+		const modelConfiguration = getRuntimeAgentModelConfiguration("opencode");
+		expect(modelConfiguration.source).toBe("agent-native");
+		// AA-O1a: Kanban only passes `--model` for a model the user selected in
+		// their own OpenCode configuration (or its documented override), never
+		// one read out of OpenCode's auth store and never a hosted provider
+		// preference - so the note has to say which of those it is.
+		expect(modelConfiguration.note).toContain("--model");
+		expect(modelConfiguration.note).toContain("auth");
+		expect(modelConfiguration.configLocations.some((location) => location.includes("opencode"))).toBe(true);
+		expect(modelConfiguration.configLocations.some((location) => location.includes("auth"))).toBe(false);
+	});
+
 	it("reports the requested options an agent cannot honor", () => {
-		// OpenCode has no approval-bypass switch, so an autonomous request is
-		// refused instead of silently falling through to another agent's flags.
+		// AA-O1a: the pinned release publishes `--auto` and `--agent plan`, so
+		// autonomy and planning are both supported. What OpenCode cannot do is
+		// take attachments - only the one-shot `run` form has an attachment flag
+		// and Kanban launches the interactive TUI - so that request is refused by
+		// name instead of being dropped.
 		expect(
 			getUnsupportedAgentLaunchOperations("opencode", {
 				autonomousModeRequested: true,
+				startInPlanMode: true,
 				imagesRequested: false,
-				startInPlanMode: false,
 			}),
-		).toEqual(["autonomous-mode"]);
+		).toEqual([]);
+		expect(getUnsupportedAgentLaunchOperations("opencode", { imagesRequested: true })).toEqual(["image-attachment"]);
 
 		expect(
 			getUnsupportedAgentLaunchOperations("claude", {

@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { RuntimeBoardData, RuntimeTaskSessionSummary } from "../../../src/core/api-contract";
 import { loadWorkspaceState, saveWorkspaceState } from "../../../src/state/workspace-state";
-import type { TerminalSessionManager } from "../../../src/terminal/session-manager";
+import { TerminalSessionManager } from "../../../src/terminal/session-manager";
 import { createHooksApi } from "../../../src/trpc/hooks-api";
 import { type RecordHookPullRequestsInput, recordHookPullRequests } from "../../../src/workspace/task-pull-requests";
 import { createGitTestEnv } from "../../utilities/git-env";
@@ -492,5 +492,184 @@ describe("createHooksApi review lookup trigger (PRLINK-5)", () => {
 			expect(response).toEqual({ ok: true });
 			expect(manager.transitionToReview).toHaveBeenCalledWith("task-1", "hook");
 		});
+	});
+});
+describe("createHooksApi agent session identity (AA-O1a)", () => {
+	function createIdentityManager(options: { launchAttemptId?: string | null } = {}) {
+		const launchAttemptId = options.launchAttemptId ?? "attempt-2";
+		const reviewedSummary: RuntimeTaskSessionSummary = {
+			...createSummary({ state: "awaiting_review", reviewReason: "hook" }),
+			launchAttemptId,
+		};
+		const manager = {
+			getSummary: vi.fn(() => createSummary({ state: "running", agentId: "opencode", launchAttemptId })),
+			transitionToReview: vi.fn(() => reviewedSummary),
+			transitionToRunning: vi.fn(),
+			applyHookActivity: vi.fn(),
+			applyTurnCheckpoint: vi.fn(),
+			applyExternalSessionId: vi.fn(),
+		};
+		const deps = {
+			getWorkspacePathById: vi.fn(() => "/tmp/repo"),
+			ensureTerminalManagerForWorkspace: vi.fn(async () => manager as unknown as TerminalSessionManager),
+			broadcastRuntimeWorkspaceStateUpdated: vi.fn(),
+			broadcastTaskReadyForReview: vi.fn(),
+			captureTaskTurnCheckpoint: vi.fn(async () => ({
+				turn: 1,
+				ref: "refs/kanban/checkpoints/task-1/turn/1",
+				commit: "1111111",
+				createdAt: 1,
+			})),
+			deleteTaskTurnCheckpointRef: vi.fn(async () => undefined),
+		};
+		return { manager, api: createHooksApi(deps) };
+	}
+
+	it("remembers the session id for exact resume", async () => {
+		const { manager, api } = createIdentityManager();
+
+		await api.ingest({
+			taskId: "task-1",
+			workspaceId: "workspace-1",
+			event: "to_review",
+			attemptId: "attempt-2",
+			sessionId: "ses_08f7c2a9b1eF4d",
+			metadata: { source: "opencode", hookEventName: "session.idle" },
+		});
+		// Plain activity carries the id too, so a card that never reached a review
+		// still knows which conversation to resume.
+		await api.ingest({
+			taskId: "task-1",
+			workspaceId: "workspace-1",
+			event: "activity",
+			attemptId: "attempt-2",
+			sessionId: "ses_08f7c2a9b1eF4d",
+			metadata: { source: "opencode", hookEventName: "BeforeTool", toolName: "bash" },
+		});
+
+		expect(manager.applyExternalSessionId).toHaveBeenCalledTimes(2);
+		expect(manager.applyExternalSessionId).toHaveBeenLastCalledWith("task-1", "ses_08f7c2a9b1eF4d");
+	});
+
+	it("refuses a superseded attempt's session id", async () => {
+		const { manager, api } = createIdentityManager();
+
+		const response = await api.ingest({
+			taskId: "task-1",
+			workspaceId: "workspace-1",
+			event: "to_review",
+			attemptId: "attempt-1",
+			sessionId: "ses_aabbccddeeff",
+			metadata: { source: "opencode" },
+		});
+
+		// A stale event would otherwise rebind the card to another task's chat.
+		expect(response).toEqual({ ok: true });
+		expect(manager.applyExternalSessionId).not.toHaveBeenCalled();
+	});
+
+	it("parks a failed turn with the error reason instead of finishing it", async () => {
+		const { manager, api } = createIdentityManager();
+
+		await api.ingest({
+			taskId: "task-1",
+			workspaceId: "workspace-1",
+			event: "to_review",
+			attemptId: "attempt-2",
+			metadata: { source: "opencode", hookEventName: "session.error", notificationType: "error" },
+		});
+
+		expect(manager.transitionToReview).toHaveBeenCalledWith("task-1", "error");
+	});
+
+	it("marks a waiting approval as attention rather than completion", async () => {
+		const { manager, api } = createIdentityManager();
+
+		await api.ingest({
+			taskId: "task-1",
+			workspaceId: "workspace-1",
+			event: "to_review",
+			attemptId: "attempt-2",
+			metadata: { source: "opencode", hookEventName: "PermissionRequest", notificationType: "permission.asked" },
+		});
+
+		expect(manager.transitionToReview).toHaveBeenCalledWith("task-1", "attention");
+	});
+});
+describe("createHooksApi review reasons through the real session manager (AA-O1)", () => {
+	// Every other suite here stubs the manager, which is exactly how a reason that
+	// dies inside `transitionToReview` stayed invisible: the call was recorded with
+	// the right argument while the card never moved. These run the real state
+	// machine, so the summary has to end up holding the reason the bridge claimed.
+	function createLiveManager(summary: RuntimeTaskSessionSummary) {
+		const manager = new TerminalSessionManager();
+		manager.hydrateFromRecord({ [summary.taskId]: summary });
+		const api = createHooksApi({
+			getWorkspacePathById: vi.fn(() => "/tmp/repo"),
+			ensureTerminalManagerForWorkspace: vi.fn(async () => manager),
+			broadcastRuntimeWorkspaceStateUpdated: vi.fn(),
+			broadcastTaskReadyForReview: vi.fn(),
+			captureTaskTurnCheckpoint: vi.fn(async () => ({
+				turn: 1,
+				ref: "refs/kanban/checkpoints/task-1/turn/1",
+				commit: "1111111",
+				createdAt: 1,
+			})),
+			deleteTaskTurnCheckpointRef: vi.fn(async () => undefined),
+		});
+		return { manager, api };
+	}
+
+	it("parks the card as an error rather than a finished turn", async () => {
+		const { manager, api } = createLiveManager(createSummary({ state: "running", agentId: "opencode" }));
+
+		const response = await api.ingest({
+			taskId: "task-1",
+			workspaceId: "workspace-1",
+			event: "to_review",
+			metadata: { source: "opencode", hookEventName: "session.error", notificationType: "error" },
+		});
+
+		expect(response).toEqual({ ok: true });
+		expect(manager.getSummary("task-1")?.state).toBe("awaiting_review");
+		expect(manager.getSummary("task-1")?.reviewReason).toBe("error");
+	});
+
+	it("parks a waiting approval as attention and lets the answer move the card again", async () => {
+		const { manager, api } = createLiveManager(createSummary({ state: "running", agentId: "opencode" }));
+
+		await api.ingest({
+			taskId: "task-1",
+			workspaceId: "workspace-1",
+			event: "to_review",
+			metadata: { source: "opencode", hookEventName: "PermissionRequest", notificationType: "permission.asked" },
+		});
+		expect(manager.getSummary("task-1")?.reviewReason).toBe("attention");
+
+		// Answering the approval is enough on its own: the card only leaves the
+		// parked state because the recorded reason is one a paused turn can return
+		// from, which is what an approval pause is.
+		await api.ingest({
+			taskId: "task-1",
+			workspaceId: "workspace-1",
+			event: "to_in_progress",
+			metadata: { source: "opencode", hookEventName: "BeforeTool" },
+		});
+		expect(manager.getSummary("task-1")?.state).toBe("running");
+		expect(manager.getSummary("task-1")?.reviewReason).toBeNull();
+	});
+
+	it("keeps an ordinary completion on the hook reason", async () => {
+		const { manager, api } = createLiveManager(createSummary({ state: "running", agentId: "opencode" }));
+
+		await api.ingest({
+			taskId: "task-1",
+			workspaceId: "workspace-1",
+			event: "to_review",
+			metadata: { source: "opencode", hookEventName: "session.idle", finalMessage: "12 tests pass." },
+		});
+
+		expect(manager.getSummary("task-1")?.state).toBe("awaiting_review");
+		expect(manager.getSummary("task-1")?.reviewReason).toBe("hook");
 	});
 });

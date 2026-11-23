@@ -756,11 +756,14 @@ export function parseHookIngestRequest(value: unknown): RuntimeHookIngestRequest
 				source: parsed.metadata.source?.trim(),
 			}
 		: undefined;
+	// AA-O1a: a blank session id is no id at all, so it never reaches the summary.
+	const sessionId = parsed.sessionId?.trim();
 	return {
 		...parsed,
 		taskId,
 		workspaceId,
 		metadata,
+		...(sessionId ? { sessionId } : { sessionId: undefined }),
 	};
 }
 

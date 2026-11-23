@@ -952,6 +952,13 @@ export const runtimeTaskSessionSummarySchema = z.object({
 	launchAttemptId: z.string().nullable().optional(),
 	/** AA-S1: provenance snapshot of the settings this session was launched with. */
 	launchProvenance: runtimeTaskLaunchProvenanceSchema.nullable().optional(),
+	/**
+	 * AA-O1a: the agent's own session id, reported by an integration that can
+	 * observe it (OpenCode's plugin). A later launch resumes exactly this
+	 * conversation instead of whichever session the CLI touched last. Optional
+	 * so summaries persisted before AA-O1 keep loading.
+	 */
+	externalSessionId: z.string().nullable().optional(),
 });
 export type RuntimeTaskSessionSummary = z.infer<typeof runtimeTaskSessionSummarySchema>;
 
@@ -2876,6 +2883,13 @@ export const runtimeHookIngestRequestSchema = z.object({
 	 * a superseded attempt and must not move the card.
 	 */
 	attemptId: z.string().min(1).max(200).optional(),
+	/**
+	 * AA-O1a: the agent's own session id, echoed by an integration that can
+	 * observe it. Kanban records it on the session summary so the next launch
+	 * resumes this exact conversation; bounded to the shape the agent emits so a
+	 * malformed integration cannot grow the state file.
+	 */
+	sessionId: z.string().min(1).max(200).optional(),
 	/** Canonical PR URLs detected by the hook CLI (re-parsed server-side; max 10). */
 	pullRequestUrls: z.array(z.string().min(1).max(2048)).max(10).optional(),
 });

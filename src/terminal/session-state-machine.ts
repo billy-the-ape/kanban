@@ -1,7 +1,15 @@
 import type { RuntimeTaskSessionReviewReason, RuntimeTaskSessionSummary } from "../core/api-contract";
 
+/**
+ * The only reasons an integration may report through a hook review. `attention`
+ * is a pause that waits for the human, `error` is a turn that failed, and `hook`
+ * is an ordinary finished turn. Every other reason comes from the process
+ * lifecycle rather than from an agent, so it cannot be claimed here.
+ */
+export type HookReviewReason = Extract<RuntimeTaskSessionReviewReason, "attention" | "error" | "hook">;
+
 export type SessionTransitionEvent =
-	| { type: "hook.to_review" }
+	| { type: "hook.to_review"; reason: HookReviewReason }
 	| { type: "hook.to_in_progress" }
 	| { type: "agent.prompt-ready" }
 	| { type: "process.exit"; exitCode: number | null; interrupted: boolean };
@@ -32,11 +40,17 @@ export function reduceSessionTransition(
 			if (summary.state !== "running") {
 				return { changed: false, patch: {}, clearAttentionBuffer: false };
 			}
+			// The reported reason is carried into the summary instead of every hook
+			// review being labelled `hook`: a turn that failed or a turn parked on an
+			// approval must stay distinguishable from a finished one, because a card
+			// that says "ready for review" for a failed turn reads as a completed
+			// task. `canReturnToRunning` below is what lets the same integration move
+			// the card again once the pause ends.
 			return {
 				changed: true,
 				patch: {
-					state: "awaiting_review",
-					reviewReason: "hook",
+					state: asReviewState(event.reason),
+					reviewReason: event.reason,
 				},
 				clearAttentionBuffer: true,
 			};
