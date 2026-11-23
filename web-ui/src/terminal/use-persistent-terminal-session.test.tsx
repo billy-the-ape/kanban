@@ -9,6 +9,11 @@ import { usePersistentTerminalSession } from "@/terminal/use-persistent-terminal
 const ensurePersistentTerminalMock = vi.hoisted(() => vi.fn());
 const disposePersistentTerminalMock = vi.hoisted(() => vi.fn());
 const registerTerminalControllerMock = vi.hoisted(() => vi.fn());
+const restoreTaskSessionMock = vi.hoisted(() => vi.fn());
+
+vi.mock("@/runtime/trpc-client", () => ({
+	getRuntimeTrpcClient: () => ({ runtime: { startTaskSession: { mutate: restoreTaskSessionMock } } }),
+}));
 
 vi.mock("@/terminal/persistent-terminal-manager", () => ({
 	ensurePersistentTerminal: ensurePersistentTerminalMock,
@@ -37,6 +42,8 @@ function HookHarness({
 	taskId,
 	workspaceId,
 	sessionStartedAt,
+	sessionSummary,
+	baseRef,
 	enabled = true,
 	onSummary,
 	onConnectionReady,
@@ -44,6 +51,8 @@ function HookHarness({
 	taskId: string;
 	workspaceId: string | null;
 	sessionStartedAt: number | null;
+	sessionSummary?: RuntimeTaskSessionSummary | null;
+	baseRef?: string;
 	enabled?: boolean;
 	onSummary?: (summary: RuntimeTaskSessionSummary) => void;
 	onConnectionReady?: (taskId: string) => void;
@@ -55,6 +64,8 @@ function HookHarness({
 		onSummary,
 		onConnectionReady,
 		sessionStartedAt,
+		sessionSummary,
+		baseRef,
 		terminalBackgroundColor: "terminal-background",
 		cursorColor: "cursor-color",
 	});
@@ -71,6 +82,8 @@ describe("usePersistentTerminalSession", () => {
 		ensurePersistentTerminalMock.mockReset();
 		disposePersistentTerminalMock.mockReset();
 		registerTerminalControllerMock.mockReset();
+		restoreTaskSessionMock.mockReset();
+		restoreTaskSessionMock.mockResolvedValue({ ok: true, summary: null });
 		registerTerminalControllerMock.mockReturnValue(() => {});
 		ensurePersistentTerminalMock.mockImplementation(() => createPersistentTerminalMock());
 		window.localStorage.clear();
@@ -98,6 +111,53 @@ describe("usePersistentTerminalSession", () => {
 			(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT =
 				previousActEnvironment;
 		}
+	});
+
+	it("reattaches a persisted Pi review session exactly once without a prompt", async () => {
+		const onSummary = vi.fn();
+		const saved = {
+			taskId: "task-a", state: "awaiting_review" as const, agentId: "pi" as const,
+			workspacePath: "/tmp/task-a", pid: 1234, startedAt: 100, updatedAt: 100,
+			lastOutputAt: 90, reviewReason: "hook" as const, exitCode: null,
+			lastHookAt: 90, latestHookActivity: null,
+		};
+		const restored = { ...saved, pid: 5678, startedAt: 200 };
+		restoreTaskSessionMock.mockResolvedValue({ ok: true, summary: restored });
+		await act(async () => {
+			root.render(
+				<HookHarness taskId="task-a" workspaceId="project-1"
+					sessionStartedAt={100} sessionSummary={saved}
+					baseRef="main" onSummary={onSummary} />,
+			);
+			await Promise.resolve();
+			await Promise.resolve();
+		});
+		expect(restoreTaskSessionMock).toHaveBeenCalledWith({
+			taskId: "task-a", agentId: "pi", prompt: "", baseRef: "main", restoreDetachedSession: true,
+		});
+		expect(onSummary).toHaveBeenCalledWith(restored);
+		await act(async () => {
+			root.render(
+				<HookHarness taskId="task-a" workspaceId="project-1"
+					sessionStartedAt={100} sessionSummary={saved}
+					baseRef="main" onSummary={onSummary} />,
+			);
+		});
+		expect(restoreTaskSessionMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not auto-restore intentionally stopped Pi sessions", async () => {
+		const saved = {
+			taskId: "task-a", state: "awaiting_review" as const, agentId: "pi" as const,
+			workspacePath: "/tmp/task-a", pid: null, startedAt: 100, updatedAt: 120,
+			lastOutputAt: 90, reviewReason: "exit" as const, exitCode: 0,
+			lastHookAt: 90, latestHookActivity: null,
+		};
+		await act(async () => {
+			root.render(<HookHarness taskId="task-a" workspaceId="project-1"
+				sessionStartedAt={100} sessionSummary={saved} baseRef="main" />);
+		});
+		expect(restoreTaskSessionMock).not.toHaveBeenCalled();
 	});
 
 	it("resets the persistent terminal in place when a new session starts for the same task", async () => {

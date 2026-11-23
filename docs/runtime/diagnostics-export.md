@@ -18,6 +18,10 @@ What is deliberately excluded: provider credentials, auth headers, raw environme
 
 > The bundle contains the full conversation and every tool output, so it can include secrets that tools printed. Review it before sharing it. The UI shows this caveat next to the export action.
 
+## Recovery of Pi task terminals
+
+When opening a task with an orphaned Pi process after a server restart, the task-detail terminal reconnects the **exact** persisted Pi session with an empty prompt. Recovery is single-flight, requires the existing worktree and recorded session ID, preserves the Review lane and turn checkpoints, and never repeats an interrupted model turn. Intentional Stop does not trigger automatic restore. Other terminal agents are not automatically relaunched until their exact-resume capabilities can be verified.
+
 ## Transport
 
 - **Browser**: a same-origin `GET /api/task-diagnostics/download?workspaceId=…&taskId=…`, authenticated by the `SameSite=Strict; HttpOnly` session cookie (sent automatically). The response is `application/json` with `Content-Disposition: attachment`, `Cache-Control: no-store`, and an `X-Kanban-Diagnostics-Completeness` header. The route dispatches after the runtime auth gate and before the unmatched `/api/` 404; unknown workspaces, unknown tasks, and export failures return clear non-2xx JSON errors. A failure mid-stream terminates the response so a truncated file is never mistaken for a complete bundle.

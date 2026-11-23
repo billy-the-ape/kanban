@@ -49,6 +49,58 @@ describe("TerminalSessionManager auto-restart", () => {
 		}));
 	});
 
+	it("restores a saved Pi conversation in Review without starting a turn or losing checkpoints", async () => {
+		const session = createMockPtySession(222, {});
+		ptySessionSpawnMock.mockReturnValue(session);
+		const manager = new TerminalSessionManager();
+		const checkpoint = { turn: 7, ref: "refs/kanban/checkpoints/task-1/turn/7", commit: "abc1234", createdAt: 7 };
+		manager.hydrateFromRecord({
+			"task-1": {
+				taskId: "task-1", state: "awaiting_review", agentId: "pi",
+				workspacePath: "/tmp/task-1", pid: 111, startedAt: 1, updatedAt: 2,
+				lastOutputAt: 2, reviewReason: "hook", exitCode: null,
+				lastHookAt: 2, latestHookActivity: null,
+				latestTurnCheckpoint: checkpoint, previousTurnCheckpoint: null,
+			},
+		});
+		const restored = await manager.startTaskSession({
+			taskId: "task-1", agentId: "pi", binary: "pi", args: [],
+			cwd: "/tmp/task-1", prompt: "", restoreDetachedSession: true,
+		});
+		expect(restored.state).toBe("awaiting_review");
+		expect(restored.reviewReason).toBe("hook");
+		expect(restored.latestTurnCheckpoint).toEqual(checkpoint);
+		expect(restored.pid).toBe(222);
+		expect(prepareAgentLaunchMock).toHaveBeenCalledWith(
+			expect.objectContaining({ prompt: "", agentId: "pi" }),
+		);
+		const second = await manager.startTaskSession({
+			taskId: "task-1", agentId: "pi", binary: "pi", args: [],
+			cwd: "/tmp/task-1", prompt: "", restoreDetachedSession: true,
+		});
+		expect(second.pid).toBe(222);
+		expect(ptySessionSpawnMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("preserves interrupted status when restoring a process lost mid-turn", async () => {
+		ptySessionSpawnMock.mockImplementation((request: MockSpawnRequest) => createMockPtySession(222, request));
+		const manager = new TerminalSessionManager();
+		manager.hydrateFromRecord({
+			"task-1": {
+				taskId: "task-1", state: "running", agentId: "pi",
+				workspacePath: "/tmp/task-1", pid: 111, startedAt: 1, updatedAt: 2,
+				lastOutputAt: 2, reviewReason: null, exitCode: null,
+				lastHookAt: null, latestHookActivity: null,
+			},
+		});
+		const restored = await manager.startTaskSession({
+			taskId: "task-1", agentId: "pi", binary: "pi", args: [],
+			cwd: "/tmp/task-1", prompt: "", restoreDetachedSession: true,
+		});
+		expect(restored.state).toBe("interrupted");
+		expect(restored.reviewReason).toBe("interrupted");
+	});
+
 	it("restarts an attached agent session after it exits", async () => {
 		const spawnedSessions: Array<ReturnType<typeof createMockPtySession>> = [];
 		ptySessionSpawnMock.mockImplementation((request: MockSpawnRequest) => {
