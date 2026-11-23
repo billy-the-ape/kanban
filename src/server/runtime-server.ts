@@ -39,6 +39,7 @@ import { registerAutoMergeConsumer } from "../pr-tracking/auto-merge-eligibility
 import { createAutoMergeExecutor } from "../pr-tracking/auto-merge-executor";
 import { AutoMergePolicyStore } from "../pr-tracking/auto-merge-policy-store";
 import { createPrCommentAutomationService } from "../pr-tracking/comment-automation-service";
+import { sendPreparedPiRepair } from "../pr-tracking/pi-repair-dispatch";
 import { createGitHubGhAdapter } from "../pr-tracking/github-gh-adapter";
 import { createGitHubPrClient, resolveGitHubAccessScopeId } from "../pr-tracking/github-pr-client";
 import { PrConsumerRegistry } from "../pr-tracking/pr-consumer-registry";
@@ -302,16 +303,32 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			broadcastTaskChatCleared: deps.runtimeStateHub.broadcastTaskChatCleared,
 			resolveClineLaunchConfig: () => clineProviderService.resolveLaunchConfig(),
 		}),
-		// COMMENT-0: same effective-agent semantics as task start and PR
-		// tracking — a live session's agent when one exists, else the
-		// workspace's selected agent.
+		sendPreparedPiTaskMessage: async (scope, taskId, prepare) => {
+			const manager = await getScopedTerminalManager(scope);
+			return await sendPreparedPiRepair({
+				manager, taskId, prepare,
+				restoreSavedSession: async () => {
+					const state = await loadWorkspaceState(scope.workspacePath);
+					const card = state.board.columns.flatMap((column) => column.cards)
+						.find((candidate) => candidate.id === taskId);
+					if (!card) return { ok: false, error: "The PR repair task was removed." };
+					const result = await buildRuntimeApi().startTaskSession(scope, {
+						taskId, agentId: "pi", prompt: "", baseRef: card.baseRef, restoreDetachedSession: true,
+					});
+					return { ok: result.ok, error: result.error };
+				},
+			});
+		},
+		// COMMENT-0: same effective-agent precedence as task start —
+		// persisted session agent, card override, then workspace default.
 		getEffectiveTaskAgentId: async (scope, taskId): Promise<RuntimeAgentId | null> => {
 			try {
 				const state = await loadWorkspaceState(scope.workspacePath);
 				const sessionAgent = state.sessions[taskId]?.agentId;
-				if (sessionAgent) {
-					return sessionAgent;
-				}
+				if (sessionAgent) return sessionAgent;
+				const card = state.board.columns.flatMap((column) => column.cards)
+					.find((candidate) => candidate.id === taskId);
+				if (card?.agentId) return card.agentId;
 			} catch {
 				// No readable session state: fall through to the
 				// workspace's selected agent below.
@@ -848,6 +865,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				ensureTerminalManagerForWorkspace: deps.ensureTerminalManagerForWorkspace,
 				broadcastRuntimeWorkspaceStateUpdated: broadcastRuntimeWorkspaceStateUpdatedWithReconcile,
 				broadcastTaskReadyForReview: deps.runtimeStateHub.broadcastTaskReadyForReview,
+				recordPiPublicationToolEvent: (event) => prCommentAutomationService.recordPrPublicationToolEvent(event),
 			}),
 			prTrackingApi: createPrTrackingApi({
 				getPrTrackingCoordinator: () => getPrTrackingState().coordinator,

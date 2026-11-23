@@ -334,6 +334,8 @@ export default function kanbanPiHooks(pi) {
 		const toolName = oneLine(event && event.toolName, 120) ?? "tool";
 		const payload = basePayload(ctx, "tool_execution_end");
 		payload.tool_name = toolName;
+		payload.tool_call_id = oneLine(event && event.toolCallId, 200);
+		payload.tool_is_error = event && event.isError === true;
 		payload.tool_input = boundJsonValue(event && event.args, MAX_RESULT_CHARS);
 		payload.tool_response = { output: clipText(toolResultText(event && event.result), MAX_RESULT_CHARS) };
 		if (event && event.isError === true) {

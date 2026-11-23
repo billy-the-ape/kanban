@@ -4,10 +4,11 @@ import { join } from "node:path";
 import { createTRPCProxyClient, httpBatchLink, TRPCClientError } from "@trpc/client";
 import type { Command } from "commander";
 import { extractCommandStrings } from "../cline-sdk/review-tool-policy";
-import type { RuntimeHookEvent, RuntimeTaskHookActivity } from "../core/api-contract";
+import type { RuntimeHookEvent, RuntimeHookIngestRequest, RuntimeTaskHookActivity } from "../core/api-contract";
 import { buildKanbanCommandParts } from "../core/kanban-command";
 import { detectCreatedPullRequests } from "../core/pull-request-detection";
 import { buildKanbanRuntimeUrl, getRuntimeFetch } from "../core/runtime-endpoint";
+import { detectPublicationOperations } from "../pr-tracking/pr-publication-attribution";
 import { buildWindowsCmdArgsArray, resolveWindowsComSpec, shouldUseWindowsCmdLaunch } from "../core/windows-cmd-launch";
 import { parseHookRuntimeContextFromEnv } from "../terminal/hook-runtime-context";
 import type { RuntimeAppRouter } from "../trpc/app-router";
@@ -39,6 +40,7 @@ interface HooksIngestArgs {
 	payload?: Record<string, unknown> | null;
 	/** Canonical PR URLs detected from the hook payload (max 10). */
 	pullRequestUrls?: string[];
+	publicationTool?: RuntimeHookIngestRequest["publicationTool"];
 	/**
 	 * AA-S1: launch attempt token from the agent environment. It identifies
 	 * which attempt owns this event, so a stale child or plugin cannot move the
@@ -457,6 +459,30 @@ export function normalizeHookMetadata(
 	return merged;
 }
 
+/**
+ * Only publish bounded Pi command outputs for actual PR-feedback writes.
+ * Ordinary bash calls and read-only GitHub operations never reach the
+ * publication attribution/record store.
+ */
+export function extractPiPublicationTool(
+	payload: Record<string, unknown> | null,
+	source: string | null | undefined,
+): RuntimeHookIngestRequest["publicationTool"] {
+	if (source !== "pi" || payload?.hook_event_name !== "tool_execution_end") return undefined;
+	const toolInput = asRecord(payload.tool_input);
+	const commands = toolInput ? extractCommandStrings(toolInput).slice(0, 10).map((cmd) => cmd.slice(0, 10_000)) : [];
+	if (commands.length === 0 || detectPublicationOperations(commands).length === 0) return undefined;
+	const output = extractHookToolResponse(payload)?.slice(0, 4000) ?? null;
+	return {
+		phase: "finished",
+		toolCallId: readStringField(payload, "tool_call_id")?.slice(0, 200) ?? null,
+		toolName: readStringField(payload, "tool_name")?.slice(0, 128) ?? null,
+		commands,
+		output,
+		error: payload.tool_is_error === true ? (output?.slice(0, 1000) ?? "Pi command failed") : null,
+	};
+}
+
 function parseHooksIngestArgs(
 	event: RuntimeHookEvent,
 	options: HookCommandMetadataOptionValues,
@@ -473,6 +499,7 @@ function parseHooksIngestArgs(
 	// PRLINK-2: detect PR creation in the hook CLI process so only resulting
 	// canonical URLs cross the wire, never raw tool output.
 	const pullRequestUrls = extractHookPullRequestUrls(payload);
+	const publicationTool = extractPiPublicationTool(payload, metadata?.source);
 	return {
 		event,
 		taskId: context.taskId,
@@ -482,6 +509,7 @@ function parseHooksIngestArgs(
 		metadata,
 		payload,
 		pullRequestUrls,
+		publicationTool,
 	};
 }
 
@@ -505,6 +533,7 @@ async function ingestHookEvent(args: HooksIngestArgs): Promise<void> {
 			event: args.event,
 			metadata: args.metadata,
 			pullRequestUrls: args.pullRequestUrls,
+			publicationTool: args.publicationTool,
 			...(args.attemptId ? { attemptId: args.attemptId } : {}),
 			...(args.sessionId ? { sessionId: args.sessionId } : {}),
 		}),
