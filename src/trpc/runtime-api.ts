@@ -474,7 +474,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 	const recoverUnstartedClineTask = (
 		workspaceScope: RuntimeTrpcWorkspaceScope,
 		taskId: string,
-		instruction: string,
+		body: RuntimeTaskChatSendRequest,
 	): Promise<RuntimeTaskSessionSummary | null> => {
 		const pending = unstartedRecoveryByTaskId.get(taskId);
 		if (pending) return pending;
@@ -515,7 +515,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 
 			// Preserve additional user instructions without turning a generic
 			// Resume action into the only task prompt.
-			const normalized = instruction.trim();
+			const normalized = body.text.trim();
 			const prompt = /^(resume|continue|go ahead|proceed)[.!\s]*$/i.test(normalized)
 				? card.prompt
 				: normalized
@@ -526,8 +526,9 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				prompt,
 				recoverUnstartedSession: true,
 				taskTitle: card.title,
-				images: card.images,
-				startInPlanMode: card.startInPlanMode,
+				images: [...(card.images ?? []), ...(body.images ?? [])],
+				mode: body.mode,
+				startInPlanMode: body.mode ? false : card.startInPlanMode,
 				baseRef: card.baseRef,
 				updateBaseRefBeforeStart: card.updateBaseRefBeforeStart !== false,
 				agentId: card.agentId,
@@ -539,14 +540,10 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			return started.summary;
 		})();
 		unstartedRecoveryByTaskId.set(taskId, recovery);
-		void recovery.then(
-			() => {
-				if (unstartedRecoveryByTaskId.get(taskId) === recovery) unstartedRecoveryByTaskId.delete(taskId);
-			},
-			() => {
-				if (unstartedRecoveryByTaskId.get(taskId) === recovery) unstartedRecoveryByTaskId.delete(taskId);
-			},
-		);
+		const clearRecovery = () => {
+			if (unstartedRecoveryByTaskId.get(taskId) === recovery) unstartedRecoveryByTaskId.delete(taskId);
+		};
+		void recovery.then(clearRecovery, clearRecovery);
 		return recovery;
 	};
 
@@ -2153,9 +2150,36 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				return { ok: false, summary: null, error: error instanceof Error ? error.message : String(error) };
 			}
 			try {
-				if (!isHomeAgentSessionId(body.taskId) && !isClineClearSlashCommand(body.text)) {
-					const recovered = await recoverUnstartedClineTask(workspaceScope, body.taskId, body.text);
-					if (recovered) return { ok: true, summary: recovered, message: null };
+				if (!isHomeAgentSessionId(body.taskId) && body.source !== "automated" && !isClineClearSlashCommand(body.text)) {
+					const recovered = await recoverUnstartedClineTask(workspaceScope, body.taskId, body);
+					if (recovered) {
+						// Match successful native chat sends: update the user prompt preview
+						// and classify PR links, without replaying the instruction twice.
+						if (body.text.trim()) {
+							await recordTaskLastPrompt({
+								workspaceId: workspaceScope.workspaceId,
+								workspacePath: workspaceScope.workspacePath,
+								taskId: body.taskId,
+								text: body.text,
+								acceptedAt: Date.now(),
+								broadcast: deps.broadcastRuntimeWorkspaceStateUpdated,
+							});
+						}
+						const pullRequestLinking = await resolveTaskChatPrLinking({
+							workspaceId: workspaceScope.workspaceId,
+							workspacePath: workspaceScope.workspacePath,
+							taskId: body.taskId,
+							text: body.text,
+							hasImages: Boolean(body.images?.length),
+							broadcast: deps.broadcastRuntimeWorkspaceStateUpdated,
+						});
+						return {
+							ok: true,
+							summary: recovered,
+							message: null,
+							...(pullRequestLinking ? { pullRequestLinking } : {}),
+						};
+					}
 				}
 			} catch (error) {
 				return { ok: false, summary: null, error: error instanceof Error ? error.message : String(error) };
