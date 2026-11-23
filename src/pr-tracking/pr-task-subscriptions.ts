@@ -7,6 +7,7 @@
 // ineligible; consumers are not sticky in-memory objects.
 import type { RuntimeAgentId, RuntimeBoardColumnId, RuntimePrConsumerKind } from "../core/api-contract";
 import type { PrInstalledConsumers } from "./pr-consumer-registry";
+import { isCommentServableAgent } from "./pr-lifecycle-gate";
 import { PR_OWNER_ACTIVE_COLUMNS, type PrBoardSnapshot, resolveCardAutomationPrKey } from "./pr-owner-selection";
 import type { PrTrackingSubscriptionDescriptor, SubscriptionAddResult } from "./pr-tracking-coordinator";
 
@@ -26,7 +27,7 @@ export interface PrTaskSubscriptionSource {
 	/**
 	 * Optional: the workspace's selected agent id, used to resolve an unset
 	 * card agentId for comment demand (comment follow-up only serves
-	 * native-Cline tasks, matching the comment automation service).
+	 * Cline and Pi tasks, matching the comment automation service).
 	 */
 	getSelectedAgentId?: (workspaceId: string) => Promise<RuntimeAgentId | null>;
 }
@@ -64,8 +65,9 @@ function sameConsumers(a: Record<RuntimePrConsumerKind, boolean>, b: Record<Runt
  * Compute the desired subscription set: cards in in_progress/review whose
  * automation PR is resolvable (explicit selection or sole link) and whose
  * checkboxes are enabled against INSTALLED consumers. The comments half
- * additionally requires the task to be natively servable (a Cline card, or
- * an unset card agentId in a Cline-selected workspace).
+ * additionally requires the task to be servable by the comment automation
+ * (a Cline or Pi card, or an unset card agentId in a workspace whose
+ * selected agent is Cline or Pi).
  */
 export function computeTaskSubscriptionDemand(
 	boards: PrBoardSnapshot[],
@@ -83,14 +85,14 @@ export function computeTaskSubscriptionDemand(
 				if (!resolved.key) {
 					continue;
 				}
-				// Comment follow-up only serves native-Cline tasks. When no
+				// Comment follow-up only serves Cline and Pi tasks. When no
 				// agent info is known at all (no per-card agentId and no
 				// workspace resolver), the checkbox alone decides (legacy
-				// harnesses); otherwise the effective agent must be cline.
+				// harnesses); otherwise the effective agent must be servable.
 				let commentsServable = true;
 				if (commentsAgentByWorkspace !== undefined || card.agentId !== undefined) {
 					const commentsAgentId = card.agentId ?? commentsAgentByWorkspace?.get(workspaceId) ?? null;
-					commentsServable = commentsAgentId === "cline";
+					commentsServable = isCommentServableAgent(commentsAgentId);
 				}
 				const consumers: Record<RuntimePrConsumerKind, boolean> = {
 					comments: card.autoAddressComments === true && installed.comments && commentsServable,

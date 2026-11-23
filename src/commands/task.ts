@@ -30,7 +30,7 @@ import {
 	updateTask,
 } from "../core/task-board-mutations";
 import type { PrInstalledConsumers } from "../pr-tracking/pr-consumer-registry";
-import { evaluatePrLifecycleGate } from "../pr-tracking/pr-lifecycle-gate";
+import { evaluatePrLifecycleGate, isCommentServableAgent } from "../pr-tracking/pr-lifecycle-gate";
 import { resolveProjectInputPath } from "../projects/project-path";
 import { loadWorkspaceContext, mutateWorkspaceState } from "../state/workspace-state";
 import type { RuntimeAppRouter } from "../trpc/app-router";
@@ -832,8 +832,8 @@ async function completeTaskById(input: {
 	// enabled consumer. Both consumers are always installed, so the gate
 	// keys off the task's own PR automation settings — except the comments
 	// half, which only owns tasks the comment automation can serve (native
-	// Cline). Resolve the effective agent the same way task start does: an
-	// unset card agentId falls back to the workspace's selected agent.
+	// Cline or Pi). Resolve the effective agent the same way task start does:
+	// an unset card agentId falls back to the workspace's selected agent.
 	let selectedAgentId: RuntimeAgentId | null = null;
 	try {
 		selectedAgentId = (await input.runtimeClient.runtime.getConfig.query()).selectedAgentId;
@@ -859,7 +859,7 @@ async function completeTaskById(input: {
 		}
 
 		const prGateInstalled: PrInstalledConsumers = {
-			comments: (latestRecord.task.agentId ?? selectedAgentId) === "cline",
+			comments: isCommentServableAgent(latestRecord.task.agentId ?? selectedAgentId),
 			mergeCompletion: true,
 			autoMerge: true,
 		};

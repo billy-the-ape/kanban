@@ -38,16 +38,28 @@ function isReadyPi(
 	manager: TerminalSessionManager,
 	taskId: string,
 ): boolean {
-	return summary?.agentId === "pi" && manager.hasActiveProcess(taskId) &&
-		summary.state === "awaiting_review";
+	// A Pi paused on an extension dialog (`ui_prompt_start`) is also
+	// `awaiting_review`, but pasting would answer the dialog instead of
+	// starting a turn. Key on the live dialog hook, not `reviewReason`:
+	// a session restored by `startTaskSession` is `awaiting_review` with
+	// reason `attention` too, and process starts clear hook activity, so
+	// restores stay eligible.
+	return (
+		summary?.agentId === "pi" &&
+		manager.hasActiveProcess(taskId) &&
+		summary.state === "awaiting_review" &&
+		summary.latestHookActivity?.hookEventName !== "ui_prompt_start"
+	);
 }
 
 function receivedPiStartupHook(summary: RuntimeTaskSessionSummary | null): boolean {
-	return summary !== null &&
+	return (
+		summary !== null &&
 		summary.startedAt !== null &&
 		summary.lastHookAt !== null &&
 		summary.lastHookAt >= summary.startedAt &&
-		summary.latestHookActivity?.source === "pi";
+		summary.latestHookActivity?.source === "pi"
+	);
 }
 
 async function waitForPiStartup(manager: TerminalSessionManager, taskId: string): Promise<void> {
@@ -68,13 +80,6 @@ async function waitForPiStartup(manager: TerminalSessionManager, taskId: string)
 			release();
 			reject(new Error("Pi did not report a ready session; repair was not submitted."));
 		}, PI_READY_TIMEOUT_MS);
-		// Close the window between initial read and listener registration.
-		if (receivedPiStartupHook(manager.getSummary(taskId)) && !finished) {
-			finished = true;
-			clearTimeout(timer);
-			release();
-			resolve();
-		}
 	});
 }
 
@@ -179,8 +184,18 @@ export async function sendPreparedPiRepair(input: PiPreparedRepairInput): Promis
 				return;
 			}
 			if (sawTurnStart && next.state === "awaiting_review") {
-				if (next.reviewReason === "hook") settle({ status: "completed" });
-				else if (next.reviewReason === "error") settle({ status: "failed", error: "Pi failed during PR repair." });
+				// Only Pi's real settle event closes the durable receipt. Other
+				// `to_review` hooks (or a summary re-emitted when a dialog
+				// resolves with stale activity) are pauses, not completion.
+				if (
+					next.reviewReason === "hook" &&
+					next.latestHookActivity?.hookEventName === "agent_settled" &&
+					(next.lastHookAt ?? 0) >= sentAt
+				) {
+					settle({ status: "completed" });
+				} else if (next.reviewReason === "error") {
+					settle({ status: "failed", error: "Pi failed during PR repair." });
+				}
 			}
 		});
 		sentAt = Date.now();

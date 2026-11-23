@@ -54,6 +54,7 @@ import type { PrFeedbackEvent } from "./feedback-fingerprint";
 import { computePrFeedbackFingerprint, findPrFeedbackPendingEvents } from "./feedback-fingerprint";
 import type { GitHubPrClient, GitHubPrSnapshot } from "./github-pr-client";
 import { listPrTrackingRecords, loadPrTrackingRecord, upsertPrTrackingRecord } from "./pr-comment-record-store";
+import { isCommentServableAgent } from "./pr-lifecycle-gate";
 import {
 	analyzePrPublication,
 	detectPublicationOperations,
@@ -632,12 +633,14 @@ export class PrCommentAutomationService {
 				effectiveAgentId = null;
 			}
 		}
-		if (effectiveAgentId === null && card.agentId === "cline") {
-			// Resolver unavailable: only an explicit per-card Cline counts.
-			effectiveAgentId = "cline";
+		if (effectiveAgentId === null && isCommentServableAgent(card.agentId)) {
+			// Resolver unavailable: only an explicit servable per-card agent counts.
+			effectiveAgentId = card.agentId;
 		}
-		return effectiveAgentId === "cline" ||
-			(effectiveAgentId === "pi" && this.deps.sendPreparedPiTaskMessage !== undefined);
+		return (
+			effectiveAgentId === "cline" ||
+			(effectiveAgentId === "pi" && this.deps.sendPreparedPiTaskMessage !== undefined)
+		);
 	}
 
 	/**
@@ -1315,7 +1318,7 @@ export class PrCommentAutomationService {
 			}
 		};
 		// Both agents use the same queued intent, preparation, and completion receipt.
-		const effectiveAgentId = await this.deps.getEffectiveTaskAgentId?.(scope, owner.taskId) ?? "cline";
+		const effectiveAgentId = (await this.deps.getEffectiveTaskAgentId?.(scope, owner.taskId)) ?? "cline";
 		let response: RuntimeTaskChatSendResponse;
 		if (effectiveAgentId === "pi") {
 			const sendPi = this.deps.sendPreparedPiTaskMessage;
@@ -1342,7 +1345,10 @@ export class PrCommentAutomationService {
 					revision: record.revision + 1,
 					commentAutomation: {
 						...record.commentAutomation,
-						dispatch: { ...dispatch, turnRef: effectiveAgentId === "pi" ? `pi:${dispatchId}` : response.message?.id ?? null },
+						dispatch: {
+							...dispatch,
+							turnRef: effectiveAgentId === "pi" ? `pi:${dispatchId}` : (response.message?.id ?? null),
+						},
 					},
 				};
 			});
@@ -2190,9 +2196,11 @@ export class PrCommentAutomationService {
 				if (workspace) {
 					const state = await this.deps.loadWorkspaceState(workspace.workspacePath).catch(() => null);
 					if (state) {
-						piOwnerAtRestart = await this.deps.getEffectiveTaskAgentId?.(workspace, owner.taskId).then(
-							(agentId) => agentId === "pi", () => false,
-						) ?? false;
+						piOwnerAtRestart =
+							(await this.deps.getEffectiveTaskAgentId?.(workspace, owner.taskId).then(
+								(agentId) => agentId === "pi",
+								() => false,
+							)) ?? false;
 						taskExists = state.board.columns.some((column) =>
 							column.cards.some((card) => card.id === owner.taskId),
 						);
@@ -2262,9 +2270,11 @@ export class PrCommentAutomationService {
 					{ accessScopeId: record.accessScopeId, pr: record.pr },
 					(current) => {
 						const active = current.commentAutomation.dispatch;
-						if (current.revision !== record.revision || active?.dispatchId !== dispatch.dispatchId) return current;
+						if (current.revision !== record.revision || active?.dispatchId !== dispatch.dispatchId)
+							return current;
 						return {
-							...current, revision: current.revision + 1,
+							...current,
+							revision: current.revision + 1,
 							commentAutomation: {
 								...current.commentAutomation,
 								lastDispatchedFeedbackFingerprint:
@@ -2272,7 +2282,8 @@ export class PrCommentAutomationService {
 										? active.previousFeedbackFingerprint
 										: current.commentAutomation.lastDispatchedFeedbackFingerprint,
 								dispatch: {
-									...active, status: "failed",
+									...active,
+									status: "failed",
 									error: "Pi repair was interrupted by server restart; inspect GitHub and Resume explicitly.",
 								},
 							},
@@ -2368,8 +2379,9 @@ export class PrCommentAutomationService {
 		);
 		// Same effective-agent gate as subscription and dispatch (an unset
 		// card agentId inherits the workspace's selected agent, not Cline).
-		const supported = enabled ? await this.isSupportedAgentTask(scope, card) :
-			(card.agentId ?? "cline") === "cline" || card.agentId === "pi";
+		const supported = enabled
+			? await this.isSupportedAgentTask(scope, card)
+			: (card.agentId ?? "cline") === "cline" || card.agentId === "pi";
 		if (!enabled) {
 			return { ok: true, state: { ...neutral, pr: prs[0] ?? null } };
 		}
