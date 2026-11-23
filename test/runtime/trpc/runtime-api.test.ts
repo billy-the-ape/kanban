@@ -1540,6 +1540,8 @@ describe("createRuntimeApi startTaskSession", () => {
 	});
 
 	it("recovers a paused, never-started Cline task from its original prompt after an SDK send error", async () => {
+		taskLastPromptMocks.recordTaskLastPrompt.mockClear();
+		taskChatPrLinkingMocks.resolveTaskChatPrLinking.mockClear();
 		const baselineSha = "052739f929e4e956162fef2f333422c9ac7c31f6";
 		initialStartMocks.readTaskInitialStartRecord.mockResolvedValue({
 			taskId: "d6953",
