@@ -326,6 +326,9 @@ describe("OpenCode launch overlay (AA-O1)", () => {
 		// one key of its own is the failure this merge exists to prevent.
 		expect(overlay.model).toBe("ollama/qwen2.5-coder:32b");
 		expect(overlay.provider).toEqual({ ollama: { options: { baseURL: "http://127.0.0.1:11434" } } });
+		// `$schema` describes the generated file, so the URL from theirs never stays
+		// in it even though every other key does.
+		expect(overlay.$schema).not.toBe("https://opencode.example/config.json");
 		// A relative entry resolves against the file it came from, because that is
 		// the file OpenCode would have resolved it against; the bridge stays last.
 		expect(overlay.plugin).toEqual([
