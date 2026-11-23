@@ -6,7 +6,7 @@
 // value read from Pi's own configuration files, so a `pi` started by hand in the
 // same directory keeps working untouched.
 import { createHash } from "node:crypto";
-import { readdir, readFile } from "node:fs/promises";
+import { open, readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { getRuntimeHomePath } from "../state/workspace-state";
@@ -144,8 +144,16 @@ export async function readPiSessionRecord(input: { sessionId: string; sessionDir
 		const sessionFile = join(sessionDir, entry);
 		let head: string;
 		try {
-			const handle = await readFile(sessionFile, { encoding: "utf8" });
-			head = handle.slice(0, 4096);
+			// A diagnostics export must not load a potentially huge JSONL file
+			// merely to verify the session id stored in its first line.
+			const handle = await open(sessionFile, "r");
+			try {
+				const headerBytes = Buffer.alloc(4096);
+				const { bytesRead } = await handle.read(headerBytes, 0, headerBytes.length, 0);
+				head = headerBytes.toString("utf8", 0, bytesRead);
+			} finally {
+				await handle.close();
+			}
 		} catch {
 			continue;
 		}

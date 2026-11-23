@@ -4,7 +4,12 @@ import { type UseGitHistoryDataResult, useGitHistoryData } from "@/components/gi
 import { buildTaskGitActionPrompt, type TaskGitAction } from "@/git-actions/build-task-git-action-prompt";
 import { isNativeClineAgentSelected } from "@/runtime/native-agent";
 import { getRuntimeTrpcClient } from "@/runtime/trpc-client";
-import type { RuntimeConfigResponse, RuntimeGitSyncAction, RuntimeTaskWorkspaceInfoResponse } from "@/runtime/types";
+import type {
+	RuntimeConfigResponse,
+	RuntimeGitSyncAction,
+	RuntimeTaskSessionSummary,
+	RuntimeTaskWorkspaceInfoResponse,
+} from "@/runtime/types";
 import { findCardSelection } from "@/state/board-state";
 import {
 	getTaskWorkspaceInfo,
@@ -43,6 +48,7 @@ interface UseGitActionsInput {
 	board: BoardData;
 	selectedCard: CardSelection | null;
 	runtimeProjectConfig: RuntimeConfigResponse | null;
+	taskSessions: Record<string, RuntimeTaskSessionSummary>;
 	sendTaskSessionInput: (
 		taskId: string,
 		text: string,
@@ -101,6 +107,7 @@ export function useGitActions({
 	board,
 	selectedCard,
 	runtimeProjectConfig,
+	taskSessions,
 	sendTaskSessionInput,
 	sendTaskChatMessage,
 	fetchTaskWorkspaceInfo,
@@ -225,10 +232,6 @@ export function useGitActions({
 		}
 		return next;
 	}, [taskGitActionLoadingByTaskId]);
-
-	const shouldUseClineChatForTaskGitActions = isNativeClineAgentSelected(
-		runtimeProjectConfig?.selectedAgentId ?? null,
-	);
 
 	// AUTOGIT: best-effort coordination with the server-owned per-review-episode
 	// record. Only `already_sent` suppresses the send; `no_task`,
@@ -394,6 +397,11 @@ export function useGitActions({
 					}
 				}
 
+				// A task's live/persisted session is authoritative; card overrides come next.
+				// Never route a Pi (or other terminal) task through Cline just because
+				// the workspace default happens to be Cline.
+				const taskAgentId =
+					taskSessions[taskId]?.agentId ?? selection.card.agentId ?? runtimeProjectConfig?.selectedAgentId ?? null;
 				const prompt = buildTaskGitActionPrompt({
 					action,
 					workspaceInfo,
@@ -406,7 +414,7 @@ export function useGitActions({
 							}
 						: null,
 				});
-				if (shouldUseClineChatForTaskGitActions) {
+				if (isNativeClineAgentSelected(taskAgentId)) {
 					// LASTPROMPT: generated commit/PR instructions are
 					// automated; they must not overwrite the latest user-authored
 					// prompt preview on the card.
@@ -478,8 +486,8 @@ export function useGitActions({
 			sendTaskChatMessage,
 			sendTaskSessionInput,
 			setTaskGitActionLoading,
-			shouldUseClineChatForTaskGitActions,
 			taskGitActionLoadingByTaskId,
+			taskSessions,
 		],
 	);
 

@@ -397,7 +397,18 @@ export async function streamTaskDiagnosticsExportV3(
 			await writer.writeValue(segment.editorCallEvidence, seen);
 			await writer.write("}");
 		}
-		await writer.write("]}");
+		await writer.write("]");
+		if (session.nativeTranscript) {
+			await writer.write(',"nativeTranscript":{');
+			await writer.write('"format":');
+			await writer.writeString(session.nativeTranscript.format);
+			await writer.write(',"fileName":');
+			await writer.writeString(session.nativeTranscript.fileName);
+			await writer.write(',"content":');
+			await streamArtifactText(writer, session.nativeTranscript.filePath, readArtifact);
+			await writer.write("}");
+		}
+		await writer.write("}");
 	}
 	await writer.write("]");
 	await writer.write("}");
