@@ -396,6 +396,10 @@ async function collectQualitySummaryJobEvents(taskId: string): Promise<{
 	return { events, total };
 }
 
+// Shared across API objects: runtime-server creates one API wrapper per request.
+ // This single-flight lock must outlive each wrapper.
+const restoringDetachedSessions = new Map<string, Promise<RuntimeTaskSessionStartResponse>>();
+
 export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrpcContext["runtimeApi"] {
 	const clineProviderService = createClineProviderService();
 	const clineMcpSettingsService = createClineMcpSettingsService();
@@ -613,7 +617,6 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		return pullRequestLinking;
 	};
 
-	const restoringDetachedSessions = new Map<string, Promise<RuntimeTaskSessionStartResponse>>();
 	const returningTaskIds = new Set<string>();
 	const taskLaunchVersions = new Map<string, number>();
 	// Shared by the tRPC handler (manual starts) and the B-9 dispatch queue, so
