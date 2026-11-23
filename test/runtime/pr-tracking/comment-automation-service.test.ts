@@ -58,6 +58,12 @@ const PR: RuntimeTaskPullRequest = {
 };
 const KEY = "github|github.com|octo/repo|42";
 const NOW = 1_700_000_000_000;
+/**
+ * Mirrors `TERMINAL_FAILURE_CONFIRM_MS` in the comment automation service: the
+ * polling fallback must keep observing a terminal failure this long before it
+ * may publish a sticky dispatch failure.
+ */
+const TERMINAL_FAILURE_WINDOW_MS = 30_000;
 
 function makeEvent(overrides: Partial<PrFeedbackEvent> & { providerId: string }): PrFeedbackEvent {
 	return {
@@ -1977,6 +1983,7 @@ describe("COMMENT-0 publication capture", () => {
 	it("includes the underlying session error when a repair turn fails", async () => {
 		const event = makeEvent({ providerId: "conversation-1", updatedAt: NOW });
 		await seedRunningDispatch(fingerprintOf([event]));
+		let clock = NOW;
 		const harness = makeService({
 			workspaceStates: new Map([
 				[
@@ -1990,8 +1997,14 @@ describe("COMMENT-0 publication capture", () => {
 					}),
 				],
 			]),
+			now: () => clock,
 		});
 		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		// The fallback only waits out the terminal-failure confirmation window
+		// before publishing the sticky failure.
+		expect((await load()).commentAutomation.dispatch?.status).toBe("running");
+		clock += TERMINAL_FAILURE_WINDOW_MS + 1_000;
 		await harness.service.runTick();
 		const record = await load();
 		expect(record.commentAutomation.dispatch?.status).toBe("failed");
@@ -3002,6 +3015,106 @@ describe("PR repair execution freshness", () => {
 			expect(await harness.preparations[0]?.(context())).toContain("Fix first");
 		},
 	);
+
+	it("does not permanently fail an admitted repair on a transient terminal error summary", async () => {
+		let clock = NOW;
+		let live = makeSummary({ state: "idle" });
+		const sessions = { getSummary: () => live, listSummaries: () => [live] } as unknown as ClineTaskSessionService;
+		const harness = makeService({
+			workspaceStates: states(),
+			snapshot: { events: [first] },
+			getClineTaskSessionService: async () => sessions,
+			now: () => clock,
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		expect((await record()).dispatch?.status).toBe("running");
+		// A terminal error summary is published while the turn's final hook is
+		// still reconciling the real outcome.
+		live = { ...makeSummary({ state: "interrupted", lastOutputAt: NOW + 1 }), reviewReason: "error" };
+		await harness.service.runTick();
+		// The fallback only opened a confirmation window and armed a retry; the
+		// dispatch stays retryable instead of turning sticky.
+		expect((await record()).dispatch).toMatchObject({ status: "running", error: null });
+		expect(harness.service.peekDispatchScheduling(KEY)).toEqual({
+			dispatchRetryAt: NOW + TERMINAL_FAILURE_WINDOW_MS,
+			terminalFailureObservedAt: NOW,
+		});
+		// A late final hook reconciles the transient summary before the poller
+		// can publish an irreversible failure, and the stale `updatedAt` no
+		// longer matters once the window is anchored on the observation.
+		clock += TERMINAL_FAILURE_WINDOW_MS + 1_000;
+		live = makeSummary({ state: "awaiting_review", lastOutputAt: clock });
+		await harness.service.runTick();
+		expect((await record()).dispatch).toMatchObject({ status: "completed", error: null });
+		expect(harness.service.peekDispatchScheduling(KEY)?.terminalFailureObservedAt).toBeNull();
+		expect(harness.sent).toHaveLength(1);
+	});
+
+	it("still fails a persistent terminal error after the confirmation window", async () => {
+		let clock = NOW;
+		let live = makeSummary({ state: "idle" });
+		const sessions = { getSummary: () => live, listSummaries: () => [live] } as unknown as ClineTaskSessionService;
+		const harness = makeService({
+			workspaceStates: states(),
+			snapshot: { events: [first] },
+			getClineTaskSessionService: async () => sessions,
+			now: () => clock,
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		expect((await record()).dispatch?.status).toBe("running");
+		live = makeSummary({ state: "failed", lastOutputAt: NOW + 1 });
+		await harness.service.runTick();
+		expect((await record()).dispatch?.status).toBe("running");
+		clock += TERMINAL_FAILURE_WINDOW_MS + 1_000;
+		await harness.service.runTick();
+		expect((await record()).dispatch).toMatchObject({
+			status: "failed",
+			error: expect.stringContaining("ended without completion"),
+		});
+		expect((await record()).lastDispatchedFeedbackFingerprint).toBeNull();
+	});
+
+	it("does not postpone the sticky failure while a terminal summary keeps updating", async () => {
+		let clock = NOW;
+		let live = makeSummary({ state: "idle" });
+		const sessions = { getSummary: () => live, listSummaries: () => [live] } as unknown as ClineTaskSessionService;
+		const harness = makeService({
+			workspaceStates: states(),
+			snapshot: { events: [first] },
+			getClineTaskSessionService: async () => sessions,
+			now: () => clock,
+		});
+		// Stands in for the summary being rewritten for an unrelated reason: the
+		// same terminal failure with a fresher `updatedAt` each tick.
+		const failingAt = (at: number) => ({
+			...makeSummary({ state: "failed", lastOutputAt: NOW + 1 }),
+			warningMessage: "Request failed: upstream returned 502",
+			updatedAt: at,
+		});
+		await harness.service.refreshWorkspace(scope);
+		await harness.service.runTick();
+		expect((await record()).dispatch?.status).toBe("running");
+		live = failingAt(clock);
+		await harness.service.runTick();
+		expect((await record()).dispatch?.status).toBe("running");
+		for (const step of [10_000, 20_000]) {
+			clock = NOW + step;
+			live = failingAt(clock);
+			await harness.service.runTick();
+			expect((await record()).dispatch?.status).toBe("running");
+			expect(harness.service.peekDispatchScheduling(KEY)?.terminalFailureObservedAt).toBe(NOW);
+		}
+		// The window closes on the first observation, not on the newest rewrite.
+		clock = NOW + TERMINAL_FAILURE_WINDOW_MS + 1_000;
+		live = failingAt(clock);
+		await harness.service.runTick();
+		expect((await record()).dispatch).toMatchObject({
+			status: "failed",
+			error: expect.stringContaining("upstream returned 502"),
+		});
+	});
 
 	it("protects the durable waiting write while chat admission is still in flight", async () => {
 		const live = makeSummary({ state: "awaiting_review" });
