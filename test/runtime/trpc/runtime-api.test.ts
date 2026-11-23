@@ -108,7 +108,7 @@ vi.mock("../../../src/workspace/turn-checkpoints.js", () => ({
 }));
 
 vi.mock("../../../src/workspace/task-initial-start.js", async (importOriginal) => ({
-	...(await importOriginal<typeof import("../../../src/workspace/task-initial-start")>()),
+	...(await importOriginal<typeof TaskInitialStart>()),
 	readTaskInitialStartRecord: initialStartMocks.readTaskInitialStartRecord,
 }));
 
@@ -187,6 +187,7 @@ import * as dispatchRecords from "../../../src/task-dispatch/dispatch-records";
 import type { RuntimeTrpcContext } from "../../../src/trpc/app-router";
 import { type CreateRuntimeApiDependencies, createRuntimeApi } from "../../../src/trpc/runtime-api";
 import type * as TaskLastPromptModule from "../../../src/workspace/task-last-prompt";
+import type * as TaskInitialStart from "../../../src/workspace/task-initial-start";
 import * as queuedReset from "../../../src/workspace/task-queued-reset";
 import { createGitTestEnv } from "../../utilities/git-env";
 
