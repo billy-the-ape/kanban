@@ -11,6 +11,7 @@ import {
 	deleteTaskWorktree,
 	ensureTaskWorktreeIfDoesntExist,
 	prepareInitialTaskWorktree,
+	recoverTaskWorktree,
 } from "../../src/workspace/task-worktree";
 import { createGitTestEnv } from "../utilities/git-env";
 import { createTempDir } from "../utilities/temp-dir";
@@ -154,4 +155,57 @@ describe("task work preservation acceptance (B-5.2/B-5.3/B-5.6)", () => {
 			expect((await readTaskPreservationRecord(taskId))?.cleanupBlockedReason).toMatch(/archive/i);
 		});
 	});
+});
+
+describe.sequential("failed archive recovery", () => {
+	it.each(["recover", "ensure", "start", "patch-fallback"] as const)(
+		"blocks %s, removes its incomplete checkout, and allows an explicit retry",
+		async (entryPoint) => {
+			await withRepo(async (repoPath) => {
+				const taskId = `failed-archive-${entryPoint}`;
+				const worktreePath = await startWorktree(repoPath, taskId);
+				writeFileSync(join(worktreePath, "saved.txt"), "preserved untracked content\n");
+				const deleted = await deleteTaskWorktree({ repoPath, taskId });
+				expect(deleted.ok).toBe(true);
+				const record = await readTaskPreservationRecord(taskId);
+				if (!record?.archivePath) throw new Error("Expected preserved archive");
+				const archive = readFileSync(record.archivePath);
+				if (record.patchPath) {
+					if (entryPoint === "patch-fallback") writeFileSync(record.patchPath, "invalid patch");
+					else rmSync(record.patchPath, { force: true });
+				}
+				writeFileSync(record.archivePath, "not a gzip archive");
+				const restore = () => {
+					if (entryPoint === "recover" || entryPoint === "patch-fallback") {
+						return recoverTaskWorktree({ repoPath, taskId });
+					}
+					if (entryPoint === "ensure") {
+						return ensureTaskWorktreeIfDoesntExist({ cwd: repoPath, taskId, baseRef: "HEAD" });
+					}
+					return prepareInitialTaskWorktree({
+						cwd: repoPath,
+						taskId,
+						baseRef: "HEAD",
+						updateBaseRefBeforeStart: false,
+					});
+				};
+				const failed = await restore();
+				expect(failed.ok).toBe(false);
+				expect(failed.error).toContain("Task archive command failed");
+				if (entryPoint === "patch-fallback") {
+					expect(failed.error).toContain("Patch:");
+					expect(failed.error).toContain("Archive:");
+					if (!record.patchPath) throw new Error("Expected retained patch");
+					expect(existsSync(record.patchPath)).toBe(true);
+				}
+				expect(existsSync(worktreePath)).toBe(false);
+				expect(existsSync(record.archivePath)).toBe(true);
+				expect((await readTaskPreservationRecord(taskId))?.status).toBe("preserved");
+				writeFileSync(record.archivePath, archive);
+				const retried = await restore();
+				expect(retried.ok).toBe(true);
+				expect(readFileSync(join(worktreePath, "saved.txt"), "utf8")).toBe("preserved untracked content\n");
+			});
+		},
+	);
 });
