@@ -1572,6 +1572,7 @@ describe("createRuntimeApi startTaskSession", () => {
 							id: "d6953",
 							title: "Original task",
 							prompt: "Implement the feature",
+							images: [{ id: "original", mimeType: "image/png", data: "original-data" }],
 							baseRef: "main",
 							updateBaseRefBeforeStart: true,
 							agentId: "cline",
@@ -1612,6 +1613,45 @@ describe("createRuntimeApi startTaskSession", () => {
 				}),
 			);
 			expect(cline.sendTaskSessionInput).not.toHaveBeenCalled();
+			// A second recovery send with an image but no text must carry both
+			// original and newly attached images, and preserve the requested mode.
+			taskWorktreeMocks.getTaskPreservationInfo.mockResolvedValueOnce({
+				ok: true,
+				worktreeExists: true,
+				worktreePath: "/tmp/existing-worktree",
+				headCommit: baselineSha,
+				dirty: false,
+				commitsAheadOfBase: 0,
+				changedFiles: [],
+				preservation: null,
+			});
+			const attached = { id: "new", mimeType: "image/png", data: "new-data" };
+			const withImage = await api.sendTaskChatMessage(
+				{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+				{ taskId: "d6953", text: "", images: [attached], mode: "plan" },
+			);
+			expect(withImage.ok).toBe(true);
+			expect(cline.startTaskSession).toHaveBeenLastCalledWith(
+				expect.objectContaining({
+					prompt: "Implement the feature",
+					images: [{ id: "original", mimeType: "image/png", data: "original-data" }, attached],
+					mode: "plan",
+					startInPlanMode: false,
+				}),
+			);
+			// Image-only sends never overwrite the user prompt preview.
+			expect(taskLastPromptMocks.recordTaskLastPrompt).toHaveBeenCalledTimes(1);
+			expect(taskChatPrLinkingMocks.resolveTaskChatPrLinking).toHaveBeenCalledWith(
+				expect.objectContaining({ taskId: "d6953", text: "", hasImages: true }),
+			);
+			// Automated sends are not user resumes and must not reinitialize sessions.
+			cline.sendTaskSessionInput.mockResolvedValue(createSummary({ agentId: "cline" }));
+			const automated = await api.sendTaskChatMessage(
+				{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+				{ taskId: "d6953", text: "Automated instruction", source: "automated" },
+			);
+			expect(automated.ok).toBe(true);
+			expect(cline.startTaskSession).toHaveBeenCalledTimes(2);
 		} finally {
 			boardSpy.mockRestore();
 		}
