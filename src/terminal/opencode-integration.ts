@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 /**
  * AA-O1: the single boundary where Kanban encodes OpenCode-specific facts.
@@ -311,16 +311,120 @@ export function getOpenCodeOverlayLayout(directory: string, overlayFileName = "o
  * reads; the newer `plugins` key is dropped by it with an "unsupported
  * setting" diagnostic, so emitting only `plugin` keeps the bridge alive on the
  * supported range without fighting the newer schema.
+ *
+ * A user who exports `OPENCODE_CONFIG` themselves loses that file as a source
+ * the moment Kanban repoints the variable, so the parsed content of their
+ * configuration is carried into the overlay instead: every top-level key is
+ * kept as written and their own plugin entries are kept ahead of the bridge.
  */
-export function buildOpenCodeOverlayConfigContent(overlay: OpenCodeConfigOverlay): string {
+export function buildOpenCodeOverlayConfigContent(
+	overlay: OpenCodeConfigOverlay,
+	userConfig?: OpenCodeUserConfig | null,
+): string {
+	const pluginEntries = userConfig
+		? [...userConfig.pluginEntries, overlay.pluginDirectory]
+		: [overlay.pluginDirectory];
 	return `${JSON.stringify(
 		{
 			$schema: "https://opencode.ai/config.json",
-			plugin: [overlay.pluginDirectory],
+			...(userConfig ? userConfig.settings : {}),
+			plugin: pluginEntries,
 		},
 		null,
 		2,
 	)}\n`;
+}
+
+/**
+ * The part of a user's own `OPENCODE_CONFIG` Kanban has to carry into the
+ * overlay once it repoints that variable for the launch.
+ */
+export interface OpenCodeUserConfig {
+	/** Every top-level key the user configured except `plugin`, kept verbatim. */
+	settings: Record<string, unknown>;
+	/** The user's own plugin entries, with local paths made absolute. */
+	pluginEntries: string[];
+}
+
+/**
+ * Rewrites one `plugin` entry so it still resolves from the generated overlay.
+ * A relative path is resolved against the directory the user's own file lives
+ * in, because that is the file OpenCode would have resolved it from; anything
+ * that is not a local path (a package name, a `file://` URL, an absolute path)
+ * is already independent of location and stays as written.
+ */
+function resolveOpenCodePluginEntry(entry: string, configDirectory: string): string | null {
+	const trimmed = entry.trim();
+	if (!trimmed) {
+		return null;
+	}
+	if (isAbsolute(trimmed) || trimmed.includes("://")) {
+		return trimmed;
+	}
+	if (!trimmed.startsWith(".") && !trimmed.startsWith("~")) {
+		// A bare name is a package or a scoped package, not a path.
+		return trimmed;
+	}
+	const expanded = trimmed.startsWith("~") ? trimmed.replace(/^~(?=$|\/|\\)/, homedir()) : trimmed;
+	return isAbsolute(expanded) ? expanded : resolve(configDirectory, expanded);
+}
+
+/**
+ * Reads a user's `OPENCODE_CONFIG` far enough to merge it. Returns null when the
+ * file is missing or Kanban cannot parse it, which the adapter treats as "do
+ * not repoint the variable": the user's own configuration stays in force and
+ * the launch says the bridge is inactive instead of silently discarding it.
+ */
+export function parseOpenCodeUserConfig(raw: string, configDirectory: string): OpenCodeUserConfig | null {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(stripJsonComments(raw));
+	} catch {
+		return null;
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		return null;
+	}
+	const settings: Record<string, unknown> = {};
+	const pluginEntries: string[] = [];
+	const rawPlugin = (parsed as { plugin?: unknown }).plugin;
+	const userPlugins = Array.isArray(rawPlugin) ? rawPlugin : rawPlugin === undefined ? [] : [rawPlugin];
+	for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+		if (key === "plugin") {
+			continue;
+		}
+		// `$schema` describes the file Kanban generates, not the user's.
+		if (key === "$schema") {
+			continue;
+		}
+		settings[key] = value;
+	}
+	for (const entry of userPlugins) {
+		// A non-string entry (an object form this release does not read) is
+		// dropped: Kanban cannot merge a shape it cannot describe.
+		if (typeof entry !== "string") {
+			continue;
+		}
+		const resolved = resolveOpenCodePluginEntry(entry, configDirectory);
+		if (resolved) {
+			pluginEntries.push(resolved);
+		}
+	}
+	return { settings, pluginEntries };
+}
+
+/**
+ * Loads a user's `OPENCODE_CONFIG` for merging. A directory (some users export
+ * the config *directory*) is not mergeable and reports as unreadable, because
+ * Kanban cannot know which file in it OpenCode would have read.
+ */
+export async function readOpenCodeUserConfig(configPath: string): Promise<OpenCodeUserConfig | null> {
+	try {
+		const raw = await readFile(configPath, "utf8");
+		return parseOpenCodeUserConfig(raw, dirname(configPath));
+	} catch {
+		return null;
+	}
 }
 
 /**
@@ -410,12 +514,17 @@ export function getOpenCodeConfigPathCandidates(options: {
 }): string[] {
 	const env = options.env;
 	const configured = readEnvValue(env, "OPENCODE_CONFIG");
+	// Callers walk this list from the end, so the last readable file wins. The
+	// pinned release loads `OPENCODE_CONFIG` after its global files (confirmed with
+	// `--print-logs`, which lists the global paths and then the overlay), so the
+	// exported variable outranks them. It stays below the project files, which
+	// already outrank everything else here.
 	const candidates: string[] = [];
-	if (configured) {
-		candidates.push(configured);
-	}
 	for (const directory of getGlobalConfigDirectories(env)) {
 		candidates.push(join(directory, "opencode.json"), join(directory, "opencode.jsonc"));
+	}
+	if (configured) {
+		candidates.push(configured);
 	}
 	const project = options.cwd;
 	candidates.push(
@@ -559,9 +668,9 @@ export async function resolveOpenCodeModelSelection(options: {
 	}
 	const candidates = getOpenCodeConfigPathCandidates(options);
 	for (let index = candidates.length - 1; index >= 0; index -= 1) {
-		const model = await readModelFromConfigFile(candidates[index] as string);
+		const model = await readModelFromConfigFile(candidates[index]);
 		if (model) {
-			return { model, source: "agent-config", configPath: (candidates[index] as string) ?? null, warning: null };
+			return { model, source: "agent-config", configPath: candidates[index], warning: null };
 		}
 	}
 	return { model: null, source: "none", configPath: null, warning: null };

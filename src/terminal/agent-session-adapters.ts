@@ -31,6 +31,7 @@ import {
 	isOpenCodeSessionSelector,
 	KANBAN_OPENCODE_SESSION_ID_ENV,
 	probeOpenCodeVersion,
+	readOpenCodeUserConfig,
 	resolveOpenCodeModelSelection,
 	verifyOpenCodeSession,
 } from "./opencode-integration";
@@ -647,22 +648,37 @@ const opencodeAdapter: AgentSessionAdapter = {
 		const resources = hooks ? createScopedHookResources("opencode", hooks) : null;
 		if (hooks && resources) {
 			const overlay = getOpenCodeOverlayLayout(resources.directory);
-			await ensureTextFile(
-				overlay.entryPointPath,
-				buildOpenCodePluginSource({
-					reviewArgv: buildHooksCommandParts(["ingest", "--event", "to_review"]),
-					inProgressArgv: buildHooksCommandParts(["ingest", "--event", "to_in_progress"]),
-					activityArgv: buildHooksCommandParts(["ingest", "--event", "activity"]),
-				}),
-			);
-			await ensureTextFile(overlay.manifestPath, buildOpenCodePluginManifestContent());
-			await ensureTextFile(overlay.configPath, buildOpenCodeOverlayConfigContent(overlay));
+			// A user who exports `OPENCODE_CONFIG` points it at their own file, and
+			// the pinned release reads that file instead of the ones Kanban would
+			// otherwise add, so repointing the variable has to carry their
+			// configuration into the overlay rather than replace it.
+			const userConfigPath = input.env?.OPENCODE_CONFIG?.trim() || null;
+			const userConfig = userConfigPath ? await readOpenCodeUserConfig(userConfigPath) : null;
 			Object.assign(env, createHookRuntimeEnv(hooks));
-			// The pinned release merges OPENCODE_CONFIG as an additional source, so
-			// pointing it at the overlay leaves the user's global and project
-			// configuration (providers, credentials, agents, MCP servers,
-			// instructions) in force; the overlay only adds the bridge.
-			env.OPENCODE_CONFIG = overlay.configPath;
+			if (userConfigPath && !userConfig) {
+				// Their configuration wins: Kanban leaves the variable alone instead of
+				// discarding a file it cannot parse, and says the bridge is inactive so
+				// a card that never moves is explained now rather than wondered about.
+				warnings.push(
+					`Kanban could not merge ${userConfigPath} (OPENCODE_CONFIG), so this launch runs without the Kanban bridge and the card will not move itself to review. Unset OPENCODE_CONFIG to let Kanban supply it.`,
+				);
+			} else {
+				await ensureTextFile(
+					overlay.entryPointPath,
+					buildOpenCodePluginSource({
+						reviewArgv: buildHooksCommandParts(["ingest", "--event", "to_review"]),
+						inProgressArgv: buildHooksCommandParts(["ingest", "--event", "to_in_progress"]),
+						activityArgv: buildHooksCommandParts(["ingest", "--event", "activity"]),
+					}),
+				);
+				await ensureTextFile(overlay.manifestPath, buildOpenCodePluginManifestContent());
+				await ensureTextFile(overlay.configPath, buildOpenCodeOverlayConfigContent(overlay, userConfig));
+				// The pinned release merges OPENCODE_CONFIG as an additional source, so
+				// the user's global and project configuration (providers, credentials,
+				// agents, MCP servers, instructions) keeps loading unchanged; the
+				// overlay only adds the bridge on top of it.
+				env.OPENCODE_CONFIG = overlay.configPath;
+			}
 			// A task launch must never download a different OpenCode build behind
 			// the version check that just passed.
 			env.OPENCODE_DISABLE_AUTOUPDATE = "1";

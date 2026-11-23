@@ -56,6 +56,15 @@ Treat old snapshots under `.plan/docs/CLI References/` as historical.
   single-file paths are skipped, so the directory ships with a
   `package.json` (`"type": "module"`, `main: "./index.js"`) for the `export default`
   entry point.
+- **A user who exports `OPENCODE_CONFIG` themselves.** That file is a source only
+  because of the variable, so repointing it would silently discard the user's
+  providers, agents and MCP servers. Kanban parses it (JSONC), carries every
+  top-level key into the generated overlay, resolves the user's own `plugin`
+  entries against the directory they were written in, and appends the bridge last.
+  A file Kanban cannot parse is left exactly as it is: the launch says the bridge is
+  inactive, which is visible, rather than quietly dropping configuration it was not
+  given. Model discovery ranks the same way the CLI loads: global files, then
+  `OPENCODE_CONFIG`, then the project files.
 - **Isolation.** Kanban launches one OpenCode process per card in that card's PTY, so
   no shared background service is involved; `OPENCODE_DISABLE_AUTOUPDATE=1` stops a
   task launch from downloading a different build behind the version check. Every
@@ -343,3 +352,15 @@ throwaway `HOME` and an empty project, through Kanban's own `probeOpenCodeVersio
 - `--session` resume requires the id the bridge reported. A card created before AA-O1
   (or a session OpenCode has since dropped) fails with an explicit "start a new session"
   message instead of attaching to another conversation.
+- Merging a user's `OPENCODE_CONFIG` rewrites only their `plugin` entries into absolute
+  paths; any *other* relative path inside their configuration (an `instructions` file,
+  for example) is carried as written and then resolves against the generated overlay
+  rather than the file it came from. A card whose variable points at something Kanban
+  cannot parse runs without the bridge, so it never moves itself to review; the launch
+  warning names the file.
+- Review findings from the second round that are **not** fixed by this branch and stay
+  open: the bridge's `final_message`/`activity_text`/`tool_input_summary` still need a
+  normalizer plus `--source opencode` before that text reaches a card; a saved
+  `--continue` is stripped only on a fresh launch, so a resume can still carry it next to
+  `--session`; and after an approved permission the bridge never returns the turn to
+  `busy`, so the turn's final idle is dropped and the card stays parked in attention.

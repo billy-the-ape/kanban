@@ -1,5 +1,5 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -19,8 +19,10 @@ import {
 	KANBAN_OPENCODE_MODEL_ENV,
 	OPENCODE_MINIMUM_VERSION,
 	OPENCODE_PINNED_VERSION,
+	parseOpenCodeUserConfig,
 	parseOpenCodeVersion,
 	probeOpenCodeVersion,
+	readOpenCodeUserConfig,
 	resolveOpenCodeModelSelection,
 	stripJsonComments,
 	verifyOpenCodeSession,
@@ -160,13 +162,17 @@ describe("OpenCode configuration discovery (AA-O1a)", () => {
 		expect(candidates).toContain(join(home, ".config", "opencode", "opencode.json"));
 		expect(candidates).toContain(join(tempWorkspace ?? "", "opencode.json"));
 		expect(candidates).toContain(join(tempWorkspace ?? "", ".opencode", "opencode.jsonc"));
-		// An explicit file sorts first and the project file last, so the loop that
-		// walks the list in reverse honors the most local selection.
+		// The pinned release merges global -> `OPENCODE_CONFIG` -> project, so the
+		// exported file outranks the global files but stays below the project ones
+		// for the loop that walks this list in reverse.
+		const custom = join(home, "custom.json");
 		const withOverride = getOpenCodeConfigPathCandidates({
 			cwd: tempWorkspace ?? "",
-			env: { OPENCODE_CONFIG: join(home, "custom.json") },
+			env: { OPENCODE_CONFIG: custom },
 		});
-		expect(withOverride[0]).toBe(join(home, "custom.json"));
+		const customIndex = withOverride.indexOf(custom);
+		expect(customIndex).toBeGreaterThan(withOverride.indexOf(join(home, ".config", "opencode", "opencode.json")));
+		expect(customIndex).toBeLessThan(withOverride.indexOf(join(tempWorkspace ?? "", "opencode.json")));
 		expect(withOverride.at(-1)).toBe(join(tempWorkspace ?? "", ".opencode", "opencode.jsonc"));
 		// Credentials live in the auth store and model catalogs in state: neither
 		// is a model the user selected for this card.
@@ -251,6 +257,28 @@ describe("OpenCode configuration discovery (AA-O1a)", () => {
 		expect(selection.model).toBeNull();
 		expect(selection.source).toBe("none");
 	});
+
+	it("ranks OPENCODE_CONFIG between the global files and the project", async () => {
+		const home = process.env.HOME ?? "";
+		const workspace = tempWorkspace ?? "";
+		writeConfigFile(
+			join(home, ".config", "opencode", "opencode.json"),
+			'{"model":"openrouter/anthropic/claude-sonnet-4.5"}',
+		);
+		const custom = writeConfigFile(join(home, "custom.json"), '{"model":"ollama/qwen2.5-coder:32b"}');
+
+		// OpenCode loads `OPENCODE_CONFIG` after its global files, so a selection
+		// there outranks the global one: reading the global file instead would
+		// quietly run the card on a hosted provider the user replaced.
+		const withCustom = await resolveOpenCodeModelSelection({ cwd: workspace, env: { OPENCODE_CONFIG: custom } });
+		expect(withCustom.model).toBe("ollama/qwen2.5-coder:32b");
+		expect(withCustom.configPath).toBe(custom);
+
+		// The project still wins, because OpenCode merges it last.
+		writeConfigFile(join(workspace, "opencode.json"), '{"model":"local/qwen3-coder"}');
+		const withProject = await resolveOpenCodeModelSelection({ cwd: workspace, env: { OPENCODE_CONFIG: custom } });
+		expect(withProject.model).toBe("local/qwen3-coder");
+	});
 });
 
 describe("OpenCode launch overlay (AA-O1)", () => {
@@ -276,6 +304,50 @@ describe("OpenCode launch overlay (AA-O1)", () => {
 		expect(manifest.type).toBe("module");
 		expect(manifest.main).toBe("./index.js");
 		expect(manifest.private).toBe(true);
+	});
+
+	it("carries a user's own OPENCODE_CONFIG into the overlay instead of replacing it", () => {
+		const layout = getOpenCodeOverlayLayout(join(tempHome ?? "", "attempt"));
+		const userConfig = parseOpenCodeUserConfig(
+			`{
+	// the provider I actually run against
+	"$schema": "https://opencode.example/config.json",
+	"model": "ollama/qwen2.5-coder:32b",
+	"provider": { "ollama": { "options": { "baseURL": "http://127.0.0.1:11434" } } },
+	"plugin": ["./my-plugin", "opencode-npm-plugin", "~/shared-plugin"]
+}`,
+			join(tempHome ?? "", "user-config"),
+		);
+		if (!userConfig) {
+			throw new Error("expected a mergeable user configuration");
+		}
+		const overlay = JSON.parse(buildOpenCodeOverlayConfigContent(layout, userConfig)) as Record<string, unknown>;
+		// Dropping a user's providers, agents or MCP servers because Kanban needed
+		// one key of its own is the failure this merge exists to prevent.
+		expect(overlay.model).toBe("ollama/qwen2.5-coder:32b");
+		expect(overlay.provider).toEqual({ ollama: { options: { baseURL: "http://127.0.0.1:11434" } } });
+		// A relative entry resolves against the file it came from, because that is
+		// the file OpenCode would have resolved it against; the bridge stays last.
+		expect(overlay.plugin).toEqual([
+			join(tempHome ?? "", "user-config", "my-plugin"),
+			"opencode-npm-plugin",
+			join(homedir(), "shared-plugin"),
+			layout.pluginDirectory,
+		]);
+	});
+
+	it("reports an unmergeable user configuration instead of guessing", async () => {
+		const directory = join(tempHome ?? "", "broken");
+		mkdirSync(directory, { recursive: true });
+		const broken = join(directory, "opencode.json");
+		writeFileSync(broken, "{ model: local/qwen, }", "utf8");
+		expect(parseOpenCodeUserConfig("{ model: local/qwen, }", directory)).toBeNull();
+		expect(parseOpenCodeUserConfig("[]", directory)).toBeNull();
+		await expect(readOpenCodeUserConfig(broken)).resolves.toBeNull();
+		await expect(readOpenCodeUserConfig(join(directory, "missing.json"))).resolves.toBeNull();
+		// A directory is not mergeable either: Kanban cannot know which file in it
+		// OpenCode would have read, and picking one could discard their settings.
+		await expect(readOpenCodeUserConfig(directory)).resolves.toBeNull();
 	});
 });
 

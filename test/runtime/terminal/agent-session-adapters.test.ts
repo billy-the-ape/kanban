@@ -350,6 +350,75 @@ describe("prepareAgentLaunch hook strategies", () => {
 		expect(launch.env.OPENCODE_DISABLE_AUTOUPDATE).toBe("1");
 	});
 
+	it("merges a user's own OPENCODE_CONFIG into the launch instead of overwriting it", async () => {
+		const homePath = setupTempHome();
+		const workspace = setupEmptyWorkspace();
+		const userConfigPath = join(homePath, "my-opencode.json");
+		writeFileSync(
+			userConfigPath,
+			JSON.stringify({
+				model: "ollama/qwen2.5-coder:32b",
+				mcp: { browser: { url: "http://127.0.0.1:9222" } },
+				plugin: ["./my-plugin"],
+			}),
+			"utf8",
+		);
+
+		const launch = await prepareAgentLaunch({
+			taskId: "task-opencode-user-config",
+			agentId: "opencode",
+			binary: "opencode",
+			args: [],
+			cwd: workspace,
+			prompt: "",
+			workspaceId: "workspace-1",
+			attemptId: "attempt-1",
+			env: { OPENCODE_CONFIG: userConfigPath },
+		});
+
+		// Repointing the variable is only safe because the user's own settings ride
+		// along in the file it now points at: their model, their MCP servers, and
+		// their plugin entry resolved next to the file they wrote it in.
+		expect(launch.env.OPENCODE_CONFIG).not.toBe(userConfigPath);
+		const overlay = JSON.parse(readFileSync(launch.env.OPENCODE_CONFIG ?? "", "utf8")) as Record<string, unknown>;
+		expect(overlay.model).toBe("ollama/qwen2.5-coder:32b");
+		expect(overlay.mcp).toEqual({ browser: { url: "http://127.0.0.1:9222" } });
+		const pluginEntries = overlay.plugin as string[];
+		expect(pluginEntries[0]).toBe(join(homePath, "my-plugin"));
+		expect(pluginEntries.at(-1)).toBe(join(dirname(launch.env.OPENCODE_CONFIG ?? ""), "plugin"));
+		// The same selection is what the model policy passes, not a guessed one.
+		expect(getCliFlagValue(launch.args, "--model")).toBe("ollama/qwen2.5-coder:32b");
+		expect(launch.warningMessage).toBeUndefined();
+	});
+
+	it("leaves an unmergeable OPENCODE_CONFIG in force and says the bridge is off", async () => {
+		const homePath = setupTempHome();
+		const workspace = setupEmptyWorkspace();
+		const userConfigPath = join(homePath, "opencode.jsonc");
+		writeFileSync(userConfigPath, "{ model: local/qwen, }", "utf8");
+
+		const launch = await prepareAgentLaunch({
+			taskId: "task-opencode-unreadable-config",
+			agentId: "opencode",
+			binary: "opencode",
+			args: [],
+			cwd: workspace,
+			prompt: "",
+			workspaceId: "workspace-1",
+			attemptId: "attempt-1",
+			env: { OPENCODE_CONFIG: userConfigPath },
+		});
+
+		// Their configuration outranks the bridge: Kanban drops its own hook
+		// injection rather than discarding a configuration it was not given. The
+		// launch environment is merged over the request environment, so leaving the
+		// key unset is what keeps their exported file in force - and the warning
+		// explains a card that never moves itself to review.
+		expect(launch.env.OPENCODE_CONFIG).toBeUndefined();
+		expect(launch.warningMessage ?? "").toContain("without the Kanban bridge");
+		expect(launch.warningMessage ?? "").toContain(userConfigPath);
+	});
+
 	it("leaves the OpenCode model alone when only state and auth files exist", async () => {
 		const homePath = setupTempHome();
 		const localAppDataPath = join(homePath, "AppData", "Local");
