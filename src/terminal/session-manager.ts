@@ -309,10 +309,16 @@ export class TerminalSessionManager implements TerminalSessionService {
 	async startTaskSession(request: StartTaskSessionRequest): Promise<RuntimeTaskSessionSummary> {
 		const entry = this.ensureEntry(request.taskId);
 		const summaryBeforeRestore = entry.summary;
-		entry.restartRequest = {
-			kind: "task",
-			request: cloneStartTaskSessionRequest(request),
-		};
+		// Restored Pi sessions never inherit the normal PTY auto-restart path.
+		// Doing so would bypass the API's exact-session/worktree safety checks.
+		if (request.restoreDetachedSession) {
+			entry.restartRequest = null;
+		} else {
+			entry.restartRequest = {
+				kind: "task",
+				request: cloneStartTaskSessionRequest(request),
+			};
+		}
 		if (entry.active && isActiveState(entry.summary.state)) {
 			return cloneSummary(entry.summary);
 		}
@@ -580,18 +586,32 @@ export class TerminalSessionManager implements TerminalSessionService {
 			startedAt,
 			previousConfigFingerprint,
 		});
+		// Restored Pi starts idle. An "interrupted" state cannot be
+		// exited by Pi's normal hooks, so park it in an input-ready
+		// attention state until the next actual agent turn begins.
+		const restoredReviewReason =
+			summaryBeforeRestore.state === "awaiting_review" &&
+			(summaryBeforeRestore.reviewReason === "hook" ||
+				summaryBeforeRestore.reviewReason === "attention" ||
+				summaryBeforeRestore.reviewReason === "error")
+				? summaryBeforeRestore.reviewReason
+				: "attention";
 		updateSummary(entry, {
 			state: request.restoreDetachedSession
-				? summaryBeforeRestore.state === "awaiting_review" ? "awaiting_review" : "interrupted"
-				: request.resumeFromTrash ? "awaiting_review" : "running",
+				? "awaiting_review"
+				: request.resumeFromTrash
+					? "awaiting_review"
+					: "running",
 			agentId: request.agentId,
 			workspacePath: request.cwd,
 			pid: session.pid,
 			startedAt,
 			lastOutputAt: request.restoreDetachedSession ? summaryBeforeRestore.lastOutputAt : null,
 			reviewReason: request.restoreDetachedSession
-				? summaryBeforeRestore.state === "awaiting_review" ? summaryBeforeRestore.reviewReason : "interrupted"
-				: request.resumeFromTrash ? "attention" : null,
+				? restoredReviewReason
+				: request.resumeFromTrash
+					? "attention"
+					: null,
 			exitCode: null,
 			lastHookAt: null,
 			latestHookActivity: null,

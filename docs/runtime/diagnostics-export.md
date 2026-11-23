@@ -20,7 +20,7 @@ What is deliberately excluded: provider credentials, auth headers, raw environme
 
 ## Recovery of Pi task terminals
 
-When opening a task with an orphaned Pi process after a server restart, the task-detail terminal reconnects the **exact** persisted Pi session with an empty prompt. Recovery is single-flight, requires the existing worktree and recorded session ID, preserves the Review lane and turn checkpoints, and never repeats an interrupted model turn. Intentional Stop does not trigger automatic restore. Other terminal agents are not automatically relaunched until their exact-resume capabilities can be verified.
+When opening a task with an orphaned Pi process after a server restart, the task-detail terminal reconnects the **exact** persisted Pi session with an empty prompt. Recovery is single-flight, requires the existing worktree and recorded session ID, preserves the Review lane and turn checkpoints, and never repeats an interrupted model turn. A previously interrupted task is restored as an input-ready attention pause so its next normal hook can return it to Running. A restored PTY is not automatically relaunched after another exit. Intentional Stop does not trigger automatic restore. Other terminal agents are not automatically relaunched until their exact-resume capabilities can be verified.
 
 ## Transport
 

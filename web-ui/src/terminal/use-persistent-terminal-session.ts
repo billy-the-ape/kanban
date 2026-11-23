@@ -172,7 +172,9 @@ export function usePersistentTerminalSession({
 			((sessionSummary.state === "running" || sessionSummary.state === "awaiting_review") &&
 				sessionSummary.pid !== null);
 		if (!recoverable) return;
-		const key = `${workspaceId}:${taskId}:${sessionSummary.startedAt ?? "unknown"}`;
+		// Cap reconnection to one attempt per open task view, not one per
+		// restarted process (which would create a client-side crash loop).
+		const key = `${workspaceId}:${taskId}`;
 		if (lastRestorationAttemptRef.current === key) return;
 		lastRestorationAttemptRef.current = key;
 		let cancelled = false;

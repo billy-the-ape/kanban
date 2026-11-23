@@ -82,7 +82,7 @@ describe("TerminalSessionManager auto-restart", () => {
 		expect(ptySessionSpawnMock).toHaveBeenCalledTimes(1);
 	});
 
-	it("preserves interrupted status when restoring a process lost mid-turn", async () => {
+	it("restores an interrupted Pi session to a hook-resumable, input-ready state", async () => {
 		ptySessionSpawnMock.mockImplementation((request: MockSpawnRequest) => createMockPtySession(222, request));
 		const manager = new TerminalSessionManager();
 		manager.hydrateFromRecord({
@@ -97,8 +97,40 @@ describe("TerminalSessionManager auto-restart", () => {
 			taskId: "task-1", agentId: "pi", binary: "pi", args: [],
 			cwd: "/tmp/task-1", prompt: "", restoreDetachedSession: true,
 		});
-		expect(restored.state).toBe("interrupted");
-		expect(restored.reviewReason).toBe("interrupted");
+		expect(restored.state).toBe("awaiting_review");
+		expect(restored.reviewReason).toBe("attention");
+		expect(manager.transitionToRunning("task-1")?.state).toBe("running");
+		expect(manager.transitionToReview("task-1", "hook")?.state).toBe("awaiting_review");
+		expect(manager.getSummary("task-1")?.reviewReason).toBe("hook");
+	});
+
+	it("does not auto-restart a restored Pi PTY after its process exits", async () => {
+		const sessions: Array<ReturnType<typeof createMockPtySession>> = [];
+		ptySessionSpawnMock.mockImplementation((request: MockSpawnRequest) => {
+			const session = createMockPtySession(222, request);
+			sessions.push(session);
+			return session;
+		});
+		const manager = new TerminalSessionManager();
+		manager.hydrateFromRecord({
+			"task-1": {
+				taskId: "task-1", state: "awaiting_review", agentId: "pi",
+				workspacePath: "/tmp/task-1", pid: 111, startedAt: 1, updatedAt: 2,
+				lastOutputAt: 2, reviewReason: "hook", exitCode: null,
+				lastHookAt: null, latestHookActivity: null,
+			},
+		});
+		manager.attach("task-1", { onState: vi.fn(), onOutput: vi.fn(), onExit: vi.fn() });
+		await manager.startTaskSession({
+			taskId: "task-1", agentId: "pi", binary: "pi", args: [],
+			cwd: "/tmp/task-1", prompt: "", restoreDetachedSession: true,
+		});
+		expect(ptySessionSpawnMock).toHaveBeenCalledTimes(1);
+		sessions[0]?.triggerExit(1);
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(ptySessionSpawnMock).toHaveBeenCalledTimes(1);
+		expect(manager.hasActiveProcess("task-1")).toBe(false);
 	});
 
 	it("restarts an attached agent session after it exits", async () => {

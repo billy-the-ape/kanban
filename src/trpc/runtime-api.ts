@@ -397,7 +397,7 @@ async function collectQualitySummaryJobEvents(taskId: string): Promise<{
 }
 
 // Shared across API objects: runtime-server creates one API wrapper per request.
- // This single-flight lock must outlive each wrapper.
+// This single-flight lock must outlive each wrapper.
 const restoringDetachedSessions = new Map<string, Promise<RuntimeTaskSessionStartResponse>>();
 
 export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrpcContext["runtimeApi"] {
@@ -636,7 +636,8 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
 				const card = board.columns
 					.filter((column) => column.id === "review" || column.id === "in_progress")
-					.flatMap((column) => column.cards).find((item) => item.id === body.taskId);
+					.flatMap((column) => column.cards)
+					.find((item) => item.id === body.taskId);
 				if (!card) throw new Error("Only active or Review tasks can be restored.");
 				const manager = await deps.getScopedTerminalManager(workspaceScope);
 				const saved = manager.getSummary(body.taskId);
@@ -685,6 +686,9 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 						baseRef: body.baseRef,
 					});
 				} else {
+					if (body.restoreDetachedSession) {
+						throw new Error("The task worktree disappeared during restoration; a new one will not be created.");
+					}
 					// UPD-0: prior-session detection is a preparation concern — an
 					// existing session makes the baseline fixed even without a
 					// persisted evidence record. A trash resume is a resume, never
@@ -725,7 +729,8 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					initialStart = prepared.initialStart;
 				}
 			}
-			const shouldCaptureTurnCheckpoint = !body.resumeFromTrash && !body.restoreDetachedSession && !isHomeAgentSessionId(body.taskId);
+			const shouldCaptureTurnCheckpoint =
+				!body.resumeFromTrash && !body.restoreDetachedSession && !isHomeAgentSessionId(body.taskId);
 			const terminalManager = await deps.getScopedTerminalManager(workspaceScope);
 
 			// Per-task config source-of-truth precedence:
