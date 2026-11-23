@@ -206,9 +206,9 @@ Use fixture binaries/events for CI; use the real local endpoint only for manual 
 Implementation checks: focused adapter/registry/session/hooks/settings tests, backend and
 frontend typechecks, repository CI, and Biome on changed supported files.
 
-Manual smoke: select OpenCode with local Qwen; request a small edit and test; answer a
-question; send a follow-up; stop and resume; restart Kanban and resume; run two tasks
-concurrently; exercise a failed endpoint. Confirm logs identify the selected local route.
+Manual smoke: the required pre-rollout checklist under **Deployment and rollback** is the
+current form of this run - one card per case, with the observed card state recorded next
+to each step; confirm logs identify the selected local route.
 Run publication only in an explicitly designated test repository and through existing gates.
 
 Acceptance: all listed supported operations work; limitations are visible; original
@@ -222,6 +222,33 @@ Kanban host's PATH; configure its own local provider/base URL/model and credenti
 reference; deploy Kanban after tests. OPENCODE_CONFIG is an existing version-sensitive
 integration setting, not a new globally required environment variable.
 Document any new setting names only after implementing them.
+
+### Required before production rollout (not yet performed)
+
+CI never calls a real model, so the event contract in this document is verified against
+fixtures and the CLI's help output only. Before enabling OpenCode for real work, run one
+card per case below on a host with OpenCode 1.19.6 and the intended local provider, and
+record the observed card state next to each step:
+
+1. **Small edit plus test.** Card goes to in progress once at the prompt, each tool
+   reports activity with a non-empty tool detail on both its start and its finish, and
+   the turn ends in exactly one review whose summary is this turn's assistant text.
+2. **Permission request.** Card parks with the attention reason and the terminal stays
+   interactive; approving lets the tool finish, and that same turn then produces the
+   completion review - no extra prompt is needed to resume the turn.
+3. **Tool-only or empty follow-up.** The new turn's review carries no summary from the
+   previous turn.
+4. **Stop during a model call, then resume; restart Kanban and resume.** The recorded
+   session is resumed, or Kanban says a new session is needed instead of attaching to an
+   unrelated conversation.
+5. **Two cards concurrently in different worktrees.** No cross-task activity, review or
+   cancellation, and a sub-agent session moves neither card.
+6. **Unreachable or failed endpoint.** The card shows the error reason and never claims
+   completion.
+
+If any step disagrees with the contract table above, the correction belongs in
+`src/terminal/opencode-plugin-source.ts` (version-specific translation stays there) and
+this document is updated with the observed behavior.
 
 No shared model key or global OpenCode permission change is required by this plan.
 A separately authorized AI-MONSTER setup change needs a homelab-documentation PR.
@@ -357,10 +384,10 @@ throwaway `HOME` and an empty project, through Kanban's own `probeOpenCodeVersio
 - Commit/PR automation prompts are still plain terminal input; the pre-existing
   `automatedDelivery` row was not changed here, so reliable-completion behavior for
   OpenCode is whatever that policy already allowed.
-- CI never calls a real model. Version and session probes use fixture executables, so a
-  manual smoke run against a local provider (small edit, answer a question, follow-up,
-  stop/resume, restart/resume, two concurrent cards) is still required on a host with
-  OpenCode 1.19.6 installed.
+- CI never calls a real model. Version and session probes use fixture executables, so the
+  required pre-rollout smoke run under **Deployment and rollback** is still outstanding on
+  a host with OpenCode 1.19.6 and a real local provider: the event contract, the approval
+  resume and the per-turn summary are fixture-verified only.
 - The first-run onboarding carousel keeps its original curated list; OpenCode is
   selectable in Settings and the task-start picker.
 - A card's first OpenCode launch on a machine starts a few seconds late, because loading
