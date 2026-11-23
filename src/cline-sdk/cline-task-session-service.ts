@@ -130,6 +130,14 @@ export interface ClineTaskSessionService {
 	onSummary(listener: (summary: RuntimeTaskSessionSummary) => void): () => void;
 	onMessage(listener: (taskId: string, message: ClineTaskMessage) => void): () => void;
 	startTaskSession(request: StartClineTaskSessionRequest): Promise<RuntimeTaskSessionSummary>;
+	/**
+	 * True when a live session, an in-memory restartable session, or a persisted
+	 * SDK session exists for the task. The persisted lookup matches session ids by
+	 * task-id prefix across the whole session host, so it can also report true for
+	 * a same-named task in another workspace. Callers that act on a false result
+	 * must still verify the task's own worktree and delivery state.
+	 */
+	hasRecoverableTaskSession(taskId: string): Promise<boolean>;
 	resetUnstartedQueuedTask(taskId: string, reset: (withdraw: () => Promise<boolean>) => Promise<void>): Promise<void>;
 	stopTaskSession(taskId: string): Promise<RuntimeTaskSessionSummary | null>;
 	abortTaskSession(taskId: string): Promise<RuntimeTaskSessionSummary | null>;
@@ -785,6 +793,13 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 		}
 		const compacted = compactClineConversationMessages(persistedMessages, targetTokens);
 		return compacted;
+	}
+
+	async hasRecoverableTaskSession(taskId: string): Promise<boolean> {
+		if (this.sessionRuntime.getTaskSessionId(taskId) || this.sessionRuntime.canRestartTaskSession(taskId)) {
+			return true;
+		}
+		return (await this.sessionRuntime.readPersistedTaskSession(taskId)) !== null;
 	}
 
 	async startTaskSession(request: StartClineTaskSessionRequest): Promise<RuntimeTaskSessionSummary> {

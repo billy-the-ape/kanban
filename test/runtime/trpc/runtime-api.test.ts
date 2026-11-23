@@ -8,6 +8,7 @@ import type { RuntimeConfigState } from "../../../src/config/runtime-config";
 import type {
 	RuntimeBoardData,
 	RuntimeTaskDiagnosticsResponse,
+	RuntimeTaskPreservationInfoResponse,
 	RuntimeTaskPrTrackingStateResponse,
 	RuntimeTaskSessionSummary,
 	RuntimeWorkspaceStateResponse,
@@ -22,20 +23,26 @@ const taskWorktreeMocks = vi.hoisted(() => ({
 	prepareInitialTaskWorktree: vi.fn(),
 	resolveTaskCwd: vi.fn(),
 	taskWorktreeExists: vi.fn(async () => false),
-	getTaskPreservationInfo: vi.fn(async () => ({
-		ok: true,
-		worktreeExists: false,
-		worktreePath: "/tmp/worktree",
-		headCommit: null,
-		dirty: false,
-		changedFiles: [],
-		commitsAheadOfBase: 0,
-		preservation: null,
-	})),
+	getTaskPreservationInfo: vi.fn(
+		async (): Promise<RuntimeTaskPreservationInfoResponse> => ({
+			ok: true,
+			worktreeExists: false,
+			worktreePath: "/tmp/worktree",
+			headCommit: null,
+			dirty: false,
+			changedFiles: [],
+			commitsAheadOfBase: 0,
+			preservation: null,
+		}),
+	),
 }));
 
 const turnCheckpointMocks = vi.hoisted(() => ({
 	captureTaskTurnCheckpoint: vi.fn(),
+}));
+
+const initialStartMocks = vi.hoisted(() => ({
+	readTaskInitialStartRecord: vi.fn(),
 }));
 
 const oauthMocks = vi.hoisted(() => ({
@@ -100,6 +107,11 @@ vi.mock("../../../src/workspace/task-worktree.js", () => ({
 
 vi.mock("../../../src/workspace/turn-checkpoints.js", () => ({
 	captureTaskTurnCheckpoint: turnCheckpointMocks.captureTaskTurnCheckpoint,
+}));
+
+vi.mock("../../../src/workspace/task-initial-start.js", async (importOriginal) => ({
+	...(await importOriginal<typeof TaskInitialStart>()),
+	readTaskInitialStartRecord: initialStartMocks.readTaskInitialStartRecord,
 }));
 
 vi.mock("@clinebot/core", () => ({
@@ -176,6 +188,7 @@ import * as workspaceState from "../../../src/state/workspace-state";
 import * as dispatchRecords from "../../../src/task-dispatch/dispatch-records";
 import type { RuntimeTrpcContext } from "../../../src/trpc/app-router";
 import { type CreateRuntimeApiDependencies, createRuntimeApi } from "../../../src/trpc/runtime-api";
+import type * as TaskInitialStart from "../../../src/workspace/task-initial-start";
 import type * as TaskLastPromptModule from "../../../src/workspace/task-last-prompt";
 import * as queuedReset from "../../../src/workspace/task-queued-reset";
 import { createGitTestEnv } from "../../utilities/git-env";
@@ -288,6 +301,7 @@ function createClineTaskSessionServiceMock() {
 		startTaskSession: vi.fn<(...args: unknown[]) => Promise<RuntimeTaskSessionSummary>>(async () =>
 			createSummary({ agentId: "cline", pid: null }),
 		),
+		hasRecoverableTaskSession: vi.fn(async (_taskId: string) => true),
 		onMessage: vi.fn<(...args: unknown[]) => () => void>(() => () => {}),
 		stopTaskSession: vi.fn<(...args: unknown[]) => Promise<RuntimeTaskSessionSummary | null>>(async () => null),
 		abortTaskSession: vi.fn<(...args: unknown[]) => Promise<RuntimeTaskSessionSummary | null>>(async () => null),
@@ -305,6 +319,78 @@ function createClineTaskSessionServiceMock() {
 		applyTurnCheckpoint: vi.fn<(...args: unknown[]) => RuntimeTaskSessionSummary | null>(() => null),
 		dispose: vi.fn<(...args: unknown[]) => Promise<void>>(async () => {}),
 	};
+}
+// The durable evidence that lets a never-started queued task be recovered from
+// its saved card: a prepared baseline and an untouched worktree on it.
+function createInitialStartRecord(taskId: string, baselineSha: string) {
+	return {
+		taskId,
+		baseRef: "main",
+		updateBaseRefBeforeStart: true,
+		state: "prepared" as const,
+		baselineSha,
+		failure: null,
+		updatedAt: Date.now(),
+	};
+}
+
+function createCleanTaskWorktreeInfo(baselineSha: string): RuntimeTaskPreservationInfoResponse {
+	return {
+		ok: true,
+		worktreeExists: true,
+		worktreePath: "/tmp/existing-worktree",
+		headCommit: baselineSha,
+		dirty: false,
+		commitsAheadOfBase: 0,
+		changedFiles: [],
+		preservation: null,
+	};
+}
+
+function createUnstartedRecoveryBoard(taskId: string): RuntimeBoardData {
+	return {
+		columns: [
+			{
+				id: "in_progress",
+				title: "In Progress",
+				cards: [
+					{
+						id: taskId,
+						title: "Original task",
+						prompt: "Implement the feature",
+						baseRef: "main",
+						updateBaseRefBeforeStart: true,
+						agentId: "cline",
+					},
+				],
+			},
+		],
+	} as RuntimeBoardData;
+}
+
+// An errored, never-started Cline task: no live session, no restartable
+// session, and no durable SDK record.
+function createUnstartedClineServiceMock() {
+	const cline = createClineTaskSessionServiceMock();
+	cline.hasRecoverableTaskSession.mockResolvedValue(false);
+	cline.getSummary.mockReturnValue(createSummary({ state: "awaiting_review", reviewReason: "error" }));
+	cline.listMessages.mockReturnValue([{ role: "system", content: "No previous Cline session config" }]);
+	return cline;
+}
+
+function createClineRecoveryRuntimeApi(cline: ReturnType<typeof createClineTaskSessionServiceMock>) {
+	return createTestRuntimeApi({
+		getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+		loadScopedRuntimeConfig: vi.fn(async () => ({
+			...createRuntimeConfigState(),
+			selectedAgentId: "cline" as const,
+		})),
+		setActiveRuntimeConfig: vi.fn(),
+		getScopedTerminalManager: vi.fn(async () => ({ getSummary: vi.fn(() => null) }) as never),
+		getScopedClineTaskSessionService: vi.fn(async () => cline as never),
+		resolveInteractiveShellCommand: vi.fn(),
+		runCommand: vi.fn(),
+	});
 }
 
 describe("createRuntimeApi startTaskSession", () => {
@@ -334,6 +420,8 @@ describe("createRuntimeApi startTaskSession", () => {
 			initialStart: null,
 		});
 		turnCheckpointMocks.captureTaskTurnCheckpoint.mockReset();
+		initialStartMocks.readTaskInitialStartRecord.mockReset();
+		initialStartMocks.readTaskInitialStartRecord.mockResolvedValue(null);
 		oauthMocks.addLocalProvider.mockReset();
 		oauthMocks.ensureCustomProvidersLoaded.mockReset();
 		oauthMocks.loginClineOAuth.mockReset();
@@ -1523,6 +1611,240 @@ describe("createRuntimeApi startTaskSession", () => {
 			}),
 		);
 		expect(oauthMocks.saveProviderSettings).not.toHaveBeenCalled();
+	});
+
+	it("recovers a paused, never-started Cline task from its original prompt after an SDK send error", async () => {
+		taskLastPromptMocks.recordTaskLastPrompt.mockClear();
+		taskChatPrLinkingMocks.resolveTaskChatPrLinking.mockClear();
+		const baselineSha = "052739f929e4e956162fef2f333422c9ac7c31f6";
+		initialStartMocks.readTaskInitialStartRecord.mockResolvedValue({
+			taskId: "d6953",
+			baseRef: "main",
+			updateBaseRefBeforeStart: true,
+			state: "prepared",
+			baselineSha,
+			failure: null,
+			updatedAt: Date.now(),
+		});
+		taskWorktreeMocks.getTaskPreservationInfo.mockResolvedValueOnce({
+			ok: true,
+			worktreeExists: true,
+			worktreePath: "/tmp/existing-worktree",
+			headCommit: baselineSha,
+			dirty: false,
+			commitsAheadOfBase: 0,
+			changedFiles: [],
+			preservation: null,
+		});
+		taskWorktreeMocks.resolveTaskCwd.mockResolvedValue("/tmp/existing-worktree");
+		setSelectedProviderSettings({ provider: "anthropic", model: "claude-sonnet-4-6", apiKey: "test-key" });
+		const board = {
+			columns: [
+				{
+					id: "in_progress",
+					title: "In Progress",
+					cards: [
+						{
+							id: "d6953",
+							title: "Original task",
+							prompt: "Implement the feature",
+							images: [{ id: "original", mimeType: "image/png", data: "original-data" }],
+							baseRef: "main",
+							updateBaseRefBeforeStart: true,
+							agentId: "cline",
+						},
+					],
+				},
+			],
+		} as RuntimeBoardData;
+		const boardSpy = vi.spyOn(workspaceState, "loadWorkspaceBoardById").mockResolvedValue(board);
+		try {
+			const cline = createClineTaskSessionServiceMock();
+			cline.hasRecoverableTaskSession.mockResolvedValue(false);
+			cline.getSummary.mockReturnValue(createSummary({ state: "awaiting_review", reviewReason: "error" }));
+			cline.listMessages.mockReturnValue([{ role: "system", content: "No previous Cline session config" }]);
+			const api = createTestRuntimeApi({
+				getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+				loadScopedRuntimeConfig: vi.fn(async () => ({
+					...createRuntimeConfigState(),
+					selectedAgentId: "cline" as const,
+				})),
+				setActiveRuntimeConfig: vi.fn(),
+				getScopedTerminalManager: vi.fn(async () => ({ getSummary: vi.fn(() => null) }) as never),
+				getScopedClineTaskSessionService: vi.fn(async () => cline as never),
+				resolveInteractiveShellCommand: vi.fn(),
+				runCommand: vi.fn(),
+			});
+			const response = await api.sendTaskChatMessage(
+				{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+				{ taskId: "d6953", text: "continue" },
+			);
+			expect(response.ok).toBe(true);
+			expect(cline.startTaskSession).toHaveBeenCalledWith(
+				expect.objectContaining({
+					taskId: "d6953",
+					prompt: "Implement the feature",
+					cwd: "/tmp/existing-worktree",
+					resumeFromPersistence: true,
+				}),
+			);
+			expect(cline.sendTaskSessionInput).not.toHaveBeenCalled();
+			// A second recovery send with an image but no text must carry both
+			// original and newly attached images, and preserve the requested mode.
+			taskWorktreeMocks.getTaskPreservationInfo.mockResolvedValueOnce({
+				ok: true,
+				worktreeExists: true,
+				worktreePath: "/tmp/existing-worktree",
+				headCommit: baselineSha,
+				dirty: false,
+				commitsAheadOfBase: 0,
+				changedFiles: [],
+				preservation: null,
+			});
+			const attached = { id: "new", mimeType: "image/png", data: "new-data" };
+			const withImage = await api.sendTaskChatMessage(
+				{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+				{ taskId: "d6953", text: "", images: [attached], mode: "plan" },
+			);
+			expect(withImage.ok).toBe(true);
+			expect(cline.startTaskSession).toHaveBeenLastCalledWith(
+				expect.objectContaining({
+					prompt: "Implement the feature",
+					images: [{ id: "original", mimeType: "image/png", data: "original-data" }, attached],
+					mode: "plan",
+					startInPlanMode: false,
+				}),
+			);
+			// Image-only sends never overwrite the user prompt preview.
+			expect(taskLastPromptMocks.recordTaskLastPrompt).toHaveBeenCalledTimes(1);
+			expect(taskChatPrLinkingMocks.resolveTaskChatPrLinking).toHaveBeenCalledWith(
+				expect.objectContaining({ taskId: "d6953", text: "", hasImages: true }),
+			);
+			// Automated sends are not user resumes and must not reinitialize sessions.
+			cline.sendTaskSessionInput.mockResolvedValue(createSummary({ agentId: "cline" }));
+			const automated = await api.sendTaskChatMessage(
+				{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+				{ taskId: "d6953", text: "Automated instruction", source: "automated" },
+			);
+			expect(automated.ok).toBe(true);
+			expect(cline.startTaskSession).toHaveBeenCalledTimes(2);
+		} finally {
+			boardSpy.mockRestore();
+		}
+	});
+
+	it("delivers a second chat send that arrives while a recovery start is in flight", async () => {
+		const baselineSha = "052739f929e4e956162fef2f333422c9ac7c31f6";
+		let releaseBaseline: () => void = () => {};
+		const baselineIsPending = new Promise<void>((resolve) => {
+			releaseBaseline = resolve;
+		});
+		// The recovery stays in flight between its session probe and its start.
+		initialStartMocks.readTaskInitialStartRecord.mockImplementationOnce(async () => {
+			await baselineIsPending;
+			return createInitialStartRecord("d6953", baselineSha);
+		});
+		taskWorktreeMocks.getTaskPreservationInfo.mockResolvedValueOnce(createCleanTaskWorktreeInfo(baselineSha));
+		taskWorktreeMocks.resolveTaskCwd.mockResolvedValue("/tmp/existing-worktree");
+		setSelectedProviderSettings({ provider: "anthropic", model: "claude-sonnet-4-6", apiKey: "test-key" });
+		const boardSpy = vi
+			.spyOn(workspaceState, "loadWorkspaceBoardById")
+			.mockResolvedValue(createUnstartedRecoveryBoard("d6953"));
+		try {
+			const cline = createUnstartedClineServiceMock();
+			cline.sendTaskSessionInput.mockResolvedValue(createSummary({ agentId: "cline", pid: null }));
+			const api = createClineRecoveryRuntimeApi(cline);
+			const first = api.sendTaskChatMessage(
+				{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+				{ taskId: "d6953", text: "continue" },
+			);
+			await vi.waitFor(() => {
+				expect(initialStartMocks.readTaskInitialStartRecord).toHaveBeenCalledTimes(1);
+			});
+			const second = api.sendTaskChatMessage(
+				{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+				{ taskId: "d6953", text: "also update the docs" },
+			);
+			releaseBaseline();
+			const [firstResponse, secondResponse] = await Promise.all([first, second]);
+			expect(firstResponse.ok).toBe(true);
+			// The in-flight recovery owns the original prompt, exactly once.
+			expect(cline.startTaskSession).toHaveBeenCalledTimes(1);
+			expect(cline.startTaskSession).toHaveBeenCalledWith(
+				expect.objectContaining({
+					taskId: "d6953",
+					prompt: "Implement the feature",
+					resumeFromPersistence: true,
+				}),
+			);
+			// The overlapping send is ordered behind the recovery and delivered to
+			// the recovered session instead of being reported as delivered and dropped.
+			expect(secondResponse.ok).toBe(true);
+			expect(cline.sendTaskSessionInput).toHaveBeenCalledTimes(1);
+			expect(cline.sendTaskSessionInput).toHaveBeenCalledWith("d6953", "also update the docs", undefined, undefined);
+		} finally {
+			boardSpy.mockRestore();
+		}
+	});
+
+	it("keeps the ordinary send path when a recovery pre-check fails", async () => {
+		const baselineSha = "052739f929e4e956162fef2f333422c9ac7c31f6";
+		initialStartMocks.readTaskInitialStartRecord.mockResolvedValueOnce(
+			createInitialStartRecord("d6953", baselineSha),
+		);
+		// A persisted-state lookup failure is not the user's problem: the send must
+		// still reach a live session the way it did before recovery existed.
+		taskWorktreeMocks.getTaskPreservationInfo.mockRejectedValueOnce(new Error("git status failed"));
+		taskWorktreeMocks.resolveTaskCwd.mockResolvedValue("/tmp/existing-worktree");
+		setSelectedProviderSettings({ provider: "anthropic", model: "claude-sonnet-4-6", apiKey: "test-key" });
+		const boardSpy = vi
+			.spyOn(workspaceState, "loadWorkspaceBoardById")
+			.mockResolvedValue(createUnstartedRecoveryBoard("d6953"));
+		try {
+			const cline = createUnstartedClineServiceMock();
+			cline.sendTaskSessionInput.mockResolvedValue(createSummary({ agentId: "cline", pid: null }));
+			const api = createClineRecoveryRuntimeApi(cline);
+			const response = await api.sendTaskChatMessage(
+				{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+				{ taskId: "d6953", text: "continue" },
+			);
+			expect(response.ok).toBe(true);
+			expect(cline.startTaskSession).not.toHaveBeenCalled();
+			expect(cline.sendTaskSessionInput).toHaveBeenCalledWith("d6953", "continue", undefined, undefined);
+		} finally {
+			boardSpy.mockRestore();
+		}
+	});
+
+	it("cancels a recovery start at launch when a Cline session appears in the meantime", async () => {
+		const baselineSha = "052739f929e4e956162fef2f333422c9ac7c31f6";
+		initialStartMocks.readTaskInitialStartRecord.mockResolvedValueOnce(
+			createInitialStartRecord("d6953", baselineSha),
+		);
+		taskWorktreeMocks.resolveTaskCwd.mockResolvedValue("/tmp/existing-worktree");
+		setSelectedProviderSettings({ provider: "anthropic", model: "claude-sonnet-4-6", apiKey: "test-key" });
+		const boardSpy = vi
+			.spyOn(workspaceState, "loadWorkspaceBoardById")
+			.mockResolvedValue(createUnstartedRecoveryBoard("d6953"));
+		try {
+			const cline = createUnstartedClineServiceMock();
+			// The session is created after the pre-checks probed the session host, so
+			// only the launch-time check can keep it from being replaced.
+			taskWorktreeMocks.getTaskPreservationInfo.mockImplementationOnce(async () => {
+				cline.hasRecoverableTaskSession.mockResolvedValue(true);
+				return createCleanTaskWorktreeInfo(baselineSha);
+			});
+			const api = createClineRecoveryRuntimeApi(cline);
+			const response = await api.sendTaskChatMessage(
+				{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+				{ taskId: "d6953", text: "resume" },
+			);
+			expect(response).toMatchObject({ ok: false, error: expect.stringContaining("recovery was canceled") });
+			expect(cline.startTaskSession).not.toHaveBeenCalled();
+			expect(cline.sendTaskSessionInput).not.toHaveBeenCalled();
+		} finally {
+			boardSpy.mockRestore();
+		}
 	});
 
 	it("routes cline task input and stop to cline task session service", async () => {
