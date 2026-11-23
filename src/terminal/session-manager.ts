@@ -1098,6 +1098,12 @@ export class TerminalSessionManager implements TerminalSessionService {
 		if (wasSuppressed) {
 			return false;
 		}
+		// Pi's initial task request contains the original coding prompt. A PTY
+		// crash must never automatically replay that prompt (and its external
+		// side effects). The guarded exact-session restore handles reconnection.
+		if (entry.summary.agentId === "pi") {
+			return false;
+		}
 		if (entry.listeners.size === 0 || entry.restartRequest?.kind !== "task") {
 			return false;
 		}

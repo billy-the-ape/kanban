@@ -104,6 +104,27 @@ describe("TerminalSessionManager auto-restart", () => {
 		expect(manager.getSummary("task-1")?.reviewReason).toBe("hook");
 	});
 
+	it("does not replay the original Pi task prompt when its initial process crashes", async () => {
+		const sessions: Array<ReturnType<typeof createMockPtySession>> = [];
+		ptySessionSpawnMock.mockImplementation((request: MockSpawnRequest) => {
+			const session = createMockPtySession(123, request);
+			sessions.push(session);
+			return session;
+		});
+		const manager = new TerminalSessionManager();
+		manager.attach("task-1", { onState: vi.fn(), onOutput: vi.fn(), onExit: vi.fn() });
+		await manager.startTaskSession({
+			taskId: "task-1", agentId: "pi", binary: "pi", args: [],
+			cwd: "/tmp/task-1", prompt: "Create code and push a PR",
+		});
+		expect(ptySessionSpawnMock).toHaveBeenCalledTimes(1);
+		sessions[0]?.triggerExit(1);
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(ptySessionSpawnMock).toHaveBeenCalledTimes(1);
+		expect(manager.hasActiveProcess("task-1")).toBe(false);
+	});
+
 	it("does not auto-restart a restored Pi PTY after its process exits", async () => {
 		const sessions: Array<ReturnType<typeof createMockPtySession>> = [];
 		ptySessionSpawnMock.mockImplementation((request: MockSpawnRequest) => {
