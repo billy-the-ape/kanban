@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { RuntimeTaskSessionSummary } from "../../../src/core/api-contract";
 import { buildShellCommandLine } from "../../../src/core/shell";
+import { isDetachedPiRestoreCandidate } from "../../../src/terminal/pi-session-restore";
 import { TerminalSessionManager } from "../../../src/terminal/session-manager";
 import type { HookReviewReason } from "../../../src/terminal/session-state-machine";
 
@@ -130,6 +131,52 @@ describe("TerminalSessionManager", () => {
 		expect(recovered?.agentId).toBe("claude");
 		expect(recovered?.workspacePath).toBeNull();
 		expect(recovered?.reviewReason).toBeNull();
+	});
+
+	it("keeps a hydrated Pi record restorable when the terminal attaches first", () => {
+		const manager = new TerminalSessionManager();
+		manager.hydrateFromRecord({
+			"task-1": createSummary({
+				agentId: "pi",
+				state: "running",
+				latestTurnCheckpoint: {
+					turn: 3,
+					ref: "refs/kanban/checkpoints/task-1/turn/3",
+					commit: "abc1234",
+					createdAt: 3,
+				},
+				previousTurnCheckpoint: null,
+			}),
+		});
+
+		// Opening the task detail attaches the terminal websocket in the same render
+		// that asks the runtime API to reattach the saved Pi conversation, so this
+		// recovery usually runs first. Wiping the record to `idle` stranded the card
+		// on "No interrupted Pi process exists"; it now settles into the same
+		// restore-pending shape a graceful shutdown writes.
+		const recovered = manager.recoverStaleSession("task-1");
+
+		expect(recovered?.state).toBe("interrupted");
+		expect(recovered?.reviewReason).toBe("interrupted");
+		expect(recovered?.pid).toBeNull();
+		expect(recovered?.workspacePath).toBe("/tmp/worktree");
+		expect(recovered?.latestTurnCheckpoint?.commit).toBe("abc1234");
+		expect(isDetachedPiRestoreCandidate(recovered)).toBe(true);
+	});
+
+	it("still resets a hydrated Pi record whose process already ended", () => {
+		const manager = new TerminalSessionManager();
+		manager.hydrateFromRecord({
+			"task-1": createSummary({ agentId: "pi", state: "awaiting_review", reviewReason: "exit", pid: null }),
+		});
+
+		// An intentional Stop is not a session Kanban lost, so the destructive
+		// reset still applies and the guarded restore keeps refusing.
+		const recovered = manager.recoverStaleSession("task-1");
+
+		expect(recovered?.state).toBe("idle");
+		expect(recovered?.agentId).toBe("pi");
+		expect(isDetachedPiRestoreCandidate(recovered)).toBe(false);
 	});
 
 	it("tracks only the latest two turn checkpoints", () => {

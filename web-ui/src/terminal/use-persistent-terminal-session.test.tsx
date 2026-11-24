@@ -116,31 +116,53 @@ describe("usePersistentTerminalSession", () => {
 	it("reattaches a persisted Pi review session exactly once without a prompt", async () => {
 		const onSummary = vi.fn();
 		const saved = {
-			taskId: "task-a", state: "awaiting_review" as const, agentId: "pi" as const,
-			workspacePath: "/tmp/task-a", pid: 1234, startedAt: 100, updatedAt: 100,
-			lastOutputAt: 90, reviewReason: "hook" as const, exitCode: null,
-			lastHookAt: 90, latestHookActivity: null,
+			taskId: "task-a",
+			state: "awaiting_review" as const,
+			agentId: "pi" as const,
+			workspacePath: "/tmp/task-a",
+			pid: 1234,
+			startedAt: 100,
+			updatedAt: 100,
+			lastOutputAt: 90,
+			reviewReason: "hook" as const,
+			exitCode: null,
+			lastHookAt: 90,
+			latestHookActivity: null,
 		};
 		const restored = { ...saved, pid: 5678, startedAt: 200 };
 		restoreTaskSessionMock.mockResolvedValue({ ok: true, summary: restored });
 		await act(async () => {
 			root.render(
-				<HookHarness taskId="task-a" workspaceId="project-1"
-					sessionStartedAt={100} sessionSummary={saved}
-					baseRef="main" onSummary={onSummary} />,
+				<HookHarness
+					taskId="task-a"
+					workspaceId="project-1"
+					sessionStartedAt={100}
+					sessionSummary={saved}
+					baseRef="main"
+					onSummary={onSummary}
+				/>,
 			);
 			await Promise.resolve();
 			await Promise.resolve();
 		});
 		expect(restoreTaskSessionMock).toHaveBeenCalledWith({
-			taskId: "task-a", agentId: "pi", prompt: "", baseRef: "main", restoreDetachedSession: true,
+			taskId: "task-a",
+			agentId: "pi",
+			prompt: "",
+			baseRef: "main",
+			restoreDetachedSession: true,
 		});
 		expect(onSummary).toHaveBeenCalledWith(restored);
 		await act(async () => {
 			root.render(
-				<HookHarness taskId="task-a" workspaceId="project-1"
-					sessionStartedAt={100} sessionSummary={saved}
-					baseRef="main" onSummary={onSummary} />,
+				<HookHarness
+					taskId="task-a"
+					workspaceId="project-1"
+					sessionStartedAt={100}
+					sessionSummary={saved}
+					baseRef="main"
+					onSummary={onSummary}
+				/>,
 			);
 		});
 		expect(restoreTaskSessionMock).toHaveBeenCalledTimes(1);
@@ -148,14 +170,29 @@ describe("usePersistentTerminalSession", () => {
 
 	it("does not auto-restore intentionally stopped Pi sessions", async () => {
 		const saved = {
-			taskId: "task-a", state: "awaiting_review" as const, agentId: "pi" as const,
-			workspacePath: "/tmp/task-a", pid: null, startedAt: 100, updatedAt: 120,
-			lastOutputAt: 90, reviewReason: "exit" as const, exitCode: 0,
-			lastHookAt: 90, latestHookActivity: null,
+			taskId: "task-a",
+			state: "awaiting_review" as const,
+			agentId: "pi" as const,
+			workspacePath: "/tmp/task-a",
+			pid: null,
+			startedAt: 100,
+			updatedAt: 120,
+			lastOutputAt: 90,
+			reviewReason: "exit" as const,
+			exitCode: 0,
+			lastHookAt: 90,
+			latestHookActivity: null,
 		};
 		await act(async () => {
-			root.render(<HookHarness taskId="task-a" workspaceId="project-1"
-				sessionStartedAt={100} sessionSummary={saved} baseRef="main" />);
+			root.render(
+				<HookHarness
+					taskId="task-a"
+					workspaceId="project-1"
+					sessionStartedAt={100}
+					sessionSummary={saved}
+					baseRef="main"
+				/>,
+			);
 		});
 		expect(restoreTaskSessionMock).not.toHaveBeenCalled();
 	});

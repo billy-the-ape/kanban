@@ -13,6 +13,7 @@ vi.mock("../../../src/terminal/pty-session.js", () => ({
 	},
 }));
 
+import { isDetachedPiRestoreCandidate } from "../../../src/terminal/pi-session-restore";
 import { TerminalSessionManager } from "../../../src/terminal/session-manager";
 
 interface MockSpawnRequest {
@@ -56,27 +57,44 @@ describe("TerminalSessionManager auto-restart", () => {
 		const checkpoint = { turn: 7, ref: "refs/kanban/checkpoints/task-1/turn/7", commit: "abc1234", createdAt: 7 };
 		manager.hydrateFromRecord({
 			"task-1": {
-				taskId: "task-1", state: "awaiting_review", agentId: "pi",
-				workspacePath: "/tmp/task-1", pid: 111, startedAt: 1, updatedAt: 2,
-				lastOutputAt: 2, reviewReason: "hook", exitCode: null,
-				lastHookAt: 2, latestHookActivity: null,
-				latestTurnCheckpoint: checkpoint, previousTurnCheckpoint: null,
+				taskId: "task-1",
+				state: "awaiting_review",
+				agentId: "pi",
+				workspacePath: "/tmp/task-1",
+				pid: 111,
+				startedAt: 1,
+				updatedAt: 2,
+				lastOutputAt: 2,
+				reviewReason: "hook",
+				exitCode: null,
+				lastHookAt: 2,
+				latestHookActivity: null,
+				latestTurnCheckpoint: checkpoint,
+				previousTurnCheckpoint: null,
 			},
 		});
 		const restored = await manager.startTaskSession({
-			taskId: "task-1", agentId: "pi", binary: "pi", args: [],
-			cwd: "/tmp/task-1", prompt: "", restoreDetachedSession: true,
+			taskId: "task-1",
+			agentId: "pi",
+			binary: "pi",
+			args: [],
+			cwd: "/tmp/task-1",
+			prompt: "",
+			restoreDetachedSession: true,
 		});
 		expect(restored.state).toBe("awaiting_review");
 		expect(restored.reviewReason).toBe("hook");
 		expect(restored.latestTurnCheckpoint).toEqual(checkpoint);
 		expect(restored.pid).toBe(222);
-		expect(prepareAgentLaunchMock).toHaveBeenCalledWith(
-			expect.objectContaining({ prompt: "", agentId: "pi" }),
-		);
+		expect(prepareAgentLaunchMock).toHaveBeenCalledWith(expect.objectContaining({ prompt: "", agentId: "pi" }));
 		const second = await manager.startTaskSession({
-			taskId: "task-1", agentId: "pi", binary: "pi", args: [],
-			cwd: "/tmp/task-1", prompt: "", restoreDetachedSession: true,
+			taskId: "task-1",
+			agentId: "pi",
+			binary: "pi",
+			args: [],
+			cwd: "/tmp/task-1",
+			prompt: "",
+			restoreDetachedSession: true,
 		});
 		expect(second.pid).toBe(222);
 		expect(ptySessionSpawnMock).toHaveBeenCalledTimes(1);
@@ -87,21 +105,78 @@ describe("TerminalSessionManager auto-restart", () => {
 		const manager = new TerminalSessionManager();
 		manager.hydrateFromRecord({
 			"task-1": {
-				taskId: "task-1", state: "running", agentId: "pi",
-				workspacePath: "/tmp/task-1", pid: 111, startedAt: 1, updatedAt: 2,
-				lastOutputAt: 2, reviewReason: null, exitCode: null,
-				lastHookAt: null, latestHookActivity: null,
+				taskId: "task-1",
+				state: "running",
+				agentId: "pi",
+				workspacePath: "/tmp/task-1",
+				pid: 111,
+				startedAt: 1,
+				updatedAt: 2,
+				lastOutputAt: 2,
+				reviewReason: null,
+				exitCode: null,
+				lastHookAt: null,
+				latestHookActivity: null,
 			},
 		});
 		const restored = await manager.startTaskSession({
-			taskId: "task-1", agentId: "pi", binary: "pi", args: [],
-			cwd: "/tmp/task-1", prompt: "", restoreDetachedSession: true,
+			taskId: "task-1",
+			agentId: "pi",
+			binary: "pi",
+			args: [],
+			cwd: "/tmp/task-1",
+			prompt: "",
+			restoreDetachedSession: true,
 		});
 		expect(restored.state).toBe("awaiting_review");
 		expect(restored.reviewReason).toBe("attention");
 		expect(manager.transitionToRunning("task-1")?.state).toBe("running");
 		expect(manager.transitionToReview("task-1", "hook")?.state).toBe("awaiting_review");
 		expect(manager.getSummary("task-1")?.reviewReason).toBe("hook");
+	});
+
+	it("reattaches the saved Pi session when stale recovery runs first", async () => {
+		ptySessionSpawnMock.mockImplementation((request: MockSpawnRequest) => createMockPtySession(222, request));
+		const manager = new TerminalSessionManager();
+		const checkpoint = { turn: 4, ref: "refs/kanban/checkpoints/task-1/turn/4", commit: "abc1234", createdAt: 4 };
+		manager.hydrateFromRecord({
+			"task-1": {
+				taskId: "task-1",
+				state: "running",
+				agentId: "pi",
+				workspacePath: "/tmp/task-1",
+				pid: 111,
+				startedAt: 1,
+				updatedAt: 2,
+				lastOutputAt: 2,
+				reviewReason: null,
+				exitCode: null,
+				lastHookAt: null,
+				latestHookActivity: null,
+				latestTurnCheckpoint: checkpoint,
+				previousTurnCheckpoint: null,
+			},
+		});
+		// Opening the task detail connects the terminal websocket in the same render
+		// that asks for the restore, and its connection handler settles stale
+		// sessions first. That used to reset the record to idle, so the restore then
+		// refused and nothing reattached; both orders now end up restoring.
+		const recovered = manager.recoverStaleSession("task-1");
+		expect(isDetachedPiRestoreCandidate(recovered)).toBe(true);
+		const restored = await manager.startTaskSession({
+			taskId: "task-1",
+			agentId: "pi",
+			binary: "pi",
+			args: [],
+			cwd: "/tmp/task-1",
+			prompt: "",
+			restoreDetachedSession: true,
+		});
+		expect(restored.state).toBe("awaiting_review");
+		expect(restored.reviewReason).toBe("attention");
+		expect(restored.pid).toBe(222);
+		expect(restored.latestTurnCheckpoint).toEqual(checkpoint);
+		expect(prepareAgentLaunchMock).toHaveBeenCalledWith(expect.objectContaining({ prompt: "", agentId: "pi" }));
 	});
 
 	it("does not replay the original Pi task prompt when its initial process crashes", async () => {
@@ -114,8 +189,12 @@ describe("TerminalSessionManager auto-restart", () => {
 		const manager = new TerminalSessionManager();
 		manager.attach("task-1", { onState: vi.fn(), onOutput: vi.fn(), onExit: vi.fn() });
 		await manager.startTaskSession({
-			taskId: "task-1", agentId: "pi", binary: "pi", args: [],
-			cwd: "/tmp/task-1", prompt: "Create code and push a PR",
+			taskId: "task-1",
+			agentId: "pi",
+			binary: "pi",
+			args: [],
+			cwd: "/tmp/task-1",
+			prompt: "Create code and push a PR",
 		});
 		expect(ptySessionSpawnMock).toHaveBeenCalledTimes(1);
 		sessions[0]?.triggerExit(1);
@@ -135,16 +214,29 @@ describe("TerminalSessionManager auto-restart", () => {
 		const manager = new TerminalSessionManager();
 		manager.hydrateFromRecord({
 			"task-1": {
-				taskId: "task-1", state: "awaiting_review", agentId: "pi",
-				workspacePath: "/tmp/task-1", pid: 111, startedAt: 1, updatedAt: 2,
-				lastOutputAt: 2, reviewReason: "hook", exitCode: null,
-				lastHookAt: null, latestHookActivity: null,
+				taskId: "task-1",
+				state: "awaiting_review",
+				agentId: "pi",
+				workspacePath: "/tmp/task-1",
+				pid: 111,
+				startedAt: 1,
+				updatedAt: 2,
+				lastOutputAt: 2,
+				reviewReason: "hook",
+				exitCode: null,
+				lastHookAt: null,
+				latestHookActivity: null,
 			},
 		});
 		manager.attach("task-1", { onState: vi.fn(), onOutput: vi.fn(), onExit: vi.fn() });
 		await manager.startTaskSession({
-			taskId: "task-1", agentId: "pi", binary: "pi", args: [],
-			cwd: "/tmp/task-1", prompt: "", restoreDetachedSession: true,
+			taskId: "task-1",
+			agentId: "pi",
+			binary: "pi",
+			args: [],
+			cwd: "/tmp/task-1",
+			prompt: "",
+			restoreDetachedSession: true,
 		});
 		expect(ptySessionSpawnMock).toHaveBeenCalledTimes(1);
 		sessions[0]?.triggerExit(1);

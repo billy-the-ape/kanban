@@ -117,6 +117,7 @@ import {
 } from "../task-dispatch/task-dispatch-service";
 import { buildRuntimeConfigResponse, resolveAgentCommand } from "../terminal/agent-registry";
 import { derivePiSessionId, getPiTaskSessionDir, readPiSessionRecord } from "../terminal/pi-session-options";
+import { isDetachedPiRestoreCandidate } from "../terminal/pi-session-restore";
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { createVerificationRunner } from "../verification/verification-service";
 import { evaluateDependentsUnlock, getGitDeliveryService, readTaskDeliveryReceipt } from "../workspace/git-delivery";
@@ -628,8 +629,13 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		try {
 			const body = parseTaskSessionStartRequest(input);
 			if (body.restoreDetachedSession) {
-				if (body.prompt.trim() || body.resumeFromTrash || body.images?.length ||
-					body.startInPlanMode || (body.agentId !== undefined && body.agentId !== "pi")) {
+				if (
+					body.prompt.trim() ||
+					body.resumeFromTrash ||
+					body.images?.length ||
+					body.startInPlanMode ||
+					(body.agentId !== undefined && body.agentId !== "pi")
+				) {
 					throw new Error("Pi session restoration cannot run a prompt or change execution options.");
 				}
 				if (isHomeAgentSessionId(body.taskId)) throw new Error("Home sessions cannot be auto-restored.");
@@ -642,14 +648,15 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				const manager = await deps.getScopedTerminalManager(workspaceScope);
 				const saved = manager.getSummary(body.taskId);
 				if (manager.hasActiveProcess(body.taskId)) return { ok: true, summary: saved, initialStart: null };
-				if (saved?.agentId !== "pi" ||
-					!(saved.state === "running" || saved.state === "interrupted" || saved.state === "awaiting_review") ||
-					(saved.reviewReason === "exit" && saved.pid === null)) {
-					throw new Error("No interrupted Pi process exists; refusing to launch a new conversation.");
+				if (!isDetachedPiRestoreCandidate(saved)) {
+					throw new Error(
+						"No interrupted Pi process exists; refusing to launch a new conversation. A stopped or crashed Pi session stays ended.",
+					);
 				}
 				const piScope = { workspaceId: workspaceScope.workspaceId, taskId: body.taskId };
 				const record = await readPiSessionRecord({
-					sessionId: derivePiSessionId(piScope), sessionDir: getPiTaskSessionDir(piScope),
+					sessionId: derivePiSessionId(piScope),
+					sessionDir: getPiTaskSessionDir(piScope),
 				});
 				if (!record.found) throw new Error("The exact Pi conversation is unavailable.");
 				if (!(await taskWorktreeExists(workspaceScope.workspacePath, body.taskId))) {
@@ -746,9 +753,10 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			//   session-level persistence for these;
 			//   if the user changes the model on the card, the next session launch
 			//   (including trash-restore) uses the updated values.
-			const previousTerminalAgentId = body.resumeFromTrash || body.restoreDetachedSession
-				? (terminalManager.getSummary(body.taskId)?.agentId ?? null)
-				: null;
+			const previousTerminalAgentId =
+				body.resumeFromTrash || body.restoreDetachedSession
+					? (terminalManager.getSummary(body.taskId)?.agentId ?? null)
+					: null;
 			const effectiveAgentId = previousTerminalAgentId ?? body.agentId ?? scopedRuntimeConfig.selectedAgentId;
 			let useClinePath = effectiveAgentId === "cline";
 			const shouldProbePersistedClineSession =
