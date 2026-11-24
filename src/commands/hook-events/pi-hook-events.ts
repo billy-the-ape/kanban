@@ -83,9 +83,12 @@ function inferPiActivityText(args: {
 }
 
 /**
- * `pi_session_id` / `pi_session_file` are recorded as part of the activity only
- * through the fields the shared contract has room for; the session identity
- * itself stays in the launch record, so nothing here is inferred from it.
+ * Turns one Pi payload into the activity metadata every agent integration
+ * shares. Pi's extension also reports `pi_session_id` / `pi_session_file`, but
+ * neither is activity and this normalizer never reads either field: the session
+ * a card runs is the one Kanban minted at launch (`pi --session-id`), so the
+ * session identity stays in the launch record rather than being inferred from
+ * what the agent happens to report.
  */
 export function normalizePiHookMetadata({
 	event,

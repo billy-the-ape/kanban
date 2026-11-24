@@ -695,6 +695,17 @@ function findBalancedBrace(text: string, start: number): number {
 	return -1;
 }
 
+/**
+ * A REST reply cut off mid-body: it opens as a JSON object whose brace never
+ * closes. Everything after the opening brace is then either nested inside that
+ * document or inside its unterminated string, so no later byte can be evidence
+ * on its own — a `diff_hunk` containing `() => {}` must not look like objects.
+ */
+function isTruncatedJsonDocument(text: string): boolean {
+	const trimmed = text.trim();
+	return trimmed.startsWith("{") && findBalancedBrace(trimmed, 0) < 0;
+}
+
 /** Top-level JSON objects embedded in tool output (parse failures skipped). */
 function extractJsonObjects(text: string): Array<Record<string, unknown>> {
 	const results: Array<Record<string, unknown>> = [];
@@ -704,7 +715,10 @@ function extractJsonObjects(text: string): Array<Record<string, unknown>> {
 		}
 		const end = findBalancedBrace(text, i);
 		if (end < 0) {
-			continue;
+			// A truncated document never closes, so nothing scanned after its first
+			// brace can be a top-level object; rescanning its body invented objects
+			// out of diff hunks such as `() => {}`.
+			break;
 		}
 		try {
 			const parsed: unknown = JSON.parse(text.slice(i, end + 1));
@@ -735,8 +749,8 @@ function readPositiveInt(record: Record<string, unknown>, key: string): number |
  * header fields; never scan quoted bodies, nested objects, or arrays for ids.
  */
 function readTruncatedApiResponseHeader(text: string): Record<string, unknown> | null {
+	if (!isTruncatedJsonDocument(text)) return null;
 	const trimmed = text.trim();
-	if (!trimmed.startsWith("{") || findBalancedBrace(trimmed, 0) >= 0) return null;
 	const header: Record<string, unknown> = {};
 	const allowed = new Set(["url", "id", "pull_request_review_id", "node_id"]);
 	let rest = trimmed.slice(1);
@@ -1168,6 +1182,10 @@ export function resolvePublicationOutput(input: {
 			return { status: "published", identities: [filteredIdentity], reason: null };
 		}
 		for (const candidate of candidateTexts) {
+			// A truncated body is not evidence: its quoted text can name any URL.
+			if (isTruncatedJsonDocument(candidate)) {
+				continue;
+			}
 			collected.push(...extractUrlIdentities(candidate, input.operations, input.target));
 		}
 	}

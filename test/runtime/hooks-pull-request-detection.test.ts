@@ -88,14 +88,17 @@ describe("extractHookPullRequestUrls", () => {
 
 describe("extractPiPublicationTool", () => {
 	it("captures Pi's attributed gh comment write with its tool call id", () => {
-		const event = extractPiPublicationTool({
-			hook_event_name: "tool_execution_end",
-			tool_name: "bash",
-			tool_call_id: "call-42",
-			tool_input: { command: "gh pr comment 42 --repo octo/repo --body 'Addressed'" },
-			tool_response: { output: "https://github.com/octo/repo/pull/42#issuecomment-51" },
-			tool_is_error: false,
-		}, "pi");
+		const event = extractPiPublicationTool(
+			{
+				hook_event_name: "tool_execution_end",
+				tool_name: "bash",
+				tool_call_id: "call-42",
+				tool_input: { command: "gh pr comment 42 --repo octo/repo --body 'Addressed'" },
+				tool_response: { output: "https://github.com/octo/repo/pull/42#issuecomment-51" },
+				tool_is_error: false,
+			},
+			"pi",
+		);
 		expect(event).toMatchObject({
 			phase: "finished",
 			toolCallId: "call-42",
@@ -108,12 +111,17 @@ describe("extractPiPublicationTool", () => {
 
 	it("ignores ordinary Pi commands and read-only GitHub operations", () => {
 		for (const command of ["git status --short", "npm test", "gh pr view 42 --json comments"]) {
-			expect(extractPiPublicationTool({
-				hook_event_name: "tool_execution_end",
-				tool_name: "bash",
-				tool_input: { command },
-				tool_response: { output: "https://github.com/octo/repo/pull/42" },
-			}, "pi")).toBeUndefined();
+			expect(
+				extractPiPublicationTool(
+					{
+						hook_event_name: "tool_execution_end",
+						tool_name: "bash",
+						tool_input: { command },
+						tool_response: { output: "https://github.com/octo/repo/pull/42" },
+					},
+					"pi",
+				),
+			).toBeUndefined();
 		}
 	});
 

@@ -1,5 +1,9 @@
 import type { RuntimeConfigState } from "../config/runtime-config";
-import { getRuntimeAgentCapabilities, getRuntimeAgentModelConfiguration } from "../core/agent-capabilities";
+import {
+	formatMissingAgentInstallError,
+	getRuntimeAgentCapabilities,
+	getRuntimeAgentModelConfiguration,
+} from "../core/agent-capabilities";
 import { getRuntimeLaunchSupportedAgentCatalog, RUNTIME_AGENT_CATALOG } from "../core/agent-catalog";
 import type {
 	RuntimeAgentDefinition,
@@ -105,6 +109,23 @@ export function resolveAgentCommand(runtimeConfig: RuntimeConfigState): Resolved
 		};
 	}
 	return null;
+}
+
+/**
+ * Why the selected CLI agent cannot be launched, or null when it can be (or
+ * nothing is selected). A binary that is simply not installed is answered with
+ * that agent's own install guidance instead of the generic "nothing is
+ * configured" hint, so a card that selected a CLI the machine never installed
+ * fails early with the fix. Cline is exempt: it runs through the native SDK
+ * session rather than a CLI on PATH, exactly like the curated catalog's
+ * installed flag.
+ */
+export function describeUnrunnableAgent(runtimeConfig: RuntimeConfigState): string | null {
+	const selected = getRuntimeLaunchSupportedAgentCatalog().find((entry) => entry.id === runtimeConfig.selectedAgentId);
+	if (!selected || selected.id === "cline" || isBinaryAvailableOnPath(selected.binary)) {
+		return null;
+	}
+	return formatMissingAgentInstallError(selected.id);
 }
 
 /**

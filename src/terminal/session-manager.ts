@@ -519,16 +519,23 @@ export class TerminalSessionManager implements TerminalSessionService {
 					}
 					currentEntry.active = null;
 					this.emitSummary(summary);
-					if (shouldAutoRestart) {
-						this.scheduleAutoRestart(currentEntry);
-					}
-
 					const cleanupFn = currentActive.onSessionCleanup;
 					currentActive.onSessionCleanup = null;
+					// Cleanup is ordered before the replacement attempt on purpose: an
+					// agent whose generated file is per task (Kiro) would otherwise have
+					// the new attempt's file deleted by the attempt that just exited.
 					if (cleanupFn) {
-						cleanupFn().catch(() => {
-							// Best effort: cleanup failure is non-critical.
-						});
+						void cleanupFn()
+							.catch(() => {
+								// Best effort: cleanup failure is non-critical.
+							})
+							.finally(() => {
+								if (shouldAutoRestart) {
+									this.scheduleAutoRestart(currentEntry);
+								}
+							});
+					} else if (shouldAutoRestart) {
+						this.scheduleAutoRestart(currentEntry);
 					}
 				},
 			});
@@ -613,11 +620,7 @@ export class TerminalSessionManager implements TerminalSessionService {
 				? summaryBeforeRestore.reviewReason
 				: "attention";
 		updateSummary(entry, {
-			state: request.restoreDetachedSession
-				? "awaiting_review"
-				: request.resumeFromTrash
-					? "awaiting_review"
-					: "running",
+			state: request.restoreDetachedSession || request.resumeFromTrash ? "awaiting_review" : "running",
 			agentId: request.agentId,
 			workspacePath: request.cwd,
 			pid: session.pid,

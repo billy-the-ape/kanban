@@ -236,7 +236,7 @@ function makeService(
 		sendPreparedPiTaskMessage: overrides.sendPi
 			? async (scope, taskId, prepare) => {
 					piPreparations.push(prepare);
-					return await overrides.sendPi?.(scope, taskId, prepare) ?? { ok: false, summary: null };
+					return (await overrides.sendPi?.(scope, taskId, prepare)) ?? { ok: false, summary: null };
 				}
 			: undefined,
 		getGitHubAccessScopeId: overrides.getGitHubAccessScopeId ?? (async () => "scope-1"),
@@ -505,6 +505,8 @@ describe("applyPrPollOutcome", () => {
 });
 
 describe("PrCommentAutomationService", () => {
+	const scope = { workspaceId: "w1", workspacePath: "/w1" };
+
 	it.each([false, true])("shows poll failures with existing record=%s and recovers without Resume", async (seed) => {
 		let now = NOW;
 		const event = makeEvent({ providerId: "inline-new" });
@@ -559,8 +561,6 @@ describe("PrCommentAutomationService", () => {
 		expect(harness.sent).toHaveLength(1);
 		await harness.service.dispose();
 	});
-
-	const scope = { workspaceId: "w1", workspacePath: "/w1" };
 
 	it("recovers an overdue unsent repair after restart despite a stale terminal running summary", async () => {
 		let now = NOW;

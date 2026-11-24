@@ -2,16 +2,19 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { prepareAgentLaunch } from "../../../src/terminal/agent-session-adapters";
+import { KANBAN_OPENCODE_MODEL_ENV, OPENCODE_PINNED_VERSION } from "../../../src/terminal/opencode-integration";
 
 const originalHome = process.env.HOME;
 const originalAppData = process.env.APPDATA;
 const originalLocalAppData = process.env.LOCALAPPDATA;
 const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
 const originalOpenCodeConfig = process.env.OPENCODE_CONFIG;
+const originalOpenCodeModel = process.env[KANBAN_OPENCODE_MODEL_ENV];
 let tempHome: string | null = null;
+const tempDirectories: string[] = [];
 const originalArgv = [...process.argv];
 const originalExecArgv = [...process.execArgv];
 const originalExecPath = process.execPath;
@@ -41,7 +44,39 @@ function getCliFlagValue(args: string[], flag: string): string | null {
  * `opencode.json` left in a shared directory by another suite.
  */
 function setupEmptyWorkspace(): string {
-	return mkdtempSync(join(tmpdir(), "kanban-opencode-workspace-"));
+	const directory = mkdtempSync(join(tmpdir(), "kanban-opencode-workspace-"));
+	tempDirectories.push(directory);
+	return directory;
+}
+
+/**
+ * An executable stand-in for the pinned OpenCode CLI (AA-O1). Passing the bare
+ * `opencode` instead would make every OpenCode test run whatever this machine
+ * has on PATH: the compatibility probe and the exact-session probe both consult
+ * it, and `opencode session list` prints nothing for a project with no
+ * sessions, so a resume test that passes on a machine without OpenCode fails on
+ * one that has it. The script answers both probes for the pinned release, and
+ * only the session ids a test names.
+ */
+function setupOpenCodeCliFixture(options: { sessions?: string[] } = {}): string {
+	const directory = mkdtempSync(join(tmpdir(), "kanban-opencode-cli-"));
+	tempDirectories.push(directory);
+	const sessions = options.sessions ?? [];
+	const script = [
+		"#!/bin/sh",
+		'if [ "$1" = "--version" ]; then',
+		`  echo "${OPENCODE_PINNED_VERSION}"`,
+		"  exit 0",
+		"fi",
+		'if [ "$1" = "session" ]; then',
+		...(sessions.length > 0 ? sessions.map((id) => `  echo "${id}  Kanban session  2m"`) : ["  :"]),
+		"  exit 0",
+		"fi",
+		"exit 0",
+	].join("\n");
+	const scriptPath = join(directory, "opencode");
+	writeFileSync(scriptPath, `${script}\n`, { mode: 0o755 });
+	return scriptPath;
 }
 
 /**
@@ -106,6 +141,15 @@ function getCodexConfigOverrideValues(args: string[], key: string): string[] {
 	return values;
 }
 
+// A developer shell that exports any of these changes the generated overlay's
+// keys or adds a `--model` flag, so the OpenCode assertions below would be
+// testing this machine instead of Kanban. The originals are restored afterwards.
+beforeEach(() => {
+	delete process.env.XDG_CONFIG_HOME;
+	delete process.env.OPENCODE_CONFIG;
+	delete process.env[KANBAN_OPENCODE_MODEL_ENV];
+});
+
 afterEach(() => {
 	if (originalHome === undefined) {
 		delete process.env.HOME;
@@ -136,6 +180,15 @@ afterEach(() => {
 	} else {
 		process.env.OPENCODE_CONFIG = originalOpenCodeConfig;
 	}
+	if (originalOpenCodeModel === undefined) {
+		delete process.env[KANBAN_OPENCODE_MODEL_ENV];
+	} else {
+		process.env[KANBAN_OPENCODE_MODEL_ENV] = originalOpenCodeModel;
+	}
+	for (const directory of tempDirectories) {
+		rmSync(directory, { recursive: true, force: true });
+	}
+	tempDirectories.length = 0;
 	process.argv = [...originalArgv];
 	process.execArgv = [...originalExecArgv];
 	Object.defineProperty(process, "execPath", {
@@ -312,7 +365,7 @@ describe("prepareAgentLaunch hook strategies", () => {
 		const launch = await prepareAgentLaunch({
 			taskId: "task-1",
 			agentId: "opencode",
-			binary: "opencode",
+			binary: setupOpenCodeCliFixture(),
 			args: [],
 			cwd: "/tmp",
 			prompt: "",
@@ -377,7 +430,7 @@ describe("prepareAgentLaunch hook strategies", () => {
 		const launch = await prepareAgentLaunch({
 			taskId: "task-opencode-user-config",
 			agentId: "opencode",
-			binary: "opencode",
+			binary: setupOpenCodeCliFixture(),
 			args: [],
 			cwd: workspace,
 			prompt: "",
@@ -420,7 +473,7 @@ describe("prepareAgentLaunch hook strategies", () => {
 		const launch = await prepareAgentLaunch({
 			taskId: "task-opencode-exported-config",
 			agentId: "opencode",
-			binary: "opencode",
+			binary: setupOpenCodeCliFixture(),
 			args: [],
 			cwd: workspace,
 			prompt: "",
@@ -446,7 +499,7 @@ describe("prepareAgentLaunch hook strategies", () => {
 		const launch = await prepareAgentLaunch({
 			taskId: "task-opencode-unreadable-config",
 			agentId: "opencode",
-			binary: "opencode",
+			binary: setupOpenCodeCliFixture(),
 			args: [],
 			cwd: workspace,
 			prompt: "",
@@ -508,13 +561,30 @@ describe("prepareAgentLaunch hook strategies", () => {
 		const launch = await prepareAgentLaunch({
 			taskId: "task-opencode-model",
 			agentId: "opencode",
-			binary: "opencode",
+			binary: setupOpenCodeCliFixture(),
 			args: [],
 			cwd: setupEmptyWorkspace(),
 			prompt: "",
 		});
 
 		expect(launch.args).not.toContain("--model");
+
+		// The assertion above only means something next to its positive control: a
+		// selection the user really made has to add the flag, otherwise the check
+		// would pass on a suite whose model wiring never ran at all.
+		process.env.XDG_CONFIG_HOME = join(homePath ?? "/tmp", ".config");
+		const configDir = join(homePath ?? "/tmp", ".config", "opencode");
+		mkdirSync(configDir, { recursive: true });
+		writeFileSync(join(configDir, "opencode.json"), JSON.stringify({ model: "local/qwen3-coder" }, null, 2), "utf8");
+		const selected = await prepareAgentLaunch({
+			taskId: "task-opencode-model-selected",
+			agentId: "opencode",
+			binary: setupOpenCodeCliFixture(),
+			args: [],
+			cwd: setupEmptyWorkspace(),
+			prompt: "",
+		});
+		expect(getCliFlagValue(selected.args, "--model")).toBe("local/qwen3-coder");
 	});
 
 	it("passes an explicit OpenCode model selection and nothing invented", async () => {
@@ -535,7 +605,7 @@ describe("prepareAgentLaunch hook strategies", () => {
 		const fromAgentConfig = await prepareAgentLaunch({
 			taskId: "task-opencode-config-model",
 			agentId: "opencode",
-			binary: "opencode",
+			binary: setupOpenCodeCliFixture(),
 			args: [],
 			cwd: workspaceDir,
 			prompt: "",
@@ -547,7 +617,7 @@ describe("prepareAgentLaunch hook strategies", () => {
 		const override = await prepareAgentLaunch({
 			taskId: "task-opencode-env-model",
 			agentId: "opencode",
-			binary: "opencode",
+			binary: setupOpenCodeCliFixture(),
 			args: [],
 			cwd: workspaceDir,
 			prompt: "",
@@ -560,7 +630,7 @@ describe("prepareAgentLaunch hook strategies", () => {
 		const invalid = await prepareAgentLaunch({
 			taskId: "task-opencode-invalid-model",
 			agentId: "opencode",
-			binary: "opencode",
+			binary: setupOpenCodeCliFixture(),
 			args: [],
 			cwd: workspaceDir,
 			prompt: "",
@@ -574,7 +644,7 @@ describe("prepareAgentLaunch hook strategies", () => {
 		const explicit = await prepareAgentLaunch({
 			taskId: "task-opencode-explicit-model",
 			agentId: "opencode",
-			binary: "opencode",
+			binary: setupOpenCodeCliFixture(),
 			args: ["--model", "own/provider-model"],
 			cwd: workspaceDir,
 			prompt: "",
@@ -964,7 +1034,7 @@ describe("prepareAgentLaunch hook strategies", () => {
 			prepareAgentLaunch({
 				taskId: "task-opencode",
 				agentId: "opencode",
-				binary: "opencode",
+				binary: setupOpenCodeCliFixture(),
 				args: [],
 				cwd: "/tmp",
 				prompt: "",
@@ -1011,7 +1081,9 @@ describe("prepareAgentLaunch hook strategies", () => {
 		const launch = await prepareAgentLaunch({
 			taskId: "task-opencode-resume",
 			agentId: "opencode",
-			binary: "opencode",
+			// The fixture lists this id, so the exact-session probe answers "it exists"
+			// here instead of asking this machine's OpenCode about an empty project.
+			binary: setupOpenCodeCliFixture({ sessions: ["ses_08f7c2a9b1eF4d"] }),
 			args: [],
 			cwd: setupEmptyWorkspace(),
 			prompt: "",
@@ -1027,6 +1099,26 @@ describe("prepareAgentLaunch hook strategies", () => {
 		// The bridge pins the same session instead of adopting the first it sees.
 		expect(launch.env.KANBAN_OPENCODE_SESSION_ID).toBe("ses_08f7c2a9b1eF4d");
 	});
+	it("refuses to resume an OpenCode session the CLI does not list", async () => {
+		setupTempHome();
+		// The counterpart of the test above, which is what makes it meaningful: the
+		// listing here omits the recorded id, so a launch that never consulted the
+		// probe would happily resume whichever session OpenCode touched last.
+		await expect(
+			prepareAgentLaunch({
+				taskId: "task-opencode-resume-missing",
+				agentId: "opencode",
+				binary: setupOpenCodeCliFixture(),
+				args: [],
+				cwd: setupEmptyWorkspace(),
+				prompt: "",
+				resumeFromTrash: true,
+				workspaceId: "workspace-1",
+				attemptId: "attempt-1",
+				externalSessionId: "ses_08f7c2a9b1eF4d",
+			}),
+		).rejects.toThrow(/is not available in this workspace/);
+	});
 	it("keeps a recorded session id from pinning a fresh OpenCode launch", async () => {
 		setupTempHome();
 		// A card that already reported a session can be launched again without a
@@ -1036,7 +1128,7 @@ describe("prepareAgentLaunch hook strategies", () => {
 		const launch = await prepareAgentLaunch({
 			taskId: "task-opencode-fresh",
 			agentId: "opencode",
-			binary: "opencode",
+			binary: setupOpenCodeCliFixture(),
 			args: [],
 			cwd: setupEmptyWorkspace(),
 			prompt: "",
@@ -1056,7 +1148,7 @@ describe("prepareAgentLaunch hook strategies", () => {
 		const launch = await prepareAgentLaunch({
 			taskId: "task-opencode-continue",
 			agentId: "opencode",
-			binary: "opencode",
+			binary: setupOpenCodeCliFixture(),
 			args: ["--continue", "--model", "local/qwen3-coder"],
 			cwd: setupEmptyWorkspace(),
 			prompt,
@@ -1077,7 +1169,7 @@ describe("prepareAgentLaunch hook strategies", () => {
 		const launch = await prepareAgentLaunch({
 			taskId: "task-opencode-resume-continue",
 			agentId: "opencode",
-			binary: "opencode",
+			binary: setupOpenCodeCliFixture({ sessions: ["ses_08f7c2a9b1eF4d"] }),
 			args: ["--continue"],
 			cwd: setupEmptyWorkspace(),
 			prompt: "",
@@ -1096,7 +1188,7 @@ describe("prepareAgentLaunch hook strategies", () => {
 		const launch = await prepareAgentLaunch({
 			taskId: "task-opencode-flags",
 			agentId: "opencode",
-			binary: "opencode",
+			binary: setupOpenCodeCliFixture(),
 			args: [],
 			autonomousModeEnabled: true,
 			startInPlanMode: true,
@@ -1110,7 +1202,7 @@ describe("prepareAgentLaunch hook strategies", () => {
 		const user = await prepareAgentLaunch({
 			taskId: "task-opencode-user-flags",
 			agentId: "opencode",
-			binary: "opencode",
+			binary: setupOpenCodeCliFixture(),
 			args: ["--agent", "build", "--auto"],
 			startInPlanMode: true,
 			autonomousModeEnabled: true,
