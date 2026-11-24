@@ -884,7 +884,10 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			// Restoring an existing conversation never consumes a new admission.
 			// Pi's native follow-up turns are not intercepted by this start gate.
 			const summary =
-				resolved.agentId === "pi" && !body.restoreDetachedSession && !terminalManager.hasActiveProcess(body.taskId)
+				resolved.agentId === "pi" &&
+				!body.restoreDetachedSession &&
+				body.prompt.trim().length > 0 &&
+				!terminalManager.hasActiveProcess(body.taskId)
 					? await sharedPiInitialTurnCapacityGate.start(
 							workspaceScope.workspaceId,
 							body.taskId,
