@@ -21,7 +21,9 @@ describe("normalizePiHookMetadata", () => {
 		expect(metadata).toMatchObject({
 			source: "pi",
 			hookEventName: "agent_settled",
-			notificationType: null,
+			// An event with no notification sends the explicit empty value so
+			// the sticky hook merge clears a stale error instead of keeping it.
+			notificationType: "",
 			finalMessage: "Fixed the flaky test. Commit is ready.",
 			activityText: "Final: Fixed the flaky test. Commit is ready.",
 		});

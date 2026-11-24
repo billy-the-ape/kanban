@@ -186,6 +186,7 @@ import { buildClineCompactionConfig } from "../../../src/cline-sdk/cline-compact
 import { emptyTaskEditorCallEvidence } from "../../../src/cline-sdk/cline-editor-call-evidence";
 import * as workspaceState from "../../../src/state/workspace-state";
 import * as dispatchRecords from "../../../src/task-dispatch/dispatch-records";
+import * as piSessionOptions from "../../../src/terminal/pi-session-options";
 import type { RuntimeTrpcContext } from "../../../src/trpc/app-router";
 import { type CreateRuntimeApiDependencies, createRuntimeApi } from "../../../src/trpc/runtime-api";
 import type * as TaskInitialStart from "../../../src/workspace/task-initial-start";
@@ -616,6 +617,89 @@ describe("createRuntimeApi startTaskSession", () => {
 				cwd: "/tmp/existing-worktree",
 			}),
 		);
+	});
+
+	it("refuses to restore a Pi session that already ended", async () => {
+		// Stop records the review reason it ended with and drops the pid, so nothing
+		// was lost and reopening the task must not relaunch the agent. This is the
+		// last line of defense: the terminal only asks for a restore in this shape if
+		// the record still claims a process, and the shutdown coordinator now leaves
+		// settled records alone instead of rewriting them to `interrupted`.
+		const board = {
+			columns: [{ id: "review", title: "Review", cards: [{ id: "task-1" }] }],
+		} as unknown as RuntimeBoardData;
+		const boardSpy = vi.spyOn(workspaceState, "loadWorkspaceBoardById").mockResolvedValue(board);
+		const terminalManager = {
+			getSummary: vi.fn(() =>
+				createSummary({ agentId: "pi", state: "awaiting_review", reviewReason: "exit", pid: null }),
+			),
+			hasActiveProcess: vi.fn(() => false),
+			startTaskSession: vi.fn(async () => createSummary({ agentId: "pi" })),
+			applyTurnCheckpoint: vi.fn(),
+		};
+		const api = createTestRuntimeApi({
+			getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+			loadScopedRuntimeConfig: vi.fn(async () => createRuntimeConfigState()),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: vi.fn(async () => terminalManager as never),
+			getScopedClineTaskSessionService: vi.fn(async () => createClineTaskSessionServiceMock() as never),
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+		});
+
+		const response = await api.startTaskSession(
+			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+			{ taskId: "task-1", baseRef: "main", prompt: "", agentId: "pi", restoreDetachedSession: true },
+		);
+
+		expect(response.ok).toBe(false);
+		expect(response.error).toContain("No interrupted Pi process exists");
+		expect(terminalManager.startTaskSession).not.toHaveBeenCalled();
+		boardSpy.mockRestore();
+	});
+
+	it("accepts the restore-pending Pi record stale recovery writes", async () => {
+		// A restart leaves the record of a Pi process Kanban lost as `interrupted`
+		// with no pid — the shape the terminal's stale recovery now normalizes to
+		// instead of resetting the record to `idle`. The lifecycle check has to pass
+		// for it, so the only reason left to refuse is the missing conversation.
+		const board = {
+			columns: [{ id: "review", title: "Review", cards: [{ id: "task-1" }] }],
+		} as unknown as RuntimeBoardData;
+		const boardSpy = vi.spyOn(workspaceState, "loadWorkspaceBoardById").mockResolvedValue(board);
+		const readSpy = vi.spyOn(piSessionOptions, "readPiSessionRecord").mockResolvedValue({
+			found: false,
+			sessionFile: null,
+			sessionCwd: null,
+		});
+		const terminalManager = {
+			getSummary: vi.fn(() =>
+				createSummary({ agentId: "pi", state: "interrupted", reviewReason: "interrupted", pid: null }),
+			),
+			hasActiveProcess: vi.fn(() => false),
+			startTaskSession: vi.fn(async () => createSummary({ agentId: "pi" })),
+			applyTurnCheckpoint: vi.fn(),
+		};
+		const api = createTestRuntimeApi({
+			getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+			loadScopedRuntimeConfig: vi.fn(async () => createRuntimeConfigState()),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: vi.fn(async () => terminalManager as never),
+			getScopedClineTaskSessionService: vi.fn(async () => createClineTaskSessionServiceMock() as never),
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+		});
+
+		const response = await api.startTaskSession(
+			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+			{ taskId: "task-1", baseRef: "main", prompt: "", agentId: "pi", restoreDetachedSession: true },
+		);
+
+		expect(response.ok).toBe(false);
+		expect(response.error).toContain("The exact Pi conversation is unavailable.");
+		expect(terminalManager.startTaskSession).not.toHaveBeenCalled();
+		boardSpy.mockRestore();
+		readSpy.mockRestore();
 	});
 
 	it("prepares the initial worktree through the start-owned path when none exists", async () => {

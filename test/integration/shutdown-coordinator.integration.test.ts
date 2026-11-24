@@ -82,7 +82,11 @@ function createBoard(taskIds: { inProgress?: string[]; review?: string[] }): Run
 	};
 }
 
-function createSession(taskId: string, state: "running" | "awaiting_review" | "idle"): RuntimeTaskSessionSummary {
+function createSession(
+	taskId: string,
+	state: "running" | "awaiting_review" | "interrupted" | "idle",
+	overrides: Partial<RuntimeTaskSessionSummary> = {},
+): RuntimeTaskSessionSummary {
 	return {
 		taskId,
 		state,
@@ -96,6 +100,7 @@ function createSession(taskId: string, state: "running" | "awaiting_review" | "i
 		exitCode: null,
 		lastHookAt: null,
 		latestHookActivity: null,
+		...overrides,
 	};
 }
 
@@ -187,6 +192,100 @@ describe.sequential("shutdown coordinator integration", () => {
 				expect(cardIds(indexedAfter, "review")).toEqual(["indexed-awaiting-review"]);
 				expect(indexedAfter.sessions["indexed-awaiting-review"]?.state).toBe("interrupted");
 				expect(indexedAfter.sessions["indexed-missing-session"]).toBeUndefined();
+			} finally {
+				cleanup();
+			}
+		});
+	}, 30_000);
+
+	it("keeps every restore-pending Pi worktree across shutdowns and leaves an intentionally stopped Pi session ended", async () => {
+		await withTemporaryHome(async () => {
+			const { path: sandboxRoot, cleanup } = createTempDir("kanban-shutdown-pi-");
+			try {
+				const projectPath = join(sandboxRoot, "pi-project");
+				mkdirSync(projectPath, { recursive: true });
+				initGitRepository(projectPath);
+
+				const running = createSession("pi-running", "running", { agentId: "pi" });
+				// Stop leaves a settled record: no pid, and the reason it ended with.
+				const stopped = createSession("pi-stopped", "awaiting_review", {
+					agentId: "pi",
+					reviewReason: "exit",
+					pid: null,
+				});
+				const crashed = createSession("pi-crashed", "awaiting_review", {
+					agentId: "pi",
+					reviewReason: "error",
+					pid: null,
+				});
+				// Shutdown number two for this card: an earlier shutdown already
+				// persisted it as `interrupted` and the user never reopened the task, so
+				// nothing in this runtime ran it. It is still the exact record a restore
+				// would be asked for, so its worktree has to survive again.
+				const interruptedEarlier = createSession("pi-interrupted", "interrupted", {
+					agentId: "pi",
+					reviewReason: "interrupted",
+					pid: null,
+				});
+				const initial = await loadWorkspaceState(projectPath);
+				await saveWorkspaceState(projectPath, {
+					board: createBoard({
+						inProgress: ["pi-running"],
+						review: ["pi-stopped", "pi-crashed", "pi-interrupted"],
+					}),
+					sessions: {
+						"pi-running": running,
+						"pi-stopped": stopped,
+						"pi-crashed": crashed,
+						"pi-interrupted": interruptedEarlier,
+					},
+					expectedRevision: initial.revision,
+				});
+
+				const summaries = new Map(
+					[running, stopped, crashed, interruptedEarlier].map((summary) => [summary.taskId, summary] as const),
+				);
+				const piTerminalManager = {
+					// Only the running card has a process this runtime is stopping.
+					markInterruptedAndStopAll: () => [running],
+					listSummaries: () => [running, stopped, crashed, interruptedEarlier],
+					getSummary: (taskId: string) => summaries.get(taskId) ?? null,
+				} as unknown as TerminalSessionManager;
+				const removedTaskIds: string[] = [];
+				await shutdownRuntimeServer({
+					workspaceRegistry: {
+						listManagedWorkspaces: () => [
+							{
+								workspaceId: "pi-project",
+								workspacePath: projectPath,
+								terminalManager: piTerminalManager,
+							},
+						],
+					},
+					warn: () => {},
+					closeRuntimeServer: async () => {},
+					removeTaskWorktree: async ({ taskId }) => {
+						removedTaskIds.push(taskId);
+						return { ok: true, removed: true, preserved: true, blockedReason: null };
+					},
+				});
+
+				const after = await loadWorkspaceState(projectPath);
+				// The card Kanban was actually running is the one a restart may recover.
+				expect(after.sessions["pi-running"]?.state).toBe("interrupted");
+				// A stop or a crash is not "lost": rewriting it to `interrupted` would
+				// make the task detail relaunch work the user ended on purpose.
+				expect(after.sessions["pi-stopped"]?.state).toBe("awaiting_review");
+				expect(after.sessions["pi-stopped"]?.reviewReason).toBe("exit");
+				expect(after.sessions["pi-crashed"]?.reviewReason).toBe("error");
+				// A card an earlier shutdown left `interrupted` is still waiting for a
+				// restore, so this one re-persists it and keeps the worktree the earlier
+				// shutdown kept rather than archiving the work away.
+				expect(after.sessions["pi-interrupted"]?.state).toBe("interrupted");
+				expect(after.sessions["pi-interrupted"]?.reviewReason).toBe("interrupted");
+				// The restore reattaches into the original worktree and refuses to
+				// recreate it, so archiving it away here would strand the card.
+				expect(removedTaskIds.sort()).toEqual(["pi-crashed", "pi-stopped"]);
 			} finally {
 				cleanup();
 			}

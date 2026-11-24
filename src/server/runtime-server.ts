@@ -41,6 +41,7 @@ import { AutoMergePolicyStore } from "../pr-tracking/auto-merge-policy-store";
 import { createPrCommentAutomationService } from "../pr-tracking/comment-automation-service";
 import { createGitHubGhAdapter } from "../pr-tracking/github-gh-adapter";
 import { createGitHubPrClient, resolveGitHubAccessScopeId } from "../pr-tracking/github-pr-client";
+import { sendPreparedPiRepair } from "../pr-tracking/pi-repair-dispatch";
 import { PrConsumerRegistry } from "../pr-tracking/pr-consumer-registry";
 import { defaultInspectWorktree, registerMergeCompletionConsumer } from "../pr-tracking/pr-merge-completion";
 import { findTaskCard, resolveCardAutomationPrKey } from "../pr-tracking/pr-owner-selection";
@@ -76,7 +77,7 @@ import type { RuntimeStateHub } from "./runtime-state-hub";
 import { runStartupTaskWorkspaceMaintenance } from "./startup-maintenance";
 import { handleTaskDiagnosticsDownload, TASK_DIAGNOSTICS_DOWNLOAD_PATHNAME } from "./task-diagnostics-download";
 import { isTaskWriterActive } from "./task-writer-activity";
-import type { WorkspaceRegistry } from "./workspace-registry";
+import type { WorkspaceRegistry, WorkspaceRegistryScope } from "./workspace-registry";
 
 interface DisposeTrackedWorkspaceResult {
 	terminalManager: TerminalSessionManager | null;
@@ -277,6 +278,38 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		}
 		return accessScopePromise;
 	};
+	// COMMENT-0: the single effective-agent resolver — same precedence as
+	// task start: persisted session agent, then the card's explicit agentId,
+	// then the workspace default. Shared by the comment-automation service
+	// and the PR-tracking API so both agree on a card's servability; a
+	// separate second resolver used to skip the card step and report an
+	// explicit-Pi card as unservable to the tracking-state API.
+	const resolveEffectiveTaskAgentId = async (
+		scope: WorkspaceRegistryScope,
+		taskId: string,
+	): Promise<RuntimeAgentId | null> => {
+		const workspacePath = scope.workspacePath || deps.workspaceRegistry.getWorkspacePathById(scope.workspaceId);
+		if (workspacePath) {
+			try {
+				const state = await loadWorkspaceState(workspacePath);
+				const sessionAgent = state.sessions[taskId]?.agentId;
+				if (sessionAgent) {
+					return sessionAgent;
+				}
+				const card = state.board.columns
+					.flatMap((column) => column.cards)
+					.find((candidate) => candidate.id === taskId);
+				if (card?.agentId) {
+					return card.agentId;
+				}
+			} catch {
+				// No readable session state: fall through to the
+				// workspace's selected agent below.
+			}
+		}
+		const config = await deps.workspaceRegistry.loadScopedRuntimeConfig(scope);
+		return config.selectedAgentId;
+	};
 	const prCommentAutomationService = createPrCommentAutomationService({
 		listManagedWorkspaces: () =>
 			deps.workspaceRegistry
@@ -302,23 +335,32 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			broadcastTaskChatCleared: deps.runtimeStateHub.broadcastTaskChatCleared,
 			resolveClineLaunchConfig: () => clineProviderService.resolveLaunchConfig(),
 		}),
-		// COMMENT-0: same effective-agent semantics as task start and PR
-		// tracking — a live session's agent when one exists, else the
-		// workspace's selected agent.
-		getEffectiveTaskAgentId: async (scope, taskId): Promise<RuntimeAgentId | null> => {
-			try {
-				const state = await loadWorkspaceState(scope.workspacePath);
-				const sessionAgent = state.sessions[taskId]?.agentId;
-				if (sessionAgent) {
-					return sessionAgent;
-				}
-			} catch {
-				// No readable session state: fall through to the
-				// workspace's selected agent below.
-			}
-			const config = await deps.workspaceRegistry.loadScopedRuntimeConfig(scope);
-			return config.selectedAgentId;
+		sendPreparedPiTaskMessage: async (scope, taskId, prepare) => {
+			const manager = await getScopedTerminalManager(scope);
+			return await sendPreparedPiRepair({
+				manager,
+				taskId,
+				prepare,
+				restoreSavedSession: async () => {
+					const state = await loadWorkspaceState(scope.workspacePath);
+					const card = state.board.columns
+						.flatMap((column) => column.cards)
+						.find((candidate) => candidate.id === taskId);
+					if (!card) return { ok: false, error: "The PR repair task was removed." };
+					const result = await buildRuntimeApi().startTaskSession(scope, {
+						taskId,
+						agentId: "pi",
+						prompt: "",
+						baseRef: card.baseRef,
+						restoreDetachedSession: true,
+					});
+					return { ok: result.ok, error: result.error };
+				},
+			});
 		},
+		// COMMENT-0: same effective-agent precedence as task start
+		// (session agent → card override → workspace default).
+		getEffectiveTaskAgentId: resolveEffectiveTaskAgentId,
 		getGitHubAccessScopeId: resolveAccessScopeId,
 		ghClient: createGitHubPrClient(),
 		warn: (message) => deps.warn(`[pr-comment-automation] ${message}`),
@@ -848,6 +890,7 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				ensureTerminalManagerForWorkspace: deps.ensureTerminalManagerForWorkspace,
 				broadcastRuntimeWorkspaceStateUpdated: broadcastRuntimeWorkspaceStateUpdatedWithReconcile,
 				broadcastTaskReadyForReview: deps.runtimeStateHub.broadcastTaskReadyForReview,
+				recordPiPublicationToolEvent: (event) => prCommentAutomationService.recordPrPublicationToolEvent(event),
 			}),
 			prTrackingApi: createPrTrackingApi({
 				getPrTrackingCoordinator: () => getPrTrackingState().coordinator,
@@ -863,27 +906,11 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				runPrTrackingReconcilePass: () => runPrTrackingReconcilePassShared(),
 				warn: (message) => deps.warn(`[pr-tracking] ${message}`),
 				isTaskWriterActive: probeTaskWriterActive,
-				// PRTRACK-1: effective agent for a card — a live session's agent when
-				// one exists, else the workspace's selected agent (same precedence as
-				// task start). An unset per-card agentId inherits the workspace
-				// agent, which may be non-Cline.
-				getEffectiveTaskAgentId: async (scope, taskId): Promise<RuntimeAgentId | null> => {
-					const workspacePath = deps.workspaceRegistry.getWorkspacePathById(scope.workspaceId);
-					if (workspacePath) {
-						try {
-							const state = await loadWorkspaceState(workspacePath);
-							const sessionAgent = state.sessions[taskId]?.agentId;
-							if (sessionAgent) {
-								return sessionAgent;
-							}
-						} catch {
-							// No readable session state: fall through to the
-							// workspace's selected agent below.
-						}
-					}
-					const config = await deps.workspaceRegistry.loadScopedRuntimeConfig(scope);
-					return config.selectedAgentId;
-				},
+				// PRTRACK-1: the SAME shared effective-agent resolver as the
+				// comment-automation service — session agent, card override, then
+				// workspace default. An unset per-card agentId inherits the
+				// workspace agent, which may be unservable.
+				getEffectiveTaskAgentId: resolveEffectiveTaskAgentId,
 			}),
 		};
 	};

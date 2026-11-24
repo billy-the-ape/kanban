@@ -24,6 +24,7 @@ export interface AgentTerminalPanelProps {
 	taskId: string;
 	workspaceId: string | null;
 	terminalEnabled?: boolean;
+	baseRef?: string;
 	summary: RuntimeTaskSessionSummary | null;
 	onSummary?: (summary: RuntimeTaskSessionSummary) => void;
 	onCommit?: () => void;
@@ -392,6 +393,8 @@ export function AgentTerminalPanel(props: AgentTerminalPanelProps): ReactElement
 		autoFocus: props.autoFocus,
 		isVisible: props.isVisible,
 		sessionStartedAt: props.summary?.startedAt ?? null,
+		sessionSummary: props.summary,
+		baseRef: props.baseRef,
 		terminalBackgroundColor: props.terminalBackgroundColor ?? "var(--color-surface-1)",
 		cursorColor: props.cursorColor ?? "var(--color-text-primary)",
 	});

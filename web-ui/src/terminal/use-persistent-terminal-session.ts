@@ -2,6 +2,7 @@ import type { MutableRefObject } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { getTerminalThemeColors, useTheme } from "@/hooks/use-theme";
+import { getRuntimeTrpcClient } from "@/runtime/trpc-client";
 import type { RuntimeTaskSessionSummary } from "@/runtime/types";
 import { disposePersistentTerminal, ensurePersistentTerminal } from "@/terminal/persistent-terminal-manager";
 import { registerTerminalController } from "@/terminal/terminal-controller-registry";
@@ -15,6 +16,8 @@ interface UsePersistentTerminalSessionInput {
 	autoFocus?: boolean;
 	isVisible?: boolean;
 	sessionStartedAt?: number | null;
+	sessionSummary?: RuntimeTaskSessionSummary | null;
+	baseRef?: string;
 	terminalBackgroundColor: string;
 	cursorColor: string;
 }
@@ -36,6 +39,8 @@ export function usePersistentTerminalSession({
 	autoFocus = false,
 	isVisible = true,
 	sessionStartedAt = null,
+	sessionSummary = null,
+	baseRef,
 	terminalBackgroundColor,
 	cursorColor,
 }: UsePersistentTerminalSessionInput): UsePersistentTerminalSessionResult {
@@ -57,6 +62,7 @@ export function usePersistentTerminalSession({
 	} | null>(null);
 	const [lastError, setLastError] = useState<string | null>(null);
 	const [isStopping, setIsStopping] = useState(false);
+	const lastRestorationAttemptRef = useRef<string | null>(null);
 	callbackRef.current = {
 		onSummary,
 		onConnectionReady,
@@ -155,6 +161,37 @@ export function usePersistentTerminalSession({
 		themeColors,
 		workspaceId,
 	]);
+
+	// After a server restart, a persisted Pi task can have no backing PTY.
+	// Reattach only an existing conversation; the backend verifies its session id,
+	// worktree, lifecycle and actual process liveness before starting anything.
+	// The recoverable rule mirrors `isDetachedPiRestoreCandidate` server-side: a
+	// session that already ended (no pid, and not `interrupted`) stays ended.
+	useEffect(() => {
+		if (!enabled || !workspaceId || !baseRef || sessionSummary?.agentId !== "pi") return;
+		const recoverable =
+			sessionSummary.state === "interrupted" ||
+			((sessionSummary.state === "running" || sessionSummary.state === "awaiting_review") &&
+				sessionSummary.pid !== null);
+		if (!recoverable) return;
+		// Cap reconnection to one attempt per open task view, not one per
+		// restarted process (which would create a client-side crash loop).
+		const key = `${workspaceId}:${taskId}`;
+		if (lastRestorationAttemptRef.current === key) return;
+		lastRestorationAttemptRef.current = key;
+		let cancelled = false;
+		void getRuntimeTrpcClient(workspaceId)
+			.runtime.startTaskSession.mutate({ taskId, agentId: "pi", prompt: "", baseRef, restoreDetachedSession: true })
+			.then((response) => {
+				if (!cancelled && response.ok && response.summary) callbackRef.current.onSummary?.(response.summary);
+			})
+			.catch(() => {
+				// Do not fall back to starting a new conversation if reattachment fails.
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, [enabled, workspaceId, taskId, baseRef, sessionSummary?.agentId, sessionSummary?.state, sessionSummary?.pid]);
 
 	useEffect(() => {
 		return registerTerminalController(taskId, {

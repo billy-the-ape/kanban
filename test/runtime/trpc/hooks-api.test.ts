@@ -635,6 +635,26 @@ describe("createHooksApi review reasons through the real session manager (AA-O1)
 		expect(manager.getSummary("task-1")?.reviewReason).toBe("error");
 	});
 
+	it("treats a Pi extension dialog as attention, not a completed repair turn", async () => {
+		const { manager, api } = createLiveManager(createSummary({ state: "running", agentId: "pi" }));
+		await api.ingest({
+			taskId: "task-1", workspaceId: "workspace-1",
+			event: "to_review",
+			metadata: {
+				source: "pi", hookEventName: "ui_prompt_start",
+				notificationType: "permission_prompt",
+			},
+		});
+		expect(manager.getSummary("task-1")?.state).toBe("awaiting_review");
+		expect(manager.getSummary("task-1")?.reviewReason).toBe("attention");
+		await api.ingest({
+			taskId: "task-1", workspaceId: "workspace-1",
+			event: "to_in_progress",
+			metadata: { source: "pi", hookEventName: "ui_prompt_end" },
+		});
+		expect(manager.getSummary("task-1")?.state).toBe("running");
+	});
+
 	it("parks a waiting approval as attention and lets the answer move the card again", async () => {
 		const { manager, api } = createLiveManager(createSummary({ state: "running", agentId: "opencode" }));
 

@@ -29,6 +29,18 @@ export interface CreateHooksApiDependencies {
 	fireReviewPullRequestLookup?: (input: { workspacePath: string; taskId: string }) => void;
 	/** PRLINK-2: records hook-detected PRs, fire-and-forget (tests inject a spy). */
 	recordHookPullRequests?: (input: RecordHookPullRequestsInput) => Promise<void>;
+	/** Pi's own completed tool commands can publish comments on linked PRs. */
+	recordPiPublicationToolEvent?: (input: {
+		workspaceId: string;
+		workspacePath: string;
+		taskId: string;
+		phase: "finished";
+		toolCallId: string | null;
+		toolName: string | null;
+		commands: string[];
+		output: string | null;
+		error: string | null;
+	}) => Promise<void>;
 }
 
 function canTransitionTaskForHookEvent(summary: RuntimeTaskSessionSummary, event: RuntimeHookEvent): boolean {
@@ -58,7 +70,7 @@ function hookReviewReason(notificationType: string | null | undefined): HookRevi
 	if (notificationType === "error") {
 		return "error";
 	}
-	if (notificationType === "permission.asked") {
+	if (notificationType === "permission.asked" || notificationType === "permission_prompt") {
 		return "attention";
 	}
 	return "hook";
@@ -128,6 +140,14 @@ export function createHooksApi(deps: CreateHooksApiDependencies): RuntimeTrpcCon
 						workspacePath,
 						taskId,
 						broadcast: deps.broadcastRuntimeWorkspaceStateUpdated,
+					});
+				}
+
+				if (body.publicationTool && summary.agentId === "pi" && deps.recordPiPublicationToolEvent) {
+					void deps.recordPiPublicationToolEvent({
+						workspaceId, workspacePath, taskId, ...body.publicationTool,
+					}).catch(() => {
+						// Publication evidence is best-effort, never an agent-blocking hook.
 					});
 				}
 

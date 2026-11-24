@@ -24,6 +24,7 @@ import { hasCodexWorkspaceTrustPrompt, shouldAutoConfirmCodexWorkspaceTrust } fr
 import { createLaunchAttemptId } from "./hook-runtime-context";
 import { createLaunchProvenance } from "./launch-provenance";
 import { stripAnsi } from "./output-utils";
+import { buildRestorePendingPiPatch, isDetachedPiRestoreCandidate } from "./pi-session-restore";
 import { PtySession } from "./pty-session";
 import { type HookReviewReason, reduceSessionTransition, type SessionTransitionEvent } from "./session-state-machine";
 import {
@@ -67,6 +68,13 @@ interface ActiveProcessState {
 interface SessionEntry {
 	summary: RuntimeTaskSessionSummary;
 	active: ActiveProcessState | null;
+	/**
+	 * Whether this runtime ever spawned a process for the entry. A record
+	 * hydrated after a restart has never run here, so its summary still
+	 * describes the previous runtime's conversation — the only thing that says
+	 * whether the guarded Pi restore may reattach it.
+	 */
+	startedInThisRuntime: boolean;
 	terminalStateMirror: TerminalStateMirror | null;
 	listenerIdCounter: number;
 	listeners: Map<number, TerminalSessionListener>;
@@ -87,6 +95,8 @@ export interface StartTaskSessionRequest {
 	images?: RuntimeTaskImage[];
 	startInPlanMode?: boolean;
 	resumeFromTrash?: boolean;
+	/** Reattach a saved Pi conversation but do not begin a model turn. */
+	restoreDetachedSession?: boolean;
 	cols?: number;
 	rows?: number;
 	env?: Record<string, string | undefined>;
@@ -250,6 +260,9 @@ export class TerminalSessionManager implements TerminalSessionService {
 			this.entries.set(taskId, {
 				summary: cloneSummary(summary),
 				active: null,
+				// Hydrated records never ran here: they still describe the previous
+				// runtime's conversation, which is what makes them restore candidates.
+				startedInThisRuntime: false,
 				terminalStateMirror: null,
 				listenerIdCounter: 1,
 				listeners: new Map(),
@@ -306,10 +319,20 @@ export class TerminalSessionManager implements TerminalSessionService {
 
 	async startTaskSession(request: StartTaskSessionRequest): Promise<RuntimeTaskSessionSummary> {
 		const entry = this.ensureEntry(request.taskId);
-		entry.restartRequest = {
-			kind: "task",
-			request: cloneStartTaskSessionRequest(request),
-		};
+		// From here on the entry describes a process this runtime owns, so its
+		// summary no longer stands in for a previous runtime's conversation.
+		entry.startedInThisRuntime = true;
+		const summaryBeforeRestore = entry.summary;
+		// Restored Pi sessions never inherit the normal PTY auto-restart path.
+		// Doing so would bypass the API's exact-session/worktree safety checks.
+		if (request.restoreDetachedSession) {
+			entry.restartRequest = null;
+		} else {
+			entry.restartRequest = {
+				kind: "task",
+				request: cloneStartTaskSessionRequest(request),
+			};
+		}
 		if (entry.active && isActiveState(entry.summary.state)) {
 			return cloneSummary(entry.summary);
 		}
@@ -577,26 +600,47 @@ export class TerminalSessionManager implements TerminalSessionService {
 			startedAt,
 			previousConfigFingerprint,
 		});
+		// Restored Pi starts idle. An "interrupted" state cannot be
+		// exited by Pi's normal hooks, so park it in an input-ready
+		// attention state until the next actual agent turn begins.
+		const restoredReviewReason =
+			summaryBeforeRestore.state === "awaiting_review" &&
+			(summaryBeforeRestore.reviewReason === "hook" ||
+				summaryBeforeRestore.reviewReason === "attention" ||
+				summaryBeforeRestore.reviewReason === "error")
+				? summaryBeforeRestore.reviewReason
+				: "attention";
 		updateSummary(entry, {
-			state: request.resumeFromTrash ? "awaiting_review" : "running",
+			state: request.restoreDetachedSession
+				? "awaiting_review"
+				: request.resumeFromTrash
+					? "awaiting_review"
+					: "running",
 			agentId: request.agentId,
 			workspacePath: request.cwd,
 			pid: session.pid,
 			startedAt,
-			lastOutputAt: null,
-			reviewReason: request.resumeFromTrash ? "attention" : null,
+			lastOutputAt: request.restoreDetachedSession ? summaryBeforeRestore.lastOutputAt : null,
+			reviewReason: request.restoreDetachedSession
+				? restoredReviewReason
+				: request.resumeFromTrash
+					? "attention"
+					: null,
 			exitCode: null,
 			lastHookAt: null,
 			latestHookActivity: null,
 			// An adapter that could not honor part of the request says so here.
 			warningMessage: launch.warningMessage ?? null,
-			latestTurnCheckpoint: null,
-			previousTurnCheckpoint: null,
+			latestTurnCheckpoint: request.restoreDetachedSession ? summaryBeforeRestore.latestTurnCheckpoint : null,
+			previousTurnCheckpoint: request.restoreDetachedSession ? summaryBeforeRestore.previousTurnCheckpoint : null,
 			launchAttemptId,
 			// A fresh launch is a new conversation, so the session id reported for the
 			// previous one stops describing this card until the integration reports the
 			// new id; a resume keeps the id it resumed with.
-			externalSessionId: request.resumeFromTrash ? (entry.summary.externalSessionId ?? null) : null,
+			externalSessionId:
+				request.resumeFromTrash || request.restoreDetachedSession
+					? (summaryBeforeRestore.externalSessionId ?? null)
+					: null,
 			launchProvenance,
 		});
 		this.emitSummary(entry.summary);
@@ -606,6 +650,7 @@ export class TerminalSessionManager implements TerminalSessionService {
 
 	async startShellSession(request: StartShellSessionRequest): Promise<RuntimeTaskSessionSummary> {
 		const entry = this.ensureEntry(request.taskId);
+		entry.startedInThisRuntime = true;
 		entry.restartRequest = {
 			kind: "shell",
 			request: cloneStartShellSessionRequest(request),
@@ -768,6 +813,22 @@ export class TerminalSessionManager implements TerminalSessionService {
 			return cloneSummary(entry.summary);
 		}
 
+		// A Pi record hydrated after a restart still describes the exact persisted
+		// conversation, and the task-detail terminal attaches its websocket in the
+		// same render that asks the runtime API to reattach it. Resetting that
+		// record to `idle` here would erase the only proof the guarded restore has
+		// that a Pi conversation existed and strand the card instead, so it is
+		// normalized into the same restore-pending shape a graceful shutdown
+		// writes: the stale process identity is dropped, while the lane, the last
+		// output, and the turn checkpoints survive.
+		if (!entry.startedInThisRuntime && isDetachedPiRestoreCandidate(entry.summary)) {
+			const restorePending = updateSummary(entry, buildRestorePendingPiPatch());
+			for (const listener of entry.listeners.values()) {
+				listener.onState?.(cloneSummary(restorePending));
+			}
+			this.emitSummary(restorePending);
+			return cloneSummary(restorePending);
+		}
 		// Preserve agentId so the server can route to the correct agent type
 		// (Cline SDK vs terminal PTY) when a task is restored from trash.
 		const summary = updateSummary(entry, {
@@ -1052,6 +1113,7 @@ export class TerminalSessionManager implements TerminalSessionService {
 		const created: SessionEntry = {
 			summary: createDefaultSummary(taskId),
 			active: null,
+			startedInThisRuntime: false,
 			terminalStateMirror: null,
 			listenerIdCounter: 1,
 			listeners: new Map(),
@@ -1068,6 +1130,12 @@ export class TerminalSessionManager implements TerminalSessionService {
 		const wasSuppressed = entry.suppressAutoRestartOnExit;
 		entry.suppressAutoRestartOnExit = false;
 		if (wasSuppressed) {
+			return false;
+		}
+		// Pi's initial task request contains the original coding prompt. A PTY
+		// crash must never automatically replay that prompt (and its external
+		// side effects). The guarded exact-session restore handles reconnection.
+		if (entry.summary.agentId === "pi") {
 			return false;
 		}
 		if (entry.listeners.size === 0 || entry.restartRequest?.kind !== "task") {

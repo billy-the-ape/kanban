@@ -1,8 +1,35 @@
 # Automatic PR comment execution
 
-Comment handling remains opt-in, native-Cline-only, and restricted to one linked
-`github.com` PR with one repair owner. It uses the existing observer, task chat,
-and shared Cline model-capacity scheduler.
+Comment handling remains opt-in and restricted to one linked `github.com` PR
+with one repair owner. Native Cline uses its task chat and shared model-capacity
+scheduler; Pi uses the same durable observer/feedback preparation with a
+task-scoped interactive terminal session. Other terminal agents remain blocked.
+
+## Pi repair execution
+
+Pi feedback is dispatched using the same persisted queued intent, GitHub
+snapshot, worktree refresh, deduplication, owner check, and rate limit as Cline.
+The difference is the final execution transport: Cline prepares its prompt
+inside SDK model admission; Pi prepares just before pasting it as one turn into
+its idle task-owned PTY. A real Pi `agent_start` followed by the **`agent_settled`** hook is
+required to mark the repair as completed. A temporary `ui_prompt_start`
+dialog is an attention pause, **not completion**, and Pi does not accept
+new repair messages while waiting on that dialog. A failed or interrupted
+terminal turn marks the durable dispatch failed and requires explicit Resume.
+
+When the Pi process is missing, the repair dispatcher first uses the exact
+saved-session reattachment from #146. If the original Pi session JSONL,
+worktree, or approval is missing, it fails closed; it never resubmits the old
+coding task. A server restart during an in-flight Pi repair makes the dispatch
+uncertain. The operator must inspect the PR and worktree before clicking
+**Resume comment handling**; no automatic replay is attempted.
+
+Pi command result hooks capture PR comment/review publications *after* the
+tool finishes so the implementation agent's own replies are excluded from the
+next review feedback window. This is less strong than the native Cline
+pre-publication capture: a PR update racing the immediate polling window can
+still be ambiguous. Keep the existing publication uncertainty and safety cap
+enabled, and do not use auto-merge as evidence that every comment was fixed.
 
 ## Eligibility and approvals
 
