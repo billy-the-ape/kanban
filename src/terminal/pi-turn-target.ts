@@ -13,7 +13,11 @@ function argumentAfter(args: readonly string[], flag: string): string | null {
 	const index = args.lastIndexOf(flag);
 	if (index >= 0) return args[index + 1]?.trim() || null;
 	const prefix = `${flag}=`;
-	return args.findLast((arg) => arg.startsWith(prefix))?.slice(prefix.length).trim() || null;
+	for (let index = args.length - 1; index >= 0; index -= 1) {
+		const arg = args[index];
+		if (arg?.startsWith(prefix)) return arg.slice(prefix.length).trim() || null;
+	}
+	return null;
 }
 
 /**
