@@ -39,6 +39,8 @@ import { TerminalStateMirror } from "./terminal-state-mirror";
 const MAX_WORKSPACE_TRUST_BUFFER_CHARS = 16_384;
 const AUTO_RESTART_WINDOW_MS = 5_000;
 const MAX_AUTO_RESTARTS_PER_WINDOW = 3;
+/** Shown on a task whose initial Pi start is queued behind another model turn. */
+const MODEL_CAPACITY_WAIT_MESSAGE = "Waiting for a free model slot; the agent starts when the model has capacity.";
 // TUI apps (Codex, OpenCode) can query OSC 10/11 before the browser terminal is attached
 // and ready to answer. We intercept those startup probes during early PTY output, synthesize
 // foreground/background color replies, then disable the filter once a live terminal listener
@@ -848,6 +850,58 @@ export class TerminalSessionManager implements TerminalSessionService {
 		for (const listener of entry.listeners.values()) {
 			listener.onState?.(cloneSummary(summary));
 		}
+		this.emitSummary(summary);
+		return cloneSummary(summary);
+	}
+
+	/**
+	 * AA-P2: an initial Pi start that has to wait for a model slot has no
+	 * process to describe yet, so this record is the only thing the board card,
+	 * the terminal viewer, and Stop can point at while the capacity queue holds
+	 * it. `idle` (not `running`) is deliberate: a process-less waiting record
+	 * must never look like a Pi conversation the guarded restore may reattach.
+	 * The real launch summary replaces it as soon as a slot frees.
+	 */
+	recordModelCapacityWait(input: {
+		taskId: string;
+		agentId: AgentAdapterLaunchInput["agentId"];
+		workspacePath: string;
+	}): RuntimeTaskSessionSummary {
+		const entry = this.ensureEntry(input.taskId);
+		const summary = updateSummary(entry, {
+			state: "idle",
+			agentId: input.agentId,
+			workspacePath: input.workspacePath,
+			pid: null,
+			startedAt: null,
+			lastOutputAt: null,
+			reviewReason: null,
+			exitCode: null,
+			lastHookAt: null,
+			latestHookActivity: null,
+			warningMessage: MODEL_CAPACITY_WAIT_MESSAGE,
+		});
+		this.emitSummary(summary);
+		return cloneSummary(summary);
+	}
+
+	/**
+	 * Ends a capacity wait whose queued launch never produced a process: with an
+	 * `error` the waiting record becomes a normal failure, and without one the
+	 * wait was canceled (Stop). A live process means the queued launch won, so
+	 * its own summary is left alone.
+	 */
+	settleModelCapacityWait(taskId: string, error: string | null): RuntimeTaskSessionSummary | null {
+		const entry = this.entries.get(taskId);
+		if (!entry || entry.active) {
+			return entry ? cloneSummary(entry.summary) : null;
+		}
+		const summary = updateSummary(
+			entry,
+			error !== null
+				? { state: "failed", reviewReason: "error", warningMessage: error }
+				: { state: "idle", reviewReason: null, warningMessage: null },
+		);
 		this.emitSummary(summary);
 		return cloneSummary(summary);
 	}

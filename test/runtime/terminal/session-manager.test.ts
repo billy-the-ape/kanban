@@ -132,6 +132,41 @@ describe("TerminalSessionManager", () => {
 		expect(recovered?.workspacePath).toBeNull();
 		expect(recovered?.reviewReason).toBeNull();
 	});
+	it("records a capacity wait as an idle waiting summary and settles it", () => {
+		const manager = new TerminalSessionManager();
+		const emitted: RuntimeTaskSessionSummary[] = [];
+		manager.onSummary((summary) => {
+			emitted.push(summary);
+		});
+
+		const waiting = manager.recordModelCapacityWait({
+			taskId: "task-1",
+			agentId: "pi",
+			workspacePath: "/tmp/worktree",
+		});
+		expect(waiting.state).toBe("idle");
+		expect(waiting.pid).toBeNull();
+		expect(waiting.agentId).toBe("pi");
+		expect(waiting.warningMessage).toContain("model slot");
+		// The card, the terminal viewer, and Stop all read this record, so it has
+		// to reach the browser through the same summary stream a real launch uses.
+		expect(emitted.at(-1)?.warningMessage).toBe(waiting.warningMessage);
+		// A process-less waiting record must never look like a Pi conversation the
+		// guarded exact-session restore is allowed to reattach.
+		expect(isDetachedPiRestoreCandidate(waiting)).toBe(false);
+
+		// A queued CLI that could not spawn has to say so on the card, while the
+		// Stop that canceled a wait is a plain idle card, not a failure.
+		const failed = manager.settleModelCapacityWait("task-1", "Failed to launch pi.");
+		expect(failed?.state).toBe("failed");
+		expect(failed?.reviewReason).toBe("error");
+		expect(failed?.warningMessage).toBe("Failed to launch pi.");
+		const canceled = manager.settleModelCapacityWait("task-1", null);
+		expect(canceled?.state).toBe("idle");
+		expect(canceled?.reviewReason).toBeNull();
+		expect(canceled?.warningMessage).toBeNull();
+		expect(manager.settleModelCapacityWait("missing-task", null)).toBeNull();
+	});
 
 	it("keeps a hydrated Pi record restorable when the terminal attaches first", () => {
 		const manager = new TerminalSessionManager();

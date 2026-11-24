@@ -9,7 +9,9 @@ and compaction, and releases it when the SDK turn resolves or fails.
 **Initial Pi coding turns** now use the same queue, holding capacity until a
 Pi `agent_settled` hook or process exit. A Pi turn can run shell commands and
 sleep while reserving a slot; raising the override allows other agents to
-run during these gaps. A queued initial Pi launch waits for admission.
+run during these gaps. A queued initial Pi start never blocks its request: the
+card records a **Waiting for a free model slot** summary and Kanban spawns the
+CLI in the background once a slot frees.
 Interactive Pi follow-up turns, including automated PR comment fixes, do
 not yet pass through this initial-start gate and can exceed its budget.
 This is not a hard inference-provider request limit.
@@ -43,11 +45,15 @@ queued turns retain the capacity resolved when they entered the queue, and activ
 turns are not interrupted when the setting changes.
 
 Cline turns remain In Progress with **Waiting for model capacity**, then run
-when capacity becomes available. New Pi starts wait in the initial-start
-request; Stop cancels a queued Pi start without launching its process.
-Cline pause, abort, clear/trash cleanup and runtime disposal cancel pending
-admissions so they cannot start later. The waiting queue is held
-in memory; interrupted work must be resumed after a runtime restart.
+when capacity becomes available. A new Pi start answers its request immediately
+instead of waiting inside it: with no slot free the card records **Waiting for a
+free model slot** (an idle, process-less summary) and the CLI spawns by itself
+once capacity frees, so automatic backlog dispatch never holds its brief
+per-workspace dispatch lock across another task's whole turn. Stop cancels a
+queued Pi start and its CLI is never launched; a queued CLI that cannot spawn
+marks the card failed. Cline pause, abort, clear/trash cleanup and runtime
+disposal cancel pending admissions so they cannot start later. The waiting queue
+is held in memory; interrupted work must be resumed after a runtime restart.
 
 ## Other limits
 
@@ -87,7 +93,7 @@ curl -fsS 'http://127.0.0.1:8080/props?model=qwen3.8-27b' \
 5. Test a provider without `/props`: tasks serialize and queue without errors.
    A failing turn must release capacity for the next queued task.
 
-Waiting board cards show `q #1`, `q #2`, and so on in place of the phase badge. Positions are FIFO within each endpoint/model pool and update when a waiting turn is canceled or admitted. The normal phase badge returns when the turn starts.
+Waiting board cards show `q #1`, `q #2`, and so on in place of the phase badge. Positions are FIFO within each endpoint/model pool and update when a waiting turn is canceled or admitted. The normal phase badge returns when the turn starts. A queued Pi start has no queue-position badge: its card shows the waiting summary text until its CLI spawns.
 
 
 ## Returning an unstarted queued task to Backlog
