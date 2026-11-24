@@ -52,6 +52,9 @@ interface IoOutputState {
 interface TerminalViewerState {
 	clientId: string;
 	pendingOutputChunks: Buffer[];
+	pendingOutputBytes: number;
+	/** Disconnected for lagging behind; a new socket must restore its snapshot. */
+	laggedOut: boolean;
 	restoreComplete: boolean;
 	ioState: IoOutputState | null;
 	ioSocket: WebSocket | null;
@@ -62,30 +65,19 @@ interface TerminalViewerState {
 
 interface TerminalStreamState {
 	viewers: Map<string, TerminalViewerState>;
-	// There is one real terminal process, but many browser tabs can watch it.
-	// If one tab falls behind, we pause the shared PTY so it does not get flooded.
-	// We cannot let a faster tab resume on its own, because the slower tab is still behind.
-	// VS Code does the same basic thing for one terminal view by tracking unacknowledged
-	// output and pausing once it crosses a high watermark, then resuming below a low watermark.
-	// Our extra wrinkle is that one PTY can have many viewers, so we track every backpressured
-	// viewer here and only resume once the last slow viewer catches up or disconnects.
-	backpressuredViewerIds: Set<string>;
+	// The agent PTY must never be paused by slow browser viewers.
+	// Every viewer is bounded and can reattach to the server-side snapshot.
 	detachOutputListener: (() => void) | null;
 }
 
 const OUTPUT_BATCH_INTERVAL_MS = 4;
 const LOW_LATENCY_CHUNK_BYTES = 256;
 const LOW_LATENCY_IDLE_WINDOW_MS = 5;
-const OUTPUT_BUFFER_HIGH_WATER_MARK_BYTES = 16 * 1024;
-const OUTPUT_BUFFER_LOW_WATER_MARK_BYTES = Math.floor(OUTPUT_BUFFER_HIGH_WATER_MARK_BYTES / 4);
-const OUTPUT_ACK_HIGH_WATER_MARK_BYTES = 100_000;
-const OUTPUT_ACK_LOW_WATER_MARK_BYTES = 5_000;
-const OUTPUT_RESUME_CHECK_INTERVAL_MS = 16;
-
-function getWebSocketTransportSocket(ws: WebSocket): Socket | null {
-	const transportSocket = (ws as WebSocket & { _socket?: Socket })._socket;
-	return transportSocket ?? null;
-}
+// Limits belong to each viewer. If exceeded, discard that viewer's socket;
+ // the UI reconnects and obtains a consistent server-side terminal snapshot.
+const MAX_VIEWER_UNACKNOWLEDGED_BYTES = 512 * 1024;
+const MAX_VIEWER_PENDING_RESTORE_BYTES = 512 * 1024;
+const MAX_VIEWER_SOCKET_BUFFERED_BYTES = 2 * 1024 * 1024;
 
 function rawDataToBuffer(message: RawData): Buffer {
 	if (typeof message === "string") {
@@ -152,7 +144,6 @@ export function createTerminalWebSocketBridge({
 		}
 		const created: TerminalStreamState = {
 			viewers: new Map(),
-			backpressuredViewerIds: new Set(),
 			detachOutputListener: null,
 		};
 		terminalStreamStates.set(connectionKey, created);
@@ -177,19 +168,22 @@ export function createTerminalWebSocketBridge({
 		const created: TerminalViewerState = {
 			clientId,
 			pendingOutputChunks: [],
+			pendingOutputBytes: 0,
+			laggedOut: false,
 			restoreComplete: false,
 			ioState: null,
 			ioSocket: null,
 			controlSocket: null,
 			detachControlListener: null,
 			flushPendingOutput: () => {
-				if (!created.restoreComplete || !created.ioState || created.pendingOutputChunks.length === 0) {
-					return;
-				}
-				for (const chunk of created.pendingOutputChunks) {
+				if (!created.restoreComplete || !created.ioState || created.laggedOut) return;
+				const chunks = created.pendingOutputChunks;
+				created.pendingOutputChunks = [];
+				created.pendingOutputBytes = 0;
+				for (const chunk of chunks) {
+					if (created.laggedOut) break;
 					created.ioState.enqueueOutput(chunk);
 				}
-				created.pendingOutputChunks = [];
 			},
 		};
 		streamState.viewers.set(clientId, created);
@@ -210,143 +204,98 @@ export function createTerminalWebSocketBridge({
 		cleanupTerminalStreamStateIfUnused(connectionKey);
 	};
 
+	/**
+	 * Evict only the viewer that is behind. Pausing node-pty here blocks
+	 * autonomous agents such as Pi once their terminal write buffer fills.
+	 * The headless terminal mirror continues to record output for reconnect.
+	 */
+	const evictLaggingViewer = (streamState: TerminalStreamState, clientId: string): void => {
+		const viewer = streamState.viewers.get(clientId);
+		if (!viewer || viewer.laggedOut) return;
+		viewer.laggedOut = true;
+		viewer.restoreComplete = false;
+		viewer.pendingOutputChunks = [];
+		viewer.pendingOutputBytes = 0;
+		viewer.ioState?.dispose();
+		viewer.ioSocket?.terminate();
+		viewer.controlSocket?.terminate();
+	};
+
 	const createIoOutputState = (
 		ws: WebSocket,
 		streamState: TerminalStreamState,
 		clientId: string,
-		taskId: string,
-		terminalManager: TerminalSessionService,
 	): IoOutputState => {
 		let pendingOutputChunks: Buffer[] = [];
+		let pendingOutputBytes = 0;
 		let outputFlushTimer: ReturnType<typeof setTimeout> | null = null;
 		let lastOutputSentAt = 0;
-		let outputPaused = false;
-		let resumeCheckTimer: ReturnType<typeof setTimeout> | null = null;
-		// Same idea as VS Code terminal flow control: count output that has been sent
-		// but not yet acknowledged as committed by the terminal renderer. We also look
-		// at the websocket's own bufferedAmount so we catch both xterm lag and socket lag.
 		let unacknowledgedOutputBytes = 0;
-
-		const shouldPauseOutput = () =>
-			ws.bufferedAmount >= OUTPUT_BUFFER_HIGH_WATER_MARK_BYTES ||
-			unacknowledgedOutputBytes >= OUTPUT_ACK_HIGH_WATER_MARK_BYTES;
-
-		const canResumeOutput = () =>
-			ws.bufferedAmount < OUTPUT_BUFFER_LOW_WATER_MARK_BYTES &&
-			unacknowledgedOutputBytes < OUTPUT_ACK_LOW_WATER_MARK_BYTES;
-
-		const clearResumeCheck = () => {
-			if (resumeCheckTimer !== null) {
-				clearTimeout(resumeCheckTimer);
-				resumeCheckTimer = null;
-			}
-			const transportSocket = getWebSocketTransportSocket(ws);
-			transportSocket?.removeListener("drain", checkResumeAfterBackpressure);
-		};
-
-		const checkResumeAfterBackpressure = () => {
-			if (!outputPaused) {
-				clearResumeCheck();
-				return;
-			}
-			if (ws.readyState !== ws.OPEN) {
-				return;
-			}
-			if (canResumeOutput()) {
-				outputPaused = false;
-				clearResumeCheck();
-				streamState.backpressuredViewerIds.delete(clientId);
-				if (streamState.backpressuredViewerIds.size === 0) {
-					terminalManager.resumeOutput(taskId);
-				}
-				return;
-			}
-			scheduleResumeCheck();
-		};
-
-		const scheduleResumeCheck = () => {
-			if (!outputPaused) {
-				return;
-			}
-			clearResumeCheck();
-			const transportSocket = getWebSocketTransportSocket(ws);
-			transportSocket?.once("drain", checkResumeAfterBackpressure);
-			resumeCheckTimer = setTimeout(() => {
-				resumeCheckTimer = null;
-				checkResumeAfterBackpressure();
-			}, OUTPUT_RESUME_CHECK_INTERVAL_MS);
-		};
-
-		const checkBackpressureAfterSend = (chunk: Buffer) => {
-			if (outputPaused || ws.readyState !== ws.OPEN) {
-				return;
-			}
-			unacknowledgedOutputBytes += chunk.byteLength;
-			if (shouldPauseOutput()) {
-				outputPaused = true;
-				const previouslyPaused = streamState.backpressuredViewerIds.size > 0;
-				streamState.backpressuredViewerIds.add(clientId);
-				if (!previouslyPaused) {
-					terminalManager.pauseOutput(taskId);
-				}
-				scheduleResumeCheck();
-			}
-		};
+		let disposed = false;
 
 		const sendOutputChunk = (chunk: Buffer) => {
-			if (ws.readyState !== ws.OPEN) {
+			if (disposed || ws.readyState !== ws.OPEN) return;
+			unacknowledgedOutputBytes += chunk.byteLength;
+			if (unacknowledgedOutputBytes > MAX_VIEWER_UNACKNOWLEDGED_BYTES) {
+				evictLaggingViewer(streamState, clientId);
 				return;
 			}
 			ws.send(chunk);
 			lastOutputSentAt = Date.now();
-			checkBackpressureAfterSend(chunk);
+			if (ws.bufferedAmount > MAX_VIEWER_SOCKET_BUFFERED_BYTES) {
+				evictLaggingViewer(streamState, clientId);
+			}
 		};
 
 		const flushOutputBatch = () => {
 			outputFlushTimer = null;
-			if (pendingOutputChunks.length === 0 || ws.readyState !== ws.OPEN) {
+			if (disposed || pendingOutputChunks.length === 0 || ws.readyState !== ws.OPEN) {
 				pendingOutputChunks = [];
+				pendingOutputBytes = 0;
 				return;
 			}
-			sendOutputChunk(Buffer.concat(pendingOutputChunks));
+			const chunk = Buffer.concat(pendingOutputChunks);
 			pendingOutputChunks = [];
+			pendingOutputBytes = 0;
+			sendOutputChunk(chunk);
 		};
 
 		return {
 			enqueueOutput: (chunk: Buffer) => {
+				if (disposed || ws.readyState !== ws.OPEN) return;
 				const now = Date.now();
-				const shouldSendImmediately =
+				const sendImmediately =
 					pendingOutputChunks.length === 0 &&
 					outputFlushTimer === null &&
 					chunk.byteLength <= LOW_LATENCY_CHUNK_BYTES &&
 					now - lastOutputSentAt >= LOW_LATENCY_IDLE_WINDOW_MS;
-				if (shouldSendImmediately) {
+				if (sendImmediately) {
 					sendOutputChunk(chunk);
 					return;
 				}
+				if (unacknowledgedOutputBytes + pendingOutputBytes + chunk.byteLength >
+					MAX_VIEWER_UNACKNOWLEDGED_BYTES) {
+					evictLaggingViewer(streamState, clientId);
+					return;
+				}
 				pendingOutputChunks.push(chunk);
+				pendingOutputBytes += chunk.byteLength;
 				if (outputFlushTimer === null) {
 					outputFlushTimer = setTimeout(flushOutputBatch, OUTPUT_BATCH_INTERVAL_MS);
 				}
 			},
 			acknowledgeOutput: (bytes: number) => {
-				unacknowledgedOutputBytes = Math.max(0, unacknowledgedOutputBytes - Math.max(0, Math.floor(bytes)));
-				checkResumeAfterBackpressure();
+				unacknowledgedOutputBytes = Math.max(0,
+					unacknowledgedOutputBytes - Math.max(0, Math.floor(bytes)));
 			},
 			dispose: () => {
+				disposed = true;
 				if (outputFlushTimer !== null) {
 					clearTimeout(outputFlushTimer);
 					outputFlushTimer = null;
 				}
-				clearResumeCheck();
-				if (outputPaused) {
-					outputPaused = false;
-					streamState.backpressuredViewerIds.delete(clientId);
-					if (streamState.backpressuredViewerIds.size === 0) {
-						terminalManager.resumeOutput(taskId);
-					}
-				}
 				pendingOutputChunks = [];
+				pendingOutputBytes = 0;
 			},
 		};
 	};
@@ -365,11 +314,17 @@ export function createTerminalWebSocketBridge({
 		streamState.detachOutputListener = terminalManager.attach(taskId, {
 			onOutput: (chunk) => {
 				for (const viewerState of streamState.viewers.values()) {
+					if (viewerState.laggedOut) continue;
 					if (viewerState.restoreComplete && viewerState.ioState) {
 						viewerState.ioState.enqueueOutput(chunk);
 						continue;
 					}
+					if (viewerState.pendingOutputBytes + chunk.byteLength > MAX_VIEWER_PENDING_RESTORE_BYTES) {
+						evictLaggingViewer(streamState, viewerState.clientId);
+						continue;
+					}
 					viewerState.pendingOutputChunks.push(chunk);
+					viewerState.pendingOutputBytes += chunk.byteLength;
 				}
 			},
 		});
@@ -431,8 +386,10 @@ export function createTerminalWebSocketBridge({
 		const viewerState = getOrCreateViewerState(streamState, clientId);
 		const previousIoSocket = viewerState.ioSocket;
 		viewerState.ioState?.dispose();
-		viewerState.ioState = createIoOutputState(ws, streamState, clientId, taskId, terminalManager);
+		viewerState.ioState = createIoOutputState(ws, streamState, clientId);
 		viewerState.ioSocket = ws;
+		viewerState.laggedOut = false;
+		viewerState.restoreComplete = false;
 		viewerState.flushPendingOutput();
 		ensureOutputListener(streamState, taskId, terminalManager);
 		if (previousIoSocket && previousIoSocket !== ws) {
@@ -473,7 +430,9 @@ export function createTerminalWebSocketBridge({
 		const viewerState = getOrCreateViewerState(streamState, clientId);
 		const previousControlSocket = viewerState.controlSocket;
 		viewerState.restoreComplete = false;
+		viewerState.laggedOut = false;
 		viewerState.pendingOutputChunks = [];
+		viewerState.pendingOutputBytes = 0;
 		viewerState.controlSocket = ws;
 		ensureOutputListener(streamState, taskId, terminalManager);
 		viewerState.detachControlListener?.();

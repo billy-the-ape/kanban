@@ -425,43 +425,75 @@ describe("createTerminalWebSocketBridge", () => {
 		await closeSocket(controlSocketB.socket);
 	});
 
-	it("keeps the PTY paused until every backpressured viewer drains", async () => {
+	it("never pauses a shared agent PTY when one viewer falls behind", async () => {
 		const ioUrlA = `${runtimeUrl}/api/terminal/io?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=client-a`;
 		const controlUrlA = `${runtimeUrl}/api/terminal/control?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=client-a`;
 		const ioUrlB = `${runtimeUrl}/api/terminal/io?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=client-b`;
 		const controlUrlB = `${runtimeUrl}/api/terminal/control?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=client-b`;
+		const slowIo = await openQueuedWebSocket(ioUrlA);
+		const slowControl = await openQueuedWebSocket(controlUrlA);
+		const fastIo = await openQueuedWebSocket(ioUrlB);
+		const fastControl = await openQueuedWebSocket(controlUrlB);
+		await waitForControlMessage(slowControl, (message) => message.type === "restore");
+		await waitForControlMessage(fastControl, (message) => message.type === "restore");
+		slowControl.socket.send(JSON.stringify({ type: "restore_complete" }));
+		fastControl.socket.send(JSON.stringify({ type: "restore_complete" }));
 
-		const ioSocketA = await openQueuedWebSocket(ioUrlA);
-		const controlSocketA = await openQueuedWebSocket(controlUrlA);
-		const ioSocketB = await openQueuedWebSocket(ioUrlB);
-		const controlSocketB = await openQueuedWebSocket(controlUrlB);
-
-		await waitForControlMessage(controlSocketA, (message) => message.type === "restore");
-		await waitForControlMessage(controlSocketB, (message) => message.type === "restore");
-		controlSocketA.socket.send(JSON.stringify({ type: "restore_complete" }));
-		controlSocketB.socket.send(JSON.stringify({ type: "restore_complete" }));
-
-		const output = "x".repeat(120_000);
-		terminalManager.emitOutput(TASK_ID, output);
-
-		const outputA = await waitForIoMessage(ioSocketA);
-		const outputB = await waitForIoMessage(ioSocketB);
-		expect(outputA.byteLength).toBe(Buffer.byteLength(output));
-		expect(outputB.byteLength).toBe(Buffer.byteLength(output));
-		expect(terminalManager.pauseOutput).toHaveBeenCalledTimes(1);
-
-		controlSocketA.socket.send(JSON.stringify({ type: "output_ack", bytes: outputA.byteLength }));
-		await new Promise((resolve) => setTimeout(resolve, 20));
+		// Client A deliberately never acknowledges any output. Client B
+		// acknowledges promptly and must continue receiving every chunk.
+		const output = "x".repeat(64 * 1024);
+		for (let index = 0; index < 10; index += 1) {
+			terminalManager.emitOutput(TASK_ID, output);
+			const received = await waitForIoMessage(fastIo);
+			expect(received.byteLength).toBe(Buffer.byteLength(output));
+			fastControl.socket.send(JSON.stringify({ type: "output_ack", bytes: received.byteLength }));
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		await waitForAssertion(() => {
+			expect(slowIo.socket.readyState).toBe(WebSocket.CLOSED);
+			expect(slowControl.socket.readyState).toBe(WebSocket.CLOSED);
+		}, 2_000);
+		expect(terminalManager.pauseOutput).not.toHaveBeenCalled();
 		expect(terminalManager.resumeOutput).not.toHaveBeenCalled();
 
-		controlSocketB.socket.send(JSON.stringify({ type: "output_ack", bytes: outputB.byteLength }));
-		await waitForAssertion(() => {
-			expect(terminalManager.resumeOutput).toHaveBeenCalledTimes(1);
-		});
+		terminalManager.emitOutput(TASK_ID, "still-running");
+		await expect(waitForIoMessage(fastIo)).resolves.toEqual(Buffer.from("still-running"));
 
-		await closeSocket(ioSocketA.socket);
-		await closeSocket(controlSocketA.socket);
-		await closeSocket(ioSocketB.socket);
-		await closeSocket(controlSocketB.socket);
+		// A lagging viewer can reconnect without restarting Pi; the server
+		// replays its canonical headless-terminal snapshot first.
+		terminalManager.getRestoreSnapshot.mockResolvedValue({
+			snapshot: "restored-screen", cols: 80, rows: 24,
+		});
+		const restoredIo = await openQueuedWebSocket(ioUrlA);
+		const restoredControl = await openQueuedWebSocket(controlUrlA);
+		const restore = await waitForControlMessage(restoredControl, (message) => message.type === "restore");
+		if (restore.type !== "restore") throw new Error("Expected a terminal restore snapshot");
+		expect(restore.snapshot).toBe("restored-screen");
+		restoredControl.socket.send(JSON.stringify({ type: "restore_complete" }));
+		terminalManager.emitOutput(TASK_ID, "after-restore");
+		await expect(waitForIoMessage(restoredIo)).resolves.toEqual(Buffer.from("after-restore"));
+		expect(terminalManager.pauseOutput).not.toHaveBeenCalled();
+
+		await closeSocket(restoredIo.socket);
+		await closeSocket(restoredControl.socket);
+		await closeSocket(fastIo.socket);
+		await closeSocket(fastControl.socket);
 	});
+
+	it("bounds output waiting for an inactive viewer's initial restore", async () => {
+		const ioUrl = `${runtimeUrl}/api/terminal/io?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=unresponsive`;
+		const controlUrl = `${runtimeUrl}/api/terminal/control?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=unresponsive`;
+		const io = await openQueuedWebSocket(ioUrl);
+		const control = await openQueuedWebSocket(controlUrl);
+		await waitForControlMessage(control, (message) => message.type === "restore");
+		// The browser never confirms that its renderer restored the screen.
+		terminalManager.emitOutput(TASK_ID, "x".repeat(600 * 1024));
+		await waitForAssertion(() => {
+			expect(io.socket.readyState).toBe(WebSocket.CLOSED);
+			expect(control.socket.readyState).toBe(WebSocket.CLOSED);
+		}, 2_000);
+		expect(terminalManager.pauseOutput).not.toHaveBeenCalled();
+		expect(terminalManager.resumeOutput).not.toHaveBeenCalled();
+	});
+
 });
