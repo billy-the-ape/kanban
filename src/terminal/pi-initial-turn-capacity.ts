@@ -96,6 +96,18 @@ export class PiInitialTurnCapacityGate {
 	}
 
 	/**
+	 * Whether a start for this card still holds a claim in this process.
+	 *
+	 * The queue is the only thing that knows its own waits, so task dispatch
+	 * asks here whether a card is waiting for a model slot instead of reading it
+	 * off the summary: a waiting record left behind by a restart describes a
+	 * wait nothing is still honoring, and would hold a worker slot forever.
+	 */
+	hasPending(workspaceId: string, taskId: string): boolean {
+		return this.starts.has(this.key(workspaceId, taskId));
+	}
+
+	/**
 	 * Asks the shared model queue to admit an initial Pi turn and resolves as
 	 * soon as the outcome is known: the CLI launched, or the start is queued.
 	 * Only capacity discovery and the spawn itself are awaited, so the caller
@@ -129,6 +141,7 @@ export class PiInitialTurnCapacityGate {
 					taskId: request.taskId,
 					agentId: "pi",
 					workspacePath: request.workspacePath,
+					queuePosition,
 				}),
 			});
 		};

@@ -109,6 +109,14 @@ function hydratedSession(taskId: string, state: RuntimeTaskSessionState): TaskDi
 	return { summary: createSummary(taskId, state), live: false };
 }
 
+/**
+ * A card whose start is queued for a model slot: `idle` with no process, yet
+ * the queue still owes it a CLI, so it keeps the worker slot it was given.
+ */
+function waitingSession(taskId: string): TaskDispatchSessionSnapshot {
+	return { summary: createSummary(taskId, "idle"), live: false, waitingForCapacity: true };
+}
+
 function createReceipt(
 	taskId: string,
 	status: "delivered" | "no_op" | "paused" | "failed",
@@ -517,6 +525,22 @@ describe("getActiveWorkerTaskIds", () => {
 		expect(getActiveWorkerTaskIds([hydratedSession("t-dead", "running")], board)).toEqual([]);
 	});
 
+	it("counts a card whose start waits for a model slot", () => {
+		// `t-idle` sits in in_progress with an idle, process-less card: exactly
+		// the shape a Pi start queued behind another model turn leaves behind.
+		// Without this the pass treats the queue as empty and starts more cards
+		// than there are model slots, draining the whole ready backlog.
+		const ids = getActiveWorkerTaskIds([waitingSession("t-idle"), liveSession("t-running")], board);
+		expect(ids.sort()).toEqual(["t-idle", "t-running"]);
+	});
+
+	it("releases the slot once the capacity wait is over", () => {
+		// Stop or a spawn that could not run settles the record; the card must
+		// not keep occupying a worker nothing is waiting for.
+		const ids = getActiveWorkerTaskIds([{ ...waitingSession("t-idle"), waitingForCapacity: false }], board);
+		expect(ids).toEqual([]);
+	});
+
 	it("never counts shell terminals or the home agent as workers", () => {
 		const ids = getActiveWorkerTaskIds(
 			[
@@ -758,6 +782,49 @@ describe("dispatchReadyTasks", () => {
 			board,
 			receipts: deliveredReceipts(),
 			sessions: [liveSession("__home_terminal__"), hydratedSession("crashed", "running")],
+		});
+		const response = await dispatchReadyTasks(deps);
+		expect(response.dispatchedTaskId).toBe("b");
+		expect(startedTasks.map((entry) => entry.taskId)).toEqual(["b"]);
+	});
+
+	it("holds a worker slot for a card queued for model capacity", async () => {
+		// One model slot means one card runs at a time. "queued" is waiting for
+		// that slot with no process yet, so it still fills the worker limit of 1:
+		// otherwise every pass starts another backlog card into the same single
+		// model slot and `workerLimit` stops limiting anything.
+		const board = createBoard({
+			cardsByColumn: {
+				backlog: [createCard("b"), createCard("c")],
+				in_progress: [createCard("queued")],
+			},
+		});
+		const { deps, startedTasks } = createTestDeps({
+			board,
+			workerLimit: 1,
+			sessions: [waitingSession("queued")],
+		});
+		const response = await dispatchReadyTasks(deps);
+		expect(response.dispatchedTaskId).toBeNull();
+		expect(response.skippedReason).toBe("worker_busy");
+		expect(startedTasks).toHaveLength(0);
+		// Diagnostics report the same worker set the pass used.
+		expect((await getTaskDispatchStatus(deps)).activeWorkerTaskIds).toEqual(["queued"]);
+	});
+
+	it("starts the next card once a queued card's wait ends", async () => {
+		// Stop (or a spawn that never ran) settles the wait, which frees the slot
+		// for the next ready card instead of stranding the queue.
+		const board = createBoard({
+			cardsByColumn: {
+				backlog: [createCard("b")],
+				in_progress: [createCard("queued")],
+			},
+		});
+		const { deps, startedTasks } = createTestDeps({
+			board,
+			workerLimit: 1,
+			sessions: [{ ...waitingSession("queued"), waitingForCapacity: false }],
 		});
 		const response = await dispatchReadyTasks(deps);
 		expect(response.dispatchedTaskId).toBe("b");

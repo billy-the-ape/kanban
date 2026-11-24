@@ -8,6 +8,7 @@ import type {
 	RuntimeTaskSessionSummary,
 	RuntimeTaskTurnCheckpoint,
 } from "../core/api-contract";
+import { MODEL_CAPACITY_WAIT_ACTIVITY_TEXT, MODEL_CAPACITY_WAIT_HOOK_EVENT_NAME } from "../core/task-display-state";
 import {
 	type AgentAdapterLaunchInput,
 	type AgentOutputTransitionDetector,
@@ -863,12 +864,18 @@ export class TerminalSessionManager implements TerminalSessionService {
 	 * the terminal viewer, and Stop can point at while the capacity queue holds
 	 * it. `idle` (not `running`) is deliberate: a process-less waiting record
 	 * must never look like a Pi conversation the guarded restore may reattach.
-	 * The real launch summary replaces it as soon as a slot frees.
+	 * The shared capacity-wait marker is what makes the record self-describing;
+	 * dispatch counts the card's worker slot from the queue's own pending ids
+	 * (see `PiInitialTurnCapacityGate.hasPending`), not from this record, so a
+	 * stale record left by a restart cannot hold a slot forever. The real launch
+	 * summary replaces it as soon as a slot frees.
 	 */
 	recordModelCapacityWait(input: {
 		taskId: string;
 		agentId: AgentAdapterLaunchInput["agentId"];
 		workspacePath: string;
+		/** The capacity queue's position for this start, when the queue knows it. */
+		queuePosition?: number | null;
 	}): RuntimeTaskSessionSummary {
 		const entry = this.ensureEntry(input.taskId);
 		const summary = updateSummary(entry, {
@@ -881,7 +888,21 @@ export class TerminalSessionManager implements TerminalSessionService {
 			reviewReason: null,
 			exitCode: null,
 			lastHookAt: null,
-			latestHookActivity: null,
+			latestHookActivity: {
+				// Only a queued Cline turn can hand its card back to Backlog; a
+				// queued Pi start is canceled with Stop instead.
+				canReturnToBacklog: false,
+				queuePosition: typeof input.queuePosition === "number" ? input.queuePosition : null,
+				activityText: MODEL_CAPACITY_WAIT_ACTIVITY_TEXT,
+				toolName: null,
+				toolInputSummary: null,
+				finalMessage: null,
+				// Same marker the Cline queue writes, so a card waiting for a
+				// model slot says the same thing whichever agent owns it.
+				hookEventName: MODEL_CAPACITY_WAIT_HOOK_EVENT_NAME,
+				notificationType: null,
+				source: "kanban",
+			},
 			warningMessage: MODEL_CAPACITY_WAIT_MESSAGE,
 		});
 		this.emitSummary(summary);
@@ -902,8 +923,8 @@ export class TerminalSessionManager implements TerminalSessionService {
 		const summary = updateSummary(
 			entry,
 			error !== null
-				? { state: "failed", reviewReason: "error", warningMessage: error }
-				: { state: "idle", reviewReason: null, warningMessage: null },
+				? { state: "failed", reviewReason: "error", warningMessage: error, latestHookActivity: null }
+				: { state: "idle", reviewReason: null, warningMessage: null, latestHookActivity: null },
 		);
 		this.emitSummary(summary);
 		return cloneSummary(summary);

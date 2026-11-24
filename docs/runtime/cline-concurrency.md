@@ -47,9 +47,14 @@ turns are not interrupted when the setting changes.
 Cline turns remain In Progress with **Waiting for model capacity**, then run
 when capacity becomes available. A new Pi start answers its request immediately
 instead of waiting inside it: with no slot free the card records **Waiting for a
-free model slot** (an idle, process-less summary) and the CLI spawns by itself
-once capacity frees, so automatic backlog dispatch never holds its brief
-per-workspace dispatch lock across another task's whole turn. Stop cancels a
+free model slot** (an idle, process-less summary carrying the same capacity-wait
+marker a queued Cline turn uses, plus its queue position) and the CLI spawns by
+itself once capacity frees, so automatic backlog dispatch never holds its brief
+per-workspace dispatch lock across another task's whole turn. The waiting card
+keeps the dispatch worker slot it was given — the capacity queue reports the cards
+it is still waiting for, since a summary left behind by a restart would otherwise
+hold a slot forever — so the worker limit still caps how many cards start. Stop
+cancels a
 queued Pi start and its CLI is never launched; a queued CLI that cannot spawn
 marks the card failed. Cline pause, abort, clear/trash cleanup and runtime
 disposal cancel pending admissions so they cannot start later. The waiting queue
@@ -60,7 +65,10 @@ is held in memory; interrupted work must be resumed after a runtime restart.
 - The reliable backlog dispatch policy's `taskDispatchPolicy.workerLimit` remains
   an independent per-workspace launch cap (default 1, maximum 4). Set it to 2 via
   the runtime config API if two automatically dispatched cards are desired. This
-  policy still requires deterministic delivery when enabled. Manually started
+  policy still requires deterministic delivery when enabled. A Pi card waiting for
+  a model slot counts against this cap while it waits, exactly as a running card
+  does, so a queue of waiting cards cannot drain the backlog into In Progress.
+  Manually started
   cards use the model queue directly.
 - Reservations cover this Kanban process, not other clients (such as Home
   Assistant) or separate Kanban processes. Server queuing and HTTP limits remain
@@ -93,7 +101,7 @@ curl -fsS 'http://127.0.0.1:8080/props?model=qwen3.8-27b' \
 5. Test a provider without `/props`: tasks serialize and queue without errors.
    A failing turn must release capacity for the next queued task.
 
-Waiting board cards show `q #1`, `q #2`, and so on in place of the phase badge. Positions are FIFO within each endpoint/model pool and update when a waiting turn is canceled or admitted. The normal phase badge returns when the turn starts. A queued Pi start has no queue-position badge: its card shows the waiting summary text until its CLI spawns.
+Waiting board cards show `q #1`, `q #2`, and so on in place of the phase badge. Positions are FIFO within each endpoint/model pool and update when a waiting turn is canceled or admitted. The normal phase badge returns when the turn starts. A queued Pi start has no queue-position badge, because that badge belongs to a running queued Cline turn: its card shows the waiting summary text instead, and the record carries the same queue position for diagnostics until its CLI spawns.
 
 
 ## Returning an unstarted queued task to Backlog

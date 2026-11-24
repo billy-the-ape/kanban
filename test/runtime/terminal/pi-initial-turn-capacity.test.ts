@@ -29,7 +29,7 @@ function summary(taskId: string, change: Partial<RuntimeTaskSessionSummary> = {}
 
 function fakeManager() {
 	const listeners = new Set<(value: RuntimeTaskSessionSummary) => void>();
-	const waits: string[] = [];
+	const waits: Array<{ taskId: string; queuePosition: number | null }> = [];
 	const settles: Array<{ taskId: string; error: string | null }> = [];
 	const stops: string[] = [];
 	const manager = {
@@ -39,8 +39,8 @@ function fakeManager() {
 				listeners.delete(listener);
 			};
 		},
-		recordModelCapacityWait: (input: { taskId: string }) => {
-			waits.push(input.taskId);
+		recordModelCapacityWait: (input: { taskId: string; queuePosition?: number | null }) => {
+			waits.push({ taskId: input.taskId, queuePosition: input.queuePosition ?? null });
 			return summary(input.taskId, { state: "idle", pid: null, warningMessage: "Waiting for a free model slot" });
 		},
 		settleModelCapacityWait: (taskId: string, error: string | null) => {
@@ -132,7 +132,9 @@ describe("PiInitialTurnCapacityGate", () => {
 		const queued = await gate.request(startInput(fake, "b", secondLaunch));
 		// The request answered without waiting for the slot: dispatch keeps its lock.
 		expect(expectQueued(queued)).toBe(1);
-		expect(fake.waits).toEqual(["b"]);
+		// The waiting record carries the queue position, so the card can say
+		// where it is waiting instead of only that it is idle.
+		expect(fake.waits).toEqual([{ taskId: "b", queuePosition: 1 }]);
 		expect(secondLaunch).not.toHaveBeenCalled();
 
 		fake.emit(settled("a"));
@@ -248,5 +250,26 @@ describe("PiInitialTurnCapacityGate", () => {
 		expect(launch).not.toHaveBeenCalled();
 		// A card that moved on is idle again, not a failure the human must explain.
 		expect(fake.settles).toEqual([{ taskId: "b", error: null }]);
+	});
+
+	it("answers for its own pending starts so dispatch can count the worker slot", async () => {
+		// Task dispatch must not read the wait off the card's summary — a record
+		// left behind by a restart would hold a worker slot forever — so the queue
+		// itself says which cards it still owes a CLI to.
+		const gate = new PiInitialTurnCapacityGate(new ClineTurnScheduler(async () => 1));
+		const fake = fakeManager();
+		expect(gate.hasPending("workspace", "a")).toBe(false);
+		await gate.request(startInput(fake, "a", async () => summary("a")));
+		expect(gate.hasPending("workspace", "a")).toBe(true);
+		const launch = vi.fn(async () => summary("b"));
+		expect((await gate.request(startInput(fake, "b", launch))).status).toBe("queued");
+		expect(gate.hasPending("workspace", "b")).toBe(true);
+		gate.cancel("workspace", "b");
+		await tick();
+		// A canceled wait frees the card's dispatch slot for the next pass.
+		expect(gate.hasPending("workspace", "b")).toBe(false);
+		fake.emit(summary("a", { pid: null, state: "awaiting_review", reviewReason: "exit" }));
+		await tick();
+		expect(gate.hasPending("workspace", "a")).toBe(false);
 	});
 });

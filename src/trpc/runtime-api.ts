@@ -115,8 +115,8 @@ import {
 	dispatchReadyTasks as runTaskDispatchPass,
 	type TaskDispatchDeps,
 } from "../task-dispatch/task-dispatch-service";
-import { sharedPiInitialTurnCapacityGate } from "../terminal/pi-initial-turn-capacity";
 import { buildRuntimeConfigResponse, describeUnrunnableAgent, resolveAgentCommand } from "../terminal/agent-registry";
+import { sharedPiInitialTurnCapacityGate } from "../terminal/pi-initial-turn-capacity";
 import { derivePiSessionId, getPiTaskSessionDir, readPiSessionRecord } from "../terminal/pi-session-options";
 import { collectRestorablePiCardIds, isDetachedPiRestoreCandidate } from "../terminal/pi-session-restore";
 import { resolvePiTurnTarget } from "../terminal/pi-turn-target";
@@ -1003,6 +1003,10 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					terminal: terminalManager,
 					clineSummaries: clineTaskSessionService.listSummaries(),
 					reviewSummaries: reviewSessionService?.listSessionSummaries() ?? [],
+					// AA-P2: a Pi start queued for a model slot has no process yet, but
+					// the card still owns the worker slot the pass gave it. The queue
+					// answers for its own waits, so nothing stale can hold a slot.
+					capacityWait: (taskId) => sharedPiInitialTurnCapacityGate.hasPending(workspaceScope.workspaceId, taskId),
 				});
 			},
 			readReceipt: (taskId) => readTaskDeliveryReceipt(taskId),

@@ -143,11 +143,18 @@ describe("TerminalSessionManager", () => {
 			taskId: "task-1",
 			agentId: "pi",
 			workspacePath: "/tmp/worktree",
+			queuePosition: 2,
 		});
 		expect(waiting.state).toBe("idle");
 		expect(waiting.pid).toBeNull();
 		expect(waiting.agentId).toBe("pi");
 		expect(waiting.warningMessage).toContain("model slot");
+		// The record says why the card is idle, in the vocabulary a queued
+		// Cline turn already uses. Only a Cline queue may hand a card back to
+		// Backlog, so the Pi wait never advertises that affordance.
+		expect(waiting.latestHookActivity?.hookEventName).toBe("concurrency_waiting");
+		expect(waiting.latestHookActivity?.queuePosition).toBe(2);
+		expect(waiting.latestHookActivity?.canReturnToBacklog).toBe(false);
 		// The card, the terminal viewer, and Stop all read this record, so it has
 		// to reach the browser through the same summary stream a real launch uses.
 		expect(emitted.at(-1)?.warningMessage).toBe(waiting.warningMessage);
@@ -165,6 +172,10 @@ describe("TerminalSessionManager", () => {
 		expect(canceled?.state).toBe("idle");
 		expect(canceled?.reviewReason).toBeNull();
 		expect(canceled?.warningMessage).toBeNull();
+		// Either way the wait is over, so nothing may keep claiming the card is
+		// queued: that marker is what the card and diagnostics read.
+		expect(failed?.latestHookActivity).toBeNull();
+		expect(canceled?.latestHookActivity).toBeNull();
 		expect(manager.settleModelCapacityWait("missing-task", null)).toBeNull();
 	});
 

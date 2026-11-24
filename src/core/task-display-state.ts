@@ -26,8 +26,18 @@ export const PAUSED_TASK_SESSION_STATES: ReadonlySet<RuntimeTaskSessionState> = 
 	"failed",
 ]);
 
-/** Hook event that marks a running session queued behind a concurrency slot. */
-const QUEUED_HOOK_EVENT_NAME = "concurrency_waiting";
+/**
+ * Hook event that marks a session queued behind a model-capacity slot.
+ *
+ * A queued Cline turn keeps `running` while it waits; an initial Pi start that
+ * has to wait has no process yet, so it is recorded `idle`. The marker (not the
+ * state) is what the two share, and it is what makes a waiting record describe
+ * itself instead of a card that simply stopped.
+ */
+export const MODEL_CAPACITY_WAIT_HOOK_EVENT_NAME = "concurrency_waiting";
+
+/** Activity line shared by both agents while a start waits for a model slot. */
+export const MODEL_CAPACITY_WAIT_ACTIVITY_TEXT = "Waiting for model capacity";
 
 /**
  * A placeholder summary describes no session: it is created for freshly
@@ -60,7 +70,7 @@ export function resolveTaskDisplayState(
 		return "in_progress";
 	}
 	if (summary.state === "running") {
-		if (summary.latestHookActivity?.hookEventName === QUEUED_HOOK_EVENT_NAME) {
+		if (summary.latestHookActivity?.hookEventName === MODEL_CAPACITY_WAIT_HOOK_EVENT_NAME) {
 			return "paused";
 		}
 		return "in_progress";
