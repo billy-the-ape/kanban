@@ -25,6 +25,8 @@ const SHIFT_ENTER_SEQUENCE = "\n";
 const RESIZE_DEBOUNCE_MS = 50;
 const INTERRUPT_IDLE_SETTLE_MS = 250;
 const PARKING_ROOT_ID = "kb-persistent-terminal-parking-root";
+const RECONNECT_INITIAL_DELAY_MS = 250;
+const RECONNECT_MAX_DELAY_MS = 5_000;
 
 interface PersistentTerminalAppearance {
 	cursorColor: string;
@@ -162,6 +164,20 @@ class PersistentTerminal {
 	private outputTextDecoder = new TextDecoder();
 	private terminalWriteQueue: Promise<void> = Promise.resolve();
 	private disposed = false;
+	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	private reconnectAttempts = 0;
+	private readonly onVisibilityChange = () => {
+		if (this.disposed) return;
+		if (document.visibilityState === "hidden") {
+			// No browser renderer is needed for agent execution. The server-side
+			// headless mirror keeps a fresh snapshot while this tab is hidden.
+			this.ioSocket?.close();
+			this.controlSocket?.close();
+			return;
+		}
+		this.clearReconnectTimer();
+		this.ensureConnected();
+	};
 
 	constructor(
 		private readonly taskId: string,
@@ -230,6 +246,7 @@ class PersistentTerminal {
 			// Fall back to the default renderer when WebGL is unavailable.
 		}
 
+		document.addEventListener("visibilitychange", this.onVisibilityChange);
 		this.ensureConnected();
 	}
 
@@ -346,6 +363,24 @@ class PersistentTerminal {
 		});
 	}
 
+	private clearReconnectTimer(): void {
+		if (this.reconnectTimer !== null) {
+			clearTimeout(this.reconnectTimer);
+			this.reconnectTimer = null;
+		}
+	}
+
+	private scheduleReconnect(): void {
+		if (this.disposed || this.reconnectTimer !== null || document.visibilityState === "hidden") return;
+		const delay = Math.min(RECONNECT_MAX_DELAY_MS,
+			RECONNECT_INITIAL_DELAY_MS * 2 ** Math.min(this.reconnectAttempts, 5));
+		this.reconnectAttempts += 1;
+		this.reconnectTimer = setTimeout(() => {
+			this.reconnectTimer = null;
+			this.ensureConnected();
+		}, delay);
+	}
+
 	private connectIo(): void {
 		if (this.ioSocket) {
 			return;
@@ -388,15 +423,17 @@ class PersistentTerminal {
 			this.notifyLastError();
 		};
 		ioSocket.onclose = () => {
-			if (this.disposed || this.ioSocket !== ioSocket) {
-				return;
-			}
+			if (this.disposed || this.ioSocket !== ioSocket) return;
 			this.ioSocket = null;
 			this.outputTextDecoder = new TextDecoder();
 			this.connectionReady = false;
 			this.restoreCompleted = false;
-			this.lastError = "Terminal stream closed. Close and reopen to reconnect.";
+			// A partial reconnect cannot safely replay live bytes. Close both
+			// channels so the next control socket requests a fresh snapshot.
+			this.controlSocket?.close();
+			this.lastError = "Terminal stream disconnected. Reconnecting from saved screen...";
 			this.notifyLastError();
+			this.scheduleReconnect();
 		};
 	}
 
@@ -427,6 +464,8 @@ class PersistentTerminal {
 							return;
 						}
 						this.restoreCompleted = true;
+						this.reconnectAttempts = 0;
+						this.clearReconnectTimer();
 						this.sendControlMessage({ type: "restore_complete" });
 						if (this.ioSocket && this.visibleContainer) {
 							this.requestResize();
@@ -467,19 +506,19 @@ class PersistentTerminal {
 			this.notifyLastError();
 		};
 		controlSocket.onclose = () => {
-			if (this.disposed || this.controlSocket !== controlSocket) {
-				return;
-			}
+			if (this.disposed || this.controlSocket !== controlSocket) return;
 			this.controlSocket = null;
-			this.lastError = "Terminal control connection closed. Close and reopen to reconnect.";
+			this.connectionReady = false;
+			this.restoreCompleted = false;
+			this.ioSocket?.close();
+			this.lastError = "Terminal control disconnected. Reconnecting from saved screen...";
 			this.notifyLastError();
+			this.scheduleReconnect();
 		};
 	}
 
 	private ensureConnected(): void {
-		if (this.disposed) {
-			return;
-		}
+		if (this.disposed || document.visibilityState === "hidden") return;
 		if (!this.ioSocket) {
 			this.connectIo();
 		}
@@ -685,6 +724,8 @@ class PersistentTerminal {
 			return;
 		}
 		this.disposed = true;
+		document.removeEventListener("visibilitychange", this.onVisibilityChange);
+		this.clearReconnectTimer();
 		this.unmount(this.visibleContainer);
 		this.ioSocket?.close();
 		this.controlSocket?.close();
