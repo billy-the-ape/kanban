@@ -415,9 +415,10 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		join(homedir(), ".cline", "worktrees"),
 	] as const;
 	// The two bookkeeping steps a successful browser send performs on an accepted
-	// prompt. They are split from `createTaskChatMessageSender`'s hooks so the
-	// recovery path below records exactly the same state without repeating the
-	// argument plumbing, and so an automation sender can keep leaving them unwired.
+	// prompt. They are split out of `createTaskChatMessageSender`'s hook wiring - the
+	// sender takes them directly, and the recovery path below calls the same two - so
+	// both record identical state without repeating the argument plumbing, and an
+	// automation sender can keep leaving them unwired.
 	const persistAcceptedPrompt = async (
 		workspaceScope: RuntimeTrpcWorkspaceScope,
 		body: RuntimeTaskChatSendRequest,
@@ -459,12 +460,8 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		// LASTPROMPT: only the browser sender records the latest user prompt;
 		// the COMMENT-0 automation service sender leaves it unwired so
 		// auto-generated instructions never update the card preview.
-		recordLastUserPrompt: async (workspaceScope, body, acceptedAt) => {
-			await persistAcceptedPrompt(workspaceScope, body, acceptedAt);
-		},
-		resolvePostSendPrLinking: async (workspaceScope, body) => {
-			return classifySentPrLinks(workspaceScope, body);
-		},
+		recordLastUserPrompt: persistAcceptedPrompt,
+		resolvePostSendPrLinking: classifySentPrLinks,
 	});
 
 	// B-2.9: the effective context window (budget override → provider-settings
