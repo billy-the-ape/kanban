@@ -1278,11 +1278,12 @@ export class InMemoryClineTaskSessionService implements ClineTaskSessionService 
 						}
 					})
 					.catch((error: unknown) => {
+						const isCurrentTurn = (this.turnGenerationByTaskId.get(taskId) ?? 0) === turnGeneration;
 						outcome = {
-							status: (this.turnGenerationByTaskId.get(taskId) ?? 0) === turnGeneration ? "failed" : "canceled",
+							status: isCurrentTurn ? "failed" : "canceled",
 							error: error instanceof Error ? error.message : String(error),
 						};
-						if ((this.turnGenerationByTaskId.get(taskId) ?? 0) === turnGeneration) {
+						if (isCurrentTurn) {
 							this.emitTaskFailure(taskId, entry, "send", error);
 						}
 					})

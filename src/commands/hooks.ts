@@ -8,8 +8,8 @@ import type { RuntimeHookEvent, RuntimeHookIngestRequest, RuntimeTaskHookActivit
 import { buildKanbanCommandParts } from "../core/kanban-command";
 import { detectCreatedPullRequests } from "../core/pull-request-detection";
 import { buildKanbanRuntimeUrl, getRuntimeFetch } from "../core/runtime-endpoint";
-import { detectPublicationOperations } from "../pr-tracking/pr-publication-attribution";
 import { buildWindowsCmdArgsArray, resolveWindowsComSpec, shouldUseWindowsCmdLaunch } from "../core/windows-cmd-launch";
+import { detectPublicationOperations } from "../pr-tracking/pr-publication-attribution";
 import { parseHookRuntimeContextFromEnv } from "../terminal/hook-runtime-context";
 import type { RuntimeAppRouter } from "../trpc/app-router";
 import {
@@ -470,7 +470,11 @@ export function extractPiPublicationTool(
 ): RuntimeHookIngestRequest["publicationTool"] {
 	if (source !== "pi" || payload?.hook_event_name !== "tool_execution_end") return undefined;
 	const toolInput = asRecord(payload.tool_input);
-	const commands = toolInput ? extractCommandStrings(toolInput).slice(0, 10).map((cmd) => cmd.slice(0, 10_000)) : [];
+	const commands = toolInput
+		? extractCommandStrings(toolInput)
+				.slice(0, 10)
+				.map((cmd) => cmd.slice(0, 10_000))
+		: [];
 	if (commands.length === 0 || detectPublicationOperations(commands).length === 0) return undefined;
 	const output = extractHookToolResponse(payload)?.slice(0, 4000) ?? null;
 	return {

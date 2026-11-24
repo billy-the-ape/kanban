@@ -121,6 +121,12 @@ const DISPATCH_RETRY_MS = 30_000;
  * `updatedAt`, so a summary that keeps being rewritten cannot postpone it.
  */
 const TERMINAL_FAILURE_CONFIRM_MS = 30_000;
+/**
+ * `dispatch.turnRef` marker for a repair turn handed to Pi through the
+ * prepared terminal sender. Such a turn is settled only by Pi's own hook
+ * observer, so every reader of the marker shares this one rule.
+ */
+const PI_TURN_REF_PREFIX = "pi:";
 /** How long dispose() waits for already-running work before giving up on it. */
 const DISPOSE_GRACE_MS = 3_000;
 const BACKOFF_SCHEDULE_MS = [60_000, 120_000, 240_000, 480_000, 900_000];
@@ -139,6 +145,16 @@ const STALE_PENDING_CAPTURE_REASON =
 	"A publication command started but its result never arrived; the published identity could not be confirmed.";
 /** Columns whose tasks count as active comment-handling subscriptions. */
 const ACTIVE_COLUMN_IDS = new Set(["backlog", "in_progress", "review"]);
+
+/**
+ * Whether a polled session summary reports a turn that ended in failure
+ * (finished as failed/interrupted, or parked by an error) rather than one
+ * still running or waiting for input. Both the stale-observation reset and the
+ * sticky-failure decision read this, so the two cannot drift apart.
+ */
+function isTerminalFailureSummary(session: RuntimeTaskSessionSummary): boolean {
+	return session.state === "failed" || session.state === "interrupted" || session.reviewReason === "error";
+}
 
 function backoffMs(consecutiveFailures: number): number {
 	return BACKOFF_SCHEDULE_MS[Math.min(Math.max(consecutiveFailures, 1) - 1, BACKOFF_SCHEDULE_MS.length - 1)];
@@ -959,7 +975,7 @@ export class PrCommentAutomationService {
 			return;
 		}
 		if (dispatch !== null && dispatch.status === "running") {
-			if (dispatch.turnRef?.startsWith("pi:")) {
+			if (dispatch.turnRef?.startsWith(PI_TURN_REF_PREFIX)) {
 				// Pi's exact turn is settled by its live hook observer, never by
 				// a generic output timestamp. If the observer is gone, fail closed.
 				await this.setDispatchFailed(
@@ -986,10 +1002,7 @@ export class PrCommentAutomationService {
 			// Not a terminal failure observation (still running, recovered, or no
 			// summary at all): any earlier observation is stale, so a later failure
 			// must start a fresh confirmation window.
-			if (
-				session === null ||
-				(session.state !== "failed" && session.state !== "interrupted" && session.reviewReason !== "error")
-			) {
+			if (session === null || !isTerminalFailureSummary(session)) {
 				sub.terminalFailureObservation = null;
 			}
 
@@ -1008,7 +1021,7 @@ export class PrCommentAutomationService {
 				sub.dispatchRetryAt = nowMs + DISPATCH_RETRY_MS;
 				return;
 			}
-			if (session.state === "failed" || session.state === "interrupted" || session.reviewReason === "error") {
+			if (isTerminalFailureSummary(session)) {
 				// A summary is an observation, not the settled turn outcome: give the
 				// terminal owner time to publish its final hook/summary before making
 				// a sticky failure that only a manual Resume can clear. The window is
@@ -1041,12 +1054,7 @@ export class PrCommentAutomationService {
 		// A queued dispatch whose send was already attempted (the post-send
 		// write failed, or a restart left it behind) has an unknown outcome:
 		// never send it again automatically; surface it for an explicit Resume.
-		if (
-			dispatch !== null &&
-			dispatch.status === "queued" &&
-			dispatch.attemptedAt !== null &&
-			!this.sendsInFlight.has(sub.key)
-		) {
+		if (dispatch !== null && dispatch.status === "queued" && dispatch.attemptedAt !== null) {
 			await this.setDispatchFailed(
 				sub,
 				`A previous send attempt's outcome is unknown; resume manually.`,
@@ -1191,6 +1199,17 @@ export class PrCommentAutomationService {
 		}
 	}
 
+	/**
+	 * Drops this attempt's live-dispatch claim, but only while this attempt
+	 * still owns it: an older send finishing late must not release the claim a
+	 * newer attempt took over.
+	 */
+	private releaseLiveDispatch(key: string, dispatchId: string): void {
+		if (this.liveDispatches.get(key) === dispatchId) {
+			this.liveDispatches.delete(key);
+		}
+	}
+
 	private async sendDispatch(
 		sub: PrSubscriptionState,
 		owner: RuntimePrCommentOwner,
@@ -1314,7 +1333,7 @@ export class PrCommentAutomationService {
 			try {
 				await this.settlePreparedDispatch(sub, dispatchId, outcome);
 			} finally {
-				if (this.liveDispatches.get(sub.key) === dispatchId) this.liveDispatches.delete(sub.key);
+				this.releaseLiveDispatch(sub.key, dispatchId);
 			}
 		};
 		// Both agents use the same queued intent, preparation, and completion receipt.
@@ -1347,7 +1366,10 @@ export class PrCommentAutomationService {
 						...record.commentAutomation,
 						dispatch: {
 							...dispatch,
-							turnRef: effectiveAgentId === "pi" ? `pi:${dispatchId}` : (response.message?.id ?? null),
+							turnRef:
+								effectiveAgentId === "pi"
+									? `${PI_TURN_REF_PREFIX}${dispatchId}`
+									: (response.message?.id ?? null),
 						},
 					},
 				};
@@ -1355,7 +1377,7 @@ export class PrCommentAutomationService {
 			return { status: "sent" };
 		}
 		const error = response.error ?? `Could not send the comment-handling instruction.`;
-		if (this.liveDispatches.get(sub.key) === dispatchId) this.liveDispatches.delete(sub.key);
+		this.releaseLiveDispatch(sub.key, dispatchId);
 		await upsertPrTrackingRecord(sub.key, identity, (record) => {
 			const dispatch = record.commentAutomation.dispatch;
 			if (dispatch === null || dispatch.dispatchId !== dispatchId) {
@@ -2262,7 +2284,7 @@ export class PrCommentAutomationService {
 				// Otherwise: keep queued; the deadline pass re-validates.
 				continue;
 			}
-			if (piOwnerAtRestart || dispatch.turnRef?.startsWith("pi:")) {
+			if (piOwnerAtRestart || dispatch.turnRef?.startsWith(PI_TURN_REF_PREFIX)) {
 				// After a restart no exact Pi turn outcome can be proved. Require
 				// explicit Resume rather than replaying feedback or guessing success.
 				await upsertPrTrackingRecord(

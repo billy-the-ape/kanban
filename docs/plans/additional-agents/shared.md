@@ -164,7 +164,8 @@ Landed in this repository; AA-O1 and AA-P1 build on it without changing it.
   cannot honor (for example autonomous mode on OpenCode, or explicit resume on any
   CLI-launched agent) and `formatUnsupportedAgentLaunchError` names the agent and the
   operation. A missing binary yields `formatMissingAgentInstallError` with the catalog
-  install URL, so no phantom session is created.
+  install URL (`describeUnrunnableAgent` answers the terminal start before any process is
+  spawned), so no phantom session is created.
 - Attempt ownership: `createLaunchAttemptId` mints one token per launch, the adapter hands
   it to the agent as `KANBAN_HOOK_ATTEMPT_ID_ENV`, the session summary stores it as
   `launchAttemptId`, and `createHooksApi().ingest` refuses card mutations and activity

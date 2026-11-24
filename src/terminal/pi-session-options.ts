@@ -17,7 +17,6 @@ export const PI_CODING_AGENT_DIR_ENV = "PI_CODING_AGENT_DIR";
 
 export const PI_AGENT_DIR_NAME = ".pi";
 export const PI_AGENT_SUBDIR_NAME = "agent";
-export const PI_SETTINGS_FILENAME = "settings.json";
 /**
  * Pi keeps its provider catalogue and its credentials (`models.json`,
  * `auth.json`, `trust.json`) next to this settings file. Kanban reads the
@@ -25,6 +24,7 @@ export const PI_SETTINGS_FILENAME = "settings.json";
  * never read or copied, and project trust is never granted on the user's
  * behalf.
  */
+export const PI_SETTINGS_FILENAME = "settings.json";
 
 /** Pi only loads extension files ending in `.ts` or `.js` (extensions/loader). */
 export const PI_HOOK_EXTENSION_FILENAME = "kanban-pi-hook.js";

@@ -12,6 +12,7 @@ import type { RuntimeConfigState } from "../../../src/config/runtime-config";
 import { RUNTIME_AGENT_CATALOG } from "../../../src/core/agent-catalog";
 import {
 	buildRuntimeConfigResponse,
+	describeUnrunnableAgent,
 	detectInstalledCommands,
 	resolveAgentCommand,
 } from "../../../src/terminal/agent-registry";
@@ -60,6 +61,26 @@ describe("agent-registry", () => {
 		const resolved = resolveAgentCommand(createRuntimeConfigState({ selectedAgentId: "claude" }));
 
 		expect(resolved).toBeNull();
+	});
+
+	it("names the missing CLI and its install page when a selected agent is not installed", () => {
+		// A card that selected an agent the machine never installed has to learn
+		// which CLI to install, not just that nothing is configured.
+		const message = describeUnrunnableAgent(createRuntimeConfigState({ selectedAgentId: "pi" }));
+
+		expect(message).toContain("Pi is not installed");
+		expect(message).toContain("`pi` on PATH");
+		expect(message).toContain("https://github.com/earendil-works/pi");
+	});
+
+	it("explains nothing when the selected CLI exists or the native agent is chosen", () => {
+		commandDiscoveryMocks.isBinaryAvailableOnPath.mockImplementation((binary: string) => binary === "claude");
+		expect(describeUnrunnableAgent(createRuntimeConfigState({ selectedAgentId: "claude" }))).toBeNull();
+		// Cline runs through the SDK session, so a missing `cline` binary is not
+		// its story and the generic "nothing configured" answer stays correct.
+		expect(describeUnrunnableAgent(createRuntimeConfigState({ selectedAgentId: "cline" }))).toBeNull();
+		// An agent Kanban does not launch at all has no CLI to install here.
+		expect(describeUnrunnableAgent(createRuntimeConfigState({ selectedAgentId: "gemini" }))).toBeNull();
 	});
 });
 

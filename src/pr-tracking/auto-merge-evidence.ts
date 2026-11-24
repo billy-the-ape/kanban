@@ -30,7 +30,6 @@ import type {
 	RawRestListResult,
 } from "./github-gh-adapter";
 import type { ParsedCanonicalPrKey } from "./pr-identity";
-import type { PrThreadInfo } from "./pr-snapshots";
 
 type RawObject = Record<string, unknown>;
 
@@ -182,22 +181,6 @@ export function selectEffectiveCommitStatuses(rawItems: unknown[], headSha: stri
 		}
 	}
 	return [...effective.values()];
-}
-
-/**
- * Unresolved, non-outdated (ACTIVE) review threads from the thread map.
- * The map is keyed per comment id, so distinct thread info objects are
- * counted by identity (one count per thread).
- */
-export function countUnresolvedActiveThreads(threads: Map<string, PrThreadInfo>): number {
-	const seen = new Set<PrThreadInfo>();
-	for (const info of threads.values()) {
-		if (info.resolved || info.outdated) {
-			continue;
-		}
-		seen.add(info);
-	}
-	return seen.size;
 }
 
 export interface AutoMergeEvidenceOptions {
