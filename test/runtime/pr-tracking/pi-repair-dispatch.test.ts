@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ClineTurnOutcome, ClineTurnPreparation } from "../../../src/cline-sdk/cline-turn-preparation";
+import { normalizePiHookMetadata } from "../../../src/commands/hook-events/pi-hook-events";
 import type { RuntimeTaskSessionSummary } from "../../../src/core/api-contract";
 import { sendPreparedPiRepair } from "../../../src/pr-tracking/pi-repair-dispatch";
-import type { TerminalSessionManager } from "../../../src/terminal/session-manager";
+import { TerminalSessionManager } from "../../../src/terminal/session-manager";
 
 const PI_PASTE_SETTLE_TEST_MS = 200;
 
@@ -120,6 +121,92 @@ describe("sendPreparedPiRepair", () => {
 		pi.emit({ state: "awaiting_review", reviewReason: "hook" });
 		expect(settled).toHaveBeenCalledTimes(1);
 		expect(pi.listeners.size).toBe(0);
+	});
+
+	it("settles a clean agent_settled even after stale error or aborted notifications", async () => {
+		// Pi's extension sends `--notification-type error` for a routine failed
+		// tool call and no notification on the successful `agent_settled`, and
+		// an interrupted turn reports `aborted` once. The shared hook merge is
+		// sticky, so replay that stream through the production normalizer and
+		// the real `applyHookActivity`: the merged activity arriving with the
+		// clean `agent_settled` must not carry the stale values, or a repair
+		// turn that actually succeeded settles as failed (watermark rolled
+		// back, feedback re-sent on Resume).
+		const merge = new TerminalSessionManager();
+		merge.hydrateFromRecord({
+			"pi-task": {
+				taskId: "pi-task",
+				state: "awaiting_review",
+				agentId: "pi",
+				workspacePath: "/tmp/pi-task",
+				pid: 123,
+				startedAt: 1,
+				updatedAt: 2,
+				lastOutputAt: 2,
+				reviewReason: "hook",
+				exitCode: null,
+				lastHookAt: 1,
+				launchAttemptId: "attempt-1",
+				latestHookActivity: {
+					source: "pi",
+					hookEventName: "agent_start",
+					notificationType: null,
+					activityText: "Pi is working",
+					toolName: null,
+					toolInputSummary: null,
+					finalMessage: null,
+				},
+			},
+		});
+		merge.applyHookActivity(
+			"pi-task",
+			normalizePiHookMetadata({
+				event: "activity",
+				sourceHint: "pi",
+				flagMetadata: {},
+				payload: { hook_event_name: "tool_execution_end", tool_name: "bash", notification_type: "error" },
+			}) ?? {},
+		);
+		expect(merge.getSummary("pi-task")?.latestHookActivity?.notificationType).toBe("error");
+		merge.applyHookActivity(
+			"pi-task",
+			normalizePiHookMetadata({
+				event: "to_review",
+				sourceHint: "pi",
+				flagMetadata: {},
+				payload: { hook_event_name: "agent_settled", notification_type: "aborted" },
+			}) ?? {},
+		);
+		expect(merge.getSummary("pi-task")?.latestHookActivity?.notificationType).toBe("aborted");
+		const cleanSettle = normalizePiHookMetadata({
+			event: "to_review",
+			sourceHint: "pi",
+			flagMetadata: {},
+			payload: { hook_event_name: "agent_settled", final_message: "Pushed the branch." },
+		});
+		merge.applyHookActivity("pi-task", cleanSettle ?? {});
+		const merged = merge.getSummary("pi-task")?.latestHookActivity;
+		expect(merged?.hookEventName).toBe("agent_settled");
+		expect(merged?.notificationType).not.toBe("error");
+		expect(merged?.notificationType).not.toBe("aborted");
+
+		const pi = createPiManager();
+		const { prepare, settled } = createPreparation("Fix review feedback");
+		const result = await sendPreparedPiRepair({
+			manager: pi.manager,
+			taskId: "pi-task",
+			prepare,
+			restoreSavedSession: async () => ({ ok: true }),
+		});
+		expect(result.ok).toBe(true);
+		pi.emit({ state: "running", reviewReason: null });
+		pi.emit({
+			state: "awaiting_review",
+			reviewReason: "hook",
+			lastHookAt: Date.now(),
+			latestHookActivity: merged ?? null,
+		});
+		expect(settled).toHaveBeenCalledExactlyOnceWith({ status: "completed" });
 	});
 
 	it("strips terminal control characters from untrusted PR feedback before bracketed paste", async () => {

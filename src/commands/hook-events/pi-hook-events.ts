@@ -111,7 +111,14 @@ export function normalizePiHookMetadata({
 		source: flagMetadata.source ?? sourceHint ?? "pi",
 		hookEventName,
 		toolName,
-		notificationType,
+		// Pi events are complete snapshots, but the shared hook merge treats a
+		// missing (null) field as “keep the previous value”. Send an explicit
+		// empty string so an event without a notification CLEARS a stale one:
+		// a routine failed tool call (`--notification-type error`) or an
+		// aborted turn would otherwise survive into the successful
+		// `agent_settled` merge and make PR repair dispatch mark a turn that
+		// actually succeeded as failed.
+		notificationType: notificationType ?? "",
 		finalMessage: normalizedFinalMessage,
 		activityText: activityText ? normalizeWhitespace(clip(activityText, PI_ACTIVITY_LIMIT)) : null,
 	};
