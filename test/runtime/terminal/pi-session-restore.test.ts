@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import type { RuntimeTaskSessionSummary } from "../../../src/core/api-contract";
+import type { RuntimeBoardData, RuntimeTaskSessionSummary } from "../../../src/core/api-contract";
 import {
+	collectRestorablePiCardIds,
 	isDetachedPiRestoreCandidate,
 	isSettledPiSummaryWithoutProcess,
 } from "../../../src/terminal/pi-session-restore";
@@ -22,6 +23,16 @@ function createPiSummary(overrides: Partial<RuntimeTaskSessionSummary> = {}): Ru
 		latestHookActivity: null,
 		...overrides,
 	};
+}
+
+function createBoard(cardsByColumn: Record<string, string[]>): RuntimeBoardData {
+	return {
+		columns: Object.entries(cardsByColumn).map(([id, cards]) => ({
+			id,
+			title: id,
+			cards: cards.map((cardId) => ({ id: cardId })),
+		})),
+	} as unknown as RuntimeBoardData;
 }
 
 describe("isDetachedPiRestoreCandidate", () => {
@@ -68,5 +79,29 @@ describe("isSettledPiSummaryWithoutProcess", () => {
 		expect(isSettledPiSummaryWithoutProcess(createPiSummary({ state: "running", pid: null }))).toBe(false);
 		expect(isSettledPiSummaryWithoutProcess(createPiSummary())).toBe(false);
 		expect(isSettledPiSummaryWithoutProcess(createPiSummary({ agentId: "codex", pid: null }))).toBe(false);
+	});
+
+	it("never treats an interrupted Pi record as ended on its own", () => {
+		// Both a graceful shutdown and the terminal's stale-record recovery leave a
+		// card in exactly this shape. If the shutdown coordinator read it as ended,
+		// the next shutdown — before the user reopened the task — would archive the
+		// worktree the earlier one deliberately kept, stranding the conversation.
+		expect(isSettledPiSummaryWithoutProcess(createPiSummary({ state: "interrupted", pid: null }))).toBe(false);
+		expect(
+			isSettledPiSummaryWithoutProcess(
+				createPiSummary({ state: "interrupted", reviewReason: "interrupted", pid: null }),
+			),
+		).toBe(false);
+	});
+});
+
+describe("collectRestorablePiCardIds", () => {
+	it("returns the cards in the two lanes a restore may be asked for", () => {
+		// Shared by the restore guard and the shutdown coordinator, so the worktree
+		// it keeps is exactly the one the guard is allowed to reattach into.
+		const ids = collectRestorablePiCardIds(
+			createBoard({ backlog: ["b"], in_progress: ["p"], review: ["r"], done: ["d"], trash: ["t"] }),
+		);
+		expect(Array.from(ids).sort()).toEqual(["p", "r"]);
 	});
 });

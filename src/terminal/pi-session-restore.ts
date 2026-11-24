@@ -6,7 +6,28 @@
 // power loss) or one that already ended on its own. Reattaching the first is
 // recovery; reattaching the second would relaunch a finished, crashed, or
 // intentionally stopped agent, so every attach path uses this one predicate.
-import type { RuntimeTaskSessionSummary } from "../core/api-contract";
+import type { RuntimeBoardData, RuntimeTaskSessionSummary } from "../core/api-contract";
+
+/**
+ * The only lanes whose detached Pi session the task-detail terminal asks to be
+ * reattached, so they are also the only lanes whose worktree a graceful
+ * shutdown keeps. Shared by the restore guard and the shutdown coordinator so
+ * the two cannot drift apart.
+ */
+const RESTORABLE_PI_CARD_COLUMN_IDS: ReadonlySet<string> = new Set(["in_progress", "review"]);
+
+/** Cards a reattach may still be asked for, by task id. */
+export function collectRestorablePiCardIds(board: RuntimeBoardData): Set<string> {
+	const taskIds = new Set<string>();
+	for (const column of board.columns) {
+		if (RESTORABLE_PI_CARD_COLUMN_IDS.has(column.id)) {
+			for (const card of column.cards) {
+				taskIds.add(card.id);
+			}
+		}
+	}
+	return taskIds;
+}
 
 /**
  * Whether a summary still describes a Pi conversation that the guarded
@@ -57,9 +78,18 @@ export function buildRestorePendingPiPatch(): Pick<
  * itself (an intentional stop, a crash, or a finished Review). Such a session
  * keeps the state it has instead of being rewritten into a restore that the
  * user never asked for.
+ *
+ * `interrupted` is deliberately *not* settled: Kanban writes it only when it
+ * lost a live process, and both a previous graceful shutdown and the terminal's
+ * stale-record recovery leave a card in exactly that shape. Reading it as ended
+ * would let the next shutdown — before the user reopened the task — delete the
+ * worktree the earlier one kept, stranding the conversation for good.
  */
 export function isSettledPiSummaryWithoutProcess(summary: RuntimeTaskSessionSummary | null | undefined): boolean {
 	if (!summary || summary.agentId !== "pi") {
+		return false;
+	}
+	if (summary.state === "interrupted") {
 		return false;
 	}
 	return summary.pid === null && summary.state !== "running";

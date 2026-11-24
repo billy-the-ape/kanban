@@ -84,7 +84,7 @@ function createBoard(taskIds: { inProgress?: string[]; review?: string[] }): Run
 
 function createSession(
 	taskId: string,
-	state: "running" | "awaiting_review" | "idle",
+	state: "running" | "awaiting_review" | "interrupted" | "idle",
 	overrides: Partial<RuntimeTaskSessionSummary> = {},
 ): RuntimeTaskSessionSummary {
 	return {
@@ -198,7 +198,7 @@ describe.sequential("shutdown coordinator integration", () => {
 		});
 	}, 30_000);
 
-	it("keeps a restore-pending Pi worktree and leaves an intentionally stopped Pi session ended", async () => {
+	it("keeps every restore-pending Pi worktree across shutdowns and leaves an intentionally stopped Pi session ended", async () => {
 		await withTemporaryHome(async () => {
 			const { path: sandboxRoot, cleanup } = createTempDir("kanban-shutdown-pi-");
 			try {
@@ -218,22 +218,37 @@ describe.sequential("shutdown coordinator integration", () => {
 					reviewReason: "error",
 					pid: null,
 				});
+				// Shutdown number two for this card: an earlier shutdown already
+				// persisted it as `interrupted` and the user never reopened the task, so
+				// nothing in this runtime ran it. It is still the exact record a restore
+				// would be asked for, so its worktree has to survive again.
+				const interruptedEarlier = createSession("pi-interrupted", "interrupted", {
+					agentId: "pi",
+					reviewReason: "interrupted",
+					pid: null,
+				});
 				const initial = await loadWorkspaceState(projectPath);
 				await saveWorkspaceState(projectPath, {
-					board: createBoard({ inProgress: ["pi-running"], review: ["pi-stopped", "pi-crashed"] }),
+					board: createBoard({
+						inProgress: ["pi-running"],
+						review: ["pi-stopped", "pi-crashed", "pi-interrupted"],
+					}),
 					sessions: {
 						"pi-running": running,
 						"pi-stopped": stopped,
 						"pi-crashed": crashed,
+						"pi-interrupted": interruptedEarlier,
 					},
 					expectedRevision: initial.revision,
 				});
 
-				const summaries = new Map([running, stopped, crashed].map((summary) => [summary.taskId, summary] as const));
+				const summaries = new Map(
+					[running, stopped, crashed, interruptedEarlier].map((summary) => [summary.taskId, summary] as const),
+				);
 				const piTerminalManager = {
 					// Only the running card has a process this runtime is stopping.
 					markInterruptedAndStopAll: () => [running],
-					listSummaries: () => [running, stopped, crashed],
+					listSummaries: () => [running, stopped, crashed, interruptedEarlier],
 					getSummary: (taskId: string) => summaries.get(taskId) ?? null,
 				} as unknown as TerminalSessionManager;
 				const removedTaskIds: string[] = [];
@@ -263,6 +278,11 @@ describe.sequential("shutdown coordinator integration", () => {
 				expect(after.sessions["pi-stopped"]?.state).toBe("awaiting_review");
 				expect(after.sessions["pi-stopped"]?.reviewReason).toBe("exit");
 				expect(after.sessions["pi-crashed"]?.reviewReason).toBe("error");
+				// A card an earlier shutdown left `interrupted` is still waiting for a
+				// restore, so this one re-persists it and keeps the worktree the earlier
+				// shutdown kept rather than archiving the work away.
+				expect(after.sessions["pi-interrupted"]?.state).toBe("interrupted");
+				expect(after.sessions["pi-interrupted"]?.reviewReason).toBe("interrupted");
 				// The restore reattaches into the original worktree and refuses to
 				// recreate it, so archiving it away here would strand the card.
 				expect(removedTaskIds.sort()).toEqual(["pi-crashed", "pi-stopped"]);

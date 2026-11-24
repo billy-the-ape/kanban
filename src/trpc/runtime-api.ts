@@ -117,7 +117,7 @@ import {
 } from "../task-dispatch/task-dispatch-service";
 import { buildRuntimeConfigResponse, resolveAgentCommand } from "../terminal/agent-registry";
 import { derivePiSessionId, getPiTaskSessionDir, readPiSessionRecord } from "../terminal/pi-session-options";
-import { isDetachedPiRestoreCandidate } from "../terminal/pi-session-restore";
+import { collectRestorablePiCardIds, isDetachedPiRestoreCandidate } from "../terminal/pi-session-restore";
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { createVerificationRunner } from "../verification/verification-service";
 import { evaluateDependentsUnlock, getGitDeliveryService, readTaskDeliveryReceipt } from "../workspace/git-delivery";
@@ -640,11 +640,11 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				}
 				if (isHomeAgentSessionId(body.taskId)) throw new Error("Home sessions cannot be auto-restored.");
 				const board = await loadWorkspaceBoardById(workspaceScope.workspaceId);
-				const card = board.columns
-					.filter((column) => column.id === "review" || column.id === "in_progress")
-					.flatMap((column) => column.cards)
-					.find((item) => item.id === body.taskId);
-				if (!card) throw new Error("Only active or Review tasks can be restored.");
+				// The same lane rule the shutdown coordinator uses to decide which
+				// worktree to keep, so a card it preserved is never refused here.
+				if (!collectRestorablePiCardIds(board).has(body.taskId)) {
+					throw new Error("Only active or Review tasks can be restored.");
+				}
 				const manager = await deps.getScopedTerminalManager(workspaceScope);
 				const saved = manager.getSummary(body.taskId);
 				if (manager.hasActiveProcess(body.taskId)) return { ok: true, summary: saved, initialStart: null };

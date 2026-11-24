@@ -1,11 +1,14 @@
 import type {
-	RuntimeBoardData,
 	RuntimeTaskSessionSummary,
 	RuntimeWorkspaceStateResponse,
 	RuntimeWorktreeDeleteResponse,
 } from "../core/api-contract";
 import { listWorkspaceIndexEntries, loadWorkspaceState, saveWorkspaceState } from "../state/workspace-state";
-import { isSettledPiSummaryWithoutProcess } from "../terminal/pi-session-restore";
+import {
+	collectRestorablePiCardIds,
+	isDetachedPiRestoreCandidate,
+	isSettledPiSummaryWithoutProcess,
+} from "../terminal/pi-session-restore";
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { deleteTaskWorktree, removeTaskWorktreeSetupLock } from "../workspace/task-worktree";
 import type { WorkspaceRegistry } from "./workspace-registry";
@@ -18,24 +21,6 @@ export interface RuntimeShutdownCoordinatorDependencies {
 	skipSessionCleanup?: boolean;
 	/** Test seam for the worktree removal itself; the real cleanup is the default. */
 	removeTaskWorktree?: (input: { repoPath: string; taskId: string }) => Promise<RuntimeWorktreeDeleteResponse>;
-}
-
-/**
- * The only cards whose detached Pi session the task-detail terminal asks to be
- * reattached after a restart (see the guarded restore in `runtime-api.ts`).
- */
-const RESTORABLE_CARD_COLUMNS: Set<string> = new Set(["in_progress", "review"]);
-
-function collectRestorableCardIds(board: RuntimeBoardData): Set<string> {
-	const taskIds = new Set<string>();
-	for (const column of board.columns) {
-		if (RESTORABLE_CARD_COLUMNS.has(column.id)) {
-			for (const card of column.cards) {
-				taskIds.add(card.id);
-			}
-		}
-	}
-	return taskIds;
 }
 
 interface PersistInterruptedSessionsResult {
@@ -62,7 +47,7 @@ async function persistInterruptedSessions(
 	const workspaceState = options.workspaceState;
 	const worktreeTaskIds = collectProjectWorktreeTaskIdsForRemoval(workspaceState.board);
 	const worktreeTaskIdsToCleanup = interruptedTaskIds.filter((taskId) => worktreeTaskIds.has(taskId));
-	const restorableCardIds = collectRestorableCardIds(workspaceState.board);
+	const restorableCardIds = collectRestorablePiCardIds(workspaceState.board);
 	// B-5: interrupted cards stay in their current column. Their work is
 	// preserved (and their worktrees kept or durably preserved), not discarded,
 	// so no board change is made here.
@@ -74,8 +59,20 @@ async function persistInterruptedSessions(
 		if (!summary) {
 			continue;
 		}
-		// A Pi session this runtime never ran and that claims no process already
-		// ended on its own — an intentional Stop or a crash. Rewriting it to
+		// The guarded restore refuses to recreate the worktree it reattaches into,
+		// so a Pi card that a restore may still be asked for keeps its worktree —
+		// on this shutdown and on every later one, until the card is reopened or
+		// leaves these lanes. A card this runtime is stopping is always left
+		// restore-pending (it is rewritten to `interrupted` just below); for the
+		// rest the same candidate rule the restore guard applies decides, which is
+		// what keeps a card interrupted by an earlier shutdown restorable instead of
+		// archiving it away on shutdown number two.
+		const leavesRestorePending = isDetachedPiRestoreCandidate(summary) || options.liveTaskIds.has(taskId);
+		if (summary.agentId === "pi" && restorableCardIds.has(taskId) && leavesRestorePending) {
+			result.restorePendingTaskIds.add(taskId);
+		}
+		// A Pi session this runtime never ran and that already ended on its own —
+		// an intentional Stop or a crash — keeps the state it has. Rewriting it to
 		// `interrupted` would claim Kanban lost a live process, and reopening the
 		// task after the restart would relaunch work the user deliberately stopped.
 		if (!options.liveTaskIds.has(taskId) && isSettledPiSummaryWithoutProcess(summary)) {
@@ -88,12 +85,6 @@ async function persistInterruptedSessions(
 			pid: null,
 			updatedAt: Date.now(),
 		};
-		// A restore-pending Pi card is reattached by reopening the task, and the
-		// guarded restore refuses to recreate the worktree it reattaches into. Its
-		// work stays in place instead of being archived away by this shutdown.
-		if (summary.agentId === "pi" && restorableCardIds.has(taskId)) {
-			result.restorePendingTaskIds.add(taskId);
-		}
 	}
 	await saveWorkspaceState(workspacePath, {
 		board: workspaceState.board,
