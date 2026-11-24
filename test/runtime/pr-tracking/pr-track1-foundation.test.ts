@@ -224,6 +224,30 @@ describe("pr-track1 task-derived subscription demand", () => {
 		expect(computeTaskSubscriptionDemand(explicitBoards, bothInstalled, commentsAgents)).toHaveLength(1);
 	});
 
+	it("scopes comment demand to Pi tasks as well as Cline tasks", () => {
+		const piCard = makeCard({ id: "t-pi", autoAddressComments: true, agentId: "pi", pullRequests: [LINK] });
+		const unsetPiWorkspaceCard = makeCard({ id: "t-unset-pi", autoAddressComments: true, pullRequests: [LINK] });
+		const codexCard = makeCard({ id: "t-codex", autoAddressComments: true, agentId: "codex", pullRequests: [LINK] });
+		const boards = [
+			makeBoard("ws-pi", [
+				{ columnId: "in_progress", card: piCard },
+				{ columnId: "in_progress", card: unsetPiWorkspaceCard },
+			]),
+			makeBoard("ws-codex", [{ columnId: "in_progress", card: codexCard }]),
+		];
+		const commentsAgents = new Map<string, RuntimeAgentId | null>([
+			["ws-pi", "pi"],
+			["ws-codex", "codex"],
+		]);
+
+		// Both Pi cards yield comment demand (explicit card agent and the
+		// workspace-selected agent fallback); the codex card stays blocked.
+		const demands = computeTaskSubscriptionDemand(boards, bothInstalled, commentsAgents);
+		expect(demands).toHaveLength(2);
+		expect(demands.map((demand) => demand.taskId).sort()).toEqual(["t-pi", "t-unset-pi"]);
+		expect(demands[0]).toMatchObject({ consumers: { comments: true, mergeCompletion: false, autoMerge: false } });
+	});
+
 	it("keeps the checkbox-alone rule when no agent info is available", () => {
 		const card = makeCard({ id: "t-unset", autoAddressComments: true, pullRequests: [LINK] });
 		const boards = [makeBoard("ws-1", [{ columnId: "in_progress", card }])];

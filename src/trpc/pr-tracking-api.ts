@@ -54,7 +54,7 @@ import { setTaskSelectedAutomationPr, updateTaskPrSettings } from "../core/task-
 import { type AutoMergePolicyStore, normalizeAutoMergeRepository } from "../pr-tracking/auto-merge-policy-store";
 import type { PrInstalledConsumers } from "../pr-tracking/pr-consumer-registry";
 import { isTrackingSupportedPr, parseCanonicalPrKey } from "../pr-tracking/pr-identity";
-import { evaluatePrLifecycleGate } from "../pr-tracking/pr-lifecycle-gate";
+import { evaluatePrLifecycleGate, isCommentServableAgent } from "../pr-tracking/pr-lifecycle-gate";
 import {
 	assignRepairOwner,
 	findTaskCard,
@@ -445,10 +445,10 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		const card = found.card;
 		const settingsRevision = card.settingsRevision ?? 0;
 		const resolved = resolveCardAutomationPrKey(card);
-		// Per-task agent support: comment follow-up is native-Cline only;
-		// merge completion is provider-independent. An UNSET card agentId
-		// means "use the workspace's selected agent", not Cline — resolve
-		// the effective agent the same way task start does.
+		// Per-task agent support: comment follow-up serves native Cline and
+		// Pi tasks; merge completion is provider-independent. An UNSET card
+		// agentId means "use the workspace's selected agent", not Cline —
+		// resolve the effective agent the same way task start does.
 		let effectiveAgentId: RuntimeAgentId | null = null;
 		if (deps.getEffectiveTaskAgentId) {
 			try {
@@ -457,20 +457,24 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 				effectiveAgentId = null;
 			}
 		}
-		if (effectiveAgentId === null && card.agentId === "cline") {
-			// Resolver unavailable: only an explicit per-card Cline counts.
-			effectiveAgentId = "cline";
+		if (effectiveAgentId === null && isCommentServableAgent(card.agentId)) {
+			// Resolver unavailable: only an explicit servable per-card agent counts.
+			effectiveAgentId = card.agentId;
 		}
-		const nativeClineTask = effectiveAgentId === "cline";
+		const commentsServableTask = isCommentServableAgent(effectiveAgentId);
 		// Both PR tracking consumers are always installed, so the shared
 		// lifecycle gate keys off the task's own PR automation settings —
 		// except the comments half, which only owns tasks the comment
-		// automation can actually serve (native Cline).
-		const installed: PrInstalledConsumers = { comments: nativeClineTask, mergeCompletion: true, autoMerge: true };
+		// automation can actually serve (native Cline or Pi).
+		const installed: PrInstalledConsumers = {
+			comments: commentsServableTask,
+			mergeCompletion: true,
+			autoMerge: true,
+		};
 		const gate = evaluatePrLifecycleGate({ card, installed });
 		const blockers: Array<{ kind: RuntimeTaskTrackingStateResponse["blockers"][number]["kind"]; message: string }> =
 			[];
-		const commentsSupportedForTask = nativeClineTask;
+		const commentsSupportedForTask = commentsServableTask;
 		const coordinatorState = coordinator ? coordinator.getState() : null;
 		if (coordinatorState?.authBlocker) {
 			blockers.push({ kind: "auth", message: coordinatorState.authBlocker });
@@ -502,10 +506,10 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		if (!resolved.key) {
 			blockers.push({ kind: "waiting_for_linked_pr", message: "No PR link is recorded for this task yet." });
 		}
-		if (card.autoAddressComments === true && !nativeClineTask) {
+		if (card.autoAddressComments === true && !commentsServableTask) {
 			blockers.push({
 				kind: "comments_unsupported",
-				message: "Comment follow-up automation requires a native Cline task.",
+				message: "Comment follow-up automation requires a native Cline or Pi task.",
 			});
 		}
 		const eligible = active && resolved.key !== null && gate.legacyCompletionGated;

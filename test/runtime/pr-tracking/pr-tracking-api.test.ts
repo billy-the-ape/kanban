@@ -186,7 +186,7 @@ describe("pr-tracking api: tracking-state diagnostics", () => {
 		expect(state.commentsSupportedForTask).toBe(false);
 		expect(state.blockers).toContainEqual({
 			kind: "comments_unsupported",
-			message: "Comment follow-up automation requires a native Cline task.",
+			message: "Comment follow-up automation requires a native Cline or Pi task.",
 		});
 	});
 
@@ -200,6 +200,19 @@ describe("pr-tracking api: tracking-state diagnostics", () => {
 		expect(state.blockers.some((blocker) => blocker.kind === "comments_unsupported")).toBe(false);
 	});
 
+	it("supports comments for an explicitly Pi-assigned task", async () => {
+		const board = makeBoard(makeCard({ autoAddressComments: true, agentId: "pi" }));
+		mockWorkspaceState(board);
+		const harness = createHarness(board);
+
+		const state = await harness.api.getTaskTrackingState(SCOPE, { taskId: OPERATOR_TASK_ID });
+		expect(state.commentsSupportedForTask).toBe(true);
+		expect(state.blockers.some((blocker) => blocker.kind === "comments_unsupported")).toBe(false);
+		// The comments half of the lifecycle gate owns Pi tasks too, so
+		// legacy completion cannot strand a Pi dispatch receipt.
+		expect(state.legacyCompletionGated).toBe(true);
+	});
+
 	it("treats an unset agentId as the workspace's selected agent (non-Cline)", async () => {
 		// No per-card agentId: the effective agent is the workspace's selected
 		// agent, which here is non-Cline.
@@ -211,7 +224,7 @@ describe("pr-tracking api: tracking-state diagnostics", () => {
 		expect(state.commentsSupportedForTask).toBe(false);
 		expect(state.blockers).toContainEqual({
 			kind: "comments_unsupported",
-			message: "Comment follow-up automation requires a native Cline task.",
+			message: "Comment follow-up automation requires a native Cline or Pi task.",
 		});
 	});
 
@@ -225,7 +238,7 @@ describe("pr-tracking api: tracking-state diagnostics", () => {
 	});
 
 	it("does not gate legacy completion for a non-Cline task even with the comments checkbox on", async () => {
-		// The comments half of the lifecycle gate only owns native-Cline
+		// The comments half of the lifecycle gate only owns Cline and Pi
 		// tasks: a codex task with auto-finish-off must stay completable.
 		const board = makeBoard(makeCard({ autoAddressComments: true, autoFinishOnMerge: false, agentId: "codex" }));
 		mockWorkspaceState(board);

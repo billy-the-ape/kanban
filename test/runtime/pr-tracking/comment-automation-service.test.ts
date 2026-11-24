@@ -176,6 +176,11 @@ function makeService(
 			scope: { workspaceId: string; workspacePath: string },
 			body: RuntimeTaskChatSendRequest,
 		) => Promise<RuntimeTaskChatSendResponse>;
+		sendPi?: (
+			scope: { workspaceId: string; workspacePath: string },
+			taskId: string,
+			prepare: ClineTurnPreparation,
+		) => Promise<RuntimeTaskChatSendResponse>;
 		/** Stands in for the workspace's selected agent (default: cline). */
 		selectedAgentId?: RuntimeAgentId;
 		/** Stands in for the durable workspace index (default: nothing resolves). */
@@ -195,6 +200,7 @@ function makeService(
 	const sent: Array<{ scope: { workspaceId: string; workspacePath: string }; body: RuntimeTaskChatSendRequest }> = [];
 	const snapshotCalls: string[] = [];
 	const preparations: ClineTurnPreparation[] = [];
+	const piPreparations: ClineTurnPreparation[] = [];
 	const warnings: string[] = [];
 	const service = createPrCommentAutomationService({
 		listManagedWorkspaces: () => workspaces,
@@ -227,6 +233,12 @@ function makeService(
 				? overrides.send(scope, body)
 				: { ok: true, summary: null, message: { id: "msg-1", role: "user", content: body.text, createdAt: NOW } };
 		},
+		sendPreparedPiTaskMessage: overrides.sendPi
+			? async (scope, taskId, prepare) => {
+					piPreparations.push(prepare);
+					return await overrides.sendPi?.(scope, taskId, prepare) ?? { ok: false, summary: null };
+				}
+			: undefined,
 		getGitHubAccessScopeId: overrides.getGitHubAccessScopeId ?? (async () => "scope-1"),
 		// Harness effective-agent resolution: the card's explicit agentId
 		// stands in for the live session's agent; `selectedAgentId` stands
@@ -248,7 +260,7 @@ function makeService(
 		now: overrides.now ?? (() => NOW),
 		warn: (message) => warnings.push(message),
 	});
-	return { service, sent, workspaces, workspaceStates, snapshotCalls, preparations, warnings };
+	return { service, sent, workspaces, workspaceStates, snapshotCalls, preparations, piPreparations, warnings };
 }
 
 describe("applyPrPollOutcome", () => {
@@ -701,7 +713,7 @@ describe("PrCommentAutomationService", () => {
 		expect(result.state.pendingCount).toBe(0);
 	});
 
-	it("blocks non-Cline tasks in v1", async () => {
+	it("blocks terminal agents without a prepared feedback dispatcher", async () => {
 		const harness = makeService({
 			workspaceStates: new Map([
 				[
@@ -717,7 +729,7 @@ describe("PrCommentAutomationService", () => {
 		expect(result.state.blocker).toContain("Cline");
 	});
 
-	it("does not subscribe a task whose workspace-selected agent is not Cline", async () => {
+	it("does not subscribe a task whose workspace-selected agent is unsupported", async () => {
 		const harness = makeService({
 			workspaceStates: new Map([
 				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR] })])],
@@ -857,6 +869,65 @@ describe("PrCommentAutomationService", () => {
 		expect(automation.pendingFeedbackFingerprint).toBeNull();
 		expect(automation.pendingCount).toBeNull();
 		expect(automation.lastDispatchedFeedbackFingerprint).toEqual(fingerprint);
+	});
+
+	it("dispatches Pi feedback through the prepared terminal sender and settles its durable receipt", async () => {
+		const event = makeEvent({ providerId: "review-1", updatedAt: NOW - 471_000 });
+		const fingerprint = fingerprintOf([event]);
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			taskBindings: [{ workspaceId: "w1", taskId: "t1", terminal: false }],
+			commentAutomation: {
+				...record.commentAutomation,
+				repairOwner: { workspaceId: "w1", taskId: "t1", revision: 1 },
+				pendingFeedbackFingerprint: fingerprint,
+				pendingCount: 1,
+				firstPendingAt: NOW - 590_000,
+				debounceDeadline: NOW - 351_000,
+			},
+		}));
+		const piPrompts: string[] = [];
+		const harness = makeService({
+			workspaceStates: new Map([
+				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR], agentId: "pi" })])],
+			]),
+			snapshot: { events: [event] },
+			sendPi: async (_scope, taskId, prepare) => {
+				expect(taskId).toBe("t1");
+				const instruction = await prepare({ cwd: "/task-worktree", signal: new AbortController().signal });
+				if (instruction !== null) piPrompts.push(instruction);
+				return { ok: true, summary: null, message: null };
+			},
+		});
+		await harness.service.refreshWorkspace(scope);
+		expect((await harness.service.getTaskPrTrackingState(scope, "t1")).state.supported).toBe(true);
+		await harness.service.runTick();
+		expect(harness.sent).toHaveLength(0);
+		expect(harness.piPreparations).toHaveLength(1);
+		expect(piPrompts[0]).toContain(buildCommentHandlingInstruction(PR.url));
+		let record = await loadPrTrackingRecord(KEY);
+		expect(record.status).toBe("ok");
+		if (record.status !== "ok") throw new Error("unreachable");
+		expect(record.record.commentAutomation.dispatch?.status).toBe("running");
+		expect(record.record.commentAutomation.dispatch?.turnRef).toMatch(/^pi:/);
+		await harness.piPreparations[0]?.onSettled?.({ status: "completed" });
+		record = await loadPrTrackingRecord(KEY);
+		if (record.status !== "ok") throw new Error("unreachable");
+		expect(record.record.commentAutomation.dispatch?.status).toBe("completed");
+		await harness.service.runTick();
+		expect(harness.piPreparations).toHaveLength(1);
+	});
+
+	it("does not advertise Pi support if the terminal sender is missing", async () => {
+		const harness = makeService({
+			workspaceStates: new Map([
+				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR], agentId: "pi" })])],
+			]),
+		});
+		const state = (await harness.service.getTaskPrTrackingState(scope, "t1")).state;
+		expect(state.supported).toBe(false);
+		expect(state.blocker).toContain("Cline or Pi");
 	});
 
 	it("restarts the quiet window at settle when feedback arrived after the last poll", async () => {
@@ -1826,6 +1897,48 @@ describe("COMMENT-0 publication capture", () => {
 		await harness.service.refreshWorkspace(scope);
 		await harness.service.runTick();
 		expect(harness.sent).toHaveLength(0);
+	});
+
+	it("restores a null Pi feedback watermark after an unverified first repair on restart", async () => {
+		const event = makeEvent({ providerId: "conversation-1", updatedAt: NOW });
+		const fingerprint = fingerprintOf([event]);
+		await upsertSeed((record) => ({
+			...record,
+			revision: record.revision + 1,
+			taskBindings: [{ workspaceId: "w1", taskId: "t1", terminal: false }],
+			commentAutomation: {
+				...record.commentAutomation,
+				repairOwner: { workspaceId: "w1", taskId: "t1", revision: 1 },
+				lastDispatchedFeedbackFingerprint: fingerprint,
+				dispatch: {
+					dispatchId: "pi-first-repair",
+					attemptedAt: NOW - 5_000,
+					fingerprint,
+					previousFeedbackFingerprint: null,
+					ownerRevision: 1,
+					status: "running",
+					turnRef: "pi:pi-first-repair",
+					error: null,
+				},
+			},
+		}));
+		const harness = makeService({
+			workspaceStates: new Map([
+				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR], agentId: "pi" })])],
+			]),
+			sendPi: async () => ({ ok: true, summary: null, message: null }),
+		});
+		await harness.service.start();
+		try {
+			const loaded = await load();
+			expect(loaded.commentAutomation.dispatch?.status).toBe("failed");
+			expect(loaded.commentAutomation.dispatch?.error).toContain("Resume");
+			// Null is intentional: the first review batch must remain eligible
+			// after the operator reconciles GitHub and explicitly resumes.
+			expect(loaded.commentAutomation.lastDispatchedFeedbackFingerprint).toBeNull();
+		} finally {
+			await harness.service.dispose();
+		}
 	});
 
 	it("does not advance the dispatched watermark past an ignored implementation reply", async () => {

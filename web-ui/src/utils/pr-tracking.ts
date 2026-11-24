@@ -38,8 +38,9 @@ export function cardHasResolvableAutomationPr(card: BoardCard): boolean {
  * (comment follow-up and merge completion) are always installed, so the
  * gate keys off the card's own automation checkboxes — except the comments
  * half, which only owns tasks the comment automation can serve (native
- * Cline; an unset card agentId falls back to the workspace's selected
- * agent).
+ * Cline or Pi; an unset card agentId falls back to the workspace's selected
+ * agent). Mirrors the server's `isCommentServableAgent` in
+ * `src/pr-tracking/pr-lifecycle-gate.ts`.
  */
 export function isPrLifecycleGated(card: BoardCard, workspaceAgentId: RuntimeAgentId | null): boolean {
 	if (!cardHasResolvableAutomationPr(card)) {
@@ -49,7 +50,7 @@ export function isPrLifecycleGated(card: BoardCard, workspaceAgentId: RuntimeAge
 		return true;
 	}
 	const effectiveAgentId = card.agentId ?? workspaceAgentId;
-	return card.autoAddressComments === true && effectiveAgentId === "cline";
+	return card.autoAddressComments === true && (effectiveAgentId === "cline" || effectiveAgentId === "pi");
 }
 
 /** The task ids whose legacy completion is gated by the installed PR consumers. */

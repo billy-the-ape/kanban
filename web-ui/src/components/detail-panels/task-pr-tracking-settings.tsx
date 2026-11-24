@@ -67,7 +67,7 @@ function PrTrackingCheckbox({
 
 /**
  * The PR tracking settings/status block: checkbox preferences (with
- * feature-unavailable / native-Cline hints), the separately labelled
+ * feature-unavailable / Cline-or-Pi hints), the separately labelled
  * Automation PR selector, blockers, repair-owner information, lifecycle
  * messages and the explicit Resume PR tracking action. Rendering or
  * toggling anything here never enables or resumes automation on its own —

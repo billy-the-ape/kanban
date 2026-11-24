@@ -54,6 +54,7 @@ import type { PrFeedbackEvent } from "./feedback-fingerprint";
 import { computePrFeedbackFingerprint, findPrFeedbackPendingEvents } from "./feedback-fingerprint";
 import type { GitHubPrClient, GitHubPrSnapshot } from "./github-pr-client";
 import { listPrTrackingRecords, loadPrTrackingRecord, upsertPrTrackingRecord } from "./pr-comment-record-store";
+import { isCommentServableAgent } from "./pr-lifecycle-gate";
 import {
 	analyzePrPublication,
 	detectPublicationOperations,
@@ -161,6 +162,12 @@ export interface PrCommentAutomationServiceDependencies {
 		scope: PrCommentAutomationWorkspaceScope,
 		body: RuntimeTaskChatSendRequest,
 		preparePrompt?: ClineTurnPreparation,
+	) => Promise<RuntimeTaskChatSendResponse>;
+	/** Pi accepts prepared repair turns through its task-scoped PTY. */
+	sendPreparedPiTaskMessage?: (
+		scope: PrCommentAutomationWorkspaceScope,
+		taskId: string,
+		preparePrompt: ClineTurnPreparation,
 	) => Promise<RuntimeTaskChatSendResponse>;
 	/**
 	 * Effective agent for a card — a live session's agent when one exists,
@@ -611,11 +618,13 @@ export class PrCommentAutomationService {
 	}
 
 	/**
-	 * COMMENT-0 v1 support gate: the task's effective agent must be the
-	 * native Cline agent. An unset per-card agentId inherits the
-	 * workspace's selected agent (resolved like task start), not Cline.
+	 * Only agents with a verified, prepared-turn sender are supported.
+	 * Other terminal harnesses remain blocked to avoid losing dispatch receipts.
 	 */
-	private async isClineAgentTask(scope: PrCommentAutomationWorkspaceScope, card: RuntimeBoardCard): Promise<boolean> {
+	private async isSupportedAgentTask(
+		scope: PrCommentAutomationWorkspaceScope,
+		card: RuntimeBoardCard,
+	): Promise<boolean> {
 		let effectiveAgentId: RuntimeAgentId | null = null;
 		if (this.deps.getEffectiveTaskAgentId) {
 			try {
@@ -624,11 +633,14 @@ export class PrCommentAutomationService {
 				effectiveAgentId = null;
 			}
 		}
-		if (effectiveAgentId === null && card.agentId === "cline") {
-			// Resolver unavailable: only an explicit per-card Cline counts.
-			effectiveAgentId = "cline";
+		if (effectiveAgentId === null && isCommentServableAgent(card.agentId)) {
+			// Resolver unavailable: only an explicit servable per-card agent counts.
+			effectiveAgentId = card.agentId;
 		}
-		return effectiveAgentId === "cline";
+		return (
+			effectiveAgentId === "cline" ||
+			(effectiveAgentId === "pi" && this.deps.sendPreparedPiTaskMessage !== undefined)
+		);
 	}
 
 	/**
@@ -684,7 +696,7 @@ export class PrCommentAutomationService {
 					(pullRequest) => pullRequest.provider === "github" && pullRequest.host === "github.com",
 				);
 				const pullRequest = prs.length === 1 ? (prs[0] ?? null) : null;
-				if (pullRequest === null || !(await this.isClineAgentTask(scope, card))) {
+				if (pullRequest === null || !(await this.isSupportedAgentTask(scope, card))) {
 					continue;
 				}
 				const key = getPullRequestIdentityKey(pullRequest);
@@ -947,6 +959,16 @@ export class PrCommentAutomationService {
 			return;
 		}
 		if (dispatch !== null && dispatch.status === "running") {
+			if (dispatch.turnRef?.startsWith("pi:")) {
+				// Pi's exact turn is settled by its live hook observer, never by
+				// a generic output timestamp. If the observer is gone, fail closed.
+				await this.setDispatchFailed(
+					sub,
+					"Pi PR repair lost its completion observer; inspect GitHub and Resume explicitly.",
+					dispatch.dispatchId,
+				);
+				return;
+			}
 			if (!owner) {
 				await this.setDispatchFailed(sub, `The repair owner is unavailable; resume manually.`, dispatch.dispatchId);
 				return;
@@ -1295,15 +1317,25 @@ export class PrCommentAutomationService {
 				if (this.liveDispatches.get(sub.key) === dispatchId) this.liveDispatches.delete(sub.key);
 			}
 		};
-		const response = await this.deps.sendTaskChatMessage(
-			scope,
-			{
-				taskId: owner.taskId,
-				text: `Queued automatic PR repair for ${sub.pr.url}. Feedback will be captured when execution begins.`,
-				mode: "act",
-			},
-			prepare,
-		);
+		// Both agents use the same queued intent, preparation, and completion receipt.
+		const effectiveAgentId = (await this.deps.getEffectiveTaskAgentId?.(scope, owner.taskId)) ?? "cline";
+		let response: RuntimeTaskChatSendResponse;
+		if (effectiveAgentId === "pi") {
+			const sendPi = this.deps.sendPreparedPiTaskMessage;
+			response = sendPi
+				? await sendPi(scope, owner.taskId, prepare)
+				: { ok: false, summary: null, error: "Pi PR comment dispatcher is not configured." };
+		} else {
+			response = await this.deps.sendTaskChatMessage(
+				scope,
+				{
+					taskId: owner.taskId,
+					text: `Queued automatic PR repair for ${sub.pr.url}. Feedback will be captured when execution begins.`,
+					mode: "act",
+				},
+				prepare,
+			);
+		}
 		if (response.ok) {
 			await upsertPrTrackingRecord(sub.key, identity, (record) => {
 				const dispatch = record.commentAutomation.dispatch;
@@ -1313,7 +1345,10 @@ export class PrCommentAutomationService {
 					revision: record.revision + 1,
 					commentAutomation: {
 						...record.commentAutomation,
-						dispatch: { ...dispatch, turnRef: response.message?.id ?? null },
+						dispatch: {
+							...dispatch,
+							turnRef: effectiveAgentId === "pi" ? `pi:${dispatchId}` : (response.message?.id ?? null),
+						},
 					},
 				};
 			});
@@ -1385,7 +1420,7 @@ export class PrCommentAutomationService {
 				!card?.autoAddressComments ||
 				prs.length !== 1 ||
 				getPullRequestIdentityKey(prs[0]) !== sub.key ||
-				!(await this.isClineAgentTask(scope, card))
+				!(await this.isSupportedAgentTask(scope, card))
 			)
 				return skip();
 			const loaded = await loadPrTrackingRecord(sub.key);
@@ -2155,11 +2190,17 @@ export class PrCommentAutomationService {
 			let sessionLastOutputAt: number | null = null;
 			let taskExists = false;
 			let workspaceStateUnavailable = false;
+			let piOwnerAtRestart = false;
 			if (owner) {
 				const workspace = await this.resolveWorkspaceScope(owner.workspaceId);
 				if (workspace) {
 					const state = await this.deps.loadWorkspaceState(workspace.workspacePath).catch(() => null);
 					if (state) {
+						piOwnerAtRestart =
+							(await this.deps.getEffectiveTaskAgentId?.(workspace, owner.taskId).then(
+								(agentId) => agentId === "pi",
+								() => false,
+							)) ?? false;
 						taskExists = state.board.columns.some((column) =>
 							column.cards.some((card) => card.id === owner.taskId),
 						);
@@ -2219,6 +2260,36 @@ export class PrCommentAutomationService {
 					);
 				}
 				// Otherwise: keep queued; the deadline pass re-validates.
+				continue;
+			}
+			if (piOwnerAtRestart || dispatch.turnRef?.startsWith("pi:")) {
+				// After a restart no exact Pi turn outcome can be proved. Require
+				// explicit Resume rather than replaying feedback or guessing success.
+				await upsertPrTrackingRecord(
+					record.canonicalPrKey,
+					{ accessScopeId: record.accessScopeId, pr: record.pr },
+					(current) => {
+						const active = current.commentAutomation.dispatch;
+						if (current.revision !== record.revision || active?.dispatchId !== dispatch.dispatchId)
+							return current;
+						return {
+							...current,
+							revision: current.revision + 1,
+							commentAutomation: {
+								...current.commentAutomation,
+								lastDispatchedFeedbackFingerprint:
+									active.previousFeedbackFingerprint !== undefined
+										? active.previousFeedbackFingerprint
+										: current.commentAutomation.lastDispatchedFeedbackFingerprint,
+								dispatch: {
+									...active,
+									status: "failed",
+									error: "Pi repair was interrupted by server restart; inspect GitHub and Resume explicitly.",
+								},
+							},
+						};
+					},
+				);
 				continue;
 			}
 			if (sessionState === "running" && dispatch.status !== "waiting") {
@@ -2308,7 +2379,9 @@ export class PrCommentAutomationService {
 		);
 		// Same effective-agent gate as subscription and dispatch (an unset
 		// card agentId inherits the workspace's selected agent, not Cline).
-		const supported = enabled ? await this.isClineAgentTask(scope, card) : (card.agentId ?? "cline") === "cline";
+		const supported = enabled
+			? await this.isSupportedAgentTask(scope, card)
+			: (card.agentId ?? "cline") === "cline" || card.agentId === "pi";
 		if (!enabled) {
 			return { ok: true, state: { ...neutral, pr: prs[0] ?? null } };
 		}
@@ -2320,7 +2393,7 @@ export class PrCommentAutomationService {
 					enabled: true,
 					supported: false,
 					pr: prs[0] ?? null,
-					blocker: `Comment handling supports the native Cline agent only in v1.`,
+					blocker: `Automatic comment handling requires a Cline or Pi task session.`,
 				},
 			};
 		}

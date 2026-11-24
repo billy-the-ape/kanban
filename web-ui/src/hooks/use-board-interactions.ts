@@ -100,7 +100,7 @@ interface UseBoardInteractionsInput {
 	backendTaskDispatchEnabled?: boolean;
 	/**
 	 * The workspace's selected agent: resolves an unset card agentId for the
-	 * PR lifecycle gate (the comments half only serves native-Cline tasks).
+	 * PR lifecycle gate (the comments half only serves Cline and Pi tasks).
 	 */
 	selectedAgentId?: RuntimeAgentId | null;
 }
@@ -691,7 +691,7 @@ export function useBoardInteractions({
 	// PRTRACK-1: the shared lifecycle gate — legacy automatic completion is
 	// skipped for tasks whose linked PR workflow is owned by an installed
 	// enabled consumer (both consumers are always installed; the comments
-	// half only owns native-Cline tasks).
+	// half only owns Cline or Pi tasks).
 	const prCompletionGatedTaskIds = useMemo(
 		() => computePrLifecycleGatedTaskIds(board, selectedAgentId),
 		[board, selectedAgentId],

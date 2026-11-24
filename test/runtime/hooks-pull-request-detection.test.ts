@@ -2,7 +2,7 @@
 // from the agent's hook payload — raw tool output never crosses the wire.
 import { describe, expect, it } from "vitest";
 
-import { extractHookPullRequestUrls } from "../../src/commands/hooks";
+import { extractHookPullRequestUrls, extractPiPublicationTool } from "../../src/commands/hooks";
 
 describe("extractHookPullRequestUrls", () => {
 	it("detects a PR created via gh in a Claude-style Bash payload", () => {
@@ -83,5 +83,49 @@ describe("extractHookPullRequestUrls", () => {
 				tool_response: { stdout: "", stderr: "" },
 			}),
 		).toBeUndefined();
+	});
+});
+
+describe("extractPiPublicationTool", () => {
+	it("captures Pi's attributed gh comment write with its tool call id", () => {
+		const event = extractPiPublicationTool({
+			hook_event_name: "tool_execution_end",
+			tool_name: "bash",
+			tool_call_id: "call-42",
+			tool_input: { command: "gh pr comment 42 --repo octo/repo --body 'Addressed'" },
+			tool_response: { output: "https://github.com/octo/repo/pull/42#issuecomment-51" },
+			tool_is_error: false,
+		}, "pi");
+		expect(event).toMatchObject({
+			phase: "finished",
+			toolCallId: "call-42",
+			toolName: "bash",
+			commands: ["gh pr comment 42 --repo octo/repo --body 'Addressed'"],
+			output: "https://github.com/octo/repo/pull/42#issuecomment-51",
+			error: null,
+		});
+	});
+
+	it("ignores ordinary Pi commands and read-only GitHub operations", () => {
+		for (const command of ["git status --short", "npm test", "gh pr view 42 --json comments"]) {
+			expect(extractPiPublicationTool({
+				hook_event_name: "tool_execution_end",
+				tool_name: "bash",
+				tool_input: { command },
+				tool_response: { output: "https://github.com/octo/repo/pull/42" },
+			}, "pi")).toBeUndefined();
+		}
+	});
+
+	it("ignores non-Pi tool events and preserves failure evidence", () => {
+		const payload = {
+			hook_event_name: "tool_execution_end",
+			tool_name: "bash",
+			tool_input: { command: "gh pr comment 42 --body 'retry'" },
+			tool_response: { output: "HTTP 403" },
+			tool_is_error: true,
+		};
+		expect(extractPiPublicationTool(payload, "cline")).toBeUndefined();
+		expect(extractPiPublicationTool(payload, "pi")?.error).toBe("HTTP 403");
 	});
 });
