@@ -116,8 +116,10 @@ import {
 	type TaskDispatchDeps,
 } from "../task-dispatch/task-dispatch-service";
 import { buildRuntimeConfigResponse, describeUnrunnableAgent, resolveAgentCommand } from "../terminal/agent-registry";
+import { sharedPiInitialTurnCapacityGate } from "../terminal/pi-initial-turn-capacity";
 import { derivePiSessionId, getPiTaskSessionDir, readPiSessionRecord } from "../terminal/pi-session-options";
 import { collectRestorablePiCardIds, isDetachedPiRestoreCandidate } from "../terminal/pi-session-restore";
+import { resolvePiTurnTarget } from "../terminal/pi-turn-target";
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { createVerificationRunner } from "../verification/verification-service";
 import { evaluateDependentsUnlock, getGitDeliveryService, readTaskDeliveryReceipt } from "../workspace/git-delivery";
@@ -667,8 +669,10 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				}
 			}
 			const launchVersion = taskLaunchVersions.get(body.taskId) ?? 0;
+			const isLaunchCurrent = (): boolean =>
+				!returningTaskIds.has(body.taskId) && launchVersion === (taskLaunchVersions.get(body.taskId) ?? 0);
 			const assertLaunchCurrent = () => {
-				if (returningTaskIds.has(body.taskId) || launchVersion !== (taskLaunchVersions.get(body.taskId) ?? 0)) {
+				if (!isLaunchCurrent()) {
 					throw new Error("Task was returned to Backlog during launch.");
 				}
 			};
@@ -869,25 +873,32 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				};
 			}
 			assertLaunchCurrent();
-			const summary = await terminalManager.startTaskSession({
-				taskId: body.taskId,
-				agentId: resolved.agentId,
-				binary: resolved.binary,
-				args: resolved.args,
-				autonomousModeEnabled: scopedRuntimeConfig.agentAutonomousModeEnabled,
-				cwd: taskCwd,
-				prompt: body.prompt,
-				images: body.images,
-				startInPlanMode: body.startInPlanMode,
-				resumeFromTrash: body.resumeFromTrash,
-				restoreDetachedSession: body.restoreDetachedSession,
-				cols: body.cols,
-				rows: body.rows,
-				workspaceId: workspaceScope.workspaceId,
-			});
-
-			let nextSummary = summary;
-			if (shouldCaptureTurnCheckpoint) {
+			const launchTerminal = async () =>
+				await terminalManager.startTaskSession({
+					taskId: body.taskId,
+					agentId: resolved.agentId,
+					binary: resolved.binary,
+					args: resolved.args,
+					autonomousModeEnabled: scopedRuntimeConfig.agentAutonomousModeEnabled,
+					cwd: taskCwd,
+					prompt: body.prompt,
+					images: body.images,
+					startInPlanMode: body.startInPlanMode,
+					resumeFromTrash: body.resumeFromTrash,
+					restoreDetachedSession: body.restoreDetachedSession,
+					cols: body.cols,
+					rows: body.rows,
+					workspaceId: workspaceScope.workspaceId,
+				});
+			/**
+			 * Captures the requested turn checkpoint after a launch and returns the
+			 * summary it saved. A queued start runs this from the background spawn, so
+			 * the checkpoint still describes the worktree as its agent sees it.
+			 */
+			const captureTurnCheckpoint = async (summary: RuntimeTaskSessionSummary) => {
+				if (!shouldCaptureTurnCheckpoint) {
+					return summary;
+				}
 				try {
 					const nextTurn = (summary.latestTurnCheckpoint?.turn ?? 0) + 1;
 					const checkpoint = await captureTaskTurnCheckpoint({
@@ -895,14 +906,49 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 						taskId: body.taskId,
 						turn: nextTurn,
 					});
-					nextSummary = terminalManager.applyTurnCheckpoint(body.taskId, checkpoint) ?? summary;
+					return terminalManager.applyTurnCheckpoint(body.taskId, checkpoint) ?? summary;
 				} catch {
 					// Best effort checkpointing only.
+					return summary;
 				}
+			};
+			// Initial Pi coding turns share the same model-capacity pool as Cline.
+			// The start request itself never waits for admission: a queued Pi start
+			// returns the manager's waiting record now and its CLI spawns in the
+			// background once the model frees a slot. Task dispatch awaits this call
+			// while it holds the per-workspace dispatch lock (documented as brief),
+			// and must not hold it across another task's whole first turn.
+			// Restoring an existing conversation never consumes a new admission, and
+			// Pi's native follow-up turns are not intercepted by this start gate.
+			if (
+				resolved.agentId === "pi" &&
+				!body.restoreDetachedSession &&
+				body.prompt.trim().length > 0 &&
+				!terminalManager.hasActiveProcess(body.taskId)
+			) {
+				const admission = await sharedPiInitialTurnCapacityGate.request({
+					workspaceId: workspaceScope.workspaceId,
+					taskId: body.taskId,
+					workspacePath: taskCwd,
+					manager: terminalManager,
+					target: await resolvePiTurnTarget(resolved.args),
+					// A queued start spawns later from inside the gate, and captures
+					// its turn checkpoint when the CLI actually starts.
+					launch: async () => await captureTurnCheckpoint(await launchTerminal()),
+					isCurrent: isLaunchCurrent,
+				});
+				// A launched admission returns the checkpointed launch summary; a
+				// queued one returns the waiting record that describes the card
+				// until its CLI spawns.
+				return {
+					ok: true,
+					summary: admission.summary,
+					initialStart,
+				};
 			}
 			return {
 				ok: true,
-				summary: nextSummary,
+				summary: await captureTurnCheckpoint(await launchTerminal()),
 				initialStart,
 			};
 		} catch (error) {
@@ -957,6 +1003,10 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					terminal: terminalManager,
 					clineSummaries: clineTaskSessionService.listSummaries(),
 					reviewSummaries: reviewSessionService?.listSessionSummaries() ?? [],
+					// AA-P2: a Pi start queued for a model slot has no process yet, but
+					// the card still owns the worker slot the pass gave it. The queue
+					// answers for its own waits, so nothing stale can hold a slot.
+					capacityWait: (taskId) => sharedPiInitialTurnCapacityGate.hasPending(workspaceScope.workspaceId, taskId),
 				});
 			},
 			readReceipt: (taskId) => readTaskDeliveryReceipt(taskId),
@@ -2010,6 +2060,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		stopTaskSession: async (workspaceScope, input) => {
 			try {
 				const body = parseTaskSessionStopRequest(input);
+				const canceledPiAdmission = sharedPiInitialTurnCapacityGate.cancel(workspaceScope.workspaceId, body.taskId);
 				const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
 				const clineSummary = await clineTaskSessionService.stopTaskSession(body.taskId);
 				if (clineSummary) {
@@ -2026,7 +2077,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					runTaskDispatchAfterStateChange(workspaceScope);
 				}
 				return {
-					ok: Boolean(summary),
+					ok: Boolean(summary) || canceledPiAdmission,
 					summary,
 				};
 			} catch (error) {

@@ -7,9 +7,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
-
+import { PR_CI_HANDOFF_GUIDANCE } from "../../../src/prompts/pr-ci-handoff";
 import { type AgentAdapterLaunchInput, prepareAgentLaunch } from "../../../src/terminal/agent-session-adapters";
-import { preparePiLaunch } from "../../../src/terminal/pi-session-adapter";
+import { preparePiLaunch, withPiCiHandoffGuidance } from "../../../src/terminal/pi-session-adapter";
 import {
 	buildPiLaunchArgs,
 	derivePiSessionId,
@@ -229,6 +229,18 @@ describe("readPiSessionRecord", () => {
 	});
 });
 
+describe("Pi CI handoff policy", () => {
+	it("adds CI no-poll instructions once to real task prompts", () => {
+		const prompt = withPiCiHandoffGuidance("Open the PR");
+		expect(prompt).toContain("do not sleep, poll, watch checks");
+		expect(withPiCiHandoffGuidance(prompt)).toBe(prompt);
+	});
+	it("does not transform empty restore prompts into model turns", () => {
+		expect(withPiCiHandoffGuidance("")).toBe("");
+		expect(withPiCiHandoffGuidance("   ")).toBe("   ");
+	});
+});
+
 describe("preparePiLaunch", () => {
 	it("starts the task in its own session with the generated extension", async () => {
 		setupTempHome();
@@ -252,14 +264,16 @@ describe("preparePiLaunch", () => {
 		expect(launch.env.KANBAN_HOOK_WORKSPACE_ID).toBe("workspace-1");
 		// The prompt is appended as data after `--`, never as an option Pi parses.
 		const promptIndex = launch.args.length - 1;
-		expect(launch.args[promptIndex]).toBe("Fix the flaky test");
+		expect(launch.args[promptIndex]).toContain("Fix the flaky test");
+		expect(launch.args[promptIndex]).toContain(PR_CI_HANDOFF_GUIDANCE);
 		expect(launch.args[promptIndex - 1]).toBe("--");
 	});
 
 	it("keeps a prompt that starts with a dash away from option parsing", async () => {
 		setupTempHome();
 		const launch = await preparePiLaunch(piLaunchInput({ prompt: "--no-session is not what I meant" }));
-		expect(launch.args.slice(-2)).toEqual(["--", "--no-session is not what I meant"]);
+		expect(launch.args.at(-2)).toBe("--");
+		expect(launch.args.at(-1)).toContain("--no-session is not what I meant");
 	});
 
 	it("reports the next launch as a resume of the session it created", async () => {

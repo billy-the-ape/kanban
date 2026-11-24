@@ -2,6 +2,7 @@
 // Keep protocol-specific parsing here so the runtime and repository can stay
 // focused on lifecycle, storage, and task-facing orchestration.
 import type { RuntimeTaskSessionSummary } from "../core/api-contract";
+import { MODEL_CAPACITY_WAIT_ACTIVITY_TEXT, MODEL_CAPACITY_WAIT_HOOK_EVENT_NAME } from "../core/task-display-state";
 import {
 	appendAssistantChunk,
 	appendReasoningChunk,
@@ -280,11 +281,11 @@ export function applyClineSessionEvent(input: ApplyClineSessionEventInput): void
 			latestHookActivity: {
 				queuePosition,
 				canReturnToBacklog: queued && concurrencyEvent.canReturnToBacklog === true,
-				activityText: queued ? "Waiting for model capacity" : "Agent active",
+				activityText: queued ? MODEL_CAPACITY_WAIT_ACTIVITY_TEXT : "Agent active",
 				toolName: null,
 				toolInputSummary: null,
 				finalMessage: null,
-				hookEventName: queued ? "concurrency_waiting" : "turn_start",
+				hookEventName: queued ? MODEL_CAPACITY_WAIT_HOOK_EVENT_NAME : "turn_start",
 				notificationType: null,
 				source: "cline-sdk",
 			},

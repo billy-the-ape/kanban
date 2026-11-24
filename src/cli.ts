@@ -34,6 +34,7 @@ import { disablePasscode, generateInternalToken, generatePasscode } from "./secu
 import { terminateProcessForTimeout } from "./server/process-termination";
 import type { RuntimeStateHub } from "./server/runtime-state-hub";
 import { captureNodeException, flushNodeTelemetry } from "./telemetry/sentry-node.js";
+import { sharedPiInitialTurnCapacityGate } from "./terminal/pi-initial-turn-capacity";
 import type { TerminalSessionManager } from "./terminal/session-manager";
 import { runOnDemandUpdate } from "./update/update";
 
@@ -407,6 +408,16 @@ async function startServer(): Promise<{
 		import("./update/update.js"),
 	]);
 	let runtimeStateHub: RuntimeStateHub | undefined;
+	const trackTerminalManager = (workspaceId: string, manager: TerminalSessionManager): void => {
+		// A Pi start queued for a model slot holds a claim with no process behind
+		// it, so bulk-stopping this workspace's sessions cannot reach it: without
+		// dropping that claim, the slot freed by shutdown or project removal would
+		// admit a fresh CLI against a manager that is being torn down.
+		manager.setOnBulkStop(() => {
+			sharedPiInitialTurnCapacityGate.cancelWorkspace(workspaceId);
+		});
+		runtimeStateHub?.trackTerminalManager(workspaceId, manager);
+	};
 	const workspaceRegistry = await createWorkspaceRegistry({
 		cwd: process.cwd(),
 		loadGlobalRuntimeConfig,
@@ -415,7 +426,7 @@ async function startServer(): Promise<{
 		pathIsDirectory,
 		getClineTaskSessionSummaries: (workspaceId) => runtimeStateHub?.listClineTaskSessionSummaries(workspaceId) ?? [],
 		onTerminalManagerReady: (workspaceId, manager) => {
-			runtimeStateHub?.trackTerminalManager(workspaceId, manager);
+			trackTerminalManager(workspaceId, manager);
 		},
 	});
 	runtimeStateHub = createRuntimeStateHub({
@@ -423,7 +434,7 @@ async function startServer(): Promise<{
 	});
 	const runtimeHub = runtimeStateHub;
 	for (const { workspaceId, terminalManager } of workspaceRegistry.listManagedWorkspaces()) {
-		runtimeHub.trackTerminalManager(workspaceId, terminalManager);
+		trackTerminalManager(workspaceId, terminalManager);
 	}
 
 	const disposeTrackedWorkspace = (

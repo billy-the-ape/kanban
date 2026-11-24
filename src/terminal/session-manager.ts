@@ -8,6 +8,7 @@ import type {
 	RuntimeTaskSessionSummary,
 	RuntimeTaskTurnCheckpoint,
 } from "../core/api-contract";
+import { MODEL_CAPACITY_WAIT_ACTIVITY_TEXT, MODEL_CAPACITY_WAIT_HOOK_EVENT_NAME } from "../core/task-display-state";
 import {
 	type AgentAdapterLaunchInput,
 	type AgentOutputTransitionDetector,
@@ -39,6 +40,8 @@ import { TerminalStateMirror } from "./terminal-state-mirror";
 const MAX_WORKSPACE_TRUST_BUFFER_CHARS = 16_384;
 const AUTO_RESTART_WINDOW_MS = 5_000;
 const MAX_AUTO_RESTARTS_PER_WINDOW = 3;
+/** Shown on a task whose initial Pi start is queued behind another model turn. */
+const MODEL_CAPACITY_WAIT_MESSAGE = "Waiting for a free model slot; the agent starts when the model has capacity.";
 // TUI apps (Codex, OpenCode) can query OSC 10/11 before the browser terminal is attached
 // and ready to answer. We intercept those startup probes during early PTY output, synthesize
 // foreground/background color replies, then disable the filter once a live terminal listener
@@ -218,6 +221,8 @@ function hasCodexStartupUiRendered(text: string): boolean {
 export class TerminalSessionManager implements TerminalSessionService {
 	private readonly entries = new Map<string, SessionEntry>();
 	private readonly summaryListeners = new Set<(summary: RuntimeTaskSessionSummary) => void>();
+	/** Runs before this manager's sessions are bulk-stopped; see `setOnBulkStop`. */
+	private bulkStopListener: (() => void) | null = null;
 
 	private trySendDeferredCodexStartupInput(taskId: string): boolean {
 		const entry = this.entries.get(taskId);
@@ -855,6 +860,78 @@ export class TerminalSessionManager implements TerminalSessionService {
 		return cloneSummary(summary);
 	}
 
+	/**
+	 * AA-P2: an initial Pi start that has to wait for a model slot has no
+	 * process to describe yet, so this record is the only thing the board card,
+	 * the terminal viewer, and Stop can point at while the capacity queue holds
+	 * it. `idle` (not `running`) is deliberate: a process-less waiting record
+	 * must never look like a Pi conversation the guarded restore may reattach.
+	 * The shared capacity-wait marker is what makes the record self-describing;
+	 * dispatch counts the card's worker slot from the queue's own pending ids
+	 * (see `PiInitialTurnCapacityGate.hasPending`), not from this record, so a
+	 * stale record left by a restart cannot hold a slot forever. The real launch
+	 * summary replaces it as soon as a slot frees.
+	 */
+	recordModelCapacityWait(input: {
+		taskId: string;
+		agentId: AgentAdapterLaunchInput["agentId"];
+		workspacePath: string;
+		/** The capacity queue's position for this start, when the queue knows it. */
+		queuePosition?: number | null;
+	}): RuntimeTaskSessionSummary {
+		const entry = this.ensureEntry(input.taskId);
+		const summary = updateSummary(entry, {
+			state: "idle",
+			agentId: input.agentId,
+			workspacePath: input.workspacePath,
+			pid: null,
+			startedAt: null,
+			lastOutputAt: null,
+			reviewReason: null,
+			exitCode: null,
+			lastHookAt: null,
+			latestHookActivity: {
+				// Only a queued Cline turn can hand its card back to Backlog; a
+				// queued Pi start is canceled with Stop instead.
+				canReturnToBacklog: false,
+				queuePosition: typeof input.queuePosition === "number" ? input.queuePosition : null,
+				activityText: MODEL_CAPACITY_WAIT_ACTIVITY_TEXT,
+				toolName: null,
+				toolInputSummary: null,
+				finalMessage: null,
+				// Same marker the Cline queue writes, so a card waiting for a
+				// model slot says the same thing whichever agent owns it.
+				hookEventName: MODEL_CAPACITY_WAIT_HOOK_EVENT_NAME,
+				notificationType: null,
+				source: "kanban",
+			},
+			warningMessage: MODEL_CAPACITY_WAIT_MESSAGE,
+		});
+		this.emitSummary(summary);
+		return cloneSummary(summary);
+	}
+
+	/**
+	 * Ends a capacity wait whose queued launch never produced a process: with an
+	 * `error` the waiting record becomes a normal failure, and without one the
+	 * wait was canceled (Stop). A live process means the queued launch won, so
+	 * its own summary is left alone.
+	 */
+	settleModelCapacityWait(taskId: string, error: string | null): RuntimeTaskSessionSummary | null {
+		const entry = this.entries.get(taskId);
+		if (!entry || entry.active) {
+			return entry ? cloneSummary(entry.summary) : null;
+		}
+		const summary = updateSummary(
+			entry,
+			error !== null
+				? { state: "failed", reviewReason: "error", warningMessage: error, latestHookActivity: null }
+				: { state: "idle", reviewReason: null, warningMessage: null, latestHookActivity: null },
+		);
+		this.emitSummary(summary);
+		return cloneSummary(summary);
+	}
+
 	writeInput(taskId: string, data: Buffer): RuntimeTaskSessionSummary | null {
 		const entry = this.entries.get(taskId);
 		if (!entry?.active) {
@@ -1080,7 +1157,26 @@ export class TerminalSessionManager implements TerminalSessionService {
 		return cloneSummary(entry.summary);
 	}
 
+	/**
+	 * Registers the work that must run when every session on this manager is
+	 * bulk-stopped. That stop can only reach processes, so a claim with no process
+	 * behind it - a Pi start queued for a model slot, wired in the composition root
+	 * - survives it and would spawn later against a manager being torn down, once
+	 * the stopped process frees the slot.
+	 */
+	setOnBulkStop(listener: () => void): void {
+		this.bulkStopListener = listener;
+	}
+
 	markInterruptedAndStopAll(): RuntimeTaskSessionSummary[] {
+		// Drop queued work before stopping anything: ending the session that holds
+		// a model slot frees it, and a start queued behind it would otherwise be
+		// admitted while this manager is still being shut down or disposed.
+		try {
+			this.bulkStopListener?.();
+		} catch {
+			// Best effort: releasing a claim never outranks stopping live work.
+		}
 		const activeEntries = Array.from(this.entries.values()).filter((entry) => entry.active != null);
 		for (const entry of activeEntries) {
 			if (!entry.active) {

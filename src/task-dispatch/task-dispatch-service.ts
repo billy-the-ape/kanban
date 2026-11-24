@@ -84,6 +84,12 @@ export interface TaskDispatchSessionSnapshot {
 	 * when their persisted state still reads "running".
 	 */
 	live: boolean;
+	/**
+	 * True while this session's start is queued for a model slot: there is no
+	 * process yet, so `live` is false, yet the card still owns the worker slot
+	 * the dispatch pass gave it and its CLI launches as soon as the model frees.
+	 */
+	waitingForCapacity?: boolean;
 }
 
 /**
@@ -101,11 +107,19 @@ export function collectTaskDispatchSessions(input: {
 	};
 	clineSummaries: RuntimeTaskSessionSummary[];
 	reviewSummaries?: RuntimeTaskSessionSummary[];
+	/**
+	 * Whether a terminal start is queued for a model slot. The runtime's
+	 * capacity queue is the authority here (a waiting record on its own could
+	 * outlive the wait across a restart), and a queued card still holds its
+	 * worker slot — see `getActiveWorkerTaskIds`.
+	 */
+	capacityWait?: (taskId: string) => boolean;
 }): TaskDispatchSessionSnapshot[] {
 	return [
 		...input.terminal.listSummaries().map((summary) => ({
 			summary,
 			live: input.terminal.hasActiveProcess(summary.taskId),
+			waitingForCapacity: input.capacityWait?.(summary.taskId) ?? false,
 		})),
 		...input.clineSummaries.map((summary) => ({ summary, live: summary.state === "running" })),
 		...(input.reviewSummaries ?? []).map((summary) => ({
@@ -401,10 +415,15 @@ async function buildReadinessInput(
 
 /**
  * Task ids holding a model worker slot. A slot belongs to a board card in
- * in_progress or review whose session is either running in this runtime or
- * finished and awaiting review. Sessions that are not board cards (home agent,
- * home and per-task shell terminals) never hold a slot, and neither do
- * summaries hydrated from disk that only claim to be running.
+ * in_progress or review whose session is either running in this runtime,
+ * finished and awaiting review, or waiting for a model slot — a queued start
+ * has no process yet but its CLI launches as soon as the model frees, so it
+ * still owns the slot the pass gave it. Without that last case a queue of
+ * waiting cards would let each pass start more work past `workerLimit` (the
+ * whole ready backlog would drain into In Progress). Sessions that are not
+ * board cards (home agent, home and per-task shell terminals) never hold a
+ * slot, and neither do summaries hydrated from disk that only claim to be
+ * running.
  */
 export function getActiveWorkerTaskIds(sessions: TaskDispatchSessionSnapshot[], board: RuntimeBoardData): string[] {
 	const workerTaskIds = new Set<string>();
@@ -414,7 +433,7 @@ export function getActiveWorkerTaskIds(sessions: TaskDispatchSessionSnapshot[], 
 			continue;
 		}
 		const { state } = session.summary;
-		if ((state === "running" && session.live) || state === "awaiting_review") {
+		if (session.waitingForCapacity === true || (state === "running" && session.live) || state === "awaiting_review") {
 			workerTaskIds.add(session.summary.taskId);
 		}
 	}
@@ -423,11 +442,15 @@ export function getActiveWorkerTaskIds(sessions: TaskDispatchSessionSnapshot[], 
 
 /**
  * Whether a task still has a session that restart reconciliation must not
- * replace: one running in this runtime, or one that finished and awaits review.
+ * replace: one running in this runtime, one that finished and awaits review, or
+ * one whose start is still queued for a model slot (relaunching it then would
+ * claim a second slot for the same card).
  */
 function hasRecoverableSession(sessions: TaskDispatchSessionSnapshot[], taskId: string): boolean {
 	return sessions.some(
-		(session) => session.summary.taskId === taskId && (session.live || session.summary.state === "awaiting_review"),
+		(session) =>
+			session.summary.taskId === taskId &&
+			(session.live || session.waitingForCapacity === true || session.summary.state === "awaiting_review"),
 	);
 }
 

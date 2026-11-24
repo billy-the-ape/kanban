@@ -5,6 +5,7 @@
 // one generated extension for lifecycle events. Pi keeps its own tools, prompt,
 // user extensions and provider configuration.
 import { formatUnsupportedAgentLaunchError, getUnsupportedAgentLaunchOperations } from "../core/agent-capabilities";
+import { PR_CI_HANDOFF_GUIDANCE } from "../prompts/pr-ci-handoff";
 import {
 	createScopedHookResources,
 	ensureTextFile,
@@ -73,6 +74,16 @@ export interface PiPreparedLaunch extends PreparedAgentLaunch {
 }
 
 /**
+ * Keep CI monitoring out of autonomous coding turns. Existing PR and repair
+ * templates already include this guidance; do not duplicate it or submit
+ * an empty restoration prompt (which would accidentally start a new turn).
+ */
+export function withPiCiHandoffGuidance(prompt: string): string {
+	if (!prompt.trim() || prompt.includes(PR_CI_HANDOFF_GUIDANCE)) return prompt;
+	return `${prompt.trimEnd()}\n\n${PR_CI_HANDOFF_GUIDANCE}`;
+}
+
+/**
  * Builds one Pi launch: the exact-session flags, the generated hook extension,
  * the model request forwarded from Pi's own settings, and the durable session
  * Kanban is about to continue.
@@ -106,7 +117,7 @@ export async function preparePiLaunch(input: AgentAdapterLaunchInput): Promise<P
 	const record = await readPiSessionRecord({ sessionId, sessionDir });
 	// Pi reads options until `--`, so a task description that starts with a dash
 	// stays data instead of becoming an option Pi never intended.
-	const withPromptLaunch = withPrompt([...args, "--"], input.prompt, "append");
+	const withPromptLaunch = withPrompt([...args, "--"], withPiCiHandoffGuidance(input.prompt), "append");
 	const env: Record<string, string | undefined> = { ...withPromptLaunch.env };
 	if (hooks) {
 		Object.assign(env, createHookRuntimeEnv(hooks));

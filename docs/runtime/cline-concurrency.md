@@ -1,17 +1,29 @@
-# Cline model concurrency
+# Cline and Pi model concurrency
 
 Cline turns share a process-wide capacity queue keyed by normalized API endpoint
 and model ID. Implementation, home-agent, review and verification-repair runtimes
-use the same budget. A live but idle session holds no capacity. A turn holds its
-reservation through SDK startup, generation, tool execution and compaction, and
-releases it when the SDK turn resolves or fails.
+use the same budget. A live but idle Cline session holds no capacity. A
+Cline turn reserves a slot through SDK startup, generation, tool execution,
+and compaction, and releases it when the SDK turn resolves or fails.
+
+**Initial Pi coding turns** now use the same queue, holding capacity until a
+Pi `agent_settled` hook or process exit. A Pi turn can run shell commands and
+sleep while reserving a slot; raising the override allows other agents to
+run during these gaps. A queued initial Pi start never blocks its request: the
+card records a **Waiting for a free model slot** summary and Kanban spawns the
+CLI in the background once a slot frees.
+Interactive Pi follow-up turns, including automated PR comment fixes, do
+not yet pass through this initial-start gate and can exceed its budget.
+This is not a hard inference-provider request limit.
 
 ## Automatic discovery
 
-Leave **Settings → Cline → Concurrent Cline turns per model** empty. Kanban reads
+Leave **Settings → General → Concurrent agent turns per model** empty. Kanban reads
 `GET /props?model=<model-id>` from the provider endpoint, removing a final `/v1`
 from the URL while retaining any reverse-proxy prefix. A positive integer
-`total_slots` is the parallel capacity. Model names are URL-encoded; configured
+`total_slots` is the parallel capacity. Pi obtains its model and endpoint from
+its own `settings.json` and `models.json`, without reading credentials.
+Model names are URL-encoded; configured
 API keys are sent as Bearer authorization. No context size is changed or inferred
 from the slot count.
 
@@ -25,23 +37,43 @@ the next discovery after cache expiry reads the actual slot count.
 
 Enter an integer from 1 to 64 to bypass discovery. The override applies to every
 endpoint/model pool; it is not a single global maximum. Clear the field to restore
-automatic discovery. The global preference is stored as `clineConcurrencyLimit`
+automatic discovery. For compatibility the global preference is still stored
+under the existing `clineConcurrencyLimit` key
 in Kanban's runtime config (`null` or absent means automatic). No environment
 variables or database migrations are required. Settings affect new admissions;
 queued turns retain the capacity resolved when they entered the queue, and active
 turns are not interrupted when the setting changes.
 
-Excess turns remain In Progress with **Waiting for model capacity**, then run when
-capacity becomes available. Pause, abort, clear/trash cleanup and runtime disposal
-cancel pending admissions so they cannot start later. The waiting queue is held
-in memory; interrupted work must be resumed after a runtime restart.
+Cline turns remain In Progress with **Waiting for model capacity**, then run
+when capacity becomes available. A new Pi start answers its request immediately
+instead of waiting inside it: with no slot free the card records **Waiting for a
+free model slot** (an idle, process-less summary carrying the same capacity-wait
+marker a queued Cline turn uses, plus its queue position) and the CLI spawns by
+itself once capacity frees, so automatic backlog dispatch never holds its brief
+per-workspace dispatch lock across another task's whole turn. The waiting card
+keeps the dispatch worker slot it was given — the capacity queue reports the cards
+it is still waiting for, since a summary left behind by a restart would otherwise
+hold a slot forever — so the worker limit still caps how many cards start. Stop
+cancels a
+queued Pi start and its CLI is never launched; a queued CLI that cannot spawn
+marks the card failed. Bulk-stopping a workspace's sessions — runtime shutdown,
+project removal, workspace disposal — cancels that workspace's queued starts the
+same way, because the stop can only reach processes and the slot it just freed
+would otherwise admit a new CLI against a manager being torn down; the card is
+left idle rather than failed, and relaunched by the next reconciliation. Cline
+pause, abort, clear/trash cleanup and runtime disposal cancel pending admissions
+so they cannot start later. The waiting queue
+is held in memory; interrupted work must be resumed after a runtime restart.
 
 ## Other limits
 
 - The reliable backlog dispatch policy's `taskDispatchPolicy.workerLimit` remains
   an independent per-workspace launch cap (default 1, maximum 4). Set it to 2 via
   the runtime config API if two automatically dispatched cards are desired. This
-  policy still requires deterministic delivery when enabled. Manually started
+  policy still requires deterministic delivery when enabled. A Pi card waiting for
+  a model slot counts against this cap while it waits, exactly as a running card
+  does, so a queue of waiting cards cannot drain the backlog into In Progress.
+  Manually started
   cards use the model queue directly.
 - Reservations cover this Kanban process, not other clients (such as Home
   Assistant) or separate Kanban processes. Server queuing and HTTP limits remain
@@ -74,7 +106,7 @@ curl -fsS 'http://127.0.0.1:8080/props?model=qwen3.8-27b' \
 5. Test a provider without `/props`: tasks serialize and queue without errors.
    A failing turn must release capacity for the next queued task.
 
-Waiting board cards show `q #1`, `q #2`, and so on in place of the phase badge. Positions are FIFO within each endpoint/model pool and update when a waiting turn is canceled or admitted. The normal phase badge returns when the turn starts.
+Waiting board cards show `q #1`, `q #2`, and so on in place of the phase badge. Positions are FIFO within each endpoint/model pool and update when a waiting turn is canceled or admitted. The normal phase badge returns when the turn starts. A queued Pi start has no queue-position badge, because that badge belongs to a running queued Cline turn: its card shows the waiting summary text instead, and the record carries the same queue position for diagnostics until its CLI spawns.
 
 
 ## Returning an unstarted queued task to Backlog
@@ -86,3 +118,12 @@ For a successful return, Kanban cancels the waiting admission, drains its pendin
 A dirty worktree, untracked files, actual ignored files/directories, task commits/branches, saved patches, preserved archives, or delivery/session history block the return before cancellation or cleanup. Mirrored ignored dependency/config symlinks are permitted; their source files are not removed. Cleanup uses Git's normal worktree removal, with no forced deletion. If cleanup fails after cancellation, the card stays In Progress in an interrupted state with the error available.
 
 A durable manual deferral prevents automatic backlog dispatch or restart reconciliation from immediately launching the returned card again. Start it manually (including Start all) to clear the deferral. No new settings or environment variables are required; deploy Kanban and refresh the browser.
+
+## Pi PR / CI handoff
+
+Every **non-empty initial Pi coding prompt** now includes the shared PR CI handoff
+instruction: complete local verification, publish the PR, report it and end the
+turn. Do not sleep, poll for checks, run `gh pr checks --watch`, or wait for
+CI/reviewer completion. The reviewer and Kanban's comment handling own follow-up
+feedback. Explicit user instructions to monitor CI still take precedence.
+Empty session-restore prompts stay empty, preventing accidental replay.

@@ -132,6 +132,52 @@ describe("TerminalSessionManager", () => {
 		expect(recovered?.workspacePath).toBeNull();
 		expect(recovered?.reviewReason).toBeNull();
 	});
+	it("records a capacity wait as an idle waiting summary and settles it", () => {
+		const manager = new TerminalSessionManager();
+		const emitted: RuntimeTaskSessionSummary[] = [];
+		manager.onSummary((summary) => {
+			emitted.push(summary);
+		});
+
+		const waiting = manager.recordModelCapacityWait({
+			taskId: "task-1",
+			agentId: "pi",
+			workspacePath: "/tmp/worktree",
+			queuePosition: 2,
+		});
+		expect(waiting.state).toBe("idle");
+		expect(waiting.pid).toBeNull();
+		expect(waiting.agentId).toBe("pi");
+		expect(waiting.warningMessage).toContain("model slot");
+		// The record says why the card is idle, in the vocabulary a queued
+		// Cline turn already uses. Only a Cline queue may hand a card back to
+		// Backlog, so the Pi wait never advertises that affordance.
+		expect(waiting.latestHookActivity?.hookEventName).toBe("concurrency_waiting");
+		expect(waiting.latestHookActivity?.queuePosition).toBe(2);
+		expect(waiting.latestHookActivity?.canReturnToBacklog).toBe(false);
+		// The card, the terminal viewer, and Stop all read this record, so it has
+		// to reach the browser through the same summary stream a real launch uses.
+		expect(emitted.at(-1)?.warningMessage).toBe(waiting.warningMessage);
+		// A process-less waiting record must never look like a Pi conversation the
+		// guarded exact-session restore is allowed to reattach.
+		expect(isDetachedPiRestoreCandidate(waiting)).toBe(false);
+
+		// A queued CLI that could not spawn has to say so on the card, while the
+		// Stop that canceled a wait is a plain idle card, not a failure.
+		const failed = manager.settleModelCapacityWait("task-1", "Failed to launch pi.");
+		expect(failed?.state).toBe("failed");
+		expect(failed?.reviewReason).toBe("error");
+		expect(failed?.warningMessage).toBe("Failed to launch pi.");
+		const canceled = manager.settleModelCapacityWait("task-1", null);
+		expect(canceled?.state).toBe("idle");
+		expect(canceled?.reviewReason).toBeNull();
+		expect(canceled?.warningMessage).toBeNull();
+		// Either way the wait is over, so nothing may keep claiming the card is
+		// queued: that marker is what the card and diagnostics read.
+		expect(failed?.latestHookActivity).toBeNull();
+		expect(canceled?.latestHookActivity).toBeNull();
+		expect(manager.settleModelCapacityWait("missing-task", null)).toBeNull();
+	});
 
 	it("keeps a hydrated Pi record restorable when the terminal attaches first", () => {
 		const manager = new TerminalSessionManager();
@@ -328,5 +374,20 @@ describe("TerminalSessionManager", () => {
 			rows: 40,
 		});
 		expect(getSnapshotSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("asks the workspace to drop queued claims when every session is stopped", () => {
+		// A capacity wait has no process, so bulk stop cannot reach it. The listener
+		// (paired with the Pi capacity gate in the composition root) runs
+		// synchronously here, before a stopped process can free a model slot and
+		// admit a new CLI against a manager that is being torn down.
+		const manager = new TerminalSessionManager();
+		let drops = 0;
+		manager.setOnBulkStop(() => {
+			drops += 1;
+		});
+		expect(drops).toBe(0);
+		expect(manager.markInterruptedAndStopAll()).toEqual([]);
+		expect(drops).toBe(1);
 	});
 });
