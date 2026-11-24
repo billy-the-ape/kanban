@@ -36,6 +36,7 @@ function renderCommentHandlingInstruction(
 		"Fix valid issues, explain any disagreements, and update the same PR.",
 		"When you post a PR comment, review, or reply, keep its API response (full JSON) or returned comment/review URL visible in the tool result — do not filter it to just `.id`/`.body`, suppress it, or mix it with unrelated output; post one publication per tool result where practical.",
 		"Explain changes and disagreements in PR comments and within task chat.",
+		"If an item is your own earlier implementation reply, it is not new review feedback; do not reply to it or make a new commit. Report the duplicate in task chat only.",
 		PR_CI_HANDOFF_GUIDANCE,
 	].join(" ");
 	if (!batch) return instruction;
