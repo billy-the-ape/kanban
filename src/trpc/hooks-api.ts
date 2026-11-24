@@ -144,11 +144,16 @@ export function createHooksApi(deps: CreateHooksApiDependencies): RuntimeTrpcCon
 				}
 
 				if (body.publicationTool && summary.agentId === "pi" && deps.recordPiPublicationToolEvent) {
-					void deps.recordPiPublicationToolEvent({
-						workspaceId, workspacePath, taskId, ...body.publicationTool,
-					}).catch(() => {
-						// Publication evidence is best-effort, never an agent-blocking hook.
-					});
+					void deps
+						.recordPiPublicationToolEvent({
+							workspaceId,
+							workspacePath,
+							taskId,
+							...body.publicationTool,
+						})
+						.catch(() => {
+							// Publication evidence is best-effort, never an agent-blocking hook.
+						});
 				}
 
 				if (!canTransitionTaskForHookEvent(summary, event)) {

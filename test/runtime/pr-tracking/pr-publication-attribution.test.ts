@@ -976,6 +976,26 @@ describe("truncated REST reply responses", () => {
 	])("rejects incomplete or conflicting identity headers: %s", (result) => {
 		expect(analyze([{ ...fixture, result }]).identities).toEqual([]);
 	});
+	it("captures a truncated reply whose cut-off diff_hunk contains braces", () => {
+		// Real code hunks are full of braces. Scanning inside the unterminated
+		// string used to invent objects out of them, so the recovery gate saw a
+		// non-empty object count and left a fully attributable reply uncertain.
+		const result =
+			'{"url":"https://api.github.com/repos/octo/repo/pulls/comments/77","pull_request_review_id":88,"id":77,' +
+			'"node_id":"PRRC_test","diff_hunk":"@@ -10,3 +10,5 @@\\n+const noop = () => {}\\n+if (x) { y(); }\\ncut';
+		expect(() => JSON.parse(result)).toThrow();
+		expect(analyze([{ ...fixture, result }])).toMatchObject({
+			status: "published",
+			identities: [{ kind: "inline", id: 77 }],
+		});
+	});
+	it("does not scrape an identity out of a truncated body that lost its header", () => {
+		// With no complete header the only text left is quoted body content, and a
+		// diff hunk can quote any URL. That is never evidence of a publication.
+		const result =
+			'{"diff_hunk":"@@ -1,1 +1,2 @@\\n+see https://github.com/octo/repo/pull/42#issuecomment-77 and () => {} cut';
+		expect(analyze([{ ...fixture, result }])).toMatchObject({ status: "uncertain", identities: [] });
+	});
 	it("does not infer ids from a nested object, array, echoed query, or failed result", () => {
 		for (const result of [
 			`[${fixture.result}`,

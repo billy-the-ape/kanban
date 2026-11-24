@@ -115,7 +115,7 @@ import {
 	dispatchReadyTasks as runTaskDispatchPass,
 	type TaskDispatchDeps,
 } from "../task-dispatch/task-dispatch-service";
-import { buildRuntimeConfigResponse, resolveAgentCommand } from "../terminal/agent-registry";
+import { buildRuntimeConfigResponse, describeUnrunnableAgent, resolveAgentCommand } from "../terminal/agent-registry";
 import { derivePiSessionId, getPiTaskSessionDir, readPiSessionRecord } from "../terminal/pi-session-options";
 import { collectRestorablePiCardIds, isDetachedPiRestoreCandidate } from "../terminal/pi-session-restore";
 import type { TerminalSessionManager } from "../terminal/session-manager";
@@ -414,6 +414,44 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		join(homedir(), ".cline", "kanban"),
 		join(homedir(), ".cline", "worktrees"),
 	] as const;
+	// The two bookkeeping steps a successful browser send performs on an accepted
+	// prompt. They are split from `createTaskChatMessageSender`'s hooks so the
+	// recovery path below records exactly the same state without repeating the
+	// argument plumbing, and so an automation sender can keep leaving them unwired.
+	const persistAcceptedPrompt = async (
+		workspaceScope: RuntimeTrpcWorkspaceScope,
+		body: RuntimeTaskChatSendRequest,
+		acceptedAt: number,
+	): Promise<void> => {
+		await recordTaskLastPrompt({
+			workspaceId: workspaceScope.workspaceId,
+			workspacePath: workspaceScope.workspacePath,
+			taskId: body.taskId,
+			text: body.text,
+			acceptedAt,
+			broadcast: deps.broadcastRuntimeWorkspaceStateUpdated,
+		});
+	};
+
+	const classifySentPrLinks = async (
+		workspaceScope: RuntimeTrpcWorkspaceScope,
+		body: RuntimeTaskChatSendRequest,
+	): Promise<RuntimeTaskChatPrLinking | undefined> => {
+		// PRLINK-8: home-agent sessions never participate.
+		// resolveTaskChatPrLinking never throws.
+		if (isHomeAgentSessionId(body.taskId)) {
+			return undefined;
+		}
+		return resolveTaskChatPrLinking({
+			workspaceId: workspaceScope.workspaceId,
+			workspacePath: workspaceScope.workspacePath,
+			taskId: body.taskId,
+			text: body.text,
+			hasImages: Boolean(body.images && body.images.length > 0),
+			broadcast: deps.broadcastRuntimeWorkspaceStateUpdated,
+		});
+	};
+
 	const sendTaskChatMessageCore = createTaskChatMessageSender({
 		getScopedClineTaskSessionService: deps.getScopedClineTaskSessionService,
 		broadcastTaskChatCleared: deps.broadcastTaskChatCleared,
@@ -422,29 +460,10 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		// the COMMENT-0 automation service sender leaves it unwired so
 		// auto-generated instructions never update the card preview.
 		recordLastUserPrompt: async (workspaceScope, body, acceptedAt) => {
-			await recordTaskLastPrompt({
-				workspaceId: workspaceScope.workspaceId,
-				workspacePath: workspaceScope.workspacePath,
-				taskId: body.taskId,
-				text: body.text,
-				acceptedAt,
-				broadcast: deps.broadcastRuntimeWorkspaceStateUpdated,
-			});
+			await persistAcceptedPrompt(workspaceScope, body, acceptedAt);
 		},
 		resolvePostSendPrLinking: async (workspaceScope, body) => {
-			// PRLINK-8: home-agent sessions never participate.
-			// resolveTaskChatPrLinking never throws.
-			if (isHomeAgentSessionId(body.taskId)) {
-				return undefined;
-			}
-			return resolveTaskChatPrLinking({
-				workspaceId: workspaceScope.workspaceId,
-				workspacePath: workspaceScope.workspacePath,
-				taskId: body.taskId,
-				text: body.text,
-				hasImages: Boolean(body.images && body.images.length > 0),
-				broadcast: deps.broadcastRuntimeWorkspaceStateUpdated,
-			});
+			return classifySentPrLinks(workspaceScope, body);
 		},
 	});
 
@@ -585,8 +604,9 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		return recovery;
 	};
 
-	// Bookkeeping shared with a successful native chat send after a recovery
-	// start: record the accepted prompt preview and classify PR links. Neither
+	// Bookkeeping a successful native chat send performs after a recovery start,
+	// shared with that path through `persistAcceptedPrompt`/`classifySentPrLinks`.
+	// It records the accepted prompt preview and classifies PR links. Neither
 	// hook may turn an accepted recovery into a failure, so both stay defensive.
 	const recordUnstartedRecoverySend = async (
 		workspaceScope: RuntimeTrpcWorkspaceScope,
@@ -595,23 +615,9 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		let pullRequestLinking: RuntimeTaskChatPrLinking | undefined;
 		try {
 			if (body.text.trim()) {
-				await recordTaskLastPrompt({
-					workspaceId: workspaceScope.workspaceId,
-					workspacePath: workspaceScope.workspacePath,
-					taskId: body.taskId,
-					text: body.text,
-					acceptedAt: Date.now(),
-					broadcast: deps.broadcastRuntimeWorkspaceStateUpdated,
-				});
+				await persistAcceptedPrompt(workspaceScope, body, Date.now());
 			}
-			pullRequestLinking = await resolveTaskChatPrLinking({
-				workspaceId: workspaceScope.workspaceId,
-				workspacePath: workspaceScope.workspacePath,
-				taskId: body.taskId,
-				text: body.text,
-				hasImages: Boolean(body.images?.length),
-				broadcast: deps.broadcastRuntimeWorkspaceStateUpdated,
-			});
+			pullRequestLinking = await classifySentPrLinks(workspaceScope, body);
 		} catch {
 			// Best-effort preview and PR-link classification only.
 		}
@@ -854,10 +860,14 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					: scopedRuntimeConfig;
 			const resolved = resolveAgentCommand(resolvedConfig);
 			if (!resolved) {
+				// A selected CLI that is not installed is named with its own install
+				// guidance, so the fix is in the error rather than a settings tour.
 				return {
 					ok: false,
 					summary: null,
-					error: "No runnable agent command is configured. Open Settings, install a supported CLI, and select it.",
+					error:
+						describeUnrunnableAgent(resolvedConfig) ??
+						"No runnable agent command is configured. Open Settings, install a supported CLI, and select it.",
 					initialStart,
 				};
 			}

@@ -11,6 +11,45 @@ import { type RecordHookPullRequestsInput, recordHookPullRequests } from "../../
 import { createGitTestEnv } from "../../utilities/git-env";
 import { createTempDir } from "../../utilities/temp-dir";
 
+interface IsolatedHome {
+	path: string;
+	cleanup: () => void;
+	previousHome?: string;
+	previousUserProfile?: string;
+}
+
+/**
+ * AGENTS.md: a suite that runs the real ingest path touches persisted workspace
+ * state, which resolves through `os.homedir()` at call time, so HOME and
+ * USERPROFILE move to a temp dir for its duration. Otherwise a `to_review`
+ * event reads and writes the developer's real `~/.cline`.
+ */
+function isolateHome(): IsolatedHome {
+	const previousHome = process.env.HOME;
+	const previousUserProfile = process.env.USERPROFILE;
+	const isolated: IsolatedHome = { ...createTempDir("kanban-hooks-home-"), previousHome, previousUserProfile };
+	process.env.HOME = isolated.path;
+	process.env.USERPROFILE = isolated.path;
+	return isolated;
+}
+
+function releaseIsolatedHome(isolated: IsolatedHome | null): void {
+	if (!isolated) {
+		return;
+	}
+	if (isolated.previousHome === undefined) {
+		delete process.env.HOME;
+	} else {
+		process.env.HOME = isolated.previousHome;
+	}
+	if (isolated.previousUserProfile === undefined) {
+		delete process.env.USERPROFILE;
+	} else {
+		process.env.USERPROFILE = isolated.previousUserProfile;
+	}
+	isolated.cleanup();
+}
+
 function createSummary(overrides: Partial<RuntimeTaskSessionSummary> = {}): RuntimeTaskSessionSummary {
 	return {
 		taskId: "task-1",
@@ -158,17 +197,12 @@ describe("createHooksApi", () => {
 // These tests touch real workspace state, so HOME/USERPROFILE are redirected
 // to a temp dir (AGENTS.md).
 describe("createHooksApi pull-request recording", () => {
-	let tempHome: { path: string; cleanup: () => void; previousHome?: string; previousUserProfile?: string } | null =
-		null;
+	let tempHome: IsolatedHome | null = null;
 	let sandboxRoot: ReturnType<typeof createTempDir> | null = null;
 	let workspacePath: string;
 
 	beforeEach(async () => {
-		const previousHome = process.env.HOME;
-		const previousUserProfile = process.env.USERPROFILE;
-		tempHome = { ...createTempDir("kanban-hooks-pr-home-"), previousHome, previousUserProfile };
-		process.env.HOME = tempHome.path;
-		process.env.USERPROFILE = tempHome.path;
+		tempHome = isolateHome();
 		sandboxRoot = createTempDir("kanban-hooks-pr-ws-");
 		workspacePath = join(sandboxRoot.path, "project-a");
 		mkdirSync(workspacePath, { recursive: true });
@@ -208,20 +242,8 @@ describe("createHooksApi pull-request recording", () => {
 	});
 
 	afterEach(() => {
-		if (tempHome) {
-			if (tempHome.previousHome === undefined) {
-				delete process.env.HOME;
-			} else {
-				process.env.HOME = tempHome.previousHome;
-			}
-			if (tempHome.previousUserProfile === undefined) {
-				delete process.env.USERPROFILE;
-			} else {
-				process.env.USERPROFILE = tempHome.previousUserProfile;
-			}
-			tempHome.cleanup();
-			tempHome = null;
-		}
+		releaseIsolatedHome(tempHome);
+		tempHome = null;
 		sandboxRoot?.cleanup();
 		sandboxRoot = null;
 	});
@@ -442,6 +464,9 @@ describe("createHooksApi review lookup trigger (PRLINK-5)", () => {
 					createdAt: 1,
 				})),
 				deleteTaskTurnCheckpointRef: vi.fn(async () => undefined),
+				// The branch lookup is fire-and-forget against the real workspace and is
+				// asserted by the test above, so this suite never runs it.
+				fireReviewPullRequestLookup: vi.fn(),
 			};
 			return { manager, deps, api: createHooksApi(deps) };
 		}
@@ -495,6 +520,19 @@ describe("createHooksApi review lookup trigger (PRLINK-5)", () => {
 	});
 });
 describe("createHooksApi agent session identity (AA-O1a)", () => {
+	let tempHome: IsolatedHome | null = null;
+
+	// Only the session manager is stubbed here: the ingest path itself is real,
+	// so it touches persisted workspace state and needs a temp HOME (AGENTS.md).
+	beforeEach(() => {
+		tempHome = isolateHome();
+	});
+
+	afterEach(() => {
+		releaseIsolatedHome(tempHome);
+		tempHome = null;
+	});
+
 	function createIdentityManager(options: { launchAttemptId?: string | null } = {}) {
 		const launchAttemptId = options.launchAttemptId ?? "attempt-2";
 		const reviewedSummary: RuntimeTaskSessionSummary = {
@@ -521,6 +559,9 @@ describe("createHooksApi agent session identity (AA-O1a)", () => {
 				createdAt: 1,
 			})),
 			deleteTaskTurnCheckpointRef: vi.fn(async () => undefined),
+			// The branch lookup is fire-and-forget against the real workspace; the
+			// PRLINK-5 suite covers it, so this one never runs it.
+			fireReviewPullRequestLookup: vi.fn(),
 		};
 		return { manager, api: createHooksApi(deps) };
 	}
@@ -597,6 +638,20 @@ describe("createHooksApi agent session identity (AA-O1a)", () => {
 	});
 });
 describe("createHooksApi review reasons through the real session manager (AA-O1)", () => {
+	let tempHome: IsolatedHome | null = null;
+
+	// These run the real state machine on the real ingest path, so neither the
+	// workspace state nor the fire-and-forget branch lookup may reach the
+	// developer's machine (AGENTS.md).
+	beforeEach(() => {
+		tempHome = isolateHome();
+	});
+
+	afterEach(() => {
+		releaseIsolatedHome(tempHome);
+		tempHome = null;
+	});
+
 	// Every other suite here stubs the manager, which is exactly how a reason that
 	// dies inside `transitionToReview` stayed invisible: the call was recorded with
 	// the right argument while the card never moved. These run the real state
@@ -616,6 +671,7 @@ describe("createHooksApi review reasons through the real session manager (AA-O1)
 				createdAt: 1,
 			})),
 			deleteTaskTurnCheckpointRef: vi.fn(async () => undefined),
+			fireReviewPullRequestLookup: vi.fn(),
 		});
 		return { manager, api };
 	}
@@ -638,17 +694,20 @@ describe("createHooksApi review reasons through the real session manager (AA-O1)
 	it("treats a Pi extension dialog as attention, not a completed repair turn", async () => {
 		const { manager, api } = createLiveManager(createSummary({ state: "running", agentId: "pi" }));
 		await api.ingest({
-			taskId: "task-1", workspaceId: "workspace-1",
+			taskId: "task-1",
+			workspaceId: "workspace-1",
 			event: "to_review",
 			metadata: {
-				source: "pi", hookEventName: "ui_prompt_start",
+				source: "pi",
+				hookEventName: "ui_prompt_start",
 				notificationType: "permission_prompt",
 			},
 		});
 		expect(manager.getSummary("task-1")?.state).toBe("awaiting_review");
 		expect(manager.getSummary("task-1")?.reviewReason).toBe("attention");
 		await api.ingest({
-			taskId: "task-1", workspaceId: "workspace-1",
+			taskId: "task-1",
+			workspaceId: "workspace-1",
 			event: "to_in_progress",
 			metadata: { source: "pi", hookEventName: "ui_prompt_end" },
 		});

@@ -5,7 +5,6 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { autoMergeEvidenceEnvelopeSchema } from "../../../src/core/api-contract";
 import {
 	collectAutoMergeEvidence,
-	countUnresolvedActiveThreads,
 	normalizeMergeReviews,
 	selectEffectiveCheckRuns,
 	selectEffectiveCommitStatuses,
@@ -323,19 +322,6 @@ describe("auto-merge-evidence normalization", () => {
 		expect(byName.get("docs")?.conclusion).toBe("pending");
 		expect(byName.get("docs")?.status).toBe("in_progress");
 		expect(byName.get("docs")?.sourceId).toBe("svc-b");
-	});
-
-	it("counts only unresolved, non-outdated threads (deduped per thread)", () => {
-		const resolved = { resolved: true, outdated: false };
-		const active = { resolved: false, outdated: false };
-		const outdated = { resolved: false, outdated: true };
-		const threads = new Map<string, PrThreadInfo>();
-		// Two comment keys map to the same active thread object.
-		threads.set("node-a", active);
-		threads.set("1000", active);
-		threads.set("node-r", resolved);
-		threads.set("node-o", outdated);
-		expect(countUnresolvedActiveThreads(threads)).toBe(1);
 	});
 });
 

@@ -417,7 +417,11 @@ throwaway `HOME` and an empty project, through Kanban's own `probeOpenCodeVersio
   installed per launch and `OPENCODE_DISABLE_AUTOUPDATE=1` keeps the version fixed.
 - `--session` resume requires the id the bridge reported. A card created before AA-O1
   (or a session OpenCode has since dropped) fails with an explicit "start a new session"
-  message instead of attaching to another conversation.
+  message instead of attaching to another conversation. The probe matches the id as a whole
+  field of `opencode session list`'s human-readable table, because the pinned CLI documents
+  no JSON form of it; a release that truncated ids inside that table would report a real
+  session as missing, which is a refusal to resume rather than a resume of another card's
+  conversation.
 - Merging a user's `OPENCODE_CONFIG` rewrites only their `plugin` entries into absolute
   paths; any *other* relative path inside their configuration (an `instructions` file,
   for example) is carried as written and then resolves against the generated overlay

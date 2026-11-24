@@ -24,8 +24,9 @@
 //   - at least one effective current-head approval exists from a non-author
 //     reviewer (later CHANGES_REQUESTED blocks until that reviewer's valid
 //     current-head approval or a GitHub dismissal);
-//   - no unresolved review threads, no active writer, no outstanding
-//     comment-repair dispatch, and no PR-gate reservation held by another task.
+//   - no active writer, no outstanding comment-repair dispatch, and no PR-gate
+//     reservation held by another task. Unresolved review threads are not a
+//     gate: only the review decision on the current head can block (AM-3).
 //
 // "blocked" is a structural / permission / configuration problem; "waiting"
 // is a normal pending condition. When eligible, the observer emits an

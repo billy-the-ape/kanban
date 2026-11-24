@@ -17,6 +17,9 @@ import type {
 const agentRegistryMocks = vi.hoisted(() => ({
 	resolveAgentCommand: vi.fn(),
 	buildRuntimeConfigResponse: vi.fn(),
+	// The real helper only formats a message; the suite controls it explicitly so
+	// a machine with (or without) a given CLI on PATH cannot change assertions.
+	describeUnrunnableAgent: vi.fn((): string | null => null),
 }));
 
 const taskWorktreeMocks = vi.hoisted(() => ({
@@ -96,6 +99,7 @@ const taskLastPromptMocks = vi.hoisted(() => ({
 vi.mock("../../../src/terminal/agent-registry.js", () => ({
 	resolveAgentCommand: agentRegistryMocks.resolveAgentCommand,
 	buildRuntimeConfigResponse: agentRegistryMocks.buildRuntimeConfigResponse,
+	describeUnrunnableAgent: agentRegistryMocks.describeUnrunnableAgent,
 }));
 
 vi.mock("../../../src/workspace/task-worktree.js", () => ({
@@ -348,7 +352,7 @@ function createCleanTaskWorktreeInfo(baselineSha: string): RuntimeTaskPreservati
 	};
 }
 
-function createUnstartedRecoveryBoard(taskId: string): RuntimeBoardData {
+function createUnstartedRecoveryBoard(taskId: string, cardOverrides: Record<string, unknown> = {}): RuntimeBoardData {
 	return {
 		columns: [
 			{
@@ -362,6 +366,7 @@ function createUnstartedRecoveryBoard(taskId: string): RuntimeBoardData {
 						baseRef: "main",
 						updateBaseRefBeforeStart: true,
 						agentId: "cline",
+						...cardOverrides,
 					},
 				],
 			},
@@ -409,6 +414,8 @@ describe("createRuntimeApi startTaskSession", () => {
 		process.env.CLINE_MCP_OAUTH_SETTINGS_PATH = mcpOauthSettingsPath;
 		agentRegistryMocks.resolveAgentCommand.mockReset();
 		agentRegistryMocks.buildRuntimeConfigResponse.mockReset();
+		agentRegistryMocks.describeUnrunnableAgent.mockReset();
+		agentRegistryMocks.describeUnrunnableAgent.mockReturnValue(null);
 		taskWorktreeMocks.resolveTaskCwd.mockReset();
 		// UPD-0: the start path checks worktree existence first; existing-worktree
 		// is the common unit-test setup so legacy cwd-resolution assertions hold.
@@ -1697,68 +1704,56 @@ describe("createRuntimeApi startTaskSession", () => {
 		expect(oauthMocks.saveProviderSettings).not.toHaveBeenCalled();
 	});
 
+	it("names the missing CLI when a selected agent cannot be launched", async () => {
+		// The card selected an agent whose CLI the machine never installed, so the
+		// answer has to carry the install guidance rather than a settings tour.
+		taskWorktreeMocks.resolveTaskCwd.mockResolvedValue("/tmp/existing-worktree");
+		agentRegistryMocks.resolveAgentCommand.mockReturnValue(null);
+		agentRegistryMocks.describeUnrunnableAgent.mockReturnValue(
+			"Pi is not installed (expected `pi` on PATH). Install it from https://github.com/earendil-works/pi, then start the task again.",
+		);
+		const terminalManager = {
+			startTaskSession: vi.fn(async () => createSummary({ agentId: "pi" })),
+			applyTurnCheckpoint: vi.fn(),
+		};
+		const api = createTestRuntimeApi({
+			getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+			loadScopedRuntimeConfig: vi.fn(async () => ({
+				...createRuntimeConfigState(),
+				selectedAgentId: "pi" as const,
+			})),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: vi.fn(async () => terminalManager as never),
+			getScopedClineTaskSessionService: vi.fn(async () => createClineTaskSessionServiceMock() as never),
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+		});
+
+		const response = await api.startTaskSession(
+			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+			{ taskId: "task-1", baseRef: "main", prompt: "Continue task", agentId: "pi" },
+		);
+
+		expect(response.ok).toBe(false);
+		expect(response.error ?? "").toContain("Pi is not installed");
+		expect(terminalManager.startTaskSession).not.toHaveBeenCalled();
+	});
+
 	it("recovers a paused, never-started Cline task from its original prompt after an SDK send error", async () => {
 		taskLastPromptMocks.recordTaskLastPrompt.mockClear();
 		taskChatPrLinkingMocks.resolveTaskChatPrLinking.mockClear();
 		const baselineSha = "052739f929e4e956162fef2f333422c9ac7c31f6";
-		initialStartMocks.readTaskInitialStartRecord.mockResolvedValue({
-			taskId: "d6953",
-			baseRef: "main",
-			updateBaseRefBeforeStart: true,
-			state: "prepared",
-			baselineSha,
-			failure: null,
-			updatedAt: Date.now(),
-		});
-		taskWorktreeMocks.getTaskPreservationInfo.mockResolvedValueOnce({
-			ok: true,
-			worktreeExists: true,
-			worktreePath: "/tmp/existing-worktree",
-			headCommit: baselineSha,
-			dirty: false,
-			commitsAheadOfBase: 0,
-			changedFiles: [],
-			preservation: null,
-		});
+		const originalImage = { id: "original", mimeType: "image/png", data: "original-data" };
+		initialStartMocks.readTaskInitialStartRecord.mockResolvedValue(createInitialStartRecord("d6953", baselineSha));
+		taskWorktreeMocks.getTaskPreservationInfo.mockResolvedValueOnce(createCleanTaskWorktreeInfo(baselineSha));
 		taskWorktreeMocks.resolveTaskCwd.mockResolvedValue("/tmp/existing-worktree");
 		setSelectedProviderSettings({ provider: "anthropic", model: "claude-sonnet-4-6", apiKey: "test-key" });
-		const board = {
-			columns: [
-				{
-					id: "in_progress",
-					title: "In Progress",
-					cards: [
-						{
-							id: "d6953",
-							title: "Original task",
-							prompt: "Implement the feature",
-							images: [{ id: "original", mimeType: "image/png", data: "original-data" }],
-							baseRef: "main",
-							updateBaseRefBeforeStart: true,
-							agentId: "cline",
-						},
-					],
-				},
-			],
-		} as RuntimeBoardData;
-		const boardSpy = vi.spyOn(workspaceState, "loadWorkspaceBoardById").mockResolvedValue(board);
+		const boardSpy = vi
+			.spyOn(workspaceState, "loadWorkspaceBoardById")
+			.mockResolvedValue(createUnstartedRecoveryBoard("d6953", { images: [originalImage] }));
 		try {
-			const cline = createClineTaskSessionServiceMock();
-			cline.hasRecoverableTaskSession.mockResolvedValue(false);
-			cline.getSummary.mockReturnValue(createSummary({ state: "awaiting_review", reviewReason: "error" }));
-			cline.listMessages.mockReturnValue([{ role: "system", content: "No previous Cline session config" }]);
-			const api = createTestRuntimeApi({
-				getActiveWorkspaceId: vi.fn(() => "workspace-1"),
-				loadScopedRuntimeConfig: vi.fn(async () => ({
-					...createRuntimeConfigState(),
-					selectedAgentId: "cline" as const,
-				})),
-				setActiveRuntimeConfig: vi.fn(),
-				getScopedTerminalManager: vi.fn(async () => ({ getSummary: vi.fn(() => null) }) as never),
-				getScopedClineTaskSessionService: vi.fn(async () => cline as never),
-				resolveInteractiveShellCommand: vi.fn(),
-				runCommand: vi.fn(),
-			});
+			const cline = createUnstartedClineServiceMock();
+			const api = createClineRecoveryRuntimeApi(cline);
 			const response = await api.sendTaskChatMessage(
 				{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
 				{ taskId: "d6953", text: "continue" },
@@ -1775,16 +1770,7 @@ describe("createRuntimeApi startTaskSession", () => {
 			expect(cline.sendTaskSessionInput).not.toHaveBeenCalled();
 			// A second recovery send with an image but no text must carry both
 			// original and newly attached images, and preserve the requested mode.
-			taskWorktreeMocks.getTaskPreservationInfo.mockResolvedValueOnce({
-				ok: true,
-				worktreeExists: true,
-				worktreePath: "/tmp/existing-worktree",
-				headCommit: baselineSha,
-				dirty: false,
-				commitsAheadOfBase: 0,
-				changedFiles: [],
-				preservation: null,
-			});
+			taskWorktreeMocks.getTaskPreservationInfo.mockResolvedValueOnce(createCleanTaskWorktreeInfo(baselineSha));
 			const attached = { id: "new", mimeType: "image/png", data: "new-data" };
 			const withImage = await api.sendTaskChatMessage(
 				{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
@@ -1794,7 +1780,7 @@ describe("createRuntimeApi startTaskSession", () => {
 			expect(cline.startTaskSession).toHaveBeenLastCalledWith(
 				expect.objectContaining({
 					prompt: "Implement the feature",
-					images: [{ id: "original", mimeType: "image/png", data: "original-data" }, attached],
+					images: [originalImage, attached],
 					mode: "plan",
 					startInPlanMode: false,
 				}),
