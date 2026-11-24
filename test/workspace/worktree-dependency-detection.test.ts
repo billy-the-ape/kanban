@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { CheckoutReader } from "../../src/workspace/dependencies/checkout-reader";
-import { resolveTransferStrategy } from "../../src/workspace/dependencies/ensure-worktree-dependencies";
+import {
+	resolveAllowInstall,
+	resolveTransferStrategy,
+} from "../../src/workspace/dependencies/ensure-worktree-dependencies";
 import { computeEnvironmentSignature, computeInstallFingerprint } from "../../src/workspace/dependencies/fingerprint";
 import { buildInstallPlan, findExecutableOnPath } from "../../src/workspace/dependencies/install-plan";
 import {
@@ -381,5 +384,16 @@ describe("resolveTransferStrategy", () => {
 		expect(resolveTransferStrategy({ strategy: "copy", env: { KANBAN_WORKTREE_DEPS_STRATEGY: "link" } })).toBe(
 			"copy",
 		);
+	});
+});
+
+describe("resolveAllowInstall", () => {
+	it("installs by default and honors the operator opt-out", () => {
+		expect(resolveAllowInstall({ env: {} })).toBe(true);
+		expect(resolveAllowInstall({ env: { KANBAN_WORKTREE_DEPS_INSTALL: "off" } })).toBe(false);
+		expect(resolveAllowInstall({ env: { KANBAN_WORKTREE_DEPS_INSTALL: " FALSE " } })).toBe(false);
+		expect(resolveAllowInstall({ env: { KANBAN_WORKTREE_DEPS_INSTALL: "on" } })).toBe(true);
+		// An explicit caller decision still wins over the environment.
+		expect(resolveAllowInstall({ allowInstall: false, env: { KANBAN_WORKTREE_DEPS_INSTALL: "on" } })).toBe(false);
 	});
 });

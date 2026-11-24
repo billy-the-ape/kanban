@@ -4,6 +4,8 @@ import { access } from "node:fs/promises";
 import path from "node:path";
 import treeKill from "tree-kill";
 
+import { terminateProcessForTimeout } from "../../server/process-termination";
+
 import { getGitCommandErrorMessage } from "../git-utils";
 import type { DependencyInstallPlan, WorktreePackageManagerId } from "./types";
 
@@ -128,6 +130,9 @@ export interface InstallRunResult {
 
 const OUTPUT_TAIL_LIMIT = 8_000;
 
+/** Grace period between the kill a package manager can catch and one it cannot. */
+const KILL_ESCALATION_MS = 5_000;
+
 /** Run one install command directly (no shell), killing it after `timeoutMs`. */
 export function runInstallPlan(
 	plan: DependencyInstallPlan,
@@ -135,7 +140,8 @@ export function runInstallPlan(
 		cwd: string;
 		timeoutMs: number;
 		env?: NodeJS.ProcessEnv;
-		killProcessTree?: (pid: number, signal: string) => void;
+		killProcessTree?: (pid: number, signal?: string, callback?: (error?: Error) => void) => void;
+		killEscalationMs?: number;
 	},
 ): Promise<InstallRunResult> {
 	const env: NodeJS.ProcessEnv = { ...(options.env ?? process.env), ...plan.env };
@@ -154,6 +160,19 @@ export function runInstallPlan(
 		}
 		let output = "";
 		let timedOut = false;
+		let escalation: ReturnType<typeof setTimeout> | undefined;
+		/** The kill a package manager cannot catch, for a tree that ignored SIGTERM. */
+		const forceKillTree = (): void => {
+			if (child.pid === undefined) {
+				child.kill("SIGKILL");
+				return;
+			}
+			try {
+				(options.killProcessTree ?? treeKill)(child.pid, "SIGKILL");
+			} catch {
+				child.kill("SIGKILL");
+			}
+		};
 		const append = (chunk: Buffer | string): void => {
 			output = (output + chunk.toString()).slice(-OUTPUT_TAIL_LIMIT);
 		};
@@ -161,22 +180,26 @@ export function runInstallPlan(
 		child.stderr?.on("data", (chunk: Buffer | string) => append(chunk));
 		const timer = setTimeout(() => {
 			timedOut = true;
-			if (child.pid !== undefined) {
-				try {
-					(options.killProcessTree ?? treeKill)(child.pid, "SIGTERM");
-				} catch {
-					child.kill("SIGKILL");
-				}
-			} else {
-				child.kill("SIGKILL");
-			}
+			// The repo-wide convention: tree-kill the child PID, falling back to a
+			// direct kill.
+			terminateProcessForTimeout(child, { killProcessTree: options.killProcessTree });
+			// An installer that shields itself (or its hook scripts) from SIGTERM
+			// would otherwise hold the task launch open forever, so escalate to a
+			// kill that cannot be caught.
+			escalation = setTimeout(forceKillTree, options.killEscalationMs ?? KILL_ESCALATION_MS);
 		}, options.timeoutMs);
-		child.on("error", (error: Error) => {
+		const clearTimers = (): void => {
 			clearTimeout(timer);
+			if (escalation !== undefined) {
+				clearTimeout(escalation);
+			}
+		};
+		child.on("error", (error: Error) => {
+			clearTimers();
 			resolve({ ok: false, exitCode: null, timedOut, output, error: error.message });
 		});
 		child.on("close", (code) => {
-			clearTimeout(timer);
+			clearTimers();
 			if (timedOut) {
 				resolve({
 					ok: false,

@@ -58,6 +58,8 @@ By default, before a task's first start Kanban fetches origin and fast-forwards 
 
 > [!NOTE]
 > [Symlinks (symbolic links)](https://en.wikipedia.org/wiki/Symbolic_link) are special "shortcuts" pointing to another file or directory, allowing access to the target from a new location without duplicating data. They work great in this case since you typically don't modify gitignored files in day-to-day work, but for when you do then don't use Kanban.
+> [!NOTE]
+> A restored `node_modules` keeps its internal symlinks intact: `node_modules/.bin` CLI shims and `file:`/workspace links resolve inside the task worktree, so a task's own edits to a local package stay visible to the packages that import it. Kanban never installs into your own checkout, only into a task worktree, and `KANBAN_WORKTREE_DEPS_INSTALL=off` turns automatic installs off entirely if you would rather have agents install for themselves (cached snapshots are still restored).
 
 As agents work, Kanban uses hooks to display the latest message or tool call on each card, so you can monitor hundreds of agents at a glance without opening each one.
 

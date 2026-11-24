@@ -48,6 +48,7 @@ import type {
 
 const DEFAULT_INSTALL_TIMEOUT_MS = 15 * 60 * 1000;
 const STRATEGY_ENV = "KANBAN_WORKTREE_DEPS_STRATEGY";
+const INSTALL_ENV = "KANBAN_WORKTREE_DEPS_INSTALL";
 
 export interface EnsureWorktreeDependenciesOptions {
 	/** Workspace checkout a snapshot may be taken from. */
@@ -110,6 +111,21 @@ export function resolveTransferStrategy(
 	const raw = (overrides.env ?? process.env)[STRATEGY_ENV];
 	const normalized = typeof raw === "string" ? raw.trim().toLowerCase() : "";
 	return normalized === "copy" ? "copy" : "link";
+}
+
+/**
+ * Whether Kanban may run a package manager at all. Restoring a snapshot only
+ * copies bytes a previous install produced, but an install executes whatever the
+ * project's lifecycle scripts do, so an operator who does not want that
+ * happening unattended can turn it off; the agent can still install for itself.
+ */
+export function resolveAllowInstall(overrides: { allowInstall?: boolean; env?: NodeJS.ProcessEnv } = {}): boolean {
+	if (overrides.allowInstall === false) {
+		return false;
+	}
+	const raw = (overrides.env ?? process.env)[INSTALL_ENV];
+	const normalized = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+	return !(normalized === "off" || normalized === "0" || normalized === "false" || normalized === "no");
 }
 
 function resolveDeps(options: EnsureWorktreeDependenciesOptions): Deps {
@@ -566,7 +582,7 @@ async function runEnsureWorktreeDependencies(
 		const installed = await installIntoWorktree({
 			context,
 			deps,
-			allowInstall: options.allowInstall !== false,
+			allowInstall: resolveAllowInstall({ allowInstall: options.allowInstall }),
 			installTimeoutMs: options.installTimeoutMs ?? DEFAULT_INSTALL_TIMEOUT_MS,
 			startedAt: startedUnitAt,
 		});

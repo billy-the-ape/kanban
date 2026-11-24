@@ -56,6 +56,11 @@ async function writeNodeModules(projectRoot: string, marker: string): Promise<vo
 	const shim = join(binDir, "dep-build");
 	await writeFile(shim, "#!/bin/sh\necho build\n", "utf8");
 	await chmod(shim, 0o755);
+	// npm writes `.bin` shims as *relative* symlinks into the package, which is
+	// the tree shape that breaks when a transfer dereferences links: the copy of
+	// the CLI resolves its relative requires against `.bin/` and fails.
+	await writeFile(join(packageDir, "run.js"), "require('../lib/run');\n", "utf8");
+	await symlink("../dep/run.js", join(binDir, "dep-run")).catch(() => undefined);
 	// A per-tree build cache, which must never travel with a snapshot.
 	const cacheDir = join(packageDir, ".cache");
 	await mkdir(cacheDir, { recursive: true });
@@ -98,7 +103,8 @@ describe("transferTree", () => {
 		const root = makeTempDir("kanban-dep-transfer-");
 		const source = join(root, "source");
 		await writeNodeModules(source, "a");
-		await symlink(join(source, "node_modules", "dep"), join(source, "node_modules", "linked"), "dir");
+		// pnpm/`file:` dependencies are relative links to sibling packages.
+		await symlink("../dep", join(source, "node_modules", "linked"), "dir");
 
 		const stats = await transferTree({
 			from: join(source, "node_modules"),
@@ -119,6 +125,77 @@ describe("transferTree", () => {
 			expect((await lstat(join(destination, "linked"))).isSymbolicLink()).toBe(true);
 		}
 		expect(stats.files).toBeGreaterThan(2);
+	});
+
+	it("keeps relative symlinks as links under the copy strategy too", async () => {
+		const root = makeTempDir("kanban-dep-transfer-copy-links-");
+		const checkout = join(root, "checkout");
+		const worktree = join(root, "worktree");
+		await writeNodeModules(checkout, "links");
+		// An npm `file:`/workspace dependency: a relative link that escapes
+		// node_modules and must keep resolving inside whichever tree it lands in.
+		await mkdir(join(checkout, "vendor", "pkg"), { recursive: true });
+		await writeFile(join(checkout, "vendor", "pkg", "index.js"), "from-checkout", "utf8");
+		await symlink("../vendor/pkg", join(checkout, "node_modules", "aliased"));
+		await mkdir(join(worktree, "vendor", "pkg"), { recursive: true });
+		await writeFile(join(worktree, "vendor", "pkg", "index.js"), "from-worktree", "utf8");
+
+		await transferTree({
+			from: join(checkout, "node_modules"),
+			to: join(worktree, "node_modules"),
+			strategy: "copy",
+		});
+		const restored = join(worktree, "node_modules");
+		if (process.platform === "win32") {
+			// Link creation needs privileges there; only the dereferencing fallback
+			// is exercisable, so the link assertions below would be moot.
+			expect(await readFile(join(restored, "dep", "index.js"), "utf8")).toContain("marker");
+			return;
+		}
+		// A `.bin` shim that became a regular file would no longer resolve its
+		// relative require, which is what a dereferencing copy silently produced.
+		const shim = join(restored, ".bin", "dep-run");
+		expect((await lstat(shim)).isSymbolicLink()).toBe(true);
+		expect(await readFile(shim, "utf8")).toContain("require");
+		expect((await lstat(join(restored, "aliased"))).isSymbolicLink()).toBe(true);
+		// It resolves to the worktree's own package, so the agent's edits there
+		// reach its consumers instead of a frozen duplicate.
+		expect(await readFile(join(restored, "aliased", "index.js"), "utf8")).toBe("from-worktree");
+		// Links share no inode, so `copy` isolation is unaffected.
+		expect((await lstat(join(restored, "dep", "index.js"))).nlink).toBe(1);
+	});
+
+	it("materializes an absolute symlinked directory instead of pointing outside", async () => {
+		const root = makeTempDir("kanban-dep-transfer-abs-link-");
+		const source = join(root, "source");
+		await writeNodeModules(source, "abs");
+		await symlink(join(source, "node_modules", "dep"), join(source, "node_modules", "aliased"), "dir");
+
+		const destination = join(root, "dest-abs");
+		await transferTree({ from: join(source, "node_modules"), to: destination, strategy: "copy" });
+		if (process.platform === "win32") {
+			return;
+		}
+		// Keeping the stored path would hand the worktree a link into the tree it
+		// was published from, so the content is copied and stays put.
+		expect((await lstat(join(destination, "aliased"))).isSymbolicLink()).toBe(false);
+		expect(await readFile(join(destination, "aliased", "index.js"), "utf8")).toContain("marker");
+	});
+
+	it("keeps a link that points back into a directory being copied", async () => {
+		const root = makeTempDir("kanban-dep-transfer-cycle-");
+		const source = join(root, "source");
+		await writeNodeModules(source, "cycle");
+		// Dereferencing this would recurse until the path name exploded.
+		await symlink(join(source, "node_modules", "dep"), join(source, "node_modules", "dep", "self"), "dir");
+
+		const destination = join(root, "dest-cycle");
+		const stats = await transferTree({ from: join(source, "node_modules"), to: destination, strategy: "copy" });
+		if (process.platform === "win32") {
+			return;
+		}
+		expect((await lstat(join(destination, "dep", "self"))).isSymbolicLink()).toBe(true);
+		expect(stats.files).toBeGreaterThan(0);
 	});
 
 	it("copies without sharing inodes when asked to", async () => {
@@ -171,6 +248,11 @@ describe("dependency snapshot store", () => {
 		const restoredFile = entry?.outputPath("node_modules");
 		expect(restoredFile).not.toBeUndefined();
 		expect(await readFile(join(restoredFile ?? "", "dep", "index.js"), "utf8")).toContain("store");
+		if (process.platform !== "win32") {
+			// Publishing is a copy, and a copy that dereferenced links would leave
+			// every restored worktree with a broken CLI shim.
+			expect((await lstat(join(restoredFile ?? "", ".bin", "dep-run"))).isSymbolicLink()).toBe(true);
+		}
 		// No staging directory survives a completed publish.
 		expect(
 			await lstat(join(getDepCacheRootPath(), "entries", "store-roundtrip", "tree")).catch(() => null),
@@ -213,7 +295,13 @@ describe("dependency snapshot store", () => {
 		const repoB = join(root, "repo-b");
 		// Two repositories whose lockfiles churn independently. The newest two
 		// entries of repo-a must not crowd out repo-b entirely.
-		for (const [index, key] of ["per-repo-a1", "per-repo-a2", "per-repo-a3", "per-repo-b1", "per-repo-b2"].entries()) {
+		for (const [index, key] of [
+			"per-repo-a1",
+			"per-repo-a2",
+			"per-repo-a3",
+			"per-repo-b1",
+			"per-repo-b2",
+		].entries()) {
 			await publishDependencyEntry({
 				key,
 				...baseMeta,
@@ -370,6 +458,11 @@ describe("ensureWorktreeDependencies", () => {
 		expect(secondReport.units[0]?.source).toBe("cache");
 		expect(installCalls).toHaveBeenCalledTimes(1);
 		expect(await readFile(join(second, "node_modules", "dep", "index.js"), "utf8")).toContain("fresh");
+		if (process.platform !== "win32") {
+			// install -> snapshot -> restore has to keep the tree's links working,
+			// or the reused tree is not usable by the next agent.
+			expect((await lstat(join(second, "node_modules", ".bin", "dep-run"))).isSymbolicLink()).toBe(true);
+		}
 	});
 
 	it("prepares every install unit of a multi-project repository", async () => {
