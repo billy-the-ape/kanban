@@ -5,7 +5,7 @@
 // rendered as green: "merged" requires the remote-confirmed journal entry,
 // and a stale eligible summary falls back to "waiting".
 
-import type { RuntimeTaskTrackingStateResponse } from "@/runtime/types";
+import type { AutoMergeEligibilitySummary, RuntimeTaskTrackingStateResponse } from "@/runtime/types";
 
 /** Mirrors the server's AUTO_MERGE_MAX_EVIDENCE_AGE_MS (2 minutes). */
 export const AUTO_MERGE_EVIDENCE_BUDGET_MS = 2 * 60 * 1000;
@@ -52,7 +52,7 @@ const BLOCKER_CODE_MESSAGES: Record<string, string> = {
 	head_changed: "The head moved during evidence collection; a fresh read is pending.",
 	evidence_incomplete: "Evidence is incomplete.",
 	evidence_stale: "Evidence is older than the 2-minute budget; re-reading.",
-	check_missing: "A required check has not run on the current head.",
+	check_missing: "A required check name was not observed on the current head.",
 	check_pending: "A required check is still running.",
 	check_failed: "A required check failed or was cancelled.",
 	changes_requested: "Unsuperseded changes requested.",
@@ -100,11 +100,14 @@ function categorizeWaitingCodes(codes: readonly string[]): "approval" | "ci" | "
 	return "other";
 }
 
-function blockerMessages(codes: readonly string[], limit: number): string {
+function blockerMessages(summary: AutoMergeEligibilitySummary, limit: number): string {
 	const seen = new Set<string>();
 	const messages: string[] = [];
-	for (const code of codes) {
-		const message = BLOCKER_CODE_MESSAGES[code] ?? `Blocked: ${code}.`;
+	for (const code of summary.codes) {
+		const message =
+			summary.blockers?.find((blocker) => blocker.code === code)?.message ??
+			BLOCKER_CODE_MESSAGES[code] ??
+			`Blocked: ${code}.`;
 		if (seen.has(message)) {
 			continue;
 		}
@@ -210,7 +213,7 @@ export function deriveAutoMergeStatus(
 		};
 	}
 	if (summary.kind === "blocked") {
-		return { label: "blocked", tone: "danger", detail: blockerMessages(summary.codes, 3), verifiedAt, headSha };
+		return { label: "blocked", tone: "danger", detail: blockerMessages(summary, 10), verifiedAt, headSha };
 	}
 	const category = categorizeWaitingCodes(summary.codes);
 	const label =
@@ -221,7 +224,7 @@ export function deriveAutoMergeStatus(
 				: category === "repair"
 					? "waiting: writer/comment repair"
 					: "waiting";
-	const detail = evidenceStale ? "Evidence is stale; re-reading." : blockerMessages(summary.codes, 2);
+	const detail = evidenceStale ? "Evidence is stale; re-reading." : blockerMessages(summary, 10);
 	return { label, tone: "neutral", detail, verifiedAt, headSha };
 }
 

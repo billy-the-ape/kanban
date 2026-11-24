@@ -256,7 +256,7 @@ export function classifyRequiredChecks(
 	}
 	const all: AutoMergeCheckEvidence[] = [...envelope.checks, ...envelope.statuses];
 	for (const name of policy.requiredChecks) {
-		const candidates = all.filter((entry) => entry.name === name);
+		const candidates = all.filter((entry) => entry.name === name && entry.sha === envelope.headSha);
 		if (candidates.length === 0) {
 			verdicts.push({ name, outcome: "missing" });
 			continue;
@@ -400,7 +400,12 @@ export function evaluateAutoMergeEligibility(input: AutoMergeEligibilityInput): 
 				requiredVerdicts.filter((verdict) => verdict.outcome === outcome).map((verdict) => verdict.name);
 			const missing = names("missing");
 			if (missing.length > 0) {
-				add("check_missing", `No check run for: ${missing.join(", ")}.`);
+				const observed = [...new Set([...envelope.checks, ...envelope.statuses]
+					.filter((entry) => entry.sha === envelope.headSha)
+					.map((entry) => entry.name))].sort();
+				const available = observed.length > 0 ? observed.slice(0, 8).join(", ") : "none";
+				const suffix = observed.length > 8 ? ` (+${observed.length - 8} more)` : "";
+				add("check_missing", `Required check not observed: ${missing.join(", ")}. Observed: ${available}${suffix}.`);
 			}
 			const pending = names("pending");
 			if (pending.length > 0) {
@@ -426,7 +431,16 @@ export function evaluateAutoMergeEligibility(input: AutoMergeEligibilityInput): 
 		);
 	}
 	if (reviewVerdict.approvers.length === 0) {
-		add("no_approval", "No effective current-head approval from a non-author reviewer yet.");
+		const previousHeads = [...new Set(envelope.reviews
+			.filter((review) => review.state === "APPROVED" && review.authorLogin !== envelope.authorLogin &&
+				review.authorLogin !== "unknown" && review.commitId !== null && review.commitId !== envelope.headSha)
+			.map((review) => review.commitId?.slice(0, 7)))].slice(0, 5);
+		add(
+			"no_approval",
+			previousHeads.length > 0
+				? `No effective approval for current head ${envelope.headSha?.slice(0, 7) ?? "unknown"}; earlier approval(s) target ${previousHeads.join(", ")}.`
+				: "No effective current-head approval from a non-author reviewer yet.",
+		);
 	}
 
 	// Phase G: competing operations on the record.
@@ -476,6 +490,10 @@ export function toAutoMergeEligibilitySummary(result: AutoMergeEligibilityResult
 		schemaVersion: AUTO_MERGE_ELIGIBILITY_SCHEMA_VERSION,
 		kind: result.kind,
 		codes: result.blockers.map((blocker) => blocker.code).slice(0, AUTO_MERGE_ELIGIBILITY_SUMMARY_MAX_CODES),
+		blockers: result.blockers.slice(0, AUTO_MERGE_ELIGIBILITY_SUMMARY_MAX_CODES).map((blocker) => ({
+			code: blocker.code,
+			message: blocker.message.length > 1000 ? `${blocker.message.slice(0, 999)}…` : blocker.message,
+		})),
 		evaluatedAt: result.evaluatedAt,
 		headSha: result.headSha,
 		baseSha: result.baseSha,

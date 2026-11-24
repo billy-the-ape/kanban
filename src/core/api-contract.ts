@@ -3626,8 +3626,13 @@ export const autoMergeEligibilitySummarySchema = z
 	.object({
 		schemaVersion: z.literal(AUTO_MERGE_ELIGIBILITY_SCHEMA_VERSION),
 		kind: autoMergeEligibilityKindSchema,
-		/** Ordered blocker codes (messages stay transient; capped by the constant above). */
+		/** Ordered blocker codes, capped by the constant above. */
 		codes: z.array(z.string().min(1)).max(AUTO_MERGE_ELIGIBILITY_SUMMARY_MAX_CODES),
+		/** Bounded diagnostic messages; absent on summaries written by older runtimes. */
+		blockers: z
+			.array(autoMergeEligibilityBlockerSchema.extend({ message: z.string().min(1).max(1000) }))
+			.max(AUTO_MERGE_ELIGIBILITY_SUMMARY_MAX_CODES)
+			.optional(),
 		evaluatedAt: z.number(),
 		headSha: z.string().nullable(),
 		baseSha: z.string().nullable(),
