@@ -888,8 +888,10 @@ export function RuntimeSettingsDialog({
 					</div>
 
 					<div className="rounded-lg border border-border bg-surface-0 px-4 py-3 mb-4">
-						<label htmlFor="cline-concurrency-limit"
-							className="block text-text-primary font-semibold text-[12px] mb-2">
+						<label
+							htmlFor="cline-concurrency-limit"
+							className="block text-text-primary font-semibold text-[12px] mb-2"
+						>
 							Concurrent agent turns per model
 						</label>
 						<input
@@ -902,10 +904,9 @@ export function RuntimeSettingsDialog({
 							className="h-8 w-full rounded-md border border-border bg-surface-2 px-2 text-[13px] text-text-primary placeholder:text-text-tertiary focus:border-border-focus focus:outline-none"
 						/>
 						<p className="text-text-secondary text-[12px] mt-2 mb-0">
-							Leave empty to detect the model's advertised parallel slots; enter 1–64 to
-							 allow additional turns while Pi runs shell commands or sleeps.
-							 Applies to Cline turns and initial Pi coding turns. Existing Pi follow-ups
-							 use Pi's native terminal and are not throttled here.
+							Leave empty to detect the model's advertised parallel slots; enter 1–64 to allow additional turns
+							while Pi runs shell commands or sleeps. Applies to Cline turns and initial Pi coding turns.
+							Existing Pi follow-ups use Pi's native terminal and are not throttled here.
 						</p>
 					</div>
 

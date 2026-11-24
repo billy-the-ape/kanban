@@ -38,6 +38,9 @@ type ReportedOutcome = "launched" | "queued" | "ended";
 
 interface RunningPiStart {
 	owner: symbol;
+	/** The owning workspace, so a bulk stop can drop only its own claims. */
+	workspaceId: string;
+	taskId: string;
 	admission: Promise<PiStartAdmission>;
 	reported: ReportedOutcome | null;
 	/** Set by Stop so a canceled wait settles as canceled, not failed. */
@@ -108,6 +111,30 @@ export class PiInitialTurnCapacityGate {
 	}
 
 	/**
+	 * Drops one workspace's queued starts when its terminal manager is bulk-stopped
+	 * or disposed. `markInterruptedAndStopAll` can only stop processes, so a start
+	 * waiting for a model slot outlives it - and the slot that shutdown, project
+	 * removal or workspace disposal just freed would otherwise admit a fresh CLI
+	 * against a manager that is being torn down. Only starts still waiting are
+	 * dropped: a launched Pi CLI is a live process, and the bulk stop stops it
+	 * itself. A dropped wait settles idle rather than failed, because teardown is
+	 * not the card's failure; the card keeps its dispatch record and is relaunched
+	 * by the next reconciliation.
+	 */
+	cancelWorkspace(workspaceId: string): number {
+		let dropped = 0;
+		for (const record of [...this.starts.values()]) {
+			if (record.workspaceId !== workspaceId || record.reported !== "queued" || record.canceled) {
+				continue;
+			}
+			record.canceled = true;
+			this.scheduler.cancel(record.owner, record.taskId);
+			dropped += 1;
+		}
+		return dropped;
+	}
+
+	/**
 	 * Asks the shared model queue to admit an initial Pi turn and resolves as
 	 * soon as the outcome is known: the CLI launched, or the start is queued.
 	 * Only capacity discovery and the spawn itself are awaited, so the caller
@@ -125,7 +152,14 @@ export class PiInitialTurnCapacityGate {
 			settle = resolve;
 			fail = reject;
 		});
-		const record: RunningPiStart = { owner, admission, reported: null, canceled: false };
+		const record: RunningPiStart = {
+			owner,
+			workspaceId: request.workspaceId,
+			taskId: request.taskId,
+			admission,
+			reported: null,
+			canceled: false,
+		};
 		this.starts.set(key, record);
 
 		/** Publishes the wait once the queue reports it, and only to the caller. */

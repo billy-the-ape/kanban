@@ -7,10 +7,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
-
+import { PR_CI_HANDOFF_GUIDANCE } from "../../../src/prompts/pr-ci-handoff";
 import { type AgentAdapterLaunchInput, prepareAgentLaunch } from "../../../src/terminal/agent-session-adapters";
 import { preparePiLaunch, withPiCiHandoffGuidance } from "../../../src/terminal/pi-session-adapter";
-import { PR_CI_HANDOFF_GUIDANCE } from "../../../src/prompts/pr-ci-handoff";
 import {
 	buildPiLaunchArgs,
 	derivePiSessionId,

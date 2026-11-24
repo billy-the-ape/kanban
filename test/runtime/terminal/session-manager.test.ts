@@ -375,4 +375,19 @@ describe("TerminalSessionManager", () => {
 		});
 		expect(getSnapshotSpy).toHaveBeenCalledTimes(1);
 	});
+
+	it("asks the workspace to drop queued claims when every session is stopped", () => {
+		// A capacity wait has no process, so bulk stop cannot reach it. The listener
+		// (paired with the Pi capacity gate in the composition root) runs
+		// synchronously here, before a stopped process can free a model slot and
+		// admit a new CLI against a manager that is being torn down.
+		const manager = new TerminalSessionManager();
+		let drops = 0;
+		manager.setOnBulkStop(() => {
+			drops += 1;
+		});
+		expect(drops).toBe(0);
+		expect(manager.markInterruptedAndStopAll()).toEqual([]);
+		expect(drops).toBe(1);
+	});
 });

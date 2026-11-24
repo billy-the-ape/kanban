@@ -56,8 +56,13 @@ it is still waiting for, since a summary left behind by a restart would otherwis
 hold a slot forever — so the worker limit still caps how many cards start. Stop
 cancels a
 queued Pi start and its CLI is never launched; a queued CLI that cannot spawn
-marks the card failed. Cline pause, abort, clear/trash cleanup and runtime
-disposal cancel pending admissions so they cannot start later. The waiting queue
+marks the card failed. Bulk-stopping a workspace's sessions — runtime shutdown,
+project removal, workspace disposal — cancels that workspace's queued starts the
+same way, because the stop can only reach processes and the slot it just freed
+would otherwise admit a new CLI against a manager being torn down; the card is
+left idle rather than failed, and relaunched by the next reconciliation. Cline
+pause, abort, clear/trash cleanup and runtime disposal cancel pending admissions
+so they cannot start later. The waiting queue
 is held in memory; interrupted work must be resumed after a runtime restart.
 
 ## Other limits

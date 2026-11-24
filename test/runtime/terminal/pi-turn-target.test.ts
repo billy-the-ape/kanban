@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -24,42 +24,62 @@ afterEach(async () => {
 describe("resolvePiTurnTarget", () => {
 	it("discovers the selected model's local llama-swap endpoint without reading credentials", async () => {
 		const dir = await makeAgentDir();
-		await writeFile(join(dir, "settings.json"), JSON.stringify({
-			defaultProvider: "local", defaultModel: "qwen3",
-		}));
-		await writeFile(join(dir, "models.json"), JSON.stringify({
-			providers: {
-				local: {
-					baseUrl: "http://127.0.0.1:8080/v1",
-					models: [{ id: "qwen3" }],
-					apiKey: "never-forward-to-capacity-probe",
+		await writeFile(
+			join(dir, "settings.json"),
+			JSON.stringify({
+				defaultProvider: "local",
+				defaultModel: "qwen3",
+			}),
+		);
+		await writeFile(
+			join(dir, "models.json"),
+			JSON.stringify({
+				providers: {
+					local: {
+						baseUrl: "http://127.0.0.1:8080/v1",
+						models: [{ id: "qwen3" }],
+						apiKey: "never-forward-to-capacity-probe",
+					},
 				},
-			},
-		}));
+			}),
+		);
 		expect(await resolvePiTurnTarget()).toEqual({
-			providerId: "local", modelId: "qwen3", baseUrl: "http://127.0.0.1:8080/v1",
+			providerId: "local",
+			modelId: "qwen3",
+			baseUrl: "http://127.0.0.1:8080/v1",
 		});
 	});
 
 	it("respects explicit Pi command model flags", async () => {
 		const dir = await makeAgentDir();
-		await writeFile(join(dir, "settings.json"), JSON.stringify({
-			defaultProvider: "local", defaultModel: "qwen3",
-		}));
-		await writeFile(join(dir, "models.json"), JSON.stringify({
-			providers: {
-				other: { baseUrl: "http://127.0.0.1:8181/v1" },
-			},
-		}));
+		await writeFile(
+			join(dir, "settings.json"),
+			JSON.stringify({
+				defaultProvider: "local",
+				defaultModel: "qwen3",
+			}),
+		);
+		await writeFile(
+			join(dir, "models.json"),
+			JSON.stringify({
+				providers: {
+					other: { baseUrl: "http://127.0.0.1:8181/v1" },
+				},
+			}),
+		);
 		expect(await resolvePiTurnTarget(["--provider", "other", "--model", "qwen-coder"])).toEqual({
-			providerId: "other", modelId: "qwen-coder", baseUrl: "http://127.0.0.1:8181/v1",
+			providerId: "other",
+			modelId: "qwen-coder",
+			baseUrl: "http://127.0.0.1:8181/v1",
 		});
 	});
 
 	it("fails closed to unknown endpoint without any Pi provider configuration", async () => {
 		await makeAgentDir();
 		expect(await resolvePiTurnTarget()).toEqual({
-			providerId: "pi", modelId: null, baseUrl: null,
+			providerId: "pi",
+			modelId: null,
+			baseUrl: null,
 		});
 	});
 });

@@ -3,7 +3,7 @@ import { ClineTurnScheduler } from "../../../src/cline-sdk/cline-turn-scheduler"
 import type { RuntimeTaskSessionSummary } from "../../../src/core/api-contract";
 import type { PiStartRequest } from "../../../src/terminal/pi-initial-turn-capacity";
 import { PiInitialTurnCapacityGate } from "../../../src/terminal/pi-initial-turn-capacity";
-import type { TerminalSessionManager } from "../../../src/terminal/session-manager";
+import { TerminalSessionManager } from "../../../src/terminal/session-manager";
 
 const target = { providerId: "pi", modelId: "qwen", baseUrl: "http://localhost:8080/v1" };
 
@@ -271,5 +271,73 @@ describe("PiInitialTurnCapacityGate", () => {
 		fake.emit(summary("a", { pid: null, state: "awaiting_review", reviewReason: "exit" }));
 		await tick();
 		expect(gate.hasPending("workspace", "a")).toBe(false);
+	});
+
+	it("drops only the bulk-stopped workspace's queued starts", async () => {
+		// Bulk stop can only stop processes, so a queued start survives it - and the
+		// slot that shutdown, project removal or workspace disposal just freed would
+		// admit a fresh CLI against a manager that is being torn down.
+		const scheduler = new ClineTurnScheduler(async () => 1);
+		const gate = new PiInitialTurnCapacityGate(scheduler);
+		const fake = fakeManager();
+		await gate.request(startInput(fake, "a", async () => summary("a")));
+		const droppedLaunch = vi.fn(async () => summary("b"));
+		expect(expectQueued(await gate.request(startInput(fake, "b", droppedLaunch)))).toBe(1);
+		const keptLaunch = vi.fn(async () => summary("c"));
+		const otherWorkspace = { ...startInput(fake, "c", keptLaunch), workspaceId: "other-workspace" };
+		expect(expectQueued(await gate.request(otherWorkspace))).toBe(2);
+
+		expect(gate.cancelWorkspace("unrelated-workspace")).toBe(0);
+		// Only the waiting claim is dropped: a launched card is a live process, and
+		// the bulk stop stops it itself.
+		expect(gate.cancelWorkspace("workspace")).toBe(1);
+		expect(gate.hasPending("workspace", "a")).toBe(true);
+		expect(gate.hasPending("other-workspace", "c")).toBe(true);
+
+		// The slot frees: the other workspace is admitted and spawns, the dropped
+		// start never does, and teardown settles its record idle instead of failed.
+		fake.emit(settled("a"));
+		await tick();
+		await tick();
+		expect(droppedLaunch).not.toHaveBeenCalled();
+		expect(keptLaunch).toHaveBeenCalledOnce();
+		expect(fake.settles).toEqual([{ taskId: "b", error: null }]);
+		expect(gate.hasPending("workspace", "b")).toBe(false);
+	});
+
+	it("settles the manager's own waiting record when a bulk stop drops the wait", async () => {
+		// The composition root pairs `setOnBulkStop` with `cancelWorkspace` on every
+		// tracked manager, so the record left behind is the manager's own: the card
+		// must read as an idle card that stopped, not as a failed one.
+		const scheduler = new ClineTurnScheduler(async () => 1);
+		const gate = new PiInitialTurnCapacityGate(scheduler);
+		const manager = new TerminalSessionManager();
+		manager.setOnBulkStop(() => {
+			gate.cancelWorkspace("workspace");
+		});
+		const request = (taskId: string, launch: () => Promise<RuntimeTaskSessionSummary>): PiStartRequest => ({
+			workspaceId: "workspace",
+			taskId,
+			workspacePath: "/tmp/task",
+			manager,
+			target,
+			launch,
+		});
+		const queuedLaunch = vi.fn(async () => summary("b"));
+		await gate.request(request("a", async () => summary("a")));
+		await gate.request(request("b", queuedLaunch));
+		expect(manager.getSummary("b")?.state).toBe("idle");
+		expect(manager.getSummary("b")?.latestHookActivity?.hookEventName).toBe("concurrency_waiting");
+
+		// This is what shutdown, project removal and workspace disposal call.
+		manager.markInterruptedAndStopAll();
+		await tick();
+		await tick();
+		expect(queuedLaunch).not.toHaveBeenCalled();
+		expect(gate.hasPending("workspace", "b")).toBe(false);
+		const dropped = manager.getSummary("b");
+		expect(dropped?.state).toBe("idle");
+		expect(dropped?.warningMessage).toBeNull();
+		expect(dropped?.latestHookActivity).toBeNull();
 	});
 });

@@ -1,11 +1,11 @@
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ClineTurnTarget } from "../cline-sdk/cline-turn-scheduler";
 import { getPiAgentDir, readPiModelDefaults } from "./pi-session-options";
-import { readFile } from "node:fs/promises";
 
 function asRecord(value: unknown): Record<string, unknown> | null {
 	return value !== null && typeof value === "object" && !Array.isArray(value)
-		? value as Record<string, unknown>
+		? (value as Record<string, unknown>)
 		: null;
 }
 

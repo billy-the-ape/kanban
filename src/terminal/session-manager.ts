@@ -221,6 +221,8 @@ function hasCodexStartupUiRendered(text: string): boolean {
 export class TerminalSessionManager implements TerminalSessionService {
 	private readonly entries = new Map<string, SessionEntry>();
 	private readonly summaryListeners = new Set<(summary: RuntimeTaskSessionSummary) => void>();
+	/** Runs before this manager's sessions are bulk-stopped; see `setOnBulkStop`. */
+	private bulkStopListener: (() => void) | null = null;
 
 	private trySendDeferredCodexStartupInput(taskId: string): boolean {
 		const entry = this.entries.get(taskId);
@@ -1155,7 +1157,26 @@ export class TerminalSessionManager implements TerminalSessionService {
 		return cloneSummary(entry.summary);
 	}
 
+	/**
+	 * Registers the work that must run when every session on this manager is
+	 * bulk-stopped. That stop can only reach processes, so a claim with no process
+	 * behind it - a Pi start queued for a model slot, wired in the composition root
+	 * - survives it and would spawn later against a manager being torn down, once
+	 * the stopped process frees the slot.
+	 */
+	setOnBulkStop(listener: () => void): void {
+		this.bulkStopListener = listener;
+	}
+
 	markInterruptedAndStopAll(): RuntimeTaskSessionSummary[] {
+		// Drop queued work before stopping anything: ending the session that holds
+		// a model slot frees it, and a start queued behind it would otherwise be
+		// admitted while this manager is still being shut down or disposed.
+		try {
+			this.bulkStopListener?.();
+		} catch {
+			// Best effort: releasing a claim never outranks stopping live work.
+		}
 		const activeEntries = Array.from(this.entries.values()).filter((entry) => entry.active != null);
 		for (const entry of activeEntries) {
 			if (!entry.active) {
