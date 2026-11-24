@@ -87,6 +87,21 @@ describe("extractHookPullRequestUrls", () => {
 });
 
 describe("extractPiPublicationTool", () => {
+	it("records recognized writes before execution with the matching call id", () => {
+		const payload = {
+			hook_event_name: "tool_execution_start",
+			tool_name: "bash",
+			tool_call_id: "call-42",
+			tool_input: { command: "gh api -X POST repos/octo/repo/pulls/42/comments -F in_reply_to=12 -f body=done" },
+		};
+		expect(extractPiPublicationTool(payload, "pi")).toMatchObject({
+			phase: "started",
+			toolCallId: "call-42",
+			output: null,
+			error: null,
+		});
+		expect(extractPiPublicationTool({ ...payload, tool_call_id: null }, "pi")).toBeUndefined();
+	});
 	it("captures Pi's attributed gh comment write with its tool call id", () => {
 		const event = extractPiPublicationTool(
 			{

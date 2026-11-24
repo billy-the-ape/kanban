@@ -51,6 +51,10 @@ export function buildPiHookExtensionSource(input: PiHookExtensionInput): string 
 const MAX_ACTIVITY_CHARS = 600;
 const MAX_MESSAGE_CHARS = 6000;
 const MAX_RESULT_CHARS = 2000;
+const MAX_PUBLICATION_COMMAND_CHARS = 10000;
+const MAX_PUBLICATION_RESULT_CHARS = 4000;
+// Pi start events carry arguments; end events may carry only the result.
+const startedBashCommands = new Map();
 
 let rootSessionId = KANBAN_SESSION_ID;
 let ownsTaskEvents = true;
@@ -224,7 +228,7 @@ function hasQueuedContinuation(ctx) {
 	}
 }
 
-function notifyKanban(event, flags, payload) {
+function notifyKanban(event, flags, payload, waitForExit = false) {
 	try {
 		if (!process.env.KANBAN_HOOK_TASK_ID) {
 			return;
@@ -240,6 +244,22 @@ function notifyKanban(event, flags, payload) {
 			args.push("--metadata-base64", Buffer.from(JSON.stringify(payload), "utf8").toString("base64"));
 		}
 		const child = spawn(KANBAN_NOTIFY_COMMAND[0], args, { stdio: "ignore", windowsHide: true });
+		if (waitForExit) {
+			// Publication capture must reach the server before the tool/turn
+			// proceeds. Bound the wait even if the hook process stalls.
+			return new Promise((resolve) => {
+				const timer = setTimeout(() => {
+					child.kill();
+					resolve();
+				}, 5000);
+				const done = () => {
+					clearTimeout(timer);
+					resolve();
+				};
+				child.once("error", done);
+				child.once("exit", done);
+			});
+		}
 		child.on("error", () => {});
 		if (typeof child.unref === "function") {
 			child.unref();
@@ -327,6 +347,22 @@ export default function kanbanPiHooks(pi) {
 		turnFailure = null;
 	});
 
+	pi.on("tool_execution_start", async (event, ctx) => {
+		if (!ownsSession(ctx) || event?.toolName !== "bash") return;
+		const id = oneLine(event.toolCallId, 200);
+		const command = event.args?.command;
+		// Only possible gh invocations need the publication barrier. The
+		// hook CLI performs the authoritative command/endpoint detection.
+		if (!id || typeof command !== "string" || !command.includes("gh")) return;
+		const bounded = command.slice(0, MAX_PUBLICATION_COMMAND_CHARS);
+		startedBashCommands.set(id, bounded);
+		const payload = basePayload(ctx, "tool_execution_start");
+		payload.tool_name = "bash";
+		payload.tool_call_id = id;
+		payload.tool_input = { command: bounded };
+		await notifyKanban("activity", [["--hook-event-name", "tool_execution_start"]], payload, true);
+	});
+
 	pi.on("tool_execution_end", async (event, ctx) => {
 		if (!ownsSession(ctx)) {
 			return;
@@ -336,11 +372,19 @@ export default function kanbanPiHooks(pi) {
 		payload.tool_name = toolName;
 		payload.tool_call_id = oneLine(event && event.toolCallId, 200);
 		payload.tool_is_error = event && event.isError === true;
-		payload.tool_input = boundJsonValue(event && event.args, MAX_RESULT_CHARS);
-		payload.tool_response = { output: clipText(toolResultText(event && event.result), MAX_RESULT_CHARS) };
+		const startedCommand = startedBashCommands.get(payload.tool_call_id);
+		startedBashCommands.delete(payload.tool_call_id);
+		const command = startedCommand ?? event?.args?.command;
+		const publicationCandidate = toolName === "bash" && typeof command === "string" && command.includes("gh");
+		payload.tool_input = publicationCandidate
+			? { command: command.slice(0, MAX_PUBLICATION_COMMAND_CHARS) }
+			: boundJsonValue(event && event.args, MAX_RESULT_CHARS);
+		payload.tool_response = {
+			output: clipText(toolResultText(event && event.result), publicationCandidate ? MAX_PUBLICATION_RESULT_CHARS : MAX_RESULT_CHARS),
+		};
 		if (event && event.isError === true) {
 			turnFailure = "the " + toolName + " tool failed";
-			notifyKanban(
+			await notifyKanban(
 				"activity",
 				[
 					["--hook-event-name", "tool_execution_end"],
@@ -349,10 +393,11 @@ export default function kanbanPiHooks(pi) {
 					["--activity-text", "Failed " + toolName],
 				],
 				payload,
+				publicationCandidate,
 			);
 			return;
 		}
-		notifyKanban(
+		await notifyKanban(
 			"activity",
 			[
 				["--hook-event-name", "tool_execution_end"],
@@ -360,6 +405,7 @@ export default function kanbanPiHooks(pi) {
 				["--activity-text", "Completed " + toolName],
 			],
 			payload,
+			publicationCandidate,
 		);
 	});
 
@@ -433,6 +479,7 @@ export default function kanbanPiHooks(pi) {
 		}
 		// The run is over, so a dialog closing afterwards belongs to no turn.
 		waitingOnPrompt = false;
+		startedBashCommands.clear();
 		const payload = basePayload(ctx, "agent_settled");
 		if (event && event.aborted === true) {
 			turnFailure = null;

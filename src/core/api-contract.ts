@@ -2896,9 +2896,9 @@ export const runtimeHookIngestRequestSchema = z.object({
 	sessionId: z.string().min(1).max(200).optional(),
 	/** Canonical PR URLs detected by the hook CLI (re-parsed server-side; max 10). */
 	pullRequestUrls: z.array(z.string().min(1).max(2048)).max(10).optional(),
-	/** Pi tool result used to exclude implementation-authored PR comments from review feedback. */
+	/** Pi tool evidence used to exclude implementation-authored PR comments from review feedback. */
 	publicationTool: z.object({
-		phase: z.literal("finished"),
+		phase: z.enum(["started", "finished"]),
 		toolCallId: z.string().max(200).nullable(),
 		toolName: z.string().max(128).nullable(),
 		commands: z.array(z.string().max(10_000)).max(10),

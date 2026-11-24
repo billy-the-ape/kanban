@@ -460,7 +460,7 @@ export function normalizeHookMetadata(
 }
 
 /**
- * Only publish bounded Pi command outputs for actual PR-feedback writes.
+ * Only forward bounded Pi command evidence for actual PR-feedback writes.
  * Ordinary bash calls and read-only GitHub operations never reach the
  * publication attribution/record store.
  */
@@ -468,7 +468,11 @@ export function extractPiPublicationTool(
 	payload: Record<string, unknown> | null,
 	source: string | null | undefined,
 ): RuntimeHookIngestRequest["publicationTool"] {
-	if (source !== "pi" || payload?.hook_event_name !== "tool_execution_end") return undefined;
+	if (source !== "pi" || !payload) return undefined;
+	const phase = payload.hook_event_name === "tool_execution_start" ? "started" : "finished";
+	if (phase === "finished" && payload.hook_event_name !== "tool_execution_end") return undefined;
+	const toolCallId = readStringField(payload, "tool_call_id")?.slice(0, 200) ?? null;
+	if (phase === "started" && !toolCallId) return undefined;
 	const toolInput = asRecord(payload.tool_input);
 	const commands = toolInput
 		? extractCommandStrings(toolInput)
@@ -476,14 +480,14 @@ export function extractPiPublicationTool(
 				.map((cmd) => cmd.slice(0, 10_000))
 		: [];
 	if (commands.length === 0 || detectPublicationOperations(commands).length === 0) return undefined;
-	const output = extractHookToolResponse(payload)?.slice(0, 4000) ?? null;
+	const output = phase === "started" ? null : (extractHookToolResponse(payload)?.slice(0, 4000) ?? null);
 	return {
-		phase: "finished",
-		toolCallId: readStringField(payload, "tool_call_id")?.slice(0, 200) ?? null,
+		phase,
+		toolCallId,
 		toolName: readStringField(payload, "tool_name")?.slice(0, 128) ?? null,
 		commands,
 		output,
-		error: payload.tool_is_error === true ? (output?.slice(0, 1000) ?? "Pi command failed") : null,
+		error: phase === "finished" && payload.tool_is_error === true ? (output?.slice(0, 1000) ?? "Pi command failed") : null,
 	};
 }
 

@@ -186,6 +186,7 @@ describe("Kanban Pi hook extension", () => {
 				"session_start",
 				"agent_start",
 				"message_end",
+				"tool_execution_start",
 				"tool_execution_end",
 				"model_select",
 				"ui_prompt_start",
@@ -245,6 +246,23 @@ describe("Kanban Pi hook extension", () => {
 		expect(settled.payload).not.toHaveProperty("pi_error");
 		// The failure stays visible as metadata without becoming the turn outcome.
 		expect(findByHookEvent(records, "tool_execution_end").flags["--notification-type"]).toBe("error");
+	});
+
+	it("retains publication arguments from the start event when the result has no args", async () => {
+		const harness = await createPiExtensionHarness({ sessionId: "kanban-task-1" });
+		const ctx = makeCtx("kanban-task-1");
+		const command = `gh api -X POST repos/octo/repo/pulls/42/comments -F in_reply_to=12 -f body="${"x".repeat(2500)}"`;
+		const output = JSON.stringify({ id: 77, url: "https://api.github.com/repos/octo/repo/pulls/comments/77" });
+		await harness.invoke("tool_execution_start", { toolName: "bash", toolCallId: "call-42", args: { command } }, ctx);
+		const started = findByHookEvent(await harness.recorded(), "tool_execution_start");
+		expect(started.payload).toMatchObject({ tool_call_id: "call-42", tool_input: { command } });
+		await harness.invoke(
+			"tool_execution_end",
+			{ toolName: "bash", toolCallId: "call-42", result: { content: [{ type: "text", text: output }] }, isError: false },
+			ctx,
+		);
+		const finished = findByHookEvent(await harness.recorded(), "tool_execution_end");
+		expect(finished.payload).toMatchObject({ tool_call_id: "call-42", tool_input: { command }, tool_response: { output } });
 	});
 
 	it("still reports a turn that stops on a failed tool call as an error", async () => {
