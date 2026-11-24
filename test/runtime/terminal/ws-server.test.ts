@@ -482,7 +482,8 @@ describe("createTerminalWebSocketBridge", () => {
 
 	it("bounds output waiting for an inactive viewer's initial restore", async () => {
 		const ioUrl = `${runtimeUrl}/api/terminal/io?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=unresponsive`;
-		const controlUrl = `${runtimeUrl}/api/terminal/control?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=unresponsive`;
+		const controlUrl =
+			`${runtimeUrl}/api/terminal/control?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=unresponsive`;
 		const io = await openQueuedWebSocket(ioUrl);
 		const control = await openQueuedWebSocket(controlUrl);
 		await waitForControlMessage(control, (message) => message.type === "restore");
