@@ -117,6 +117,8 @@ import {
 } from "../task-dispatch/task-dispatch-service";
 import { buildRuntimeConfigResponse, resolveAgentCommand } from "../terminal/agent-registry";
 import { derivePiSessionId, getPiTaskSessionDir, readPiSessionRecord } from "../terminal/pi-session-options";
+import { sharedPiInitialTurnCapacityGate } from "../terminal/pi-initial-turn-capacity";
+import { resolvePiTurnTarget } from "../terminal/pi-turn-target";
 import { collectRestorablePiCardIds, isDetachedPiRestoreCandidate } from "../terminal/pi-session-restore";
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { createVerificationRunner } from "../verification/verification-service";
@@ -862,7 +864,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				};
 			}
 			assertLaunchCurrent();
-			const summary = await terminalManager.startTaskSession({
+			const launchTerminal = async () => await terminalManager.startTaskSession({
 				taskId: body.taskId,
 				agentId: resolved.agentId,
 				binary: resolved.binary,
@@ -878,6 +880,19 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				rows: body.rows,
 				workspaceId: workspaceScope.workspaceId,
 			});
+			// Initial Pi coding turns share the same model-capacity pool as Cline.
+			// Restoring an existing conversation never consumes a new admission.
+			// Pi's native follow-up turns are not intercepted by this start gate.
+			const summary =
+				resolved.agentId === "pi" && !body.restoreDetachedSession && !terminalManager.hasActiveProcess(body.taskId)
+					? await sharedPiInitialTurnCapacityGate.start(
+							workspaceScope.workspaceId,
+							body.taskId,
+							terminalManager,
+							await resolvePiTurnTarget(resolved.args),
+							launchTerminal,
+						)
+					: await launchTerminal();
 
 			let nextSummary = summary;
 			if (shouldCaptureTurnCheckpoint) {
@@ -2003,6 +2018,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		stopTaskSession: async (workspaceScope, input) => {
 			try {
 				const body = parseTaskSessionStopRequest(input);
+				const canceledPiAdmission = sharedPiInitialTurnCapacityGate.cancel(workspaceScope.workspaceId, body.taskId);
 				const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
 				const clineSummary = await clineTaskSessionService.stopTaskSession(body.taskId);
 				if (clineSummary) {
@@ -2019,7 +2035,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					runTaskDispatchAfterStateChange(workspaceScope);
 				}
 				return {
-					ok: Boolean(summary),
+					ok: Boolean(summary) || canceledPiAdmission,
 					summary,
 				};
 			} catch (error) {

@@ -501,10 +501,7 @@ export function RuntimeSettingsDialog({
 		if (readyForReviewNotificationsEnabled !== initialReadyForReviewNotificationsEnabled) {
 			return true;
 		}
-		if (
-			selectedAgentId === "cline" &&
-			clineConcurrencyLimit.trim() !== (config.clineConcurrencyLimit?.toString() ?? "")
-		) {
+		if (clineConcurrencyLimit.trim() !== (config.clineConcurrencyLimit?.toString() ?? "")) {
 			return true;
 		}
 		if (clineSettings.hasUnsavedChanges) {
@@ -735,11 +732,10 @@ export function RuntimeSettingsDialog({
 		}
 		const concurrencyOverride = clineConcurrencyLimit.trim() === "" ? null : Number(clineConcurrencyLimit);
 		if (
-			selectedAgentId === "cline" &&
 			concurrencyOverride !== null &&
 			(!Number.isInteger(concurrencyOverride) || concurrencyOverride < 1 || concurrencyOverride > 64)
 		) {
-			setSaveError("Cline concurrency limit must be an integer between 1 and 64, or empty for automatic.");
+			setSaveError("Model concurrency limit must be an integer between 1 and 64, or empty for automatic.");
 			return;
 		}
 		// B-2.9: an invalid context budget draft blocks the whole save.
@@ -760,8 +756,7 @@ export function RuntimeSettingsDialog({
 			}
 		}
 		const saved = await save({
-			...(selectedAgentId === "cline" &&
-			clineConcurrencyLimit.trim() !== (config?.clineConcurrencyLimit?.toString() ?? "")
+			...(clineConcurrencyLimit.trim() !== (config?.clineConcurrencyLimit?.toString() ?? "")
 				? { clineConcurrencyLimit: concurrencyOverride }
 				: {}),
 			selectedAgentId,
@@ -893,6 +888,28 @@ export function RuntimeSettingsDialog({
 					</div>
 
 					<div className="rounded-lg border border-border bg-surface-0 px-4 py-3 mb-4">
+						<label htmlFor="cline-concurrency-limit"
+							className="block text-text-primary font-semibold text-[12px] mb-2">
+							Concurrent agent turns per model
+						</label>
+						<input
+							id="cline-concurrency-limit"
+							value={clineConcurrencyLimit}
+							onChange={(event) => setClineConcurrencyLimit(event.target.value)}
+							placeholder="Auto (llama-swap model slots; fallback 1)"
+							inputMode="numeric"
+							disabled={controlsDisabled}
+							className="h-8 w-full rounded-md border border-border bg-surface-2 px-2 text-[13px] text-text-primary placeholder:text-text-tertiary focus:border-border-focus focus:outline-none"
+						/>
+						<p className="text-text-secondary text-[12px] mt-2 mb-0">
+							Leave empty to detect the model's advertised parallel slots; enter 1–64 to
+							 allow additional turns while Pi runs shell commands or sleeps.
+							 Applies to Cline turns and initial Pi coding turns. Existing Pi follow-ups
+							 use Pi's native terminal and are not throttled here.
+						</p>
+					</div>
+
+					<div className="rounded-lg border border-border bg-surface-0 px-4 py-3 mb-4">
 						<h6 className="text-[12px] font-semibold uppercase tracking-wider text-text-secondary m-0 mb-1">
 							Reliable completion
 						</h6>
@@ -968,27 +985,6 @@ export function RuntimeSettingsDialog({
 									onError={setSaveError}
 									onSaved={handleClineSetupSaved}
 								/>
-								<div className="mt-4">
-									<label
-										htmlFor="cline-concurrency-limit"
-										className="block text-text-primary font-semibold text-[12px] mb-2"
-									>
-										Concurrent Cline turns per model
-									</label>
-									<input
-										id="cline-concurrency-limit"
-										value={clineConcurrencyLimit}
-										onChange={(event) => setClineConcurrencyLimit(event.target.value)}
-										placeholder="Auto (server slots; fallback 1)"
-										inputMode="numeric"
-										disabled={controlsDisabled}
-										className="h-8 w-full rounded-md border border-border bg-surface-2 px-2 text-[13px] text-text-primary placeholder:text-text-tertiary focus:border-border-focus focus:outline-none"
-									/>
-									<p className="text-text-secondary text-[12px] mt-2 mb-0">
-										Leave empty to detect model capacity automatically, or enter 1–64 to override it.
-										Additional turns wait; idle sessions do not use capacity. Changes apply to new turns.
-									</p>
-								</div>
 							</div>
 						</>
 					) : null}

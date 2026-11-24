@@ -430,6 +430,32 @@ describe("RuntimeSettingsDialog", () => {
 		expect(saveConfigMock).toHaveBeenCalledWith(expect.objectContaining({ clineConcurrencyLimit: expected }));
 	});
 
+	it("persists the same concurrency override when a terminal agent is selected", async () => {
+		saveConfigMock.mockClear();
+		await act(async () => {
+			root.render(
+				<RuntimeSettingsDialog
+					open={true}
+					workspaceId="workspace-1"
+					initialConfig={{ ...savedClineOauthConfig, selectedAgentId: "claude", clineConcurrencyLimit: null }}
+					onOpenChange={() => {}}
+				/>,
+			);
+		});
+		const input = document.querySelector<HTMLInputElement>("#cline-concurrency-limit");
+		expect(input).toBeInstanceOf(HTMLInputElement);
+		expect(document.body.textContent).toContain("Concurrent agent turns per model");
+		await act(async () => {
+			if (!input) throw new Error("Missing model concurrency field");
+			Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, "4");
+			input.dispatchEvent(new Event("input", { bubbles: true }));
+		});
+		await act(async () => {
+			findButtonByText(document.body, "Save")?.click();
+		});
+		expect(saveConfigMock).toHaveBeenCalledWith(expect.objectContaining({ clineConcurrencyLimit: 4 }));
+	});
+
 	it("blocks an invalid concurrency override before saving any configuration", async () => {
 		saveConfigMock.mockClear();
 		await act(async () => {
@@ -452,6 +478,6 @@ describe("RuntimeSettingsDialog", () => {
 			findButtonByText(document.body, "Save")?.click();
 		});
 		expect(saveConfigMock).not.toHaveBeenCalled();
-		expect(document.body.textContent).toContain("Cline concurrency limit must be an integer between 1 and 64");
+		expect(document.body.textContent).toContain("Model concurrency limit must be an integer between 1 and 64");
 	});
 });
