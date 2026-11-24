@@ -1,5 +1,8 @@
-import type { ClineTurnTarget } from "../cline-sdk/cline-turn-scheduler";
-import { type ClineTurnScheduler, sharedClineTurnScheduler } from "../cline-sdk/cline-turn-scheduler";
+import {
+	type ClineTurnScheduler,
+	type ClineTurnTarget,
+	sharedClineTurnScheduler,
+} from "../cline-sdk/cline-turn-scheduler";
 import type { RuntimeTaskSessionSummary } from "../core/api-contract";
 import type { TerminalSessionManager } from "./session-manager";
 

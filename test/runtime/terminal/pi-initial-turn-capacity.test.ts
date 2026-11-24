@@ -1,8 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { ClineTurnScheduler } from "../../../src/cline-sdk/cline-turn-scheduler";
 import type { RuntimeTaskSessionSummary } from "../../../src/core/api-contract";
-import type { PiStartRequest } from "../../../src/terminal/pi-initial-turn-capacity";
-import { PiInitialTurnCapacityGate } from "../../../src/terminal/pi-initial-turn-capacity";
+import { PiInitialTurnCapacityGate, type PiStartRequest } from "../../../src/terminal/pi-initial-turn-capacity";
 import { TerminalSessionManager } from "../../../src/terminal/session-manager";
 
 const target = { providerId: "pi", modelId: "qwen", baseUrl: "http://localhost:8080/v1" };
