@@ -62,8 +62,8 @@ export function normalizeAutoMergeRepository(repository: string): string | null 
 
 /**
  * Validate and normalize the configured check names: trimmed, case-sensitive
- * exact GitHub check-run names. Rejects empty lists, whitespace/glob
- * patterns, over-long names, and more than MAX_REQUIRED_CHECKS entries.
+ * exact GitHub check-run names. Rejects empty lists, control characters,
+ * line separators, over-long names, and more than MAX_REQUIRED_CHECKS entries.
  * Duplicate names are deduped (first occurrence wins). Returns null when the
  * input does not describe a valid nonempty policy.
  */
@@ -78,8 +78,9 @@ export function validateRequiredChecks(checks: string[]): string[] | null {
 		if (trimmed.length === 0 || trimmed.length > MAX_CHECK_LENGTH) {
 			return null;
 		}
-		// No glob patterns, no vague multi-word workflow descriptions.
-		if (trimmed.includes("*") || trimmed.includes("?") || /\s/.test(trimmed)) {
+		// Check names are literal strings, not patterns. Spaces and punctuation
+		// are valid in matrix jobs and reusable workflow checks.
+		if (/[\p{Cc}\u2028\u2029]/u.test(check)) {
 			return null;
 		}
 		if (seen.has(trimmed)) {

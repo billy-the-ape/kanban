@@ -62,15 +62,20 @@ describe("normalizeAutoMergeRepository", () => {
 });
 
 describe("validateRequiredChecks", () => {
-	it("trims and rejects empty, whitespace, glob, and empty lists", () => {
+	it("trims literal names and rejects empty or multiline entries", () => {
 		expect(validateRequiredChecks([" Build ", "lint"])).toEqual(["Build", "lint"]);
 		expect(validateRequiredChecks(["Build", "build"])).toEqual(["Build", "build"]);
 		expect(validateRequiredChecks([])).toBeNull();
 		expect(validateRequiredChecks([""])).toBeNull();
 		expect(validateRequiredChecks(["   "])).toBeNull();
-		expect(validateRequiredChecks(["ci *"])).toBeNull();
-		expect(validateRequiredChecks(["a?"])).toBeNull();
-		expect(validateRequiredChecks(["a b"])).toBeNull();
+		expect(validateRequiredChecks(["test / build-check-test", "build (node 22, linux)", "ci *", "a?"])).toEqual([
+			"test / build-check-test",
+			"build (node 22, linux)",
+			"ci *",
+			"a?",
+		]);
+		expect(validateRequiredChecks(["a\nb"])).toBeNull();
+		expect(validateRequiredChecks(["a\tb"])).toBeNull();
 	});
 });
 
@@ -103,13 +108,18 @@ describe("AutoMergePolicyStore", () => {
 			throw new Error("policy missing after write");
 		}
 		expect(both.revision).toBe(1);
-		const replacement = await store.updatePolicy("cline/kanban", { requiredChecks: ["Build", "Lint"] }, 1);
+		const replacement = await store.updatePolicy(
+			"cline/kanban",
+			{ requiredChecks: ["test / build-check-test", "Lint"] },
+			1,
+		);
 		expect(replacement.ok).toBe(true);
 		if (!replacement.ok) {
 			throw new Error("replacement failed");
 		}
 		expect(replacement.policy.revision).toBe(2);
-		expect(replacement.policy.requiredChecks).toEqual(["Build", "Lint"]);
+		expect(replacement.policy.requiredChecks).toEqual(["test / build-check-test", "Lint"]);
+		expect((await store.loadPolicy("cline/kanban"))?.requiredChecks).toEqual(["test / build-check-test", "Lint"]);
 		// The other repository is untouched by the replacement.
 		const otherPolicy = await store.loadPolicy("other/repo");
 		expect(otherPolicy?.requiredChecks).toEqual(["ci"]);
@@ -136,7 +146,7 @@ describe("AutoMergePolicyStore", () => {
 			reason: "invalid",
 		});
 		expect(await store.updatePolicy("org/repo", { requiredChecks: [] }, 0)).toEqual({ ok: false, reason: "invalid" });
-		expect(await store.updatePolicy("org/repo", { requiredChecks: ["ci *"] }, 0)).toEqual({
+		expect(await store.updatePolicy("org/repo", { requiredChecks: ["ci\nother"] }, 0)).toEqual({
 			ok: false,
 			reason: "invalid",
 		});

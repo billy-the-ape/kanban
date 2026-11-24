@@ -10,8 +10,10 @@ waiting for setup, approval, CI, or comment repairs, blocked, merging, or merged
 ## Repository setup
 
 For each repository, use **Repository CI policy → Configure** to choose the exact
-required check names and merge method. **Suggest from PR** reads available check
-names. Saving the policy activates enabled tasks automatically; no extra checkbox
+required check names and merge method. **Add names observed on the PR** reads available
+check names. Use the literal check-run name (for example `test / build-check-test`),
+not just the workflow title (`CI`). Spaces and punctuation are supported; names are
+case-sensitive and never interpreted as wildcard patterns. Saving the policy activates enabled tasks automatically; no extra checkbox
 or PR-selection step is needed for a task with exactly one linked PR. Multiple
 linked PRs require selecting the Automation PR.
 
