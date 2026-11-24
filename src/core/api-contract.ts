@@ -3894,7 +3894,7 @@ export type RuntimeTaskPrSettingsResponse = z.infer<typeof runtimeTaskPrSettings
  * AM-1: the small versioned policy for one normalized canonical GitHub
  * `owner/repo`. `requiredChecks` is an explicit, nonempty, unique set of
  * exact (case-sensitive) GitHub check names — never an empty list, never a
- * glob or vague workflow name, never an implicit "all required checks"
+ * wildcard expansion or an implicit "all required checks"
  * fallback. No tokens or credentials live in this record.
  */
 export const autoMergePolicySchema = z.object({

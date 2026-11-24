@@ -104,7 +104,11 @@ export function TaskPrAutoMergePolicyPanel({
 				setSaveError(
 					result.reason === "conflict"
 						? "The policy changed while you were editing; reload and review before saving."
-						: "The policy could not be saved.",
+						: result.reason === "invalid"
+							? "Enter valid check names (one per line, up to 100 names, 300 characters each)."
+							: result.reason === "malformed"
+								? "The stored CI policy is malformed; it was not overwritten."
+								: "The policy could not be saved.",
 				);
 				return;
 			}
