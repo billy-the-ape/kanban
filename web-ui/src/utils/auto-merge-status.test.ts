@@ -131,6 +131,17 @@ describe("deriveAutoMergeStatus", () => {
 		).toBe("waiting: writer/comment repair");
 	});
 
+	it("shows exact CI and approval diagnostics from the server", () => {
+		const summary = makeSummary("waiting", ["check_missing", "no_approval"]);
+		summary.blockers = [
+			{ code: "check_missing", message: "Required check not observed: CI. Observed: test / build-check-test." },
+			{ code: "no_approval", message: "Earlier approval targets an old head." },
+		];
+		const status = deriveAutoMergeStatus(makeTracking({ autoMergeWhenApproved: true, autoMergeEligibility: summary }), NOW);
+		expect(status?.detail).toContain("test / build-check-test");
+		expect(status?.detail).toContain("Earlier approval targets an old head.");
+	});
+
 	it("reports blocked summaries with their codes", () => {
 		const status = deriveAutoMergeStatus(
 			makeTracking({ autoMergeWhenApproved: true, autoMergeEligibility: makeSummary("blocked", ["no_policy"]) }),

@@ -20,6 +20,7 @@ import {
 	evaluateAutoMergeEligibility,
 	reconcileAutoMergeEligibility,
 	registerAutoMergeConsumer,
+	toAutoMergeEligibilitySummary,
 } from "../../../src/pr-tracking/auto-merge-eligibility";
 import { InMemoryPrRecordStore } from "../../../src/pr-tracking/in-memory-pr-record-store";
 import {
@@ -167,6 +168,24 @@ function codes(result: ReturnType<typeof evaluateAutoMergeEligibility>): string[
 }
 
 describe("AM-3 pure eligibility evaluation", () => {
+	it("reports the exact missing name and observed current-head checks", async () => {
+		const envelope = makeEnvelope();
+		envelope.checks = envelope.checks.map((check) => ({ ...check, name: "test / build-check-test" }));
+		envelope.reviews = envelope.reviews.map((review) => ({ ...review, commitId: "oldhead1" }));
+		const result = evaluateAutoMergeEligibility(makeInput({ envelope }, await makeRecord()));
+		const summary = toAutoMergeEligibilitySummary(result);
+		expect(summary.blockers).toEqual(expect.arrayContaining([
+			expect.objectContaining({ code: "check_missing", message: expect.stringContaining("test / build-check-test") }),
+			expect.objectContaining({ code: "no_approval", message: expect.stringContaining("oldhead") }),
+		]));
+		expect(summary.kind).toBe("waiting");
+	});
+
+	it("never accepts an exact name from an earlier head", () => {
+		const envelope = makeEnvelope();
+		envelope.checks = envelope.checks.map((check) => ({ ...check, sha: "oldhead1" }));
+		expect(classifyRequiredChecks(POLICY, envelope)).toEqual([{ name: "ci", outcome: "missing" }]);
+	});
 	it("is eligible when every gate is green", async () => {
 		const result = evaluateAutoMergeEligibility(makeInput({}, await makeRecord()));
 		expect(result.kind).toBe("eligible");
