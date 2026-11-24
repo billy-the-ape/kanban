@@ -23,20 +23,31 @@ function piActivity(
 
 function createPiManager() {
 	let summary: RuntimeTaskSessionSummary = {
-		taskId: "pi-task", state: "awaiting_review", agentId: "pi",
-		workspacePath: "/tmp/pi-task", pid: 123, startedAt: 1, updatedAt: 2,
-		lastOutputAt: 2, reviewReason: "hook", exitCode: null,
-		lastHookAt: null, latestHookActivity: null, launchAttemptId: "attempt-1",
+		taskId: "pi-task",
+		state: "awaiting_review",
+		agentId: "pi",
+		workspacePath: "/tmp/pi-task",
+		pid: 123,
+		startedAt: 1,
+		updatedAt: 2,
+		lastOutputAt: 2,
+		reviewReason: "hook",
+		exitCode: null,
+		lastHookAt: null,
+		latestHookActivity: null,
+		launchAttemptId: "attempt-1",
 	};
 	let active = true;
 	const listeners = new Set<(next: RuntimeTaskSessionSummary) => void>();
 	const writes: string[] = [];
 	const manager = {
-		getSummary: (taskId: string) => taskId === "pi-task" ? summary : null,
+		getSummary: (taskId: string) => (taskId === "pi-task" ? summary : null),
 		hasActiveProcess: (taskId: string) => taskId === "pi-task" && active,
 		onSummary: (listener: (next: RuntimeTaskSessionSummary) => void) => {
 			listeners.add(listener);
-			return () => { listeners.delete(listener); };
+			return () => {
+				listeners.delete(listener);
+			};
 		},
 		writeInput: (taskId: string, bytes: Buffer) => {
 			if (taskId !== "pi-task" || !active) return null;
@@ -45,12 +56,15 @@ function createPiManager() {
 		},
 	} as unknown as TerminalSessionManager;
 	return {
-		manager, writes,
+		manager,
+		writes,
 		emit: (change: Partial<RuntimeTaskSessionSummary>) => {
 			summary = { ...summary, ...change, updatedAt: Date.now() };
 			for (const listener of listeners) listener(summary);
 		},
-		setActive: (value: boolean) => { active = value; },
+		setActive: (value: boolean) => {
+			active = value;
+		},
 		listeners,
 	};
 }
@@ -74,7 +88,10 @@ describe("sendPreparedPiRepair", () => {
 		const { prepare, queued, settled } = createPreparation("Fix review feedback\nAnd push the branch.");
 		const restore = vi.fn(async () => ({ ok: true }));
 		const result = await sendPreparedPiRepair({
-			manager: pi.manager, taskId: "pi-task", prepare, restoreSavedSession: restore,
+			manager: pi.manager,
+			taskId: "pi-task",
+			prepare,
+			restoreSavedSession: restore,
 		});
 		expect(result.ok).toBe(true);
 		expect(restore).not.toHaveBeenCalled();
@@ -109,7 +126,9 @@ describe("sendPreparedPiRepair", () => {
 		const pi = createPiManager();
 		const { prepare, settled } = createPreparation("Please fix\x03 and ignore\x1b[201~\r the issue.");
 		const result = await sendPreparedPiRepair({
-			manager: pi.manager, taskId: "pi-task", prepare,
+			manager: pi.manager,
+			taskId: "pi-task",
+			prepare,
 			restoreSavedSession: async () => ({ ok: true }),
 		});
 		expect(result.ok).toBe(true);
@@ -128,13 +147,17 @@ describe("sendPreparedPiRepair", () => {
 		const pi = createPiManager();
 		const { prepare, settled } = createPreparation();
 		const result = await sendPreparedPiRepair({
-			manager: pi.manager, taskId: "pi-task", prepare, restoreSavedSession: async () => ({ ok: true }),
+			manager: pi.manager,
+			taskId: "pi-task",
+			prepare,
+			restoreSavedSession: async () => ({ ok: true }),
 		});
 		expect(result.ok).toBe(true);
 		pi.emit({ state: "running", reviewReason: null });
 		pi.emit({ state: "awaiting_review", reviewReason: "error" });
 		expect(settled).toHaveBeenCalledExactlyOnceWith({
-			status: "failed", error: "Pi failed during PR repair.",
+			status: "failed",
+			error: "Pi failed during PR repair.",
 		});
 	});
 
@@ -142,7 +165,9 @@ describe("sendPreparedPiRepair", () => {
 		const pi = createPiManager();
 		const { prepare, settled } = createPreparation();
 		const result = await sendPreparedPiRepair({
-			manager: pi.manager, taskId: "pi-task", prepare,
+			manager: pi.manager,
+			taskId: "pi-task",
+			prepare,
 			restoreSavedSession: async () => ({ ok: true }),
 		});
 		expect(result.ok).toBe(true);
@@ -150,7 +175,8 @@ describe("sendPreparedPiRepair", () => {
 		pi.setActive(false);
 		pi.emit({ state: "awaiting_review", reviewReason: "exit", pid: null, exitCode: 0 });
 		expect(settled).toHaveBeenCalledExactlyOnceWith({
-			status: "failed", error: "Pi's task process stopped before the PR repair completed.",
+			status: "failed",
+			error: "Pi's task process stopped before the PR repair completed.",
 		});
 	});
 
@@ -159,7 +185,9 @@ describe("sendPreparedPiRepair", () => {
 		pi.setActive(false);
 		const { prepare, settled } = createPreparation();
 		const result = await sendPreparedPiRepair({
-			manager: pi.manager, taskId: "pi-task", prepare,
+			manager: pi.manager,
+			taskId: "pi-task",
+			prepare,
 			restoreSavedSession: async () => {
 				pi.setActive(true);
 				pi.emit({
@@ -195,7 +223,10 @@ describe("sendPreparedPiRepair", () => {
 		const { prepare, queued } = createPreparation();
 		const restore = vi.fn(async () => ({ ok: false, error: "no matching JSONL" }));
 		const result = await sendPreparedPiRepair({
-			manager: pi.manager, taskId: "pi-task", prepare, restoreSavedSession: restore,
+			manager: pi.manager,
+			taskId: "pi-task",
+			prepare,
+			restoreSavedSession: restore,
 		});
 		expect(result).toMatchObject({ ok: false, error: "no matching JSONL" });
 		expect(restore).toHaveBeenCalledOnce();
@@ -208,7 +239,9 @@ describe("sendPreparedPiRepair", () => {
 		pi.emit({ state: "interrupted", reviewReason: "interrupted" });
 		const { prepare, queued } = createPreparation();
 		const result = await sendPreparedPiRepair({
-			manager: pi.manager, taskId: "pi-task", prepare,
+			manager: pi.manager,
+			taskId: "pi-task",
+			prepare,
 			restoreSavedSession: async () => ({ ok: true }),
 		});
 		expect(result.ok).toBe(false);
@@ -223,7 +256,9 @@ describe("sendPreparedPiRepair", () => {
 			const pi = createPiManager();
 			const { prepare, settled } = createPreparation();
 			const resultPromise = sendPreparedPiRepair({
-				manager: pi.manager, taskId: "pi-task", prepare,
+				manager: pi.manager,
+				taskId: "pi-task",
+				prepare,
 				restoreSavedSession: async () => ({ ok: true }),
 			});
 			await vi.advanceTimersByTimeAsync(PI_PASTE_SETTLE_TEST_MS);
@@ -232,7 +267,8 @@ describe("sendPreparedPiRepair", () => {
 			expect(settled).not.toHaveBeenCalled();
 			await vi.advanceTimersByTimeAsync(60_001);
 			expect(settled).toHaveBeenCalledWith({
-				status: "failed", error: "Pi did not start the PR repair turn within 60 seconds.",
+				status: "failed",
+				error: "Pi did not start the PR repair turn within 60 seconds.",
 			});
 			expect(pi.listeners.size).toBe(0);
 		} finally {
@@ -244,13 +280,16 @@ describe("sendPreparedPiRepair", () => {
 		const pi = createPiManager();
 		const { prepare, settled } = createPreparation();
 		const response = await sendPreparedPiRepair({
-			manager: pi.manager, taskId: "pi-task", prepare,
+			manager: pi.manager,
+			taskId: "pi-task",
+			prepare,
 			restoreSavedSession: async () => ({ ok: true }),
 		});
 		expect(response.ok).toBe(true);
 		pi.emit({ state: "interrupted", reviewReason: "interrupted" });
 		expect(settled).toHaveBeenCalledWith({
-			status: "failed", error: "Pi's PR repair session was interrupted before completion.",
+			status: "failed",
+			error: "Pi's PR repair session was interrupted before completion.",
 		});
 	});
 
@@ -259,7 +298,9 @@ describe("sendPreparedPiRepair", () => {
 		pi.emit({ state: "running", reviewReason: null });
 		const { prepare, queued } = createPreparation();
 		const result = await sendPreparedPiRepair({
-			manager: pi.manager, taskId: "pi-task", prepare,
+			manager: pi.manager,
+			taskId: "pi-task",
+			prepare,
 			restoreSavedSession: async () => ({ ok: true }),
 		});
 		expect(result.ok).toBe(false);
@@ -278,7 +319,9 @@ describe("sendPreparedPiRepair", () => {
 		});
 		const { prepare, queued } = createPreparation();
 		const result = await sendPreparedPiRepair({
-			manager: pi.manager, taskId: "pi-task", prepare,
+			manager: pi.manager,
+			taskId: "pi-task",
+			prepare,
 			restoreSavedSession: async () => ({ ok: true }),
 		});
 		expect(result.ok).toBe(false);
@@ -286,11 +329,48 @@ describe("sendPreparedPiRepair", () => {
 		expect(pi.writes).toEqual([]);
 	});
 
+	it("awaits the durable settle before reporting a post-prepare send failure", async () => {
+		// The service writes the failed dispatch the moment this function
+		// returns; the `onSettled` watermark rollback must land first, or
+		// `setDispatchFailed` sees a mismatched status, skips the rollback,
+		// and the advanced watermark silently drops the batch on Resume.
+		const pi = createPiManager();
+		let rollbackLanded = false;
+		const settled = vi.fn(async (_outcome: ClineTurnOutcome) => {
+			await Promise.resolve();
+			rollbackLanded = true;
+		});
+		const prepare: ClineTurnPreparation = Object.assign(
+			vi.fn(async () => {
+				// Preparation succeeded (the watermark advanced), then the user
+				// typed in the PTY during the git refresh: Pi left Review.
+				pi.setActive(false);
+				return "Fix review feedback";
+			}),
+			{ onQueued: vi.fn(), onSettled: settled },
+		);
+		const result = await sendPreparedPiRepair({
+			manager: pi.manager,
+			taskId: "pi-task",
+			prepare,
+			restoreSavedSession: async () => ({ ok: true }),
+		});
+		expect(result.ok).toBe(false);
+		expect(rollbackLanded).toBe(true);
+		expect(settled).toHaveBeenCalledWith({
+			status: "failed",
+			error: "Pi began another turn or changed sessions during PR repair preparation.",
+		});
+		expect(pi.writes).toEqual([]);
+	});
+
 	it("skips an obsolete prepared prompt without sending terminal input", async () => {
 		const pi = createPiManager();
 		const { prepare, settled } = createPreparation(null);
 		const result = await sendPreparedPiRepair({
-			manager: pi.manager, taskId: "pi-task", prepare,
+			manager: pi.manager,
+			taskId: "pi-task",
+			prepare,
 			restoreSavedSession: async () => ({ ok: true }),
 		});
 		expect(result.ok).toBe(true);

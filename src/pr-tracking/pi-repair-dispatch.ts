@@ -126,13 +126,21 @@ export async function sendPreparedPiRepair(input: PiPreparedRepairInput): Promis
 	let completionTimeout: ReturnType<typeof setTimeout> | null = null;
 	const attemptId = manager.getSummary(taskId)?.launchAttemptId ?? null;
 	let unsubscribe = () => {};
-	const settle = (outcome: ClineTurnOutcome) => {
-		if (finished) return;
+	// Returns the settle promise. Paths that hand control back to the caller
+	// (the service) must await it: once `prepare()` returned, the feedback
+	// watermark is already advanced, and the service writes the failed
+	// dispatch the moment send returns. The durable watermark rollback in
+	// `onSettled` has to land before that write, or `setDispatchFailed` sees
+	// a status mismatch and skips the rollback — silently dropping the batch.
+	const settle = (outcome: ClineTurnOutcome): Promise<void> => {
+		if (finished) return Promise.resolve();
 		finished = true;
 		if (startTimeout) clearTimeout(startTimeout);
 		if (completionTimeout) clearTimeout(completionTimeout);
 		unsubscribe();
-		void prepare.onSettled?.(outcome).catch((error: unknown) => {
+		// Invokes `onSettled` synchronously (the async IIFE still runs the
+		// call in this tick) while surfacing its promise for awaited paths.
+		return (async () => prepare.onSettled?.(outcome))().catch((error: unknown) => {
 			process.stderr.write(`[pi-repair] could not persist turn completion: ${String(error)}\n`);
 		});
 	};
@@ -142,7 +150,9 @@ export async function sendPreparedPiRepair(input: PiPreparedRepairInput): Promis
 		if (!cwd) throw new Error("Pi task worktree is unavailable.");
 		const prompt = await prepare({ cwd, signal: controller.signal });
 		if (prompt === null) {
-			settle({ status: "skipped" });
+			// Await the settle so the dispatch/skip record is durable before the
+			// service stamps its ok:true turnRef on top of it.
+			await settle({ status: "skipped" });
 			return { ok: true, summary: manager.getSummary(taskId), message: null };
 		}
 		const beforeSend = manager.getSummary(taskId);
@@ -164,7 +174,7 @@ export async function sendPreparedPiRepair(input: PiPreparedRepairInput): Promis
 				next.latestHookActivity.notificationType === "error" &&
 				(next.lastHookAt ?? 0) >= sentAt
 			) {
-				settle({ status: "failed", error: "Pi reported a failed PR repair turn." });
+				void settle({ status: "failed", error: "Pi reported a failed PR repair turn." });
 				return;
 			}
 			if (
@@ -172,15 +182,15 @@ export async function sendPreparedPiRepair(input: PiPreparedRepairInput): Promis
 				next.latestHookActivity.notificationType === "aborted" &&
 				(next.lastHookAt ?? 0) >= sentAt
 			) {
-				settle({ status: "failed", error: "Pi aborted its PR repair turn." });
+				void settle({ status: "failed", error: "Pi aborted its PR repair turn." });
 				return;
 			}
 			if (next.pid === null || !manager.hasActiveProcess(taskId)) {
-				settle({ status: "failed", error: "Pi's task process stopped before the PR repair completed." });
+				void settle({ status: "failed", error: "Pi's task process stopped before the PR repair completed." });
 				return;
 			}
 			if (next.state === "interrupted" || next.state === "failed") {
-				settle({ status: "failed", error: "Pi's PR repair session was interrupted before completion." });
+				void settle({ status: "failed", error: "Pi's PR repair session was interrupted before completion." });
 				return;
 			}
 			if (sawTurnStart && next.state === "awaiting_review") {
@@ -192,9 +202,9 @@ export async function sendPreparedPiRepair(input: PiPreparedRepairInput): Promis
 					next.latestHookActivity?.hookEventName === "agent_settled" &&
 					(next.lastHookAt ?? 0) >= sentAt
 				) {
-					settle({ status: "completed" });
+					void settle({ status: "completed" });
 				} else if (next.reviewReason === "error") {
-					settle({ status: "failed", error: "Pi failed during PR repair." });
+					void settle({ status: "failed", error: "Pi failed during PR repair." });
 				}
 			}
 		});
@@ -217,19 +227,21 @@ export async function sendPreparedPiRepair(input: PiPreparedRepairInput): Promis
 			if (!sawTurnStart) {
 				startTimeout = setTimeout(() => {
 					if (!sawTurnStart) {
-						settle({ status: "failed", error: "Pi did not start the PR repair turn within 60 seconds." });
+						void settle({ status: "failed", error: "Pi did not start the PR repair turn within 60 seconds." });
 					}
 				}, PI_TURN_START_TIMEOUT_MS);
 			}
 			completionTimeout = setTimeout(() => {
-				settle({ status: "failed", error: "Pi PR repair exceeded the one-hour execution timeout." });
+				void settle({ status: "failed", error: "Pi PR repair exceeded the one-hour execution timeout." });
 			}, PI_REPAIR_TURN_TIMEOUT_MS);
 		}
 		return { ok: true, summary: manager.getSummary(taskId), message: null };
 	} catch (error) {
 		controller.abort();
 		const message = error instanceof Error ? error.message : String(error);
-		settle({ status: "failed", error: message });
+		// Await the durable rollback (watermark + failed status) before handing
+		// control back: the service writes the failed dispatch immediately.
+		await settle({ status: "failed", error: message });
 		return { ok: false, summary: manager.getSummary(taskId), error: message };
 	}
 }
