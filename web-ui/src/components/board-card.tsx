@@ -67,12 +67,14 @@ const INITIAL_START_PREPARING_STAGES: ReadonlySet<RuntimeTaskInitialStartStage> 
 	"refreshing",
 	"creating_worktree",
 	"recording_baseline",
+	"preparing_dependencies",
 ]);
 const INITIAL_START_STAGE_LABELS: Record<RuntimeTaskInitialStartStage, string> = {
 	idle: "",
 	refreshing: "Updating base ref",
 	creating_worktree: "Creating worktree",
 	recording_baseline: "Recording baseline",
+	preparing_dependencies: "Preparing dependencies",
 	ready: "Ready",
 	blocked: "Base ref blocked",
 };

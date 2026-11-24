@@ -1281,6 +1281,7 @@ export const runtimeTaskInitialStartStageSchema = z.enum([
 	"refreshing",
 	"creating_worktree",
 	"recording_baseline",
+	"preparing_dependencies",
 	"ready",
 	"blocked",
 ]);

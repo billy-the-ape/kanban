@@ -122,6 +122,7 @@ import { collectRestorablePiCardIds, isDetachedPiRestoreCandidate } from "../ter
 import { resolvePiTurnTarget } from "../terminal/pi-turn-target";
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { createVerificationRunner } from "../verification/verification-service";
+import { prepareTaskWorktreeDependencies } from "../workspace/dependencies/prepare-task-worktree-dependencies";
 import { evaluateDependentsUnlock, getGitDeliveryService, readTaskDeliveryReceipt } from "../workspace/git-delivery";
 import { resolveTaskChatPrLinking } from "../workspace/task-chat-pr-linking";
 import {
@@ -743,6 +744,17 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					initialStart = prepared.initialStart;
 				}
 			}
+			// WORKTREE-PACKAGES: hand the agent a runnable worktree. The cache is
+			// consulted for the worktree's exact manifests/lockfiles and, only when
+			// a dependency tree is genuinely missing, restored or installed here so
+			// the agent can run the project's scripts immediately. Every failure mode
+			// falls through to launching the session anyway, matching the behavior
+			// before this layer existed.
+			await prepareTaskWorktreeDependencies({
+				workspacePath: workspaceScope.workspacePath,
+				taskId: body.taskId,
+				taskCwd,
+			});
 			const shouldCaptureTurnCheckpoint =
 				!body.resumeFromTrash && !body.restoreDetachedSession && !isHomeAgentSessionId(body.taskId);
 			const terminalManager = await deps.getScopedTerminalManager(workspaceScope);
