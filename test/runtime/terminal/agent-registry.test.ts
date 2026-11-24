@@ -70,7 +70,7 @@ describe("agent-registry", () => {
 
 		expect(message).toContain("Pi is not installed");
 		expect(message).toContain("`pi` on PATH");
-		expect(message ?? "").toContain("https://github.com/earendil-works/pi");
+		expect(message).toContain("https://github.com/earendil-works/pi");
 	});
 
 	it("explains nothing when the selected CLI exists or the native agent is chosen", () => {
