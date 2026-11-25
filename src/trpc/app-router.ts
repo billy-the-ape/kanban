@@ -117,6 +117,8 @@ import type {
 	RuntimeTaskGitActionPromptResponse,
 	RuntimeTaskInitialStartStatusRequest,
 	RuntimeTaskInitialStartStatusResponse,
+	RuntimeTaskLaunchRecoveryRequest,
+	RuntimeTaskLaunchRecoveryResponse,
 	RuntimeTaskMergeBindingUpdateRequest,
 	RuntimeTaskPhasesRequest,
 	RuntimeTaskPhasesResponse,
@@ -283,6 +285,8 @@ import {
 	runtimeTaskGitActionPromptResponseSchema,
 	runtimeTaskInitialStartStatusRequestSchema,
 	runtimeTaskInitialStartStatusResponseSchema,
+	runtimeTaskLaunchRecoveryRequestSchema,
+	runtimeTaskLaunchRecoveryResponseSchema,
 	runtimeTaskMergeBindingUpdateRequestSchema,
 	runtimeTaskPhasesRequestSchema,
 	runtimeTaskPhasesResponseSchema,
@@ -374,6 +378,15 @@ export interface RuntimeTrpcContext {
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskInitialStartStatusRequest,
 		) => Promise<RuntimeTaskInitialStartStatusResponse>;
+		/**
+		 * AA-UNSUPPORTED: whether a task with a prepared worktree but no agent
+		 * conversation can be relaunched with its stored prompt, plus the reason it
+		 * cannot when that is the case.
+		 */
+		getTaskLaunchRecoveryStatus: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimeTaskLaunchRecoveryRequest,
+		) => Promise<RuntimeTaskLaunchRecoveryResponse>;
 		startTaskReview: (
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskReviewStartRequest,
@@ -829,6 +842,14 @@ export const runtimeAppRouter = t.router({
 			.output(runtimeTaskInitialStartStatusResponseSchema)
 			.query(async ({ ctx, input }) => {
 				return await ctx.runtimeApi.getTaskInitialStartStatus(ctx.workspaceScope, input);
+			}),
+		// AA-UNSUPPORTED: "this card has a worktree but no agent" is a server-side
+		// question (baseline record, worktree HEAD, receipts, agent session file).
+		taskLaunchRecoveryStatus: workspaceProcedure
+			.input(runtimeTaskLaunchRecoveryRequestSchema)
+			.output(runtimeTaskLaunchRecoveryResponseSchema)
+			.query(async ({ ctx, input }) => {
+				return await ctx.runtimeApi.getTaskLaunchRecoveryStatus(ctx.workspaceScope, input);
 			}),
 		startTaskReview: workspaceProcedure
 			.input(runtimeTaskReviewStartRequestSchema)

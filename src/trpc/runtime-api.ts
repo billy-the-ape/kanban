@@ -31,6 +31,8 @@ import type { RuntimeConfigState } from "../config/runtime-config";
 import { updateGlobalRuntimeConfig, updateRuntimeConfig } from "../config/runtime-config";
 import type {
 	GitHubPrMergeCompletion,
+	RuntimeAgentId,
+	RuntimeBoardCard,
 	RuntimeCommandRunResponse,
 	RuntimeEffectiveContextWindow,
 	RuntimeGitDeliveryReceipt,
@@ -57,7 +59,10 @@ import type {
 	RuntimeTaskWriterActivity,
 	RuntimeUpdateStatusResponse,
 } from "../core/api-contract";
-import { runtimeTaskInitialStartStatusRequestSchema } from "../core/api-contract";
+import {
+	runtimeTaskInitialStartStatusRequestSchema,
+	runtimeTaskLaunchRecoveryRequestSchema,
+} from "../core/api-contract";
 import {
 	parseClineAccountSwitchRequest,
 	parseClineAddProviderRequest,
@@ -95,6 +100,7 @@ import { isHomeAgentSessionId } from "../core/home-agent-session";
 import { getTaskColumnId, moveTaskToColumn, setTaskAutoAddressComments } from "../core/task-board-mutations";
 import { computeTaskPhase, isDeliveryResumable, type TaskPhaseInput } from "../core/task-diagnostics";
 import { buildTaskDiagnosticsExportV3, type TaskDiagnosticsExportV3Plan } from "../core/task-diagnostics-export-v3";
+import { checkTaskLaunchRequirements } from "../core/task-launch-requirements";
 import {
 	buildTaskQualitySummaryResponse,
 	buildUnavailableTaskQualitySummaryResponse,
@@ -121,6 +127,8 @@ import { derivePiSessionId, getPiTaskSessionDir, readPiSessionRecord } from "../
 import { collectRestorablePiCardIds, isDetachedPiRestoreCandidate } from "../terminal/pi-session-restore";
 import { resolvePiTurnTarget } from "../terminal/pi-turn-target";
 import type { TerminalSessionManager } from "../terminal/session-manager";
+import { logTaskLaunchFailure } from "../terminal/task-launch-failure-log";
+import { assessUnstartedTaskRecovery, type UnstartedTaskRecoveryAssessment } from "../terminal/task-unstarted-recovery";
 import { createVerificationRunner } from "../verification/verification-service";
 import { evaluateDependentsUnlock, getGitDeliveryService, readTaskDeliveryReceipt } from "../workspace/git-delivery";
 import { resolveTaskChatPrLinking } from "../workspace/task-chat-pr-linking";
@@ -524,36 +532,15 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				?.cards.find((entry) => entry.id === taskId);
 			if (!card || !card.prompt.trim()) return notApplicableRecovery();
 			const configuredAgent = card.agentId ?? (await deps.loadScopedRuntimeConfig(workspaceScope)).selectedAgentId;
+			// Terminal agents recover through the explicit action in the detail view,
+			// never through a chat send, so this path stays Cline-scoped.
 			if (configuredAgent !== "cline") return notApplicableRecovery();
-			const cline = await deps.getScopedClineTaskSessionService(workspaceScope);
-			if (!cline.hasRecoverableTaskSession || (await cline.hasRecoverableTaskSession(taskId)))
-				return notApplicableRecovery();
-			const current = cline.getSummary(taskId);
-			if (
-				current?.state === "running" ||
-				(current?.state === "awaiting_review" && current.reviewReason !== "error")
-			) {
-				return notApplicableRecovery();
-			}
-
-			const baseline = await readTaskInitialStartRecord(taskId);
-			if (!baseline || baseline.state !== "prepared" || !baseline.baselineSha) return notApplicableRecovery();
-			const work = await getTaskPreservationInfo({ repoPath: workspaceScope.workspacePath, taskId });
-			// Missing SDK state must never erase changes or replay already delivered work.
-			if (
-				!work.ok ||
-				!work.worktreeExists ||
-				work.headCommit !== baseline.baselineSha ||
-				work.dirty ||
-				work.commitsAheadOfBase !== 0 ||
-				(work.preservation !== null && work.preservation.startingCommit !== baseline.baselineSha) ||
-				(await readTaskDeliveryReceipt(taskId)) !== null ||
-				(await findTaskPatch(taskId)) !== null ||
-				cline.listMessages(taskId).some((message) => message.role === "assistant")
-			) {
-				return notApplicableRecovery();
-			}
-
+			// AA-UNSUPPORTED: the same evidence rules the explicit recovery action uses,
+			// so a chat "resume" and the detail view's recover button agree about what an
+			// unstarted task is. Missing SDK state must never erase changes or replay
+			// already delivered work, so every guard fails closed.
+			const assessment = await assessUnstartedTaskRecoveryForScope(workspaceScope, taskId, card, configuredAgent);
+			if (!assessment.recoverable) return notApplicableRecovery();
 			// Preserve additional user instructions without turning a generic
 			// Resume action into the only task prompt.
 			const normalized = body.text.trim();
@@ -562,19 +549,25 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				: normalized
 					? `${card.prompt}\n\nAdditional instruction on resuming: ${normalized}`
 					: card.prompt;
-			const started = await startTaskSession(workspaceScope, {
-				taskId,
-				prompt,
-				recoverUnstartedSession: true,
-				taskTitle: card.title,
-				images: [...(card.images ?? []), ...(body.images ?? [])],
-				mode: body.mode,
-				startInPlanMode: body.mode ? false : card.startInPlanMode,
-				baseRef: card.baseRef,
-				updateBaseRefBeforeStart: card.updateBaseRefBeforeStart !== false,
-				agentId: card.agentId,
-				clineSettings: card.clineSettings,
-			});
+			const started = await startTaskSessionWithAssessment(
+				workspaceScope,
+				{
+					taskId,
+					prompt,
+					recoverUnstartedSession: true,
+					taskTitle: card.title,
+					images: [...(card.images ?? []), ...(body.images ?? [])],
+					mode: body.mode,
+					startInPlanMode: body.mode ? false : card.startInPlanMode,
+					baseRef: card.baseRef,
+					updateBaseRefBeforeStart: card.updateBaseRefBeforeStart !== false,
+					agentId: card.agentId,
+					clineSettings: card.clineSettings,
+				},
+				// The assessment above already gated this recovery; reusing it keeps one
+				// launch to one read of the persisted evidence.
+				assessment,
+			);
 			if (!started.ok || !started.summary) {
 				// The recovery took over this send, so a failed start is the answer.
 				return { status: "failed", error: started.error ?? "Unstarted Cline task recovery failed." };
@@ -630,11 +623,111 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		return pullRequestLinking;
 	};
 
+	/**
+	 * AA-UNSUPPORTED: gather the evidence an unstarted-task recovery needs and
+	 * assess it. Read-only: nothing here touches the worktree, the board or a
+	 * session record.
+	 *
+	 * The worktree/baseline/receipt guards are agent-independent. The one thing
+	 * that cannot be shared is proving no agent conversation exists, so each
+	 * agent contributes its own probe and an agent without one is refused rather
+	 * than guessed at (see `assessUnstartedTaskRecovery`).
+	 */
+	const assessUnstartedTaskRecoveryForScope = async (
+		workspaceScope: RuntimeTrpcWorkspaceScope,
+		taskId: string,
+		card: RuntimeBoardCard | null,
+		agentId: RuntimeAgentId | null,
+	): Promise<UnstartedTaskRecoveryAssessment> => {
+		const terminalManager = await deps.getScopedTerminalManager(workspaceScope);
+		// The session evidence is sampled first and remembered as a value: a
+		// conversation that appears while the (slower) worktree reads are in flight
+		// must still be caught by the launch-time re-check, exactly as it was before
+		// these guards were shared. Native Cline sessions live outside the terminal
+		// manager, and the Cline host is only started for a card that could
+		// realistically be one, because probing it cold-starts the SDK host.
+		const conversationEvidence = await (async (): Promise<{
+			hasAgentConversation: (() => Promise<boolean>) | undefined;
+			additionalSummaries: RuntimeTaskSessionSummary[];
+		}> => {
+			if (agentId === "cline") {
+				const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
+				const summary = clineTaskSessionService.getSummary(taskId);
+				const hasConversation = await clineTaskSessionService.hasRecoverableTaskSession(taskId).catch(() => true);
+				const hasAssistantMessage = clineTaskSessionService
+					.listMessages(taskId)
+					.some((message) => message.role === "assistant");
+				return {
+					additionalSummaries: summary ? [summary] : [],
+					hasAgentConversation: async () => hasConversation || hasAssistantMessage,
+				};
+			}
+			if (agentId === "pi") {
+				const piScope = { workspaceId: workspaceScope.workspaceId, taskId };
+				// Pi keeps its conversation under a Kanban-minted id in a Kanban-owned
+				// directory, so "no file" really does mean "no conversation to duplicate".
+				const hasConversation = (
+					await readPiSessionRecord({
+						sessionId: derivePiSessionId(piScope),
+						sessionDir: getPiTaskSessionDir(piScope),
+					})
+				).found;
+				return {
+					additionalSummaries: [],
+					hasAgentConversation: async () => hasConversation,
+				};
+			}
+			return { additionalSummaries: [], hasAgentConversation: undefined };
+		})();
+		const [baseline, work, deliveryReceipt, storedPatch] = await Promise.all([
+			readTaskInitialStartRecord(taskId).catch(() => null),
+			getTaskPreservationInfo({ repoPath: workspaceScope.workspacePath, taskId }).catch(() => null),
+			readTaskDeliveryReceipt(taskId).catch(() => null),
+			findTaskPatch(taskId)
+				.then((patch) => patch !== null)
+				.catch(() => true),
+		]);
+		return await assessUnstartedTaskRecovery({
+			taskId,
+			card,
+			agentId,
+			terminal: {
+				getSummary: (id) => terminalManager.getSummary(id),
+				hasActiveProcess: (id) => terminalManager.hasActiveProcess(id),
+			},
+			baseline,
+			work,
+			deliveryReceipt,
+			hasStoredPatch: storedPatch,
+			additionalSummaries: conversationEvidence.additionalSummaries,
+			hasAgentConversation: conversationEvidence.hasAgentConversation,
+		});
+	};
+
+	/** The persisted card for one task, or null when the board cannot be read. */
+	const loadBoardCardById = async (workspaceScope: RuntimeTrpcWorkspaceScope, taskId: string) => {
+		const board = await loadWorkspaceBoardById(workspaceScope.workspaceId).catch(() => null);
+		return board?.columns.flatMap((column) => column.cards).find((entry) => entry.id === taskId) ?? null;
+	};
+
 	const returningTaskIds = new Set<string>();
 	const taskLaunchVersions = new Map<string, number>();
 	// Shared by the tRPC handler (manual starts) and the B-9 dispatch queue, so
 	// queued tasks launch through exactly the code path the UI uses.
-	const startTaskSession: RuntimeTrpcContext["runtimeApi"]["startTaskSession"] = async (workspaceScope, input) => {
+	/**
+	 * `recoveryAssessment` lets a caller that already assessed the same evidence —
+	 * the Cline chat recovery below — hand the answer over instead of making the
+	 * runtime read the baseline record, the worktree state and the agent's own
+	 * session host twice for one launch. It is deliberately an extra parameter of
+	 * the internal function rather than a request field: the assessment is
+	 * runtime-internal evidence, and a tRPC caller must not be able to talk its way
+	 * past the guard. `startTaskSession` below is the two-argument public surface.
+	 */
+	const startTaskSessionWithAssessment = async (
+		workspaceScope: RuntimeTrpcWorkspaceScope,
+		input: unknown,
+		recoveryAssessment?: UnstartedTaskRecoveryAssessment,
+	) => {
 		// UPD-0: terminal initial-start preparation outcome surfaced on the
 		// response (null for home-agent sessions and non-preparation failures).
 		let initialStart: RuntimeTaskInitialStartOutcome | null = null;
@@ -689,7 +782,91 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			}
 			const requestedClineTaskMode = body.mode ?? "act";
 			const scopedRuntimeConfig = await deps.loadScopedRuntimeConfig(workspaceScope);
+			const terminalManager = await deps.getScopedTerminalManager(workspaceScope);
+
+			// Per-task config source-of-truth precedence:
+			//
+			// agentId resolution (which agent runtime to use):
+			//   1. previousTerminalAgentId — persisted in the terminal session summary from
+			//      the last run; ensures trash-restore resumes with the same agent runtime.
+			//   2. body.agentId — the card's current per-task agent override.
+			//   3. scopedRuntimeConfig.selectedAgentId — the workspace-level default.
+			//
+			// clineSettings (which LLM model and reasoning profile the Cline agent uses):
+			//   Always taken from the card's current override object. There is no
+			//   session-level persistence for these;
+			//   if the user changes the model on the card, the next session launch
+			//   (including trash-restore) uses the updated values.
+			const previousTerminalAgentId =
+				body.resumeFromTrash || body.restoreDetachedSession
+					? (terminalManager.getSummary(body.taskId)?.agentId ?? null)
+					: null;
+			const effectiveAgentId = previousTerminalAgentId ?? body.agentId ?? scopedRuntimeConfig.selectedAgentId;
+			// AA-UNSUPPORTED: the effective agent and the settings this launch asks
+			// for are checked here — before the base ref is refreshed, before a
+			// worktree exists, before the card moves to In Progress, before a
+			// model-capacity claim and before any process spawn. The web UI already
+			// refuses to compose such a request, but it is not the authority: an API
+			// caller (or a card saved before the rule existed) must be refused here or
+			// it leaves a prepared worktree whose launch can never run. The request is
+			// refused rather than downgraded: running Act mode instead of a plan would
+			// let an agent edit files the user only wanted planned.
+			const launchRequirements = checkTaskLaunchRequirements(effectiveAgentId, {
+				startInPlanMode: body.startInPlanMode === true,
+				imagesRequested: (body.images?.length ?? 0) > 0,
+				// The global autonomous toggle is deliberately not a refusal here. For
+				// an agent that runs tools without asking, "bypass approvals" has
+				// nothing to turn off, so the setting is not applicable rather than
+				// unsupported — and a workspace-wide setting must never strand a task
+				// the user already committed to starting.
+				autonomousModeRequested: false,
+			});
+			if (!launchRequirements.ok) {
+				logTaskLaunchFailure({
+					taskId: body.taskId,
+					agentId: effectiveAgentId,
+					stage: "settings-validation",
+					error: launchRequirements.error ?? "Unsupported launch settings.",
+					workspaceId: workspaceScope.workspaceId,
+				});
+				return {
+					ok: false,
+					summary: null,
+					error: launchRequirements.error ?? "This task requests a setting the selected agent does not support.",
+					initialStart,
+				};
+			}
 			let taskCwd: string;
+			// AA-UNSUPPORTED: an explicit recovery request is assessed here — before the
+			// start-owned preparation below — because that preparation creates a worktree
+			// and persists a new baseline. A recovery whose worktree has vanished (or whose
+			// saved work was already delivered) is refused by its own guards, and running
+			// the assessment only after preparation would have created the fresh worktree
+			// the recovery is meant to reuse. It also runs before the Cline branch, which
+			// bypasses the service's live-session short-circuit and therefore needs the
+			// same baseline/worktree/conversation evidence as a terminal relaunch, not just
+			// the presence check below. Rejected recoveries say which guard failed.
+			if (body.recoverUnstartedSession === true) {
+				const assessed =
+					recoveryAssessment ??
+					(await assessUnstartedTaskRecoveryForScope(
+						workspaceScope,
+						body.taskId,
+						await loadBoardCardById(workspaceScope, body.taskId),
+						effectiveAgentId,
+					));
+				if (!assessed.recoverable) {
+					const recoveryError = assessed.reason ?? "This task cannot be recovered in place.";
+					logTaskLaunchFailure({
+						taskId: body.taskId,
+						agentId: effectiveAgentId,
+						stage: "recovery-precheck",
+						error: recoveryError,
+						workspaceId: workspaceScope.workspaceId,
+					});
+					return { ok: false, summary: null, error: recoveryError, initialStart };
+				}
+			}
 			if (isHomeAgentSessionId(body.taskId)) {
 				taskCwd = workspaceScope.workspacePath;
 			} else {
@@ -739,6 +916,15 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					});
 					if (!prepared.ok || prepared.path === null) {
 						initialStart = prepared.initialStart;
+						// AA-UNSUPPORTED: a blocked preparation is a launch failure with a
+						// structured remedy, and nothing above this call logged it.
+						logTaskLaunchFailure({
+							taskId: body.taskId,
+							agentId: effectiveAgentId,
+							stage: "worktree-preparation",
+							error: prepared.error ?? "Initial start preparation failed.",
+							workspaceId: workspaceScope.workspaceId,
+						});
 						return {
 							ok: false,
 							summary: null,
@@ -752,26 +938,6 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			}
 			const shouldCaptureTurnCheckpoint =
 				!body.resumeFromTrash && !body.restoreDetachedSession && !isHomeAgentSessionId(body.taskId);
-			const terminalManager = await deps.getScopedTerminalManager(workspaceScope);
-
-			// Per-task config source-of-truth precedence:
-			//
-			// agentId resolution (which agent runtime to use):
-			//   1. previousTerminalAgentId — persisted in the terminal session summary from
-			//      the last run; ensures trash-restore resumes with the same agent runtime.
-			//   2. body.agentId — the card's current per-task agent override.
-			//   3. scopedRuntimeConfig.selectedAgentId — the workspace-level default.
-			//
-			// clineSettings (which LLM model and reasoning profile the Cline agent uses):
-			//   Always taken from the card's current override object. There is no
-			//   session-level persistence for these;
-			//   if the user changes the model on the card, the next session launch
-			//   (including trash-restore) uses the updated values.
-			const previousTerminalAgentId =
-				body.resumeFromTrash || body.restoreDetachedSession
-					? (terminalManager.getSummary(body.taskId)?.agentId ?? null)
-					: null;
-			const effectiveAgentId = previousTerminalAgentId ?? body.agentId ?? scopedRuntimeConfig.selectedAgentId;
 			let useClinePath = effectiveAgentId === "cline";
 			const shouldProbePersistedClineSession =
 				body.resumeFromTrash && !useClinePath && previousTerminalAgentId === null;
@@ -870,12 +1036,20 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			if (!resolved) {
 				// A selected CLI that is not installed is named with its own install
 				// guidance, so the fix is in the error rather than a settings tour.
+				const missingAgentError =
+					describeUnrunnableAgent(resolvedConfig) ??
+					"No runnable agent command is configured. Open Settings, install a supported CLI, and select it.";
+				logTaskLaunchFailure({
+					taskId: body.taskId,
+					agentId: effectiveAgentId,
+					stage: "settings-validation",
+					error: missingAgentError,
+					workspaceId: workspaceScope.workspaceId,
+				});
 				return {
 					ok: false,
 					summary: null,
-					error:
-						describeUnrunnableAgent(resolvedConfig) ??
-						"No runnable agent command is configured. Open Settings, install a supported CLI, and select it.",
+					error: missingAgentError,
 					initialStart,
 				};
 			}
@@ -971,6 +1145,10 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		}
 	};
 
+	/** The launch entry point: the tRPC handler and the B-9 dispatch queue both use it. */
+	const startTaskSession: RuntimeTrpcContext["runtimeApi"]["startTaskSession"] = (workspaceScope, input) =>
+		startTaskSessionWithAssessment(workspaceScope, input);
+
 	// UPD-0: pollable initial-start preparation status. A live in-process
 	// preparation reports its current stage; completed preparations report
 	// their durable outcome from the persisted baseline record.
@@ -984,6 +1162,55 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			taskId: body.taskId,
 			worktreeExists,
 		});
+	};
+
+	/**
+	 * AA-UNSUPPORTED: the answer behind "this card has a worktree but no agent".
+	 * The web UI cannot derive it (the baseline record, the worktree's HEAD, any
+	 * delivery receipt and the agent's own session file are all server-side), and
+	 * the answer has to come with a reason: a card that cannot be recovered in
+	 * place still needs to tell the user why and what to do instead.
+	 */
+	const getTaskLaunchRecoveryStatus: RuntimeTrpcContext["runtimeApi"]["getTaskLaunchRecoveryStatus"] = async (
+		workspaceScope,
+		input,
+	) => {
+		const body = runtimeTaskLaunchRecoveryRequestSchema.parse(input);
+		try {
+			const card = await loadBoardCardById(workspaceScope, body.taskId);
+			const scopedRuntimeConfig = await deps.loadScopedRuntimeConfig(workspaceScope);
+			const agentId = card?.agentId ?? scopedRuntimeConfig.selectedAgentId;
+			const assessment = await assessUnstartedTaskRecoveryForScope(workspaceScope, body.taskId, card, agentId);
+			const lookupSession = await createTaskSessionLookup(workspaceScope);
+			const session = lookupSession(body.taskId);
+			// The failed launch (if any) left its own explanation on the record; a
+			// never-launched task has none, which is itself the "nothing started" signal.
+			const launchFailure = session.summary?.state === "failed" ? (session.summary.warningMessage ?? null) : null;
+			return {
+				ok: true,
+				taskId: body.taskId,
+				recoverable: assessment.recoverable,
+				neverLaunched: assessment.neverLaunched,
+				agentId: assessment.agentId,
+				prompt: assessment.prompt,
+				reason: assessment.reason,
+				settingsError: assessment.settingsError,
+				launchFailure,
+			};
+		} catch (error) {
+			return {
+				ok: false,
+				taskId: body.taskId,
+				recoverable: false,
+				neverLaunched: false,
+				agentId: null,
+				prompt: "",
+				reason: null,
+				settingsError: null,
+				launchFailure: null,
+				error: error instanceof Error ? error.message : String(error),
+			};
+		}
 	};
 
 	const buildTaskDispatchDeps = (workspaceScope: RuntimeTrpcWorkspaceScope): TaskDispatchDeps => {
@@ -1032,13 +1259,30 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				}
 				return (await mergeCompletionCache).get(taskId) ?? null;
 			},
-			startSession: async ({ taskId, baseRef, prompt, taskTitle }) => {
+			startSession: async ({
+				taskId,
+				baseRef,
+				prompt,
+				taskTitle,
+				agentId,
+				startInPlanMode,
+				images,
+				clineSettings,
+			}) => {
+				// AA-UNSUPPORTED: the queued start carries the same card settings the
+				// dispatch guard checked, so the queue launches what it vetted. `mode` is
+				// deliberately left out to match the browser's Start: the plan request is
+				// expressed by `startInPlanMode`, and the hardcoded "act" here was what
+				// turned a dispatched plan-mode card into an Act session.
 				const request: RuntimeTaskSessionStartRequest = {
 					taskId,
 					baseRef,
 					prompt,
 					taskTitle,
-					mode: "act",
+					agentId,
+					startInPlanMode,
+					images,
+					clineSettings,
 				};
 				const response = await startTaskSession(workspaceScope, request);
 				return response.ok && response.summary
@@ -1540,6 +1784,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			return await startTaskSession(workspaceScope, input);
 		},
 		getTaskInitialStartStatus,
+		getTaskLaunchRecoveryStatus,
 		// B-6.2: start a bounded, fresh-context review session for a task. The
 		// effective review policy comes from the scoped runtime config; the service
 		// resolves the worktree, builds the handoff, runs the session (with the

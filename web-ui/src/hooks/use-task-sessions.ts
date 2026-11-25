@@ -63,6 +63,13 @@ export interface UseTaskSessionsResult {
 	 */
 	getTaskInitialStartStatus: (taskId: string) => Promise<RuntimeTaskInitialStartStatusResponse | null>;
 	startTaskSession: (task: BoardCard, options?: StartTaskSessionOptions) => Promise<StartTaskSessionResult>;
+	/**
+	 * AA-UNSUPPORTED: relaunches a task that never started, in its existing
+	 * worktree and with its stored prompt. The server refuses the call unless the
+	 * worktree is still at its saved baseline and no conversation exists, so a
+	 * double click cannot start a second agent or replay the prompt.
+	 */
+	recoverUnstartedTask: (task: BoardCard) => Promise<StartTaskSessionResult>;
 	stopTaskSession: (taskId: string) => Promise<void>;
 	sendTaskSessionInput: (
 		taskId: string,
@@ -231,6 +238,52 @@ export function useTaskSessions({ currentProjectId, setSessions }: UseTaskSessio
 		[currentProjectId],
 	);
 
+	// AA-UNSUPPORTED: in-place relaunch of a task whose launch never produced an
+	// agent. It sends the stored prompt with `recoverUnstartedSession`, so the
+	// server applies its own guards (existing clean worktree, no conversation)
+	// rather than trusting the caller's view of the board.
+	const recoverUnstartedTask = useCallback(
+		async (task: BoardCard): Promise<StartTaskSessionResult> => {
+			if (!currentProjectId) {
+				return { ok: false, message: "No project selected." };
+			}
+			try {
+				const trpcClient = getRuntimeTrpcClient(currentProjectId);
+				const geometry =
+					getTerminalGeometry(task.id) ?? estimateTaskSessionGeometry(window.innerWidth, window.innerHeight);
+				const payload = await trpcClient.runtime.startTaskSession.mutate({
+					taskId: task.id,
+					// The stored prompt is the point of recovery: the task never sent it.
+					prompt: task.prompt.trim(),
+					taskTitle: task.title,
+					images: task.images,
+					startInPlanMode: task.startInPlanMode,
+					recoverUnstartedSession: true,
+					baseRef: task.baseRef,
+					// The worktree already exists, so nothing here refreshes the base ref.
+					updateBaseRefBeforeStart: false,
+					cols: geometry.cols,
+					rows: geometry.rows,
+					agentId: task.agentId,
+					clineSettings: task.clineSettings,
+				});
+				if (!payload.ok || !payload.summary) {
+					return {
+						ok: false,
+						message: payload.error ?? "Could not relaunch this task.",
+						initialStart: payload.initialStart,
+					};
+				}
+				upsertSession(payload.summary);
+				return { ok: true, initialStart: payload.initialStart };
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return { ok: false, message };
+			}
+		},
+		[currentProjectId, upsertSession],
+	);
+
 	const stopTaskSession = useCallback(
 		async (taskId: string): Promise<void> => {
 			if (!currentProjectId) {
@@ -333,6 +386,7 @@ export function useTaskSessions({ currentProjectId, setSessions }: UseTaskSessio
 		ensureTaskWorkspace,
 		startTaskSession,
 		getTaskInitialStartStatus,
+		recoverUnstartedTask,
 		stopTaskSession,
 		sendTaskSessionInput,
 		sendTaskChatMessage,

@@ -4,12 +4,15 @@ import { Files, GitCompareArrows, GitPullRequest, Link, Maximize2, MessageSquare
 import type { MouseEvent as ReactMouseEvent, ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useHotkeys } from "react-hotkeys-hook";
+import { notifyError } from "@/components/app-toaster";
 import { AgentTerminalPanel } from "@/components/detail-panels/agent-terminal-panel";
 import { ClineAgentChatPanel, type ClineAgentChatPanelHandle } from "@/components/detail-panels/cline-agent-chat-panel";
 import { ColumnContextPanel } from "@/components/detail-panels/column-context-panel";
 import { type DiffLineComment, DiffViewerPanel } from "@/components/detail-panels/diff-viewer-panel";
 import { FileTreePanel } from "@/components/detail-panels/file-tree-panel";
 import { TaskDiagnosticsPanel } from "@/components/detail-panels/task-diagnostics-panel";
+import { TaskLaunchFailureBanner } from "@/components/detail-panels/task-launch-failure-banner";
+import { TaskPromptSection } from "@/components/detail-panels/task-prompt-section";
 import { TaskReviewControl } from "@/components/detail-panels/task-review-control";
 import { TaskPullRequestLink } from "@/components/task-pull-request-link";
 import { TaskPullRequestManagerPopover } from "@/components/task-pull-request-manager";
@@ -18,6 +21,7 @@ import { cn } from "@/components/ui/cn";
 import type { ClineChatActionResult } from "@/hooks/use-cline-chat-runtime-actions";
 import type { ClineChatMessage } from "@/hooks/use-cline-chat-session";
 import { useIsMobile } from "@/hooks/use-is-mobile";
+import { mayHaveUnstartedLaunch, useTaskLaunchRecovery } from "@/hooks/use-task-launch-recovery";
 import { ResizableBottomPane } from "@/resize/resizable-bottom-pane";
 import { ResizeHandle } from "@/resize/resize-handle";
 import { useCardDetailLayout } from "@/resize/use-card-detail-layout";
@@ -416,6 +420,7 @@ export function CardDetailView({
 	onMoveReviewCardToTrash,
 	onCompleteReviewCard,
 	onRestoreTaskFromTrash,
+	onRecoverUnstartedTask,
 	onCancelAutomaticTaskAction,
 	commitTaskLoadingById,
 	openPrTaskLoadingById,
@@ -478,6 +483,12 @@ export function CardDetailView({
 	onMoveReviewCardToTrash?: (taskId: string) => void;
 	onCompleteReviewCard?: (taskId: string) => void;
 	onRestoreTaskFromTrash?: (taskId: string) => void;
+	/**
+	 * AA-UNSUPPORTED: relaunches a task that never started an agent, in its
+	 * existing worktree with its stored prompt. The server re-checks every safety
+	 * condition, so this is safe to offer whenever it says the task is recoverable.
+	 */
+	onRecoverUnstartedTask?: (card: BoardCard) => Promise<{ ok: boolean; message?: string }>;
 	onCancelAutomaticTaskAction?: (taskId: string) => void;
 	commitTaskLoadingById?: Record<string, boolean>;
 	openPrTaskLoadingById?: Record<string, boolean>;
@@ -846,6 +857,53 @@ export function CardDetailView({
 		/>
 	);
 
+	// AA-UNSUPPORTED: a prepared worktree with no agent behind it must not read as
+	// an ordinary paused task, and the stored prompt has to stay reachable whether
+	// or not a session ever started — the terminal and the transcript are both
+	// empty in exactly the case where the user needs to know what was asked.
+	const canLaunchRecoveryApply = mayHaveUnstartedLaunch({
+		columnId: selection.column.id,
+		sessionSummary,
+	});
+	const { recovery: launchRecovery, refresh: refreshLaunchRecovery } = useTaskLaunchRecovery({
+		currentProjectId,
+		taskId: canLaunchRecoveryApply ? selection.card.id : null,
+		enabled: canLaunchRecoveryApply,
+	});
+	const [isRecoveringLaunch, setIsRecoveringLaunch] = useState(false);
+	const handleRecoverUnstartedTask = useCallback(async () => {
+		if (!onRecoverUnstartedTask) {
+			return;
+		}
+		setIsRecoveringLaunch(true);
+		try {
+			const result = await onRecoverUnstartedTask(selection.card);
+			if (!result.ok) {
+				notifyError(result.message ?? "Could not relaunch this task.");
+			}
+			refreshLaunchRecovery();
+		} finally {
+			setIsRecoveringLaunch(false);
+		}
+	}, [onRecoverUnstartedTask, refreshLaunchRecovery, selection.card]);
+	const launchFailureMessage = sessionSummary?.state === "failed" ? (sessionSummary.warningMessage ?? null) : null;
+	const agentLaunchStrip = (
+		<>
+			<TaskLaunchFailureBanner
+				recovery={launchRecovery}
+				launchFailure={launchFailureMessage}
+				isRecovering={isRecoveringLaunch}
+				onRecover={onRecoverUnstartedTask ? handleRecoverUnstartedTask : undefined}
+				onEditSettings={onEditTask ? () => onEditTask(selection.card) : undefined}
+			/>
+			<TaskPromptSection
+				prompt={selection.card.prompt}
+				canEdit={launchRecovery?.neverLaunched === true && onEditTask !== undefined}
+				onEdit={onEditTask ? () => onEditTask(selection.card) : undefined}
+			/>
+		</>
+	);
+
 	if (isMobile) {
 		return (
 			<div className="flex min-h-0 flex-1 flex-col overflow-hidden bg-surface-0">
@@ -864,6 +922,7 @@ export function CardDetailView({
 							className="min-h-0 min-w-0 flex-1 flex-col"
 							style={{ display: mobileTab === "chat" ? "flex" : "none" }}
 						>
+							{agentLaunchStrip}
 							{agentChatPanel}
 						</div>
 						{/* Diff panel */}
@@ -1011,9 +1070,14 @@ export function CardDetailView({
 					<>
 						<div ref={mainRowRef} className="flex min-h-0 flex-1 overflow-hidden">
 							<div
-								className="min-h-0 min-w-0"
+								className="flex min-h-0 min-w-0 flex-col"
 								style={{ display: isDiffExpanded ? "none" : "flex", width: agentPanelPercent }}
 							>
+								{/* AA-UNSUPPORTED: banner + prompt strip above the agent panel. The
+									panel stays a direct flex child so its own `flex: 1 1 0` sizing
+									still resolves; wrapping it in a plain div would collapse the
+									terminal/chat height. */}
+								{agentLaunchStrip}
 								{agentChatPanel}
 							</div>
 							{!isDiffExpanded ? (

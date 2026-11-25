@@ -28,6 +28,7 @@ import { stripAnsi } from "./output-utils";
 import { buildRestorePendingPiPatch, isDetachedPiRestoreCandidate } from "./pi-session-restore";
 import { PtySession } from "./pty-session";
 import { type HookReviewReason, reduceSessionTransition, type SessionTransitionEvent } from "./session-state-machine";
+import { formatErrorText, formatTaskLaunchFailureMessage, logTaskLaunchFailure } from "./task-launch-failure-log";
 import {
 	createTerminalProtocolFilterState,
 	disableOscColorQueryIntercept,
@@ -185,6 +186,53 @@ function formatSpawnFailure(binary: string, error: unknown): string {
 		return `Failed to launch "${binary}". Command not found. Install a supported agent CLI and select it in Settings.`;
 	}
 	return `Failed to launch "${binary}": ${message}`;
+}
+
+/**
+ * The summary patch a launch that never produced a process writes.
+ *
+ * Two shapes on purpose:
+ *
+ * - A **new** launch has nothing left to protect, so the record becomes a failure
+ *   the card, the detail view and a diagnostics download can all still show after
+ *   the toast is gone (`warningMessage`). `externalSessionId` is deliberately
+ *   kept: it is the id the agent itself reported for this card and the only
+ *   handle for resuming that exact conversation, and a failed launch destroyed
+ *   the attempt, not the agent's record.
+ * - A **restore** attempt must leave the prior record alone. `interrupted` (plus
+ *   its pid, checkpoints and last output) is the only evidence that a Pi
+ *   conversation exists to reattach: overwriting it with `failed` makes
+ *   `isDetachedPiRestoreCandidate` false for good, every later Restore answers
+ *   "No interrupted Pi process exists", and the settled-record path can then
+ *   archive a worktree whose JSONL is still intact. A transient failure in the
+ *   restore path must not consume the card's ability to recover.
+ */
+function launchFailurePatch(
+	isRestoreAttempt: boolean,
+	request: StartTaskSessionRequest,
+	message: string,
+): Partial<RuntimeTaskSessionSummary> {
+	if (isRestoreAttempt) {
+		return { warningMessage: message };
+	}
+	return {
+		state: "failed",
+		agentId: request.agentId,
+		workspacePath: request.cwd,
+		pid: null,
+		startedAt: null,
+		lastOutputAt: null,
+		reviewReason: "error",
+		exitCode: null,
+		lastHookAt: null,
+		latestHookActivity: null,
+		latestTurnCheckpoint: null,
+		previousTurnCheckpoint: null,
+		// No live attempt to own hook events after a failed launch.
+		launchAttemptId: null,
+		launchProvenance: null,
+		warningMessage: message,
+	};
 }
 
 function formatShellSpawnFailure(binary: string, error: unknown): string {
@@ -368,25 +416,51 @@ export class TerminalSessionManager implements TerminalSessionService {
 		// AA-S1: a deliberate resume records the fingerprint it changed from. A
 		// first launch for this card has no previous attempt, so it stays null.
 		const previousConfigFingerprint = entry.summary.launchProvenance?.configFingerprint ?? null;
-		const launch = await prepareAgentLaunch({
-			taskId: request.taskId,
-			agentId: request.agentId,
-			binary: request.binary,
-			args: request.args,
-			autonomousModeEnabled: request.autonomousModeEnabled,
-			cwd: request.cwd,
-			prompt: request.prompt,
-			images: request.images,
-			startInPlanMode: request.startInPlanMode,
-			resumeFromTrash: request.resumeFromTrash,
-			env: request.env,
-			workspaceId: request.workspaceId,
-			attemptId: launchAttemptId,
-			// AA-O1a: the session id this card's own agent reported earlier. Only
-			// adapters with exact resume use it, and only for resume intent: a fresh
-			// launch starts a new conversation, so a stale id must not reach it.
-			externalSessionId: request.resumeFromTrash ? (entry.summary.externalSessionId ?? null) : null,
-		});
+		// AA-UNSUPPORTED: adapter preparation used to sit outside the spawn guard
+		// below, so an adapter that refused the request (an unsupported setting) or
+		// failed to generate its launch resources threw past every summary write.
+		// The card then looked like an ordinary paused task with an empty terminal:
+		// `idle`, no pid, no message. Preparation is a launch failure like any other,
+		// so it persists a failed summary the card, the detail view and a diagnostics
+		// download can all show, and logs it with the stage that broke.
+		let launch: Awaited<ReturnType<typeof prepareAgentLaunch>>;
+		try {
+			launch = await prepareAgentLaunch({
+				taskId: request.taskId,
+				agentId: request.agentId,
+				binary: request.binary,
+				args: request.args,
+				autonomousModeEnabled: request.autonomousModeEnabled,
+				cwd: request.cwd,
+				prompt: request.prompt,
+				images: request.images,
+				startInPlanMode: request.startInPlanMode,
+				resumeFromTrash: request.resumeFromTrash,
+				env: request.env,
+				workspaceId: request.workspaceId,
+				attemptId: launchAttemptId,
+				// AA-O1a: the session id this card's own agent reported earlier. Only
+				// adapters with exact resume use it, and only for resume intent: a fresh
+				// launch starts a new conversation, so a stale id must not reach it.
+				externalSessionId: request.resumeFromTrash ? (entry.summary.externalSessionId ?? null) : null,
+			});
+		} catch (error) {
+			terminalStateMirror.dispose();
+			const preparedFailure = formatTaskLaunchFailureMessage("adapter-preparation", formatErrorText(error));
+			const summary = updateSummary(
+				entry,
+				launchFailurePatch(request.restoreDetachedSession === true, request, preparedFailure),
+			);
+			this.emitSummary(summary);
+			logTaskLaunchFailure({
+				taskId: request.taskId,
+				agentId: request.agentId,
+				stage: "adapter-preparation",
+				error,
+				workspaceId: request.workspaceId ?? null,
+			});
+			throw error;
+		}
 		const launchEnvForProvenance: Record<string, string | undefined> = {
 			...request.env,
 			...launch.env,
@@ -549,25 +623,20 @@ export class TerminalSessionManager implements TerminalSessionService {
 				});
 			}
 			terminalStateMirror.dispose();
-			const summary = updateSummary(entry, {
-				state: "failed",
-				agentId: request.agentId,
-				workspacePath: request.cwd,
-				pid: null,
-				startedAt: null,
-				lastOutputAt: null,
-				reviewReason: "error",
-				exitCode: null,
-				lastHookAt: null,
-				latestHookActivity: null,
-				latestTurnCheckpoint: null,
-				previousTurnCheckpoint: null,
-				// No live attempt to own hook events after a failed spawn.
-				launchAttemptId: null,
-				launchProvenance: null,
-			});
+			const spawnFailure = formatSpawnFailure(commandBinary, error);
+			const summary = updateSummary(
+				entry,
+				launchFailurePatch(request.restoreDetachedSession === true, request, spawnFailure),
+			);
 			this.emitSummary(summary);
-			throw new Error(formatSpawnFailure(commandBinary, error));
+			logTaskLaunchFailure({
+				taskId: request.taskId,
+				agentId: request.agentId,
+				stage: "process-spawn",
+				error,
+				workspaceId: request.workspaceId ?? null,
+			});
+			throw new Error(spawnFailure);
 		}
 
 		const active: ActiveProcessState = {

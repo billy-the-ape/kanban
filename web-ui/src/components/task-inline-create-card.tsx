@@ -1,6 +1,6 @@
 import * as RadixCheckbox from "@radix-ui/react-checkbox";
 import { deriveTaskTitleFromPrompt } from "@runtime-task-title";
-import { ArrowBigUp, Check, Command, CornerDownLeft } from "lucide-react";
+import { AlertCircle, ArrowBigUp, Check, Command, CornerDownLeft } from "lucide-react";
 import { type Dispatch, type ReactElement, type SetStateAction, useCallback, useRef, useState } from "react";
 import { useHotkeys } from "react-hotkeys-hook";
 
@@ -62,6 +62,10 @@ export function TaskInlineCreateCard({
 	prAutoAddressComments,
 	prAutoFinishOnMerge,
 	startInPlanModeDisabled = false,
+	/** AA-UNSUPPORTED: why plan mode is unavailable for the effective agent. */
+	planModeNotice = null,
+	/** Shown when the effective agent cannot receive image attachments. */
+	attachmentsNotice = null,
 	workspaceId,
 	branchRef,
 	branchOptions,
@@ -105,6 +109,10 @@ export function TaskInlineCreateCard({
 	prAutoAddressComments?: { checked: boolean; onChange: (value: boolean) => void };
 	prAutoFinishOnMerge?: { checked: boolean; onChange: (value: boolean) => void };
 	startInPlanModeDisabled?: boolean;
+	/** Explanatory text rendered beside the disabled plan-mode option. */
+	planModeNotice?: string | null;
+	/** Explanatory text rendered beside the prompt attachments. */
+	attachmentsNotice?: string | null;
 	workspaceId: string | null;
 	branchRef: string;
 	branchOptions: TaskBranchOption[];
@@ -256,6 +264,12 @@ export function TaskInlineCreateCard({
 					<code className="rounded bg-surface-3 px-1 py-px font-mono text-[11px]">{pasteShortcutLabel}</code> to
 					add images.
 				</p>
+				{attachmentsNotice ? (
+					<p className="mt-1 mb-0 flex items-start gap-1.5 text-[11px] text-status-orange">
+						<AlertCircle size={12} className="mt-0.5 shrink-0" />
+						{attachmentsNotice}
+					</p>
+				) : null}
 			</div>
 
 			<div className="flex flex-col gap-2 mt-3">
@@ -277,6 +291,7 @@ export function TaskInlineCreateCard({
 					</RadixCheckbox.Root>
 					<span>Start in plan mode</span>
 				</label>
+				{planModeNotice ? <p className="-mt-1 ml-[22px] text-[11px] text-text-tertiary">{planModeNotice}</p> : null}
 
 				<div>
 					<span className="text-[11px] text-text-secondary block mb-1">Worktree base ref</span>

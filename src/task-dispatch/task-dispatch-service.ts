@@ -28,8 +28,10 @@ import type {
 	RuntimeTaskSessionSummary,
 } from "../core/api-contract";
 import { getTaskColumnId, moveTaskToColumn } from "../core/task-board-mutations";
+import { checkTaskLaunchRequirements } from "../core/task-launch-requirements";
 import { lockedFileSystem } from "../fs/locked-file-system";
 import { getWorkspaceDirectoryPath } from "../state/workspace-state";
+import { logTaskLaunchFailure } from "../terminal/task-launch-failure-log";
 import { findMissingAncestorCommits, readGitHeadInfo } from "../workspace/git-utils";
 import { prepareInitialTaskWorktree, resolveTaskCwd } from "../workspace/task-worktree";
 import { clearTaskDispatchRecord, readTaskDispatchRecord, writeTaskDispatchRecord } from "./dispatch-records";
@@ -59,6 +61,18 @@ export interface TaskDispatchSessionStartInput {
 	baseRef: string;
 	prompt: string;
 	taskTitle: string;
+	/**
+	 * AA-UNSUPPORTED: the launch settings saved on the card, forwarded verbatim so
+	 * the queued launch is the launch the readiness guard vetted. Without them the
+	 * queue validated the card's agent + plan mode and then started the workspace
+	 * default agent in Act mode with no attachments — which both silently
+	 * downgraded a plan request and blocked cards whose settings the agent that
+	 * would actually run honors. See `dispatchSingleTask`.
+	 */
+	agentId?: RuntimeBoardCard["agentId"];
+	startInPlanMode?: RuntimeBoardCard["startInPlanMode"];
+	images?: RuntimeBoardCard["images"];
+	clineSettings?: RuntimeBoardCard["clineSettings"];
 }
 
 export interface TaskDispatchSessionStartResult {
@@ -206,6 +220,29 @@ export interface TaskDispatchReadinessInput {
 		/** MERGE-1: the prerequisite's confirmed-merge completion (null when not merge-completed). */
 		mergeCompletion: GitHubPrMergeCompletion | null;
 	} | null;
+}
+
+/**
+ * The start input for one dispatched card: the fresh prompt the queue built plus
+ * the launch settings the card itself saved. One helper so both launch sites (the
+ * normal dispatch and the merge-successor recovery) match the settings
+ * `dispatchSingleTask` checked before it took any side effect.
+ */
+function dispatchSessionInput(
+	card: RuntimeBoardCard,
+	prompt: string,
+	taskTitle: string,
+): TaskDispatchSessionStartInput {
+	return {
+		taskId: card.id,
+		baseRef: card.baseRef,
+		prompt,
+		taskTitle,
+		agentId: card.agentId,
+		startInPlanMode: card.startInPlanMode,
+		images: card.images,
+		clineSettings: card.clineSettings,
+	};
 }
 
 function cardTitle(card: Pick<RuntimeBoardCard, "id" | "title"> | null): string {
@@ -665,6 +702,44 @@ async function dispatchSingleTask(
 	const spentAttempts = launchAttemptsInCycle(previousRecord);
 	const attempt = spentAttempts + 1;
 	const cycleStartedAt = previousRecord && spentAttempts > 0 ? previousRecord.dispatchedAt : Date.now();
+
+	// AA-UNSUPPORTED: an invalid configuration is refused before the queue takes
+	// any of its side effects. Otherwise the pass refreshes the base ref, creates
+	// a worktree, moves the card to In Progress and only then fails the launch -
+	// leaving exactly the half-started card this task is about. Blocking here
+	// leaves the card in Backlog with a dispatch record that says what to fix.
+	const dispatchConfig = await deps.loadConfig();
+	const dispatchAgentId = card.agentId ?? dispatchConfig.selectedAgentId;
+	const dispatchRequirements = checkTaskLaunchRequirements(dispatchAgentId, {
+		startInPlanMode: card.startInPlanMode === true,
+		imagesRequested: (card.images?.length ?? 0) > 0,
+	});
+	if (!dispatchRequirements.ok) {
+		const dispatchError = dispatchRequirements.error ?? "Unsupported launch settings.";
+		await writeTaskDispatchRecord({
+			taskId,
+			workspaceId: deps.workspaceId,
+			baseRef: card.baseRef,
+			baseSha: null,
+			// Nothing was attempted, so no launch attempt is spent.
+			attempt: spentAttempts,
+			status: "blocked",
+			error: dispatchError,
+			prerequisites: entry.prerequisites,
+			prompt: null,
+			agentId: dispatchAgentId,
+			dispatchedAt: cycleStartedAt,
+			updatedAt: Date.now(),
+		}).catch(() => null);
+		logTaskLaunchFailure({
+			taskId,
+			agentId: dispatchAgentId,
+			stage: "settings-validation",
+			error: dispatchError,
+			workspaceId: deps.workspaceId,
+		});
+		return { dispatched: false, boardChanged: false, surfaceReason: dispatchError };
+	}
 	const requiredAncestors = extractRequiredAncestors(entry.prerequisites);
 	const prepare =
 		deps.prepareWorktree ??
@@ -721,12 +796,9 @@ async function dispatchSingleTask(
 	await writeTaskDispatchRecord(record);
 	// B-9.3: persist readiness and ownership before the session is started.
 	await deps.persistBoard((currentBoard) => moveTaskPreservingBoard(currentBoard, taskId, "in_progress"));
-	const started = await deps.startSession({
-		taskId,
-		baseRef: card.baseRef,
-		prompt,
-		taskTitle: titleByTaskId[taskId] ?? cardTitle(card),
-	});
+	const started = await deps.startSession(
+		dispatchSessionInput(card, prompt, titleByTaskId[taskId] ?? cardTitle(card)),
+	);
 	if (!started.ok) {
 		const exhausted = attempt >= TASK_DISPATCH_RETRY_CAP;
 		const error = started.error ?? "Task session start failed.";
@@ -977,10 +1049,10 @@ export async function reconcileTaskDispatch(deps: TaskDispatchDeps): Promise<Run
 							titleByTaskId,
 						});
 			const started = await deps.startSession({
-				taskId: card.id,
+				...dispatchSessionInput(card, prompt, titleByTaskId[card.id] ?? cardTitle(card)),
+				// The recovery re-uses the base ref the dispatch record captured, not
+				// whichever ref the card happens to name now.
 				baseRef: record.baseRef,
-				prompt,
-				taskTitle: titleByTaskId[card.id] ?? cardTitle(card),
 			});
 			if (!started.ok) {
 				const exhausted = attempt >= TASK_DISPATCH_RETRY_CAP;
