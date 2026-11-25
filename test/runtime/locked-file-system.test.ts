@@ -55,4 +55,33 @@ describe("LockedFileSystem", () => {
 			tempDir.cleanup();
 		}
 	});
+
+	it("names the lock that could not be taken and keeps the ELOCKED code", async () => {
+		const tempDir = createTempDir("kanban-locked-fs-");
+		try {
+			const filePath = join(tempDir.path, "state.json");
+			const lockedFileSystem = new LockedFileSystem();
+			lockfileMocks.lock.mockRejectedValueOnce(
+				Object.assign(new Error("Lock file is already being held"), { code: "ELOCKED" }),
+			);
+
+			let failure: unknown;
+			try {
+				await lockedFileSystem.withLock({ path: filePath, type: "file" }, async () => {});
+			} catch (error) {
+				failure = error;
+			}
+
+			if (!(failure instanceof Error)) {
+				throw new Error("Expected the busy lock to reject.");
+			}
+			// The runtime home holds several distinct locks and a failed startup prints
+			// this message on its own, so it has to say which lock stalled. Callers
+			// branch on `code`, so annotating the message must keep it.
+			expect(failure.message).toBe(`Lock file is already being held (lock: ${filePath}.lock)`);
+			expect(failure).toMatchObject({ code: "ELOCKED" });
+		} finally {
+			tempDir.cleanup();
+		}
+	});
 });

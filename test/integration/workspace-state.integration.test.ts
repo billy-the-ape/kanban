@@ -16,8 +16,10 @@ import {
 	setPrimaryTaskPullRequest,
 	updateTaskPrSettings,
 } from "../../src/core/task-board-mutations";
-import type { WorkspaceStateConflictError } from "../../src/state/workspace-state";
+import { lockedFileSystem } from "../../src/fs/locked-file-system";
+import type { RuntimeWorkspaceContext, WorkspaceStateConflictError } from "../../src/state/workspace-state";
 import {
+	getWorkspaceIndexLockRequest,
 	getWorkspacesRootPath,
 	listWorkspaceIndexEntries,
 	loadWorkspaceContext,
@@ -588,6 +590,58 @@ describe.sequential("workspace-state integration", () => {
 				expect(entries.map((entry) => entry.workspaceId).sort()).toEqual(
 					[contextA.workspaceId, contextB.workspaceId].sort(),
 				);
+			} finally {
+				cleanup();
+			}
+		});
+	});
+
+	it("resolves an indexed project while the workspace index lock is held", async () => {
+		await withTemporaryHome(async () => {
+			const { path: sandboxRoot, cleanup } = createTempDir("kanban-index-lock-");
+			try {
+				const indexedPath = join(sandboxRoot, "indexed");
+				const freshPath = join(sandboxRoot, "fresh");
+				mkdirSync(indexedPath, { recursive: true });
+				mkdirSync(freshPath, { recursive: true });
+				initGitRepository(indexedPath);
+				initGitRepository(freshPath);
+
+				const indexed = await loadWorkspaceContext(indexedPath);
+				expect(indexed.workspaceId).toBe("indexed");
+
+				// Every runtime start resolves the project it was launched from and every
+				// task operation resolves its workspace, so if those reads queued on the
+				// shared index lock a busy runner - or a lock a killed process left behind,
+				// which stays un-stolen until it goes stale - failed the start outright with
+				// "Lock file is already being held". Reads must not wait for the lock.
+				let registration: Promise<RuntimeWorkspaceContext> | undefined;
+				await lockedFileSystem.withLock(getWorkspaceIndexLockRequest(), async () => {
+					await expect(loadWorkspaceContext(indexedPath)).resolves.toMatchObject({
+						workspaceId: indexed.workspaceId,
+					});
+					const registering = loadWorkspaceContext(freshPath);
+					const outcome = await Promise.race([
+						registering.then(() => "registered" as const),
+						new Promise<"waiting">((resolve) => {
+							setTimeout(() => resolve("waiting"), 200);
+						}),
+					]);
+					// Registering a new project is a read-append-write and still queues.
+					expect(outcome).toBe("waiting");
+					// Handed back unawaited: awaiting it here would self-deadlock against
+					// the lock this callback still holds.
+					registration = registering;
+				});
+				if (!registration) {
+					throw new Error("Registering the new project never started while the lock was held.");
+				}
+				// With the lock released, the queued registration completes.
+				const fresh = await registration;
+				expect(fresh.workspaceId).toBe("fresh");
+
+				const entries = await listWorkspaceIndexEntries();
+				expect(entries.map((entry) => entry.workspaceId).sort()).toEqual(["fresh", "indexed"]);
 			} finally {
 				cleanup();
 			}

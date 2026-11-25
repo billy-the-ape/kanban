@@ -226,7 +226,13 @@ function getWorkspaceMetaPath(workspaceId: string): string {
 	return join(getWorkspaceDirectoryPath(workspaceId), META_FILENAME);
 }
 
-function getWorkspaceIndexLockRequest(): LockRequest {
+/**
+ * The shared workspace-index lock handle. Registering a project is the only index
+ * write that needs it — resolving an indexed project is a lock-free read — so
+ * callers that need to observe index contention take the same handle the runtime
+ * locks on instead of guessing a lockfile path.
+ */
+export function getWorkspaceIndexLockRequest(): LockRequest {
 	return {
 		path: getWorkspaceIndexPath(),
 		type: "file",
@@ -600,39 +606,40 @@ export async function loadWorkspaceContext(
 	options: LoadWorkspaceContextOptions = {},
 ): Promise<RuntimeWorkspaceContext> {
 	const repoPath = await resolveWorkspacePath(cwd);
-	const autoCreateIfMissing = options.autoCreateIfMissing ?? true;
-	if (!autoCreateIfMissing) {
-		const index = await readWorkspaceIndex();
-		const existingEntry = findWorkspaceEntry(index, repoPath);
-		if (!existingEntry) {
-			throw new Error(`Project ${repoPath} is not added to Kanban yet.`);
-		}
-		return {
-			repoPath,
-			workspaceId: existingEntry.workspaceId,
-			statePath: getWorkspaceDirectoryPath(existingEntry.workspaceId),
-			git: detectGitRepositoryInfo(repoPath),
-		};
+	// Resolving an already-indexed project skips the shared index lock. The index
+	// file is only ever replaced with an atomic rename, so an unlocked read always
+	// sees a complete file, and `toWorkspaceContext` runs several synchronous git
+	// subprocesses — reading under the one global lock that every runtime startup
+	// and task operation waits behind is what made busy runners fail startup with
+	// "Lock file is already being held".
+	const indexedEntry = findWorkspaceEntry(await readWorkspaceIndex(), repoPath);
+	if (indexedEntry) {
+		return toWorkspaceContext(repoPath, indexedEntry);
 	}
-
-	return await lockedFileSystem.withLock(getWorkspaceIndexLockRequest(), async () => {
-		let index = await readWorkspaceIndex();
-		const existingEntry = findWorkspaceEntry(index, repoPath);
-		const ensured = existingEntry
-			? { index, entry: existingEntry, changed: false }
-			: ensureWorkspaceEntry(index, repoPath);
-		index = ensured.index;
+	if (!(options.autoCreateIfMissing ?? true)) {
+		throw new Error(`Project ${repoPath} is not added to Kanban yet.`);
+	}
+	// Registering a project is a read-append-write on the shared index and stays
+	// serialized; `ensureWorkspaceEntry` re-reads inside the lock, so a concurrent
+	// registration is reused instead of duplicated.
+	const entry = await lockedFileSystem.withLock(getWorkspaceIndexLockRequest(), async () => {
+		const index = await readWorkspaceIndex();
+		const ensured = ensureWorkspaceEntry(index, repoPath);
 		if (ensured.changed) {
-			await writeWorkspaceIndex(index);
+			await writeWorkspaceIndex(ensured.index);
 		}
-
-		return {
-			repoPath,
-			workspaceId: ensured.entry.workspaceId,
-			statePath: getWorkspaceDirectoryPath(ensured.entry.workspaceId),
-			git: detectGitRepositoryInfo(repoPath),
-		};
+		return ensured.entry;
 	});
+	return toWorkspaceContext(repoPath, entry);
+}
+
+function toWorkspaceContext(repoPath: string, entry: WorkspaceIndexEntry): RuntimeWorkspaceContext {
+	return {
+		repoPath,
+		workspaceId: entry.workspaceId,
+		statePath: getWorkspaceDirectoryPath(entry.workspaceId),
+		git: detectGitRepositoryInfo(repoPath),
+	};
 }
 
 export async function loadWorkspaceContextById(workspaceId: string): Promise<RuntimeWorkspaceContext | null> {
