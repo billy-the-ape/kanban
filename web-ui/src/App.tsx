@@ -197,6 +197,7 @@ export default function App(): ReactElement {
 		ensureTaskWorkspace,
 		getTaskInitialStartStatus,
 		startTaskSession,
+		recoverUnstartedTask,
 		stopTaskSession,
 		sendTaskSessionInput,
 		sendTaskChatMessage,
@@ -314,6 +315,8 @@ export default function App(): ReactElement {
 		newTaskPrAutoFinishOnMerge,
 		setNewTaskPrAutoFinishOnMerge,
 		isNewTaskStartInPlanModeDisabled,
+		newTaskPlanModeNotice,
+		newTaskAttachmentsNotice,
 		newTaskBranchRef,
 		setNewTaskBranchRef,
 		newTaskAgentId,
@@ -336,6 +339,8 @@ export default function App(): ReactElement {
 		editTaskPrAutoFinishOnMerge,
 		setEditTaskPrAutoFinishOnMerge,
 		isEditTaskStartInPlanModeDisabled,
+		editTaskPlanModeNotice,
+		editTaskAttachmentsNotice,
 		editTaskBranchRef,
 		setEditTaskBranchRef,
 		editTaskAgentId,
@@ -854,6 +859,8 @@ export default function App(): ReactElement {
 			startInPlanMode={editTaskStartInPlanMode}
 			onStartInPlanModeChange={setEditTaskStartInPlanMode}
 			startInPlanModeDisabled={isEditTaskStartInPlanModeDisabled}
+			planModeNotice={editTaskPlanModeNotice}
+			attachmentsNotice={editTaskAttachmentsNotice}
 			autoReviewEnabled={editTaskAutoReviewEnabled}
 			onAutoReviewEnabledChange={setEditTaskAutoReviewEnabled}
 			autoReviewMode={editTaskAutoReviewMode}
@@ -1141,7 +1148,9 @@ export default function App(): ReactElement {
 									editingTaskId={editingTaskId}
 									inlineTaskEditor={inlineTaskEditor}
 									onEditTask={(task) => {
-										handleOpenEditTask(task, { preserveDetailSelection: true });
+										// AA-UNSUPPORTED: a task that never launched stays editable in
+										// place, so an unsupported setting can be corrected and retried.
+										handleOpenEditTask(task, { preserveDetailSelection: true, allowUnstartedTask: true });
 									}}
 									onSaveTaskTitle={handleSaveTaskTitle}
 									onCommitTask={handleCommitTask}
@@ -1156,6 +1165,7 @@ export default function App(): ReactElement {
 									moveToTrashLoadingById={moveToTrashLoadingById}
 									onMoveReviewCardToTrash={handleMoveReviewCardToTrash}
 									onCompleteReviewCard={handleCompleteReviewCard}
+									onRecoverUnstartedTask={recoverUnstartedTask}
 									onRestoreTaskFromTrash={handleRestoreTaskFromTrash}
 									onCancelAutomaticTaskAction={handleCancelAutomaticTaskAction}
 									onAddReviewComments={(taskId: string, text: string) => {
@@ -1240,6 +1250,8 @@ export default function App(): ReactElement {
 					startInPlanMode={newTaskStartInPlanMode}
 					onStartInPlanModeChange={setNewTaskStartInPlanMode}
 					startInPlanModeDisabled={isNewTaskStartInPlanModeDisabled}
+					planModeNotice={newTaskPlanModeNotice}
+					attachmentsNotice={newTaskAttachmentsNotice}
 					autoReviewEnabled={newTaskAutoReviewEnabled}
 					onAutoReviewEnabledChange={setNewTaskAutoReviewEnabled}
 					autoReviewMode={newTaskAutoReviewMode}

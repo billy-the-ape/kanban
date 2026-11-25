@@ -1,7 +1,7 @@
+import { resolveEffectiveTaskAgentId } from "@runtime-task-launch-requirements";
 import { deriveTaskTitleFromPrompt } from "@runtime-task-title";
 import type { Dispatch, SetStateAction } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-
 import { showAppToast } from "@/components/app-toaster";
 import {
 	normalizeStoredTaskAutoReviewMode,
@@ -9,6 +9,7 @@ import {
 	TASK_AUTO_REVIEW_MODE_STORAGE_KEY,
 	TASK_START_IN_PLAN_MODE_STORAGE_KEY,
 } from "@/hooks/app-utils";
+import { resolveTaskSettingNotices } from "@/hooks/task-setting-notices";
 import type { RuntimeAgentId, RuntimeTaskClineSettings, RuntimeTaskInitialStartStatusResponse } from "@/runtime/types";
 import { addTaskToColumnWithResult, findCardSelection, updateTask, updateTaskTitle } from "@/state/board-state";
 import { toTelemetrySelectedAgentId, trackTaskCreated } from "@/telemetry/events";
@@ -52,6 +53,13 @@ interface UseTaskEditorInput {
 
 interface OpenEditTaskOptions {
 	preserveDetailSelection?: boolean;
+	/**
+	 * AA-UNSUPPORTED: a task that never launched keeps its editable prompt and
+	 * launch settings even though it already sits in In Progress — that is the
+	 * whole point of being able to correct an unsupported setting and retry. The
+	 * backlog-only guard in the closing effect is skipped for that caller only.
+	 */
+	allowUnstartedTask?: boolean;
 }
 
 interface CreateTaskOptions {
@@ -76,6 +84,10 @@ export interface UseTaskEditorResult {
 	newTaskPrAutoFinishOnMerge: boolean;
 	setNewTaskPrAutoFinishOnMerge: Dispatch<SetStateAction<boolean>>;
 	isNewTaskStartInPlanModeDisabled: boolean;
+	/** AA-UNSUPPORTED: why the option is unavailable, shown beside it. */
+	newTaskPlanModeNotice: string | null;
+	/** Shown when the effective agent cannot receive image attachments. */
+	newTaskAttachmentsNotice: string | null;
 	newTaskBranchRef: string;
 	setNewTaskBranchRef: Dispatch<SetStateAction<string>>;
 	/** UPD-1: new-task pre-start base refresh option (missing card values normalize to true). */
@@ -102,6 +114,10 @@ export interface UseTaskEditorResult {
 	editTaskPrAutoFinishOnMerge: boolean;
 	setEditTaskPrAutoFinishOnMerge: Dispatch<SetStateAction<boolean>>;
 	isEditTaskStartInPlanModeDisabled: boolean;
+	/** AA-UNSUPPORTED: includes a "saved setting cleared" lead-in when the card still asked for plan mode. */
+	editTaskPlanModeNotice: string | null;
+	/** Shown when the effective agent cannot receive the task's stored attachments. */
+	editTaskAttachmentsNotice: string | null;
 	editTaskBranchRef: string;
 	setEditTaskBranchRef: Dispatch<SetStateAction<string>>;
 	editTaskAgentId: RuntimeAgentId | undefined;
@@ -155,7 +171,6 @@ export function useTaskEditor({
 	);
 	const [newTaskPrAutoAddressComments, setNewTaskPrAutoAddressComments] = useState(true);
 	const [newTaskPrAutoFinishOnMerge, setNewTaskPrAutoFinishOnMerge] = useState(true);
-	const isNewTaskStartInPlanModeDisabled = false;
 	const [newTaskBranchRef, setNewTaskBranchRef] = useState("");
 	const [lastCreatedTaskBranchByProjectId, setLastCreatedTaskBranchByProjectId] = useState<Record<string, string>>({});
 	const [editingTaskId, setEditingTaskId] = useState<string | null>(null);
@@ -166,7 +181,6 @@ export function useTaskEditor({
 	const [editTaskAutoReviewMode, setEditTaskAutoReviewMode] = useState<TaskAutoReviewMode>("commit");
 	const [editTaskPrAutoAddressComments, setEditTaskPrAutoAddressComments] = useState(false);
 	const [editTaskPrAutoFinishOnMerge, setEditTaskPrAutoFinishOnMerge] = useState(false);
-	const isEditTaskStartInPlanModeDisabled = false;
 	const [editTaskBranchRef, setEditTaskBranchRef] = useState("");
 	const [newTaskUpdateBaseRefBeforeStart, setNewTaskUpdateBaseRefBeforeStart] = useState(
 		DEFAULT_NEW_TASK_UPDATE_BASE_REF_BEFORE_START,
@@ -186,6 +200,9 @@ export function useTaskEditor({
 	 * so a concurrent change while the dialog is open surfaces as a conflict
 	 * instead of being accepted on the new revision or silently reverted.
 	 */
+	// AA-UNSUPPORTED: set while the edit dialog was opened for a task that never
+	// launched, so the backlog-only close rule does not immediately shut it.
+	const editTaskAllowUnstartedRef = useRef(false);
 	const editTaskPrSettingsOpenRef = useRef<{
 		autoAddressComments: boolean;
 		autoFinishOnMerge: boolean;
@@ -196,6 +213,34 @@ export function useTaskEditor({
 	const [newTaskClineSettings, setNewTaskClineSettings] = useState<RuntimeTaskClineSettings | undefined>(undefined);
 	const [editTaskAgentId, setEditTaskAgentId] = useState<RuntimeAgentId | undefined>(undefined);
 	const [editTaskClineSettings, setEditTaskClineSettings] = useState<RuntimeTaskClineSettings | undefined>(undefined);
+
+	// AA-UNSUPPORTED: the effective agent (the task's own override, else the
+	// project/runtime default) decides which launch settings can even be asked
+	// for, so plan mode is disabled for Pi instead of promising a plan run that
+	// the launch would have to refuse. See `src/core/task-launch-requirements.ts`
+	// for the shared rule the runtime applies to the same request.
+	const newTaskNotices = resolveTaskSettingNotices({
+		agentId: resolveEffectiveTaskAgentId({ taskAgentId: newTaskAgentId, defaultAgentId: selectedAgentId }),
+		hasAttachments: newTaskImages.length > 0,
+	});
+	const isNewTaskStartInPlanModeDisabled = newTaskNotices.planModeDisabled;
+	const newTaskPlanModeNotice = newTaskNotices.planModeNotice;
+	const newTaskAttachmentsNotice = newTaskNotices.attachmentsNotice;
+
+	// A card saved before the rule (or edited while a different agent was
+	// selected) can still carry an unsupported request. The draft clears it, but
+	// the change is said out loud: silently dropping plan mode would let the
+	// user start an Act run believing they had asked for a plan.
+	const editTaskCard = editingTaskId ? (findCardSelection(board, editingTaskId)?.card ?? null) : null;
+	const editTaskNotices = resolveTaskSettingNotices({
+		agentId: resolveEffectiveTaskAgentId({ taskAgentId: editTaskAgentId, defaultAgentId: selectedAgentId }),
+		storedPlanModeRequested: editTaskCard?.startInPlanMode === true,
+		hasAttachments: (editTaskCard?.images?.length ?? 0) > 0,
+		storedAttachments: (editTaskCard?.images?.length ?? 0) > 0,
+	});
+	const isEditTaskStartInPlanModeDisabled = editTaskNotices.planModeDisabled;
+	const editTaskPlanModeNotice = editTaskNotices.planModeNotice;
+	const editTaskAttachmentsNotice = editTaskNotices.attachmentsNotice;
 
 	const lastCreatedTaskBranchRef = useMemo(() => {
 		if (!currentProjectId) {
@@ -261,8 +306,9 @@ export function useTaskEditor({
 			return;
 		}
 		const selection = findCardSelection(board, editingTaskId);
-		if (selection?.column.id !== "backlog") {
+		if (selection?.column.id !== "backlog" && !editTaskAllowUnstartedRef.current) {
 			setEditingTaskId(null);
+			editTaskAllowUnstartedRef.current = false;
 			editInitialStartStatusTaskIdRef.current = null;
 			editTaskPrSettingsOpenRef.current = null;
 
@@ -305,6 +351,7 @@ export function useTaskEditor({
 			if (!options?.preserveDetailSelection) {
 				setSelectedTaskId(null);
 			}
+			editTaskAllowUnstartedRef.current = options?.allowUnstartedTask === true;
 			setIsInlineTaskCreateOpen(false);
 
 			setNewTaskPrompt("");
@@ -350,6 +397,7 @@ export function useTaskEditor({
 	const handleCancelEditTask = useCallback(() => {
 		setEditingTaskId(null);
 		editInitialStartStatusTaskIdRef.current = null;
+		editTaskAllowUnstartedRef.current = false;
 		editTaskPrSettingsOpenRef.current = null;
 
 		setEditTaskPrompt("");
@@ -677,6 +725,8 @@ export function useTaskEditor({
 		newTaskPrAutoFinishOnMerge,
 		setNewTaskPrAutoFinishOnMerge,
 		isNewTaskStartInPlanModeDisabled,
+		newTaskPlanModeNotice,
+		newTaskAttachmentsNotice,
 		newTaskBranchRef,
 		setNewTaskBranchRef,
 		newTaskUpdateBaseRefBeforeStart,
@@ -701,6 +751,8 @@ export function useTaskEditor({
 		editTaskPrAutoFinishOnMerge,
 		setEditTaskPrAutoFinishOnMerge,
 		isEditTaskStartInPlanModeDisabled,
+		editTaskPlanModeNotice,
+		editTaskAttachmentsNotice,
 		editTaskBranchRef,
 		setEditTaskBranchRef,
 		editTaskUpdateBaseRefBeforeStart,

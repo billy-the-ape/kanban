@@ -21,6 +21,7 @@ Runtime topic references:
 - [`runtime/diagnostics-export.md`](./runtime/diagnostics-export.md) — the task diagnostics download: what the bundle contains, completeness semantics, and the browser/CLI transport
 - [`runtime/editor-recovery.md`](./runtime/editor-recovery.md) — editor tool failure recovery and file state handling
 - [`runtime/editor-trace.md`](./runtime/editor-trace.md) — editor trace event contract and consumer behavior
+- [`runtime/task-launch-validation.md`](./runtime/task-launch-validation.md) — which launch settings an agent may be asked for, when they are validated, and how a task that never started an agent is recovered
 
 Operational references:
 

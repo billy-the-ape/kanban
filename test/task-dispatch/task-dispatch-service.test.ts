@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { baseTaskIdForReviewSessionId } from "../../src/cline-sdk/cline-review-session-service";
 import type { RuntimeConfigState } from "../../src/config/runtime-config";
 import type {
@@ -172,6 +172,8 @@ interface CreateTestDepsOptions {
 	workerLimit?: number;
 	startSessionError?: string;
 	prepareWorktree?: TaskDispatchDeps["prepareWorktree"];
+	/** The project default agent the runtime would launch with. */
+	selectedAgentId?: RuntimeAgentId;
 }
 
 /** A confirmed-merge completion binding on a task (MERGE-1 receipt). */
@@ -205,6 +207,9 @@ function createTestDeps(options: CreateTestDepsOptions = {}) {
 	const config = {
 		taskDispatchPolicy: { enabled: options.enabled ?? true, workerLimit: options.workerLimit ?? 1 },
 		gitDeliveryPolicy: { enabled: options.deliveryEnabled ?? true },
+		// The queue resolves the launch agent the same way the runtime does.
+		selectedAgentId: options.selectedAgentId ?? "cline",
+		agentAutonomousModeEnabled: true,
 	} as unknown as RuntimeConfigState;
 	const deps: TaskDispatchDeps = {
 		workspaceId: WORKSPACE_ID,
@@ -872,6 +877,49 @@ describe("dispatchReadyTasks", () => {
 		const record = await readTaskDispatchRecord("b");
 		expect(record?.status).toBe("failed");
 		expect(record?.attempt).toBe(1);
+	});
+
+	it("refuses an unsupportable card before any dispatch side effect", async () => {
+		// AA-UNSUPPORTED: the queue used to refresh the base ref, prepare the
+		// worktree and move the card to In Progress, and only then fail the launch
+		// when the agent refused the request — the half-started card the ticket is
+		// about. The capability check now runs first, so there is nothing to undo.
+		const prepareWorktree = vi.fn(async () => ({
+			ok: true,
+			worktreePath: "/wt/b",
+			baseSha: "b".repeat(40),
+			error: null,
+		}));
+		const board = createBoard({
+			cardsByColumn: {
+				backlog: [createCard("b", { agentId: "pi", startInPlanMode: true })],
+				done: [createCard("a")],
+			},
+			dependencies: [createDependency("dep-b-a", "b", "a")],
+		});
+		const { deps, startedTasks, getBoard } = createTestDeps({
+			board,
+			receipts: deliveredReceipts(),
+			prepareWorktree,
+		});
+
+		const response = await dispatchReadyTasks(deps);
+
+		expect(response.dispatchedTaskId).toBeNull();
+		expect(prepareWorktree).not.toHaveBeenCalled();
+		expect(startedTasks).toHaveLength(0);
+		expect(
+			getBoard()
+				.columns.find((column) => column.id === "backlog")
+				?.cards.map((card) => card.id),
+		).toEqual(["b"]);
+		// The reason is durable, so the browser can show it next to the card.
+		const record = await readTaskDispatchRecord("b");
+		expect(record?.status).toBe("blocked");
+		expect(record?.error).toContain("plan mode");
+		// Nothing was attempted, so the card has not spent a retry.
+		expect(record?.attempt).toBe(0);
+		expect(response.blockedTasks[0]?.blockedReason).toContain("plan mode");
 	});
 
 	it("starts a new attempt cycle after an earlier successful dispatch", async () => {

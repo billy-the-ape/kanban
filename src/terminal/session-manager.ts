@@ -28,6 +28,7 @@ import { stripAnsi } from "./output-utils";
 import { buildRestorePendingPiPatch, isDetachedPiRestoreCandidate } from "./pi-session-restore";
 import { PtySession } from "./pty-session";
 import { type HookReviewReason, reduceSessionTransition, type SessionTransitionEvent } from "./session-state-machine";
+import { formatErrorText, formatTaskLaunchFailureMessage, logTaskLaunchFailure } from "./task-launch-failure-log";
 import {
 	createTerminalProtocolFilterState,
 	disableOscColorQueryIntercept,
@@ -368,25 +369,64 @@ export class TerminalSessionManager implements TerminalSessionService {
 		// AA-S1: a deliberate resume records the fingerprint it changed from. A
 		// first launch for this card has no previous attempt, so it stays null.
 		const previousConfigFingerprint = entry.summary.launchProvenance?.configFingerprint ?? null;
-		const launch = await prepareAgentLaunch({
-			taskId: request.taskId,
-			agentId: request.agentId,
-			binary: request.binary,
-			args: request.args,
-			autonomousModeEnabled: request.autonomousModeEnabled,
-			cwd: request.cwd,
-			prompt: request.prompt,
-			images: request.images,
-			startInPlanMode: request.startInPlanMode,
-			resumeFromTrash: request.resumeFromTrash,
-			env: request.env,
-			workspaceId: request.workspaceId,
-			attemptId: launchAttemptId,
-			// AA-O1a: the session id this card's own agent reported earlier. Only
-			// adapters with exact resume use it, and only for resume intent: a fresh
-			// launch starts a new conversation, so a stale id must not reach it.
-			externalSessionId: request.resumeFromTrash ? (entry.summary.externalSessionId ?? null) : null,
-		});
+		// AA-UNSUPPORTED: adapter preparation used to sit outside the spawn guard
+		// below, so an adapter that refused the request (an unsupported setting) or
+		// failed to generate its launch resources threw past every summary write.
+		// The card then looked like an ordinary paused task with an empty terminal:
+		// `idle`, no pid, no message. Preparation is a launch failure like any other,
+		// so it persists a failed summary the card, the detail view and a diagnostics
+		// download can all show, and logs it with the stage that broke.
+		let launch: Awaited<ReturnType<typeof prepareAgentLaunch>>;
+		try {
+			launch = await prepareAgentLaunch({
+				taskId: request.taskId,
+				agentId: request.agentId,
+				binary: request.binary,
+				args: request.args,
+				autonomousModeEnabled: request.autonomousModeEnabled,
+				cwd: request.cwd,
+				prompt: request.prompt,
+				images: request.images,
+				startInPlanMode: request.startInPlanMode,
+				resumeFromTrash: request.resumeFromTrash,
+				env: request.env,
+				workspaceId: request.workspaceId,
+				attemptId: launchAttemptId,
+				// AA-O1a: the session id this card's own agent reported earlier. Only
+				// adapters with exact resume use it, and only for resume intent: a fresh
+				// launch starts a new conversation, so a stale id must not reach it.
+				externalSessionId: request.resumeFromTrash ? (entry.summary.externalSessionId ?? null) : null,
+			});
+		} catch (error) {
+			terminalStateMirror.dispose();
+			const summary = updateSummary(entry, {
+				state: "failed",
+				agentId: request.agentId,
+				workspacePath: request.cwd,
+				pid: null,
+				startedAt: null,
+				lastOutputAt: null,
+				reviewReason: "error",
+				exitCode: null,
+				lastHookAt: null,
+				latestHookActivity: null,
+				latestTurnCheckpoint: null,
+				previousTurnCheckpoint: null,
+				launchAttemptId: null,
+				launchProvenance: null,
+				externalSessionId: null,
+				warningMessage: formatTaskLaunchFailureMessage("adapter-preparation", formatErrorText(error)),
+			});
+			this.emitSummary(summary);
+			logTaskLaunchFailure({
+				taskId: request.taskId,
+				agentId: request.agentId,
+				stage: "adapter-preparation",
+				error,
+				workspaceId: request.workspaceId ?? null,
+			});
+			throw error;
+		}
 		const launchEnvForProvenance: Record<string, string | undefined> = {
 			...request.env,
 			...launch.env,
@@ -549,6 +589,7 @@ export class TerminalSessionManager implements TerminalSessionService {
 				});
 			}
 			terminalStateMirror.dispose();
+			const spawnFailure = formatSpawnFailure(commandBinary, error);
 			const summary = updateSummary(entry, {
 				state: "failed",
 				agentId: request.agentId,
@@ -565,9 +606,19 @@ export class TerminalSessionManager implements TerminalSessionService {
 				// No live attempt to own hook events after a failed spawn.
 				launchAttemptId: null,
 				launchProvenance: null,
+				// The formatted reason survives on the card so the failure is still
+				// readable after the toast disappears.
+				warningMessage: spawnFailure,
 			});
 			this.emitSummary(summary);
-			throw new Error(formatSpawnFailure(commandBinary, error));
+			logTaskLaunchFailure({
+				taskId: request.taskId,
+				agentId: request.agentId,
+				stage: "process-spawn",
+				error,
+				workspaceId: request.workspaceId ?? null,
+			});
+			throw new Error(spawnFailure);
 		}
 
 		const active: ActiveProcessState = {

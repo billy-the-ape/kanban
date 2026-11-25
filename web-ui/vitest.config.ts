@@ -14,6 +14,7 @@ export default defineConfig({
 		alias: {
 			"@": resolve(__dirname, "src"),
 			"@runtime-agent-catalog": resolve(__dirname, "../src/core/agent-catalog.ts"),
+			"@runtime-task-launch-requirements": resolve(__dirname, "../src/core/task-launch-requirements.ts"),
 			"@runtime-cline-tool-call-display": resolve(__dirname, "../src/cline-sdk/cline-tool-call-display.ts"),
 			"@runtime-contract": resolve(__dirname, "../src/core/api-contract.ts"),
 			"@runtime-home-agent-session": resolve(__dirname, "../src/core/home-agent-session.ts"),

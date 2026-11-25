@@ -3,6 +3,7 @@ import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import * as RadixSwitch from "@radix-ui/react-switch";
 
 import {
+	AlertCircle,
 	ArrowBigUp,
 	ArrowLeft,
 	Check,
@@ -116,6 +117,10 @@ export function TaskCreateDialog({
 	prAutoAddressComments,
 	prAutoFinishOnMerge,
 	startInPlanModeDisabled = false,
+	/** AA-UNSUPPORTED: why plan mode is unavailable for the effective agent. */
+	planModeNotice = null,
+	/** Shown when the effective agent cannot receive image attachments. */
+	attachmentsNotice = null,
 	workspaceId,
 	branchRef,
 	branchOptions,
@@ -156,6 +161,10 @@ export function TaskCreateDialog({
 	prAutoAddressComments?: { checked: boolean; onChange: (value: boolean) => void };
 	prAutoFinishOnMerge?: { checked: boolean; onChange: (value: boolean) => void };
 	startInPlanModeDisabled?: boolean;
+	/** Explanatory text rendered beside the disabled plan-mode option. */
+	planModeNotice?: string | null;
+	/** Explanatory text rendered beside the prompt attachments. */
+	attachmentsNotice?: string | null;
 	workspaceId: string | null;
 	branchRef: string;
 	branchOptions: BranchSelectOption[];
@@ -481,6 +490,12 @@ export function TaskCreateDialog({
 								</button>
 							) : null}
 						</div>
+						{attachmentsNotice ? (
+							<p className="mt-1.5 flex items-start gap-1.5 text-[11px] text-status-orange">
+								<AlertCircle size={12} className="mt-0.5 shrink-0" />
+								{attachmentsNotice}
+							</p>
+						) : null}
 					</div>
 				) : (
 					<div>
@@ -548,6 +563,9 @@ export function TaskCreateDialog({
 						</RadixCheckbox.Root>
 						Start in plan mode
 					</label>
+					{planModeNotice ? (
+						<p className="-mt-1.5 ml-[22px] text-[11px] text-text-tertiary">{planModeNotice}</p>
+					) : null}
 
 					<div>
 						<span className="text-[11px] text-text-secondary block mb-1">Worktree base ref</span>

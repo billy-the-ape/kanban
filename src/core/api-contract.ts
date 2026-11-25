@@ -1318,6 +1318,46 @@ export const runtimeTaskInitialStartStatusResponseSchema = z.object({
 });
 export type RuntimeTaskInitialStartStatusResponse = z.infer<typeof runtimeTaskInitialStartStatusResponseSchema>;
 
+/**
+ * AA-UNSUPPORTED: whether a task that has a prepared worktree but never started
+ * an agent conversation can be relaunched in place with its stored prompt.
+ *
+ * The server owns this answer: it needs the persisted baseline, the worktree's
+ * HEAD/dirty state, any delivery receipt or stored patch, and the agent's own
+ * session evidence. A `recoverable: false` response always carries the reason,
+ * so the card explains itself (and says what to fix) instead of looking like an
+ * ordinary paused task with an empty terminal.
+ */
+export const runtimeTaskLaunchRecoveryRequestSchema = z.object({
+	taskId: z.string(),
+});
+export type RuntimeTaskLaunchRecoveryRequest = z.infer<typeof runtimeTaskLaunchRecoveryRequestSchema>;
+
+export const runtimeTaskLaunchRecoveryResponseSchema = z.object({
+	ok: z.boolean(),
+	taskId: z.string(),
+	/** True only when relaunching the stored prompt is safe right now. */
+	recoverable: z.boolean(),
+	/**
+	 * Nothing shows an agent ever ran for this task (no process, no session that
+	 * ever started, no agent-side conversation). This is what separates "the
+	 * launch never happened" from an ordinary paused or interrupted task.
+	 */
+	neverLaunched: z.boolean().default(false),
+	/** The agent a relaunch would use (card override, then project default). */
+	agentId: runtimeAgentIdSchema.nullable().default(null),
+	/** The stored task prompt, so recovery never substitutes a generic resume. */
+	prompt: z.string().default(""),
+	/** Null when recoverable, otherwise what the user can do about it. */
+	reason: z.string().nullable().default(null),
+	/** Set when the saved settings must be corrected before a retry. */
+	settingsError: z.string().nullable().default(null),
+	/** Durable failure text recorded by the failed launch, when there is one. */
+	launchFailure: z.string().nullable().default(null),
+	error: z.string().optional(),
+});
+export type RuntimeTaskLaunchRecoveryResponse = z.infer<typeof runtimeTaskLaunchRecoveryResponseSchema>;
+
 export const runtimeWorktreeDeleteRequestSchema = z.object({
 	taskId: z.string(),
 });
@@ -2897,14 +2937,16 @@ export const runtimeHookIngestRequestSchema = z.object({
 	/** Canonical PR URLs detected by the hook CLI (re-parsed server-side; max 10). */
 	pullRequestUrls: z.array(z.string().min(1).max(2048)).max(10).optional(),
 	/** Pi tool evidence used to exclude implementation-authored PR comments from review feedback. */
-	publicationTool: z.object({
-		phase: z.enum(["started", "finished"]),
-		toolCallId: z.string().max(200).nullable(),
-		toolName: z.string().max(128).nullable(),
-		commands: z.array(z.string().max(10_000)).max(10),
-		output: z.string().max(4000).nullable(),
-		error: z.string().max(1000).nullable(),
-	}).optional(),
+	publicationTool: z
+		.object({
+			phase: z.enum(["started", "finished"]),
+			toolCallId: z.string().max(200).nullable(),
+			toolName: z.string().max(128).nullable(),
+			commands: z.array(z.string().max(10_000)).max(10),
+			output: z.string().max(4000).nullable(),
+			error: z.string().max(1000).nullable(),
+		})
+		.optional(),
 });
 export type RuntimeHookIngestRequest = z.infer<typeof runtimeHookIngestRequestSchema>;
 

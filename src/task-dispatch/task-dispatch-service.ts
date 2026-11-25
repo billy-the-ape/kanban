@@ -28,8 +28,10 @@ import type {
 	RuntimeTaskSessionSummary,
 } from "../core/api-contract";
 import { getTaskColumnId, moveTaskToColumn } from "../core/task-board-mutations";
+import { checkTaskLaunchRequirements } from "../core/task-launch-requirements";
 import { lockedFileSystem } from "../fs/locked-file-system";
 import { getWorkspaceDirectoryPath } from "../state/workspace-state";
+import { logTaskLaunchFailure } from "../terminal/task-launch-failure-log";
 import { findMissingAncestorCommits, readGitHeadInfo } from "../workspace/git-utils";
 import { prepareInitialTaskWorktree, resolveTaskCwd } from "../workspace/task-worktree";
 import { clearTaskDispatchRecord, readTaskDispatchRecord, writeTaskDispatchRecord } from "./dispatch-records";
@@ -665,6 +667,44 @@ async function dispatchSingleTask(
 	const spentAttempts = launchAttemptsInCycle(previousRecord);
 	const attempt = spentAttempts + 1;
 	const cycleStartedAt = previousRecord && spentAttempts > 0 ? previousRecord.dispatchedAt : Date.now();
+
+	// AA-UNSUPPORTED: an invalid configuration is refused before the queue takes
+	// any of its side effects. Otherwise the pass refreshes the base ref, creates
+	// a worktree, moves the card to In Progress and only then fails the launch -
+	// leaving exactly the half-started card this task is about. Blocking here
+	// leaves the card in Backlog with a dispatch record that says what to fix.
+	const dispatchConfig = await deps.loadConfig();
+	const dispatchAgentId = card.agentId ?? dispatchConfig.selectedAgentId;
+	const dispatchRequirements = checkTaskLaunchRequirements(dispatchAgentId, {
+		startInPlanMode: card.startInPlanMode === true,
+		imagesRequested: (card.images?.length ?? 0) > 0,
+	});
+	if (!dispatchRequirements.ok) {
+		const dispatchError = dispatchRequirements.error ?? "Unsupported launch settings.";
+		await writeTaskDispatchRecord({
+			taskId,
+			workspaceId: deps.workspaceId,
+			baseRef: card.baseRef,
+			baseSha: null,
+			// Nothing was attempted, so no launch attempt is spent.
+			attempt: spentAttempts,
+			status: "blocked",
+			error: dispatchError,
+			prerequisites: entry.prerequisites,
+			prompt: null,
+			agentId: dispatchAgentId,
+			dispatchedAt: cycleStartedAt,
+			updatedAt: Date.now(),
+		}).catch(() => null);
+		logTaskLaunchFailure({
+			taskId,
+			agentId: dispatchAgentId,
+			stage: "settings-validation",
+			error: dispatchError,
+			workspaceId: deps.workspaceId,
+		});
+		return { dispatched: false, boardChanged: false, surfaceReason: dispatchError };
+	}
 	const requiredAncestors = extractRequiredAncestors(entry.prerequisites);
 	const prepare =
 		deps.prepareWorktree ??
