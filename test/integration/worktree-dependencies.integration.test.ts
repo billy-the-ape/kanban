@@ -1,8 +1,10 @@
 import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { chmod, lstat, mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { readDependencyEntry } from "../../src/workspace/dependencies/dependency-store";
 import { ensureWorktreeDependencies } from "../../src/workspace/dependencies/ensure-worktree-dependencies";
 import { createTempDir } from "../utilities/temp-dir";
@@ -17,6 +19,48 @@ import { createTempDir } from "../utilities/temp-dir";
  * therefore deterministic.
  */
 const npmAvailable = spawnSync("npm", ["--version"], { encoding: "utf8" }).status === 0;
+
+// The snapshot cache resolves through os.homedir(), so this suite would
+// otherwise publish real entries into the developer's ~/.cline. npm's own cache
+// is pinned to the real home to keep the install warm (and offline).
+const realNpmCache = join(homedir(), ".npm");
+let home: string;
+let homeBackup: string | undefined;
+let userBackup: string | undefined;
+let npmCacheBackup: string | undefined;
+
+beforeEach(() => {
+	home = mkdtempSync(join(tmpdir(), "kanban-dep-int-home-"));
+	homeBackup = process.env.HOME;
+	userBackup = process.env.USERPROFILE;
+	npmCacheBackup = process.env.npm_config_cache;
+	process.env.HOME = home;
+	if (process.platform === "win32") {
+		process.env.USERPROFILE = home;
+	}
+	if (existsSync(realNpmCache)) {
+		process.env.npm_config_cache = realNpmCache;
+	}
+});
+
+afterEach(() => {
+	if (homeBackup === undefined) {
+		delete process.env.HOME;
+	} else {
+		process.env.HOME = homeBackup;
+	}
+	if (userBackup === undefined) {
+		delete process.env.USERPROFILE;
+	} else {
+		process.env.USERPROFILE = userBackup;
+	}
+	if (npmCacheBackup === undefined) {
+		delete process.env.npm_config_cache;
+	} else {
+		process.env.npm_config_cache = npmCacheBackup;
+	}
+	rmSync(home, { recursive: true, force: true });
+});
 
 async function writeFiles(rootPath: string, files: Record<string, string>): Promise<void> {
 	for (const [relativePath, content] of Object.entries(files)) {

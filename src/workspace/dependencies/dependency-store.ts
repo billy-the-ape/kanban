@@ -83,6 +83,10 @@ export function getDependencyEntryPath(key: string): string {
  * Per-entry lock. proper-lockfile keys its in-process map by `path`, so each
  * distinct lock needs its own `path` as well as its own lockfile: two requests
  * sharing a path would overwrite each other's in-process entry (see AGENTS.md).
+ * The shared retry budget is deliberate: the winner of a concurrent publish
+ * holds the lock for a full tree copy (seconds on a multi-GB `node_modules`),
+ * and a caller that waits that out finds the entry already published, while one
+ * that runs out gets `ok: false` from `publishDependencyEntry`.
  */
 export function getDependencyEntryLock(key: string): LockRequest {
 	const locksDir = join(getDepCacheRootPath(), LOCKS_DIR_NAME);
@@ -189,6 +193,12 @@ export interface PublishDependencyEntryOptions {
 	sourceRoot: string;
 	strategy?: DependencyTransferStrategy;
 	now?: number;
+	/**
+	 * Lock retry budget override. Publishing waits for the per-key lock (another
+	 * task may be copying the same tree), and the default budget is the shared
+	 * several-seconds one; tests use a small value to exercise giving up.
+	 */
+	lockRetries?: number;
 }
 
 export interface PublishDependencyEntryResult {
@@ -204,6 +214,9 @@ export interface PublishDependencyEntryResult {
  * tree. Publishing an input set that already has a usable entry is a no-op, and
  * a failed publish only ever removes its own staging directory: a snapshot
  * another task is restoring from is never deleted because this publish failed.
+ * Every failure — including losing the per-key lock to a concurrent publish —
+ * comes back as `ok: false` rather than a rejection, because the callers degrade
+ * on the result and a task launch must not be lost to the cache.
  */
 export async function publishDependencyEntry(
 	options: PublishDependencyEntryOptions,
@@ -224,7 +237,29 @@ export async function publishDependencyEntry(
 			error: "Install produced no node_modules directory, so there is nothing to cache.",
 		};
 	}
-	return await lockedFileSystem.withLock(getDependencyEntryLock(options.key), async () => {
+	const lock = getDependencyEntryLock(options.key);
+	const request: LockRequest = options.lockRetries === undefined ? lock : { ...lock, retries: options.lockRetries };
+	try {
+		return await lockedFileSystem.withLock(request, publishUnderLock);
+	} catch (error) {
+		// Losing the lock must not be a dependency failure: this call would throw
+		// past the callers that degrade on `ok: false`, and the task would lose a
+		// report for work that already succeeded. The winner of a concurrent
+		// publish for this exact key copied the same tree, so its entry answers
+		// this call; otherwise the caller falls back exactly as it does for any
+		// other publish failure.
+		const winner = await readDependencyEntry(options.key);
+		if (winner !== null) {
+			return { ok: true, meta: winner.meta, error: null };
+		}
+		return {
+			ok: false,
+			meta: null,
+			error: `Could not take the snapshot lock: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+
+	async function publishUnderLock(): Promise<PublishDependencyEntryResult> {
 		// Re-check now that the lock is held: the other task's snapshot is the
 		// answer, not something to re-copy over. Without this, concurrent cold
 		// starts of one key each transfer the whole tree and the last one replaces
@@ -276,7 +311,7 @@ export async function publishDependencyEntry(
 				error: error instanceof Error ? error.message : String(error),
 			};
 		}
-	});
+	}
 }
 
 export interface PruneDependencyEntriesResult {

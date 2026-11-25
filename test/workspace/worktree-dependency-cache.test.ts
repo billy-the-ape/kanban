@@ -1,10 +1,14 @@
+import { mkdtempSync, rmSync } from "node:fs";
 import { chmod, lstat, mkdir, readdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { lockedFileSystem } from "../../src/fs/locked-file-system";
 import { getTaskWorktreesHomePath } from "../../src/state/workspace-state";
 import {
 	getDepCacheRootPath,
+	getDependencyEntryLock,
 	pruneDependencyEntries,
 	publishDependencyEntry,
 	readDependencyEntry,
@@ -35,6 +39,38 @@ afterEach(() => {
 	while (cleanups.length > 0) {
 		cleanups.pop()?.();
 	}
+});
+
+// Every test runs against a temporary HOME: the snapshot cache resolves its root
+// through os.homedir() at call time, so without this the suite publishes real
+// (multi-hundred-megabyte) entries into the developer's own ~/.cline and leaks
+// cache state between runs.
+let home: string;
+let homeBackup: string | undefined;
+let userBackup: string | undefined;
+
+beforeEach(() => {
+	home = mkdtempSync(join(tmpdir(), "kanban-dep-home-"));
+	homeBackup = process.env.HOME;
+	userBackup = process.env.USERPROFILE;
+	process.env.HOME = home;
+	if (process.platform === "win32") {
+		process.env.USERPROFILE = home;
+	}
+});
+
+afterEach(() => {
+	if (homeBackup === undefined) {
+		delete process.env.HOME;
+	} else {
+		process.env.HOME = homeBackup;
+	}
+	if (userBackup === undefined) {
+		delete process.env.USERPROFILE;
+	} else {
+		process.env.USERPROFILE = userBackup;
+	}
+	rmSync(home, { recursive: true, force: true });
 });
 
 async function writeCheckout(rootPath: string, files: Record<string, string>): Promise<void> {
@@ -328,7 +364,9 @@ describe("dependency snapshot store", () => {
 		expect(first.ok).toBe(true);
 		expect(second.ok).toBe(true);
 		expect(second.meta?.createdAt).toBe(first.meta?.createdAt);
-		expect([first.meta?.createdAt, second.meta?.createdAt]).toContain(20_000);
+		// Which caller wins the lock is not deterministic, so assert the shared
+		// value came from this test's two clocks rather than naming a winner.
+		expect([20_000, 30_000]).toContain(first.meta?.createdAt);
 
 		const entry = await readDependencyEntry(key);
 		expect(entry).not.toBeNull();
@@ -338,6 +376,63 @@ describe("dependency snapshot store", () => {
 		expect(
 			(await readdir(join(getDepCacheRootPath(), "entries"))).filter((name) => name.startsWith(".tmp-")),
 		).toEqual([]);
+	});
+
+	it("waits for a busy entry lock instead of failing the publish", async () => {
+		const root = makeTempDir("kanban-dep-store-lock-wait-");
+		const source = join(root, "checkout");
+		await writeNodeModules(source, "lock-wait");
+		const key = "lock-wait-roundtrip";
+
+		// A publish holds the per-key lock for the whole tree copy, so a second
+		// cold start on the same key has to wait it out rather than fail.
+		const [, result] = await Promise.all([
+			lockedFileSystem.withLock(getDependencyEntryLock(key), async () => {
+				await new Promise((resolve) => {
+					setTimeout(resolve, 100);
+				});
+			}),
+			publishDependencyEntry({
+				key,
+				...baseMeta,
+				inputs: [{ path: "package.json", sha256: "lock-wait-digest" }],
+				outputs: ["node_modules"],
+				source: "install",
+				sourceRoot: source,
+			}),
+		]);
+
+		expect(result.error).toBeNull();
+		expect(result.ok).toBe(true);
+		expect(await readDependencyEntry(key)).not.toBeNull();
+	});
+
+	it("reports a failed publish instead of throwing when the lock cannot be taken", async () => {
+		const root = makeTempDir("kanban-dep-store-lock-lost-");
+		const source = join(root, "checkout");
+		await writeNodeModules(source, "lock-lost");
+		const key = "lock-lost-roundtrip";
+
+		// `lockRetries: 0` stands in for giving up after the retry budget while a
+		// first publisher copies a multi-gigabyte tree.
+		const result = await lockedFileSystem.withLock(getDependencyEntryLock(key), async () =>
+			publishDependencyEntry({
+				key,
+				...baseMeta,
+				inputs: [{ path: "package.json", sha256: "lock-lost-digest" }],
+				outputs: ["node_modules"],
+				source: "install",
+				sourceRoot: source,
+				lockRetries: 0,
+			}),
+		);
+
+		// Callers degrade on `ok: false`. A rejection escapes them and loses the
+		// report for a worktree whose install already succeeded.
+		expect(result.ok).toBe(false);
+		expect(result.meta).toBeNull();
+		expect(result.error).toContain("snapshot lock");
+		expect(await readDependencyEntry(key)).toBeNull();
 	});
 
 	it("caps how many entries one repository may hold", async () => {
