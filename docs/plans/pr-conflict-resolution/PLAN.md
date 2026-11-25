@@ -98,7 +98,7 @@ Mirror `commitPromptTemplate` / `openPrPromptTemplate` everywhere, adding `confl
 | `{{base_branch}}` | snapshot `base.ref` | required — refuse |
 | `{{head_sha}}` / `{{base_sha}}` | snapshot `head.sha` / `base.sha` | optional — omit the sentence, never render `null` |
 | `{{base_ref}}` | `card.baseRef` (the task's own base) | optional; add an explicit "card base ref may differ from the PR base; the PR base wins" clause |
-| `{{task_worktree_path}}` | `resolveTaskCwd({ ensure: false })` | optional — omit if the worktree is gone, and refuse the dispatch instead |
+| `{{task_worktree_path}}` | `resolveTaskCwd({ ensure: false })` | required — refuse when the worktree is missing, and refuse rather than substitute a scratch checkout (it names the only checkout the turn may touch) |
 
 Rendering rules: reuse a shared `interpolateTemplate` (extract from `build-task-git-action-prompt.ts` so both paths share it); **never** substitute an empty string for a required token; leave unknown `{{tokens}}` untouched so an operator template stays intact; length-cap and single-quote every interpolated value (branch names and PR text are untrusted and end up in a turn that has push rights).
 
@@ -169,9 +169,14 @@ PR branch.
      remote provider. Treat these as authoritative; the supplied metadata may
      be stale.
    - Fetch both branches and inspect the working tree.
-   - Use the existing task checkout only if it is on the correct branch and its
-     state is understood. Preserve uncommitted work. If necessary, use a
-     separate worktree to isolate the repair.
+   - Work only in the task checkout at {{task_worktree_path}}. Do not create or
+     switch to another worktree or checkout, and do not touch any other working
+     copy — including the one holding the base branch. Use it only if it is on
+     the PR head, either as the head branch itself or as a detached HEAD at that
+     commit (the Kanban default), and only if its state is understood; preserve
+     uncommitted work. If it is unusable (missing, dirty beyond your work,
+     mid-operation, or diverged from the PR head), stop and report instead of
+     improvising.
    - Confirm that a conflict still exists against the latest base. If it has
      already been resolved, report that and make no unnecessary changes.
 
@@ -214,6 +219,13 @@ PR branch.
      If it did, fetch and incorporate those changes, then repeat relevant
      validation. Do not overwrite another actor's commits.
    - Commit the resolution and push normally to the existing PR head branch.
+     The task checkout is usually a detached HEAD with no local branch of the
+     PR's own, so push the current commit to the remote ref explicitly:
+     `git push <remote-for-the-head-repository> HEAD:refs/heads/<head_branch>`.
+     Never force. A rejected (non-fast-forward) push means the remote moved:
+     fetch, re-verify, and incorporate it — do not reach for `--force` or
+     `--force-with-lease`, and do not push a new branch into another
+     repository.
    - If the base moved again, assess whether another merge is necessary. Avoid
      an unbounded repair loop; report persistent concurrent updates.
    - Leave the PR open for CI and review. Do not merge the PR, approve it,
@@ -230,9 +242,12 @@ reported state. Do not claim the conflict is resolved unless the repair has
 been committed and pushed successfully.
 ```
 
-Two additions worth keeping over the raw request, both cheap and both failure-shaped:
+Three additions over the requested text, each failure-shaped:
 - The **known SHAs** line + "treat these as authoritative" pair, so the model can prove the remote moved instead of trusting a stale Kanban render.
-- An explicit **push-target** clause when the checkout is detached (the Kanban default): `git push <remote> HEAD:refs/heads/<head_branch>` with a normal (non-forced) push, and "a rejected push means the remote moved — fetch, re-verify, never `--force`." A non-fast-forward rejection is the safety net; do not let `--force-with-lease` talk it out of the model's head.
+- A **pinned checkout**: step 1 names `{{task_worktree_path}}` as the only working copy the turn may touch. Without it, "never touch any checkout other than the ones named here" names nothing, and gotchas 11 and 18 become live risks rather than closed ones. This is why the token is required rather than optional.
+- The **detached-HEAD push-target** clause (the Kanban default is a detached worktree with no local PR branch): `git push <remote> HEAD:refs/heads/<head_branch>`, non-forced only, with "a rejected push means the remote moved — fetch, re-verify, never `--force`". A non-fast-forward rejection is the safety net; do not let `--force-with-lease` talk it out of the model's head.
+
+**Anything this block is meant to instruct must live inside the block.** PCR-2 copies the fenced text into `DEFAULT_CONFLICT_PROMPT_TEMPLATE` verbatim; a bullet written after the closing fence is documentation for us and silence for the model. Both of this document's first-draft contradictions came from exactly that: a push-target rule described below the fence but absent from step 5, and a scratch-worktree invitation inside the fence that gotchas 11 and 18 argued against. Re-read the fenced block on its own before editing it — the template must be self-consistent with no outside prose to lean on.
 
 ---
 
@@ -253,7 +268,7 @@ Two additions worth keeping over the raw request, both cheap and both failure-sh
 8. **The worktree may not exist at all.** `cleanupInterruptedTaskWorktrees` in `src/server/shutdown-coordinator.ts` removes In Progress/Review worktrees on shutdown, and done/trash paths remove them too. A button that survives a restart but has nothing to merge in must refuse, not silently `ensure` a fresh worktree at the current base (that would *lose* the PR's commits from the local view and invite a "reimplement it" turn).
 9. **The worktree may be behind or diverged from the PR head.** Reuse `refreshCommentWorktree`'s discipline: clean tree only, fast-forward only, refuse on divergence, and re-verify HEAD/attachment after the fetch.
 10. **Uncommitted local work belongs to the user.** Commit-template language ("preserve pre-existing user uncommitted changes") is not a substitute for a policy: state whether to stash, and forbid `stash`/`reset --hard`/`clean -fd` in the repair turn if the tree is dirty (refuse instead).
-11. **Scratch-worktree mode has its own traps** (the template invites it): worktree pruning races, `node_modules`/venvs are absent so validation silently fails (this fork's task worktrees ship without `node_modules`), and Kanban's own cleanup may delete what the model created. If V1 does not support it, say "use the task's own checkout or stop".
+11. **Scratch worktrees are a PCR-4 problem, so step 1 forbids them.** A second checkout for isolation sounds safer but breaks validation: worktree pruning races, `node_modules`/venvs are absent so test/lint steps silently no-op (this fork's task worktrees ship without `node_modules`), and Kanban's own cleanup may delete what the model created mid-turn. V1 pins the repair to `{{task_worktree_path}}` and tells the model to stop when that checkout is unusable; if isolation is ever needed, that variant has to provision dependencies and exempt its own scratch path from cleanup first.
 
 ### The push
 
@@ -266,7 +281,7 @@ Two additions worth keeping over the raw request, both cheap and both failure-sh
 ### Concurrency
 
 17. **Multiple writers on one PR.** Competing with: comment-repair turns (same session), deterministic delivery B-8 (`gitDeliveryPolicy.enabled` routes Commit/Open PR through the app and can integrate/push under the repair), the auto-merge executor's fenced merge, `reservePrOperation` holders from browser/CLI, and base-refresh/worktree-setup locks (`getTaskBaseRefreshLock` vs `getTaskWorktreeSetupLock` must stay distinct paths). Take the PR reservation for the repair and refuse while it is held.
-18. **The base branch checkout is someone else's.** The commit template habitually walks the model to the base checkout (`git worktree list` → `git -C P cherry-pick`). Repair must stay in the task worktree; say so explicitly, or it will merge into the user's primary checkout.
+18. **The base branch checkout is someone else's.** The commit template habitually walks the model to the base checkout (`git worktree list` → `git -C P cherry-pick`). Repair must stay in the task worktree, which is what the `{{task_worktree_path}}` sentence in step 1 buys; keep the token and that sentence together, or the prompt says "other checkouts are off-limits" while naming none.
 19. **The `autoReviewEnabled` path can fire right after the repair ends** (a review episode re-evaluates when the session settles) and the review-episode dedupe record is shared with commit/PR. Keep conflict repair out of `sentGitActionPrompt` and check `autoReviewEnabled` before promising the card will idle.
 
 ### Delivery to the agent
