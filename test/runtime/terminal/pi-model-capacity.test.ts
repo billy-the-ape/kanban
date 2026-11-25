@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { ClineTurnScheduler } from "../../../src/cline-sdk/cline-turn-scheduler";
 import type { RuntimeTaskSessionSummary } from "../../../src/core/api-contract";
-import { PiModelCapacityGate, type PiTurnRequest } from "../../../src/terminal/pi-model-capacity";
+import {
+	PI_TURN_START_GRACE_MS,
+	PiModelCapacityGate,
+	type PiTurnRequest,
+} from "../../../src/terminal/pi-model-capacity";
 import { TerminalSessionManager } from "../../../src/terminal/session-manager";
 
 const target = { providerId: "pi", modelId: "qwen", baseUrl: "http://localhost:8080/v1" };
@@ -109,7 +113,6 @@ function turnInput(
 		run: write,
 	};
 }
-
 /** Fails loudly instead of asserting through a nullable union. */
 function expectLaunched(admission: Admission): RuntimeTaskSessionSummary {
 	if (admission.status !== "launched") {
@@ -422,7 +425,8 @@ describe("PiModelCapacityGate", () => {
 		const fake = fakeManager();
 		await gate.request(startInput(fake, "a", async () => summary("a")));
 		const write = vi.fn(async () => summary("b"));
-		await gate.request(turnInput(fake, "b", write));
+		const notRun = vi.fn();
+		await gate.request({ ...turnInput(fake, "b", write), onNotRun: notRun });
 
 		expect(gate.cancel("workspace", "b")).toBe(true);
 		await tick();
@@ -432,5 +436,100 @@ describe("PiModelCapacityGate", () => {
 
 		expect(write).not.toHaveBeenCalled();
 		expect(fake.turnClears).toEqual([{ taskId: "b", error: null }]);
+		// Stop leaves the card clean, but the caller was already answered `queued`,
+		// so it still has to learn that its input will never be written.
+		expect(notRun).toHaveBeenCalledExactlyOnceWith("The turn was canceled before the model had capacity.");
+	});
+
+	it("releases the slot when written input never became a turn", async () => {
+		vi.useFakeTimers();
+		try {
+			const scheduler = new ClineTurnScheduler(async () => 1);
+			const gate = new PiModelCapacityGate(scheduler);
+			const fake = fakeManager();
+			const launchC = vi.fn(async () => summary("c"));
+			await gate.request(startInput(fake, "a", async () => summary("a")));
+			await gate.request(startInput(fake, "b", async () => summary("b")));
+			await gate.request(startInput(fake, "c", launchC));
+
+			// The slot passes to b, whose input is written - and then Pi reports
+			// nothing at all, because it was blocked on something else.
+			fake.emit(settled("a"));
+			await vi.advanceTimersByTimeAsync(PI_TURN_START_GRACE_MS - 1000);
+			expect(launchC).not.toHaveBeenCalled();
+
+			// A turn Pi never started must not hold a model slot for the rest of the
+			// session, so the reservation is dropped once Pi has been silent long
+			// enough that no turn can be assumed to be running.
+			await vi.advanceTimersByTimeAsync(2000);
+			expect(launchC).toHaveBeenCalledOnce();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("keeps a queued chat message and a queued repair instead of replacing one", async () => {
+		const scheduler = new ClineTurnScheduler(async () => 1);
+		const gate = new PiModelCapacityGate(scheduler);
+		const fake = fakeManager();
+		// The only slot this model offers is busy on another card.
+		await gate.request(startInput(fake, "holder", async () => summary("holder")));
+
+		const order: string[] = [];
+		const chatNotRun = vi.fn();
+		const repairNotRun = vi.fn();
+		const chat = vi.fn(async () => {
+			order.push("chat");
+			return summary("b");
+		});
+		const repair = vi.fn(async () => {
+			order.push("repair");
+			return summary("b");
+		});
+
+		expect((await gate.request({ ...turnInput(fake, "b", chat), onNotRun: chatNotRun })).status).toBe("queued");
+		expect((await gate.request({ ...turnInput(fake, "b", repair), onNotRun: repairNotRun })).status).toBe("queued");
+		// Both wait behind the card's single claim, and neither may be dropped: a
+		// dropped repair strands its durable receipt, a dropped message throws away
+		// what a human typed.
+		expect(chat).not.toHaveBeenCalled();
+		expect(repair).not.toHaveBeenCalled();
+		expect(fake.turnClears).toEqual([]);
+
+		fake.emit(settled("holder"));
+		await tick();
+		await tick();
+
+		expect(order).toEqual(["chat", "repair"]);
+		expect(chatNotRun).not.toHaveBeenCalled();
+		expect(repairNotRun).not.toHaveBeenCalled();
+	});
+
+	it("tells every queued input when an earlier one never reached the model", async () => {
+		const scheduler = new ClineTurnScheduler(async () => 1);
+		const gate = new PiModelCapacityGate(scheduler);
+		const fake = fakeManager();
+		await gate.request(startInput(fake, "holder", async () => summary("holder")));
+		const failure = new Error("Pi's terminal process disappeared before the repair was submitted.");
+		const failing = vi.fn(async () => {
+			throw failure;
+		});
+		const failingNotRun = vi.fn();
+		const later = vi.fn(async () => summary("b"));
+		const laterNotRun = vi.fn();
+		await gate.request({ ...turnInput(fake, "b", failing), onNotRun: failingNotRun });
+		await gate.request({ ...turnInput(fake, "b", later), onNotRun: laterNotRun });
+
+		fake.emit(settled("holder"));
+		await tick();
+		await tick();
+
+		// Nothing further in the queue runs once an input fails, so its owner is
+		// the only one who can settle the work it owned.
+		expect(failing).toHaveBeenCalledOnce();
+		expect(later).not.toHaveBeenCalled();
+		expect(failingNotRun).toHaveBeenCalledExactlyOnceWith(failure.message);
+		expect(laterNotRun).toHaveBeenCalledExactlyOnceWith(failure.message);
+		expect(fake.turnClears.at(-1)?.error).toBe(failure.message);
 	});
 });

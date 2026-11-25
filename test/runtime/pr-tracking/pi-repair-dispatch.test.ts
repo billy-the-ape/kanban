@@ -253,6 +253,40 @@ describe("sendPreparedPiRepair", () => {
 		expect(pi.writes).toEqual(["\x1b[200~Fix review feedback.\x1b[201~", "\r"]);
 	});
 
+	it("settles the receipt when a queued repair never reaches Pi", async () => {
+		const pi = createPiManager();
+		const { prepare, settled } = createPreparation("Fix review feedback.");
+		const abandons: Array<(reason: string) => void> = [];
+		const result = await sendPreparedPiRepair({
+			manager: pi.manager,
+			taskId: "pi-task",
+			prepare,
+			restoreSavedSession: async () => ({ ok: true }),
+			capacity: async ({ onNotRun }) => {
+				abandons.push(onNotRun);
+			},
+		});
+		// The send returned while the repair still waited for a slot, so the only
+		// thing that can close the durable receipt is the gate reporting that the
+		// paste will never happen.
+		expect(result.ok).toBe(true);
+		expect(pi.writes).toEqual([]);
+		expect(settled).not.toHaveBeenCalled();
+		expect(abandons).toHaveLength(1);
+		const listenersBefore = pi.listeners.size;
+		expect(listenersBefore).toBeGreaterThan(0);
+
+		abandons[0]?.("The turn was canceled before the model had capacity.");
+
+		expect(settled).toHaveBeenCalledExactlyOnceWith({
+			status: "failed",
+			error: "The PR repair never reached Pi. The turn was canceled before the model had capacity.",
+		});
+		// Settling also releases the turn listener, which otherwise runs for the
+		// life of the session.
+		expect(pi.listeners.size).toBe(0);
+	});
+
 	it("fails the receipt if Pi ends with a hook error", async () => {
 		const pi = createPiManager();
 		const { prepare, settled } = createPreparation();

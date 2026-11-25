@@ -43,6 +43,12 @@ export interface PiPreparedRepairInput {
 type PiRepairTurnCapacity = (input: {
 	taskId: string;
 	manager: TerminalSessionManager;
+	/**
+	 * How the gate reports a queued repair that never reached Pi: the wait was
+	 * canceled, the card moved on, or the paste failed. The caller was already
+	 * answered, so this is the only way its durable receipt can settle.
+	 */
+	onNotRun: (reason: string) => void;
 	run: () => Promise<RuntimeTaskSessionSummary>;
 }) => Promise<void>;
 
@@ -267,6 +273,15 @@ export async function sendPreparedPiRepair(input: PiPreparedRepairInput): Promis
 			await capacity({
 				taskId,
 				manager,
+				// The gate answers a queued repair as soon as it is queued, so nothing
+				// here is still waiting when the paste later fails or is canceled. The
+				// turn listener cannot report it either: it ignores everything until the
+				// paste is written. Settling here is what rolls the feedback watermark
+				// back and releases the live dispatch entry, instead of leaving the card
+				// skipped as `waiting` until a runtime restart.
+				onNotRun: (reason) => {
+					void settle({ status: "failed", error: `The PR repair never reached Pi. ${reason}` });
+				},
 				run: async () => {
 					await submitRepair();
 					return reportSubmitted();

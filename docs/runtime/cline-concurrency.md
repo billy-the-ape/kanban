@@ -15,9 +15,19 @@ run during these gaps. A queued Pi turn never blocks its request: the
 card records a **Waiting for model capacity** summary and Kanban spawns the
 CLI, or writes the follow-up input, in the background once a slot frees.
 A live session that already holds a slot is written to immediately, because its
-in-flight turn already reserves the card's slot.
-Only typing directly into a card's own terminal bypasses this queue, because
-Kanban cannot queue another client's keystrokes.
+in-flight turn already reserves the card's slot. A card keeps **one** reservation,
+so input that arrives while its turn is queued is kept in arrival order and
+written together with it: a queued chat message and a queued PR repair both
+reach Pi, and neither replaces the other. Input whose work never reached the
+model is reported back to whoever asked for it, which is how an automated PR
+repair settles its durable receipt instead of waiting for a runtime restart.
+Only a paste that does not itself start a turn - review comments or a git-action
+prompt typed with `appendNewline: false`, which the human still has to submit -
+and typing directly into a card's own terminal bypass this queue. A paste must
+not reserve a slot for a turn that may never start, and Kanban cannot queue
+another client's keystrokes. A turn that was written but that Pi never starts
+releases its reservation once Pi has gone quiet long enough that no turn can be
+assumed to be running.
 This is not a hard inference-provider request limit.
 
 ## Automatic discovery
@@ -65,7 +75,10 @@ reserves the card's slot is written to immediately. Stop
 cancels a
 queued Pi turn - its CLI is never launched and a queued follow-up is never
 written; a queued CLI that cannot spawn
-marks the card failed. Bulk-stopping a workspace's sessions — runtime shutdown,
+marks the card failed. An automated PR repair that is still queued when Stop,
+project removal or shutdown cancels the wait settles its dispatch record as
+failed and rolls its feedback watermark back, so the card is retried by the next
+reconciliation instead of sitting in `waiting` until a restart. Bulk-stopping a workspace's sessions — runtime shutdown,
 project removal, workspace disposal — cancels that workspace's queued starts the
 same way, because the stop can only reach processes and the slot it just freed
 would otherwise admit a new CLI against a manager being torn down; the card is
@@ -118,6 +131,9 @@ curl -fsS 'http://127.0.0.1:8080/props?model=qwen3.8-27b' \
    chat. The card shows **Waiting for model capacity** with its queue position
    while the session stays live, and the message reaches Pi by itself once a
    slot frees. Stop cancels the wait and never writes the input.
+7. While both slots are busy, add review comments to a Pi card. The paste lands
+   immediately and takes no reservation, because only input that submits a turn
+   is queued. Then send a chat message: that one waits.
 
 Waiting board cards show `q #1`, `q #2`, and so on in place of the phase badge. Positions are FIFO within each endpoint/model pool and update when a waiting turn is canceled or admitted. The normal phase badge returns when the turn starts. A queued Pi start has no queue-position badge, because that badge belongs to a running queued Cline turn: its card shows the waiting summary text instead, and the record carries the same queue position for diagnostics until its CLI spawns.
 

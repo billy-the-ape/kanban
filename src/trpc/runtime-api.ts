@@ -2118,9 +2118,18 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				// outside the budget, so a limit of 2 was observed running three agents
 				// at once. With no slot free the input is annotated as waiting on the
 				// card and written in the background when capacity frees.
+				//
+				// Only input that actually starts a turn may hold a slot. The web UI
+				// sends review comments and git-action prompts as two calls (a paste with
+				// `appendNewline: false`, then `"\r"`), and `handleAddReviewComments`
+				// pastes without any Enter at all: queueing a paste would reserve a slot
+				// for a turn that never starts, because the Enter is written - or never
+				// typed - independently of it.
+				const submitsTurn = body.appendNewline !== false || /[\r\n]$/.test(body.text);
 				if (
 					liveSummary?.agentId === "pi" &&
 					payloadText.trim().length > 0 &&
+					submitsTurn &&
 					terminalManager.hasActiveProcess(body.taskId)
 				) {
 					const admission = await piCapacityGate.request({

@@ -2025,6 +2025,38 @@ describe("createRuntimeApi startTaskSession", () => {
 		expect(marks).toEqual([{ taskId: "task-1", queuePosition: 1 }]);
 	});
 
+	it("writes a non-submitting Pi paste straight through", async () => {
+		// The web UI types review comments and git-action prompts as a paste with
+		// `appendNewline: false` and a separate Enter, and adding review comments
+		// never sends that Enter at all. A paste therefore starts no turn, so
+		// queueing it would reserve a model slot for work the model was never
+		// asked to do - and the Enter, written independently, would land on an
+		// idle session. Only input that submits a turn may hold a slot.
+		const gate = await busyPiCapacity();
+		const writeInput = vi.fn(() => createSummary({ agentId: "pi", pid: 4242 }));
+		const { manager, marks } = createPiTerminalManager(writeInput);
+
+		const api = createTestRuntimeApi({
+			piCapacityGate: gate,
+			getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+			loadScopedRuntimeConfig: vi.fn(async () => createRuntimeConfigState()),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: vi.fn(async () => manager as never),
+			getScopedClineTaskSessionService: vi.fn(async () => createClineTaskSessionServiceMock() as never),
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+		});
+
+		const response = await api.sendTaskSessionInput(
+			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+			{ taskId: "task-1", text: "review comments", appendNewline: false },
+		);
+
+		expect(response.ok).toBe(true);
+		expect(writeInput).toHaveBeenCalledWith("task-1", Buffer.from("review comments", "utf8"));
+		expect(marks).toEqual([]);
+	});
+
 	it("writes a Pi follow-up at once when a model slot is free", async () => {
 		const writeInput = vi.fn(() => createSummary({ agentId: "pi", pid: 4242 }));
 		const { manager, marks } = createPiTerminalManager(writeInput);
