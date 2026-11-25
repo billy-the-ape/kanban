@@ -15,6 +15,24 @@ vi.mock("../../../src/terminal/pty-session.js", () => ({
 
 import { TerminalSessionManager } from "../../../src/terminal/session-manager";
 
+function createSummary(overrides: Partial<RuntimeTaskSessionSummary> = {}): RuntimeTaskSessionSummary {
+	return {
+		taskId: "task-1",
+		state: "running",
+		agentId: "claude",
+		workspacePath: "/tmp/worktree",
+		pid: 1234,
+		startedAt: Date.now(),
+		updatedAt: Date.now(),
+		lastOutputAt: Date.now(),
+		reviewReason: null,
+		exitCode: null,
+		lastHookAt: null,
+		latestHookActivity: null,
+		...overrides,
+	};
+}
+
 function createPtySession(pid: number) {
 	return {
 		pid,
@@ -121,6 +139,40 @@ describe("TerminalSessionManager launch failures (AA-UNSUPPORTED)", () => {
 		expect(loggedLines()).toContain("task-launch-failed task=task-2");
 		expect(loggedLines()).toContain("stage=process-spawn");
 		expect(loggedLines()).toContain("agent=claude");
+	});
+
+	it("keeps the agent's own session id when preparation fails", async () => {
+		// The id is the card's link to the conversation the agent itself reported,
+		// and the only way a later resume can name that exact session. A refused
+		// launch destroyed the attempt, not the agent's record, so the id has to
+		// survive; clearing it would silently turn the next resume into a new
+		// conversation.
+		const manager = new TerminalSessionManager();
+		manager.hydrateFromRecord({
+			"task-4": createSummary({
+				taskId: "task-4",
+				agentId: "pi",
+				state: "awaiting_review",
+				reviewReason: "exit",
+				pid: null,
+				externalSessionId: "sess-42",
+			}),
+		});
+
+		await expect(
+			manager.startTaskSession({
+				taskId: "task-4",
+				agentId: "pi",
+				binary: "pi",
+				args: [],
+				cwd: "/tmp/worktree",
+				prompt: "Plan this",
+				startInPlanMode: true,
+			}),
+		).rejects.toThrow(/plan mode/i);
+
+		expect(manager.getSummary("task-4")?.warningMessage).toMatch(/plan mode/i);
+		expect(manager.getSummary("task-4")?.externalSessionId).toBe("sess-42");
 	});
 
 	it("clears the recorded failure once an agent actually starts", async () => {

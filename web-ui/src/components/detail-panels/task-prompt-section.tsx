@@ -53,7 +53,7 @@ export function TaskPromptSection({
 		// provider, and Radix `Tooltip` refuses to render without one, so the
 		// section owns a provider instead of depending on which host mounts it.
 		<TooltipProvider>
-			<div className="border-b border-border bg-surface-1">
+			<div className="shrink-0 border-b border-border bg-surface-1">
 				<Collapsible.Root open={isOpen} onOpenChange={setIsOpen}>
 					<div className="flex items-center gap-1 px-3 py-1.5">
 						<Collapsible.Trigger asChild>

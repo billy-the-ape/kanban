@@ -542,19 +542,25 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				: normalized
 					? `${card.prompt}\n\nAdditional instruction on resuming: ${normalized}`
 					: card.prompt;
-			const started = await startTaskSession(workspaceScope, {
-				taskId,
-				prompt,
-				recoverUnstartedSession: true,
-				taskTitle: card.title,
-				images: [...(card.images ?? []), ...(body.images ?? [])],
-				mode: body.mode,
-				startInPlanMode: body.mode ? false : card.startInPlanMode,
-				baseRef: card.baseRef,
-				updateBaseRefBeforeStart: card.updateBaseRefBeforeStart !== false,
-				agentId: card.agentId,
-				clineSettings: card.clineSettings,
-			});
+			const started = await startTaskSessionWithAssessment(
+				workspaceScope,
+				{
+					taskId,
+					prompt,
+					recoverUnstartedSession: true,
+					taskTitle: card.title,
+					images: [...(card.images ?? []), ...(body.images ?? [])],
+					mode: body.mode,
+					startInPlanMode: body.mode ? false : card.startInPlanMode,
+					baseRef: card.baseRef,
+					updateBaseRefBeforeStart: card.updateBaseRefBeforeStart !== false,
+					agentId: card.agentId,
+					clineSettings: card.clineSettings,
+				},
+				// The assessment above already gated this recovery; reusing it keeps one
+				// launch to one read of the persisted evidence.
+				assessment,
+			);
 			if (!started.ok || !started.summary) {
 				// The recovery took over this send, so a failed start is the answer.
 				return { status: "failed", error: started.error ?? "Unstarted Cline task recovery failed." };
@@ -701,7 +707,20 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 	const taskLaunchVersions = new Map<string, number>();
 	// Shared by the tRPC handler (manual starts) and the B-9 dispatch queue, so
 	// queued tasks launch through exactly the code path the UI uses.
-	const startTaskSession: RuntimeTrpcContext["runtimeApi"]["startTaskSession"] = async (workspaceScope, input) => {
+	/**
+	 * `recoveryAssessment` lets a caller that already assessed the same evidence —
+	 * the Cline chat recovery below — hand the answer over instead of making the
+	 * runtime read the baseline record, the worktree state and the agent's own
+	 * session host twice for one launch. It is deliberately an extra parameter of
+	 * the internal function rather than a request field: the assessment is
+	 * runtime-internal evidence, and a tRPC caller must not be able to talk its way
+	 * past the guard. `startTaskSession` below is the two-argument public surface.
+	 */
+	const startTaskSessionWithAssessment = async (
+		workspaceScope: RuntimeTrpcWorkspaceScope,
+		input: unknown,
+		recoveryAssessment?: UnstartedTaskRecoveryAssessment,
+	) => {
 		// UPD-0: terminal initial-start preparation outcome surfaced on the
 		// response (null for home-agent sessions and non-preparation failures).
 		let initialStart: RuntimeTaskInitialStartOutcome | null = null;
@@ -811,6 +830,36 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				};
 			}
 			let taskCwd: string;
+			// AA-UNSUPPORTED: an explicit recovery request is assessed here — before the
+			// start-owned preparation below — because that preparation creates a worktree
+			// and persists a new baseline. A recovery whose worktree has vanished (or whose
+			// saved work was already delivered) is refused by its own guards, and running
+			// the assessment only after preparation would have created the fresh worktree
+			// the recovery is meant to reuse. It also runs before the Cline branch, which
+			// bypasses the service's live-session short-circuit and therefore needs the
+			// same baseline/worktree/conversation evidence as a terminal relaunch, not just
+			// the presence check below. Rejected recoveries say which guard failed.
+			if (body.recoverUnstartedSession === true) {
+				const assessed =
+					recoveryAssessment ??
+					(await assessUnstartedTaskRecoveryForScope(
+						workspaceScope,
+						body.taskId,
+						await loadBoardCardById(workspaceScope, body.taskId),
+						effectiveAgentId,
+					));
+				if (!assessed.recoverable) {
+					const recoveryError = assessed.reason ?? "This task cannot be recovered in place.";
+					logTaskLaunchFailure({
+						taskId: body.taskId,
+						agentId: effectiveAgentId,
+						stage: "recovery-precheck",
+						error: recoveryError,
+						workspaceId: workspaceScope.workspaceId,
+					});
+					return { ok: false, summary: null, error: recoveryError, initialStart };
+				}
+			}
 			if (isHomeAgentSessionId(body.taskId)) {
 				taskCwd = workspaceScope.workspacePath;
 			} else {
@@ -997,33 +1046,6 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					initialStart,
 				};
 			}
-			// AA-UNSUPPORTED: an explicit recovery request relaunches the task's own
-			// stored prompt as a new conversation, so every guard below has to hold
-			// before a single process is spawned: the worktree is still at its saved
-			// baseline with no work of its own, nothing was delivered or preserved,
-			// and the agent has no conversation that a second launch would duplicate.
-			// Rejected recoveries say which one failed, so the user can act instead of
-			// clicking Start again and again.
-			if (body.recoverUnstartedSession === true) {
-				const recoveryCard = await loadBoardCardById(workspaceScope, body.taskId);
-				const recoveryAssessment = await assessUnstartedTaskRecoveryForScope(
-					workspaceScope,
-					body.taskId,
-					recoveryCard,
-					effectiveAgentId,
-				);
-				if (!recoveryAssessment.recoverable) {
-					const recoveryError = recoveryAssessment.reason ?? "This task cannot be recovered in place.";
-					logTaskLaunchFailure({
-						taskId: body.taskId,
-						agentId: effectiveAgentId,
-						stage: "recovery-precheck",
-						error: recoveryError,
-						workspaceId: workspaceScope.workspaceId,
-					});
-					return { ok: false, summary: null, error: recoveryError, initialStart };
-				}
-			}
 			assertLaunchCurrent();
 			const launchTerminal = async () =>
 				await terminalManager.startTaskSession({
@@ -1113,6 +1135,10 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 			};
 		}
 	};
+
+	/** The launch entry point: the tRPC handler and the B-9 dispatch queue both use it. */
+	const startTaskSession: RuntimeTrpcContext["runtimeApi"]["startTaskSession"] = (workspaceScope, input) =>
+		startTaskSessionWithAssessment(workspaceScope, input);
 
 	// UPD-0: pollable initial-start preparation status. A live in-process
 	// preparation reports its current stage; completed preparations report

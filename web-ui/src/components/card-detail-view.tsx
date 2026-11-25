@@ -923,7 +923,7 @@ export function CardDetailView({
 							style={{ display: mobileTab === "chat" ? "flex" : "none" }}
 						>
 							{agentLaunchStrip}
-							<div className="min-h-0 min-w-0 flex-1">{agentChatPanel}</div>
+							{agentChatPanel}
 						</div>
 						{/* Diff panel */}
 						<div
@@ -1073,8 +1073,12 @@ export function CardDetailView({
 								className="flex min-h-0 min-w-0 flex-col"
 								style={{ display: isDiffExpanded ? "none" : "flex", width: agentPanelPercent }}
 							>
+								{/* AA-UNSUPPORTED: banner + prompt strip above the agent panel. The
+									panel stays a direct flex child so its own `flex: 1 1 0` sizing
+									still resolves; wrapping it in a plain div would collapse the
+									terminal/chat height. */}
 								{agentLaunchStrip}
-								<div className="min-h-0 min-w-0 flex-1">{agentChatPanel}</div>
+								{agentChatPanel}
 							</div>
 							{!isDiffExpanded ? (
 								<ResizeHandle

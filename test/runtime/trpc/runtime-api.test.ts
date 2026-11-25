@@ -4812,6 +4812,119 @@ describe("createRuntimeApi launch guard (AA-UNSUPPORTED)", () => {
 		}
 	});
 
+	it("refuses a recovery whose worktree is gone instead of preparing a new one", async () => {
+		// Review regression: the recovery pre-check used to run after the
+		// start-owned preparation, so a task whose worktree had been removed got a
+		// brand-new worktree and a new baseline persisted for it — the fresh
+		// checkout the recovery is specifically not allowed to create.
+		const baselineSha = "052739f929e4e956162fef2f333422c9ac7c31f6";
+		agentRegistryMocks.resolveAgentCommand.mockReturnValue({
+			agentId: "pi",
+			label: "Pi",
+			command: "pi",
+			binary: "pi",
+			args: [],
+		});
+		taskWorktreeMocks.taskWorktreeExists.mockResolvedValue(false);
+		initialStartMocks.readTaskInitialStartRecord.mockResolvedValue(
+			createInitialStartRecord("task-1", baselineSha) as never,
+		);
+		taskWorktreeMocks.getTaskPreservationInfo.mockResolvedValue({
+			...createCleanTaskWorktreeInfo(baselineSha),
+			worktreeExists: false,
+			headCommit: null,
+		});
+		const readPiRecord = vi.spyOn(piSessionOptions, "readPiSessionRecord").mockResolvedValue({
+			found: false,
+			sessionFile: null,
+			sessionCwd: null,
+		});
+		const boardSpy = vi
+			.spyOn(workspaceState, "loadWorkspaceBoardById")
+			.mockResolvedValue(createLaunchGuardBoard("task-1"));
+		try {
+			const terminalManager = createPiTerminalManager();
+			const api = createLaunchGuardApi(terminalManager);
+
+			const response = await api.startTaskSession(
+				{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+				{
+					taskId: "task-1",
+					baseRef: "main",
+					prompt: "Investigate the flaky suite",
+					recoverUnstartedSession: true,
+					agentId: "pi",
+				},
+			);
+
+			expect(response.ok).toBe(false);
+			expect(response.error).toContain("does not exist");
+			expect(taskWorktreeMocks.prepareInitialTaskWorktree).not.toHaveBeenCalled();
+			expect(terminalManager.startTaskSession).not.toHaveBeenCalled();
+		} finally {
+			boardSpy.mockRestore();
+			readPiRecord.mockRestore();
+		}
+	});
+
+	it("applies the recovery guards to a Cline relaunch as well", async () => {
+		// Review regression: the Cline branch only re-checked session presence, so
+		// the banner's action bypassed the baseline / worktree / delivery guards that
+		// every other relaunch has to clear — and Cline recovery is exactly the path
+		// that bypasses the session service's own live-entry short-circuit.
+		const baselineSha = "052739f929e4e956162fef2f333422c9ac7c31f6";
+		taskWorktreeMocks.taskWorktreeExists.mockResolvedValue(true);
+		initialStartMocks.readTaskInitialStartRecord.mockResolvedValue(
+			createInitialStartRecord("task-1", baselineSha) as never,
+		);
+		// Work of its own: relaunching the stored prompt would discard it.
+		taskWorktreeMocks.getTaskPreservationInfo.mockResolvedValue({
+			...createCleanTaskWorktreeInfo(baselineSha),
+			dirty: true,
+			changedFiles: ["src/someone-elses-work.ts"],
+		});
+		const boardSpy = vi
+			.spyOn(workspaceState, "loadWorkspaceBoardById")
+			.mockResolvedValue(createLaunchGuardBoard("task-1", { agentId: "cline" }));
+		try {
+			const cline = createClineTaskSessionServiceMock();
+			cline.startTaskSession.mockResolvedValue(createSummary({ agentId: "cline", pid: 999 }));
+			const terminalManager = createPiTerminalManager();
+			const api = createTestRuntimeApi({
+				getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+				loadScopedRuntimeConfig: vi.fn(async () => ({
+					...createRuntimeConfigState(),
+					selectedAgentId: "cline" as const,
+				})),
+				setActiveRuntimeConfig: vi.fn(),
+				getScopedTerminalManager: vi.fn(async () => terminalManager as never),
+				getScopedClineTaskSessionService: vi.fn(async () => cline as never),
+				resolveInteractiveShellCommand: vi.fn(),
+				runCommand: vi.fn(),
+			});
+
+			const response = await api.startTaskSession(
+				{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+				{
+					taskId: "task-1",
+					baseRef: "main",
+					prompt: "Investigate the flaky suite",
+					recoverUnstartedSession: true,
+					agentId: "cline",
+				},
+			);
+
+			expect(response.ok).toBe(false);
+			expect(response.error).toContain("uncommitted changes");
+			// Nothing was resolved, prepared or started: the refusal is the whole answer.
+			expect(taskWorktreeMocks.resolveTaskCwd).not.toHaveBeenCalled();
+			expect(taskWorktreeMocks.prepareInitialTaskWorktree).not.toHaveBeenCalled();
+			expect(cline.startTaskSession).not.toHaveBeenCalled();
+		} finally {
+			boardSpy.mockRestore();
+		}
+	});
+
 	it("does not call an interrupted Pi session an unstarted task", async () => {
 		// An interrupted record keeps the pid it ran with; Restore owns that card, and
 		// a "start with saved prompt" action would begin a second conversation.

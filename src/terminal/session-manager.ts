@@ -414,7 +414,12 @@ export class TerminalSessionManager implements TerminalSessionService {
 				previousTurnCheckpoint: null,
 				launchAttemptId: null,
 				launchProvenance: null,
-				externalSessionId: null,
+				// `externalSessionId` is deliberately kept: it is the id the agent itself
+				// reported for this card, and the only thing that lets a later resume name
+				// that exact conversation. A failed preparation destroyed the launch, not
+				// the agent's session record, so clearing it here would silently turn the
+				// next resume into a brand-new conversation (mirroring the spawn-failure
+				// path below, which never touched it).
 				warningMessage: formatTaskLaunchFailureMessage("adapter-preparation", formatErrorText(error)),
 			});
 			this.emitSummary(summary);

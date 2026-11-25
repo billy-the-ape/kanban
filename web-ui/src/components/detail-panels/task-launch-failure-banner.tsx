@@ -42,7 +42,7 @@ export function TaskLaunchFailureBanner({
 	const explanation = failure ?? recovery?.reason ?? null;
 
 	return (
-		<div className="flex flex-col gap-1.5 border-b border-border bg-status-red/10 px-3 py-2">
+		<div className="flex shrink-0 flex-col gap-1.5 border-b border-border bg-status-red/10 px-3 py-2">
 			<div className="flex items-start gap-2">
 				{failure ? (
 					<AlertCircle size={14} className="mt-0.5 shrink-0 text-status-red" />
