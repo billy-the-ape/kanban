@@ -34,7 +34,7 @@ import { disablePasscode, generateInternalToken, generatePasscode } from "./secu
 import { terminateProcessForTimeout } from "./server/process-termination";
 import type { RuntimeStateHub } from "./server/runtime-state-hub";
 import { captureNodeException, flushNodeTelemetry } from "./telemetry/sentry-node.js";
-import { sharedPiInitialTurnCapacityGate } from "./terminal/pi-initial-turn-capacity";
+import { sharedPiModelCapacityGate } from "./terminal/pi-model-capacity";
 import type { TerminalSessionManager } from "./terminal/session-manager";
 import { runOnDemandUpdate } from "./update/update";
 
@@ -414,7 +414,7 @@ async function startServer(): Promise<{
 		// dropping that claim, the slot freed by shutdown or project removal would
 		// admit a fresh CLI against a manager that is being torn down.
 		manager.setOnBulkStop(() => {
-			sharedPiInitialTurnCapacityGate.cancelWorkspace(workspaceId);
+			sharedPiModelCapacityGate.cancelWorkspace(workspaceId);
 		});
 		runtimeStateHub?.trackTerminalManager(workspaceId, manager);
 	};

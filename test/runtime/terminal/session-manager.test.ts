@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { RuntimeTaskSessionSummary } from "../../../src/core/api-contract";
 import { buildShellCommandLine } from "../../../src/core/shell";
+import { MODEL_CAPACITY_WAIT_HOOK_EVENT_NAME } from "../../../src/core/task-display-state";
 import { isDetachedPiRestoreCandidate } from "../../../src/terminal/pi-session-restore";
 import { TerminalSessionManager } from "../../../src/terminal/session-manager";
 import type { HookReviewReason } from "../../../src/terminal/session-state-machine";
@@ -177,6 +178,45 @@ describe("TerminalSessionManager", () => {
 		expect(failed?.latestHookActivity).toBeNull();
 		expect(canceled?.latestHookActivity).toBeNull();
 		expect(manager.settleModelCapacityWait("missing-task", null)).toBeNull();
+	});
+
+	it("marks a live session waiting for model capacity without ending its turn", () => {
+		const manager = new TerminalSessionManager();
+		manager.hydrateFromRecord({ "task-1": createSummary({ agentId: "pi", state: "running", pid: 4242 }) });
+		const emitted: RuntimeTaskSessionSummary[] = [];
+		manager.onSummary((summary) => {
+			emitted.push(summary);
+		});
+
+		const waiting = manager.markTurnCapacityWait({ taskId: "task-1", queuePosition: 2 });
+
+		// A follow-up waits on a real running session, unlike a queued initial start
+		// that has no process yet: state and pid have to survive the annotation or
+		// the card would read as ended while its CLI is still there.
+		expect(waiting.state).toBe("running");
+		expect(waiting.pid).toBe(4242);
+		expect(waiting.latestHookActivity?.hookEventName).toBe(MODEL_CAPACITY_WAIT_HOOK_EVENT_NAME);
+		expect(waiting.latestHookActivity?.queuePosition).toBe(2);
+		expect(waiting.warningMessage).toContain("Waiting");
+		expect(emitted).toHaveLength(1);
+
+		// Once Pi's own turn hook lands the marker is gone, and a late clear from
+		// the capacity gate must never erase the activity that replaced it - only
+		// the warning the wait itself wrote.
+		// Pi derives its own activity text from the hook event, so this is what a
+		// real Pi tool hook leaves behind a few milliseconds after the write.
+		manager.applyHookActivity("task-1", { source: "pi", hookEventName: "tool_execution_end", toolName: "Read" });
+		const resumed = manager.clearTurnCapacityWait("task-1");
+		expect(resumed?.latestHookActivity?.hookEventName).toBe("tool_execution_end");
+		expect(resumed?.latestHookActivity?.toolName).toBe("Read");
+		expect(resumed?.warningMessage).toBeNull();
+
+		// A canceled or failed wait clears only its own marker and reports why.
+		manager.markTurnCapacityWait({ taskId: "task-1", queuePosition: 1 });
+		const failed = manager.clearTurnCapacityWait("task-1", "Task session is not running.");
+		expect(failed?.latestHookActivity).toBeNull();
+		expect(failed?.warningMessage).toBe("Task session is not running.");
+		expect(manager.clearTurnCapacityWait("missing-task")).toBeNull();
 	});
 
 	it("keeps a hydrated Pi record restorable when the terminal attaches first", () => {

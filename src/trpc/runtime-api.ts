@@ -122,7 +122,7 @@ import {
 	type TaskDispatchDeps,
 } from "../task-dispatch/task-dispatch-service";
 import { buildRuntimeConfigResponse, describeUnrunnableAgent, resolveAgentCommand } from "../terminal/agent-registry";
-import { sharedPiInitialTurnCapacityGate } from "../terminal/pi-initial-turn-capacity";
+import { type PiModelCapacityGate, sharedPiModelCapacityGate } from "../terminal/pi-model-capacity";
 import { derivePiSessionId, getPiTaskSessionDir, readPiSessionRecord } from "../terminal/pi-session-options";
 import { collectRestorablePiCardIds, isDetachedPiRestoreCandidate } from "../terminal/pi-session-restore";
 import { resolvePiTurnTarget } from "../terminal/pi-turn-target";
@@ -157,6 +157,12 @@ export interface CreateRuntimeApiDependencies {
 	loadScopedRuntimeConfig: (scope: RuntimeTrpcWorkspaceScope) => Promise<RuntimeConfigState>;
 	setActiveRuntimeConfig: (config: RuntimeConfigState) => void;
 	getScopedTerminalManager: (scope: RuntimeTrpcWorkspaceScope) => Promise<TerminalSessionManager>;
+	/**
+	 * The per-model capacity queue every Pi coding turn joins: the initial prompt
+	 * and each later input Kanban submits. Defaults to the process-wide gate; a
+	 * caller with its own queue (or a test with fixed capacity) injects one.
+	 */
+	piCapacityGate?: PiModelCapacityGate;
 	getScopedClineTaskSessionService: (scope: RuntimeTrpcWorkspaceScope) => Promise<ClineTaskSessionService>;
 	/** B-6: the per-workspace bounded review session service (its own Cline session instance). */
 	getScopedReviewSessionService?: (scope: RuntimeTrpcWorkspaceScope) => Promise<ClineReviewSessionService>;
@@ -412,6 +418,7 @@ async function collectQualitySummaryJobEvents(taskId: string): Promise<{
 const restoringDetachedSessions = new Map<string, Promise<RuntimeTaskSessionStartResponse>>();
 
 export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrpcContext["runtimeApi"] {
+	const piCapacityGate = deps.piCapacityGate ?? sharedPiModelCapacityGate;
 	const clineProviderService = createClineProviderService();
 	const clineMcpSettingsService = createClineMcpSettingsService();
 	const clineMcpRuntimeService = createClineMcpRuntimeService({
@@ -1086,21 +1093,23 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					return summary;
 				}
 			};
-			// Initial Pi coding turns share the same model-capacity pool as Cline.
-			// The start request itself never waits for admission: a queued Pi start
-			// returns the manager's waiting record now and its CLI spawns in the
-			// background once the model frees a slot. Task dispatch awaits this call
-			// while it holds the per-workspace dispatch lock (documented as brief),
-			// and must not hold it across another task's whole first turn.
-			// Restoring an existing conversation never consumes a new admission, and
-			// Pi's native follow-up turns are not intercepted by this start gate.
+			// Pi coding turns share the same model-capacity pool as Cline. The start
+			// request itself never waits for admission: a queued Pi start returns the
+			// manager's waiting record now and its CLI spawns in the background once
+			// the model frees a slot. Task dispatch awaits this call while it holds the
+			// per-workspace dispatch lock (documented as brief), and must not hold it
+			// across another task's whole first turn.
+			// Restoring an existing conversation never consumes a new admission; the
+			// follow-up input that turn eventually receives is gated by
+			// `sendTaskSessionInput` instead.
 			if (
 				resolved.agentId === "pi" &&
 				!body.restoreDetachedSession &&
 				body.prompt.trim().length > 0 &&
 				!terminalManager.hasActiveProcess(body.taskId)
 			) {
-				const admission = await sharedPiInitialTurnCapacityGate.request({
+				const admission = await piCapacityGate.request({
+					kind: "start",
 					workspaceId: workspaceScope.workspaceId,
 					taskId: body.taskId,
 					workspacePath: taskCwd,
@@ -1108,7 +1117,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					target: await resolvePiTurnTarget(resolved.args),
 					// A queued start spawns later from inside the gate, and captures
 					// its turn checkpoint when the CLI actually starts.
-					launch: async () => await captureTurnCheckpoint(await launchTerminal()),
+					run: async () => await captureTurnCheckpoint(await launchTerminal()),
 					isCurrent: isLaunchCurrent,
 				});
 				// A launched admission returns the checkpointed launch summary; a
@@ -1233,7 +1242,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					// AA-P2: a Pi start queued for a model slot has no process yet, but
 					// the card still owns the worker slot the pass gave it. The queue
 					// answers for its own waits, so nothing stale can hold a slot.
-					capacityWait: (taskId) => sharedPiInitialTurnCapacityGate.hasPending(workspaceScope.workspaceId, taskId),
+					capacityWait: (taskId) => piCapacityGate.hasPending(workspaceScope.workspaceId, taskId),
 				});
 			},
 			readReceipt: (taskId) => readTaskDeliveryReceipt(taskId),
@@ -2305,7 +2314,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		stopTaskSession: async (workspaceScope, input) => {
 			try {
 				const body = parseTaskSessionStopRequest(input);
-				const canceledPiAdmission = sharedPiInitialTurnCapacityGate.cancel(workspaceScope.workspaceId, body.taskId);
+				const canceledPiAdmission = piCapacityGate.cancel(workspaceScope.workspaceId, body.taskId);
 				const clineTaskSessionService = await deps.getScopedClineTaskSessionService(workspaceScope);
 				const clineSummary = await clineTaskSessionService.stopTaskSession(body.taskId);
 				if (clineSummary) {
@@ -2347,6 +2356,46 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 					};
 				}
 				const terminalManager = await deps.getScopedTerminalManager(workspaceScope);
+				const liveSummary = terminalManager.getSummary(body.taskId);
+				// A Pi turn Kanban is asked to submit goes through the same model
+				// capacity queue as the initial prompt and as every Cline turn. Capping
+				// only the first turn let a card that had already settled keep working
+				// outside the budget, so a limit of 2 was observed running three agents
+				// at once. With no slot free the input is annotated as waiting on the
+				// card and written in the background when capacity frees.
+				//
+				// Only input that actually starts a turn may hold a slot, and that has to
+				// be decided by the bytes going to Pi rather than by the request fields:
+				// text ending in a newline is a submit - the composer's Enter, or the lone
+				// `"\r"` the web UI sends after pasting review comments or a git-action
+				// prompt - while a paste with no Enter is only typed text. Gating a paste
+				// would reserve a slot for a turn that may never start
+				// (`handleAddReviewComments` never sends an Enter at all); leaving the lone
+				// Enter ungated would let the submission that follows it run a third
+				// concurrent turn with no reservation.
+				const submitsTurn = /[\r\n]$/.test(payloadText);
+				if (liveSummary?.agentId === "pi" && submitsTurn && terminalManager.hasActiveProcess(body.taskId)) {
+					const admission = await piCapacityGate.request({
+						kind: "turn",
+						workspaceId: workspaceScope.workspaceId,
+						taskId: body.taskId,
+						manager: terminalManager,
+						// Pi resolves its own endpoint and model, so the follow-up joins the
+						// same pool the start used (both read Pi's own settings).
+						target: await resolvePiTurnTarget(),
+						run: async () => {
+							const written = terminalManager.writeInput(body.taskId, Buffer.from(payloadText, "utf8"));
+							if (!written) {
+								throw new Error("Task session is not running.");
+							}
+							return written;
+						},
+					});
+					return {
+						ok: true,
+						summary: admission.summary,
+					};
+				}
 				const summary = terminalManager.writeInput(body.taskId, Buffer.from(payloadText, "utf8"));
 				if (!summary) {
 					return {
