@@ -173,7 +173,11 @@ function resolveTsxLoaderImportSpecifier(): string {
 	return pathToFileURL(requireFromHere.resolve("tsx")).href;
 }
 
-async function waitForProcessStart(process: ChildProcess, timeoutMs = 10_000): Promise<{ runtimeUrl: string }> {
+// These suites spawn the real CLI under tsx, and CI runs them with one vitest
+// worker per core, so a cold start that takes ~2s idle can take most of 10s on a
+// saturated runner. Waiting generously only delays a genuinely stuck start; a
+// tight budget fails the suite for a reason the product never had a chance to fail.
+async function waitForProcessStart(process: ChildProcess, timeoutMs = 20_000): Promise<{ runtimeUrl: string }> {
 	return await new Promise((resolveStart, rejectStart) => {
 		if (!process.stdout || !process.stderr) {
 			rejectStart(new Error("Expected child process stdout/stderr pipes to be available."));

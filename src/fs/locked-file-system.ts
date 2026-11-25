@@ -93,6 +93,24 @@ export class LockedFileSystem {
 		return await this.withLocks([request], operation);
 	}
 
+	/**
+	 * proper-lockfile only ever reports "Lock file is already being held", and a
+	 * failed startup prints that as its single line of output — with several
+	 * distinct locks under the runtime home there is no way to tell which one
+	 * stalled. Name the lock while keeping the original error (and its `ELOCKED`
+	 * code) so callers that branch on the code keep working.
+	 */
+	private async acquireLock(request: NormalizedLockRequest): Promise<() => Promise<void>> {
+		try {
+			return await lockfile.lock(request.path, request.options);
+		} catch (error) {
+			if (error instanceof Error && !error.message.includes(request.sortKey)) {
+				error.message = `${error.message} (lock: ${request.sortKey})`;
+			}
+			throw error;
+		}
+	}
+
 	async withLocks<T>(requests: readonly LockRequest[], operation: () => Promise<T>): Promise<T> {
 		const normalizedRequests = await Promise.all(
 			requests.map(async (request) => await this.normalizeLockRequest(request)),
@@ -103,7 +121,7 @@ export class LockedFileSystem {
 		const releases: Array<() => Promise<void>> = [];
 		try {
 			for (const request of orderedRequests) {
-				releases.push(await lockfile.lock(request.path, request.options));
+				releases.push(await this.acquireLock(request));
 			}
 			return await operation();
 		} finally {
