@@ -323,6 +323,14 @@ export class PiModelCapacityGate {
 				input.onNotRun?.(reason);
 			}
 		};
+		/**
+		 * Whether any input on this claim was answered `queued`. That answer is what
+		 * writes the manager's waiting annotation on the card, and it can happen
+		 * without the claim itself ever being reported queued: capacity may free
+		 * while the queue is still resolving, leaving the annotation for this claim
+		 * to clear.
+		 */
+		const anyInputAnsweredQueued = (): boolean => record.inputs.some((input) => input.answeredQueued);
 
 		/** Publishes the wait once the queue reports it, and only to the caller. */
 		const reportQueued = (queuePosition: number | null): void => {
@@ -342,19 +350,24 @@ export class PiModelCapacityGate {
 			});
 		};
 		/**
-		 * Routes the outcome of a turn that stopped progressing. While the creating
-		 * caller still knows nothing the failure is its own; after a queued report it
-		 * holds a waiting record, so annotating that record and reporting the
-		 * abandoned input are the only ways the outcome can be seen.
+		 * Routes the outcome of a turn that stopped progressing. A caller still
+		 * awaiting the admission learns it by rejection; one that already holds a
+		 * waiting answer learns it through `onNotRun` and through the card's
+		 * waiting annotation, which has to be ended whether the claim was ever
+		 * reported queued or only an appended input was answered that way.
 		 */
 		const handleFailure = (error: unknown): void => {
+			// The operation's catch and the claim's rejection both route here, and the
+			// waiting annotation must be ended once: a second clear would overwrite
+			// whatever the first wrote.
+			if (record.reported === "ended") return;
 			const ownerReason = describeAbandonment(error, record.canceled);
 			const cardError = describeCardFailure(error, record.canceled);
-			if (record.reported === "queued") {
+			if (record.reported === "queued" || anyInputAnsweredQueued()) {
 				this.endWaiting(request, cardError);
-				abandon(ownerReason);
-			} else if (record.reported === null) {
-				abandon(ownerReason);
+			}
+			abandon(ownerReason);
+			if (record.reported === null) {
 				reject(error);
 			}
 			record.reported = "ended";
@@ -414,7 +427,6 @@ export class PiModelCapacityGate {
 							// returned to Backlog; that CLI must never spawn.
 							throw new ObsoletePiTurnError("Task was returned to Backlog during launch.");
 						}
-						const wasQueued = record.reported === "queued";
 						// A queued follow-up waits on a live session that keeps running;
 						// a queued start has no process, so its launch summary replaces
 						// the waiting record instead.
@@ -453,9 +465,13 @@ export class PiModelCapacityGate {
 							record.reported = "launched";
 							settle({ status: "launched", summary });
 						}
-						if (wasQueued && waitsOnLiveSession) {
-							// The live session is working now, so its waiting annotation
-							// has to go before Pi's own turn hooks land.
+						if (waitsOnLiveSession && record.delivered >= record.inputs.length && anyInputAnsweredQueued()) {
+							// The live session is working now, so its waiting annotation has
+							// to go before Pi's own turn hooks land. This is keyed on any input
+							// having been answered `queued` rather than on the claim being
+							// reported queued: capacity can free before the queue answers, and
+							// an annotation written for input that is still waiting is left
+							// alone, because it is still true.
 							request.manager.clearTurnCapacityWait(request.taskId);
 						}
 						if (signal.aborted) {

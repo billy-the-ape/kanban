@@ -441,6 +441,58 @@ describe("PiModelCapacityGate", () => {
 		expect(notRun).toHaveBeenCalledExactlyOnceWith("The turn was canceled before the model had capacity.");
 	});
 
+	it("clears a waiting marker written while capacity was still resolving", async () => {
+		const scheduler = new ClineTurnScheduler(async () => 1);
+		const gate = new PiModelCapacityGate(scheduler);
+		const fake = fakeManager();
+		const first = vi.fn(async () => summary("a"));
+		const second = vi.fn(async () => summary("a"));
+
+		// The second send arrives while the claim is still resolving capacity, so it
+		// is answered `queued` - which writes the card's waiting marker - even
+		// though the queue never has to wait for either input.
+		const pending = gate.request(turnInput(fake, "a", first));
+		const appended = await gate.request(turnInput(fake, "a", second));
+		expect(appended.status).toBe("queued");
+		expect(fake.turnMarks).toHaveLength(1);
+
+		await pending;
+		await tick();
+		await tick();
+
+		expect(first).toHaveBeenCalledOnce();
+		expect(second).toHaveBeenCalledOnce();
+		// Nothing waits any more, so the card must not keep "Waiting for a free
+		// model slot" for the rest of the session, nor be read as paused.
+		expect(fake.turnClears).toEqual([{ taskId: "a", error: null }]);
+	});
+
+	it("ends the waiting marker when queued-answered input fails before the claim waited", async () => {
+		const scheduler = new ClineTurnScheduler(async () => 1);
+		const gate = new PiModelCapacityGate(scheduler);
+		const fake = fakeManager();
+		const failure = new Error("Pi's terminal process disappeared before the repair was submitted.");
+		const notRun = vi.fn();
+
+		const pending = gate.request(
+			turnInput(fake, "a", async () => {
+				throw failure;
+			}),
+		);
+		const appended = await gate.request({ ...turnInput(fake, "a", async () => summary("a")), onNotRun: notRun });
+		expect(appended.status).toBe("queued");
+
+		await expect(pending).rejects.toThrow(failure.message);
+		await tick();
+		await tick();
+
+		// The claim failed without ever being reported queued, but the appended
+		// input's caller was answered `queued`, so its annotation has to end with
+		// the reason instead of staying on the live card.
+		expect(fake.turnClears).toEqual([{ taskId: "a", error: failure.message }]);
+		expect(notRun).toHaveBeenCalledExactlyOnceWith(failure.message);
+	});
+
 	it("answers a failing turn that was never queued by rejection alone", async () => {
 		const scheduler = new ClineTurnScheduler(async () => 1);
 		const gate = new PiModelCapacityGate(scheduler);
