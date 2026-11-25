@@ -230,6 +230,29 @@ describe("sendPreparedPiRepair", () => {
 		expect(settled).toHaveBeenCalledWith({ status: "completed" });
 	});
 
+	it("waits for a model slot before pasting an automated repair", async () => {
+		const pi = createPiManager();
+		const { prepare } = createPreparation("Fix review feedback.");
+		const waits: Array<() => Promise<unknown>> = [];
+		const result = await sendPreparedPiRepair({
+			manager: pi.manager,
+			taskId: "pi-task",
+			prepare,
+			restoreSavedSession: async () => ({ ok: true }),
+			capacity: async ({ run }) => {
+				waits.push(run);
+			},
+		});
+		// The prompt was built, but both model slots were busy, so the automated
+		// repair waits behind the same budget as a human turn instead of silently
+		// adding a third concurrent request to the model.
+		expect(result.ok).toBe(true);
+		expect(pi.writes).toEqual([]);
+		expect(waits).toHaveLength(1);
+		await waits[0]?.();
+		expect(pi.writes).toEqual(["\x1b[200~Fix review feedback.\x1b[201~", "\r"]);
+	});
+
 	it("fails the receipt if Pi ends with a hook error", async () => {
 		const pi = createPiManager();
 		const { prepare, settled } = createPreparation();

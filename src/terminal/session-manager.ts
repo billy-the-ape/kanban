@@ -868,7 +868,7 @@ export class TerminalSessionManager implements TerminalSessionService {
 	 * must never look like a Pi conversation the guarded restore may reattach.
 	 * The shared capacity-wait marker is what makes the record self-describing;
 	 * dispatch counts the card's worker slot from the queue's own pending ids
-	 * (see `PiInitialTurnCapacityGate.hasPending`), not from this record, so a
+	 * (see `PiModelCapacityGate.hasPending`), not from this record, so a
 	 * stale record left by a restart cannot hold a slot forever. The real launch
 	 * summary replaces it as soon as a slot frees.
 	 */
@@ -928,6 +928,61 @@ export class TerminalSessionManager implements TerminalSessionService {
 				? { state: "failed", reviewReason: "error", warningMessage: error, latestHookActivity: null }
 				: { state: "idle", reviewReason: null, warningMessage: null, latestHookActivity: null },
 		);
+		this.emitSummary(summary);
+		return cloneSummary(summary);
+	}
+
+	/**
+	 * AA-P3: a Pi *follow-up* turn that has to wait for a model slot is different
+	 * from a queued initial start: its session is live, so its own summary stays
+	 * valid and only gains the shared capacity-wait marker. State and pid are kept
+	 * on purpose - the process is real, and `isDetachedPiRestoreCandidate` must
+	 * keep reading the record as a live session rather than a lost process.
+	 */
+	markTurnCapacityWait(input: {
+		taskId: string;
+		/** The capacity queue's position for this turn, when the queue knows it. */
+		queuePosition?: number | null;
+	}): RuntimeTaskSessionSummary {
+		const entry = this.ensureEntry(input.taskId);
+		const summary = updateSummary(entry, {
+			latestHookActivity: {
+				// Answering a waiting turn is Stop, not returning the card to Backlog.
+				canReturnToBacklog: false,
+				queuePosition: typeof input.queuePosition === "number" ? input.queuePosition : null,
+				activityText: MODEL_CAPACITY_WAIT_ACTIVITY_TEXT,
+				toolName: null,
+				toolInputSummary: null,
+				finalMessage: null,
+				hookEventName: MODEL_CAPACITY_WAIT_HOOK_EVENT_NAME,
+				notificationType: null,
+				source: "kanban",
+			},
+			warningMessage: MODEL_CAPACITY_WAIT_MESSAGE,
+		});
+		this.emitSummary(summary);
+		return cloneSummary(summary);
+	}
+
+	/**
+	 * Removes a turn's capacity-wait annotation once its input is written (or the
+	 * wait was canceled/failed). Pi's own turn hooks land in milliseconds and may
+	 * already have replaced the marker, so only the parts of the record the wait
+	 * owns are cleared: its marker, when still present, and its warning.
+	 */
+	clearTurnCapacityWait(taskId: string, error: string | null = null): RuntimeTaskSessionSummary | null {
+		const entry = this.entries.get(taskId);
+		if (!entry) {
+			return null;
+		}
+		const hasMarker = entry.summary.latestHookActivity?.hookEventName === MODEL_CAPACITY_WAIT_HOOK_EVENT_NAME;
+		if (!hasMarker && entry.summary.warningMessage !== MODEL_CAPACITY_WAIT_MESSAGE) {
+			return cloneSummary(entry.summary);
+		}
+		const summary = updateSummary(entry, {
+			...(hasMarker ? { latestHookActivity: null } : {}),
+			warningMessage: error,
+		});
 		this.emitSummary(summary);
 		return cloneSummary(summary);
 	}

@@ -1,12 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { ClineTurnScheduler } from "../../../src/cline-sdk/cline-turn-scheduler";
 import type { RuntimeTaskSessionSummary } from "../../../src/core/api-contract";
-import { PiInitialTurnCapacityGate, type PiStartRequest } from "../../../src/terminal/pi-initial-turn-capacity";
+import { PiModelCapacityGate, type PiTurnRequest } from "../../../src/terminal/pi-model-capacity";
 import { TerminalSessionManager } from "../../../src/terminal/session-manager";
 
 const target = { providerId: "pi", modelId: "qwen", baseUrl: "http://localhost:8080/v1" };
 
-type Admission = Awaited<ReturnType<PiInitialTurnCapacityGate["request"]>>;
+type Admission = Awaited<ReturnType<PiModelCapacityGate["request"]>>;
 
 function summary(taskId: string, change: Partial<RuntimeTaskSessionSummary> = {}): RuntimeTaskSessionSummary {
 	return {
@@ -30,6 +30,8 @@ function fakeManager() {
 	const listeners = new Set<(value: RuntimeTaskSessionSummary) => void>();
 	const waits: Array<{ taskId: string; queuePosition: number | null }> = [];
 	const settles: Array<{ taskId: string; error: string | null }> = [];
+	const turnMarks: Array<{ taskId: string; queuePosition: number | null }> = [];
+	const turnClears: Array<{ taskId: string; error: string | null }> = [];
 	const stops: string[] = [];
 	const manager = {
 		onSummary: (listener: (value: RuntimeTaskSessionSummary) => void) => {
@@ -46,6 +48,15 @@ function fakeManager() {
 			settles.push({ taskId, error });
 			return summary(taskId, { state: error === null ? "idle" : "failed" });
 		},
+		markTurnCapacityWait: (input: { taskId: string; queuePosition?: number | null }) => {
+			turnMarks.push({ taskId: input.taskId, queuePosition: input.queuePosition ?? null });
+			// A live session keeps running and just gains the capacity-wait marker.
+			return summary(input.taskId, { warningMessage: "Waiting for model capacity" });
+		},
+		clearTurnCapacityWait: (taskId: string, error: string | null = null) => {
+			turnClears.push({ taskId, error });
+			return summary(taskId, { warningMessage: null });
+		},
 		stopTaskSession: (taskId: string) => {
 			stops.push(taskId);
 			return summary(taskId, { state: "idle", pid: null });
@@ -59,6 +70,8 @@ function fakeManager() {
 		listenerCount: () => listeners.size,
 		waits,
 		settles,
+		turnMarks,
+		turnClears,
 		stops,
 	};
 }
@@ -68,15 +81,32 @@ function startInput(
 	taskId: string,
 	launch: () => Promise<RuntimeTaskSessionSummary>,
 	isCurrent?: () => boolean,
-): PiStartRequest {
+): PiTurnRequest {
 	return {
+		kind: "start",
 		workspaceId: "workspace",
 		taskId,
 		workspacePath: "/tmp/task",
 		manager: fake.manager,
 		target,
-		launch,
+		run: launch,
 		...(isCurrent ? { isCurrent } : {}),
+	};
+}
+
+/** A follow-up Kanban submits to a task whose Pi session is already live. */
+function turnInput(
+	fake: ReturnType<typeof fakeManager>,
+	taskId: string,
+	write: () => Promise<RuntimeTaskSessionSummary>,
+): PiTurnRequest {
+	return {
+		kind: "turn",
+		workspaceId: "workspace",
+		taskId,
+		manager: fake.manager,
+		target,
+		run: write,
 	};
 }
 
@@ -116,10 +146,10 @@ async function tick(): Promise<void> {
 	for (let i = 0; i < 24; i += 1) await Promise.resolve();
 }
 
-describe("PiInitialTurnCapacityGate", () => {
+describe("PiModelCapacityGate", () => {
 	it("launches immediately when a slot is free and holds it until the task settles, not until its PTY exits", async () => {
 		const scheduler = new ClineTurnScheduler(async () => 1);
-		const gate = new PiInitialTurnCapacityGate(scheduler);
+		const gate = new PiModelCapacityGate(scheduler);
 		const fake = fakeManager();
 		const firstLaunch = vi.fn(async () => summary("a"));
 		const launched = await gate.request(startInput(fake, "a", firstLaunch));
@@ -146,7 +176,7 @@ describe("PiInitialTurnCapacityGate", () => {
 	});
 
 	it("admits as many initial turns as the configured capacity allows", async () => {
-		const gate = new PiInitialTurnCapacityGate(new ClineTurnScheduler(async () => 3));
+		const gate = new PiModelCapacityGate(new ClineTurnScheduler(async () => 3));
 		const fake = fakeManager();
 		const launches = ["a", "b", "c"].map((taskId) => vi.fn(async () => summary(taskId)));
 		const started = launches.map((launch, index) => gate.request(startInput(fake, String(index), launch)));
@@ -161,7 +191,7 @@ describe("PiInitialTurnCapacityGate", () => {
 	});
 
 	it("settles the waiting record as canceled when Stop cancels a queued start", async () => {
-		const gate = new PiInitialTurnCapacityGate(new ClineTurnScheduler(async () => 1));
+		const gate = new PiModelCapacityGate(new ClineTurnScheduler(async () => 1));
 		const fake = fakeManager();
 		await gate.request(startInput(fake, "a", async () => summary("a")));
 		const launch = vi.fn(async () => summary("b"));
@@ -179,7 +209,7 @@ describe("PiInitialTurnCapacityGate", () => {
 	});
 
 	it("reports a queued launch failure on the waiting record instead of losing it", async () => {
-		const gate = new PiInitialTurnCapacityGate(new ClineTurnScheduler(async () => 1));
+		const gate = new PiModelCapacityGate(new ClineTurnScheduler(async () => 1));
 		const fake = fakeManager();
 		await gate.request(startInput(fake, "a", async () => summary("a")));
 		const failure = new Error('Failed to launch "pi". Command not found.');
@@ -198,7 +228,7 @@ describe("PiInitialTurnCapacityGate", () => {
 	});
 
 	it("stops a process spawned when Stop landed mid-spawn", async () => {
-		const gate = new PiInitialTurnCapacityGate(new ClineTurnScheduler(async () => 2));
+		const gate = new PiModelCapacityGate(new ClineTurnScheduler(async () => 2));
 		const fake = fakeManager();
 		let resolveLaunch!: (value: RuntimeTaskSessionSummary) => void;
 		const request = gate.request(
@@ -222,7 +252,7 @@ describe("PiInitialTurnCapacityGate", () => {
 	});
 
 	it("deduplicates concurrent requests to start the same task", async () => {
-		const gate = new PiInitialTurnCapacityGate(new ClineTurnScheduler(async () => 1));
+		const gate = new PiModelCapacityGate(new ClineTurnScheduler(async () => 1));
 		const fake = fakeManager();
 		const launch = vi.fn(async () => summary("a"));
 		const [first, second] = await Promise.all([
@@ -236,7 +266,7 @@ describe("PiInitialTurnCapacityGate", () => {
 	});
 
 	it("never launches a queued CLI whose card moved on", async () => {
-		const gate = new PiInitialTurnCapacityGate(new ClineTurnScheduler(async () => 1));
+		const gate = new PiModelCapacityGate(new ClineTurnScheduler(async () => 1));
 		const fake = fakeManager();
 		await gate.request(startInput(fake, "a", async () => summary("a")));
 		const launch = vi.fn(async () => summary("b"));
@@ -255,7 +285,7 @@ describe("PiInitialTurnCapacityGate", () => {
 		// Task dispatch must not read the wait off the card's summary — a record
 		// left behind by a restart would hold a worker slot forever — so the queue
 		// itself says which cards it still owes a CLI to.
-		const gate = new PiInitialTurnCapacityGate(new ClineTurnScheduler(async () => 1));
+		const gate = new PiModelCapacityGate(new ClineTurnScheduler(async () => 1));
 		const fake = fakeManager();
 		expect(gate.hasPending("workspace", "a")).toBe(false);
 		await gate.request(startInput(fake, "a", async () => summary("a")));
@@ -277,7 +307,7 @@ describe("PiInitialTurnCapacityGate", () => {
 		// slot that shutdown, project removal or workspace disposal just freed would
 		// admit a fresh CLI against a manager that is being torn down.
 		const scheduler = new ClineTurnScheduler(async () => 1);
-		const gate = new PiInitialTurnCapacityGate(scheduler);
+		const gate = new PiModelCapacityGate(scheduler);
 		const fake = fakeManager();
 		await gate.request(startInput(fake, "a", async () => summary("a")));
 		const droppedLaunch = vi.fn(async () => summary("b"));
@@ -309,18 +339,19 @@ describe("PiInitialTurnCapacityGate", () => {
 		// tracked manager, so the record left behind is the manager's own: the card
 		// must read as an idle card that stopped, not as a failed one.
 		const scheduler = new ClineTurnScheduler(async () => 1);
-		const gate = new PiInitialTurnCapacityGate(scheduler);
+		const gate = new PiModelCapacityGate(scheduler);
 		const manager = new TerminalSessionManager();
 		manager.setOnBulkStop(() => {
 			gate.cancelWorkspace("workspace");
 		});
-		const request = (taskId: string, launch: () => Promise<RuntimeTaskSessionSummary>): PiStartRequest => ({
+		const request = (taskId: string, launch: () => Promise<RuntimeTaskSessionSummary>): PiTurnRequest => ({
+			kind: "start",
 			workspaceId: "workspace",
 			taskId,
 			workspacePath: "/tmp/task",
 			manager,
 			target,
-			launch,
+			run: launch,
 		});
 		const queuedLaunch = vi.fn(async () => summary("b"));
 		await gate.request(request("a", async () => summary("a")));
@@ -338,5 +369,68 @@ describe("PiInitialTurnCapacityGate", () => {
 		expect(dropped?.state).toBe("idle");
 		expect(dropped?.warningMessage).toBeNull();
 		expect(dropped?.latestHookActivity).toBeNull();
+	});
+
+	it("queues a follow-up input while every slot is busy and writes it once a turn ahead settles", async () => {
+		const scheduler = new ClineTurnScheduler(async () => 2);
+		const gate = new PiModelCapacityGate(scheduler);
+		const fake = fakeManager();
+		// Two cards already hold both slots of this model.
+		await gate.request(startInput(fake, "a", async () => summary("a")));
+		await gate.request(startInput(fake, "b", async () => summary("b")));
+
+		const write = vi.fn(async () => summary("c"));
+		const queued = await gate.request(turnInput(fake, "c", write));
+
+		// The bug this closes: a settled card's follow-up used to bypass the queue,
+		// so a limit of 2 ran three agents at once.
+		expect(expectQueued(queued)).toBe(1);
+		expect(write).not.toHaveBeenCalled();
+		expect(fake.turnMarks).toEqual([{ taskId: "c", queuePosition: 1 }]);
+		// A live session keeps running and is annotated, never replaced by an idle
+		// process-less waiting record.
+		expect(fake.waits).toEqual([]);
+
+		fake.emit(settled("a"));
+		await tick();
+		await tick();
+		expect(write).toHaveBeenCalledOnce();
+		// The waiting marker is gone as soon as the input is written.
+		expect(fake.turnClears).toEqual([{ taskId: "c", error: null }]);
+		expect(fake.turnMarks).toHaveLength(1);
+	});
+
+	it("writes straight to a session that already holds the card's slot", async () => {
+		const scheduler = new ClineTurnScheduler(async () => 1);
+		const gate = new PiModelCapacityGate(scheduler);
+		const fake = fakeManager();
+		expect((await gate.request(turnInput(fake, "a", async () => summary("a")))).status).toBe("launched");
+
+		const second = vi.fn(async () => summary("a"));
+		const admission = await gate.request(turnInput(fake, "a", second));
+
+		// The card's in-flight turn already reserves its slot, so a second input to
+		// the same session can never claim a second one and deadlock behind itself.
+		expect(expectLaunched(admission).taskId).toBe("a");
+		expect(second).toHaveBeenCalledOnce();
+		expect(fake.turnMarks).toEqual([]);
+	});
+
+	it("never writes a queued follow-up that Stop canceled", async () => {
+		const scheduler = new ClineTurnScheduler(async () => 1);
+		const gate = new PiModelCapacityGate(scheduler);
+		const fake = fakeManager();
+		await gate.request(startInput(fake, "a", async () => summary("a")));
+		const write = vi.fn(async () => summary("b"));
+		await gate.request(turnInput(fake, "b", write));
+
+		expect(gate.cancel("workspace", "b")).toBe(true);
+		await tick();
+		fake.emit(settled("a"));
+		await tick();
+		await tick();
+
+		expect(write).not.toHaveBeenCalled();
+		expect(fake.turnClears).toEqual([{ taskId: "b", error: null }]);
 	});
 });

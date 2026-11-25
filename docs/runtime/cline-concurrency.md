@@ -6,14 +6,18 @@ use the same budget. A live but idle Cline session holds no capacity. A
 Cline turn reserves a slot through SDK startup, generation, tool execution,
 and compaction, and releases it when the SDK turn resolves or fails.
 
-**Initial Pi coding turns** now use the same queue, holding capacity until a
-Pi `agent_settled` hook or process exit. A Pi turn can run shell commands and
+**Every Pi coding turn Kanban starts** now uses the same queue — the initial
+prompt and any later input Kanban submits (task chat, and the automated PR
+feedback handoff) — holding capacity until a Pi `agent_settled` hook or process
+exit. A Pi turn can run shell commands and
 sleep while reserving a slot; raising the override allows other agents to
-run during these gaps. A queued initial Pi start never blocks its request: the
-card records a **Waiting for a free model slot** summary and Kanban spawns the
-CLI in the background once a slot frees.
-Interactive Pi follow-up turns, including automated PR comment fixes, do
-not yet pass through this initial-start gate and can exceed its budget.
+run during these gaps. A queued Pi turn never blocks its request: the
+card records a **Waiting for model capacity** summary and Kanban spawns the
+CLI, or writes the follow-up input, in the background once a slot frees.
+A live session that already holds a slot is written to immediately, because its
+in-flight turn already reserves the card's slot.
+Only typing directly into a card's own terminal bypasses this queue, because
+Kanban cannot queue another client's keystrokes.
 This is not a hard inference-provider request limit.
 
 ## Automatic discovery
@@ -53,9 +57,14 @@ itself once capacity frees, so automatic backlog dispatch never holds its brief
 per-workspace dispatch lock across another task's whole turn. The waiting card
 keeps the dispatch worker slot it was given — the capacity queue reports the cards
 it is still waiting for, since a summary left behind by a restart would otherwise
-hold a slot forever — so the worker limit still caps how many cards start. Stop
+hold a slot forever — so the worker limit still caps how many cards start. A
+follow-up to a live Pi session waits the same way: the session keeps running and
+its own summary gains the capacity-wait marker and queue position, and Kanban
+writes the input once a slot frees; a session whose in-flight turn already
+reserves the card's slot is written to immediately. Stop
 cancels a
-queued Pi start and its CLI is never launched; a queued CLI that cannot spawn
+queued Pi turn - its CLI is never launched and a queued follow-up is never
+written; a queued CLI that cannot spawn
 marks the card failed. Bulk-stopping a workspace's sessions — runtime shutdown,
 project removal, workspace disposal — cancels that workspace's queued starts the
 same way, because the stop can only reach processes and the slot it just freed
@@ -105,6 +114,10 @@ curl -fsS 'http://127.0.0.1:8080/props?model=qwen3.8-27b' \
    start fresh turns to return to discovery.
 5. Test a provider without `/props`: tasks serialize and queue without errors.
    A failing turn must release capacity for the next queued task.
+6. With both slots busy on Pi, send a message to a settled Pi task from task
+   chat. The card shows **Waiting for model capacity** with its queue position
+   while the session stays live, and the message reaches Pi by itself once a
+   slot frees. Stop cancels the wait and never writes the input.
 
 Waiting board cards show `q #1`, `q #2`, and so on in place of the phase badge. Positions are FIFO within each endpoint/model pool and update when a waiting turn is canceled or admitted. The normal phase badge returns when the turn starts. A queued Pi start has no queue-position badge, because that badge belongs to a running queued Cline turn: its card shows the waiting summary text instead, and the record carries the same queue position for diagnostics until its CLI spawns.
 

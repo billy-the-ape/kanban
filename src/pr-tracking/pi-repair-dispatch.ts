@@ -31,7 +31,20 @@ export interface PiPreparedRepairInput {
 	prepare: ClineTurnPreparation;
 	/** Only exact-session restoration is allowed; never replay the last prompt. */
 	restoreSavedSession: () => Promise<{ ok: boolean; error?: string }>;
+	/**
+	 * Model-capacity seam for the repair turn. The runtime hands in the shared Pi
+	 * capacity gate so an automated repair waits behind the same per-model budget
+	 * as a human turn instead of silently adding a third concurrent request to
+	 * the model. Omitted only by harnesses that have no capacity queue.
+	 */
+	capacity?: PiRepairTurnCapacity;
 }
+
+type PiRepairTurnCapacity = (input: {
+	taskId: string;
+	manager: TerminalSessionManager;
+	run: () => Promise<RuntimeTaskSessionSummary>;
+}) => Promise<void>;
 
 function isReadyPi(
 	summary: RuntimeTaskSessionSummary | null,
@@ -88,7 +101,7 @@ async function waitForPiStartup(manager: TerminalSessionManager, taskId: string)
  * durable dispatch record and must fail closed on uncertain outcomes.
  */
 export async function sendPreparedPiRepair(input: PiPreparedRepairInput): Promise<RuntimeTaskChatSendResponse> {
-	const { manager, taskId, prepare } = input;
+	const { manager, taskId, prepare, capacity } = input;
 	let summary = manager.getSummary(taskId);
 	let restored = false;
 	if (!manager.hasActiveProcess(taskId)) {
@@ -208,32 +221,59 @@ export async function sendPreparedPiRepair(input: PiPreparedRepairInput): Promis
 				}
 			}
 		});
-		sentAt = Date.now();
-		accepted = true;
-		// Paste as a single multiline prompt (not individual terminal commands).
-		// Strip control characters that could terminate the bracketed-paste frame.
-		const safePrompt = stripTerminalControls(prompt);
-		if (!manager.writeInput(taskId, Buffer.from(`\x1b[200~${safePrompt}\x1b[201~`, "utf8"))) {
-			throw new Error("Pi's terminal process disappeared before the repair was submitted.");
-		}
-		await new Promise<void>((resolve) => setTimeout(resolve, PI_PASTE_SETTLE_MS));
-		if (!manager.hasActiveProcess(taskId) || manager.getSummary(taskId)?.launchAttemptId !== attemptId) {
-			throw new Error("Pi's task process exited before the submitted repair could start.");
-		}
-		if (!manager.writeInput(taskId, Buffer.from("\r", "utf8"))) {
-			throw new Error("Pi did not accept the repair prompt.");
-		}
-		if (!finished) {
-			if (!sawTurnStart) {
-				startTimeout = setTimeout(() => {
-					if (!sawTurnStart) {
-						void settle({ status: "failed", error: "Pi did not start the PR repair turn within 60 seconds." });
-					}
-				}, PI_TURN_START_TIMEOUT_MS);
+		/**
+		 * Pastes the prompt and starts Pi's turn. Runs immediately when a model slot
+		 * is free, or from the capacity gate in the background once one frees, which
+		 * is why both turn timers start here rather than before admission: they must
+		 * only measure a turn Pi actually received.
+		 */
+		const submitRepair = async (): Promise<void> => {
+			sentAt = Date.now();
+			accepted = true;
+			// Paste as a single multiline prompt (not individual terminal commands).
+			// Strip control characters that could terminate the bracketed-paste frame.
+			const safePrompt = stripTerminalControls(prompt);
+			if (!manager.writeInput(taskId, Buffer.from(`\x1b[200~${safePrompt}\x1b[201~`, "utf8"))) {
+				throw new Error("Pi's terminal process disappeared before the repair was submitted.");
 			}
-			completionTimeout = setTimeout(() => {
-				void settle({ status: "failed", error: "Pi PR repair exceeded the one-hour execution timeout." });
-			}, PI_REPAIR_TURN_TIMEOUT_MS);
+			await new Promise<void>((resolve) => setTimeout(resolve, PI_PASTE_SETTLE_MS));
+			if (!manager.hasActiveProcess(taskId) || manager.getSummary(taskId)?.launchAttemptId !== attemptId) {
+				throw new Error("Pi's task process exited before the submitted repair could start.");
+			}
+			if (!manager.writeInput(taskId, Buffer.from("\r", "utf8"))) {
+				throw new Error("Pi did not accept the repair prompt.");
+			}
+			if (!finished) {
+				if (!sawTurnStart) {
+					startTimeout = setTimeout(() => {
+						if (!sawTurnStart) {
+							void settle({ status: "failed", error: "Pi did not start the PR repair turn within 60 seconds." });
+						}
+					}, PI_TURN_START_TIMEOUT_MS);
+				}
+				completionTimeout = setTimeout(() => {
+					void settle({ status: "failed", error: "Pi PR repair exceeded the one-hour execution timeout." });
+				}, PI_REPAIR_TURN_TIMEOUT_MS);
+			}
+		};
+		const reportSubmitted = (): RuntimeTaskSessionSummary => {
+			const submitted = manager.getSummary(taskId);
+			if (!submitted) {
+				throw new Error("Pi's task session disappeared before the repair was submitted.");
+			}
+			return submitted;
+		};
+		if (capacity) {
+			await capacity({
+				taskId,
+				manager,
+				run: async () => {
+					await submitRepair();
+					return reportSubmitted();
+				},
+			});
+		} else {
+			await submitRepair();
 		}
 		return { ok: true, summary: manager.getSummary(taskId), message: null };
 	} catch (error) {
