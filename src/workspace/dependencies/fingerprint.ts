@@ -75,7 +75,7 @@ export function computeInstallFingerprint(options: {
 		`inputs=${digests.map((digest) => `${digest.path}:${digest.sha256}`).join("\n")}`,
 	].join("\n");
 	const fingerprint = createHash("sha256").update(canonical, "utf8").digest("hex");
-	const scope = options.installPath === "." ? "root" : sanitizeKeySegment(options.installPath).replace(/\//g, "-");
+	const scope = options.installPath === "." ? "root" : sanitizeKeySegment(options.installPath);
 	const key = `${scope}__${options.packageManager}__${sanitizeKeySegment(environment)}__${fingerprint.slice(0, 24)}`;
 	return { key, fingerprint, digests };
 }

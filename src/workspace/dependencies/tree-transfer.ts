@@ -8,14 +8,14 @@ import type { DependencyTransferStrategy } from "./types";
  * Directory names never carried into a worktree: they are per-tree build or
  * tooling caches, and restoring them would leak one task's caches into
  * another. They are recreated by the tools that need them.
+ *
+ * Only tool cache directory names belong here, and they are all dot-prefixed:
+ * these names are skipped at *every* depth of `node_modules`, so a plain word
+ * would drop real package content (a `logs/` source directory, for instance,
+ * which some packages ship and require internally) and hand an agent a tree
+ * that fails with MODULE_NOT_FOUND.
  */
-export const VOLATILE_DIRECTORY_NAMES: ReadonlySet<string> = new Set([
-	".cache",
-	".parcel-cache",
-	".turbo",
-	".vite",
-	"logs",
-]);
+export const VOLATILE_DIRECTORY_NAMES: ReadonlySet<string> = new Set([".cache", ".parcel-cache", ".turbo", ".vite"]);
 
 export interface TreeTransferStats {
 	files: number;

@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -65,6 +65,11 @@ async function writeNodeModules(projectRoot: string, marker: string): Promise<vo
 	const cacheDir = join(packageDir, ".cache");
 	await mkdir(cacheDir, { recursive: true });
 	await writeFile(join(cacheDir, "stale.txt"), "stale", "utf8");
+	// A package shipping a directory named like a tool's cache (`@sentry/core`
+	// ships `build/cjs/logs/` and requires it), which must survive the transfer.
+	const shippedDir = join(packageDir, "build", "cjs", "logs");
+	await mkdir(shippedDir, { recursive: true });
+	await writeFile(join(shippedDir, "index.js"), "export const logger = 1;\n", "utf8");
 }
 
 function manifestPair(token: string): Record<string, string> {
@@ -118,6 +123,9 @@ describe("transferTree", () => {
 		expect(shimStat.isFile()).toBe(true);
 		expect((shimStat.mode & 0o111) !== 0).toBe(true);
 		expect(await lstat(join(destination, "dep", ".cache")).catch(() => null)).toBeNull();
+		// Only tool cache names are dropped: a real package directory that happens
+		// to be named `logs` has to arrive or the restored tree cannot be required.
+		expect(await readFile(join(destination, "dep", "build", "cjs", "logs", "index.js"), "utf8")).toContain("logger");
 		if (process.platform !== "win32") {
 			// Two directory entries, one inode: this is why restoring a 1GB tree
 			// costs milliseconds instead of seconds.
@@ -253,6 +261,9 @@ describe("dependency snapshot store", () => {
 			// every restored worktree with a broken CLI shim.
 			expect((await lstat(join(restoredFile ?? "", ".bin", "dep-run"))).isSymbolicLink()).toBe(true);
 		}
+		expect(await readFile(join(restoredFile ?? "", "dep", "build", "cjs", "logs", "index.js"), "utf8")).toContain(
+			"logger",
+		);
 		// No staging directory survives a completed publish.
 		expect(
 			await lstat(join(getDepCacheRootPath(), "entries", "store-roundtrip", "tree")).catch(() => null),
@@ -285,6 +296,48 @@ describe("dependency snapshot store", () => {
 		expect(pruned.removed).toBeGreaterThanOrEqual(1);
 		expect(await readDependencyEntry("prune-a")).toBeNull();
 		expect(await readDependencyEntry("prune-c")).not.toBeNull();
+		// Eviction renames an entry out before deleting it, so nothing is left
+		// behind for a later prune to find.
+		expect(
+			(await readdir(join(getDepCacheRootPath(), "entries"))).filter((name) => name.startsWith(".tmp-")),
+		).toEqual([]);
+	});
+
+	it("publishes one snapshot when two cold starts race on the same key", async () => {
+		const root = makeTempDir("kanban-dep-store-race-");
+		const source = join(root, "checkout");
+		await writeNodeModules(source, "race");
+		const key = "race-roundtrip";
+		const request = {
+			key,
+			...baseMeta,
+			inputs: [{ path: "package.json", sha256: "race-digest" }],
+			outputs: ["node_modules"],
+			source: "install" as const,
+			sourceRoot: source,
+		};
+
+		// Two tasks dispatched against the same cold cache state: the loser takes
+		// the winner's snapshot instead of re-copying over the one being restored.
+		// The distinct clocks make a silent second publish observable, whichever
+		// one wins the lock.
+		const [first, second] = await Promise.all([
+			publishDependencyEntry({ ...request, now: 20_000 }),
+			publishDependencyEntry({ ...request, now: 30_000 }),
+		]);
+		expect(first.ok).toBe(true);
+		expect(second.ok).toBe(true);
+		expect(second.meta?.createdAt).toBe(first.meta?.createdAt);
+		expect([first.meta?.createdAt, second.meta?.createdAt]).toContain(20_000);
+
+		const entry = await readDependencyEntry(key);
+		expect(entry).not.toBeNull();
+		const output = entry?.outputPath("node_modules");
+		expect(await readFile(join(output ?? "", "dep", "index.js"), "utf8")).toContain("race");
+		expect(await readFile(join(output ?? "", "dep", "build", "cjs", "logs", "index.js"), "utf8")).toContain("logger");
+		expect(
+			(await readdir(join(getDepCacheRootPath(), "entries"))).filter((name) => name.startsWith(".tmp-")),
+		).toEqual([]);
 	});
 
 	it("caps how many entries one repository may hold", async () => {

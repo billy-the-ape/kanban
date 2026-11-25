@@ -1,5 +1,5 @@
 import { readdir, readFile, rename, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { z } from "zod";
 import type { LockRequest } from "../../fs/locked-file-system";
 import { lockedFileSystem } from "../../fs/locked-file-system";
@@ -97,6 +97,36 @@ async function pathExists(path: string): Promise<boolean> {
 	return (await stat(path).catch(() => null)) !== null;
 }
 
+/**
+ * Move a directory out of the way atomically before deleting it.
+ *
+ * Deleting an entry in place is not safe while other tasks may be restoring
+ * from it: a transfer that merely *skips* a vanished entry does not throw, so a
+ * half-removed tree could pass the "output exists" gate and be handed to an
+ * agent. A rename is atomic, so a concurrent reader either resolves the whole
+ * entry or gets ENOENT and rolls the partial restore back.
+ */
+async function moveAsideEntry(entriesDir: string, key: string, entryPath: string): Promise<void> {
+	if (!(await pathExists(entryPath))) {
+		return;
+	}
+	// Staging prefix on purpose: an interrupted cleanup then ages out with every
+	// other staging directory instead of needing its own lifecycle.
+	const trashPath = join(
+		entriesDir,
+		`${STAGING_PREFIX}${basename(key)}-replaced-${Math.random().toString(36).slice(2, 8)}`,
+	);
+	try {
+		await rename(entryPath, trashPath);
+	} catch {
+		// Could not move it (already gone, or a filesystem that refuses the
+		// rename); fall back to removing it where it stands.
+		await removeTree(entryPath).catch(() => undefined);
+		return;
+	}
+	await removeTree(trashPath).catch(() => undefined);
+}
+
 async function readMeta(entryPath: string): Promise<DependencyEntryMeta | null> {
 	const raw = await readFile(join(entryPath, META_FILENAME), "utf8").catch(() => null);
 	if (raw === null) {
@@ -171,19 +201,21 @@ export interface PublishDependencyEntryResult {
 /**
  * Publish a snapshot: every output tree is copied into a staging directory
  * first and only then moved into place, so a reader can never observe half a
- * tree. A failure part-way through costs the previous entry (worst case a later
- * task re-installs) but never leaves a half-restorable entry behind.
+ * tree. Publishing an input set that already has a usable entry is a no-op, and
+ * a failed publish only ever removes its own staging directory: a snapshot
+ * another task is restoring from is never deleted because this publish failed.
  */
 export async function publishDependencyEntry(
 	options: PublishDependencyEntryOptions,
 ): Promise<PublishDependencyEntryResult> {
 	const now = options.now ?? Date.now();
 	const entryPath = getDependencyEntryPath(options.key);
-	if (await pathExists(entryPath)) {
-		const existing = await readMeta(entryPath);
-		if (existing !== null) {
-			return { ok: true, meta: existing, error: null };
-		}
+	const entriesDir = dirname(entryPath);
+	// Cheap check first (no lock held); the authoritative one runs inside the
+	// lock below, because two tasks starting cold on the same key are normal.
+	const publishedAlready = await readDependencyEntry(options.key);
+	if (publishedAlready !== null) {
+		return { ok: true, meta: publishedAlready.meta, error: null };
 	}
 	if (options.outputs.length === 0) {
 		return {
@@ -193,6 +225,14 @@ export async function publishDependencyEntry(
 		};
 	}
 	return await lockedFileSystem.withLock(getDependencyEntryLock(options.key), async () => {
+		// Re-check now that the lock is held: the other task's snapshot is the
+		// answer, not something to re-copy over. Without this, concurrent cold
+		// starts of one key each transfer the whole tree and the last one replaces
+		// the entry the first is restoring from.
+		const published = await readDependencyEntry(options.key);
+		if (published !== null) {
+			return { ok: true, meta: published.meta, error: null };
+		}
 		const stagingPath = join(
 			getEntriesDirPath(),
 			`${STAGING_PREFIX}${options.key}-${now.toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
@@ -223,12 +263,13 @@ export async function publishDependencyEntry(
 				});
 			}
 			await writeMeta(stagingPath, meta);
-			await removeTree(entryPath);
+			// Only an unusable entry can still be here (unparseable metadata, or a
+			// tree someone half-deleted): move it aside rather than unlink it.
+			await moveAsideEntry(entriesDir, options.key, entryPath);
 			await rename(stagingPath, entryPath);
 			return { ok: true, meta, error: null };
 		} catch (error) {
 			await removeTree(stagingPath).catch(() => undefined);
-			await removeTree(entryPath).catch(() => undefined);
 			return {
 				ok: false,
 				meta: null,
@@ -273,7 +314,7 @@ export async function pruneDependencyEntries(
 		}
 		const meta = await readMeta(entryPath);
 		if (meta === null || meta.version !== DEPENDENCY_CACHE_SCHEMA_VERSION) {
-			await removeTree(entryPath).catch(() => undefined);
+			await moveAsideEntry(entriesDir, name, entryPath);
 			removed += 1;
 			continue;
 		}
@@ -298,7 +339,9 @@ export async function pruneDependencyEntries(
 		if (kept.has(entry.name)) {
 			continue;
 		}
-		await removeTree(join(entriesDir, entry.name)).catch(() => undefined);
+		// Renamed out before deletion, so a restore in flight either saw the whole
+		// tree or fails loudly enough to fall through to an install.
+		await moveAsideEntry(entriesDir, entry.name, join(entriesDir, entry.name)).catch(() => undefined);
 		removed += 1;
 	}
 	return { removed, remaining: kept.size };
