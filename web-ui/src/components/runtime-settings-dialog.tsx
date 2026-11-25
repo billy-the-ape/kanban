@@ -905,8 +905,9 @@ export function RuntimeSettingsDialog({
 						/>
 						<p className="text-text-secondary text-[12px] mt-2 mb-0">
 							Leave empty to detect the model's advertised parallel slots; enter 1–64 to allow additional turns
-							while Pi runs shell commands or sleeps. Applies to Cline turns and initial Pi coding turns.
-							Existing Pi follow-ups use Pi's native terminal and are not throttled here.
+							while Pi runs shell commands or sleeps. Applies to every Cline turn and every Pi coding turn Kanban
+							starts, including follow-ups from task chat and PR feedback. Typing directly into a card's own
+							terminal is not throttled here.
 						</p>
 					</div>
 

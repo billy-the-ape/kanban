@@ -188,9 +188,13 @@ vi.mock("../../../src/workspace/task-last-prompt.js", async () => {
 
 import { buildClineCompactionConfig } from "../../../src/cline-sdk/cline-compaction-config";
 import { emptyTaskEditorCallEvidence } from "../../../src/cline-sdk/cline-editor-call-evidence";
+import { ClineTurnScheduler } from "../../../src/cline-sdk/cline-turn-scheduler";
 import * as workspaceState from "../../../src/state/workspace-state";
 import * as dispatchRecords from "../../../src/task-dispatch/dispatch-records";
+import { PiModelCapacityGate } from "../../../src/terminal/pi-model-capacity";
 import * as piSessionOptions from "../../../src/terminal/pi-session-options";
+import { resolvePiTurnTarget } from "../../../src/terminal/pi-turn-target";
+import type { TerminalSessionManager } from "../../../src/terminal/session-manager";
 import type { RuntimeTrpcContext } from "../../../src/trpc/app-router";
 import { type CreateRuntimeApiDependencies, createRuntimeApi } from "../../../src/trpc/runtime-api";
 import type * as TaskInitialStart from "../../../src/workspace/task-initial-start";
@@ -1952,6 +1956,162 @@ describe("createRuntimeApi startTaskSession", () => {
 		expect(stopResponse.ok).toBe(true);
 		expect(clineTaskSessionService.stopTaskSession).toHaveBeenCalledWith("task-1");
 		expect(terminalManager.stopTaskSession).not.toHaveBeenCalled();
+	});
+
+	/**
+	 * One slot, already held by another card's turn that has not settled. The
+	 * holder joins the same target the API resolves so both land in one pool.
+	 */
+	async function busyPiCapacity() {
+		const gate = new PiModelCapacityGate(new ClineTurnScheduler(async () => 1));
+		const holderManager = { onSummary: vi.fn(() => () => {}) } as unknown as TerminalSessionManager;
+		const admission = await gate.request({
+			kind: "start",
+			workspaceId: "workspace-1",
+			taskId: "holder",
+			workspacePath: "/tmp/repo",
+			manager: holderManager,
+			target: await resolvePiTurnTarget(),
+			// A live process keeps the reservation: a Pi turn that runs shell
+			// commands or sleeps is still working, so its slot is not reusable.
+			run: async () => createSummary({ agentId: "pi", pid: 99 }),
+		});
+		expect(admission.status).toBe("launched");
+		return gate;
+	}
+
+	function createPiTerminalManager(writeInput: ReturnType<typeof vi.fn>) {
+		const piSummary = createSummary({ agentId: "pi", pid: 4242, state: "running" });
+		const marks: Array<{ taskId: string; queuePosition: number | null }> = [];
+		const manager = {
+			getSummary: vi.fn(() => piSummary),
+			hasActiveProcess: vi.fn(() => true),
+			writeInput,
+			onSummary: vi.fn(() => () => {}),
+			markTurnCapacityWait: vi.fn((input: { taskId: string; queuePosition?: number | null }) => {
+				marks.push({ taskId: input.taskId, queuePosition: input.queuePosition ?? null });
+				return piSummary;
+			}),
+		};
+		return { manager, marks };
+	}
+
+	it("queues a Pi follow-up for model capacity instead of writing past the budget", async () => {
+		const gate = await busyPiCapacity();
+		const writeInput = vi.fn(() => createSummary({ agentId: "pi", pid: 4242 }));
+		const { manager, marks } = createPiTerminalManager(writeInput);
+
+		const api = createTestRuntimeApi({
+			piCapacityGate: gate,
+			getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+			loadScopedRuntimeConfig: vi.fn(async () => createRuntimeConfigState()),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: vi.fn(async () => manager as never),
+			getScopedClineTaskSessionService: vi.fn(async () => createClineTaskSessionServiceMock() as never),
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+		});
+
+		const response = await api.sendTaskSessionInput(
+			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+			{ taskId: "task-1", text: "keep going", appendNewline: true },
+		);
+
+		expect(response.ok).toBe(true);
+		// The reported bug: this wrote straight through the queue, so a card whose
+		// turn had already settled added a third concurrent request to a model
+		// configured for two.
+		expect(writeInput).not.toHaveBeenCalled();
+		expect(marks).toEqual([{ taskId: "task-1", queuePosition: 1 }]);
+	});
+
+	it("queues the lone Enter that submits a pasted Pi prompt", async () => {
+		// Review comments and git-action prompts arrive as a paste followed by
+		// `sendTaskSessionInput(taskId, "\r", { appendNewline: false })`. The paste
+		// starts no turn and is written straight through, but that Enter is what
+		// starts the turn: if it bypassed the queue because it carries no text, a
+		// git action on a settled Pi card would run a third concurrent turn with no
+		// reservation - the exact over-budget behaviour this PR removes.
+		const gate = await busyPiCapacity();
+		const writeInput = vi.fn(() => createSummary({ agentId: "pi", pid: 4242 }));
+		const { manager, marks } = createPiTerminalManager(writeInput);
+
+		const api = createTestRuntimeApi({
+			piCapacityGate: gate,
+			getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+			loadScopedRuntimeConfig: vi.fn(async () => createRuntimeConfigState()),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: vi.fn(async () => manager as never),
+			getScopedClineTaskSessionService: vi.fn(async () => createClineTaskSessionServiceMock() as never),
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+		});
+
+		const response = await api.sendTaskSessionInput(
+			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+			{ taskId: "task-1", text: "\r", appendNewline: false },
+		);
+
+		expect(response.ok).toBe(true);
+		expect(writeInput).not.toHaveBeenCalled();
+		expect(marks).toEqual([{ taskId: "task-1", queuePosition: 1 }]);
+	});
+
+	it("writes a non-submitting Pi paste straight through", async () => {
+		// The web UI types review comments and git-action prompts as a paste with
+		// `appendNewline: false` and a separate Enter, and adding review comments
+		// never sends that Enter at all. A paste therefore starts no turn, so
+		// queueing it would reserve a model slot for work the model was never
+		// asked to do. Only bytes that end in a newline may hold a slot - which is
+		// decided from the payload, so the gate and the write cannot disagree.
+		const gate = await busyPiCapacity();
+		const writeInput = vi.fn(() => createSummary({ agentId: "pi", pid: 4242 }));
+		const { manager, marks } = createPiTerminalManager(writeInput);
+
+		const api = createTestRuntimeApi({
+			piCapacityGate: gate,
+			getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+			loadScopedRuntimeConfig: vi.fn(async () => createRuntimeConfigState()),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: vi.fn(async () => manager as never),
+			getScopedClineTaskSessionService: vi.fn(async () => createClineTaskSessionServiceMock() as never),
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+		});
+
+		const response = await api.sendTaskSessionInput(
+			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+			{ taskId: "task-1", text: "review comments", appendNewline: false },
+		);
+
+		expect(response.ok).toBe(true);
+		expect(writeInput).toHaveBeenCalledWith("task-1", Buffer.from("review comments", "utf8"));
+		expect(marks).toEqual([]);
+	});
+
+	it("writes a Pi follow-up at once when a model slot is free", async () => {
+		const writeInput = vi.fn(() => createSummary({ agentId: "pi", pid: 4242 }));
+		const { manager, marks } = createPiTerminalManager(writeInput);
+
+		const api = createTestRuntimeApi({
+			piCapacityGate: new PiModelCapacityGate(new ClineTurnScheduler(async () => 1)),
+			getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+			loadScopedRuntimeConfig: vi.fn(async () => createRuntimeConfigState()),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: vi.fn(async () => manager as never),
+			getScopedClineTaskSessionService: vi.fn(async () => createClineTaskSessionServiceMock() as never),
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+		});
+
+		const response = await api.sendTaskSessionInput(
+			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+			{ taskId: "task-1", text: "keep going", appendNewline: true },
+		);
+
+		expect(response.ok).toBe(true);
+		expect(writeInput).toHaveBeenCalledWith("task-1", Buffer.from("keep going\n", "utf8"));
+		expect(marks).toEqual([]);
 	});
 
 	it("returns cline chat messages and sends chat message through cline service", async () => {

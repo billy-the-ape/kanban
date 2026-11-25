@@ -57,6 +57,8 @@ import {
 	mutateWorkspaceState,
 } from "../state/workspace-state";
 import { shouldRunMergedPrStartupRecovery } from "../task-dispatch/task-dispatch-service";
+import { sharedPiModelCapacityGate } from "../terminal/pi-model-capacity";
+import { resolvePiTurnTarget } from "../terminal/pi-turn-target";
 import type { TerminalSessionManager } from "../terminal/session-manager";
 import { createTerminalWebSocketBridge } from "../terminal/ws-server";
 import { type RuntimeTrpcContext, type RuntimeTrpcWorkspaceScope, runtimeAppRouter } from "../trpc/app-router";
@@ -341,6 +343,20 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				manager,
 				taskId,
 				prepare,
+				// An automated PR feedback turn is a Pi coding turn like any other: it
+				// takes its place behind the shared per-model budget rather than
+				// silently running a third request against the model.
+				capacity: async ({ taskId: repairTaskId, manager: repairManager, onNotRun, run }) => {
+					await sharedPiModelCapacityGate.request({
+						kind: "turn",
+						workspaceId: scope.workspaceId,
+						taskId: repairTaskId,
+						manager: repairManager,
+						target: await resolvePiTurnTarget(),
+						onNotRun,
+						run,
+					});
+				},
 				restoreSavedSession: async () => {
 					const state = await loadWorkspaceState(scope.workspacePath);
 					const card = state.board.columns
