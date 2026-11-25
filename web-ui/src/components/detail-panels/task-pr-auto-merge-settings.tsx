@@ -1,8 +1,12 @@
 // Auto-merge preference and execution status are separate: setup blockers
 // never prevent saving the preference. The server binds ready tasks to CI policy.
 
+import { GitMerge } from "lucide-react";
 import { useCallback, useState } from "react";
+import { showAppToast } from "@/components/app-toaster";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/components/ui/cn";
+import { Spinner } from "@/components/ui/spinner";
 import { getRuntimeTrpcClient } from "@/runtime/trpc-client";
 import type { AutoMergePolicy, RuntimeTaskTrackingStateResponse } from "@/runtime/types";
 import { useTrpcQuery } from "@/runtime/use-trpc-query";
@@ -113,6 +117,41 @@ export function TaskPrAutoMergeSettings({
 	const verifiedAt = formatVerifiedAt(status?.verifiedAt ?? null);
 	const headShort = shortSha(status?.headSha ?? null);
 
+	// PCR-2 secondary CTA: the auto-merge status explains the blocker; this
+	// line offers the explicit repair. It keys off the merge_conflicts CODE
+	// (the red line is shared with unrelated blockers) plus the conflict
+	// block, never off "the status is red".
+	const hasMergeConflictBlocker = tracking.autoMergeEligibility?.codes?.includes("merge_conflicts") === true;
+	const showConflictCta =
+		hasMergeConflictBlocker &&
+		tracking.conflict?.state === "conflicting" &&
+		selectedKey !== null &&
+		workspaceId !== null;
+	const [ctaRepairing, setCtaRepairing] = useState(false);
+	const [ctaError, setCtaError] = useState<string | null>(null);
+	const runConflictRepair = useCallback(async (): Promise<void> => {
+		if (workspaceId === null || selectedKey === null) {
+			return;
+		}
+		setCtaRepairing(true);
+		setCtaError(null);
+		try {
+			const response = await getRuntimeTrpcClient(workspaceId).workspace.prTracking.resolveTaskPrConflicts.mutate({
+				taskId,
+				prKey: selectedKey,
+			});
+			if (!response.ok) {
+				setCtaError(response.error || "Could not dispatch the conflict repair.");
+				return;
+			}
+			showAppToast({ intent: "primary", message: "Sent the conflict-repair turn to the task agent." });
+		} catch (error) {
+			setCtaError(error instanceof Error ? error.message : "Could not dispatch the conflict repair.");
+		} finally {
+			setCtaRepairing(false);
+		}
+	}, [selectedKey, taskId, workspaceId]);
+
 	return (
 		<div className="flex flex-col gap-1.5">
 			<label
@@ -157,6 +196,22 @@ export function TaskPrAutoMergeSettings({
 							{headShort !== null ? ` · head ${headShort}` : ""}
 						</span>
 					) : null}
+				</div>
+			) : null}
+
+			{showConflictCta ? (
+				<div className="ml-5 flex flex-col gap-1" data-testid="task-pr-conflict-repair-cta">
+					<Button
+						variant="primary"
+						size="sm"
+						icon={ctaRepairing ? <Spinner size={10} /> : <GitMerge size={12} />}
+						disabled={ctaRepairing}
+						onClick={() => void runConflictRepair()}
+						data-testid="task-pr-auto-merge-resolve-conflicts"
+					>
+						Resolve conflicts
+					</Button>
+					{ctaError !== null ? <span className="text-[11px] text-status-red">{ctaError}</span> : null}
 				</div>
 			) : null}
 

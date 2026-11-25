@@ -27,6 +27,7 @@ import {
 	removeWorkspaceIndexEntry,
 	saveWorkspaceState,
 } from "../../src/state/workspace-state";
+import { recordConflictRepairOnBoard } from "../../src/workspace/task-conflict-repair";
 import { recordTaskLastPrompt } from "../../src/workspace/task-last-prompt";
 import { createGitTestEnv } from "../utilities/git-env";
 import { createTempDir } from "../utilities/temp-dir";
@@ -527,6 +528,82 @@ describe.sequential("workspace-state integration", () => {
 				expect(staleTask1Loaded.autoMergeWhenApproved).toBe(true);
 				expect(staleTask1Loaded.armedAutoMergePolicyRevision).toBe(4);
 				expect(staleTask1Loaded.settingsRevision).toBe(1);
+			} finally {
+				cleanup();
+			}
+		});
+	});
+
+	it("a stale whole-board save cannot clear or forge the conflict-repair record (PCR)", async () => {
+		await withTemporaryHome(async () => {
+			const { path: sandboxRoot, cleanup } = createTempDir("kanban-workspace-conflict-repair-");
+			try {
+				const workspacePath = join(sandboxRoot, "project-a");
+				mkdirSync(workspacePath, { recursive: true });
+				initGitRepository(workspacePath);
+
+				const initial = await loadWorkspaceState(workspacePath);
+				await saveWorkspaceState(workspacePath, {
+					board: createBoard("Task One"),
+					sessions: {},
+					expectedRevision: initial.revision,
+				});
+
+				// The server writer (the dispatch path) records the repair.
+				const recorded = await mutateWorkspaceState<boolean>(workspacePath, (state) => {
+					const applied = recordConflictRepairOnBoard(state.board, "task-1", {
+						prKey: "github|github.com|octo/repo|42",
+						headSha: "abc1234def56789012345678901234567890abcd",
+						dispatchedAt: 1_800_000_000_000,
+						status: "dispatched",
+					});
+					return { value: applied.changed, board: applied.board, save: applied.changed };
+				});
+				expect(recorded.value).toBe(true);
+				const withRecord = await loadWorkspaceState(workspacePath);
+				expect(findCard(withRecord.board, "task-1")?.conflictRepair?.status).toBe("dispatched");
+
+				// A stale whole-board save: omits the record on task-1 and forges
+				// one on a new card. Neither may change the server-owned truth.
+				const staleBoard = createBoard("Stale title");
+				const staleBacklog = staleBoard.columns[0];
+				if (staleBacklog === undefined) {
+					throw new Error("backlog column missing");
+				}
+				staleBacklog.cards.push({
+					id: "task-2",
+					title: "Task Two",
+					prompt: "Task Two",
+					startInPlanMode: false,
+					baseRef: "main",
+					createdAt: Date.now(),
+					updatedAt: Date.now(),
+					conflictRepair: {
+						prKey: "github|github.com|octo/repo|9",
+						headSha: "ffff123456789012345678901234567890abcdef1",
+						dispatchedAt: 1,
+						status: "dispatched",
+					},
+				});
+				await saveWorkspaceState(workspacePath, {
+					board: staleBoard,
+					sessions: {},
+					expectedRevision: withRecord.revision,
+				});
+
+				const afterStale = await loadWorkspaceState(workspacePath);
+				const task1 = findCard(afterStale.board, "task-1");
+				if (task1 === undefined) {
+					throw new Error("task-1 missing");
+				}
+				// Board content saved, server-owned record survived.
+				expect(task1.title).toBe("Stale title");
+				expect(task1.conflictRepair).toMatchObject({
+					prKey: "github|github.com|octo/repo|42",
+					status: "dispatched",
+				});
+				// The client cannot forge the record on a card the server never dispatched.
+				expect(findCard(afterStale.board, "task-2")?.conflictRepair ?? null).toBeNull();
 			} finally {
 				cleanup();
 			}

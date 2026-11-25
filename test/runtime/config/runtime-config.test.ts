@@ -529,6 +529,39 @@ describe("B-2.9 — context budget settings", () => {
 			cleanupHome();
 		}
 	});
+	it("round-trips a custom conflict prompt template through the global config file", async () => {
+		const { path: tempHome, cleanup: cleanupHome } = createTempDir("kanban-home-runtime-config-conflict-template-");
+		const { path: tempProject, cleanup: cleanupProject } = createTempDir(
+			"kanban-project-runtime-config-conflict-template-",
+		);
+
+		try {
+			await withTemporaryEnv({ home: tempHome }, async () => {
+				const loaded = await loadRuntimeConfig(tempProject);
+				expect(loaded.conflictPromptTemplate).toBe(loaded.conflictPromptTemplateDefault);
+				expect(loaded.conflictPromptTemplateDefault).toContain("Resolve merge conflicts");
+
+				const updated = await updateRuntimeConfig(tempProject, {
+					conflictPromptTemplate: "Resolve the conflicts on {{pr_url}} in {{repository}}.",
+				});
+				expect(updated.conflictPromptTemplate).toBe("Resolve the conflicts on {{pr_url}} in {{repository}}.");
+
+				const filePayload = JSON.parse(readFileSync(join(tempHome, ".cline", "kanban", "config.json"), "utf8")) as {
+					conflictPromptTemplate?: string;
+				};
+				expect(filePayload.conflictPromptTemplate).toBe("Resolve the conflicts on {{pr_url}} in {{repository}}.");
+
+				const reloaded = await loadRuntimeConfig(tempProject);
+				expect(reloaded.conflictPromptTemplate).toBe("Resolve the conflicts on {{pr_url}} in {{repository}}.");
+				// The default stays the shipped one so the settings Reset restores it.
+				expect(reloaded.conflictPromptTemplateDefault).toContain("Resolve merge conflicts");
+			});
+		} finally {
+			cleanupProject();
+			cleanupHome();
+		}
+	});
+
 	it("treats null fields as clear-to-default and undefined fields as untouched", async () => {
 		const { path: tempHome, cleanup: cleanupHome } = createTempDir("kanban-home-runtime-config-budget-clear-");
 		const { path: tempProject, cleanup: cleanupProject } = createTempDir(

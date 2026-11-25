@@ -1,3 +1,4 @@
+import { interpolateTemplate } from "@runtime-prompt-template";
 import type { RuntimeTaskAutoReviewMode, RuntimeTaskWorkspaceInfoResponse } from "@/runtime/types";
 
 export type TaskGitAction = Extract<RuntimeTaskAutoReviewMode, "commit" | "pr">;
@@ -48,14 +49,6 @@ function resolveTemplate(action: TaskGitAction, templates?: TaskGitPromptTemplat
 		return defaultTemplate;
 	}
 	return "Handle this pull request action using the provided git context.";
-}
-
-function interpolateTemplate(template: string, variables: Record<string, string>): string {
-	let result = template;
-	for (const [key, value] of Object.entries(variables)) {
-		result = result.replaceAll(`{{${key}}}`, value);
-	}
-	return result;
 }
 
 export function buildTaskGitActionPrompt(input: BuildTaskGitActionPromptInput): string {

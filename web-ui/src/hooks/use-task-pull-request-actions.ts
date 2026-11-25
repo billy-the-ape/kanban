@@ -14,6 +14,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { showAppToast } from "@/components/app-toaster";
 import { getRuntimeTrpcClient } from "@/runtime/trpc-client";
 import type { RuntimeTaskPullRequest } from "@/runtime/types";
+import { toCanonicalPrKeyForLink } from "@/utils/pr-tracking";
 import { getLinkedRefreshMessages, getPullRequestKey, getPullRequestRefreshMessage } from "@/utils/task-pull-requests";
 
 /** Sentinel pending key for the "use automatic display order" (clear) action. */
@@ -52,6 +53,21 @@ export interface TaskPullRequestActions {
 	refreshAllPending: boolean;
 	/** Branch lookup followed by a linked-metadata refresh (manager Refresh). */
 	refreshAll: () => Promise<void>;
+	/** PCR-2: pending indicator for the Resolve-conflicts dispatch (PR key). */
+	repairPendingKey: string | null;
+	/** PCR-1: pending indicator for the conflict Re-check (PR key). */
+	recheckPendingKey: string | null;
+	/**
+	 * PCR-2: the last repair refusal, shown inline next to the row (a push is
+	 * destructive-adjacent, so the reason must survive a re-render, not just
+	 * live in a toast).
+	 */
+	repairError: string | null;
+	clearRepairError: () => void;
+	/** Returns true when the server accepted the repair turn. */
+	resolveConflicts: (pullRequest: RuntimeTaskPullRequest) => Promise<boolean>;
+	/** PCR-1: force one provider read for the conflict block (Re-check). */
+	recheckConflict: (pullRequest: RuntimeTaskPullRequest) => Promise<void>;
 }
 
 function toErrorMessage(error: unknown, fallback: string): string {
@@ -71,6 +87,9 @@ export function useTaskPullRequestActions({
 	const [linkedRefreshing, setLinkedRefreshing] = useState(false);
 	const [branchLookupPending, setBranchLookupPending] = useState(false);
 	const [refreshAllPending, setRefreshAllPending] = useState(false);
+	const [repairPendingKey, setRepairPendingKey] = useState<string | null>(null);
+	const [recheckPendingKey, setRecheckPendingKey] = useState<string | null>(null);
+	const [repairError, setRepairError] = useState<string | null>(null);
 
 	// Task-scoped pending state: switching tasks/workspaces drops any pending
 	// indicators so a previous task's in-flight mutation cannot drive this
@@ -84,6 +103,9 @@ export function useTaskPullRequestActions({
 		setLinkedRefreshing(false);
 		setBranchLookupPending(false);
 		setRefreshAllPending(false);
+		setRepairPendingKey(null);
+		setRecheckPendingKey(null);
+		setRepairError(null);
 	}, [workspaceId, taskId]);
 
 	// Current scope, read by in-flight actions when their responses land.
@@ -98,6 +120,97 @@ export function useTaskPullRequestActions({
 	const clearAddError = useCallback(() => {
 		setAddError(null);
 	}, []);
+
+	const clearRepairError = useCallback(() => {
+		setRepairError(null);
+	}, []);
+
+	const resolveConflicts = useCallback(
+		async (pullRequest: RuntimeTaskPullRequest): Promise<boolean> => {
+			const prKey = toCanonicalPrKeyForLink(pullRequest);
+			if (workspaceId === null || prKey === null) {
+				return false;
+			}
+			const scope = { workspaceId, taskId };
+			const key = getPullRequestKey(pullRequest);
+			setRepairPendingKey(key);
+			setRepairError(null);
+			try {
+				const response = await getRuntimeTrpcClient(workspaceId).workspace.prTracking.resolveTaskPrConflicts.mutate(
+					{
+						taskId,
+						prKey,
+					},
+				);
+				if (!sameScope(scope)) {
+					return response.ok;
+				}
+				if (!response.ok) {
+					// Refusals are inline text next to the row, not toasts only.
+					setRepairError(response.error || "Could not dispatch the conflict repair.");
+					return false;
+				}
+				showAppToast({
+					intent: "primary",
+					message: "Sent the conflict-repair turn to the task agent.",
+				});
+				return true;
+			} catch (error) {
+				const message = toErrorMessage(error, "Could not dispatch the conflict repair.");
+				if (sameScope(scope)) {
+					setRepairError(message);
+				}
+				return false;
+			} finally {
+				if (sameScope(scope)) {
+					setRepairPendingKey(null);
+				}
+			}
+		},
+		[taskId, workspaceId],
+	);
+
+	const recheckConflict = useCallback(
+		async (pullRequest: RuntimeTaskPullRequest): Promise<void> => {
+			const prKey = toCanonicalPrKeyForLink(pullRequest);
+			if (workspaceId === null || prKey === null) {
+				return;
+			}
+			const scope = { workspaceId, taskId };
+			const key = getPullRequestKey(pullRequest);
+			setRecheckPendingKey(key);
+			try {
+				const response = await getRuntimeTrpcClient(workspaceId).workspace.prTracking.refreshTaskPrConflict.mutate({
+					taskId,
+					prKey,
+				});
+				if (!sameScope(scope)) {
+					return;
+				}
+				if (!response.ok) {
+					showAppToast({ intent: "warning", message: response.error || "Could not re-check mergeability." });
+					return;
+				}
+				const state = response.conflict?.state ?? "unknown";
+				showAppToast({
+					intent: state === "conflicting" ? "warning" : "primary",
+					message:
+						state === "conflicting"
+							? "Still conflicting against the base branch."
+							: state === "clean"
+								? "Conflicts resolved — the PR merges cleanly."
+								: "GitHub is recomputing mergeability.",
+				});
+			} catch (error) {
+				showAppToast({ intent: "warning", message: toErrorMessage(error, "Could not re-check mergeability.") });
+			} finally {
+				if (sameScope(scope)) {
+					setRecheckPendingKey(null);
+				}
+			}
+		},
+		[taskId, workspaceId],
+	);
 
 	const addPullRequest = useCallback(
 		async (url: string): Promise<boolean> => {
@@ -381,5 +494,11 @@ export function useTaskPullRequestActions({
 		findBranchPullRequests,
 		refreshAllPending,
 		refreshAll,
+		repairPendingKey,
+		recheckPendingKey,
+		repairError,
+		clearRepairError,
+		resolveConflicts,
+		recheckConflict,
 	};
 }

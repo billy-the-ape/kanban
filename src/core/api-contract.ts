@@ -585,6 +585,27 @@ export const runtimeTaskGitActionPromptReleaseResponseSchema = z.object({
 });
 export type RuntimeTaskGitActionPromptReleaseResponse = z.infer<typeof runtimeTaskGitActionPromptReleaseResponseSchema>;
 
+/**
+ * PCR-2: the durable conflict-repair dispatch record, keyed by head SHA and
+ * kept on the task card (deliberately NOT `sentGitActionPrompt`, whose union
+ * is `commit | pr` and which is cleared when the card leaves Review: a failed
+ * repair must be re-triggerable while a duplicate from a second tab must
+ * not be). Set before the send; a later dispatch overwrites it; a second
+ * click while `dispatched` for the SAME head is refused. It is never
+ * replayed on restart (same rule as comment repair: an accepted prompt is
+ * never re-run) — it only explains the state, and a fresh click against the
+ * current head is what retries. After a successful push the head SHA
+ * changes, so the record naturally no longer matches the next read.
+ */
+export const runtimeTaskConflictRepairRecordSchema = z.object({
+	prKey: z.string(),
+	headSha: z.string(),
+	dispatchedAt: z.number().int().nonnegative(),
+	status: z.enum(["dispatched", "failed"]),
+	error: z.string().optional(),
+});
+export type RuntimeTaskConflictRepairRecord = z.infer<typeof runtimeTaskConflictRepairRecordSchema>;
+
 export const runtimeBoardCardSchema = z
 	.object({
 		id: z.string(),
@@ -690,6 +711,13 @@ export const runtimeBoardCardSchema = z
 				sentAt: z.number().int().nonnegative(),
 			})
 			.optional(),
+		/**
+		 * PCR-2: the last explicit conflict-repair dispatch for this task's
+		 * Automation PR (server-owned; written only by the repair dispatch
+		 * under the workspace lock and restored over any client-supplied value
+		 * by `saveWorkspaceState`).
+		 */
+		conflictRepair: runtimeTaskConflictRepairRecordSchema.optional(),
 		createdAt: z.number(),
 		updatedAt: z.number(),
 	})
@@ -2358,6 +2386,9 @@ export const runtimeConfigResponseSchema = z.object({
 	openPrPromptTemplate: z.string(),
 	commitPromptTemplateDefault: z.string(),
 	openPrPromptTemplateDefault: z.string(),
+	/** PCR-2: the server-rendered conflict-repair template (+ default). */
+	conflictPromptTemplate: z.string().optional(),
+	conflictPromptTemplateDefault: z.string().optional(),
 	clineConcurrencyLimit: z.number().int().min(1).max(64).nullable().optional(),
 	contextBudget: runtimeContextBudgetSchema.nullable(),
 	/** B-6: global review lifecycle policy; null means all defaults (off, 2 repair rounds). */
@@ -2382,6 +2413,8 @@ export const runtimeConfigSaveRequestSchema = z.object({
 	readyForReviewNotificationsEnabled: z.boolean().optional(),
 	commitPromptTemplate: z.string().optional(),
 	openPrPromptTemplate: z.string().optional(),
+	/** PCR-2: conflict-repair template; mirrors the other two. */
+	conflictPromptTemplate: z.string().optional(),
 	clineConcurrencyLimit: z.number().int().min(1).max(64).nullable().optional(),
 	contextBudget: runtimeContextBudgetSaveSchema.optional(),
 	/** B-6: `null` clears the stored review policy; `undefined` leaves it untouched. */
@@ -4198,6 +4231,98 @@ export const runtimeTaskPrTrackingResumeResponseSchema = z.object({
 export type RuntimeTaskPrTrackingResumeResponse = z.infer<typeof runtimeTaskPrTrackingResumeResponseSchema>;
 
 /**
+ * PCR-1: the conflict block on the task tracking state — the trigger signal
+ * for the explicit Resolve-conflicts action, independent of the auto-merge
+ * opt-in (a button driven off `deriveAutoMergeStatus()` would be dead for
+ * most cards). `state` follows the fixed resolution order in
+ * `src/pr-tracking/pr-conflict-state.ts`: provider snapshot first, advisory
+ * local probe as the fallback, then unknown/unsupported with a `note`.
+ */
+export const runtimePrConflictStateSchema = z.object({
+	/** `clean` is only ever reported from a provider snapshot, never a probe. */
+	state: z.enum(["clean", "conflicting", "unknown", "unsupported"]),
+	/** The canonical PR key this block is scoped to. */
+	prKey: z.string().nullable(),
+	headRef: z.string().nullable(),
+	baseRef: z.string().nullable(),
+	headSha: z.string().nullable(),
+	baseSha: z.string().nullable(),
+	checkedAt: z.number().nullable(),
+	source: z.enum(["provider_snapshot", "local_probe", "none"]),
+	/** "GitHub is still computing mergeability", "gh unavailable", … */
+	note: z.string().nullable(),
+});
+export type RuntimePrConflictState = z.infer<typeof runtimePrConflictStateSchema>;
+
+/**
+ * PCR-2: dispatch the server-rendered conflict-repair turn to the task's own
+ * agent session. The PR is named by the row the user clicked, never by
+ * "whichever PR the automation would pick".
+ */
+export const runtimePrConflictRepairRequestSchema = z.object({
+	taskId: z.string().min(1),
+	prKey: z.string().min(1),
+});
+export type RuntimePrConflictRepairRequest = z.infer<typeof runtimePrConflictRepairRequestSchema>;
+
+export const runtimePrConflictRepairResponseSchema = z.object({
+	ok: z.boolean(),
+	taskId: z.string(),
+	prKey: z.string().nullable(),
+	/** The head SHA the repair was keyed against (null on refusal). */
+	headSha: z.string().nullable(),
+	dispatchedAt: z.number().nullable(),
+	/** Stable machine-readable refusal reason (null when ok). */
+	reason: z
+		.enum([
+			"no_task",
+			"inactive_task",
+			"no_automation_pr",
+			"pr_mismatch",
+			"agent_unsupported",
+			"launch_unsupported",
+			"worktree_missing",
+			"git_operation_in_progress",
+			"unmerged_index",
+			"writer_active",
+			"comment_repair_pending",
+			"auto_merge_attempting",
+			"already_dispatched",
+			"pr_reserved",
+			"no_snapshot",
+			"pr_not_open",
+			"native_auto_merge",
+			"head_unknown",
+			"clean_merge",
+			"invalid_ref",
+			"no_head_remote",
+			"prompt_invalid",
+			"send_failed",
+		])
+		.nullable(),
+	error: z.string().nullable(),
+});
+export type RuntimePrConflictRepairResponse = z.infer<typeof runtimePrConflictRepairResponseSchema>;
+
+/**
+ * PCR-1: force one provider metadata read for the conflict block (the
+ * Re-check affordance). Server-side debounced; never claims a green light a
+ * provider has not reported.
+ */
+export const runtimePrConflictRecheckRequestSchema = z.object({
+	taskId: z.string().min(1),
+	prKey: z.string().min(1),
+});
+export type RuntimePrConflictRecheckRequest = z.infer<typeof runtimePrConflictRecheckRequestSchema>;
+
+export const runtimePrConflictRecheckResponseSchema = z.object({
+	ok: z.boolean(),
+	conflict: runtimePrConflictStateSchema.nullable(),
+	error: z.string().nullable(),
+});
+export type RuntimePrConflictRecheckResponse = z.infer<typeof runtimePrConflictRecheckResponseSchema>;
+
+/**
  * Revision-checked task tracking-state diagnostics: the single server source
  * for the UI's active/disabled checkbox state, blockers, owner, reservation,
  * snapshot freshness, and installed-consumer/capability signals.
@@ -4310,6 +4435,17 @@ export const runtimeTaskTrackingStateResponseSchema = z.object({
 	 * never writes the journal; the server-side executor owns it.
 	 */
 	autoMergeAttempt: autoMergeAttemptSchema.nullable().optional(),
+	/**
+	 * PCR-1: the merge-conflict trigger block for the task's Automation PR
+	 * (null while no PR is resolvable). Additive/optional so older casts of
+	 * this response keep working.
+	 */
+	conflict: runtimePrConflictStateSchema.nullable().optional(),
+	/**
+	 * PCR-2: the durable conflict-repair dispatch record for this task
+	 * (projected from the card; null while nothing was dispatched).
+	 */
+	conflictRepair: runtimeTaskConflictRepairRecordSchema.nullable().optional(),
 	error: z.string().nullable(),
 });
 export type RuntimeTaskTrackingStateResponse = z.infer<typeof runtimeTaskTrackingStateResponseSchema>;
@@ -4435,7 +4571,12 @@ export type RuntimePrRepairOwnerResponse = z.infer<typeof runtimePrRepairOwnerRe
 
 // ── Fenced operation reservations ────────────────────────────────────────────
 
-export const runtimePrOperationKindSchema = z.enum(["comment_followup", "merge_completion", "auto_merge"]);
+export const runtimePrOperationKindSchema = z.enum([
+	"comment_followup",
+	"merge_completion",
+	"auto_merge",
+	"conflict_repair",
+]);
 export type RuntimePrOperationKind = z.infer<typeof runtimePrOperationKindSchema>;
 
 export const runtimePrOperationReservationRequestSchema = z.object({

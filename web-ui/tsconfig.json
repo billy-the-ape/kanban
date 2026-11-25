@@ -21,6 +21,7 @@
       "@runtime-home-agent-session": ["../src/core/home-agent-session.ts"],
       "@runtime-trpc": ["../src/trpc/app-router.ts"],
       "@runtime-pull-request-links": ["../src/core/pull-request-links.ts"],
+      "@runtime-prompt-template": ["../src/core/prompt-template-interpolation.ts"],
       "@runtime-shortcuts": ["../src/config/shortcut-utils.ts"],
       "@runtime-task-id": ["../src/core/task-id.ts"],
       "@runtime-task-title": ["../src/core/task-title.ts"],

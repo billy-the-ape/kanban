@@ -182,6 +182,10 @@ export function buildRuntimeConfigResponse(
 		openPrPromptTemplate: runtimeConfig.openPrPromptTemplate,
 		commitPromptTemplateDefault: runtimeConfig.commitPromptTemplateDefault,
 		openPrPromptTemplateDefault: runtimeConfig.openPrPromptTemplateDefault,
+		// PCR-2: the conflict-repair template is server-rendered, but the
+		// settings dialog edits it like the other two.
+		conflictPromptTemplate: runtimeConfig.conflictPromptTemplate,
+		conflictPromptTemplateDefault: runtimeConfig.conflictPromptTemplateDefault,
 		clineConcurrencyLimit: runtimeConfig.clineConcurrencyLimit ?? null,
 		contextBudget: runtimeConfig.contextBudget ?? null,
 		reviewPolicy: runtimeConfig.reviewPolicy ?? null,

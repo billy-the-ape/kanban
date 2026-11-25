@@ -3,6 +3,7 @@ import type {
 	RuntimeBoardColumnId,
 	RuntimeTaskAutoReviewMode,
 	RuntimeTaskClineSettings,
+	RuntimeTaskConflictRepairRecord,
 	RuntimeTaskImage,
 	RuntimeTaskPullRequest,
 } from "@/runtime/types";
@@ -69,6 +70,12 @@ export interface BoardCard {
 	 * (server-owned; cleared automatically when the card leaves Review).
 	 */
 	sentGitActionPrompt?: { action: "commit" | "pr"; sentAt: number };
+	/**
+	 * PCR-2: the last explicit conflict-repair dispatch for the task's
+	 * Automation PR (server-owned, keyed by the head SHA it was dispatched
+	 * against; see `docs/runtime/pr-conflict-repair.md`).
+	 */
+	conflictRepair?: RuntimeTaskConflictRepairRecord;
 	baseRef: string;
 	/** UPD-0: missing values normalize to true; an explicit false disables the pre-start base refresh. */
 	updateBaseRefBeforeStart?: boolean;

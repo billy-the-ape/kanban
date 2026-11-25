@@ -65,6 +65,10 @@ import type {
 	RuntimePrAuthorizedSnapshotRequest,
 	RuntimePrAuthorizedSnapshotResponse,
 	RuntimePrCommentDispatchUpdateRequest,
+	RuntimePrConflictRecheckRequest,
+	RuntimePrConflictRecheckResponse,
+	RuntimePrConflictRepairRequest,
+	RuntimePrConflictRepairResponse,
 	RuntimePrOperationReleaseRequest,
 	RuntimePrOperationReservationRequest,
 	RuntimePrOperationReservationResponse,
@@ -233,6 +237,10 @@ import {
 	runtimePrAuthorizedSnapshotRequestSchema,
 	runtimePrAuthorizedSnapshotResponseSchema,
 	runtimePrCommentDispatchUpdateRequestSchema,
+	runtimePrConflictRecheckRequestSchema,
+	runtimePrConflictRecheckResponseSchema,
+	runtimePrConflictRepairRequestSchema,
+	runtimePrConflictRepairResponseSchema,
 	runtimePrOperationReleaseRequestSchema,
 	runtimePrOperationReservationRequestSchema,
 	runtimePrOperationReservationResponseSchema,
@@ -690,6 +698,16 @@ export interface RuntimeTrpcContext {
 			scope: RuntimeTrpcWorkspaceScope,
 			input: RuntimeTaskTrackingStateRequest,
 		) => Promise<RuntimeTaskTrackingStateResponse>;
+		// PCR-1: forced conflict-state re-check (one provider read, debounced).
+		refreshTaskPrConflict: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimePrConflictRecheckRequest,
+		) => Promise<RuntimePrConflictRecheckResponse>;
+		// PCR-2: the explicit Resolve-conflicts dispatch.
+		resolveTaskPrConflicts: (
+			scope: RuntimeTrpcWorkspaceScope,
+			input: RuntimePrConflictRepairRequest,
+		) => Promise<RuntimePrConflictRepairResponse>;
 		// AM-1: per-repository auto-merge policy (read + revision-checked write).
 		getAutoMergePolicy: (
 			scope: RuntimeTrpcWorkspaceScope,
@@ -1268,6 +1286,21 @@ export const runtimeAppRouter = t.router({
 				.output(runtimeTaskTrackingStateResponseSchema)
 				.query(async ({ ctx, input }) => {
 					return await ctx.prTrackingApi.getTaskTrackingState(ctx.workspaceScope, input);
+				}),
+			// PCR-1: Re-check affordance — one forced provider read for the
+			// conflict block (coalesced/rate-limit-aware in the coordinator).
+			refreshTaskPrConflict: workspaceProcedure
+				.input(runtimePrConflictRecheckRequestSchema)
+				.output(runtimePrConflictRecheckResponseSchema)
+				.mutation(async ({ ctx, input }) => {
+					return await ctx.prTrackingApi.refreshTaskPrConflict(ctx.workspaceScope, input);
+				}),
+			// PCR-2: the explicit Resolve-conflicts action, scoped to one PR.
+			resolveTaskPrConflicts: workspaceProcedure
+				.input(runtimePrConflictRepairRequestSchema)
+				.output(runtimePrConflictRepairResponseSchema)
+				.mutation(async ({ ctx, input }) => {
+					return await ctx.prTrackingApi.resolveTaskPrConflicts(ctx.workspaceScope, input);
 				}),
 			// AM-1: per-repository auto-merge policy.
 			getAutoMergePolicy: workspaceProcedure
