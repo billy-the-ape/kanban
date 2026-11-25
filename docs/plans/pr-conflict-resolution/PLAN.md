@@ -156,7 +156,7 @@ Known remote head: {{head_sha}}   Known remote base: {{base_sha}}
 This turn is the explicit exception to the standing "do not fetch, pull,
 rebase, or merge" guidance: fetching the base and merging it into the PR head
 is required. Everything else in that guidance still applies. Never force-push,
-never rewrite published history, never touch any checkout other than the ones
+never rewrite published history, never touch any checkout other than the one
 named here, and never merge the pull request.
 
 Your goal is to preserve the intended behavior of both the PR and the latest
@@ -244,7 +244,7 @@ been committed and pushed successfully.
 
 Three additions over the requested text, each failure-shaped:
 - The **known SHAs** line + "treat these as authoritative" pair, so the model can prove the remote moved instead of trusting a stale Kanban render.
-- A **pinned checkout**: step 1 names `{{task_worktree_path}}` as the only working copy the turn may touch. Without it, "never touch any checkout other than the ones named here" names nothing, and gotchas 11 and 18 become live risks rather than closed ones. This is why the token is required rather than optional.
+- A **pinned checkout**: step 1 names `{{task_worktree_path}}` as the only working copy the turn may touch, which is what makes "never touch any checkout other than the one named here" name something. Without it the clause names nothing and gotchas 11 and 18 become live risks rather than closed ones. This is why the token is required rather than optional, and why the clause is singular — exactly one checkout is in scope.
 - The **detached-HEAD push-target** clause (the Kanban default is a detached worktree with no local PR branch): `git push <remote> HEAD:refs/heads/<head_branch>`, non-forced only, with "a rejected push means the remote moved — fetch, re-verify, never `--force`". A non-fast-forward rejection is the safety net; do not let `--force-with-lease` talk it out of the model's head.
 
 **Anything this block is meant to instruct must live inside the block.** PCR-2 copies the fenced text into `DEFAULT_CONFLICT_PROMPT_TEMPLATE` verbatim; a bullet written after the closing fence is documentation for us and silence for the model. Both of this document's first-draft contradictions came from exactly that: a push-target rule described below the fence but absent from step 5, and a scratch-worktree invitation inside the fence that gotchas 11 and 18 argued against. Re-read the fenced block on its own before editing it — the template must be self-consistent with no outside prose to lean on.
