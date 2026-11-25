@@ -2119,19 +2119,17 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				// at once. With no slot free the input is annotated as waiting on the
 				// card and written in the background when capacity frees.
 				//
-				// Only input that actually starts a turn may hold a slot. The web UI
-				// sends review comments and git-action prompts as two calls (a paste with
-				// `appendNewline: false`, then `"\r"`), and `handleAddReviewComments`
-				// pastes without any Enter at all: queueing a paste would reserve a slot
-				// for a turn that never starts, because the Enter is written - or never
-				// typed - independently of it.
-				const submitsTurn = body.appendNewline !== false || /[\r\n]$/.test(body.text);
-				if (
-					liveSummary?.agentId === "pi" &&
-					payloadText.trim().length > 0 &&
-					submitsTurn &&
-					terminalManager.hasActiveProcess(body.taskId)
-				) {
+				// Only input that actually starts a turn may hold a slot, and that has to
+				// be decided by the bytes going to Pi rather than by the request fields:
+				// text ending in a newline is a submit - the composer's Enter, or the lone
+				// `"\r"` the web UI sends after pasting review comments or a git-action
+				// prompt - while a paste with no Enter is only typed text. Gating a paste
+				// would reserve a slot for a turn that may never start
+				// (`handleAddReviewComments` never sends an Enter at all); leaving the lone
+				// Enter ungated would let the submission that follows it run a third
+				// concurrent turn with no reservation.
+				const submitsTurn = /[\r\n]$/.test(payloadText);
+				if (liveSummary?.agentId === "pi" && submitsTurn && terminalManager.hasActiveProcess(body.taskId)) {
 					const admission = await piCapacityGate.request({
 						kind: "turn",
 						workspaceId: workspaceScope.workspaceId,

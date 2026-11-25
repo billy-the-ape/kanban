@@ -2014,7 +2014,7 @@ describe("createRuntimeApi startTaskSession", () => {
 
 		const response = await api.sendTaskSessionInput(
 			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
-			{ taskId: "task-1", text: "keep going" },
+			{ taskId: "task-1", text: "keep going", appendNewline: true },
 		);
 
 		expect(response.ok).toBe(true);
@@ -2025,13 +2025,45 @@ describe("createRuntimeApi startTaskSession", () => {
 		expect(marks).toEqual([{ taskId: "task-1", queuePosition: 1 }]);
 	});
 
+	it("queues the lone Enter that submits a pasted Pi prompt", async () => {
+		// Review comments and git-action prompts arrive as a paste followed by
+		// `sendTaskSessionInput(taskId, "\r", { appendNewline: false })`. The paste
+		// starts no turn and is written straight through, but that Enter is what
+		// starts the turn: if it bypassed the queue because it carries no text, a
+		// git action on a settled Pi card would run a third concurrent turn with no
+		// reservation - the exact over-budget behaviour this PR removes.
+		const gate = await busyPiCapacity();
+		const writeInput = vi.fn(() => createSummary({ agentId: "pi", pid: 4242 }));
+		const { manager, marks } = createPiTerminalManager(writeInput);
+
+		const api = createTestRuntimeApi({
+			piCapacityGate: gate,
+			getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+			loadScopedRuntimeConfig: vi.fn(async () => createRuntimeConfigState()),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: vi.fn(async () => manager as never),
+			getScopedClineTaskSessionService: vi.fn(async () => createClineTaskSessionServiceMock() as never),
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+		});
+
+		const response = await api.sendTaskSessionInput(
+			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+			{ taskId: "task-1", text: "\r", appendNewline: false },
+		);
+
+		expect(response.ok).toBe(true);
+		expect(writeInput).not.toHaveBeenCalled();
+		expect(marks).toEqual([{ taskId: "task-1", queuePosition: 1 }]);
+	});
+
 	it("writes a non-submitting Pi paste straight through", async () => {
 		// The web UI types review comments and git-action prompts as a paste with
 		// `appendNewline: false` and a separate Enter, and adding review comments
 		// never sends that Enter at all. A paste therefore starts no turn, so
 		// queueing it would reserve a model slot for work the model was never
-		// asked to do - and the Enter, written independently, would land on an
-		// idle session. Only input that submits a turn may hold a slot.
+		// asked to do. Only bytes that end in a newline may hold a slot - which is
+		// decided from the payload, so the gate and the write cannot disagree.
 		const gate = await busyPiCapacity();
 		const writeInput = vi.fn(() => createSummary({ agentId: "pi", pid: 4242 }));
 		const { manager, marks } = createPiTerminalManager(writeInput);
@@ -2074,11 +2106,11 @@ describe("createRuntimeApi startTaskSession", () => {
 
 		const response = await api.sendTaskSessionInput(
 			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
-			{ taskId: "task-1", text: "keep going" },
+			{ taskId: "task-1", text: "keep going", appendNewline: true },
 		);
 
 		expect(response.ok).toBe(true);
-		expect(writeInput).toHaveBeenCalledWith("task-1", Buffer.from("keep going", "utf8"));
+		expect(writeInput).toHaveBeenCalledWith("task-1", Buffer.from("keep going\n", "utf8"));
 		expect(marks).toEqual([]);
 	});
 

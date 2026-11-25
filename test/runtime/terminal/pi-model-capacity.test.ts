@@ -441,6 +441,47 @@ describe("PiModelCapacityGate", () => {
 		expect(notRun).toHaveBeenCalledExactlyOnceWith("The turn was canceled before the model had capacity.");
 	});
 
+	it("answers a failing turn that was never queued by rejection alone", async () => {
+		const scheduler = new ClineTurnScheduler(async () => 1);
+		const gate = new PiModelCapacityGate(scheduler);
+		const fake = fakeManager();
+		const failure = new Error("Pi's terminal process disappeared before the repair was submitted.");
+		const notRun = vi.fn();
+
+		// Nothing else holds the slot, so this caller is still awaiting its admission
+		// when the work fails. Reporting through `onNotRun` as well would let a caller
+		// with a durable receipt settle the same outcome twice - once unawaited through
+		// the callback, once awaited through its own catch - so rejection is its only
+		// channel here.
+		await expect(
+			gate.request({
+				...startInput(fake, "a", async () => {
+					throw failure;
+				}),
+				onNotRun: notRun,
+			}),
+		).rejects.toThrow(failure.message);
+		expect(notRun).not.toHaveBeenCalled();
+
+		// Once a caller has been answered `queued`, though, the promise is spent and
+		// the callback is the only report it can still receive.
+		await gate.request(startInput(fake, "holder", async () => summary("holder")));
+		const queuedNotRun = vi.fn();
+		const queued = await gate.request({
+			...startInput(fake, "b", async () => {
+				throw failure;
+			}),
+			onNotRun: queuedNotRun,
+		});
+		expect(queued.status).toBe("queued");
+
+		fake.emit(settled("holder"));
+		await tick();
+		await tick();
+
+		expect(queuedNotRun).toHaveBeenCalledExactlyOnceWith(failure.message);
+	});
+
 	it("releases the slot when written input never became a turn", async () => {
 		vi.useFakeTimers();
 		try {

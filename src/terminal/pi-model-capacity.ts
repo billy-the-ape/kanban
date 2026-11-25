@@ -58,11 +58,12 @@ export interface PiTurnRequest {
 	/**
 	 * Fires exactly once when this request's work never reached the model: the
 	 * wait was canceled, the card moved on, the write failed, or an earlier
-	 * queued input for the same card failed first. A caller answered `queued`
-	 * sees no other outcome, so anything owning a durable receipt (an automated
-	 * PR repair) must settle it here. Never called for a request answered
-	 * `launched`, or for a request whose promise rejected - those callers
-	 * already know.
+	 * queued input for the same card failed first. It fires only for a request
+	 * that was answered `queued`, because that caller has already returned and
+	 * has no other channel - anything owning a durable receipt (an automated PR
+	 * repair) must settle it here. A caller still awaiting this promise, or one
+	 * already answered `launched`, is never called: the first learns the outcome
+	 * by rejection, the second already knows the work started.
 	 */
 	onNotRun?: (reason: string) => void;
 }
@@ -76,6 +77,13 @@ interface QueuedPiInput {
 	 * either it reached the model, or it was abandoned with a reason.
 	 */
 	reported: boolean;
+	/**
+	 * Whether this caller has already been answered `queued` and so can only
+	 * learn the outcome through `onNotRun`. The creating request is not answered
+	 * until the queue reports a wait, and while it still awaits, rejection is its
+	 * channel - reporting both would let a caller settle durable state twice.
+	 */
+	answeredQueued: boolean;
 }
 
 /** Which outcome the creating caller was told about, or null while it awaits. */
@@ -255,6 +263,8 @@ export class PiModelCapacityGate {
 					run: request.run,
 					...(request.onNotRun ? { onNotRun: request.onNotRun } : {}),
 					reported: false,
+					// This caller is answered `queued` by the return below.
+					answeredQueued: true,
 				});
 				return {
 					status: "queued",
@@ -290,19 +300,25 @@ export class PiModelCapacityGate {
 					run: request.run,
 					...(request.onNotRun ? { onNotRun: request.onNotRun } : {}),
 					reported: false,
+					// Flipped once the queue reports a wait; until then the caller
+					// awaits this promise and rejection answers it.
+					answeredQueued: false,
 				},
 			],
 		};
 		this.turns.set(key, record);
 
 		/**
-		 * Tells every still-silent owner that its input never reached the model. A
-		 * caller answered `queued` has no other channel, and the creating caller is
-		 * only silent once it holds a waiting record.
+		 * Tells every still-silent caller that its input never reached the model.
+		 * Only a caller already answered `queued` is reached: one still awaiting
+		 * the admission is answered by the rejection that follows, and reporting
+		 * both would let a caller with a durable receipt settle the same outcome
+		 * twice - once unawaited through `onNotRun`, once awaited through its own
+		 * catch.
 		 */
 		const abandon = (reason: string): void => {
 			for (const input of record.inputs) {
-				if (input.reported) continue;
+				if (input.reported || !input.answeredQueued) continue;
 				input.reported = true;
 				input.onNotRun?.(reason);
 			}
@@ -313,6 +329,10 @@ export class PiModelCapacityGate {
 			if (record.reported !== null) return;
 			record.queuePosition = queuePosition;
 			record.reported = "queued";
+			// From here the creating caller has returned with a waiting record, so
+			// a later failure can only reach it through `onNotRun`.
+			const creator = record.inputs[0];
+			if (creator) creator.answeredQueued = true;
 			// Until the work runs, the manager's waiting record is the only state
 			// the card, the terminal viewer, and Stop can point at.
 			settle({
@@ -445,8 +465,14 @@ export class PiModelCapacityGate {
 							abandon(describeAbandonment(undefined, true));
 							break;
 						}
-						const ended = waitForTurnEnd(seenBeforeDelivery);
-						await ended;
+						// Waits for a settle counted after this mark. A settle that lands
+						// while the input is still being written is counted too, which can
+						// free the slot a beat early when a previous turn settles at that
+						// instant; the alternative - waiting for a settle strictly after the
+						// writes - can instead miss the settle of a short turn and hold the
+						// slot until the process exits. Releasing a beat early costs one
+						// extra concurrent turn for a moment; holding costs the whole budget.
+						await waitForTurnEnd(seenBeforeDelivery);
 						clearGrace();
 						if (record.canceled) {
 							// Stop answers a still-queued input now: it must never be

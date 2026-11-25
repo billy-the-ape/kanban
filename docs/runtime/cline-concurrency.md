@@ -25,7 +25,10 @@ Only a paste that does not itself start a turn - review comments or a git-action
 prompt typed with `appendNewline: false`, which the human still has to submit -
 and typing directly into a card's own terminal bypass this queue. A paste must
 not reserve a slot for a turn that may never start, and Kanban cannot queue
-another client's keystrokes. A turn that was written but that Pi never starts
+another client's keystrokes. The Enter that submits such a paste is queued, and
+it is decided from the bytes being written rather than from the request fields:
+text ending in a newline is a submit, so `"\r"` holds a slot even though it
+carries no text, while a paste that is never submitted holds none. A turn that was written but that Pi never starts
 releases its reservation once Pi has gone quiet long enough that no turn can be
 assumed to be running.
 This is not a hard inference-provider request limit.
@@ -133,7 +136,8 @@ curl -fsS 'http://127.0.0.1:8080/props?model=qwen3.8-27b' \
    slot frees. Stop cancels the wait and never writes the input.
 7. While both slots are busy, add review comments to a Pi card. The paste lands
    immediately and takes no reservation, because only input that submits a turn
-   is queued. Then send a chat message: that one waits.
+   is queued. Then submit it, or send a chat message: that is queued, and the
+   card shows **Waiting for model capacity** until a slot frees.
 
 Waiting board cards show `q #1`, `q #2`, and so on in place of the phase badge. Positions are FIFO within each endpoint/model pool and update when a waiting turn is canceled or admitted. The normal phase badge returns when the turn starts. A queued Pi start has no queue-position badge, because that badge belongs to a running queued Cline turn: its card shows the waiting summary text instead, and the record carries the same queue position for diagnostics until its CLI spawns.
 
