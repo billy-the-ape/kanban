@@ -19,7 +19,10 @@
 export function interpolateTemplate(template: string, variables: Record<string, string>): string {
 	let result = template;
 	for (const [key, value] of Object.entries(variables)) {
-		result = result.replaceAll(`{{${key}}}`, value);
+		// The replacer form is required: a string replacement would interpret
+		// `$&`, `$'`, `` $` `` and `$$` in the value, and branch names may
+		// legally contain `$`.
+		result = result.replaceAll(`{{${key}}}`, () => value);
 	}
 	return result;
 }

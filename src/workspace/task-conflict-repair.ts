@@ -61,3 +61,54 @@ export async function recordConflictRepair(input: RecordConflictRepairInput): Pr
 		return false;
 	}
 }
+
+export type ConflictRepairClaim =
+	| { status: "claimed" }
+	/** A `dispatched` record for the same PR + head already exists under the lock. */
+	| { status: "duplicate"; existing: RuntimeTaskConflictRepairRecord };
+
+/**
+ * Compare-and-set version of {@link recordConflictRepair}: the write
+ * re-checks the CURRENT card inside the workspace lock and refuses to
+ * overwrite a `dispatched` record for the same PR key and head SHA. This is
+ * what makes the dedupe atomic — two concurrent dispatch calls can both
+ * pass an earlier board read, but only one claim can land, and the loser
+ * gets the existing record back (the PR reservation cannot close this gap:
+ * `reservePrOperation` treats a second reservation by the SAME task and
+ * operation as idempotent success). A lock failure degrades to `claimed`
+ * exactly like the unconditional writer, so a broken lock never strands the
+ * retry lane.
+ */
+export async function claimConflictRepair(input: RecordConflictRepairInput): Promise<ConflictRepairClaim> {
+	try {
+		const result = await mutateWorkspaceState<ConflictRepairClaim>(input.workspacePath, (state) => {
+			const found = findTaskLocation(state.board, input.taskId.trim());
+			const existing = found?.task.conflictRepair;
+			if (
+				found !== null &&
+				existing !== undefined &&
+				existing.status === "dispatched" &&
+				existing.prKey === input.record.prKey &&
+				existing.headSha === input.record.headSha
+			) {
+				return { board: state.board, value: { status: "duplicate" as const, existing }, save: false };
+			}
+			const applied = recordConflictRepairOnBoard(state.board, input.taskId, input.record);
+			return {
+				board: applied.board,
+				value: { status: "claimed" as const },
+				save: applied.changed,
+			};
+		});
+		return result.value;
+	} catch (error) {
+		logWorkspaceEvent(
+			`conflict-repair claim failed task=${input.taskId} error=${
+				error instanceof Error ? error.message : String(error)
+			}`,
+		);
+		// Degrade to sending without durable dedupe (same contract as the
+		// unconditional writer): a lock failure must never strand the repair.
+		return { status: "claimed" };
+	}
+}

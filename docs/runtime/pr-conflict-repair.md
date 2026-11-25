@@ -64,19 +64,30 @@ human-readable `error`) before any side effect:
 
 Delivery: native Cline via the shared task-chat sender (`mode: "act"`,
 `source: "automated"`); Pi via the prepared-repair paste with the shared
-model-capacity gate (`sendPreparedPiRepair`). The PR reservation is held for
-the dispatch window only (acquire → record → send → release in all
-outcomes); the repair turn itself re-checks the remote before pushing.
+model-capacity gate (`sendPreparedPiRepair`). The dispatch record is claimed
+compare-and-set **before** the PR reservation is taken (see below), and the
+reservation is then held for the dispatch window only (acquire → send →
+release in all outcomes); the repair turn itself re-checks the remote before
+pushing.
 
 ### Dispatch record and restart safety
 
 `card.conflictRepair` (`prKey`, `headSha`, `dispatchedAt`, `status`,
 `error?`) is server-owned (`mergeServerOwnedConflictRepair` in
-`src/state/workspace-state.ts`), written **before** the send so a second
-click in any tab sees it, keyed by head SHA: after a successful repair push
-the head changes and the record naturally expires on the next read. It is
-never replayed after a restart — it only explains the state; a fresh click
-against the current head is what retries.
+`src/state/workspace-state.ts`). The claim is a **compare-and-set under the
+workspace lock** (`claimConflictRepair`): it refuses to overwrite an
+outstanding `dispatched` record for the same PR key and head SHA, so two
+clicks racing in separate tabs can both pass the earlier board read but only
+one can land — the loser is refused with the winner's dispatch time. (The PR
+reservation cannot close this gap: `reservePrOperation` treats a second
+reservation by the same task and operation as an idempotent success.) The
+claim runs before the reservation so a losing call never releases the
+winner's hold. Any failure after the claim — a rejected send, a thrown send,
+an unexpected throw — settles the record as `failed`, keeping the retry lane
+open for the same head. It is never replayed after a restart — it only
+explains the state; a fresh click against the current head is what retries.
+After a successful repair push the head SHA changes, so the record
+naturally expires on the next read.
 
 ## Prompt template
 
@@ -105,7 +116,8 @@ interpolator (`src/core/prompt-template-interpolation.ts`):
   and cached background probe behavior.
 - `test/runtime/pr-tracking/conflict-prompt.test.ts` — renderer rules.
 - `test/runtime/pr-tracking/conflict-repair-dispatch.test.ts` — guard
-  ordering, reservation, both delivery lanes, dispatch record.
+  ordering, reservation, both delivery lanes, concurrent-click claim, thrown-
+  send failure record.
 - `web-ui/src/components/detail-panels/task-pull-request-row.test.tsx` —
   the CTA contract (unknown → Re-check; conflicting → Resolve; dispatched →
   disabled with the reason; failed → retry allowed).

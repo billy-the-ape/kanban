@@ -26,7 +26,7 @@ import { checkTaskLaunchRequirements } from "../core/task-launch-requirements";
 import { checkoutHasGitOperationInProgress, checkoutHasUnmergedIndexEntries } from "../workspace/git-operation-state";
 import { runGit } from "../workspace/git-utils";
 import { parseGitRemoteRepository } from "../workspace/pr-merge-probe";
-import { recordConflictRepair } from "../workspace/task-conflict-repair";
+import { claimConflictRepair, recordConflictRepair } from "../workspace/task-conflict-repair";
 import { describeMissingConflictPromptToken, renderConflictRepairPrompt } from "./conflict-prompt";
 import { toCanonicalPrKey } from "./pr-key-parsing";
 import { getCardLinkedPrKeys, resolveCardAutomationPrKey } from "./pr-owner-selection";
@@ -79,6 +79,10 @@ const UNSERVABLE_AGENT_MESSAGE =
 
 function formatDispatchedAt(timestamp: number): string {
 	return new Date(timestamp).toLocaleTimeString();
+}
+
+function alreadyDispatchedMessage(dispatchedAt: number): string {
+	return `A conflict-repair turn was already dispatched for this head at ${formatDispatchedAt(dispatchedAt)}. Wait for it to finish, or press again after the head changes.`;
 }
 
 /** The card link matching a canonical PR key (null when unlinked/unparseable). */
@@ -159,6 +163,10 @@ export function createConflictRepairService(deps: ConflictRepairServiceDeps): Co
 		});
 		let reservationHeld = false;
 		let reservationReleased = false;
+		// Hoisted so the catch can settle a claimed-but-never-sent dispatch as
+		// failed; otherwise the head stays locked behind `already_dispatched`.
+		let claimWritten = false;
+		let pendingDispatchRecord: RuntimeTaskConflictRepairRecord | null = null;
 		const releaseReservation = async (): Promise<void> => {
 			if (!reservationHeld || reservationReleased) {
 				return;
@@ -173,6 +181,25 @@ export function createConflictRepairService(deps: ConflictRepairServiceDeps): Co
 				deps.warn?.(
 					`[pr-conflict] reservation release failed pr=${input.prKey} error=${
 						error instanceof Error ? error.message : String(error)
+					}`,
+				);
+			}
+		};
+		/**
+		 * Settles a written dispatch record as failed (best effort — the record
+		 * writer itself never throws) so the retry lane stays open for this head.
+		 */
+		const markDispatchFailed = async (record: RuntimeTaskConflictRepairRecord, error: string): Promise<void> => {
+			try {
+				await recordConflictRepair({
+					workspacePath: scope.workspacePath,
+					taskId: input.taskId,
+					record: { ...record, status: "failed", error },
+				});
+			} catch (markError) {
+				deps.warn?.(
+					`[pr-conflict] failed to settle dispatch record task=${input.taskId} error=${
+						markError instanceof Error ? markError.message : String(markError)
 					}`,
 				);
 			}
@@ -356,16 +383,60 @@ export function createConflictRepairService(deps: ConflictRepairServiceDeps): Co
 					`No configured Git remote carries ${headRepository}, so a normal push could not reach the PR head. Add the remote (fork heads need their own remote) and try again.`,
 				);
 			}
-			// Duplicate-click dedupe keyed by head SHA: a second click while a
-			// dispatch for THIS head is outstanding is refused with its time.
+			// Duplicate-click dedupe keyed by head SHA. This early read is only a
+			// fast path for the honest message; the durable truth is the
+			// compare-and-set claim below (two tabs can both pass here, and the PR
+			// reservation is idempotent per task + operation, so it cannot close
+			// this window either).
 			const prior = card.conflictRepair;
 			if (prior?.status === "dispatched" && prior.prKey === input.prKey && prior.headSha === snapshot.headSha) {
-				return fail(
-					"already_dispatched",
-					`A conflict-repair turn was already dispatched for this head at ${formatDispatchedAt(prior.dispatchedAt)}. Wait for it to finish, or press again after the head changes.`,
-					{ headSha: snapshot.headSha, dispatchedAt: prior.dispatchedAt },
-				);
+				return fail("already_dispatched", alreadyDispatchedMessage(prior.dispatchedAt), {
+					headSha: snapshot.headSha,
+					dispatchedAt: prior.dispatchedAt,
+				});
 			}
+			const template = await deps.getConflictPromptTemplate(scope);
+			const rendered = renderConflictRepairPrompt(template, {
+				prUrl: link.url,
+				repository: link.repository,
+				headBranch: snapshot.headRef,
+				baseBranch: snapshot.baseRef,
+				headSha: snapshot.headSha,
+				baseSha: snapshot.baseSha ?? null,
+				cardBaseRef: card.baseRef,
+				taskWorktreePath: worktreePath,
+			});
+			if (!rendered.ok) {
+				const detail =
+					rendered.missing.length > 0
+						? rendered.missing.map((token) => describeMissingConflictPromptToken(token)).join(" ")
+						: "The conflict prompt template rendered empty. Restore the default template in settings.";
+				return fail("prompt_invalid", detail);
+			}
+			const dispatchedAt = now();
+			const dispatchRecord: RuntimeTaskConflictRepairRecord = {
+				prKey: input.prKey,
+				headSha: snapshot.headSha,
+				dispatchedAt,
+				status: "dispatched",
+			};
+			pendingDispatchRecord = dispatchRecord;
+			// The claim IS the dedupe: it re-checks the current card under the
+			// workspace lock, so two concurrent clicks against the same head can
+			// never both send. It happens BEFORE the reservation so a losing call
+			// never touches (and never releases) the winner's hold.
+			const claim = await claimConflictRepair({
+				workspacePath: scope.workspacePath,
+				taskId: input.taskId,
+				record: dispatchRecord,
+			});
+			if (claim.status === "duplicate") {
+				return fail("already_dispatched", alreadyDispatchedMessage(claim.existing.dispatchedAt), {
+					headSha: snapshot.headSha,
+					dispatchedAt: claim.existing.dispatchedAt,
+				});
+			}
+			claimWritten = true;
 			// PR reservation: the browser, the CLI, and deterministic delivery
 			// must never race the PR while a dispatch is being accepted. Held
 			// only for the dispatch window (the repair turn itself re-checks the
@@ -385,54 +456,19 @@ export function createConflictRepairService(deps: ConflictRepairServiceDeps): Co
 				},
 			);
 			if (reservation.status !== "reserved") {
-				return fail(
-					"pr_reserved",
-					reservation.detail ?? "Another operation holds this PR right now. Try again once it releases.",
-				);
+				// The claim is already visible on the card; settle it as failed so
+				// this head stays retryable.
+				const error = reservation.detail ?? "Another operation holds this PR right now.";
+				await markDispatchFailed(dispatchRecord, error);
+				await deps.broadcastWorkspaceUpdated?.(scope);
+				return fail("pr_reserved", `${error} Try again once it releases.`);
 			}
 			reservationHeld = true;
-			const template = await deps.getConflictPromptTemplate(scope);
-			const rendered = renderConflictRepairPrompt(template, {
-				prUrl: link.url,
-				repository: link.repository,
-				headBranch: snapshot.headRef,
-				baseBranch: snapshot.baseRef,
-				headSha: snapshot.headSha,
-				baseSha: snapshot.baseSha ?? null,
-				cardBaseRef: card.baseRef,
-				taskWorktreePath: worktreePath,
-			});
-			if (!rendered.ok) {
-				const detail =
-					rendered.missing.length > 0
-						? rendered.missing.map((token) => describeMissingConflictPromptToken(token)).join(" ")
-						: "The conflict prompt template rendered empty. Restore the default template in settings.";
-				await releaseReservation();
-				return fail("prompt_invalid", detail);
-			}
-			const dispatchedAt = now();
-			const dispatchRecord: RuntimeTaskConflictRepairRecord = {
-				prKey: input.prKey,
-				headSha: snapshot.headSha,
-				dispatchedAt,
-				status: "dispatched",
-			};
-			// The record is set BEFORE the send so a concurrent second click in
-			// any tab sees it.
-			await recordConflictRepair({
-				workspacePath: scope.workspacePath,
-				taskId: input.taskId,
-				record: dispatchRecord,
-			});
 			const send = effectiveAgentId === "pi" ? deps.sendPiMessage : deps.sendClineMessage;
 			const response = await send(scope, input.taskId, rendered.prompt);
 			if (!response.ok) {
 				const error = response.error ?? "The repair turn could not be delivered.";
-				await recordConflictRepair({
-					workspacePath: scope.workspacePath,
-					taskId: input.taskId,
-					record: { ...dispatchRecord, status: "failed", error },
-				});
+				await markDispatchFailed(dispatchRecord, error);
 				await releaseReservation();
 				await deps.broadcastWorkspaceUpdated?.(scope);
 				return fail("send_failed", error);
@@ -449,8 +485,16 @@ export function createConflictRepairService(deps: ConflictRepairServiceDeps): Co
 				error: null,
 			};
 		} catch (error) {
-			await releaseReservation();
 			const message = error instanceof Error ? error.message : String(error);
+			// A claimed-but-never-sent dispatch (a rejected send, a Pi call that
+			// threw, any unexpected failure after the claim) must settle the
+			// record as failed — otherwise the head stays locked behind
+			// `already_dispatched` forever.
+			if (claimWritten && pendingDispatchRecord !== null) {
+				await markDispatchFailed(pendingDispatchRecord, `Conflict repair dispatch failed: ${message}`);
+				await deps.broadcastWorkspaceUpdated?.(scope);
+			}
+			await releaseReservation();
 			deps.warn?.(`[pr-conflict] dispatch failed task=${input.taskId} error=${message}`);
 			return fail("send_failed", `Conflict repair dispatch failed: ${message}`);
 		}

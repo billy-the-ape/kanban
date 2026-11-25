@@ -72,8 +72,10 @@ export function parseGitRemoteRepository(url: string): { host: string; repositor
 		return { host: host.toLowerCase(), repository: repository.replace(/\/+$/, "") };
 	}
 	// scp-like syntax: [user@]host:owner/repo(.git) — the colon separates the
-	// host from the path, which distinguishes it from a local path.
-	const scp = trimmed.match(/^(?:[^@/]+@)?([^:/\\s]+):(.+?)(?:\.git)?\/?$/);
+	// host from the path, which distinguishes it from a local path. (Inside a
+	// regex literal `\s` is whitespace; `\\s` would be a literal backslash and
+	// would silently reject hosts containing an "s".)
+	const scp = trimmed.match(/^(?:[^@/]+@)?([^:/\s]+):(.+?)(?:\.git)?\/?$/);
 	if (scp) {
 		const host = scp[1];
 		const repository = scp[2];

@@ -133,6 +133,7 @@ interface HarnessOptions {
 	commentRepairInFlight?: boolean;
 	autoMergeAttempting?: boolean;
 	sendFails?: boolean;
+	sendThrows?: boolean;
 	template?: string;
 	worktreePath?: string | null;
 }
@@ -174,6 +175,9 @@ function createHarness(options: HarnessOptions = {}) {
 		commentRepairInFlight: () => options.commentRepairInFlight === true,
 		getEffectiveTaskAgentId: async () => (options.agentId ?? "cline") as never,
 		sendClineMessage: async (_scope, _taskId, prompt) => {
+			if (options.sendThrows === true) {
+				throw new Error("send exploded");
+			}
 			sends.push(prompt);
 			return options.sendFails === true
 				? ({
@@ -564,5 +568,37 @@ describe("conflict-repair dispatch", () => {
 		expect(result.ok).toBe(false);
 		expect(result.reason).toBe("prompt_invalid");
 		expect(harness.sends).toHaveLength(0);
+	});
+
+	it("sends exactly one turn for two concurrent clicks on the same head", async () => {
+		// The fast-path dedupe is a check-then-act and the PR reservation is
+		// idempotent per task + operation; the compare-and-set claim under the
+		// workspace lock is what makes two simultaneous tabs safe.
+		const harness = createHarness();
+		await harness.seedRecord();
+		const [first, second] = await Promise.all([harness.dispatch(), harness.dispatch()]);
+		const results = [first, second];
+		expect(results.filter((result) => result.ok)).toHaveLength(1);
+		const loser = results.find((result) => !result.ok);
+		expect(loser?.reason).toBe("already_dispatched");
+		expect(harness.sends).toHaveLength(1);
+		expect(harness.cardNow()?.conflictRepair).toMatchObject({ status: "dispatched" });
+	});
+
+	it("a thrown send settles the record as failed and the retry lane stays open", async () => {
+		const harness = createHarness({ sendThrows: true });
+		await harness.seedRecord();
+		const result = await harness.dispatch();
+		expect(result.ok).toBe(false);
+		expect(result.reason).toBe("send_failed");
+		if (result.ok) return;
+		expect(result.error).toContain("send exploded");
+		expect(harness.cardNow()?.conflictRepair).toMatchObject({ status: "failed" });
+		// The stuck-on-`dispatched` wedge the failure record prevents: a fresh
+		// click still reaches the send lane instead of `already_dispatched`.
+		const retried = await harness.dispatch();
+		expect(retried.reason).toBe("send_failed");
+		expect(harness.sends).toHaveLength(0);
+		expect(harness.cardNow()?.conflictRepair).toMatchObject({ status: "failed" });
 	});
 });

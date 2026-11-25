@@ -165,6 +165,13 @@ describe("parseGitRemoteRepository", () => {
 			host: "github.com",
 			repository: "Octo/Repo",
 		});
+		// The scp host class must be real whitespace exclusion (`\\s` in a
+		// regex literal is backslash + "s", which silently rejected every host
+		// containing an "s" and made fork heads look un-pushable).
+		expect(parseGitRemoteRepository("git@ssh.github.com:Octo/Repo.git")).toEqual({
+			host: "ssh.github.com",
+			repository: "Octo/Repo",
+		});
 		expect(parseGitRemoteRepository("https://ghe.example.com/team/app.git")).toEqual({
 			host: "ghe.example.com",
 			repository: "team/app",
