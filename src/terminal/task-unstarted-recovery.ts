@@ -165,19 +165,34 @@ export async function assessUnstartedTaskRecovery(
 	if (summaries.some((summary) => summary.state === "running")) {
 		return refuse("The task session is already running.");
 	}
+	// An `interrupted` record is written only for a process Kanban itself ran
+	// (shutdown, stale-record recovery, a killed PTY), and it belongs to Restore —
+	// relaunching here would open a second conversation over one that is waiting to
+	// be resumed. Both halves of the pair matter: the state is what
+	// `isDetachedPiRestoreCandidate` keys on, and the review reason is what the
+	// Cline adapters and the PTY exit path write alongside it.
+	const interrupted = summaries.some(
+		(summary) => summary.state === "interrupted" || summary.reviewReason === "interrupted",
+	);
+	if (interrupted) {
+		neverLaunched = false;
+		return refuse("This task has an agent conversation to restore; use Restore instead of relaunching.");
+	}
 	const reviewed = summaries.find(
 		(summary) => summary.state === "awaiting_review" && summary.reviewReason !== "error",
 	);
 	if (reviewed) {
 		neverLaunched = false;
-		return refuse(
-			reviewed.reviewReason === "interrupted"
-				? "This task has an agent conversation to restore; use Restore instead of relaunching."
-				: "The task session finished and is waiting for review.",
-		);
+		return refuse("The task session finished and is waiting for review.");
 	}
 
 	if (!canProbeAgentConversation(input.agentId) || !input.hasAgentConversation) {
+		// Without proof that the conversation is empty, "nothing ever ran" is not
+		// knowable. A Claude task that ran and whose *relaunch* then failed looks
+		// exactly like a never-started one here, because the failure paths reset
+		// `startedAt`, so claiming it never started would mislabel the card and
+		// unlock prompt editing on a task that has real work behind it.
+		neverLaunched = false;
 		return refuse(
 			`${input.agentId} sessions cannot be proven empty, so this task cannot be relaunched in place. Open a terminal for this task and start the agent by hand, or move the card back to Backlog to start a fresh task.`,
 		);

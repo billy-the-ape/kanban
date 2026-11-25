@@ -202,7 +202,16 @@ function createMergeCompletion(
 function createTestDeps(options: CreateTestDepsOptions = {}) {
 	let board = options.board ?? createBoard();
 	const receipts = options.receipts ?? new Map<string, RuntimeGitDeliveryReceipt | null>();
-	const startedTasks: Array<{ taskId: string; baseRef: string; prompt: string; taskTitle: string }> = [];
+	const startedTasks: Array<{
+		taskId: string;
+		baseRef: string;
+		prompt: string;
+		taskTitle: string;
+		agentId?: RuntimeAgentId;
+		startInPlanMode?: boolean;
+		images?: RuntimeBoardCard["images"];
+		clineSettings?: RuntimeBoardCard["clineSettings"];
+	}> = [];
 	let stateUpdateCount = 0;
 	const config = {
 		taskDispatchPolicy: { enabled: options.enabled ?? true, workerLimit: options.workerLimit ?? 1 },
@@ -877,6 +886,35 @@ describe("dispatchReadyTasks", () => {
 		const record = await readTaskDispatchRecord("b");
 		expect(record?.status).toBe("failed");
 		expect(record?.attempt).toBe(1);
+	});
+
+	it("starts the card's own agent and plan flag, not the workspace default", async () => {
+		// AA-UNSUPPORTED: the queue used to forward only the prompt and `mode: "act"`,
+		// so it validated one launch and performed another. A claude card asking for
+		// plan mode under a Pi default passed the guard and launched Pi in Act mode —
+		// the silent plan-to-act downgrade this change exists to prevent — while a pi
+		// card under a claude default was blocked over a setting the real launch
+		// would have honored. Both guards now see the same configuration.
+		const board = createBoard({
+			cardsByColumn: {
+				backlog: [createCard("b", { agentId: "claude" as RuntimeAgentId, startInPlanMode: true })],
+				done: [createCard("a")],
+			},
+			dependencies: [createDependency("dep-b-a", "b", "a")],
+		});
+		const { deps, startedTasks } = createTestDeps({
+			board,
+			receipts: deliveredReceipts(),
+			// The project default cannot do what the card asked for.
+			selectedAgentId: "pi" as RuntimeAgentId,
+		});
+
+		const response = await dispatchReadyTasks(deps);
+
+		expect(response.dispatchedTaskId).toBe("b");
+		expect(startedTasks).toHaveLength(1);
+		expect(startedTasks[0]?.agentId).toBe("claude");
+		expect(startedTasks[0]?.startInPlanMode).toBe(true);
 	});
 
 	it("refuses an unsupportable card before any dispatch side effect", async () => {

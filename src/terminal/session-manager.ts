@@ -188,6 +188,53 @@ function formatSpawnFailure(binary: string, error: unknown): string {
 	return `Failed to launch "${binary}": ${message}`;
 }
 
+/**
+ * The summary patch a launch that never produced a process writes.
+ *
+ * Two shapes on purpose:
+ *
+ * - A **new** launch has nothing left to protect, so the record becomes a failure
+ *   the card, the detail view and a diagnostics download can all still show after
+ *   the toast is gone (`warningMessage`). `externalSessionId` is deliberately
+ *   kept: it is the id the agent itself reported for this card and the only
+ *   handle for resuming that exact conversation, and a failed launch destroyed
+ *   the attempt, not the agent's record.
+ * - A **restore** attempt must leave the prior record alone. `interrupted` (plus
+ *   its pid, checkpoints and last output) is the only evidence that a Pi
+ *   conversation exists to reattach: overwriting it with `failed` makes
+ *   `isDetachedPiRestoreCandidate` false for good, every later Restore answers
+ *   "No interrupted Pi process exists", and the settled-record path can then
+ *   archive a worktree whose JSONL is still intact. A transient failure in the
+ *   restore path must not consume the card's ability to recover.
+ */
+function launchFailurePatch(
+	isRestoreAttempt: boolean,
+	request: StartTaskSessionRequest,
+	message: string,
+): Partial<RuntimeTaskSessionSummary> {
+	if (isRestoreAttempt) {
+		return { warningMessage: message };
+	}
+	return {
+		state: "failed",
+		agentId: request.agentId,
+		workspacePath: request.cwd,
+		pid: null,
+		startedAt: null,
+		lastOutputAt: null,
+		reviewReason: "error",
+		exitCode: null,
+		lastHookAt: null,
+		latestHookActivity: null,
+		latestTurnCheckpoint: null,
+		previousTurnCheckpoint: null,
+		// No live attempt to own hook events after a failed launch.
+		launchAttemptId: null,
+		launchProvenance: null,
+		warningMessage: message,
+	};
+}
+
 function formatShellSpawnFailure(binary: string, error: unknown): string {
 	const message = error instanceof Error ? error.message : String(error);
 	const normalized = message.toLowerCase();
@@ -399,29 +446,11 @@ export class TerminalSessionManager implements TerminalSessionService {
 			});
 		} catch (error) {
 			terminalStateMirror.dispose();
-			const summary = updateSummary(entry, {
-				state: "failed",
-				agentId: request.agentId,
-				workspacePath: request.cwd,
-				pid: null,
-				startedAt: null,
-				lastOutputAt: null,
-				reviewReason: "error",
-				exitCode: null,
-				lastHookAt: null,
-				latestHookActivity: null,
-				latestTurnCheckpoint: null,
-				previousTurnCheckpoint: null,
-				launchAttemptId: null,
-				launchProvenance: null,
-				// `externalSessionId` is deliberately kept: it is the id the agent itself
-				// reported for this card, and the only thing that lets a later resume name
-				// that exact conversation. A failed preparation destroyed the launch, not
-				// the agent's session record, so clearing it here would silently turn the
-				// next resume into a brand-new conversation (mirroring the spawn-failure
-				// path below, which never touched it).
-				warningMessage: formatTaskLaunchFailureMessage("adapter-preparation", formatErrorText(error)),
-			});
+			const preparedFailure = formatTaskLaunchFailureMessage("adapter-preparation", formatErrorText(error));
+			const summary = updateSummary(
+				entry,
+				launchFailurePatch(request.restoreDetachedSession === true, request, preparedFailure),
+			);
 			this.emitSummary(summary);
 			logTaskLaunchFailure({
 				taskId: request.taskId,
@@ -595,26 +624,10 @@ export class TerminalSessionManager implements TerminalSessionService {
 			}
 			terminalStateMirror.dispose();
 			const spawnFailure = formatSpawnFailure(commandBinary, error);
-			const summary = updateSummary(entry, {
-				state: "failed",
-				agentId: request.agentId,
-				workspacePath: request.cwd,
-				pid: null,
-				startedAt: null,
-				lastOutputAt: null,
-				reviewReason: "error",
-				exitCode: null,
-				lastHookAt: null,
-				latestHookActivity: null,
-				latestTurnCheckpoint: null,
-				previousTurnCheckpoint: null,
-				// No live attempt to own hook events after a failed spawn.
-				launchAttemptId: null,
-				launchProvenance: null,
-				// The formatted reason survives on the card so the failure is still
-				// readable after the toast disappears.
-				warningMessage: spawnFailure,
-			});
+			const summary = updateSummary(
+				entry,
+				launchFailurePatch(request.restoreDetachedSession === true, request, spawnFailure),
+			);
 			this.emitSummary(summary);
 			logTaskLaunchFailure({
 				taskId: request.taskId,

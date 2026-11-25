@@ -13,6 +13,7 @@ vi.mock("../../../src/terminal/pty-session.js", () => ({
 	},
 }));
 
+import { isDetachedPiRestoreCandidate } from "../../../src/terminal/pi-session-restore";
 import { TerminalSessionManager } from "../../../src/terminal/session-manager";
 
 function createSummary(overrides: Partial<RuntimeTaskSessionSummary> = {}): RuntimeTaskSessionSummary {
@@ -139,6 +140,59 @@ describe("TerminalSessionManager launch failures (AA-UNSUPPORTED)", () => {
 		expect(loggedLines()).toContain("task-launch-failed task=task-2");
 		expect(loggedLines()).toContain("stage=process-spawn");
 		expect(loggedLines()).toContain("agent=claude");
+	});
+
+	it("keeps a restorable Pi record when a restore attempt cannot be prepared", async () => {
+		// A restore that never got to spawn is a transient failure, not a new
+		// session. Overwriting the record made `isDetachedPiRestoreCandidate` false
+		// for good, so every later Restore answered "No interrupted Pi process
+		// exists" and the settled-record path could archive a worktree whose
+		// conversation file was still intact.
+		const manager = new TerminalSessionManager();
+		manager.hydrateFromRecord({
+			"task-5": createSummary({
+				taskId: "task-5",
+				agentId: "pi",
+				state: "interrupted",
+				reviewReason: "interrupted",
+				pid: null,
+				startedAt: 1_700_000_000_000,
+				lastOutputAt: 1_700_000_000_500,
+				externalSessionId: "sess-5",
+				latestTurnCheckpoint: {
+					turn: 1,
+					ref: "refs/kanban/checkpoints/task-5",
+					commit: "a".repeat(40),
+					createdAt: 1,
+				},
+			}),
+		});
+
+		await expect(
+			manager.startTaskSession({
+				taskId: "task-5",
+				agentId: "pi",
+				binary: "pi",
+				args: [],
+				cwd: "/tmp/worktree",
+				prompt: "",
+				restoreDetachedSession: true,
+				// Refused by the Pi adapter during preparation.
+				startInPlanMode: true,
+			}),
+		).rejects.toThrow(/plan mode/i);
+
+		const summary = manager.getSummary("task-5");
+		expect(summary?.state).toBe("interrupted");
+		expect(summary?.startedAt).toBe(1_700_000_000_000);
+		expect(summary?.lastOutputAt).toBe(1_700_000_000_500);
+		expect(summary?.latestTurnCheckpoint?.turn).toBe(1);
+		// The card keeps its Restore lane...
+		expect(isDetachedPiRestoreCandidate(summary)).toBe(true);
+		// ...and the failed attempt is still reported.
+		expect(summary?.warningMessage).toMatch(/plan mode/i);
+		expect(loggedLines()).toContain("task-launch-failed task=task-5");
+		expect(loggedLines()).toContain("stage=adapter-preparation");
 	});
 
 	it("keeps the agent's own session id when preparation fails", async () => {

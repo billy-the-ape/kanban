@@ -155,13 +155,50 @@ describe("unstarted task recovery assessment (AA-UNSUPPORTED)", () => {
 	});
 
 	it("points an interrupted session at Restore instead of a second conversation", async () => {
+		// `state: "interrupted"` is the shape Kanban actually writes when it loses a
+		// live process (shutdown coordinator, stale-record recovery, killed PTY) and
+		// the shape `isDetachedPiRestoreCandidate` accepts. Matching only the review
+		// reason left every real record eligible for a relaunch over a conversation
+		// Restore owns.
 		const assessment = await assess({
 			terminal: createTerminal(
-				createSummary({ state: "awaiting_review", reviewReason: "interrupted", startedAt: 1 }),
+				createSummary({
+					agentId: "pi",
+					state: "interrupted",
+					reviewReason: "interrupted",
+					pid: null,
+					startedAt: 1_700_000_000_000,
+				}),
 			),
 		});
 		expect(assessment.recoverable).toBe(false);
 		expect(assessment.reason).toContain("Restore");
+		expect(assessment.neverLaunched).toBe(false);
+	});
+
+	it("does not call a task never launched when its conversation cannot be probed", async () => {
+		// Claude (and Codex/Droid/Kiro/Gemini) resume "the latest session", so nothing
+		// proves a conversation is absent. A task that ran and whose relaunch then
+		// failed is indistinguishable from a never-started one — the failure paths
+		// reset `startedAt` — so claiming otherwise would mislabel the card and free
+		// the prompt editor on a task with real work behind it.
+		const assessment = await assess({
+			agentId: "claude" as UnstartedTaskRecoveryInput["agentId"],
+			hasAgentConversation: undefined,
+			terminal: createTerminal(
+				createSummary({
+					agentId: "claude",
+					state: "failed",
+					reviewReason: "error",
+					startedAt: null,
+					pid: null,
+					warningMessage: "Could not start the agent process: boom",
+				}),
+			),
+		});
+		expect(assessment.recoverable).toBe(false);
+		expect(assessment.reason).toContain("cannot be proven empty");
+		expect(assessment.neverLaunched).toBe(false);
 	});
 
 	it("guards the native Cline record that lives outside the terminal manager", async () => {

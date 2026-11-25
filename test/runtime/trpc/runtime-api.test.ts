@@ -4926,8 +4926,9 @@ describe("createRuntimeApi launch guard (AA-UNSUPPORTED)", () => {
 	});
 
 	it("does not call an interrupted Pi session an unstarted task", async () => {
-		// An interrupted record keeps the pid it ran with; Restore owns that card, and
-		// a "start with saved prompt" action would begin a second conversation.
+		// `state: "interrupted"` is what shutdown and stale recovery actually write,
+		// and what the restore guard accepts; a "start with saved prompt" action on
+		// that card would begin a second conversation over the one waiting to resume.
 		const baselineSha = "052739f929e4e956162fef2f333422c9ac7c31f6";
 		initialStartMocks.readTaskInitialStartRecord.mockResolvedValue(
 			createInitialStartRecord("task-1", baselineSha) as never,
@@ -4942,7 +4943,7 @@ describe("createRuntimeApi launch guard (AA-UNSUPPORTED)", () => {
 			const terminalManager = createPiTerminalManager(
 				createSummary({
 					agentId: "pi",
-					state: "awaiting_review",
+					state: "interrupted",
 					reviewReason: "interrupted",
 					pid: null,
 					startedAt: 1_700_000_000_000,

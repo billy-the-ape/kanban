@@ -30,6 +30,10 @@ are refused instead of dropped.
 
 ## Where the check runs
 
+The queue is a full launch entry point, not a lighter one: the settings it checks
+are the settings it sends, so a dispatched plan-mode card is a plan launch and a
+card whose agent differs from the project default starts on its own agent.
+
 The rule is enforced at every entry point that can start an agent, and always
 *before* the first side effect (base refresh, worktree creation, the move to In
 Progress, model-slot admission, process spawn):
@@ -38,7 +42,7 @@ Progress, model-slot admission, process spawn):
 | --- | --- |
 | Manual Start / Start in progress / resume | `startTaskSession` in [`src/trpc/runtime-api.ts`](../src/trpc/runtime-api.ts) |
 | Unstarted-task relaunch | the recovery pre-check in the same function |
-| Dispatch queue | `dispatchSingleTask` in [`src/task-dispatch/task-dispatch-service.ts`](../src/task-dispatch/task-dispatch-service.ts) |
+| Dispatch queue | `dispatchSingleTask` in [`src/task-dispatch/task-dispatch-service.ts`](../src/task-dispatch/task-dispatch-service.ts), launching through `dispatchSessionInput` so the queued start carries the card's own `agentId`, plan mode, attachments and Cline settings |
 | Terminal launch | the agent adapter in [`src/terminal/agent-session-adapters.ts`](../src/terminal/agent-session-adapters.ts) |
 | Browser form | `use-task-editor.ts` + `task-setting-notices.ts` (disables the option, shows the reason) |
 
@@ -61,8 +65,17 @@ Anything that stops a launch records itself twice:
 
 Capacity waits and cancellations are deliberately **not** failures: a start queued for a
 model slot is an idle record with no pid plus a `PiInitialTurnCapacityGate` wait, an
-interrupted launch keeps its `interrupted` review reason so Restore still applies, and a
-user Stop is recorded as an exit, not an error.
+interrupted launch keeps its `interrupted` state so Restore still applies, and a user
+Stop is recorded as an exit, not an error.
+
+A **failed restore** writes no failure state at all. `state: "interrupted"` (plus its
+pid, turn checkpoints and last output) is the only evidence that a Pi conversation
+exists to reattach; rewriting it to `failed` would make `isDetachedPiRestoreCandidate`
+false forever, so every later Restore answers "No interrupted Pi process exists" and the
+settled-record path may archive a worktree whose conversation file is intact. The
+attempt is recorded as `warningMessage` and in the log line, and the record is otherwise
+left alone (`launchFailurePatch` in
+[`src/terminal/session-manager.ts`](../src/terminal/session-manager.ts)).
 
 ## A prepared worktree with no session is not "paused"
 
@@ -72,11 +85,17 @@ answers two separate questions, and both are surfaced in the task detail view:
 
 - **`neverLaunched`** — no active process, no session that ever started, and no
   agent-side conversation. This is what distinguishes "nothing ran" from an ordinary
-  idle, paused or interrupted card.
+  idle, paused or interrupted card. It is only claimed when the absence of a
+  conversation can actually be *probed*: Cline and Pi keep their conversations in
+  Kanban-readable state, while the CLI agents resume "the latest session", so a Claude
+  task whose relaunch failed is indistinguishable from a never-started one (the failure
+  paths reset `startedAt`) and is reported as a failed session instead.
 - **`recoverable`** — the stored prompt can be re-sent safely **in place**. Every
   condition below must hold, otherwise the answer explains what to do instead:
   - the task has a prompt and an agent, and its saved settings are supported;
-  - no process, no running session, and no finished session awaiting review;
+  - no process, no running session, no finished session awaiting review, and no
+    `interrupted` record — the state Kanban writes when it loses a live process, which
+    `isDetachedPiRestoreCandidate` keys on and which belongs to Restore;
   - the agent can prove it has no conversation to duplicate (Cline: no recoverable
     session and no assistant message; Pi: no session file under its Kanban-minted id).
     An agent that cannot be probed is refused rather than guessed at;

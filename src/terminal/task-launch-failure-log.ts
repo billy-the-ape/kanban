@@ -83,8 +83,9 @@ export function formatTaskLaunchFailureMessage(stage: TaskLaunchStage, detail: s
 			return `Could not start the agent process: ${detail}`;
 		case "capacity-admission":
 			return `Could not admit this task to the model queue: ${detail}`;
+		// Both already read as one actionable sentence to the user; re-wrapping them
+		// would only repeat the same sentence twice.
 		case "settings-validation":
-			return detail;
 		case "recovery-precheck":
 			return detail;
 		case "worktree-preparation":

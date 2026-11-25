@@ -1170,7 +1170,7 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		try {
 			const card = await loadBoardCardById(workspaceScope, body.taskId);
 			const scopedRuntimeConfig = await deps.loadScopedRuntimeConfig(workspaceScope);
-			const agentId = card?.agentId ?? scopedRuntimeConfig.selectedAgentId ?? null;
+			const agentId = card?.agentId ?? scopedRuntimeConfig.selectedAgentId;
 			const assessment = await assessUnstartedTaskRecoveryForScope(workspaceScope, body.taskId, card, agentId);
 			const lookupSession = await createTaskSessionLookup(workspaceScope);
 			const session = lookupSession(body.taskId);
@@ -1250,13 +1250,30 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 				}
 				return (await mergeCompletionCache).get(taskId) ?? null;
 			},
-			startSession: async ({ taskId, baseRef, prompt, taskTitle }) => {
+			startSession: async ({
+				taskId,
+				baseRef,
+				prompt,
+				taskTitle,
+				agentId,
+				startInPlanMode,
+				images,
+				clineSettings,
+			}) => {
+				// AA-UNSUPPORTED: the queued start carries the same card settings the
+				// dispatch guard checked, so the queue launches what it vetted. `mode` is
+				// deliberately left out to match the browser's Start: the plan request is
+				// expressed by `startInPlanMode`, and the hardcoded "act" here was what
+				// turned a dispatched plan-mode card into an Act session.
 				const request: RuntimeTaskSessionStartRequest = {
 					taskId,
 					baseRef,
 					prompt,
 					taskTitle,
-					mode: "act",
+					agentId,
+					startInPlanMode,
+					images,
+					clineSettings,
 				};
 				const response = await startTaskSession(workspaceScope, request);
 				return response.ok && response.summary

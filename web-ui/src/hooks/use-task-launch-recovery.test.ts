@@ -51,6 +51,12 @@ describe("mayHaveUnstartedLaunch (AA-UNSUPPORTED)", () => {
 		expect(
 			mayHaveUnstartedLaunch({
 				columnId: "review",
+				sessionSummary: { state: "interrupted", pid: null, reviewReason: "interrupted" },
+			}),
+		).toBe(false);
+		expect(
+			mayHaveUnstartedLaunch({
+				columnId: "in_progress",
 				sessionSummary: { state: "awaiting_review", pid: null, reviewReason: "interrupted" },
 			}),
 		).toBe(false);

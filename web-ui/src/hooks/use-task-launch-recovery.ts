@@ -90,5 +90,12 @@ export function mayHaveUnstartedLaunch(input: {
 	if (summary.state === "running" || summary.pid !== null) {
 		return false;
 	}
+	// `interrupted` is the state Kanban writes for a process it lost (shutdown,
+	// stale-record recovery), and it is what `isDetachedPiRestoreCandidate` keys on:
+	// that card belongs to Restore, so asking the recovery question — and offering
+	// a relaunch over a conversation waiting to be resumed — would be wrong.
+	if (summary.state === "interrupted" || summary.reviewReason === "interrupted") {
+		return false;
+	}
 	return !(summary.state === "awaiting_review" && summary.reviewReason !== "error");
 }
