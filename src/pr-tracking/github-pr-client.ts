@@ -7,9 +7,11 @@
 // conversation comments are fetched with complete pagination; a snapshot is
 // only complete when every page succeeds (a partial API failure cannot
 // dispatch). Bot policy (foundation): nonempty submitted review bodies and
-// inline feedback from human and bot accounts are eligible; empty/
-// approval-only review events, unpublished reviews, resolved threads, and
-// bot conversation/status chatter are ignored.
+// inline feedback from human and bot accounts are eligible; empty review
+// events, anything an approval published (its body and the inline comments it
+// carried), a reviewer's own bodies their later approval retired,
+// unpublished reviews, resolved threads, and bot conversation/status chatter
+// are ignored.
 import { createHash } from "node:crypto";
 import { runGhCommand } from "../workspace/git-delivery";
 import type { PrFeedbackEvent } from "./feedback-fingerprint";
@@ -285,23 +287,46 @@ async function fetchResolvedInlineCommentIds(
 	return { ids, complete: false, error: `Review threads: exceeded the ${MAX_PAGES}-page limit` };
 }
 
-function mapReviews(entries: ReviewEntry[]): PrFeedbackEvent[] {
-	const events: PrFeedbackEvent[] = [];
-	// A later approval supersedes that reviewer's earlier change-request body,
-	// never another reviewer's requests or unresolved inline threads.
-	const decisions = new Map<string, ReviewEntry>();
+/**
+ * Epoch milliseconds of each reviewer's latest submitted approval, keyed by
+ * login. An approval is that reviewer's verdict on the pull request, so it
+ * retires the review bodies they submitted earlier (a change request *or* a
+ * plain comment: the approval is their current stance on both). Approvals
+ * without a parseable `submitted_at` retire nothing, and an approval never
+ * retires another reviewer's requests or a body submitted at/after it.
+ */
+function latestApprovalAtByReviewer(entries: readonly ReviewEntry[]): Map<string, number> {
+	const approvals = new Map<string, number>();
 	for (const entry of entries) {
 		const author = entry.user?.login;
-		if (typeof author !== "string" || (entry.state !== "APPROVED" && entry.state !== "CHANGES_REQUESTED")) continue;
-		const previous = decisions.get(author);
-		if (!previous || toEpochMs(entry.submitted_at) >= toEpochMs(previous.submitted_at)) decisions.set(author, entry);
-	}
-	for (const entry of entries) {
-		const decision = typeof entry.user?.login === "string" ? decisions.get(entry.user.login) : undefined;
-		if (entry.state === "APPROVED" || (entry.state === "CHANGES_REQUESTED" && decision?.state === "APPROVED"))
+		if (typeof author !== "string" || entry.state !== "APPROVED") {
 			continue;
-		// PENDING (unpublished) and DISMISSED reviews are never eligible;
-		// empty bodies (including approval-only events) are ignored.
+		}
+		const submittedAt = toEpochMs(entry.submitted_at);
+		if (submittedAt === 0) {
+			continue;
+		}
+		if (submittedAt > (approvals.get(author) ?? 0)) {
+			approvals.set(author, submittedAt);
+		}
+	}
+	return approvals;
+}
+
+function mapReviews(entries: ReviewEntry[]): PrFeedbackEvent[] {
+	const events: PrFeedbackEvent[] = [];
+	const approvals = latestApprovalAtByReviewer(entries);
+	for (const entry of entries) {
+		const approvedAt = typeof entry.user?.login === "string" ? (approvals.get(entry.user.login) ?? 0) : 0;
+		// A body submitted at or after the reviewer's own latest approval stays
+		// eligible; only strictly-earlier bodies are retired by that verdict, and
+		// an unparseable submission time is never treated as earlier.
+		const submittedAt = toEpochMs(entry.submitted_at);
+		if (entry.state === "APPROVED" || (approvedAt > 0 && submittedAt > 0 && submittedAt < approvedAt)) {
+			continue;
+		}
+		// PENDING (unpublished) and DISMISSED reviews are never eligible; empty
+		// review bodies are ignored.
 		if (typeof entry.state !== "string" || entry.state === "PENDING" || entry.state === "DISMISSED") {
 			continue;
 		}
@@ -338,14 +363,39 @@ function pendingReviewIds(entries: ReviewEntry[]): Set<number> {
 	return ids;
 }
 
+/**
+ * Ids of submitted approving reviews. The inline comments published *inside*
+ * an approval (`gh pr review --approve -b`, the submit-review mutation, or the
+ * review box's "Approve" submission) are notes from a reviewer who approved the
+ * change rather than a request for work, so they never schedule a repair. Only
+ * the comments carried by that approval are excluded: another reviewer's
+ * unresolved inline comments, and every comment under a change request or plain
+ * comment review, stay eligible.
+ */
+function approvingReviewIds(entries: ReviewEntry[]): Set<number> {
+	const ids = new Set<number>();
+	for (const entry of entries) {
+		if (entry.state === "APPROVED" && typeof entry.id === "number") {
+			ids.add(entry.id);
+		}
+	}
+	return ids;
+}
+
 function mapInlineComments(
 	entries: InlineCommentEntry[],
 	resolvedIds: Set<number>,
 	draftReviewIds: Set<number>,
+	approvalIds: Set<number>,
 ): PrFeedbackEvent[] {
 	const events: PrFeedbackEvent[] = [];
 	for (const entry of entries) {
 		if (typeof entry.id !== "number" || resolvedIds.has(entry.id)) {
+			continue;
+		}
+		// An inline comment published inside an approval is a non-blocking note
+		// from a reviewer who approved the change, not a request for work.
+		if (typeof entry.pull_request_review_id === "number" && approvalIds.has(entry.pull_request_review_id)) {
 			continue;
 		}
 		// The authenticated user's own draft comments are returned by this
@@ -519,7 +569,12 @@ export function createGitHubPrClient(
 				htmlUrl: typeof metadata.html_url === "string" ? metadata.html_url : null,
 				events: [
 					...mapReviews(reviews.items),
-					...mapInlineComments(inlineComments.items, resolved.ids, pendingReviewIds(reviews.items)),
+					...mapInlineComments(
+						inlineComments.items,
+						resolved.ids,
+						pendingReviewIds(reviews.items),
+						approvingReviewIds(reviews.items),
+					),
 					...mapConversationComments(conversationComments.items),
 				],
 			};
