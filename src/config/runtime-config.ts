@@ -174,9 +174,11 @@ export const DEFAULT_CONFLICT_PROMPT_TEMPLATE = `Resolve merge conflicts for the
 
 PR: {{pr_url}}
 Repository: {{repository}}
-Head branch: {{head_branch}}
-Base branch: {{base_branch}}
-Task card base ref: {{base_ref}}
+Head branch: '{{head_branch}}'
+Base branch: '{{base_branch}}'
+Task card base ref: '{{base_ref}}'
+Kanban only ever names branches built from [A-Za-z0-9._/@+-]; still, quote
+every branch name below when you use it in a shell command.
 The card's own base ref may differ from the PR base branch named above; the PR base branch wins for this repair.
 Known remote head: {{head_sha}}   Known remote base: {{base_sha}}
 

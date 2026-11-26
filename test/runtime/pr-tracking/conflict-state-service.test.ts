@@ -5,6 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GitHubPrMetadataSnapshot } from "../../../src/core/api-contract";
 import {
+	CONFLICT_PROBE_TTL_MS,
 	type ConflictStateQuery,
 	type ConflictStateServiceDeps,
 	createConflictStateService,
@@ -58,17 +59,20 @@ function step(ok: boolean, stdout = "", exitCode = ok ? 0 : 128): ProbeStepResul
 	} as ProbeStepResult;
 }
 
+/** Scripted merge-probe answer: fetch succeeds, merge-tree conflicts. */
+function conflictingStep(args: string[]): ProbeStepResult {
+	if (args[0] === "check-ref-format") return step(true);
+	if (args[0] === "rev-parse" && args[1] === "HEAD") return step(true, "headshead\n");
+	if (args[0] === "remote") return step(true, "origin\n");
+	if (args[0] === "fetch") return step(true);
+	if (args[0] === "rev-parse") return step(true, "basetipsha\n");
+	if (args[0] === "merge-tree") return step(false, "tree\nCONFLICT (content): file.ts\n", 1);
+	return step(true);
+}
+
 /** A merge-tree-shaped fake runner: fetch succeeds, merge-tree conflicts. */
 function conflictingProbeRunner(): MergeProbeRunner {
-	return vi.fn(async (_cwd: string, args: string[]) => {
-		if (args[0] === "check-ref-format") return step(true);
-		if (args[0] === "rev-parse" && args[1] === "HEAD") return step(true, "headshead\n");
-		if (args[0] === "remote") return step(true, "origin\n");
-		if (args[0] === "fetch") return step(true);
-		if (args[0] === "rev-parse") return step(true, "basetipsha\n");
-		if (args[0] === "merge-tree") return step(false, "tree\nCONFLICT (content): file.ts\n", 1);
-		return step(true);
-	}) as unknown as MergeProbeRunner;
+	return vi.fn(async (_cwd: string, args: string[]) => conflictingStep(args)) as unknown as MergeProbeRunner;
 }
 
 let nowValue = 100_000;
@@ -196,5 +200,56 @@ describe("conflict-state service", () => {
 			host: "gitlab.com",
 		});
 		expect(conflict.state).toBe("unsupported");
+	});
+
+	it("keeps the last completed probe visible while a TTL re-probe runs", async () => {
+		// Regression: the TTL re-probe used to blank the only answer a
+		// snapshot-less PR had, flipping Resolve conflicts back to Re-check
+		// every CONFLICT_PROBE_TTL_MS for the duration of the git work.
+		await seed(null);
+		// A gate the fake runner waits on while armed; disarming lets every
+		// already-started probe stream through.
+		let gateArmed = false;
+		let gatePromise: Promise<void> = Promise.resolve();
+		let gateRelease: (() => void) | undefined;
+		const armGate = () => {
+			gatePromise = new Promise<void>((resolve) => {
+				gateRelease = resolve;
+			});
+			gateArmed = true;
+		};
+		const releaseGate = () => {
+			gateArmed = false;
+			gateRelease?.();
+		};
+		const runner = vi.fn(async (_cwd: string, args: string[]) => {
+			if (gateArmed) {
+				await gatePromise;
+			}
+			return conflictingStep(args);
+		}) as unknown as MergeProbeRunner;
+		const { service } = createService({ probeRunner: runner });
+
+		// First probe: honest unknown while nothing is known yet.
+		armGate();
+		expect((await service.compute(baseQuery)).state).toBe("unknown");
+		releaseGate();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		// Completed view answers from the cache.
+		const settled = await service.compute(baseQuery);
+		expect(settled).toMatchObject({ state: "conflicting", source: "local_probe" });
+
+		// TTL expiry re-probes in the background WITHOUT blanking the answer.
+		nowValue += CONFLICT_PROBE_TTL_MS + 1;
+		armGate();
+		const during = await service.compute(baseQuery);
+		expect(during).toMatchObject({ state: "conflicting", source: "local_probe" });
+		// ...and the in-flight re-probe is still visible on the NEXT read.
+		const stillDuring = await service.compute(baseQuery);
+		expect(stillDuring.state).toBe("conflicting");
+		releaseGate();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect((await service.compute(baseQuery)).state).toBe("conflicting");
 	});
 });

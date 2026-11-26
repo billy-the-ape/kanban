@@ -163,9 +163,15 @@ export function createConflictStateService(deps: ConflictStateServiceDeps): Conf
 		if (snapshot === null && query.active) {
 			const cacheKey = `${query.workspaceId}|${query.taskId}|${query.prKey}`;
 			const cached = probeCache.get(cacheKey);
-			if (cached !== undefined && !cached.inFlight) {
+			// A TTL re-probe keeps the LAST COMPLETED view visible: without a
+			// provider snapshot the probe answer is the only knowledge the panel
+			// has, and dropping it for the duration of a re-probe (a fetch plus
+			// merge-tree, up to 30s per git call) would flip Resolve conflicts
+			// back to Re-check every TTL. The initial in-flight placeholder is
+			// told apart by completedAt === 0 and reports honest unknown.
+			if (cached !== undefined && (!cached.inFlight || cached.completedAt > 0)) {
 				probe = { ...cached.view, checkedAt: cached.view.checkedAt ?? cached.completedAt };
-				if (now() - cached.completedAt > CONFLICT_PROBE_TTL_MS) {
+				if (!cached.inFlight && now() - cached.completedAt > CONFLICT_PROBE_TTL_MS) {
 					runProbe(query, cacheKey, cached.completedAt);
 				}
 			} else if (cached === undefined) {

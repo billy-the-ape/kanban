@@ -81,6 +81,14 @@ function formatDispatchedAt(timestamp: number): string {
 	return new Date(timestamp).toLocaleTimeString();
 }
 
+/**
+ * Kanban's safe branch-name set. Stricter than `git check-ref-format` on
+ * purpose: check-ref-format accepts shell metacharacters, and these values
+ * are interpolated into the repair prompt for an agent that has push rights
+ * and typically executes commands through a shell.
+ */
+const SAFE_BRANCH_NAME_PATTERN = /^[A-Za-z0-9._/@+-]+$/;
+
 function alreadyDispatchedMessage(dispatchedAt: number): string {
 	return `A conflict-repair turn was already dispatched for this head at ${formatDispatchedAt(dispatchedAt)}. Wait for it to finish, or press again after the head changes.`;
 }
@@ -371,7 +379,19 @@ export function createConflictRepairService(deps: ConflictRepairServiceDeps): Co
 			if (headRepository === null || !/^[^\s/]+\/[^\s/]+$/.test(headRepository)) {
 				return fail("invalid_ref", "The PR head repository could not be verified from the provider metadata.");
 			}
+			// Conservative allow-list BEFORE check-ref-format: Git's own check
+			// accepts shell metacharacters (`;`, `&`, `|`, backtick — verified
+			// against git 2.x), and both refs are interpolated into a prompt the
+			// agent may run through a shell (`git push <remote> HEAD:refs/heads/
+			// <branch>`). A fork PR author controls headRef, so only a charset
+			// that cannot compose a command is allowed to name the branch.
 			for (const ref of [headRef, baseRef]) {
+				if (!SAFE_BRANCH_NAME_PATTERN.test(ref)) {
+					return fail(
+						"invalid_ref",
+						`The branch name ${ref} contains characters outside Kanban's safe branch set, so the repair prompt cannot name it.`,
+					);
+				}
 				const valid = await runGitStep(worktreePath, ["check-ref-format", `refs/heads/${ref}`]);
 				if (!valid.ok) {
 					return fail("invalid_ref", `The branch name ${ref} is not a valid Git ref on this checkout.`);

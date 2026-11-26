@@ -451,6 +451,26 @@ describe("conflict-repair dispatch", () => {
 		expect(result.error).toContain("contributor/fork");
 	});
 
+	it("refuses branch names that could break out of the agent's shell commands", async () => {
+		// git check-ref-format ACCEPTS shell metacharacters (`;`, `&`, `|`,
+		// backtick — verified against the installed git), and the prompt tells
+		// the agent to push by branch name. The dispatch allow-list must refuse
+		// before the prompt ever names such a branch.
+		for (const headRef of ["x;touch pwned", "b`id`", "a&&curl", "f$(x)", "r|s"]) {
+			const harness = createHarness({ snapshot: makeSnapshot({ headRef }) });
+			await harness.seedRecord();
+			const result = await harness.dispatch();
+			expect(result.ok).toBe(false);
+			expect(result.reason).toBe("invalid_ref");
+			expect(harness.sends).toHaveLength(0);
+			expect(harness.cardNow()?.conflictRepair ?? null).toBeNull();
+		}
+		// The conservative set still admits real-world branch names.
+		const okBranch = createHarness({ snapshot: makeSnapshot({ headRef: "feature/two@v1.2+fix_3" }) });
+		await okBranch.seedRecord();
+		expect((await okBranch.dispatch()).ok).toBe(true);
+	});
+
 	it("holds the PR reservation against other operations for the dispatch window", async () => {
 		const harness = createHarness();
 		await harness.seedRecord();

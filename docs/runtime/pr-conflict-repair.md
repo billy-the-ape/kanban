@@ -27,7 +27,9 @@ force-push anywhere in this lane.
   deletes it afterwards: the working tree, index, and HEAD are never
   touched. Results are cached per (workspace, task, PR) for
   `CONFLICT_PROBE_TTL_MS` and refreshed in the background — the response
-  never blocks on git.
+  never blocks on git, and the last completed view stays displayed while a
+  TTL re-probe is in flight (blanking it would flip the row back to
+  Re-check every TTL).
 - **Never green, never red, on inference.** Probe results carry
   `source: "local_probe"`; a local *clean* renders as `unknown` (merge-tree
   follows local merge drivers, rename heuristics and LFS pointers, and
@@ -56,7 +58,7 @@ human-readable `error`) before any side effect:
 | `writer_active` | the card's own agent still holds the writer |
 | `comment_repair_pending` | a comment-repair turn is queued/running for the same PR/session |
 | `auto_merge_attempting` | the fenced auto-merge executor is writing to this PR |
-| `no_snapshot` / `pr_not_open` / `native_auto_merge` / `head_unknown` / `clean_merge` / `invalid_ref` / `no_head_remote` | provider re-verification immediately before dispatch (head re-read included) |
+| `no_snapshot` / `pr_not_open` / `native_auto_merge` / `head_unknown` / `clean_merge` / `invalid_ref` / `no_head_remote` | provider re-verification immediately before dispatch (head re-read included); `invalid_ref` additionally enforces a conservative branch allow-list (`[A-Za-z0-9._/@+-]`) because `git check-ref-format` accepts shell metacharacters and the refs name a push command in a prompt an agent with push rights may run through a shell |
 | `already_dispatched` | a repair is outstanding for this PR **and head SHA** (refusal carries the dispatch time) |
 | `pr_reserved` | another operation holds the PR reservation |
 | `prompt_invalid` | the template renders empty or a required token has no value |
@@ -104,8 +106,11 @@ interpolator (`src/core/prompt-template-interpolation.ts`):
 - Unknown `{{tokens}}` are left untouched.
 - Every value is sanitized (line breaks collapsed, length-capped) because
   branch names and provider strings are untrusted text entering a turn that
-  has push rights. The hard refusals (no force-push, no merges, no bypass)
-  also live in the dispatch guards, since operators may edit the template.
+  has push rights; branch refs that reach the prompt are additionally gated
+  by the dispatch allow-list, and the default template quotes the branch
+  placeholders as a second layer. The hard refusals (no force-push, no
+  merges, no bypass) also live in the dispatch guards, since operators may
+  edit the template.
 
 ## Test surfaces
 
