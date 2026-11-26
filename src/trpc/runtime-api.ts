@@ -604,10 +604,11 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 		return recovery;
 	};
 
-	// Bookkeeping a successful native chat send performs after a recovery start,
-	// shared with that path through `persistAcceptedPrompt`/`classifySentPrLinks`.
-	// It records the accepted prompt preview and classifies PR links. Neither
-	// hook may turn an accepted recovery into a failure, so both stay defensive.
+	// Bookkeeping a recovery start shares with a successful native chat send: the
+	// `persistAcceptedPrompt`/`classifySentPrLinks` helpers, which record the
+	// accepted prompt preview and classify PR links. Neither helper may turn an
+	// accepted recovery into a failure, so both stay defensive and their errors
+	// are swallowed here.
 	const recordUnstartedRecoverySend = async (
 		workspaceScope: RuntimeTrpcWorkspaceScope,
 		body: RuntimeTaskChatSendRequest,
@@ -2392,9 +2393,10 @@ export function createRuntimeApi(deps: CreateRuntimeApiDependencies): RuntimeTrp
 						workspaceId: workspaceScope.workspaceId,
 						taskId: body.taskId,
 						manager: terminalManager,
-						// Pi resolves its own endpoint and model, so the follow-up joins the
-						// same pool the start used (both read Pi's own settings).
-						target: await resolvePiTurnTarget(),
+						// The follow-up joins the pool the CLI's own start joined. Pi takes its
+						// model from `--model`/`--provider`, so the launch argv — not the settings
+						// read now — decides which per-model budget applies.
+						target: await resolvePiTurnTarget(terminalManager.getLaunchArgs(body.taskId) ?? []),
 						run: async () => {
 							const written = terminalManager.writeInput(body.taskId, Buffer.from(payloadText, "utf8"));
 							if (!written) {

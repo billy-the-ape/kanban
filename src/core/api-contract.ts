@@ -3695,6 +3695,12 @@ export type AutoMergeEligibilityResult = z.infer<typeof autoMergeEligibilityResu
 export const AUTO_MERGE_ELIGIBILITY_SUMMARY_MAX_CODES = 10;
 
 /**
+ * Cap on one persisted blocker message (shared with the evaluator, which truncates
+ * to exactly this many characters so a long diagnostic never fails validation).
+ */
+export const AUTO_MERGE_ELIGIBILITY_SUMMARY_MAX_MESSAGE_LENGTH = 1000;
+
+/**
  * The small eligibility summary/diagnostic persisted on the task binding
  * (a projection of the full result; at most this summary).
  */
@@ -3706,7 +3712,11 @@ export const autoMergeEligibilitySummarySchema = z
 		codes: z.array(z.string().min(1)).max(AUTO_MERGE_ELIGIBILITY_SUMMARY_MAX_CODES),
 		/** Bounded diagnostic messages; absent on summaries written by older runtimes. */
 		blockers: z
-			.array(autoMergeEligibilityBlockerSchema.extend({ message: z.string().min(1).max(1000) }))
+			.array(
+				autoMergeEligibilityBlockerSchema.extend({
+					message: z.string().min(1).max(AUTO_MERGE_ELIGIBILITY_SUMMARY_MAX_MESSAGE_LENGTH),
+				}),
+			)
 			.max(AUTO_MERGE_ELIGIBILITY_SUMMARY_MAX_CODES)
 			.optional(),
 		evaluatedAt: z.number(),

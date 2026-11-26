@@ -347,14 +347,15 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				prepare,
 				// An automated PR feedback turn is a Pi coding turn like any other: it
 				// takes its place behind the shared per-model budget rather than
-				// silently running a third request against the model.
+				// silently running a third request against the model. The launch argv keeps
+				// it in the pool its own CLI started in.
 				capacity: async ({ taskId: repairTaskId, manager: repairManager, onNotRun, run }) => {
 					await sharedPiModelCapacityGate.request({
 						kind: "turn",
 						workspaceId: scope.workspaceId,
 						taskId: repairTaskId,
 						manager: repairManager,
-						target: await resolvePiTurnTarget(),
+						target: await resolvePiTurnTarget(repairManager.getLaunchArgs(repairTaskId) ?? []),
 						onNotRun,
 						run,
 					});
@@ -437,15 +438,15 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				// The conflict prompt is fully rendered server-side; no per-turn
 				// feedback capture is needed, so the preparation is static.
 				prepare: async () => prompt,
-				// A conflict-repair turn is a Pi coding turn like any other: it
-				// waits behind the shared per-model budget.
+				// A conflict-repair turn is a Pi coding turn like any other: it waits
+				// behind the shared per-model budget, in the pool its own CLI started in.
 				capacity: async ({ taskId: repairTaskId, manager: repairManager, onNotRun, run }) => {
 					await sharedPiModelCapacityGate.request({
 						kind: "turn",
 						workspaceId: scope.workspaceId,
 						taskId: repairTaskId,
 						manager: repairManager,
-						target: await resolvePiTurnTarget(),
+						target: await resolvePiTurnTarget(repairManager.getLaunchArgs(repairTaskId) ?? []),
 						onNotRun,
 						run,
 					});

@@ -85,7 +85,6 @@ export async function claimConflictRepair(input: RecordConflictRepairInput): Pro
 			const found = findTaskLocation(state.board, input.taskId.trim());
 			const existing = found?.task.conflictRepair;
 			if (
-				found !== null &&
 				existing !== undefined &&
 				existing.status === "dispatched" &&
 				existing.prKey === input.record.prKey &&

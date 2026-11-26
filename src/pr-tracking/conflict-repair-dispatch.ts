@@ -28,6 +28,7 @@ import { runGit } from "../workspace/git-utils";
 import { parseGitRemoteRepository } from "../workspace/pr-merge-probe";
 import { claimConflictRepair, recordConflictRepair } from "../workspace/task-conflict-repair";
 import { describeMissingConflictPromptToken, renderConflictRepairPrompt } from "./conflict-prompt";
+import { latestSnapshotFromRecord } from "./pr-conflict-state";
 import { toCanonicalPrKey } from "./pr-key-parsing";
 import { getCardLinkedPrKeys, resolveCardAutomationPrKey } from "./pr-owner-selection";
 import type { PrRecordStoreBase } from "./pr-record-store";
@@ -335,7 +336,7 @@ export function createConflictRepairService(deps: ConflictRepairServiceDeps): Co
 					);
 				}
 			}
-			const storedSnapshot = record ? latestSnapshot(record.snapshots) : null;
+			const storedSnapshot = latestSnapshotFromRecord(record);
 			const snapshot: GitHubPrMetadataSnapshot | null = refreshed
 				? ((await latestFromStore()) ?? storedSnapshot)
 				: storedSnapshot;
@@ -344,7 +345,7 @@ export function createConflictRepairService(deps: ConflictRepairServiceDeps): Co
 					return null;
 				}
 				const after = await deps.getStore().loadRecord(input.prKey);
-				return after.ok ? latestSnapshot(after.record.snapshots) : null;
+				return after.ok ? latestSnapshotFromRecord(after.record) : null;
 			}
 			if (snapshot === null) {
 				return fail(
@@ -521,15 +522,4 @@ export function createConflictRepairService(deps: ConflictRepairServiceDeps): Co
 	};
 
 	return { resolveTaskPrConflicts };
-}
-
-/** The newest access-scoped snapshot of a record (any scope). */
-function latestSnapshot(snapshots: Record<string, GitHubPrMetadataSnapshot>): GitHubPrMetadataSnapshot | null {
-	let latest: GitHubPrMetadataSnapshot | null = null;
-	for (const snapshot of Object.values(snapshots)) {
-		if (latest === null || snapshot.checkedAt > latest.checkedAt) {
-			latest = snapshot;
-		}
-	}
-	return latest;
 }

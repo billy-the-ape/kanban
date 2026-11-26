@@ -1,7 +1,7 @@
 import { act, useEffect, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
+import { TASK_START_IN_PLAN_MODE_STORAGE_KEY } from "@/hooks/app-utils";
 import { useTaskEditor } from "@/hooks/use-task-editor";
 import type { RuntimeAgentId, RuntimeTaskClineSettings, RuntimeTaskInitialStartStatusResponse } from "@/runtime/types";
 import type { BoardCard, BoardData, TaskAutoReviewMode, TaskImage } from "@/types";
@@ -42,6 +42,9 @@ interface HookSnapshot {
 	newTaskUpdateBaseRefBeforeStart: boolean;
 	setNewTaskUpdateBaseRefBeforeStart: (value: boolean) => void;
 	newTaskAgentId: RuntimeAgentId | undefined;
+	newTaskStartInPlanMode: boolean;
+	isNewTaskStartInPlanModeDisabled: boolean;
+	setNewTaskStartInPlanMode: (value: boolean) => void;
 	newTaskClineSettings: RuntimeTaskClineSettings | undefined;
 	editingTaskId: string | null;
 	editTaskPrompt: string;
@@ -114,6 +117,9 @@ function HookHarness({
 			newTaskUpdateBaseRefBeforeStart: editor.newTaskUpdateBaseRefBeforeStart,
 			setNewTaskUpdateBaseRefBeforeStart: editor.setNewTaskUpdateBaseRefBeforeStart,
 			newTaskAgentId: editor.newTaskAgentId,
+			newTaskStartInPlanMode: editor.newTaskStartInPlanMode,
+			isNewTaskStartInPlanModeDisabled: editor.isNewTaskStartInPlanModeDisabled,
+			setNewTaskStartInPlanMode: editor.setNewTaskStartInPlanMode,
 			newTaskClineSettings: editor.newTaskClineSettings,
 			editingTaskId: editor.editingTaskId,
 			editTaskPrompt: editor.editTaskPrompt,
@@ -156,6 +162,8 @@ function HookHarness({
 		editor.newTaskImages,
 		editor.newTaskBranchRef,
 		editor.newTaskAgentId,
+		editor.newTaskStartInPlanMode,
+		editor.isNewTaskStartInPlanModeDisabled,
 		editor.newTaskClineSettings,
 		editor.setEditTaskAutoReviewEnabled,
 		editor.setEditTaskAutoReviewMode,
@@ -752,5 +760,49 @@ describe("useTaskEditor", () => {
 			autoAddressComments: true,
 			expectedSettingsRevision: 5,
 		});
+	});
+
+	it("masks plan mode for an unsupported agent without discarding the stored preference", async () => {
+		let latestSnapshot: HookSnapshot | null = null;
+		await act(async () => {
+			root.render(
+				<HookHarness
+					initialBoard={createBoard()}
+					onSnapshot={(snapshot) => {
+						latestSnapshot = snapshot;
+					}}
+				/>,
+			);
+		});
+
+		await act(async () => {
+			requireSnapshot(latestSnapshot).setNewTaskStartInPlanMode(true);
+		});
+		expect(localStorage.getItem(TASK_START_IN_PLAN_MODE_STORAGE_KEY)).toBe("true");
+
+		// Pi cannot start in plan mode, so the dialog must not offer it and a create
+		// must not ask for it.
+		await act(async () => {
+			requireSnapshot(latestSnapshot).setNewTaskAgentId("pi");
+			requireSnapshot(latestSnapshot).setNewTaskPrompt("Plan this change");
+		});
+		expect(requireSnapshot(latestSnapshot).isNewTaskStartInPlanModeDisabled).toBe(true);
+		expect(requireSnapshot(latestSnapshot).newTaskStartInPlanMode).toBe(false);
+
+		let createdTaskId: string | null = null;
+		await act(async () => {
+			createdTaskId = requireSnapshot(latestSnapshot).handleCreateTask();
+		});
+		const created = requireSnapshot(latestSnapshot).board.columns[0]?.cards.find((card) => card.id === createdTaskId);
+		expect(created?.startInPlanMode).toBe(false);
+
+		// The preference belongs to the user, not to this one selection: picking Pi
+		// (or defaulting to it) used to overwrite the stored setting for every agent.
+		expect(localStorage.getItem(TASK_START_IN_PLAN_MODE_STORAGE_KEY)).toBe("true");
+		await act(async () => {
+			requireSnapshot(latestSnapshot).setNewTaskAgentId(undefined);
+		});
+		expect(requireSnapshot(latestSnapshot).isNewTaskStartInPlanModeDisabled).toBe(false);
+		expect(requireSnapshot(latestSnapshot).newTaskStartInPlanMode).toBe(true);
 	});
 });

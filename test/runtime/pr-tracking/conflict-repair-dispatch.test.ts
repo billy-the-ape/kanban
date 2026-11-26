@@ -21,6 +21,7 @@ import {
 } from "../../../src/pr-tracking/conflict-repair-dispatch";
 import { InMemoryPrRecordStore } from "../../../src/pr-tracking/in-memory-pr-record-store";
 import { releasePrOperation, reservePrOperation } from "../../../src/pr-tracking/pr-reservations";
+import type * as WorkspaceStateModule from "../../../src/state/workspace-state";
 import { runGit } from "../../../src/workspace/git-utils";
 import { createGitTestEnv } from "../../utilities/git-env";
 import { isolateTestEnvironment } from "../../utilities/test-environment";
@@ -29,7 +30,7 @@ const workspaceStateMocks = vi.hoisted(() => ({
 	mutateWorkspaceState: vi.fn(),
 }));
 vi.mock("../../../src/state/workspace-state", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("../../../src/state/workspace-state")>();
+	const actual = await importOriginal<typeof WorkspaceStateModule>();
 	return { ...actual, mutateWorkspaceState: workspaceStateMocks.mutateWorkspaceState };
 });
 

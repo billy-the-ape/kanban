@@ -10,6 +10,12 @@ import type { AutoMergeEligibilitySummary, RuntimeTaskTrackingStateResponse } fr
 /** Mirrors the server's AUTO_MERGE_MAX_EVIDENCE_AGE_MS (2 minutes). */
 export const AUTO_MERGE_EVIDENCE_BUDGET_MS = 2 * 60 * 1000;
 
+/**
+ * How many blocker messages one status line shows. The server already caps the
+ * persisted summary's messages and codes; this only keeps the detail readable.
+ */
+const MAX_DISPLAYED_BLOCKERS = 10;
+
 export type AutoMergeUiTone = "neutral" | "info" | "success" | "warning" | "danger";
 
 export interface AutoMergeUiStatus {
@@ -213,7 +219,13 @@ export function deriveAutoMergeStatus(
 		};
 	}
 	if (summary.kind === "blocked") {
-		return { label: "blocked", tone: "danger", detail: blockerMessages(summary, 10), verifiedAt, headSha };
+		return {
+			label: "blocked",
+			tone: "danger",
+			detail: blockerMessages(summary, MAX_DISPLAYED_BLOCKERS),
+			verifiedAt,
+			headSha,
+		};
 	}
 	const category = categorizeWaitingCodes(summary.codes);
 	const label =
@@ -224,7 +236,7 @@ export function deriveAutoMergeStatus(
 				: category === "repair"
 					? "waiting: writer/comment repair"
 					: "waiting";
-	const detail = evidenceStale ? "Evidence is stale; re-reading." : blockerMessages(summary, 10);
+	const detail = evidenceStale ? "Evidence is stale; re-reading." : blockerMessages(summary, MAX_DISPLAYED_BLOCKERS);
 	return { label, tone: "neutral", detail, verifiedAt, headSha };
 }
 

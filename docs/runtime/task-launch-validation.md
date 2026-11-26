@@ -64,7 +64,7 @@ Anything that stops a launch records itself twice:
    ([`src/terminal/task-launch-failure-log.ts`](../src/terminal/task-launch-failure-log.ts)).
 
 Capacity waits and cancellations are deliberately **not** failures: a start queued for a
-model slot is an idle record with no pid plus a `PiInitialTurnCapacityGate` wait, an
+model slot is an idle record with no pid plus a `PiModelCapacityGate` wait, an
 interrupted launch keeps its `interrupted` state so Restore still applies, and a user
 Stop is recorded as an exit, not an error.
 

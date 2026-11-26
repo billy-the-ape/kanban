@@ -57,8 +57,7 @@ import type {
 } from "../core/api-contract";
 import { setTaskSelectedAutomationPr, updateTaskPrSettings } from "../core/task-board-mutations";
 import { type AutoMergePolicyStore, normalizeAutoMergeRepository } from "../pr-tracking/auto-merge-policy-store";
-import type { ConflictRepairService } from "../pr-tracking/conflict-repair-dispatch";
-import { findLinkForPrKey } from "../pr-tracking/conflict-repair-dispatch";
+import { type ConflictRepairService, findLinkForPrKey } from "../pr-tracking/conflict-repair-dispatch";
 import type { ConflictStateService } from "../pr-tracking/conflict-state-service";
 import type { PrInstalledConsumers } from "../pr-tracking/pr-consumer-registry";
 import { isTrackingSupportedPr, parseCanonicalPrKey } from "../pr-tracking/pr-identity";

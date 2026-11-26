@@ -49,11 +49,7 @@ export async function hasUnmergedIndexEntries(exec: GitStep): Promise<boolean> {
 	return paths.trim().length > 0;
 }
 
-/**
- * Direct-`runGit` convenience wrappers for callers (like the conflict-repair
- * guard) that own no git helper of their own. A failed probe reports `true`
- * (fail closed): a checkout we cannot inspect is never "clean enough".
- */
+/** Runs one read-only git step in a checkout the caller does not own. */
 async function runStep(cwd: string, args: string[]): Promise<string> {
 	const result = await runGit(cwd, args, {
 		timeoutMs: 10_000,
@@ -65,6 +61,11 @@ async function runStep(cwd: string, args: string[]): Promise<string> {
 	return result.stdout;
 }
 
+/**
+ * Direct-`runGit` convenience wrappers for callers (like the conflict-repair
+ * guard) that own no git helper of their own. A failed probe reports `true`
+ * (fail closed): a checkout we cannot inspect is never "clean enough".
+ */
 export async function checkoutHasGitOperationInProgress(cwd: string): Promise<boolean> {
 	try {
 		return await hasGitOperationInProgress((args) => runStep(cwd, args));

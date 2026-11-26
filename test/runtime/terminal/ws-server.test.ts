@@ -425,6 +425,38 @@ describe("createTerminalWebSocketBridge", () => {
 		await closeSocket(controlSocketB.socket);
 	});
 
+	it("resumes an I/O-only reconnect from its queued bytes without a new restore", async () => {
+		const ioUrl = `${runtimeUrl}/api/terminal/io?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=io-only`;
+		const controlUrl = `${runtimeUrl}/api/terminal/control?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=io-only`;
+		const io = await openQueuedWebSocket(ioUrl);
+		const control = await openQueuedWebSocket(controlUrl);
+		await waitForControlMessage(control, (message) => message.type === "restore");
+		await waitForControlMessage(control, (message) => message.type === "state");
+		control.socket.send(JSON.stringify({ type: "restore_complete" }));
+		terminalManager.emitOutput(TASK_ID, "live-1");
+		await expect(waitForIoMessage(io)).resolves.toEqual(Buffer.from("live-1", "utf8"));
+		expect(control.queue).toHaveLength(0);
+
+		// Only the byte stream drops. The control channel keeps its completed restore,
+		// so the server still knows this viewer is showing a current screen.
+		await closeSocket(io.socket);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		terminalManager.emitOutput(TASK_ID, "during-gap");
+
+		const reconnectedIo = await openQueuedWebSocket(ioUrl);
+		// The bytes written while the stream was down are delivered as soon as it
+		// reopens. Making the viewer wait for a restore it never lost would hold them
+		// until the pending cap evicted it, so the server would depend on which of the
+		// two sockets happens to reconnect first.
+		await expect(waitForIoMessage(reconnectedIo)).resolves.toEqual(Buffer.from("during-gap", "utf8"));
+		expect(control.queue).toHaveLength(0);
+		terminalManager.emitOutput(TASK_ID, "live-2");
+		await expect(waitForIoMessage(reconnectedIo)).resolves.toEqual(Buffer.from("live-2", "utf8"));
+
+		await closeSocket(reconnectedIo.socket);
+		await closeSocket(control.socket);
+	});
+
 	it("never pauses a shared agent PTY when one viewer falls behind", async () => {
 		const ioUrlA = `${runtimeUrl}/api/terminal/io?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=client-a`;
 		const controlUrlA = `${runtimeUrl}/api/terminal/control?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=client-a`;
@@ -462,7 +494,9 @@ describe("createTerminalWebSocketBridge", () => {
 		// A lagging viewer can reconnect without restarting Pi; the server
 		// replays its canonical headless-terminal snapshot first.
 		terminalManager.getRestoreSnapshot.mockResolvedValue({
-			snapshot: "restored-screen", cols: 80, rows: 24,
+			snapshot: "restored-screen",
+			cols: 80,
+			rows: 24,
 		});
 		const restoredIo = await openQueuedWebSocket(ioUrlA);
 		const restoredControl = await openQueuedWebSocket(controlUrlA);
@@ -482,8 +516,7 @@ describe("createTerminalWebSocketBridge", () => {
 
 	it("bounds output waiting for an inactive viewer's initial restore", async () => {
 		const ioUrl = `${runtimeUrl}/api/terminal/io?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=unresponsive`;
-		const controlUrl =
-			`${runtimeUrl}/api/terminal/control?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=unresponsive`;
+		const controlUrl = `${runtimeUrl}/api/terminal/control?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=unresponsive`;
 		const io = await openQueuedWebSocket(ioUrl);
 		const control = await openQueuedWebSocket(controlUrl);
 		await waitForControlMessage(control, (message) => message.type === "restore");
@@ -496,5 +529,4 @@ describe("createTerminalWebSocketBridge", () => {
 		expect(terminalManager.pauseOutput).not.toHaveBeenCalled();
 		expect(terminalManager.resumeOutput).not.toHaveBeenCalled();
 	});
-
 });

@@ -85,18 +85,14 @@ export function createConflictStateService(deps: ConflictStateServiceDeps): Conf
 			return;
 		}
 		lastLazyRefreshAt.set(query.prKey, at);
-		void coordinator
-			.refreshPrMetadataOnce(query.prKey)
-			.then(() => {
-				// The result lands in the durable record; the next panel read sees it.
-			})
-			.catch((error: unknown) => {
-				deps.warn?.(
-					`[pr-conflict] lazy metadata refresh failed pr=${query.prKey} error=${
-						error instanceof Error ? error.message : String(error)
-					}`,
-				);
-			});
+		// The result lands in the durable record; the next panel read sees it.
+		void coordinator.refreshPrMetadataOnce(query.prKey).catch((error: unknown) => {
+			deps.warn?.(
+				`[pr-conflict] lazy metadata refresh failed pr=${query.prKey} error=${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+		});
 	};
 
 	const runProbe = (query: ConflictStateQuery, cacheKey: string, completedAt: number): void => {

@@ -224,6 +224,14 @@ export function useTaskEditor({
 		hasAttachments: newTaskImages.length > 0,
 	});
 	const isNewTaskStartInPlanModeDisabled = newTaskNotices.planModeDisabled;
+	/**
+	 * What a create actually asks for: the stored preference, masked while the
+	 * effective agent cannot honor it. The stored value is deliberately left alone —
+	 * picking Pi (or defaulting to it) must not wipe the plan-mode preference the
+	 * user wants for the agents that support it — and the mask lifts as soon as a
+	 * supported agent is selected again.
+	 */
+	const newTaskStartInPlanModeRequested = !isNewTaskStartInPlanModeDisabled && newTaskStartInPlanMode;
 	const newTaskPlanModeNotice = newTaskNotices.planModeNotice;
 	const newTaskAttachmentsNotice = newTaskNotices.attachmentsNotice;
 
@@ -275,13 +283,6 @@ export function useTaskEditor({
 			setNewTaskBranchRef(resolvedDefaultTaskBranchRef);
 		}
 	}, [isInlineTaskCreateOpen, newTaskBranchRef, resolvedDefaultTaskBranchRef]);
-
-	useEffect(() => {
-		if (!isNewTaskStartInPlanModeDisabled || !newTaskStartInPlanMode) {
-			return;
-		}
-		setNewTaskStartInPlanMode(false);
-	}, [isNewTaskStartInPlanModeDisabled, newTaskStartInPlanMode, setNewTaskStartInPlanMode]);
 
 	useEffect(() => {
 		if (!isEditTaskStartInPlanModeDisabled || !editTaskStartInPlanMode) {
@@ -548,7 +549,7 @@ export function useTaskEditor({
 			const created = addTaskToColumnWithResult(board, "backlog", {
 				title,
 				prompt,
-				startInPlanMode: newTaskStartInPlanMode,
+				startInPlanMode: newTaskStartInPlanModeRequested,
 				autoReviewEnabled: newTaskAutoReviewEnabled,
 				autoReviewMode: newTaskAutoReviewMode,
 				images: newTaskImages,
@@ -564,7 +565,7 @@ export function useTaskEditor({
 			setBoard(created.board);
 			trackTaskCreated({
 				selected_agent_id: toTelemetrySelectedAgentId(newTaskAgentId ?? selectedAgentId),
-				start_in_plan_mode: newTaskStartInPlanMode,
+				start_in_plan_mode: newTaskStartInPlanModeRequested,
 				...(newTaskAutoReviewEnabled ? { auto_review_mode: newTaskAutoReviewMode } : {}),
 				prompt_character_count: prompt.length,
 			});
@@ -597,7 +598,7 @@ export function useTaskEditor({
 			newTaskClineSettings,
 			newTaskImages,
 			newTaskPrompt,
-			newTaskStartInPlanMode,
+			newTaskStartInPlanModeRequested,
 			newTaskUpdateBaseRefBeforeStart,
 			resolvedDefaultTaskBranchRef,
 			selectedAgentId,
@@ -622,7 +623,7 @@ export function useTaskEditor({
 			for (const prompt of validPrompts) {
 				const created = addTaskToColumnWithResult(updatedBoard, "backlog", {
 					prompt,
-					startInPlanMode: newTaskStartInPlanMode,
+					startInPlanMode: newTaskStartInPlanModeRequested,
 					autoReviewEnabled: newTaskAutoReviewEnabled,
 					autoReviewMode: newTaskAutoReviewMode,
 					images: newTaskImages,
@@ -642,7 +643,7 @@ export function useTaskEditor({
 			for (const prompt of validPrompts) {
 				trackTaskCreated({
 					selected_agent_id: toTelemetrySelectedAgentId(newTaskAgentId ?? selectedAgentId),
-					start_in_plan_mode: newTaskStartInPlanMode,
+					start_in_plan_mode: newTaskStartInPlanModeRequested,
 					...(newTaskAutoReviewEnabled ? { auto_review_mode: newTaskAutoReviewMode } : {}),
 					prompt_character_count: prompt.length,
 				});
@@ -675,7 +676,7 @@ export function useTaskEditor({
 			newTaskBranchRef,
 			newTaskClineSettings,
 			newTaskImages,
-			newTaskStartInPlanMode,
+			newTaskStartInPlanModeRequested,
 			newTaskUpdateBaseRefBeforeStart,
 			resolvedDefaultTaskBranchRef,
 			selectedAgentId,
@@ -714,7 +715,9 @@ export function useTaskEditor({
 		setNewTaskPrompt,
 		newTaskImages,
 		setNewTaskImages,
-		newTaskStartInPlanMode,
+		// The masked value (see `newTaskStartInPlanModeRequested`), so an unsupported
+		// selection shows the box cleared while the stored preference survives.
+		newTaskStartInPlanMode: newTaskStartInPlanModeRequested,
 		setNewTaskStartInPlanMode,
 		newTaskAutoReviewEnabled,
 		setNewTaskAutoReviewEnabled,

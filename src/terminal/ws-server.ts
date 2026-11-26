@@ -74,7 +74,7 @@ const OUTPUT_BATCH_INTERVAL_MS = 4;
 const LOW_LATENCY_CHUNK_BYTES = 256;
 const LOW_LATENCY_IDLE_WINDOW_MS = 5;
 // Limits belong to each viewer. If exceeded, discard that viewer's socket;
- // the UI reconnects and obtains a consistent server-side terminal snapshot.
+// the UI reconnects and obtains a consistent server-side terminal snapshot.
 const MAX_VIEWER_UNACKNOWLEDGED_BYTES = 512 * 1024;
 const MAX_VIEWER_PENDING_RESTORE_BYTES = 512 * 1024;
 const MAX_VIEWER_SOCKET_BUFFERED_BYTES = 2 * 1024 * 1024;
@@ -221,11 +221,7 @@ export function createTerminalWebSocketBridge({
 		viewer.controlSocket?.terminate();
 	};
 
-	const createIoOutputState = (
-		ws: WebSocket,
-		streamState: TerminalStreamState,
-		clientId: string,
-	): IoOutputState => {
+	const createIoOutputState = (ws: WebSocket, streamState: TerminalStreamState, clientId: string): IoOutputState => {
 		let pendingOutputChunks: Buffer[] = [];
 		let pendingOutputBytes = 0;
 		let outputFlushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -273,8 +269,7 @@ export function createTerminalWebSocketBridge({
 					sendOutputChunk(chunk);
 					return;
 				}
-				if (unacknowledgedOutputBytes + pendingOutputBytes + chunk.byteLength >
-					MAX_VIEWER_UNACKNOWLEDGED_BYTES) {
+				if (unacknowledgedOutputBytes + pendingOutputBytes + chunk.byteLength > MAX_VIEWER_UNACKNOWLEDGED_BYTES) {
 					evictLaggingViewer(streamState, clientId);
 					return;
 				}
@@ -285,8 +280,7 @@ export function createTerminalWebSocketBridge({
 				}
 			},
 			acknowledgeOutput: (bytes: number) => {
-				unacknowledgedOutputBytes = Math.max(0,
-					unacknowledgedOutputBytes - Math.max(0, Math.floor(bytes)));
+				unacknowledgedOutputBytes = Math.max(0, unacknowledgedOutputBytes - Math.max(0, Math.floor(bytes)));
 			},
 			dispose: () => {
 				disposed = true;
@@ -389,7 +383,11 @@ export function createTerminalWebSocketBridge({
 		viewerState.ioState = createIoOutputState(ws, streamState, clientId);
 		viewerState.ioSocket = ws;
 		viewerState.laggedOut = false;
-		viewerState.restoreComplete = false;
+		// `restoreComplete` is the control channel's promise that the viewer has a
+		// current screen, so only a control connection may revoke it. Revoking it
+		// here would strand an I/O-only reconnect — the bytes produced while the
+		// stream was down are already queued below — until the pending cap evicted
+		// the viewer, and would make the server depend on which socket connects first.
 		viewerState.flushPendingOutput();
 		ensureOutputListener(streamState, taskId, terminalManager);
 		if (previousIoSocket && previousIoSocket !== ws) {

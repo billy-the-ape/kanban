@@ -1991,13 +1991,14 @@ describe("createRuntimeApi startTaskSession", () => {
 		return gate;
 	}
 
-	function createPiTerminalManager(writeInput: ReturnType<typeof vi.fn>) {
+	function createPiTerminalManager(writeInput: ReturnType<typeof vi.fn>, launchArgs: string[] = []) {
 		const piSummary = createSummary({ agentId: "pi", pid: 4242, state: "running" });
 		const marks: Array<{ taskId: string; queuePosition: number | null }> = [];
 		const manager = {
 			getSummary: vi.fn(() => piSummary),
 			hasActiveProcess: vi.fn(() => true),
 			writeInput,
+			getLaunchArgs: vi.fn(() => launchArgs),
 			onSummary: vi.fn(() => () => {}),
 			markTurnCapacityWait: vi.fn((input: { taskId: string; queuePosition?: number | null }) => {
 				marks.push({ taskId: input.taskId, queuePosition: input.queuePosition ?? null });
@@ -2034,6 +2035,36 @@ describe("createRuntimeApi startTaskSession", () => {
 		// configured for two.
 		expect(writeInput).not.toHaveBeenCalled();
 		expect(marks).toEqual([{ taskId: "task-1", queuePosition: 1 }]);
+	});
+
+	it("puts a Pi follow-up in the model pool its own CLI selected", async () => {
+		// A user-supplied `--model` selects a different per-model budget than Pi's
+		// settings. Resolving the follow-up from the defaults read now would put the
+		// turn in the wrong pool: here the default pool is full and the session's own
+		// model is free, so only the launch argv lets the turn run at once.
+		const gate = await busyPiCapacity();
+		const writeInput = vi.fn(() => createSummary({ agentId: "pi", pid: 4242 }));
+		const { manager, marks } = createPiTerminalManager(writeInput, ["--model", "qwen-coder"]);
+
+		const api = createTestRuntimeApi({
+			piCapacityGate: gate,
+			getActiveWorkspaceId: vi.fn(() => "workspace-1"),
+			loadScopedRuntimeConfig: vi.fn(async () => createRuntimeConfigState()),
+			setActiveRuntimeConfig: vi.fn(),
+			getScopedTerminalManager: vi.fn(async () => manager as never),
+			getScopedClineTaskSessionService: vi.fn(async () => createClineTaskSessionServiceMock() as never),
+			resolveInteractiveShellCommand: vi.fn(),
+			runCommand: vi.fn(),
+		});
+
+		const response = await api.sendTaskSessionInput(
+			{ workspaceId: "workspace-1", workspacePath: "/tmp/repo" },
+			{ taskId: "task-1", text: "keep going", appendNewline: true },
+		);
+
+		expect(response.ok).toBe(true);
+		expect(writeInput).toHaveBeenCalledWith("task-1", Buffer.from("keep going\n", "utf8"));
+		expect(marks).toEqual([]);
 	});
 
 	it("queues the lone Enter that submits a pasted Pi prompt", async () => {
