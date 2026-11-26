@@ -33,11 +33,20 @@ enabled, and do not use auto-merge as evidence that every comment was fixed.
 
 ## Eligibility and approvals
 
-Approval review bodies never trigger a repair, including approvals containing text.
-A reviewer's later submitted approval supersedes their earlier change-request review
-body. It does not erase other reviewers' requests, conversation feedback, or unresolved
-inline comments, including inline comments attached to an approving review. Approvals
-are not a mergeability verdict; auto-merge and merge-candidate UI are outside this change.
+An approval is a verdict, never a request for work, so nothing an approval published ever
+triggers a repair: neither its review body (including approvals containing text) nor the
+inline comments submitted inside it (`gh pr review --approve -b`, the submit-review
+mutation, or an **Approve** submission that carried review comments).
+
+A reviewer's later submitted approval also retires the review bodies that same reviewer
+submitted earlier, whether they requested changes or only commented. It retires nothing
+else: a body submitted at or after their own approval stays eligible, and so does another
+reviewer's request, human conversation feedback, or an unresolved inline comment attached
+to a change-request or plain-comment review, the approving reviewer's own included.
+Resolving a thread remains the reviewer's call.
+
+Approvals are not a mergeability verdict; auto-merge and merge-candidate UI are outside
+this change.
 
 ## Queuing and execution
 

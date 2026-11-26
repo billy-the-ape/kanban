@@ -370,4 +370,142 @@ describe("approval filtering and captured feedback context", () => {
 		expect(snapshot.complete).toBe(true);
 		expect(snapshot.events).toEqual([]);
 	});
+	it("excludes every inline comment an approval published, keeping the rest", async () => {
+		// The real reviewer workflow approves while leaving non-blocking nits as
+		// inline comments inside the approving review; none of that may schedule
+		// a repair, while another reviewer's feedback still does.
+		const snapshot = await clientWith(
+			makeRunner(
+				baseRoutes({
+					reviews: [
+						{
+							id: 1,
+							state: "COMMENTED",
+							body: "One thing to change",
+							submitted_at: "2026-10-01T00:00:00Z",
+							user: { login: "carol", type: "User" },
+						},
+						{
+							id: 2,
+							state: "APPROVED",
+							body: "Approving: two nits below",
+							submitted_at: "2026-10-02T00:00:00Z",
+							user: { login: "github-actions[bot]", type: "Bot" },
+						},
+					],
+					inline: [
+						{
+							id: 3,
+							body: "nit: rename this local",
+							updated_at: "2026-10-02T00:00:00Z",
+							pull_request_review_id: 2,
+							user: { login: "github-actions[bot]", type: "Bot" },
+						},
+						{
+							id: 4,
+							body: "Unresolved request",
+							updated_at: "2026-10-01T00:00:00Z",
+							pull_request_review_id: 1,
+							user: { login: "carol", type: "User" },
+						},
+					],
+					conversation: [
+						{
+							id: 5,
+							body: "Please also update the docs",
+							updated_at: "2026-10-02T00:00:00Z",
+							user: { login: "carol", type: "User" },
+						},
+					],
+				}),
+			),
+		).fetchSnapshot(PR, "/repo", "scope");
+		expect(snapshot.complete).toBe(true);
+		expect(snapshot.events.map((event) => event.providerId)).toEqual(["review-1", "inline-4", "conversation-5"]);
+	});
+	it("produces no eligible feedback when an approval is the only feedback", async () => {
+		// Regression: the reviewer workflow approves while leaving its nits as
+		// inline comments inside that approving review. Neither the approval body
+		// nor those comments may schedule a repair turn.
+		const snapshot = await clientWith(
+			makeRunner(
+				baseRoutes({
+					reviews: [
+						{
+							id: 1,
+							state: "APPROVED",
+							body: "Approving: no blocking issues, two nits below",
+							submitted_at: "2026-10-02T00:00:00Z",
+							user: { login: "github-actions[bot]", type: "Bot" },
+						},
+					],
+					inline: [
+						{
+							id: 2,
+							body: "Nit: `updatedAt` is already carried by the spread",
+							updated_at: "2026-10-02T00:00:00Z",
+							pull_request_review_id: 1,
+							user: { login: "github-actions[bot]", type: "Bot" },
+						},
+						{
+							id: 3,
+							body: "Nit: this type is only used in this file",
+							updated_at: "2026-10-02T00:00:00Z",
+							pull_request_review_id: 1,
+							user: { login: "github-actions[bot]", type: "Bot" },
+						},
+					],
+				}),
+			),
+		).fetchSnapshot(PR, "/repo", "scope");
+		expect(snapshot.complete).toBe(true);
+		expect(snapshot.events).toEqual([]);
+	});
+	it("retires a reviewer's earlier bodies when they approve later, never their newer ones", async () => {
+		const snapshot = await clientWith(
+			makeRunner(
+				baseRoutes({
+					reviews: [
+						{
+							id: 1,
+							state: "COMMENTED",
+							body: "Earlier comment body",
+							submitted_at: "2026-10-01T00:00:00Z",
+							user: { login: "alice" },
+						},
+						{
+							id: 2,
+							state: "CHANGES_REQUESTED",
+							body: "Earlier change request",
+							submitted_at: "2026-10-01T12:00:00Z",
+							user: { login: "alice" },
+						},
+						{
+							id: 3,
+							state: "APPROVED",
+							body: "Approved",
+							submitted_at: "2026-10-02T00:00:00Z",
+							user: { login: "alice" },
+						},
+						{
+							id: 4,
+							state: "COMMENTED",
+							body: "Comment made after approving",
+							submitted_at: "2026-10-03T00:00:00Z",
+							user: { login: "alice" },
+						},
+						{
+							id: 5,
+							state: "COMMENTED",
+							body: "Another reviewer, never approved",
+							submitted_at: "2026-10-01T00:00:00Z",
+							user: { login: "bob" },
+						},
+					],
+				}),
+			),
+		).fetchSnapshot(PR, "/repo", "scope");
+		expect(snapshot.complete).toBe(true);
+		expect(snapshot.events.map((event) => event.providerId)).toEqual(["review-4", "review-5"]);
+	});
 });
