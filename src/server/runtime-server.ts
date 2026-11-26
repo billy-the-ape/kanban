@@ -2,7 +2,6 @@ import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 import { join } from "node:path";
-
 import { createHTTPHandler } from "@trpc/server/adapters/standalone";
 import { handleClineMcpOauthCallback } from "../cline-sdk/cline-mcp-runtime-service";
 import { createClineProviderService } from "../cline-sdk/cline-provider-service";
@@ -16,6 +15,7 @@ import {
 	type ClineTaskSessionService,
 	createInMemoryClineTaskSessionService,
 } from "../cline-sdk/cline-task-session-service";
+import type { ClineTurnOutcome } from "../cline-sdk/cline-turn-preparation";
 import { createClineWatcherRegistry } from "../cline-sdk/cline-watcher-registry";
 import type {
 	GitHubPrMergeCompletion,
@@ -43,13 +43,13 @@ import { createConflictRepairService } from "../pr-tracking/conflict-repair-disp
 import { createConflictStateService } from "../pr-tracking/conflict-state-service";
 import { createGitHubGhAdapter } from "../pr-tracking/github-gh-adapter";
 import { createGitHubPrClient, resolveGitHubAccessScopeId } from "../pr-tracking/github-pr-client";
-import { sendPreparedPiRepair } from "../pr-tracking/pi-repair-dispatch";
 import { PrConsumerRegistry } from "../pr-tracking/pr-consumer-registry";
 import { defaultInspectWorktree, registerMergeCompletionConsumer } from "../pr-tracking/pr-merge-completion";
 import { findTaskCard, resolveCardAutomationPrKey } from "../pr-tracking/pr-owner-selection";
 import { PrRecordStore } from "../pr-tracking/pr-record-store";
 import { createReconcilePass, type PrTaskReconcileOptions } from "../pr-tracking/pr-task-subscriptions";
 import { createPrTrackingCoordinator } from "../pr-tracking/pr-tracking-coordinator";
+import { sendPreparedOpenCodeRepair, sendPreparedPiRepair } from "../pr-tracking/terminal-repair-dispatch";
 import { extractSessionTokenFromCookie, isPasscodeEnabled, validateSession } from "../security/passcode-manager";
 import {
 	listWorkspaceIndexEntries,
@@ -339,6 +339,8 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 			broadcastTaskChatCleared: deps.runtimeStateHub.broadcastTaskChatCleared,
 			resolveClineLaunchConfig: () => clineProviderService.resolveLaunchConfig(),
 		}),
+		sendPreparedOpenCodeTaskMessage: async (scope, taskId, prepare) =>
+			await sendPreparedOpenCodeRepair({ manager: await getScopedTerminalManager(scope), taskId, prepare }),
 		sendPreparedPiTaskMessage: async (scope, taskId, prepare) => {
 			const manager = await getScopedTerminalManager(scope);
 			return await sendPreparedPiRepair({
@@ -430,6 +432,16 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		getEffectiveTaskAgentId: async (scope, taskId) => await resolveEffectiveTaskAgentId(scope, taskId),
 		sendClineMessage: async (scope, taskId, prompt) =>
 			await conflictRepairChatSender(scope, { taskId, text: prompt, mode: "act", source: "automated" }),
+		sendOpenCodeMessage: async (scope, taskId, prompt, onFailed) =>
+			await sendPreparedOpenCodeRepair({
+				manager: await getScopedTerminalManager(scope),
+				taskId,
+				prepare: Object.assign(async () => prompt, {
+					onSettled: async (outcome: ClineTurnOutcome) => {
+						if (outcome.status === "failed") await onFailed(outcome.error);
+					},
+				}),
+			}),
 		sendPiMessage: async (scope, taskId, prompt) => {
 			const manager = await getScopedTerminalManager(scope);
 			return await sendPreparedPiRepair({
@@ -1000,7 +1012,8 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				ensureTerminalManagerForWorkspace: deps.ensureTerminalManagerForWorkspace,
 				broadcastRuntimeWorkspaceStateUpdated: broadcastRuntimeWorkspaceStateUpdatedWithReconcile,
 				broadcastTaskReadyForReview: deps.runtimeStateHub.broadcastTaskReadyForReview,
-				recordPiPublicationToolEvent: (event) => prCommentAutomationService.recordPrPublicationToolEvent(event),
+				recordTerminalPublicationToolEvent: (event) =>
+					prCommentAutomationService.recordPrPublicationToolEvent(event),
 			}),
 			prTrackingApi: createPrTrackingApi({
 				getPrTrackingCoordinator: () => getPrTrackingState().coordinator,

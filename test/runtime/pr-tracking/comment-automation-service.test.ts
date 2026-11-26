@@ -16,6 +16,7 @@ import type {
 	RuntimeWorkspaceStateResponse,
 } from "../../../src/core/api-contract";
 import { getPullRequestIdentityKey } from "../../../src/core/pull-request-links";
+import type { PrCommentAutomationServiceDependencies } from "../../../src/pr-tracking/comment-automation-service";
 import {
 	applyPrPollOutcome,
 	buildCommentHandlingInstruction,
@@ -181,6 +182,7 @@ function makeService(
 			taskId: string,
 			prepare: ClineTurnPreparation,
 		) => Promise<RuntimeTaskChatSendResponse>;
+		sendOpenCode?: PrCommentAutomationServiceDependencies["sendPreparedOpenCodeTaskMessage"];
 		/** Stands in for the workspace's selected agent (default: cline). */
 		selectedAgentId?: RuntimeAgentId;
 		/** Stands in for the durable workspace index (default: nothing resolves). */
@@ -239,6 +241,7 @@ function makeService(
 					return (await overrides.sendPi?.(scope, taskId, prepare)) ?? { ok: false, summary: null };
 				}
 			: undefined,
+		sendPreparedOpenCodeTaskMessage: overrides.sendOpenCode,
 		getGitHubAccessScopeId: overrides.getGitHubAccessScopeId ?? (async () => "scope-1"),
 		// Harness effective-agent resolution: the card's explicit agentId
 		// stands in for the live session's agent; `selectedAgentId` stands
@@ -872,53 +875,64 @@ describe("PrCommentAutomationService", () => {
 		expect(automation.lastDispatchedFeedbackFingerprint).toEqual(fingerprint);
 	});
 
-	it("dispatches Pi feedback through the prepared terminal sender and settles its durable receipt", async () => {
-		const event = makeEvent({ providerId: "review-1", updatedAt: NOW - 471_000 });
-		const fingerprint = fingerprintOf([event]);
-		await upsertSeed((record) => ({
-			...record,
-			revision: record.revision + 1,
-			taskBindings: [{ workspaceId: "w1", taskId: "t1", terminal: false }],
-			commentAutomation: {
-				...record.commentAutomation,
-				repairOwner: { workspaceId: "w1", taskId: "t1", revision: 1 },
-				pendingFeedbackFingerprint: fingerprint,
-				pendingCount: 1,
-				firstPendingAt: NOW - 590_000,
-				debounceDeadline: NOW - 351_000,
-			},
-		}));
-		const piPrompts: string[] = [];
-		const harness = makeService({
-			workspaceStates: new Map([
-				["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR], agentId: "pi" })])],
-			]),
-			snapshot: { events: [event] },
-			sendPi: async (_scope, taskId, prepare) => {
+	it.each(["pi", "opencode"] as const)(
+		"dispatches %s feedback through the prepared terminal sender and settles its durable receipt",
+		async (agentId) => {
+			const event = makeEvent({ providerId: "review-1", updatedAt: NOW - 471_000 });
+			const fingerprint = fingerprintOf([event]);
+			await upsertSeed((record) => ({
+				...record,
+				revision: record.revision + 1,
+				taskBindings: [{ workspaceId: "w1", taskId: "t1", terminal: false }],
+				commentAutomation: {
+					...record.commentAutomation,
+					repairOwner: { workspaceId: "w1", taskId: "t1", revision: 1 },
+					pendingFeedbackFingerprint: fingerprint,
+					pendingCount: 1,
+					firstPendingAt: NOW - 590_000,
+					debounceDeadline: NOW - 351_000,
+				},
+			}));
+			const prompts: string[] = [];
+			const captured: ClineTurnPreparation[] = [];
+			const send: NonNullable<PrCommentAutomationServiceDependencies["sendPreparedOpenCodeTaskMessage"]> = async (
+				_scope,
+				taskId,
+				prepare,
+			) => {
 				expect(taskId).toBe("t1");
+				captured.push(prepare);
 				const instruction = await prepare({ cwd: "/task-worktree", signal: new AbortController().signal });
-				if (instruction !== null) piPrompts.push(instruction);
+				if (instruction !== null) prompts.push(instruction);
 				return { ok: true, summary: null, message: null };
-			},
-		});
-		await harness.service.refreshWorkspace(scope);
-		expect((await harness.service.getTaskPrTrackingState(scope, "t1")).state.supported).toBe(true);
-		await harness.service.runTick();
-		expect(harness.sent).toHaveLength(0);
-		expect(harness.piPreparations).toHaveLength(1);
-		expect(piPrompts[0]).toContain(buildCommentHandlingInstruction(PR.url));
-		let record = await loadPrTrackingRecord(KEY);
-		expect(record.status).toBe("ok");
-		if (record.status !== "ok") throw new Error("unreachable");
-		expect(record.record.commentAutomation.dispatch?.status).toBe("running");
-		expect(record.record.commentAutomation.dispatch?.turnRef).toMatch(/^pi:/);
-		await harness.piPreparations[0]?.onSettled?.({ status: "completed" });
-		record = await loadPrTrackingRecord(KEY);
-		if (record.status !== "ok") throw new Error("unreachable");
-		expect(record.record.commentAutomation.dispatch?.status).toBe("completed");
-		await harness.service.runTick();
-		expect(harness.piPreparations).toHaveLength(1);
-	});
+			};
+			const harness = makeService({
+				workspaceStates: new Map([
+					["/w1", makeState([makeCard({ id: "t1", autoAddressComments: true, pullRequests: [PR], agentId })])],
+				]),
+				snapshot: { events: [event] },
+				sendPi: agentId === "pi" ? send : undefined,
+				sendOpenCode: agentId === "opencode" ? send : undefined,
+			});
+			await harness.service.refreshWorkspace(scope);
+			expect((await harness.service.getTaskPrTrackingState(scope, "t1")).state.supported).toBe(true);
+			await harness.service.runTick();
+			expect(harness.sent).toHaveLength(0);
+			expect(captured).toHaveLength(1);
+			expect(prompts[0]).toContain(buildCommentHandlingInstruction(PR.url));
+			let record = await loadPrTrackingRecord(KEY);
+			expect(record.status).toBe("ok");
+			if (record.status !== "ok") throw new Error("unreachable");
+			expect(record.record.commentAutomation.dispatch?.status).toBe("running");
+			expect(record.record.commentAutomation.dispatch?.turnRef).toMatch(new RegExp(`^${agentId}:`));
+			await captured[0]?.onSettled?.({ status: "completed" });
+			record = await loadPrTrackingRecord(KEY);
+			if (record.status !== "ok") throw new Error("unreachable");
+			expect(record.record.commentAutomation.dispatch?.status).toBe("completed");
+			await harness.service.runTick();
+			expect(captured).toHaveLength(1);
+		},
+	);
 
 	it("does not advertise Pi support if the terminal sender is missing", async () => {
 		const harness = makeService({
@@ -928,7 +942,7 @@ describe("PrCommentAutomationService", () => {
 		});
 		const state = (await harness.service.getTaskPrTrackingState(scope, "t1")).state;
 		expect(state.supported).toBe(false);
-		expect(state.blocker).toContain("Cline or Pi");
+		expect(state.blocker).toContain("Cline, Pi, or OpenCode");
 	});
 
 	it("restarts the quiet window at settle when feedback arrived after the last poll", async () => {

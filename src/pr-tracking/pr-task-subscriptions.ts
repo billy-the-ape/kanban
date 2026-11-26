@@ -27,7 +27,7 @@ export interface PrTaskSubscriptionSource {
 	/**
 	 * Optional: the workspace's selected agent id, used to resolve an unset
 	 * card agentId for comment demand (comment follow-up only serves
-	 * Cline and Pi tasks, matching the comment automation service).
+	 * Cline, Pi, and OpenCode tasks, matching the comment automation service).
 	 */
 	getSelectedAgentId?: (workspaceId: string) => Promise<RuntimeAgentId | null>;
 }
@@ -66,8 +66,8 @@ function sameConsumers(a: Record<RuntimePrConsumerKind, boolean>, b: Record<Runt
  * automation PR is resolvable (explicit selection or sole link) and whose
  * checkboxes are enabled against INSTALLED consumers. The comments half
  * additionally requires the task to be servable by the comment automation
- * (a Cline or Pi card, or an unset card agentId in a workspace whose
- * selected agent is Cline or Pi).
+ * (a Cline, Pi, or OpenCode card, or an unset card agentId in a workspace whose
+ * selected agent is one of those three).
  */
 export function computeTaskSubscriptionDemand(
 	boards: PrBoardSnapshot[],
@@ -85,7 +85,7 @@ export function computeTaskSubscriptionDemand(
 				if (!resolved.key) {
 					continue;
 				}
-				// Comment follow-up only serves Cline and Pi tasks. When no
+				// Comment follow-up only serves Cline, Pi, and OpenCode tasks. When no
 				// agent info is known at all (no per-card agentId and no
 				// workspace resolver), the checkbox alone decides (legacy
 				// harnesses); otherwise the effective agent must be servable.

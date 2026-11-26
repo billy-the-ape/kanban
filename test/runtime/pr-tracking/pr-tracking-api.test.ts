@@ -186,7 +186,7 @@ describe("pr-tracking api: tracking-state diagnostics", () => {
 		expect(state.commentsSupportedForTask).toBe(false);
 		expect(state.blockers).toContainEqual({
 			kind: "comments_unsupported",
-			message: "Comment follow-up automation requires a native Cline or Pi task.",
+			message: "Comment follow-up automation requires a native Cline, Pi, or OpenCode task.",
 		});
 	});
 
@@ -224,7 +224,7 @@ describe("pr-tracking api: tracking-state diagnostics", () => {
 		expect(state.commentsSupportedForTask).toBe(false);
 		expect(state.blockers).toContainEqual({
 			kind: "comments_unsupported",
-			message: "Comment follow-up automation requires a native Cline or Pi task.",
+			message: "Comment follow-up automation requires a native Cline, Pi, or OpenCode task.",
 		});
 	});
 

@@ -460,17 +460,19 @@ export function normalizeHookMetadata(
 }
 
 /**
- * Only forward bounded Pi command evidence for actual PR-feedback writes.
+ * Only forward bounded terminal command evidence for actual PR-feedback writes.
  * Ordinary bash calls and read-only GitHub operations never reach the
  * publication attribution/record store.
  */
-export function extractPiPublicationTool(
+export function extractTerminalPublicationTool(
 	payload: Record<string, unknown> | null,
 	source: string | null | undefined,
 ): RuntimeHookIngestRequest["publicationTool"] {
-	if (source !== "pi" || !payload) return undefined;
-	const phase = payload.hook_event_name === "tool_execution_start" ? "started" : "finished";
-	if (phase === "finished" && payload.hook_event_name !== "tool_execution_end") return undefined;
+	if ((source !== "pi" && source !== "opencode") || !payload) return undefined;
+	const before = source === "pi" ? "tool_execution_start" : "BeforeTool";
+	const after = source === "pi" ? "tool_execution_end" : "AfterTool";
+	if (payload.hook_event_name !== before && payload.hook_event_name !== after) return undefined;
+	const phase = payload.hook_event_name === before ? "started" : "finished";
 	const toolCallId = readStringField(payload, "tool_call_id")?.slice(0, 200) ?? null;
 	if (phase === "started" && !toolCallId) return undefined;
 	const toolInput = asRecord(payload.tool_input);
@@ -487,7 +489,8 @@ export function extractPiPublicationTool(
 		toolName: readStringField(payload, "tool_name")?.slice(0, 128) ?? null,
 		commands,
 		output,
-		error: phase === "finished" && payload.tool_is_error === true ? (output?.slice(0, 1000) ?? "Pi command failed") : null,
+		error:
+			phase === "finished" && payload.tool_is_error === true ? (output?.slice(0, 1000) ?? "Command failed") : null,
 	};
 }
 
@@ -507,7 +510,7 @@ function parseHooksIngestArgs(
 	// PRLINK-2: detect PR creation in the hook CLI process so only resulting
 	// canonical URLs cross the wire, never raw tool output.
 	const pullRequestUrls = extractHookPullRequestUrls(payload);
-	const publicationTool = extractPiPublicationTool(payload, metadata?.source);
+	const publicationTool = extractTerminalPublicationTool(payload, metadata?.source);
 	return {
 		event,
 		taskId: context.taskId,

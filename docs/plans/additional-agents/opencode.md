@@ -405,10 +405,8 @@ throwaway `HOME` and an empty project, through Kanban's own `probeOpenCodeVersio
   required pre-rollout smoke run under **Deployment and rollback** is still outstanding on
   a host with OpenCode 1.19.6 and a real local provider: the event contract, the approval
   resume and the per-turn summary are fixture-verified only.
-- Ingest is ordered per call, not per card: two `hooks ingest` processes from one session can
-  land in the opposite order (a turn that ends in well under a second makes that likelier), so
-  a `to_in_progress` may be dropped as a no-op and the following `to_review` park the card one
-  beat late. The next busy event moves it back; nothing is lost permanently.
+- The bridge serializes card transitions so a fast completion cannot overtake the
+  start that put the card back into In Progress.
 - The first-run onboarding carousel keeps its original curated list; OpenCode is
   selectable in Settings and the task-start picker.
 - A card's first OpenCode launch on a machine starts a few seconds late, because loading
@@ -428,3 +426,24 @@ throwaway `HOME` and an empty project, through Kanban's own `probeOpenCodeVersio
   rather than the file it came from. A card whose variable points at something Kanban
   cannot parse runs without the bridge, so it never moves itself to review; the launch
   warning names the file.
+
+
+### PR feedback and conflict repair
+
+OpenCode cards can receive automatic review follow-up and use **Resolve conflicts**.
+Use a live OpenCode Build session that has completed an initial turn. After a restart,
+resume the card and complete a turn before retrying the repair. A permission pause
+or process interruption never counts as a completed repair. OpenCode shell-based
+PR publications use the same attribution path as Pi.
+
+Use the tested OpenCode release (`npm install -g opencode-ai@1.19.6`) on the
+Kanban service user's PATH. Configure the local provider in that user's
+`~/.config/opencode/opencode.json`. Set `KANBAN_OPENCODE_MODEL=provider/model`
+in the service environment if Kanban should enforce one explicit model.
+No additional Kanban settings are required beyond enabling the desired
+PR automation on the card and configuring its existing repository policies.
+
+For the rollout smoke test, let an OpenCode Build card create a disposable PR.
+Confirm one review follow-up edits and pushes the branch, then introduce a
+conflict and use **Resolve conflicts** on the same card. Check the new head in
+the PRs tab and let the existing auto-merge policy evaluate its checks and review.

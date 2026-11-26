@@ -29,8 +29,8 @@ export interface CreateHooksApiDependencies {
 	fireReviewPullRequestLookup?: (input: { workspacePath: string; taskId: string }) => void;
 	/** PRLINK-2: records hook-detected PRs, fire-and-forget (tests inject a spy). */
 	recordHookPullRequests?: (input: RecordHookPullRequestsInput) => Promise<void>;
-	/** Pi tool start/result evidence for comments on linked PRs. */
-	recordPiPublicationToolEvent?: (input: {
+	/** Terminal tool start/result evidence for comments on linked PRs. */
+	recordTerminalPublicationToolEvent?: (input: {
 		workspaceId: string;
 		workspacePath: string;
 		taskId: string;
@@ -143,11 +143,15 @@ export function createHooksApi(deps: CreateHooksApiDependencies): RuntimeTrpcCon
 					});
 				}
 
-				if (body.publicationTool && summary.agentId === "pi" && deps.recordPiPublicationToolEvent) {
+				if (
+					body.publicationTool &&
+					(summary.agentId === "pi" || summary.agentId === "opencode") &&
+					deps.recordTerminalPublicationToolEvent
+				) {
 					// Unlike ordinary activity, publication evidence is a dispatch
 					// barrier: acknowledge it only after the record is updated.
 					await deps
-						.recordPiPublicationToolEvent({
+						.recordTerminalPublicationToolEvent({
 							workspaceId,
 							workspacePath,
 							taskId,

@@ -396,7 +396,6 @@ export class TerminalSessionManager implements TerminalSessionService {
 		// From here on the entry describes a process this runtime owns, so its
 		// summary no longer stands in for a previous runtime's conversation.
 		entry.startedInThisRuntime = true;
-		entry.launchArgs = [...request.args];
 		const summaryBeforeRestore = entry.summary;
 		// Restored Pi sessions never inherit the normal PTY auto-restart path.
 		// Doing so would bypass the API's exact-session/worktree safety checks.
@@ -412,6 +411,7 @@ export class TerminalSessionManager implements TerminalSessionService {
 			return cloneSummary(entry.summary);
 		}
 
+		entry.launchArgs = [...request.args];
 		if (entry.active) {
 			stopWorkspaceTrustTimers(entry.active);
 			entry.active.session.stop();
@@ -494,6 +494,7 @@ export class TerminalSessionManager implements TerminalSessionService {
 		// (for example, Codex uses a wrapper script to watch session logs for hook transitions).
 		const commandBinary = launch.binary ?? request.binary;
 		const commandArgs = [...launch.args];
+		if (request.agentId === "opencode") entry.launchArgs = commandArgs;
 		const hasCodexLaunchSignature = [commandBinary, ...commandArgs].some((part) =>
 			part.toLowerCase().includes("codex"),
 		);

@@ -483,7 +483,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		// Both PR tracking consumers are always installed, so the shared
 		// lifecycle gate keys off the task's own PR automation settings —
 		// except the comments half, which only owns tasks the comment
-		// automation can actually serve (native Cline or Pi).
+		// automation can actually serve (native Cline, Pi, or OpenCode).
 		const installed: PrInstalledConsumers = {
 			comments: commentsServableTask,
 			mergeCompletion: true,
@@ -527,7 +527,7 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		if (card.autoAddressComments === true && !commentsServableTask) {
 			blockers.push({
 				kind: "comments_unsupported",
-				message: "Comment follow-up automation requires a native Cline or Pi task.",
+				message: "Comment follow-up automation requires a native Cline, Pi, or OpenCode task.",
 			});
 		}
 		const eligible = active && resolved.key !== null && gate.legacyCompletionGated;

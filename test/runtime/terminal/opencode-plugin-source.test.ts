@@ -206,6 +206,25 @@ describe("generated OpenCode bridge (AA-O1)", () => {
 		expect(reviews[0]?.payload.source).toBe("opencode");
 	});
 
+	it("reports the pinned release's permission events as a pause and resume", async () => {
+		const hooks = await setupBridge();
+		const sessionID = "ses_root01";
+		await emit(hooks, { type: "session.status", properties: { sessionID, status: { type: "busy" } } });
+		await emit(hooks, {
+			type: "permission.asked",
+			properties: { sessionID, permission: "bash", patterns: ["npm test"] },
+		});
+		await emit(hooks, { type: "permission.replied", properties: { sessionID, reply: "once" } });
+		await emit(hooks, { type: "session.status", properties: { sessionID, status: { type: "idle" } } });
+		expect(readCalls().map((call) => call.payload.notification_type)).toEqual([
+			"turn.started",
+			"permission.asked",
+			"turn.started",
+			"turn.completed",
+		]);
+		expect(readCalls()[1]?.payload.activity_text).toContain("npm test");
+	});
+
 	it("treats a permission request as attention, not completion", async () => {
 		const hooks = await setupBridge();
 		await emit(hooks, { type: "session.busy", properties: { sessionID: "ses_root01" } });
@@ -227,8 +246,8 @@ describe("generated OpenCode bridge (AA-O1)", () => {
 		await emit(hooks, { type: "session.idle", properties: { sessionID: "ses_root01" } });
 		calls = readCalls();
 		expect(calls.slice(2).map((call) => [call.event, call.payload.notification_type])).toEqual([
-			["to_in_progress", undefined],
-			["to_review", undefined],
+			["to_in_progress", "turn.started"],
+			["to_review", "turn.completed"],
 		]);
 	});
 
@@ -405,7 +424,7 @@ describe("generated OpenCode bridge (AA-O1)", () => {
 		const completion = calls[calls.length - 1];
 		expect(completion?.event).toBe("to_review");
 		// The finished turn is an ordinary completion, not a second approval.
-		expect(completion?.payload.notification_type).toBeUndefined();
+		expect(completion?.payload.notification_type).toBe("turn.completed");
 		expect(completion?.payload.final_message).toBe("All 12 tests pass.");
 	});
 
@@ -422,11 +441,11 @@ describe("generated OpenCode bridge (AA-O1)", () => {
 		await emit(hooks, { type: "session.idle", properties: { sessionID: "ses_root01" } });
 
 		expect(readCalls().map((call) => [call.event, call.payload.notification_type])).toEqual([
-			["to_in_progress", undefined],
+			["to_in_progress", "turn.started"],
 			["to_review", "error"],
-			["to_in_progress", undefined],
+			["to_in_progress", "turn.started"],
 			["activity", undefined],
-			["to_review", undefined],
+			["to_review", "turn.completed"],
 		]);
 	});
 

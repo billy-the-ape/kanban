@@ -165,6 +165,7 @@ function createHarness(options: HarnessOptions = {}) {
 	const store = new InMemoryPrRecordStore();
 	const sends: string[] = [];
 	const piSends: string[] = [];
+	const openCodeSends: string[] = [];
 	let broadcasts = 0;
 
 	const deps: ConflictRepairServiceDeps = {
@@ -191,6 +192,10 @@ function createHarness(options: HarnessOptions = {}) {
 		sendPiMessage: async (_scope, _taskId, prompt) => {
 			piSends.push(prompt);
 			return { ok: true, summary: null } satisfies RuntimeTaskChatSendResponse;
+		},
+		sendOpenCodeMessage: async (_scope, _taskId, prompt) => {
+			openCodeSends.push(prompt);
+			return { ok: true, summary: null };
 		},
 		getConflictPromptTemplate: async () =>
 			options.template ??
@@ -288,6 +293,7 @@ function createHarness(options: HarnessOptions = {}) {
 		cardNow,
 		sends,
 		piSends,
+		openCodeSends,
 		broadcastCount: () => broadcasts,
 	};
 }
@@ -524,6 +530,15 @@ describe("conflict-repair dispatch", () => {
 		// The reservation is released on the accepted path too.
 		const stored = await harness.store.loadRecord(PR_KEY);
 		expect(stored.ok ? stored.record?.reservation.state : "reserved").not.toBe("reserved");
+	});
+
+	it("routes an OpenCode conflict only to its task terminal", async () => {
+		const harness = createHarness({ agentId: "opencode" });
+		await harness.seedRecord();
+		expect((await harness.dispatch()).ok).toBe(true);
+		expect(harness.openCodeSends).toHaveLength(1);
+		expect(harness.sends).toHaveLength(0);
+		expect(harness.piSends).toHaveLength(0);
 	});
 
 	it("routes Pi repairs through the Pi send lane", async () => {

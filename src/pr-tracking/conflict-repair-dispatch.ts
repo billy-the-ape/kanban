@@ -60,6 +60,12 @@ export interface ConflictRepairServiceDeps {
 		prompt: string,
 	) => Promise<RuntimeTaskChatSendResponse>;
 	sendPiMessage: (scope: ConflictRepairScope, taskId: string, prompt: string) => Promise<RuntimeTaskChatSendResponse>;
+	sendOpenCodeMessage?: (
+		scope: ConflictRepairScope,
+		taskId: string,
+		prompt: string,
+		onFailed: (error: string) => Promise<void>,
+	) => Promise<RuntimeTaskChatSendResponse>;
 	/** The scoped runtime config's (possibly operator-edited) conflict template. */
 	getConflictPromptTemplate: (scope: ConflictRepairScope) => Promise<string>;
 	/** Board broadcast so the dispatch record surfaces without waiting for a poll. */
@@ -76,7 +82,7 @@ export interface ConflictRepairService {
 }
 
 const UNSERVABLE_AGENT_MESSAGE =
-	"Conflict repair needs a native Cline or Pi session. Open this task's terminal and keep it idle, then press Resolve conflicts.";
+	"Conflict repair needs a native Cline, Pi, or OpenCode session. Open this task's terminal and keep it idle, then press Resolve conflicts.";
 
 function formatDispatchedAt(timestamp: number): string {
 	return new Date(timestamp).toLocaleTimeString();
@@ -257,7 +263,15 @@ export function createConflictRepairService(deps: ConflictRepairServiceDeps): Co
 			// Delivery feasibility is checked before ANY side effect — an
 			// unsupported request is a refusal, never a downgrade.
 			const effectiveAgentId = await deps.getEffectiveTaskAgentId(scope, input.taskId);
-			if (effectiveAgentId !== "cline" && effectiveAgentId !== "pi") {
+			const send =
+				effectiveAgentId === "cline"
+					? deps.sendClineMessage
+					: effectiveAgentId === "pi"
+						? deps.sendPiMessage
+						: effectiveAgentId === "opencode"
+							? deps.sendOpenCodeMessage
+							: undefined;
+			if (!effectiveAgentId || !send) {
 				return fail("agent_unsupported", UNSERVABLE_AGENT_MESSAGE);
 			}
 			const launch = checkTaskLaunchRequirements(effectiveAgentId, {
@@ -485,8 +499,10 @@ export function createConflictRepairService(deps: ConflictRepairServiceDeps): Co
 				return fail("pr_reserved", `${error} Try again once it releases.`);
 			}
 			reservationHeld = true;
-			const send = effectiveAgentId === "pi" ? deps.sendPiMessage : deps.sendClineMessage;
-			const response = await send(scope, input.taskId, rendered.prompt);
+			const response = await send(scope, input.taskId, rendered.prompt, async (error) => {
+				await markDispatchFailed(dispatchRecord, error);
+				await deps.broadcastWorkspaceUpdated?.(scope);
+			});
 			if (!response.ok) {
 				const error = response.error ?? "The repair turn could not be delivered.";
 				await markDispatchFailed(dispatchRecord, error);
