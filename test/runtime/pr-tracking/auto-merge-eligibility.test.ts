@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import {
+	AUTO_MERGE_ELIGIBILITY_SCHEMA_VERSION,
+	AUTO_MERGE_ELIGIBILITY_SUMMARY_MAX_MESSAGE_LENGTH,
 	AUTO_MERGE_EVIDENCE_SCHEMA_VERSION,
+	type AutoMergeEligibilityResult,
 	type AutoMergeEvidenceEnvelope,
 	type AutoMergePolicy,
 	type AutoMergeReviewEvidence,
+	autoMergeEligibilitySummarySchema,
 	type GitHubPrMetadataSnapshot,
 	type GitHubPrTaskIdentity,
 	type GitHubPrTrackingRecord,
@@ -174,11 +178,38 @@ describe("AM-3 pure eligibility evaluation", () => {
 		envelope.reviews = envelope.reviews.map((review) => ({ ...review, commitId: "oldhead1" }));
 		const result = evaluateAutoMergeEligibility(makeInput({ envelope }, await makeRecord()));
 		const summary = toAutoMergeEligibilitySummary(result);
-		expect(summary.blockers).toEqual(expect.arrayContaining([
-			expect.objectContaining({ code: "check_missing", message: expect.stringContaining("test / build-check-test") }),
-			expect.objectContaining({ code: "no_approval", message: expect.stringContaining("oldhead") }),
-		]));
+		expect(summary.blockers).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					code: "check_missing",
+					message: expect.stringContaining("test / build-check-test"),
+				}),
+				expect.objectContaining({ code: "no_approval", message: expect.stringContaining("oldhead") }),
+			]),
+		);
 		expect(summary.kind).toBe("waiting");
+	});
+
+	it("caps a persisted blocker message at the contract limit", () => {
+		const result: AutoMergeEligibilityResult = {
+			schemaVersion: AUTO_MERGE_ELIGIBILITY_SCHEMA_VERSION,
+			kind: "blocked",
+			blockers: [{ code: "check_failed", message: "x".repeat(1200) }],
+			evaluatedAt: NOW,
+			headSha: HEAD,
+			baseSha: BASE,
+			policyRevision: 1,
+			evidenceCheckedAt: NOW,
+			evidenceAgeMs: 1_000,
+		};
+
+		const summary = toAutoMergeEligibilitySummary(result);
+
+		// The ellipsis replaces a character rather than adding one, and the evaluator
+		// truncates with the same constant the schema enforces: a summary the runtime
+		// wrote must parse when it is read back.
+		expect(summary.blockers?.[0]?.message).toHaveLength(AUTO_MERGE_ELIGIBILITY_SUMMARY_MAX_MESSAGE_LENGTH);
+		expect(autoMergeEligibilitySummarySchema.safeParse(summary).success).toBe(true);
 	});
 
 	it("never accepts an exact name from an earlier head", () => {

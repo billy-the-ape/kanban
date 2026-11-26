@@ -35,6 +35,7 @@
 import {
 	AUTO_MERGE_ELIGIBILITY_SCHEMA_VERSION,
 	AUTO_MERGE_ELIGIBILITY_SUMMARY_MAX_CODES,
+	AUTO_MERGE_ELIGIBILITY_SUMMARY_MAX_MESSAGE_LENGTH,
 	type AutoMergeCheckEvidence,
 	type AutoMergeEligibilityBlocker,
 	type AutoMergeEligibilityKind,
@@ -55,6 +56,13 @@ import type { PrTrackingCoordinator } from "./pr-tracking-coordinator";
 
 /** Default evidence freshness budget: two poll intervals (60s cadence). */
 const AUTO_MERGE_MAX_EVIDENCE_AGE_MS = 2 * 60 * 1000;
+
+/**
+ * How many observed check names a `check_missing` diagnostic lists before it
+ * collapses into a `(+N more)` tail, so one long list cannot crowd the other
+ * blockers out of the persisted summary.
+ */
+const MAX_OBSERVED_CHECK_NAMES = 8;
 
 /** Live task facts the evaluator needs (re-read from the board, never cached). */
 export interface AutoMergeEligibilityTaskFacts {
@@ -400,12 +408,23 @@ export function evaluateAutoMergeEligibility(input: AutoMergeEligibilityInput): 
 				requiredVerdicts.filter((verdict) => verdict.outcome === outcome).map((verdict) => verdict.name);
 			const missing = names("missing");
 			if (missing.length > 0) {
-				const observed = [...new Set([...envelope.checks, ...envelope.statuses]
-					.filter((entry) => entry.sha === envelope.headSha)
-					.map((entry) => entry.name))].sort();
-				const available = observed.length > 0 ? observed.slice(0, 8).join(", ") : "none";
-				const suffix = observed.length > 8 ? ` (+${observed.length - 8} more)` : "";
-				add("check_missing", `Required check not observed: ${missing.join(", ")}. Observed: ${available}${suffix}.`);
+				const observed = [
+					...new Set(
+						[...envelope.checks, ...envelope.statuses]
+							.filter((entry) => entry.sha === envelope.headSha)
+							.map((entry) => entry.name),
+					),
+				].sort();
+				const shown = observed.slice(0, MAX_OBSERVED_CHECK_NAMES);
+				const available = shown.length > 0 ? shown.join(", ") : "none";
+				const suffix =
+					observed.length > MAX_OBSERVED_CHECK_NAMES
+						? ` (+${observed.length - MAX_OBSERVED_CHECK_NAMES} more)`
+						: "";
+				add(
+					"check_missing",
+					`Required check not observed: ${missing.join(", ")}. Observed: ${available}${suffix}.`,
+				);
 			}
 			const pending = names("pending");
 			if (pending.length > 0) {
@@ -431,15 +450,27 @@ export function evaluateAutoMergeEligibility(input: AutoMergeEligibilityInput): 
 		);
 	}
 	if (reviewVerdict.approvers.length === 0) {
-		const previousHeads = [...new Set(envelope.reviews
-			.filter((review) => review.state === "APPROVED" && review.authorLogin !== envelope.authorLogin &&
-				review.authorLogin !== "unknown" && review.commitId !== null && review.commitId !== envelope.headSha)
-			.map((review) => review.commitId?.slice(0, 7)))].slice(0, 5);
+		const shortHeadSha = envelope.headSha?.slice(0, 7) ?? "unknown";
+		const previousHeads = [
+			...new Set(
+				envelope.reviews
+					.filter(
+						(review) =>
+							review.state === "APPROVED" &&
+							review.authorLogin !== envelope.authorLogin &&
+							review.authorLogin !== "unknown" &&
+							review.commitId !== null &&
+							review.commitId !== envelope.headSha,
+					)
+					.map((review) => review.commitId?.slice(0, 7)),
+			),
+		].slice(0, 5);
+		const earlierHeads = previousHeads.length > 0 ? previousHeads.join(", ") : null;
 		add(
 			"no_approval",
-			previousHeads.length > 0
-				? `No effective approval for current head ${envelope.headSha?.slice(0, 7) ?? "unknown"}; earlier approval(s) target ${previousHeads.join(", ")}.`
-				: "No effective current-head approval from a non-author reviewer yet.",
+			earlierHeads === null
+				? "No effective current-head approval from a non-author reviewer yet."
+				: `No effective approval for current head ${shortHeadSha}; earlier approval(s) target ${earlierHeads}.`,
 		);
 	}
 
@@ -484,6 +515,18 @@ export function evaluateAutoMergeEligibility(input: AutoMergeEligibilityInput): 
 	};
 }
 
+/**
+ * Caps one blocker message to the persisted summary's limit. One character is
+ * kept back for the ellipsis, so a truncated message still satisfies
+ * `AUTO_MERGE_ELIGIBILITY_SUMMARY_MAX_MESSAGE_LENGTH` when the summary is read
+ * back through the contract.
+ */
+function truncateAutoMergeBlockerMessage(message: string): string {
+	return message.length > AUTO_MERGE_ELIGIBILITY_SUMMARY_MAX_MESSAGE_LENGTH
+		? `${message.slice(0, AUTO_MERGE_ELIGIBILITY_SUMMARY_MAX_MESSAGE_LENGTH - 1)}…`
+		: message;
+}
+
 /** Project a full evaluation result to the small persisted summary. */
 export function toAutoMergeEligibilitySummary(result: AutoMergeEligibilityResult): AutoMergeEligibilitySummary {
 	return {
@@ -492,7 +535,7 @@ export function toAutoMergeEligibilitySummary(result: AutoMergeEligibilityResult
 		codes: result.blockers.map((blocker) => blocker.code).slice(0, AUTO_MERGE_ELIGIBILITY_SUMMARY_MAX_CODES),
 		blockers: result.blockers.slice(0, AUTO_MERGE_ELIGIBILITY_SUMMARY_MAX_CODES).map((blocker) => ({
 			code: blocker.code,
-			message: blocker.message.length > 1000 ? `${blocker.message.slice(0, 999)}…` : blocker.message,
+			message: truncateAutoMergeBlockerMessage(blocker.message),
 		})),
 		evaluatedAt: result.evaluatedAt,
 		headSha: result.headSha,

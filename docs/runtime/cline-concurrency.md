@@ -74,7 +74,10 @@ hold a slot forever — so the worker limit still caps how many cards start. A
 follow-up to a live Pi session waits the same way: the session keeps running and
 its own summary gains the capacity-wait marker and queue position, and Kanban
 writes the input once a slot frees; a session whose in-flight turn already
-reserves the card's slot is written to immediately. Stop
+reserves the card's slot is written to immediately. Both a start and its follow-ups
+resolve the pool from the launch flags the CLI actually runs with, so a session started
+with an explicit `--model`/`--provider` keeps that model's budget for every turn even if
+the settings change while it lives. Stop
 cancels a
 queued Pi turn - its CLI is never launched and a queued follow-up is never
 written; a queued CLI that cannot spawn
@@ -139,7 +142,7 @@ curl -fsS 'http://127.0.0.1:8080/props?model=qwen3.8-27b' \
    is queued. Then submit it, or send a chat message: that is queued, and the
    card shows **Waiting for model capacity** until a slot frees.
 
-Waiting board cards show `q #1`, `q #2`, and so on in place of the phase badge. Positions are FIFO within each endpoint/model pool and update when a waiting turn is canceled or admitted. The normal phase badge returns when the turn starts. A queued Pi start has no queue-position badge, because that badge belongs to a running queued Cline turn: its card shows the waiting summary text instead, and the record carries the same queue position for diagnostics until its CLI spawns.
+Waiting board cards show `q #1`, `q #2`, and so on in place of the phase badge. Positions are FIFO within each endpoint/model pool and update when a waiting turn is canceled or admitted. The normal phase badge returns when the turn starts. A queued Pi start has no queue-position badge, because that badge belongs to a running queued Cline turn: its card shows the waiting summary text instead, and the record carries the queue position for diagnostics until its CLI spawns, refreshed whenever a card ahead of it is admitted.
 
 
 ## Returning an unstarted queued task to Backlog

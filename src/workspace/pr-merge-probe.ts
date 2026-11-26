@@ -40,9 +40,9 @@ export interface MergeProbeInput {
 	/** The base branch to fetch and merge into the head. */
 	baseRef: string;
 	/**
-	 * `owner/repo` of the PR's base repository (used to pick the matching
-	 * remote); the first remote wins when absent or unmatched only if it is
-	 * literally `origin`.
+	 * `owner/repo` of the PR's base repository: the probe fetches the base branch
+	 * from the configured remote whose URL carries it, falling back to `origin`
+	 * when no remote matches (the common single-remote case).
 	 */
 	baseRepository: string | null;
 	runner?: MergeProbeRunner;

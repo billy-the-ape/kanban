@@ -6,7 +6,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RawData } from "ws";
 import { WebSocket } from "ws";
 
-import type { RuntimeTaskSessionSummary, RuntimeTerminalWsServerMessage } from "../../../src/core/api-contract";
+import {
+	RUNTIME_TERMINAL_IO_CLOSE_CODE_SESSION_NOT_RUNNING,
+	type RuntimeTaskSessionSummary,
+	type RuntimeTerminalWsServerMessage,
+} from "../../../src/core/api-contract";
 import { getKanbanRuntimePort, setKanbanRuntimePort } from "../../../src/core/runtime-endpoint";
 import type { TerminalSessionListener, TerminalSessionService } from "../../../src/terminal/terminal-session-service";
 import type { TerminalRestoreSnapshot } from "../../../src/terminal/terminal-state-mirror";
@@ -69,7 +73,7 @@ class FakeTerminalManager implements TerminalSessionService {
 		}),
 	);
 	recoverStaleSession = vi.fn(() => createSummary());
-	writeInput = vi.fn(() => createSummary());
+	writeInput = vi.fn((): RuntimeTaskSessionSummary | null => createSummary());
 	resize = vi.fn(() => true);
 	pauseOutput = vi.fn(() => true);
 	resumeOutput = vi.fn(() => true);
@@ -425,6 +429,71 @@ describe("createTerminalWebSocketBridge", () => {
 		await closeSocket(controlSocketB.socket);
 	});
 
+	it("resumes an I/O-only reconnect from its queued bytes without a new restore", async () => {
+		const ioUrl = `${runtimeUrl}/api/terminal/io?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=io-only`;
+		const controlUrl = `${runtimeUrl}/api/terminal/control?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=io-only`;
+		const io = await openQueuedWebSocket(ioUrl);
+		const control = await openQueuedWebSocket(controlUrl);
+		await waitForControlMessage(control, (message) => message.type === "restore");
+		await waitForControlMessage(control, (message) => message.type === "state");
+		control.socket.send(JSON.stringify({ type: "restore_complete" }));
+		terminalManager.emitOutput(TASK_ID, "live-1");
+		await expect(waitForIoMessage(io)).resolves.toEqual(Buffer.from("live-1", "utf8"));
+		expect(control.queue).toHaveLength(0);
+
+		// Only the byte stream drops. The control channel keeps its completed restore,
+		// so the server still knows this viewer is showing a current screen.
+		await closeSocket(io.socket);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		terminalManager.emitOutput(TASK_ID, "during-gap");
+
+		const reconnectedIo = await openQueuedWebSocket(ioUrl);
+		// The bytes written while the stream was down are delivered as soon as it
+		// reopens. Making the viewer wait for a restore it never lost would hold them
+		// until the pending cap evicted it, so the server would depend on which of the
+		// two sockets happens to reconnect first.
+		await expect(waitForIoMessage(reconnectedIo)).resolves.toEqual(Buffer.from("during-gap", "utf8"));
+		expect(control.queue).toHaveLength(0);
+		terminalManager.emitOutput(TASK_ID, "live-2");
+		await expect(waitForIoMessage(reconnectedIo)).resolves.toEqual(Buffer.from("live-2", "utf8"));
+
+		await closeSocket(reconnectedIo.socket);
+		await closeSocket(control.socket);
+	});
+
+	it("closes an exited session's stream with a code of its own", async () => {
+		const ioUrl = `${runtimeUrl}/api/terminal/io?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=exited-session`;
+		// The task exited, so input has nowhere to go. The answer must not be 1011: the
+		// viewer treats that as a dropped stream and would reopen it, resetting the
+		// screen over the exit line it is already showing, only to be refused again on
+		// the next keystroke.
+		terminalManager.writeInput = vi.fn((): RuntimeTaskSessionSummary | null => null);
+		const io = await openQueuedWebSocket(ioUrl);
+		const closed = once(io.socket, "close");
+		io.socket.send("ls\n");
+		const [code, reason] = await closed;
+		expect(code).toBe(RUNTIME_TERMINAL_IO_CLOSE_CODE_SESSION_NOT_RUNNING);
+		expect(reason.toString("utf8")).toBe("Task session is not running.");
+		await closeSocket(io.socket);
+	});
+
+	it("keeps a failed write on the close code a viewer reconnects on", async () => {
+		const ioUrl = `${runtimeUrl}/api/terminal/io?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=write-failed`;
+		// A throw says nothing about the session: the PTY can still be running, and a
+		// viewer that read this close as an exited session would quietly stop
+		// delivering keystrokes from a live task.
+		terminalManager.writeInput = vi.fn((): RuntimeTaskSessionSummary => {
+			throw new Error("write EPIPE");
+		});
+		const io = await openQueuedWebSocket(ioUrl);
+		const closed = once(io.socket, "close");
+		io.socket.send("ls\n");
+		const [code, reason] = await closed;
+		expect(code).toBe(1011);
+		expect(reason.toString("utf8")).toBe("write EPIPE");
+		await closeSocket(io.socket);
+	});
+
 	it("never pauses a shared agent PTY when one viewer falls behind", async () => {
 		const ioUrlA = `${runtimeUrl}/api/terminal/io?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=client-a`;
 		const controlUrlA = `${runtimeUrl}/api/terminal/control?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=client-a`;
@@ -462,7 +531,9 @@ describe("createTerminalWebSocketBridge", () => {
 		// A lagging viewer can reconnect without restarting Pi; the server
 		// replays its canonical headless-terminal snapshot first.
 		terminalManager.getRestoreSnapshot.mockResolvedValue({
-			snapshot: "restored-screen", cols: 80, rows: 24,
+			snapshot: "restored-screen",
+			cols: 80,
+			rows: 24,
 		});
 		const restoredIo = await openQueuedWebSocket(ioUrlA);
 		const restoredControl = await openQueuedWebSocket(controlUrlA);
@@ -482,8 +553,7 @@ describe("createTerminalWebSocketBridge", () => {
 
 	it("bounds output waiting for an inactive viewer's initial restore", async () => {
 		const ioUrl = `${runtimeUrl}/api/terminal/io?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=unresponsive`;
-		const controlUrl =
-			`${runtimeUrl}/api/terminal/control?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=unresponsive`;
+		const controlUrl = `${runtimeUrl}/api/terminal/control?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=unresponsive`;
 		const io = await openQueuedWebSocket(ioUrl);
 		const control = await openQueuedWebSocket(controlUrl);
 		await waitForControlMessage(control, (message) => message.type === "restore");
@@ -496,5 +566,4 @@ describe("createTerminalWebSocketBridge", () => {
 		expect(terminalManager.pauseOutput).not.toHaveBeenCalled();
 		expect(terminalManager.resumeOutput).not.toHaveBeenCalled();
 	});
-
 });

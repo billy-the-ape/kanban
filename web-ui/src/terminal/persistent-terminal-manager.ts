@@ -1,3 +1,4 @@
+import { RUNTIME_TERMINAL_IO_CLOSE_CODE_SESSION_NOT_RUNNING } from "@runtime-contract";
 import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { FitAddon } from "@xterm/addon-fit";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
@@ -27,6 +28,13 @@ const INTERRUPT_IDLE_SETTLE_MS = 250;
 const PARKING_ROOT_ID = "kb-persistent-terminal-parking-root";
 const RECONNECT_INITIAL_DELAY_MS = 250;
 const RECONNECT_MAX_DELAY_MS = 5_000;
+/**
+ * A refused upgrade (passcode, unknown workspace, no terminal manager) never
+ * succeeds, so an uncapped backoff would knock on the server on every 5s delay
+ * forever. Restoring a screen clears the streak, and foregrounding the tab
+ * starts a new one.
+ */
+const RECONNECT_MAX_ATTEMPTS = 12;
 
 interface PersistentTerminalAppearance {
 	cursorColor: string;
@@ -166,6 +174,12 @@ class PersistentTerminal {
 	private disposed = false;
 	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	private reconnectAttempts = 0;
+	/**
+	 * Set when the server closed the stream because the task session is not
+	 * running. The stream stays closed until the card's own state says a session
+	 * runs again, rather than being reopened just to be closed again.
+	 */
+	private awaitingSessionRestart = false;
 	private readonly onVisibilityChange = () => {
 		if (this.disposed) return;
 		if (document.visibilityState === "hidden") {
@@ -176,6 +190,9 @@ class PersistentTerminal {
 			return;
 		}
 		this.clearReconnectTimer();
+		// Returning to the tab is an explicit request for this terminal, so a
+		// stopped reconnect streak starts over.
+		this.reconnectAttempts = 0;
 		this.ensureConnected();
 	};
 
@@ -258,6 +275,18 @@ class PersistentTerminal {
 
 	private notifySummary(summary: RuntimeTaskSessionSummary): void {
 		this.latestSummary = summary;
+		// A stream closed because the session had exited stays closed until a
+		// session runs again, which is what the control channel reports for the card.
+		if (this.awaitingSessionRestart && summary.state === "running") {
+			this.awaitingSessionRestart = false;
+			this.reconnectAttempts = 0;
+			// The byte stream is still closed, so `ensureConnected` reopens the pair:
+			// only a control connection sends `restore`, and that handshake is what
+			// re-applies the geometry to the restarted PTY and reports the viewer ready.
+			// Reconnecting I/O alone onto this control socket would attach at the old size
+			// and leave callers of `onConnectionReady` falling through on their timeout.
+			this.ensureConnected();
+		}
 		for (const subscriber of this.subscribers) {
 			subscriber.onSummary?.(summary);
 		}
@@ -372,8 +401,15 @@ class PersistentTerminal {
 
 	private scheduleReconnect(): void {
 		if (this.disposed || this.reconnectTimer !== null || document.visibilityState === "hidden") return;
-		const delay = Math.min(RECONNECT_MAX_DELAY_MS,
-			RECONNECT_INITIAL_DELAY_MS * 2 ** Math.min(this.reconnectAttempts, 5));
+		if (this.reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
+			this.lastError = "Terminal stream disconnected. Switch to another tab and back to retry.";
+			this.notifyLastError();
+			return;
+		}
+		const delay = Math.min(
+			RECONNECT_MAX_DELAY_MS,
+			RECONNECT_INITIAL_DELAY_MS * 2 ** Math.min(this.reconnectAttempts, 5),
+		);
 		this.reconnectAttempts += 1;
 		this.reconnectTimer = setTimeout(() => {
 			this.reconnectTimer = null;
@@ -422,12 +458,21 @@ class PersistentTerminal {
 			this.lastError = "Terminal stream failed.";
 			this.notifyLastError();
 		};
-		ioSocket.onclose = () => {
+		ioSocket.onclose = (event) => {
 			if (this.disposed || this.ioSocket !== ioSocket) return;
 			this.ioSocket = null;
 			this.outputTextDecoder = new TextDecoder();
 			this.connectionReady = false;
 			this.restoreCompleted = false;
+			if (event.code === RUNTIME_TERMINAL_IO_CLOSE_CODE_SESSION_NOT_RUNNING) {
+				// The task exited and the server refused input, so the terminal is
+				// already showing why. Reconnecting would reset the screen over that exit
+				// line and be closed again on the next keystroke. Any other close — including
+				// the 1011 the server uses when writing input throws, which can happen while
+				// the session is still running — falls through and reconnects below.
+				this.awaitingSessionRestart = true;
+				return;
+			}
 			// A partial reconnect cannot safely replay live bytes. Close both
 			// channels so the next control socket requests a fresh snapshot.
 			this.controlSocket?.close();
@@ -520,6 +565,16 @@ class PersistentTerminal {
 	private ensureConnected(): void {
 		if (this.disposed || document.visibilityState === "hidden") return;
 		if (!this.ioSocket) {
+			if (this.controlSocket) {
+				// Never reconnect only the byte stream: it cannot replay the bytes produced
+				// while it was down, and the open control socket will not send another
+				// `restore`, so the viewer would be attached without a current screen (and,
+				// after a session restart, at the previous geometry). Closing the control
+				// socket makes its close handler schedule one fresh attempt over both
+				// channels.
+				this.controlSocket.close();
+				return;
+			}
 			this.connectIo();
 		}
 		if (!this.controlSocket) {

@@ -178,6 +178,33 @@ describe("PiModelCapacityGate", () => {
 		expect(fake.listenerCount()).toBe(0);
 	});
 
+	it("refreshes the waiting record when a card ahead of a queued start clears", async () => {
+		const scheduler = new ClineTurnScheduler(async () => 1);
+		const gate = new PiModelCapacityGate(scheduler);
+		const fake = fakeManager();
+		const launchB = vi.fn(async () => summary("b"));
+		const launchC = vi.fn(async () => summary("c"));
+		await gate.request(startInput(fake, "a", async () => summary("a")));
+		const second = await gate.request(startInput(fake, "b", launchB));
+		const third = await gate.request(startInput(fake, "c", launchC));
+		expect(launchB).not.toHaveBeenCalled();
+		expect(launchC).not.toHaveBeenCalled();
+		expect(expectQueued(second)).toBe(1);
+		expect(expectQueued(third)).toBe(2);
+		expect(fake.waits).toEqual([
+			{ taskId: "b", queuePosition: 1 },
+			{ taskId: "c", queuePosition: 2 },
+		]);
+
+		// Admitting `b` frees the slot and moves `c` up the queue. The queue reports
+		// the new position, and the card must follow it: a waiting record frozen at
+		// its first reading would have the operator watch a stale place in line until
+		// the CLI actually launched.
+		fake.emit(settled("a"));
+		await tick();
+		expect(fake.waits.at(-1)).toEqual({ taskId: "c", queuePosition: 1 });
+	});
+
 	it("admits as many initial turns as the configured capacity allows", async () => {
 		const gate = new PiModelCapacityGate(new ClineTurnScheduler(async () => 3));
 		const fake = fakeManager();

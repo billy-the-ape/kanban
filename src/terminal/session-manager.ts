@@ -73,6 +73,14 @@ interface SessionEntry {
 	summary: RuntimeTaskSessionSummary;
 	active: ActiveProcessState | null;
 	/**
+	 * The argv the CLI was launched with, kept for the entry's whole life (unlike
+	 * `restartRequest`, which a guarded Pi restore clears). Pi picks its model
+	 * endpoint from `--model`/`--provider`, so a follow-up turn must join the
+	 * per-model capacity pool its own start joined, not the one the settings
+	 * happen to describe now.
+	 */
+	launchArgs: readonly string[] | null;
+	/**
 	 * Whether this runtime ever spawned a process for the entry. A record
 	 * hydrated after a restart has never run here, so its summary still
 	 * describes the previous runtime's conversation — the only thing that says
@@ -313,6 +321,9 @@ export class TerminalSessionManager implements TerminalSessionService {
 			this.entries.set(taskId, {
 				summary: cloneSummary(summary),
 				active: null,
+				// Nothing was launched in this runtime, so no argv survives a restart;
+				// the next start records its own.
+				launchArgs: null,
 				// Hydrated records never ran here: they still describe the previous
 				// runtime's conversation, which is what makes them restore candidates.
 				startedInThisRuntime: false,
@@ -345,6 +356,16 @@ export class TerminalSessionManager implements TerminalSessionService {
 		return Boolean(this.entries.get(taskId)?.active);
 	}
 
+	/**
+	 * The argv the task's CLI was launched with, or null when no session started
+	 * here. Read-only: callers may not rewrite what a live process was started
+	 * with.
+	 */
+	getLaunchArgs(taskId: string): readonly string[] | null {
+		const args = this.entries.get(taskId)?.launchArgs;
+		return args ? [...args] : null;
+	}
+
 	attach(taskId: string, listener: TerminalSessionListener): (() => void) | null {
 		const entry = this.ensureEntry(taskId);
 
@@ -375,6 +396,7 @@ export class TerminalSessionManager implements TerminalSessionService {
 		// From here on the entry describes a process this runtime owns, so its
 		// summary no longer stands in for a previous runtime's conversation.
 		entry.startedInThisRuntime = true;
+		entry.launchArgs = [...request.args];
 		const summaryBeforeRestore = entry.summary;
 		// Restored Pi sessions never inherit the normal PTY auto-restart path.
 		// Doing so would bypass the API's exact-session/worktree safety checks.
@@ -728,6 +750,7 @@ export class TerminalSessionManager implements TerminalSessionService {
 	async startShellSession(request: StartShellSessionRequest): Promise<RuntimeTaskSessionSummary> {
 		const entry = this.ensureEntry(request.taskId);
 		entry.startedInThisRuntime = true;
+		entry.launchArgs = request.args ? [...request.args] : [];
 		entry.restartRequest = {
 			kind: "shell",
 			request: cloneStartShellSessionRequest(request),
@@ -1336,6 +1359,7 @@ export class TerminalSessionManager implements TerminalSessionService {
 		const created: SessionEntry = {
 			summary: createDefaultSummary(taskId),
 			active: null,
+			launchArgs: null,
 			startedInThisRuntime: false,
 			terminalStateMirror: null,
 			listenerIdCounter: 1,

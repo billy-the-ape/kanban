@@ -1,3 +1,4 @@
+import { RUNTIME_TERMINAL_IO_CLOSE_CODE_SESSION_NOT_RUNNING } from "@runtime-contract";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const terminalResetMock = vi.hoisted(() => vi.fn());
@@ -14,18 +15,25 @@ vi.mock("@xterm/xterm", () => ({
 		onData() {}
 		onBinary() {}
 		attachCustomKeyEventHandler() {}
-		resize(cols: number, rows: number) { this.cols = cols; this.rows = rows; }
+		resize(cols: number, rows: number) {
+			this.cols = cols;
+			this.rows = rows;
+		}
 		write(data: string | Uint8Array, callback?: () => void) {
 			terminalWriteMock(data);
 			callback?.();
 		}
-		reset() { terminalResetMock(); }
+		reset() {
+			terminalResetMock();
+		}
 		focus() {}
 		dispose() {}
 	},
 }));
 vi.mock("@xterm/addon-fit", () => ({
-	FitAddon: class { fit() {} },
+	FitAddon: class {
+		fit() {}
+	},
 }));
 vi.mock("@xterm/addon-clipboard", () => ({
 	ClipboardAddon: class {},
@@ -37,13 +45,17 @@ vi.mock("@xterm/addon-web-links", () => ({
 	WebLinksAddon: class {},
 }));
 vi.mock("@xterm/addon-webgl", () => ({
-	WebglAddon: class { onContextLoss() {} dispose() {} },
+	WebglAddon: class {
+		onContextLoss() {}
+		dispose() {}
+	},
 }));
 vi.mock("@/hooks/use-theme", () => ({
 	getTerminalThemeColors: () => ({ foreground: "#fff", background: "#000" }),
 }));
 vi.mock("@/terminal/terminal-geometry-registry", () => ({
-	clearTerminalGeometry: vi.fn(), reportTerminalGeometry: vi.fn(),
+	clearTerminalGeometry: vi.fn(),
+	reportTerminalGeometry: vi.fn(),
 }));
 vi.mock("@/runtime/trpc-client", () => ({
 	getRuntimeTrpcClient: () => ({ runtime: { stopTaskSession: { mutate: vi.fn() } } }),
@@ -59,7 +71,7 @@ class MockSocket {
 	readyState = 0;
 	binaryType = "blob";
 	onopen: (() => void) | null = null;
-	onclose: (() => void) | null = null;
+	onclose: ((event: { code: number; reason: string }) => void) | null = null;
 	onerror: (() => void) | null = null;
 	onmessage: ((event: { data: string }) => void) | null = null;
 
@@ -69,11 +81,14 @@ class MockSocket {
 	}
 
 	addEventListener() {}
-	send(data: string) { this.sent.push(data); }
-	close() {
+	send(data: string) {
+		this.sent.push(data);
+	}
+	close(code?: number, reason?: string) {
 		if (this.readyState === MockSocket.CLOSED) return;
 		this.readyState = MockSocket.CLOSED;
-		this.onclose?.();
+		// A client-initiated close carries no code; a server-side refusal does.
+		this.onclose?.({ code: code ?? 1005, reason: reason ?? "" });
 	}
 	open() {
 		this.readyState = MockSocket.OPEN;
@@ -84,6 +99,27 @@ class MockSocket {
 	}
 }
 const sockets: MockSocket[] = [];
+
+function ioSockets(): MockSocket[] {
+	return sockets.filter((socket) => socket.url.includes("/api/terminal/io"));
+}
+
+function runningSummary(taskId: string) {
+	return {
+		taskId,
+		state: "running",
+		agentId: "codex",
+		workspacePath: "/tmp/worktree",
+		pid: 4321,
+		startedAt: 1,
+		updatedAt: 1,
+		lastOutputAt: null,
+		reviewReason: null,
+		exitCode: null,
+		lastHookAt: null,
+		latestHookActivity: null,
+	};
+}
 
 async function flushTerminalWrites() {
 	for (let index = 0; index < 12; index += 1) await Promise.resolve();
@@ -99,11 +135,18 @@ describe("persistent terminal background recovery", () => {
 		terminalWriteMock.mockReset();
 		vi.useFakeTimers();
 		vi.stubGlobal("WebSocket", MockSocket);
-		vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+		vi.stubGlobal(
+			"ResizeObserver",
+			class {
+				observe() {}
+				disconnect() {}
+			},
+		);
 		previousDescriptor = Object.getOwnPropertyDescriptor(document, "visibilityState");
 		visibility = "visible";
 		Object.defineProperty(document, "visibilityState", {
-			configurable: true, get: () => visibility,
+			configurable: true,
+			get: () => visibility,
 		});
 	});
 
@@ -121,8 +164,10 @@ describe("persistent terminal background recovery", () => {
 
 	it("disconnects only the viewer while hidden and restores the snapshot on foreground", async () => {
 		ensurePersistentTerminal({
-			taskId: "task-a", workspaceId: "workspace-a",
-			terminalBackgroundColor: "#000", cursorColor: "#fff",
+			taskId: "task-a",
+			workspaceId: "workspace-a",
+			terminalBackgroundColor: "#000",
+			cursorColor: "#fff",
 		});
 		expect(sockets).toHaveLength(2);
 		for (const socket of sockets) socket.open();
@@ -146,8 +191,10 @@ describe("persistent terminal background recovery", () => {
 
 	it("reconnects both channels after the server evicts a slow viewer", async () => {
 		ensurePersistentTerminal({
-			taskId: "task-a", workspaceId: "workspace-a",
-			terminalBackgroundColor: "#000", cursorColor: "#fff",
+			taskId: "task-a",
+			workspaceId: "workspace-a",
+			terminalBackgroundColor: "#000",
+			cursorColor: "#fff",
 		});
 		for (const socket of sockets) socket.open();
 		sockets[0]?.close();
@@ -162,11 +209,135 @@ describe("persistent terminal background recovery", () => {
 		expect(control?.sent).toContain(JSON.stringify({ type: "restore_complete" }));
 	});
 
+	it("does not reconnect after the server closes the stream for an exited session", async () => {
+		ensurePersistentTerminal({
+			taskId: "task-a",
+			workspaceId: "workspace-a",
+			terminalBackgroundColor: "#000",
+			cursorColor: "#fff",
+		});
+		for (const socket of sockets) socket.open();
+		const control = sockets[1];
+		control?.receive({ type: "exit", code: 0 });
+		await flushTerminalWrites();
+		expect(terminalWriteMock).toHaveBeenCalledWith(expect.stringContaining("session exited"));
+		terminalResetMock.mockClear();
+
+		// Keystrokes after the process died reach the server, which closes the stream
+		// deliberately with the exited-session code. Reconnecting would reset the
+		// terminal over the exit line the viewer is showing and be closed again on the
+		// next keystroke.
+		ioSockets()[0]?.close(RUNTIME_TERMINAL_IO_CLOSE_CODE_SESSION_NOT_RUNNING, "Task session is not running.");
+		await vi.advanceTimersByTimeAsync(30_000);
+		expect(sockets).toHaveLength(2);
+		expect(control?.readyState).toBe(MockSocket.OPEN);
+		expect(terminalResetMock).not.toHaveBeenCalled();
+	});
+
+	it("reconnects a stream the server closed because writing input failed", async () => {
+		ensurePersistentTerminal({
+			taskId: "task-a",
+			workspaceId: "workspace-a",
+			terminalBackgroundColor: "#000",
+			cursorColor: "#fff",
+		});
+		for (const socket of sockets) socket.open();
+		const control = sockets[1];
+
+		// 1011 means this stream failed, not that the session ended: writing input can
+		// throw while the PTY is live. Treating it as an exited session would leave a
+		// quiet, running task deaf to keystrokes until its state happened to change.
+		ioSockets()[0]?.close(1011, "write EPIPE");
+		expect(control?.readyState).not.toBe(MockSocket.OPEN);
+		await vi.advanceTimersByTimeAsync(300);
+		expect(ioSockets()).toHaveLength(2);
+		expect(sockets).toHaveLength(4);
+	});
+
+	it("reopens both channels with a fresh restore once the card reports a running session", async () => {
+		const terminal = ensurePersistentTerminal({
+			taskId: "task-a",
+			workspaceId: "workspace-a",
+			terminalBackgroundColor: "#000",
+			cursorColor: "#fff",
+		});
+		const ready: string[] = [];
+		const unsubscribe = terminal.subscribe({
+			onConnectionReady: (taskId) => {
+				ready.push(taskId);
+			},
+		});
+		for (const socket of sockets) socket.open();
+		const control = sockets[1];
+		control?.receive({ type: "restore", snapshot: "saved screen", cols: 80, rows: 24 });
+		await flushTerminalWrites();
+		expect(control?.sent).toContain(JSON.stringify({ type: "restore_complete" }));
+		expect(ready).toEqual(["task-a"]);
+		ready.length = 0;
+
+		ioSockets()[0]?.close(RUNTIME_TERMINAL_IO_CLOSE_CODE_SESSION_NOT_RUNNING, "Task session is not running.");
+		await vi.advanceTimersByTimeAsync(30_000);
+		expect(sockets).toHaveLength(2);
+
+		// The control channel stayed open, so the card's own state is what says a
+		// session exists to type into again. Only a control connection sends `restore`,
+		// and that handshake is what re-applies the geometry to the new PTY and reports
+		// the viewer ready, so the whole pair reopens rather than I/O alone.
+		control?.receive({ type: "state", summary: runningSummary("task-a") });
+		expect(control?.readyState).not.toBe(MockSocket.OPEN);
+		await vi.advanceTimersByTimeAsync(300);
+		expect(sockets).toHaveLength(4);
+		for (const socket of sockets.slice(2)) socket.open();
+		const reopenedControl = sockets[3];
+		reopenedControl?.receive({ type: "restore", snapshot: "restarted screen", cols: 100, rows: 30 });
+		await flushTerminalWrites();
+		expect(reopenedControl?.sent).toContain(JSON.stringify({ type: "restore_complete" }));
+		expect(terminalWriteMock).toHaveBeenLastCalledWith("restarted screen");
+		// The caller waiting on this would otherwise fall through on its timeout and
+		// leave the restarted session at the previous geometry.
+		expect(ready).toEqual(["task-a"]);
+		unsubscribe();
+	});
+
+	it("caps the reconnect loop when the server keeps refusing the stream", async () => {
+		const terminal = ensurePersistentTerminal({
+			taskId: "task-a",
+			workspaceId: "workspace-a",
+			terminalBackgroundColor: "#000",
+			cursorColor: "#fff",
+		});
+		const errors: Array<string | null> = [];
+		const unsubscribe = terminal.subscribe({
+			onLastError: (message) => {
+				errors.push(message);
+			},
+		});
+		for (const socket of sockets) socket.open();
+
+		ioSockets()[0]?.close();
+		for (let attempt = 0; attempt < 15; attempt += 1) {
+			await vi.advanceTimersByTimeAsync(5_000);
+			const newest = ioSockets().at(-1);
+			if (newest && newest.readyState !== MockSocket.CLOSED) {
+				newest.close();
+			}
+		}
+		const refusedAttempts = ioSockets().length;
+		expect(refusedAttempts).toBeGreaterThan(2);
+		expect(errors.at(-1)).toContain("Switch to another tab and back to retry");
+
+		await vi.advanceTimersByTimeAsync(120_000);
+		expect(ioSockets()).toHaveLength(refusedAttempts);
+		unsubscribe();
+	});
+
 	it("does not connect a terminal constructed in a background tab", () => {
 		visibility = "hidden";
 		ensurePersistentTerminal({
-			taskId: "task-a", workspaceId: "workspace-a",
-			terminalBackgroundColor: "#000", cursorColor: "#fff",
+			taskId: "task-a",
+			workspaceId: "workspace-a",
+			terminalBackgroundColor: "#000",
+			cursorColor: "#fff",
 		});
 		expect(sockets).toHaveLength(0);
 		visibility = "visible";

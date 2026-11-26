@@ -219,6 +219,30 @@ describe("TerminalSessionManager", () => {
 		expect(manager.clearTurnCapacityWait("missing-task")).toBeNull();
 	});
 
+	it("keeps the argv a task's CLI launched with for its follow-up turns", () => {
+		const manager = new TerminalSessionManager();
+		// A record hydrated after a restart names no argv: nothing launched in this
+		// runtime, so the pool a follow-up joins belongs to the next start.
+		manager.hydrateFromRecord({ "task-1": createSummary({ agentId: "pi", state: "running" }) });
+		expect(manager.getLaunchArgs("task-1")).toBeNull();
+
+		const entries = (manager as unknown as { entries: Map<string, { launchArgs: readonly string[] | null }> })
+			.entries;
+		const entry = entries.get("task-1");
+		if (!entry) {
+			throw new Error("Expected a hydrated entry.");
+		}
+		entry.launchArgs = ["--provider", "local", "--model", "qwen-coder"];
+
+		expect(manager.getLaunchArgs("task-1")).toEqual(["--provider", "local", "--model", "qwen-coder"]);
+		// The argv is handed out as a copy: a capacity request must not be able to
+		// rewrite what a live process was started with.
+		const args = manager.getLaunchArgs("task-1");
+		const again = manager.getLaunchArgs("task-1");
+		expect(args).not.toBe(again);
+		expect(again).toEqual(["--provider", "local", "--model", "qwen-coder"]);
+	});
+
 	it("keeps a hydrated Pi record restorable when the terminal attaches first", () => {
 		const manager = new TerminalSessionManager();
 		manager.hydrateFromRecord({

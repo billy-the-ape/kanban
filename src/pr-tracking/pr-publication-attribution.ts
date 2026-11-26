@@ -695,6 +695,11 @@ function findBalancedBrace(text: string, start: number): number {
 	return -1;
 }
 
+/** True when an already-trimmed reply opens as a JSON object whose brace never closes. */
+function isTruncatedJsonObject(trimmed: string): boolean {
+	return trimmed.startsWith("{") && findBalancedBrace(trimmed, 0) < 0;
+}
+
 /**
  * A REST reply cut off mid-body: it opens as a JSON object whose brace never
  * closes. Everything after the opening brace is then either nested inside that
@@ -702,8 +707,7 @@ function findBalancedBrace(text: string, start: number): number {
  * on its own — a `diff_hunk` containing `() => {}` must not look like objects.
  */
 function isTruncatedJsonDocument(text: string): boolean {
-	const trimmed = text.trim();
-	return trimmed.startsWith("{") && findBalancedBrace(trimmed, 0) < 0;
+	return isTruncatedJsonObject(text.trim());
 }
 
 /** Top-level JSON objects embedded in tool output (parse failures skipped). */
@@ -749,8 +753,8 @@ function readPositiveInt(record: Record<string, unknown>, key: string): number |
  * header fields; never scan quoted bodies, nested objects, or arrays for ids.
  */
 function readTruncatedApiResponseHeader(text: string): Record<string, unknown> | null {
-	if (!isTruncatedJsonDocument(text)) return null;
 	const trimmed = text.trim();
+	if (!isTruncatedJsonObject(trimmed)) return null;
 	const header: Record<string, unknown> = {};
 	const allowed = new Set(["url", "id", "pull_request_review_id", "node_id"]);
 	let rest = trimmed.slice(1);
@@ -841,6 +845,24 @@ function mapApiResponseIdentity(
 }
 
 /**
+ * An explicit `gh api` write pinned to the target PR. Both the filtered-response
+ * mapping and the repeated-write acceptance ask with this helper, so neither can
+ * widen (or narrow) the set of writes the other treats as attributable.
+ */
+function isExplicitTargetApiWrite(
+	operation: PrPublicationOperation | undefined,
+	target: PrPublicationTarget,
+): operation is PrPublicationOperation & { kind: PrPublishedIdentityKind } {
+	return (
+		operation !== undefined &&
+		operation.operation === "gh api" &&
+		operation.kind !== null &&
+		operation.explicitRepository?.toLowerCase() === target.repository.toLowerCase() &&
+		operation.explicitNumber === target.number
+	);
+}
+
+/**
  * A filtered REST response can retain only {id, url}. Comment API URLs do
  * not carry the PR number, so require one explicit, target-matching REST
  * write as well as a matching response repository, kind and database id.
@@ -856,10 +878,7 @@ function mapFilteredApiResponseIdentity(
 	}
 	const operation = operations[0];
 	if (
-		operation.operation !== "gh api" ||
-		operation.kind === null ||
-		operation.explicitRepository?.toLowerCase() !== target.repository.toLowerCase() ||
-		operation.explicitNumber !== target.number ||
+		!isExplicitTargetApiWrite(operation, target) ||
 		["html_url", "issue_url", "pull_request_url"].some((key) => key in object)
 	) {
 		return null;
@@ -1037,11 +1056,7 @@ function resolveRepeatedPublicationIdentity(
 		objects.length < 2 ||
 		target === null ||
 		operations.length !== 1 ||
-		!operation ||
-		operation.operation !== "gh api" ||
-		operation.kind === null ||
-		operation.explicitRepository?.toLowerCase() !== target.repository.toLowerCase() ||
-		operation.explicitNumber !== target.number
+		!isExplicitTargetApiWrite(operation, target)
 	) {
 		return null;
 	}
@@ -1054,10 +1069,7 @@ function resolveRepeatedPublicationIdentity(
 			current = mapFilteredApiResponseIdentity(object, operations, target);
 			// A filtered response may retain the canonical HTML URL instead
 			// of the REST URL. Require the top-level id to agree with it.
-			if (
-				current === null &&
-				!["issue_url", "pull_request_url", "url", "comments"].some((key) => key in object)
-			) {
+			if (current === null && !["issue_url", "pull_request_url", "url", "comments"].some((key) => key in object)) {
 				const id = readPositiveInt(object, "id");
 				const htmlUrl = readString(object, "html_url");
 				if (id !== null && htmlUrl !== null) {

@@ -615,5 +615,3 @@ async function runEnsureWorktreeDependencies(
 				: failed.map((report) => `${label(report.installPath)}: ${report.reason ?? "failed"}`).join("; "),
 	};
 }
-
-export { DEFAULT_INSTALL_TIMEOUT_MS };

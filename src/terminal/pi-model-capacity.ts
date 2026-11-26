@@ -332,8 +332,20 @@ export class PiModelCapacityGate {
 		 */
 		const anyInputAnsweredQueued = (): boolean => record.inputs.some((input) => input.answeredQueued);
 
-		/** Publishes the wait once the queue reports it, and only to the caller. */
+		/**
+		 * Publishes the wait once the queue reports it, and only to the caller. The
+		 * queue reports again whenever a card ahead of this one clears, so a later
+		 * position refreshes the waiting record instead of being dropped: a card first
+		 * seen third in line must not keep telling the card third until its own work
+		 * starts.
+		 */
 		const reportQueued = (queuePosition: number | null): void => {
+			if (record.reported === "queued") {
+				if (record.queuePosition === queuePosition) return;
+				record.queuePosition = queuePosition;
+				this.recordWaiting(request, queuePosition);
+				return;
+			}
 			if (record.reported !== null) return;
 			record.queuePosition = queuePosition;
 			record.reported = "queued";
