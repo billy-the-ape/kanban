@@ -23,11 +23,12 @@ const trpcClientMocks = vi.hoisted(() => ({
 	refreshTaskPullRequestEntry: vi.fn(),
 	refreshLinkedTaskPullRequests: vi.fn(),
 	getTaskTrackingState: vi.fn(),
+	getAutoMergePolicy: vi.fn(),
 	selectTaskAutomationPr: vi.fn(),
 }));
 
-vi.mock("@/runtime/trpc-client", () => ({
-	getRuntimeTrpcClient: () => ({
+vi.mock("@/runtime/trpc-client", () => {
+	const client = {
 		workspace: {
 			addTaskPullRequest: { mutate: trpcClientMocks.addTaskPullRequest },
 			removeTaskPullRequest: { mutate: trpcClientMocks.removeTaskPullRequest },
@@ -37,11 +38,13 @@ vi.mock("@/runtime/trpc-client", () => ({
 			refreshLinkedTaskPullRequests: { mutate: trpcClientMocks.refreshLinkedTaskPullRequests },
 			prTracking: {
 				getTaskTrackingState: { query: trpcClientMocks.getTaskTrackingState },
+				getAutoMergePolicy: { query: trpcClientMocks.getAutoMergePolicy },
 				selectTaskAutomationPr: { mutate: trpcClientMocks.selectTaskAutomationPr },
 			},
 		},
-	}),
-}));
+	};
+	return { getRuntimeTrpcClient: () => client };
+});
 
 vi.mock("@/components/app-toaster", () => ({
 	showAppToast: vi.fn(),
@@ -258,6 +261,7 @@ describe("CardDetailView", () => {
 		trpcClientMocks.refreshTaskPullRequestEntry.mockReset();
 		trpcClientMocks.refreshLinkedTaskPullRequests.mockReset();
 		trpcClientMocks.getTaskTrackingState.mockReset();
+		trpcClientMocks.getAutoMergePolicy.mockReset().mockResolvedValue({ policy: null });
 		previousActEnvironment = (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
 			.IS_REACT_ACT_ENVIRONMENT;
 		(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -1482,6 +1486,7 @@ describe("TaskPrTrackingPanel (PRs view)", () => {
 		trpcClientMocks.refreshTaskPullRequestEntry.mockReset();
 		trpcClientMocks.refreshLinkedTaskPullRequests.mockReset();
 		trpcClientMocks.getTaskTrackingState.mockReset();
+		trpcClientMocks.getAutoMergePolicy.mockReset().mockResolvedValue({ policy: null });
 		trpcClientMocks.selectTaskAutomationPr.mockReset();
 		previousActEnvironment = (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
 			.IS_REACT_ACT_ENVIRONMENT;
@@ -1541,6 +1546,8 @@ describe("TaskPrTrackingPanel (PRs view)", () => {
 		});
 
 		expect(container.textContent).toContain("cline/kanban#12 (automatic)");
+		expect(trpcClientMocks.getAutoMergePolicy).toHaveBeenCalledExactlyOnceWith({ repository: "cline/kanban" });
+		expect(container.textContent).toContain("No CI policy configured yet.");
 		expect(container.querySelector('[aria-label="Automation PR"]')).toBeNull();
 		expect(trpcClientMocks.selectTaskAutomationPr).not.toHaveBeenCalled();
 	});
@@ -1582,6 +1589,7 @@ describe("TaskPrTrackingPanel (PRs view)", () => {
 		});
 		expect(trpcClientMocks.selectTaskAutomationPr).toHaveBeenCalledWith({ taskId: "task-1", prKey });
 		expect(container.querySelector<HTMLSelectElement>('[aria-label="Automation PR"]')?.value).toBe(prKey);
+		expect(trpcClientMocks.getAutoMergePolicy).toHaveBeenCalledExactlyOnceWith({ repository: "cline/kanban" });
 	});
 
 	it("renders stored links with metadata and order, without a provider round-trip", async () => {
