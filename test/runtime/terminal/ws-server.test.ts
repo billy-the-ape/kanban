@@ -6,7 +6,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RawData } from "ws";
 import { WebSocket } from "ws";
 
-import type { RuntimeTaskSessionSummary, RuntimeTerminalWsServerMessage } from "../../../src/core/api-contract";
+import {
+	RUNTIME_TERMINAL_IO_CLOSE_CODE_SESSION_NOT_RUNNING,
+	type RuntimeTaskSessionSummary,
+	type RuntimeTerminalWsServerMessage,
+} from "../../../src/core/api-contract";
 import { getKanbanRuntimePort, setKanbanRuntimePort } from "../../../src/core/runtime-endpoint";
 import type { TerminalSessionListener, TerminalSessionService } from "../../../src/terminal/terminal-session-service";
 import type { TerminalRestoreSnapshot } from "../../../src/terminal/terminal-state-mirror";
@@ -69,7 +73,7 @@ class FakeTerminalManager implements TerminalSessionService {
 		}),
 	);
 	recoverStaleSession = vi.fn(() => createSummary());
-	writeInput = vi.fn(() => createSummary());
+	writeInput = vi.fn((): RuntimeTaskSessionSummary | null => createSummary());
 	resize = vi.fn(() => true);
 	pauseOutput = vi.fn(() => true);
 	resumeOutput = vi.fn(() => true);
@@ -455,6 +459,39 @@ describe("createTerminalWebSocketBridge", () => {
 
 		await closeSocket(reconnectedIo.socket);
 		await closeSocket(control.socket);
+	});
+
+	it("closes an exited session's stream with a code of its own", async () => {
+		const ioUrl = `${runtimeUrl}/api/terminal/io?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=exited-session`;
+		// The task exited, so input has nowhere to go. The answer must not be 1011: the
+		// viewer treats that as a dropped stream and would reopen it, resetting the
+		// screen over the exit line it is already showing, only to be refused again on
+		// the next keystroke.
+		terminalManager.writeInput = vi.fn((): RuntimeTaskSessionSummary | null => null);
+		const io = await openQueuedWebSocket(ioUrl);
+		const closed = once(io.socket, "close");
+		io.socket.send("ls\n");
+		const [code, reason] = await closed;
+		expect(code).toBe(RUNTIME_TERMINAL_IO_CLOSE_CODE_SESSION_NOT_RUNNING);
+		expect(reason.toString("utf8")).toBe("Task session is not running.");
+		await closeSocket(io.socket);
+	});
+
+	it("keeps a failed write on the close code a viewer reconnects on", async () => {
+		const ioUrl = `${runtimeUrl}/api/terminal/io?taskId=${TASK_ID}&workspaceId=${WORKSPACE_ID}&clientId=write-failed`;
+		// A throw says nothing about the session: the PTY can still be running, and a
+		// viewer that read this close as an exited session would quietly stop
+		// delivering keystrokes from a live task.
+		terminalManager.writeInput = vi.fn((): RuntimeTaskSessionSummary => {
+			throw new Error("write EPIPE");
+		});
+		const io = await openQueuedWebSocket(ioUrl);
+		const closed = once(io.socket, "close");
+		io.socket.send("ls\n");
+		const [code, reason] = await closed;
+		expect(code).toBe(1011);
+		expect(reason.toString("utf8")).toBe("write EPIPE");
+		await closeSocket(io.socket);
 	});
 
 	it("never pauses a shared agent PTY when one viewer falls behind", async () => {

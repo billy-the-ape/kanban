@@ -1,3 +1,4 @@
+import { RUNTIME_TERMINAL_IO_CLOSE_CODE_SESSION_NOT_RUNNING } from "@runtime-contract";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const terminalResetMock = vi.hoisted(() => vi.fn());
@@ -83,11 +84,11 @@ class MockSocket {
 	send(data: string) {
 		this.sent.push(data);
 	}
-	close(code?: number) {
+	close(code?: number, reason?: string) {
 		if (this.readyState === MockSocket.CLOSED) return;
 		this.readyState = MockSocket.CLOSED;
 		// A client-initiated close carries no code; a server-side refusal does.
-		this.onclose?.({ code: code ?? 1005, reason: "" });
+		this.onclose?.({ code: code ?? 1005, reason: reason ?? "" });
 	}
 	open() {
 		this.readyState = MockSocket.OPEN;
@@ -223,16 +224,17 @@ describe("persistent terminal background recovery", () => {
 		terminalResetMock.mockClear();
 
 		// Keystrokes after the process died reach the server, which closes the stream
-		// deliberately (1011). Reconnecting would reset the terminal over the exit
-		// line the viewer is showing and be closed again on the next keystroke.
-		ioSockets()[0]?.close(1011);
+		// deliberately with the exited-session code. Reconnecting would reset the
+		// terminal over the exit line the viewer is showing and be closed again on the
+		// next keystroke.
+		ioSockets()[0]?.close(RUNTIME_TERMINAL_IO_CLOSE_CODE_SESSION_NOT_RUNNING, "Task session is not running.");
 		await vi.advanceTimersByTimeAsync(30_000);
 		expect(sockets).toHaveLength(2);
 		expect(control?.readyState).toBe(MockSocket.OPEN);
 		expect(terminalResetMock).not.toHaveBeenCalled();
 	});
 
-	it("reopens the stream once the card reports a running session again", async () => {
+	it("reconnects a stream the server closed because writing input failed", async () => {
 		ensurePersistentTerminal({
 			taskId: "task-a",
 			workspaceId: "workspace-a",
@@ -241,14 +243,60 @@ describe("persistent terminal background recovery", () => {
 		});
 		for (const socket of sockets) socket.open();
 		const control = sockets[1];
-		ioSockets()[0]?.close(1011);
+
+		// 1011 means this stream failed, not that the session ended: writing input can
+		// throw while the PTY is live. Treating it as an exited session would leave a
+		// quiet, running task deaf to keystrokes until its state happened to change.
+		ioSockets()[0]?.close(1011, "write EPIPE");
+		expect(control?.readyState).not.toBe(MockSocket.OPEN);
+		await vi.advanceTimersByTimeAsync(300);
+		expect(ioSockets()).toHaveLength(2);
+		expect(sockets).toHaveLength(4);
+	});
+
+	it("reopens both channels with a fresh restore once the card reports a running session", async () => {
+		const terminal = ensurePersistentTerminal({
+			taskId: "task-a",
+			workspaceId: "workspace-a",
+			terminalBackgroundColor: "#000",
+			cursorColor: "#fff",
+		});
+		const ready: string[] = [];
+		const unsubscribe = terminal.subscribe({
+			onConnectionReady: (taskId) => {
+				ready.push(taskId);
+			},
+		});
+		for (const socket of sockets) socket.open();
+		const control = sockets[1];
+		control?.receive({ type: "restore", snapshot: "saved screen", cols: 80, rows: 24 });
+		await flushTerminalWrites();
+		expect(control?.sent).toContain(JSON.stringify({ type: "restore_complete" }));
+		expect(ready).toEqual(["task-a"]);
+		ready.length = 0;
+
+		ioSockets()[0]?.close(RUNTIME_TERMINAL_IO_CLOSE_CODE_SESSION_NOT_RUNNING, "Task session is not running.");
 		await vi.advanceTimersByTimeAsync(30_000);
 		expect(sockets).toHaveLength(2);
 
 		// The control channel stayed open, so the card's own state is what says a
-		// session exists to type into again.
+		// session exists to type into again. Only a control connection sends `restore`,
+		// and that handshake is what re-applies the geometry to the new PTY and reports
+		// the viewer ready, so the whole pair reopens rather than I/O alone.
 		control?.receive({ type: "state", summary: runningSummary("task-a") });
-		expect(ioSockets()).toHaveLength(2);
+		expect(control?.readyState).not.toBe(MockSocket.OPEN);
+		await vi.advanceTimersByTimeAsync(300);
+		expect(sockets).toHaveLength(4);
+		for (const socket of sockets.slice(2)) socket.open();
+		const reopenedControl = sockets[3];
+		reopenedControl?.receive({ type: "restore", snapshot: "restarted screen", cols: 100, rows: 30 });
+		await flushTerminalWrites();
+		expect(reopenedControl?.sent).toContain(JSON.stringify({ type: "restore_complete" }));
+		expect(terminalWriteMock).toHaveBeenLastCalledWith("restarted screen");
+		// The caller waiting on this would otherwise fall through on its timeout and
+		// leave the restarted session at the previous geometry.
+		expect(ready).toEqual(["task-a"]);
+		unsubscribe();
 	});
 
 	it("caps the reconnect loop when the server keeps refusing the stream", async () => {

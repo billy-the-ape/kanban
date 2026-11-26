@@ -2876,6 +2876,21 @@ export const runtimeTerminalWsServerMessageSchema = z.discriminatedUnion("type",
 ]);
 export type RuntimeTerminalWsServerMessage = z.infer<typeof runtimeTerminalWsServerMessageSchema>;
 
+/**
+ * Close code the terminal I/O stream uses when input arrives for a task session
+ * that has already exited (`writeInput` returned no summary; see
+ * `src/terminal/ws-server.ts`). It is deliberately not 1011: the server also
+ * closes the stream with 1011 when `writeInput` throws, which can happen while
+ * the PTY is still live, and a viewer that treated that as an exited session
+ * would stop reconnecting and silently drop keystrokes from a running task.
+ * The viewer keeps the stream closed for this code until the card reports a
+ * running session again.
+ *
+ * A private-range code (RFC 6455 §7.4.2) is used because no registered status
+ * code distinguishes "the session ended" from "the transport failed".
+ */
+export const RUNTIME_TERMINAL_IO_CLOSE_CODE_SESSION_NOT_RUNNING = 4001;
+
 export const runtimeGitCommitSchema = z.object({
 	hash: z.string(),
 	shortHash: z.string(),
