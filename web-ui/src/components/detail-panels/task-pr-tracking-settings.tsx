@@ -178,19 +178,20 @@ export function TaskPrTrackingSettings({
 
 			{mergeStatusLine ? <div className="mt-2 text-xs text-text-secondary">{mergeStatusLine}</div> : null}
 
-			{/* The selector also shows for a single linked PR while there is no
-			explicit selection: persisting it is required before arming
-			auto-merge (a sole link alone does not count as selected). */}
-			{selectionCandidates.length > 1 ||
-			(selectionCandidates.length === 1 && tracking.explicitAutomationPrKey === null) ? (
+			{/* The server already resolves a sole linked PR. */}
+			{selectionCandidates.length === 1 &&
+			selectionCandidates[0]?.prKey === tracking.selectedAutomationPrKey ? (
 				<div className="mt-2 flex items-center gap-2 text-xs text-text-secondary">
 					<span>Automation PR</span>
-					{/* Driven by the EXPLICIT selection (with a placeholder while
-						unset): the resolved key would make the sole linked PR
-						"already selected", and a browser fires no change event
-						when the already-selected option is picked again. */}
+					<span>{selectionCandidates[0].label} (automatic)</span>
+				</div>
+			) : null}
+			{selectionCandidates.length > 1 ? (
+				<div className="mt-2 flex items-center gap-2 text-xs text-text-secondary">
+					<span>Automation PR</span>
+					{/* Use the resolved selection rather than a dangling explicit key. */}
 					<select
-						value={tracking.explicitAutomationPrKey ?? ""}
+						value={tracking.selectedAutomationPrKey ?? ""}
 						disabled={acting}
 						onChange={(event) => {
 							const prKey = event.target.value;
@@ -203,7 +204,7 @@ export function TaskPrTrackingSettings({
 						aria-label="Automation PR"
 						className="max-w-[220px] rounded-md border border-bright bg-surface-2 px-2 py-1 text-xs text-text-primary"
 					>
-						{tracking.explicitAutomationPrKey === null ? <option value="">Select a PR…</option> : null}
+						{tracking.selectedAutomationPrKey === null ? <option value="">Select a PR…</option> : null}
 						{selectionCandidates.map((candidate) => (
 							<option key={candidate.prKey ?? candidate.label} value={candidate.prKey ?? ""}>
 								{candidate.label}
@@ -226,6 +227,19 @@ export function TaskPrTrackingSettings({
 
 			<div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-text-secondary">
 				{tracking.ownerLabel ? <span>Repairs owned by {tracking.ownerLabel}</span> : null}
+				{tracking.selectedAutomationPrKey && blockers.some((blocker) => blocker.kind === "auth") ? (
+					<button
+						type="button"
+						disabled={acting}
+						onClick={() =>
+							void runMutation(() => client.workspace.prTracking.refreshTaskPrSnapshot.mutate({ taskId }))
+						}
+						className="inline-flex items-center gap-1 rounded-md border border-bright bg-surface-2 px-2 py-1 text-xs text-text-primary hover:bg-surface-3 disabled:opacity-50"
+					>
+						<RefreshCw size={12} />
+						Retry PR tracking
+					</button>
+				) : null}
 				{tracking.terminalStop ? (
 					<button
 						type="button"

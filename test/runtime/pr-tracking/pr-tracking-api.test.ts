@@ -286,8 +286,8 @@ describe("pr-tracking api: tracking-state diagnostics", () => {
 	});
 
 	it("does not treat a sole linked PR as an explicit selection", async () => {
-		// The resolved key falls back to the sole link, but the EXPLICIT
-		// selection stays null — the arming write requires an explicit one.
+		// The resolved key falls back to the sole link; no explicit
+		// selection is required for automation or arming.
 		const board = makeBoard(makeCard());
 		mockWorkspaceState(board);
 		const harness = createHarness(board);

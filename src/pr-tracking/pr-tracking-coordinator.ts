@@ -234,6 +234,8 @@ export class PrTrackingCoordinator {
 	private readonly evidenceInFlight = new Map<string, Promise<AutoMergeEvidenceEnvelope>>();
 	private scopeCache: AccessScope | null = null;
 	private scopeFailure: GhAdapterFailure | null = null;
+	private lastScopeFailureAt: number | null = null;
+	private subscriptionRecovery: Promise<void> | null = null;
 	private schedulerLockRelease: (() => Promise<void>) | null = null;
 	private schedulerBlocked = false;
 	private authBlocker: string | null = null;
@@ -301,6 +303,7 @@ export class PrTrackingCoordinator {
 		for (const job of this.evidenceInFlight.values()) {
 			inFlight.push(job.then(() => undefined));
 		}
+		if (this.subscriptionRecovery) inFlight.push(this.subscriptionRecovery);
 		await Promise.all(inFlight);
 		if (this.schedulerLockRelease) {
 			const release = this.schedulerLockRelease;
@@ -576,12 +579,14 @@ export class PrTrackingCoordinator {
 		const resolved = await this.adapter.resolveAccessScope();
 		if (!resolved.ok) {
 			this.scopeFailure = resolved.failure;
+			this.lastScopeFailureAt = this.now();
 			this.authBlocker = resolved.failure.message;
 			this.warn(`PR tracking auth blocker: ${resolved.failure.message}`);
 			this.cancelAllPolls();
 			return { ok: false, blocker: "auth" };
 		}
 		const previousScope = this.scopeCache;
+		this.lastScopeFailureAt = null;
 		this.scopeCache = resolved.scope;
 		this.scopes.set(resolved.scope.accessScopeId, resolved.scope);
 		this.applyScopeChange(resolved.scope, previousScope);
@@ -722,6 +727,41 @@ export class PrTrackingCoordinator {
 			return this.blockedSubscription(descriptor, scopeResult.scope, "record_malformed");
 		}
 		return await this.finishSubscriptionAdd(descriptor, scopeResult.scope);
+	}
+
+	/**
+	 * Initial credential failures leave subscriptions without bindings or
+	 * polls. Retry initialization on demand reconciliation, throttling failed
+	 * probes. Explicit tracking refresh can retry immediately.
+	 */
+	async recoverBlockedSubscriptions(force = false): Promise<void> {
+		if (this.stopping) return;
+		if (this.subscriptionRecovery) return this.subscriptionRecovery;
+		const blocked = [...this.subscriptions.values()].filter((sub) => sub.blocker === "auth" || sub.blocker === "scope");
+		if (blocked.length === 0) return;
+		if (!force && this.lastScopeFailureAt !== null && this.now() - this.lastScopeFailureAt < 60_000) {
+			return;
+		}
+		const job = (async () => {
+			const scopeResult = await this.ensureScope(
+				undefined,
+				force || this.scopeFailure !== null || this.authBlocker !== null,
+			);
+			if (!scopeResult.ok || this.stopping) return;
+			for (const sub of blocked) {
+				if (this.stopping || this.subscriptions.get(this.subscriptionKey(sub.workspaceId, sub.taskId)) !== sub) {
+					continue;
+				}
+				await this.addSubscription({ ...sub, accessScopeId: scopeResult.scope.accessScopeId });
+			}
+			await this.reevaluateAll();
+		})();
+		this.subscriptionRecovery = job;
+		try {
+			await job;
+		} finally {
+			this.subscriptionRecovery = null;
+		}
 	}
 
 	private async finishSubscriptionAdd(
@@ -1524,6 +1564,16 @@ export class PrTrackingCoordinator {
 	 * set (permission changes do not require a new auth context).
 	 */
 	async refresh(prKey: string, accessScopeId: string): Promise<{ coalesced: boolean }> {
+		const blocked = [...this.subscriptions.values()].some(
+			(sub) =>
+				sub.canonicalPrKey === prKey &&
+				sub.accessScopeId === accessScopeId &&
+				(sub.blocker === "auth" || sub.blocker === "scope"),
+		);
+		if (blocked) {
+			await this.recoverBlockedSubscriptions(true);
+			return { coalesced: false };
+		}
 		const state = this.polls.get(this.pollKey(prKey, accessScopeId));
 		if (!state) {
 			return { coalesced: false };

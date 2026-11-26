@@ -495,9 +495,6 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			[];
 		const commentsSupportedForTask = commentsServableTask;
 		const coordinatorState = coordinator ? coordinator.getState() : null;
-		if (coordinatorState?.authBlocker) {
-			blockers.push({ kind: "auth", message: coordinatorState.authBlocker });
-		}
 		if (coordinatorState?.schedulerBlocked) {
 			blockers.push({ kind: "scheduler", message: "The PR tracking scheduler is blocked; reads are paused." });
 		}
@@ -508,12 +505,20 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 					.listSubscriptions()
 					.find((entry) => entry.workspaceId === scope.workspaceId && entry.taskId === input.taskId)
 			: undefined;
-		if (subscriptionState?.blocker) {
-			const mapping = SUBSCRIPTION_BLOCKER_MESSAGES[subscriptionState.blocker];
-			blockers.push({
-				kind: mapping.kind,
-				message: mapping.message,
-			});
+		if (subscriptionState && subscriptionState.canonicalPrKey === resolved.key) {
+			if (coordinatorState?.authBlocker) {
+				blockers.push({ kind: "auth", message: coordinatorState.authBlocker });
+			}
+			if (subscriptionState.blocker && !(subscriptionState.blocker === "auth" && coordinatorState?.authBlocker)) {
+				const mapping = SUBSCRIPTION_BLOCKER_MESSAGES[subscriptionState.blocker];
+				blockers.push({
+					kind: mapping.kind,
+					message:
+						subscriptionState.blocker === "auth"
+							? "PR tracking has not reconnected yet. Retry PR tracking."
+							: mapping.message,
+				});
+			}
 		}
 		const active = found.columnId === "in_progress" || found.columnId === "review";
 		if (resolved.ambiguous) {
@@ -760,8 +765,8 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		}
 		const found = await loadScopedCard(scope, input.taskId);
 		const resolved = found ? resolveCardAutomationPrKey(found.card) : null;
-		if (!resolved?.key) {
-			return { ok: false, coalesced: false, checkedAt: null, error: "No resolvable Automation PR for this task" };
+		if (!resolved?.key || resolved.key !== sub.canonicalPrKey) {
+			return { ok: false, coalesced: false, checkedAt: null, error: "No current Automation PR subscription for this task" };
 		}
 		const refreshed = await coordinator.refresh(sub.canonicalPrKey, sub.accessScopeId);
 		const after = coordinator.getTaskAuthorizedSnapshot(scope.workspaceId, input.taskId);

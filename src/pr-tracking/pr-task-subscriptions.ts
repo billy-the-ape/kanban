@@ -36,6 +36,7 @@ export interface PrTaskSubscriptionSource {
 export interface PrSubscriptionController {
 	addSubscription(descriptor: PrTrackingSubscriptionDescriptor): Promise<SubscriptionAddResult>;
 	removeSubscription(workspaceId: string, taskId: string): Promise<void>;
+	recoverBlockedSubscriptions?(): Promise<void>;
 	listSubscriptions(): Array<{
 		workspaceId: string;
 		taskId: string;
@@ -226,6 +227,7 @@ export async function reconcileTaskSubscriptions(
 		if (
 			existing &&
 			existing.canonicalPrKey === demand.canonicalPrKey &&
+			existing.column === demand.column &&
 			sameConsumers(existing.consumers, demand.consumers)
 		) {
 			continue;
@@ -253,6 +255,8 @@ export async function reconcileTaskSubscriptions(
 			removed.push(key);
 		}
 	}
+	// Recover initialization only after stale demand has been removed.
+	await controller.recoverBlockedSubscriptions?.();
 	return { added, removed, updated };
 }
 
