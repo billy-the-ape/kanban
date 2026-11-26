@@ -1529,30 +1529,59 @@ describe("TaskPrTrackingPanel (PRs view)", () => {
 		expect(trpcClientMocks.getTaskTrackingState).toHaveBeenCalledWith({ taskId: "task-1" });
 	});
 
-	it("persists the sole linked PR through the selector while no explicit selection exists", async () => {
+	it("automatically displays the sole linked PR without persisting an explicit selection", async () => {
 		const link = createTaskPullRequest(12);
-		trpcClientMocks.getTaskTrackingState.mockResolvedValue(createTrackingState());
+		trpcClientMocks.getTaskTrackingState.mockResolvedValue({
+			...createTrackingState(),
+			selectedAutomationPrKey: toCanonicalPrKeyForLink(link),
+		});
+
 		await act(async () => {
 			renderPanel({ pullRequests: [link] });
 		});
 
-		// With no explicit selection, the controlled select starts at the
-		// placeholder (not at the implicitly-resolved sole link), so picking
-		// the linked PR fires a change and persists the selection.
+		expect(container.textContent).toContain("cline/kanban#12 (automatic)");
+		expect(container.querySelector('[aria-label="Automation PR"]')).toBeNull();
+		expect(trpcClientMocks.selectTaskAutomationPr).not.toHaveBeenCalled();
+	});
+
+	it("persists an explicit automation PR selection when multiple PRs are linked", async () => {
+		const first = createTaskPullRequest(12);
+		const second = createTaskPullRequest(99);
+		trpcClientMocks.getTaskTrackingState.mockResolvedValue(createTrackingState());
+		const prKey = toCanonicalPrKeyForLink(second);
+		if (prKey === null) {
+			throw new Error("expected a canonical PR key for the linked PR");
+		}
+		trpcClientMocks.selectTaskAutomationPr.mockImplementation(async () => {
+			trpcClientMocks.getTaskTrackingState.mockResolvedValue({
+				...createTrackingState(),
+				selectedAutomationPrKey: prKey,
+				explicitAutomationPrKey: prKey,
+			});
+			return { ok: true };
+		});
+
+		await act(async () => {
+			renderPanel({ pullRequests: [first, second] });
+		});
+
 		const select = container.querySelector('[aria-label="Automation PR"]') as HTMLSelectElement | null;
 		if (select === null) {
 			throw new Error("Automation PR selector is not rendered");
 		}
 		expect(select.value).toBe("");
-		const prKey = toCanonicalPrKeyForLink(link);
-		if (prKey === null) {
-			throw new Error("expected a canonical PR key for the linked PR");
-		}
+		expect(Array.from(select.options).map((option) => option.value)).toEqual([
+			"",
+			toCanonicalPrKeyForLink(first),
+			prKey,
+		]);
 		await act(async () => {
 			select.value = prKey;
 			select.dispatchEvent(new Event("change", { bubbles: true }));
 		});
 		expect(trpcClientMocks.selectTaskAutomationPr).toHaveBeenCalledWith({ taskId: "task-1", prKey });
+		expect(container.querySelector<HTMLSelectElement>('[aria-label="Automation PR"]')?.value).toBe(prKey);
 	});
 
 	it("renders stored links with metadata and order, without a provider round-trip", async () => {
