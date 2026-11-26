@@ -1,5 +1,5 @@
 import type { DropResult } from "@hello-pangea/dnd";
-import { runtimeTaskPullRequestSchema } from "@runtime-contract";
+import { runtimeTaskConflictRepairRecordSchema, runtimeTaskPullRequestSchema } from "@runtime-contract";
 import { createShortTaskId } from "@runtime-task-id";
 import * as runtimeTaskState from "@runtime-task-state";
 
@@ -8,6 +8,7 @@ import type {
 	RuntimeAgentId,
 	RuntimeClineReasoningEffort,
 	RuntimeTaskClineSettings,
+	RuntimeTaskConflictRepairRecord,
 	RuntimeTaskPullRequest,
 } from "@/runtime/types";
 import { isAllowedCrossColumnCardMove, type ProgrammaticCardMoveInFlight } from "@/state/drag-rules";
@@ -190,6 +191,19 @@ function normalizeSentGitActionPrompt(raw: unknown): { action: "commit" | "pr"; 
 	return { action: value.action, sentAt: value.sentAt };
 }
 
+/**
+ * PCR: the server-owned conflict-repair dispatch record carries through
+ * board hydration (the server re-owns it on save), and it is what keeps the
+ * PR row's "repair dispatched / repair failed" line, the duplicate-click
+ * disable, and the failure reason alive after a reload or a workspace-sync
+ * replace. The shared contract schema is the single source of truth; a
+ * malformed payload is dropped exactly like the AUTOGIT record above.
+ */
+function normalizeConflictRepair(raw: unknown): RuntimeTaskConflictRepairRecord | undefined {
+	const parsed = runtimeTaskConflictRepairRecordSchema.safeParse(raw);
+	return parsed.success ? parsed.data : undefined;
+}
+
 function normalizeCard(rawCard: unknown): BoardCard | null {
 	if (!rawCard || typeof rawCard !== "object") {
 		return null;
@@ -218,6 +232,7 @@ function normalizeCard(rawCard: unknown): BoardCard | null {
 		lastPrompt?: unknown;
 		lastPromptAt?: unknown;
 		sentGitActionPrompt?: unknown;
+		conflictRepair?: unknown;
 		createdAt?: unknown;
 		updatedAt?: unknown;
 	};
@@ -243,6 +258,7 @@ function normalizeCard(rawCard: unknown): BoardCard | null {
 
 	const now = Date.now();
 	const sentGitActionPrompt = normalizeSentGitActionPrompt(card.sentGitActionPrompt);
+	const conflictRepair = normalizeConflictRepair(card.conflictRepair);
 
 	return {
 		id: typeof card.id === "string" && card.id ? card.id : createShortTaskId(createBrowserUuid),
@@ -281,6 +297,11 @@ function normalizeCard(rawCard: unknown): BoardCard | null {
 		// auto-review scheduler can suppress the already-delivered prompt
 		// for this episode without waiting for the server acquire.
 		...(sentGitActionPrompt !== undefined ? { sentGitActionPrompt } : {}),
+		// PCR: server-owned; carried through board hydration so the PR row can
+		// still explain an outstanding repair (and refuse a duplicate click)
+		// after a reload — hydration previously stripped it, leaving the
+		// dispatched/failed states and the disable guard permanently invisible.
+		...(conflictRepair !== undefined ? { conflictRepair } : {}),
 		createdAt: typeof card.createdAt === "number" ? card.createdAt : now,
 		updatedAt: typeof card.updatedAt === "number" ? card.updatedAt : now,
 	};

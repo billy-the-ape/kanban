@@ -121,3 +121,6 @@ interpolator (`src/core/prompt-template-interpolation.ts`):
 - `web-ui/src/components/detail-panels/task-pull-request-row.test.tsx` —
   the CTA contract (unknown → Re-check; conflicting → Resolve; dispatched →
   disabled with the reason; failed → retry allowed).
+- `web-ui/src/state/board-state.test.ts` — `card.conflictRepair` survives
+  board hydration (the row only ever sees the normalized board) and
+  malformed records are dropped.
