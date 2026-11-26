@@ -921,6 +921,44 @@ export function mergeServerOwnedSentGitActionPrompt(
 }
 
 /**
+ * PCR-2: server-owned conflict-repair dispatch record. Written only by the
+ * repair dispatch through `mutateWorkspaceState` under the workspace lock, so
+ * a stale whole-board save can neither erase a just-dispatched repair (which
+ * would let a second click double-send the same turn) nor forge one. Unlike
+ * the auto git-action record, it is NOT cleared when the card leaves Review:
+ * it stays keyed to the head SHA it was dispatched against, and the next
+ * successful push naturally makes it stale on the following read.
+ */
+export function mergeServerOwnedConflictRepair(
+	board: RuntimeBoardData,
+	persistedBoard: RuntimeBoardData,
+): RuntimeBoardData {
+	const persistedByTaskId = new Map<string, RuntimeBoardCard["conflictRepair"]>();
+	for (const column of persistedBoard.columns) {
+		for (const card of column.cards) {
+			if (card.conflictRepair !== undefined) {
+				persistedByTaskId.set(card.id, card.conflictRepair);
+			}
+		}
+	}
+	return {
+		...board,
+		columns: board.columns.map((column) => ({
+			...column,
+			cards: column.cards.map((card) => {
+				const next: RuntimeBoardCard = { ...card };
+				delete next.conflictRepair;
+				const persisted = persistedByTaskId.get(card.id);
+				if (persisted !== undefined) {
+					next.conflictRepair = persisted;
+				}
+				return next;
+			}),
+		})),
+	};
+}
+
+/**
  * MERGE-1: server-owned manual-reopen marker. The board is client-owned, but
  * the marker is derived server-side from the persisted -> incoming column
  * transition so a stale client board can neither forge nor drop it:
@@ -1015,10 +1053,13 @@ export async function saveWorkspaceState(
 		}
 		const persistedBoard = await readWorkspaceBoard(context.workspaceId);
 		const board = applyManualReopenMarkers(
-			mergeServerOwnedLastPrompt(
-				mergeServerOwnedPrSettings(
-					mergeServerOwnedSentGitActionPrompt(
-						mergeServerOwnedPullRequests(parsedPayload.board, persistedBoard),
+			mergeServerOwnedConflictRepair(
+				mergeServerOwnedLastPrompt(
+					mergeServerOwnedPrSettings(
+						mergeServerOwnedSentGitActionPrompt(
+							mergeServerOwnedPullRequests(parsedPayload.board, persistedBoard),
+							persistedBoard,
+						),
 						persistedBoard,
 					),
 					persistedBoard,

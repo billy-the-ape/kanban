@@ -715,6 +715,73 @@ describe("board dependency state", () => {
 		);
 	});
 
+	it("carries the server-owned conflict repair record through normalization", () => {
+		// PCR regression: hydration used to rebuild cards from a field list
+		// without conflictRepair, silently killing the row's dispatched/failed
+		// line, the duplicate-click disable, and the failure reason.
+		const normalized = normalizeBoardData({
+			columns: [
+				{
+					id: "backlog",
+					cards: [
+						{
+							id: "b",
+							prompt: "Task B",
+							startInPlanMode: false,
+							baseRef: "main",
+							conflictRepair: {
+								prKey: "github|github.com|octo/repo|42",
+								headSha: "abc123def4567890abc123def4567890abc123de",
+								dispatchedAt: 1234,
+								status: "dispatched",
+							},
+						},
+						{
+							id: "c",
+							prompt: "Task C",
+							startInPlanMode: false,
+							baseRef: "main",
+							conflictRepair: { prKey: "", headSha: 7, dispatchedAt: "soon", status: "exploded" },
+						},
+					],
+				},
+				{ id: "in_progress", cards: [] },
+				{ id: "review", cards: [] },
+				{ id: "trash", cards: [] },
+			],
+			dependencies: [],
+		});
+		if (!normalized) {
+			throw new Error("Expected board to normalize");
+		}
+		const cards = normalized.columns.flatMap((column) => column.cards);
+		// Valid server-owned record carries through hydration.
+		expect(cards.find((card) => card.id === "b")?.conflictRepair).toEqual({
+			prKey: "github|github.com|octo/repo|42",
+			headSha: "abc123def4567890abc123def4567890abc123de",
+			dispatchedAt: 1234,
+			status: "dispatched",
+		});
+		// Malformed records never reach the UI.
+		expect(cards.find((card) => card.id === "c")?.conflictRepair).toBeUndefined();
+
+		// Card edit operations retain the server-owned record (raw-card spread).
+		const updated = updateTask(normalized, "b", {
+			title: "Task B",
+			prompt: "Task B",
+			startInPlanMode: false,
+			autoReviewEnabled: false,
+			autoReviewMode: "commit",
+			images: [],
+			baseRef: "main",
+		});
+		expect(updated.updated).toBe(true);
+		expect(
+			updated.board.columns.flatMap((column) => column.cards).find((card) => card.id === "b")?.conflictRepair
+				?.status,
+		).toBe("dispatched");
+	});
+
 	it("carries the server-owned git action prompt record through normalization", () => {
 		const normalized = normalizeBoardData({
 			columns: [

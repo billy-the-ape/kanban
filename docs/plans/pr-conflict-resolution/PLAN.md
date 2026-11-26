@@ -1,6 +1,8 @@
 # PR conflict repair — an explicit "Resolve conflicts" action
 
-**Status: planning.** Not implemented. Source baseline: `main` @ `e003a49c`. Re-inspect current code before implementing; `AGENTS.md` and repo conventions take precedence over this document.
+**Status: implemented** (branch `pcr/resolve-conflicts-action`, PR targets `main`; see the implementation appendix at the bottom for deltas from this plan). Source baseline: `main` @ `e003a49c`. `AGENTS.md` and repo conventions take precedence over this document.
+
+> **The durable contract now lives in `docs/runtime/pr-conflict-repair.md`.** This plan stays as the design rationale.
 
 ## Goal
 
@@ -330,3 +332,21 @@ Three additions over the requested text, each failure-shaped:
 2. Is **conflict repair from a Done card** worth PCR-4's complexity, or does "reopened card" cover it?
 3. Should the local probe be the default when `gh` is missing, or strictly opt-in via a setting so we never advertise a conflict GitHub has not reported?
 4. Should this button also be exposed through the CLI (`kanban task repair-conflicts --task-id …`), which would make the mutation the single entry point for browser, CLI, and any future automation?
+
+---
+
+## Implementation appendix (final state, PCR-1..3 in one PR)
+
+All of PCR-1..PCR-3 shipped; PCR-4 did not. Answers and deltas:
+
+- **Open Q1:** Re-check (`prTracking.refreshTaskPrConflict`) forces one provider read through the coordinator (which coalesces and honors Retry-After); lazy top-ups inside the 5s panel poll are separately debounced to `CONFLICT_LAZY_REFRESH_MIN_INTERVAL_MS` (30s per PR).
+- **Open Q2/Q3/Q4:** Done-card repair, non-github hosts, and the CLI surface were not built. The local probe ships as the automatic fallback (not opt-in) but is *advisory only*: probe results are labeled `source: "local_probe"` and a local clean never renders as a provider-confirmed clean.
+- **New files (server):** `src/core/prompt-template-interpolation.ts` (shared interpolator — web-ui's `build-task-git-action-prompt.ts` now uses it too), `src/workspace/git-operation-state.ts` (shared marker/unmerged probes, also reused by `comment-git-refresh`), `src/workspace/pr-merge-probe.ts` (advisory `merge-tree` probe with scoped throwaway refs), `src/workspace/task-conflict-repair.ts` (durable `card.conflictRepair` write), `src/pr-tracking/pr-conflict-state.ts` (pure resolution), `src/pr-tracking/conflict-prompt.ts` (server renderer), `src/pr-tracking/conflict-state-service.ts`, `src/pr-tracking/conflict-repair-dispatch.ts`.
+- **Delta — reservation lifetime:** `reservePrOperation(kind: "conflict_repair")` is held only for the dispatch window (claim → reserve → send → release in every outcome), not across the whole repair turn; the turn re-checks the remote before pushing and the head-SHA-keyed record is the cross-tab dedupe.
+- **Delta — dedupe is a claim (review follow-up):** the plan's "set the record before the send" is not atomic on its own — two simultaneous clicks can both pass the board read, and `reservePrOperation` is idempotent for the same task + operation, so it cannot serialize them either. The dispatch instead claims the record compare-and-set under the workspace lock (`claimConflictRepair`) *before* taking the reservation (a loser therefore never releases the winner's hold), and any post-claim failure — including a thrown send — settles the record as `failed` so the head never wedges behind `already_dispatched`.
+- **Delta — `dispatchHold`:** the persisted record has no `dispatchHold` field (that is a runtime-view concept); the guard reads `commentAutomation.dispatch.status ∈ {queued, running}` plus the live `commentRepairInFlight` probe instead.
+- **Delta — unknown at dispatch:** dispatch refuses `clean_merge` when the provider re-read says clean; a *null* mergeability on the re-read is allowed through (the click already came from a `conflicting` block; `conflict_unknown` is deliberately not a refusal reason).
+- **Delta — worktree identity:** the guard resolves the task's own checkout via the workspace-state mapping (`ensure: false`) and verifies live Git state (markers, unmerged index, ref validity, head-repo remote); it does not re-verify `matchesWorkspaceInfoSelection` against the card base ref.
+- **UI:** the row block renders the conflict line, `Re-check` (unknown), `Resolve conflicts` (conflicting, disabled with the dispatch-time reason while the same head is outstanding), the dispatch/failure record, and inline refusal errors; the auto-merge settings show a secondary CTA when `merge_conflicts` blocks an opted-in merge. `TaskPullRequestRow` now renders its own `TooltipProvider` (detail-panel rule). The settings dialog gained the third "Resolve conflicts" template variant with a per-variant variable list.
+- **Restart rule:** `card.conflictRepair` is server-owned (`mergeServerOwnedConflictRepair`) and is never replayed; covered in `test/integration/workspace-state.integration.test.ts`.
+- **Docs:** `docs/runtime/pr-conflict-repair.md` is the durable contract; test surfaces are listed there.

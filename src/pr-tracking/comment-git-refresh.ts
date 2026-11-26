@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { stat } from "node:fs/promises";
 import { createGitProcessEnv } from "../core/git-process-env";
+import { hasGitOperationInProgress } from "../workspace/git-operation-state";
 import { runGit } from "../workspace/git-utils";
 import type { GitHubPrSnapshot } from "./github-pr-client";
 
@@ -59,23 +59,7 @@ export async function refreshCommentWorktree(
 	const attachment = await readAttachment();
 	if (attachment.kind === "branch" && attachment.name !== headRef)
 		throw new Error(`Expected PR branch ${headRef}; task is on ${attachment.name}.`);
-	for (const marker of [
-		"MERGE_HEAD",
-		"rebase-merge",
-		"rebase-apply",
-		"CHERRY_PICK_HEAD",
-		"REVERT_HEAD",
-		"sequencer",
-	]) {
-		const path = await git(["rev-parse", "--path-format=absolute", "--git-path", marker]);
-		if (
-			await stat(path).then(
-				() => true,
-				() => false,
-			)
-		)
-			throw new Error("A Git operation is already in progress.");
-	}
+	if (await hasGitOperationInProgress(git)) throw new Error("A Git operation is already in progress.");
 	const assertClean = async () => {
 		if (await git(["status", "--porcelain=v1", "--untracked-files=all"])) {
 			throw new Error(

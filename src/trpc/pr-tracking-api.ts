@@ -26,6 +26,11 @@ import type {
 	RuntimePrAuthorizedSnapshotRequest,
 	RuntimePrAuthorizedSnapshotResponse,
 	RuntimePrCommentDispatchUpdateRequest,
+	RuntimePrConflictRecheckRequest,
+	RuntimePrConflictRecheckResponse,
+	RuntimePrConflictRepairRequest,
+	RuntimePrConflictRepairResponse,
+	RuntimePrConflictState,
 	RuntimePrOperationReleaseRequest,
 	RuntimePrOperationReservationRequest,
 	RuntimePrOperationReservationResponse,
@@ -52,6 +57,9 @@ import type {
 } from "../core/api-contract";
 import { setTaskSelectedAutomationPr, updateTaskPrSettings } from "../core/task-board-mutations";
 import { type AutoMergePolicyStore, normalizeAutoMergeRepository } from "../pr-tracking/auto-merge-policy-store";
+import type { ConflictRepairService } from "../pr-tracking/conflict-repair-dispatch";
+import { findLinkForPrKey } from "../pr-tracking/conflict-repair-dispatch";
+import type { ConflictStateService } from "../pr-tracking/conflict-state-service";
 import type { PrInstalledConsumers } from "../pr-tracking/pr-consumer-registry";
 import { isTrackingSupportedPr, parseCanonicalPrKey } from "../pr-tracking/pr-identity";
 import { evaluatePrLifecycleGate, isCommentServableAgent } from "../pr-tracking/pr-lifecycle-gate";
@@ -103,6 +111,17 @@ export interface CreatePrTrackingApiDependencies {
 	) => Promise<RuntimeAgentId | null> | (RuntimeAgentId | null);
 	/** Audited operator actions (force releases) are reported here. */
 	warn?: (message: string) => void;
+	/**
+	 * PCR-1: the conflict-state provider (lazy snapshot top-up + advisory local
+	 * probe). Optional in partial harnesses: no conflict block is produced and
+	 * the tracking-state read never blocks on it.
+	 */
+	getConflictStateService?: () => ConflictStateService | null;
+	/**
+	 * PCR-2: the explicit conflict-repair dispatcher behind the Resolve
+	 * conflicts button. Optional in partial harnesses (the mutation refuses).
+	 */
+	getConflictRepairService?: () => ConflictRepairService | null;
 }
 
 /** Human-facing mapping for coordinator subscription blockers. */
@@ -548,6 +567,36 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 			blockers.push({ kind: "needs_human", message: "Merge reconciliation needs a human decision." });
 		}
 		const snapshot = coordinator ? coordinator.getTaskAuthorizedSnapshot(scope.workspaceId, input.taskId) : null;
+		// PCR-1: the conflict block for the resolved Automation PR. Read from
+		// the durable record (never auto-merge's opt-in-gated status); the
+		// service tops the snapshot up lazily so opening the PRs tab is enough
+		// to know the answer. A failure here must never fail the whole read.
+		let conflict: RuntimePrConflictState | null = null;
+		if (resolved.key !== null) {
+			const conflictService = deps.getConflictStateService?.() ?? null;
+			const link = findLinkForPrKey(card, resolved.key);
+			if (conflictService !== null && link !== null) {
+				try {
+					conflict = await conflictService.compute({
+						workspaceId: scope.workspaceId,
+						workspacePath: scope.workspacePath,
+						taskId: input.taskId,
+						prKey: resolved.key,
+						baseRef: card.baseRef,
+						provider: link.provider,
+						host: link.host,
+						repository: link.repository,
+						active,
+					});
+				} catch (error) {
+					deps.warn?.(
+						`[pr-conflict] state read failed task=${input.taskId} error=${
+							error instanceof Error ? error.message : String(error)
+						}`,
+					);
+				}
+			}
+		}
 		return {
 			ok: true,
 			taskId: input.taskId,
@@ -587,8 +636,84 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 				: null,
 			autoMergeEligibility: binding?.autoMerge ?? null,
 			autoMergeAttempt: binding?.autoMergeAttempt ?? null,
+			conflict,
+			conflictRepair: card.conflictRepair ?? null,
 			error: null,
 		};
+	};
+
+	/**
+	 * PCR-1: the Re-check affordance — one forced provider metadata read for
+	 * the conflict block, then a recompute. Rate limits argue for a debounce,
+	 * so the forced read goes through the coordinator's own coalescing and
+	 * Retry-After handling; it never claims a green light GitHub has not
+	 * reported.
+	 */
+	const refreshTaskPrConflict = async (
+		scope: RuntimeTrpcWorkspaceScope,
+		input: RuntimePrConflictRecheckRequest,
+	): Promise<RuntimePrConflictRecheckResponse> => {
+		const conflictService = deps.getConflictStateService?.() ?? null;
+		if (conflictService === null) {
+			return { ok: false, conflict: null, error: "Conflict-state reads are not available in this runtime." };
+		}
+		const found = await loadScopedCard(scope, input.taskId);
+		if (!found) {
+			return { ok: false, conflict: null, error: "Task not found" };
+		}
+		const resolved = resolveCardAutomationPrKey(found.card);
+		if (resolved.key !== input.prKey) {
+			return { ok: false, conflict: null, error: "This PR is not the task's Automation PR." };
+		}
+		const link = findLinkForPrKey(found.card, input.prKey);
+		if (link === null) {
+			return { ok: false, conflict: null, error: "The PR link could not be parsed." };
+		}
+		const active = found.columnId === "in_progress" || found.columnId === "review";
+		try {
+			const conflict = await conflictService.recheck({
+				workspaceId: scope.workspaceId,
+				workspacePath: scope.workspacePath,
+				taskId: input.taskId,
+				prKey: input.prKey,
+				baseRef: found.card.baseRef,
+				provider: link.provider,
+				host: link.host,
+				repository: link.repository,
+				active,
+			});
+			return { ok: true, conflict, error: null };
+		} catch (error) {
+			return {
+				ok: false,
+				conflict: null,
+				error: error instanceof Error ? error.message : String(error),
+			};
+		}
+	};
+
+	/**
+	 * PCR-2: dispatch the explicit conflict-repair turn for one named PR.
+	 * Every precondition is a visible refusal (see the guard table in
+	 * `docs/runtime/pr-conflict-repair.md`).
+	 */
+	const resolveTaskPrConflicts = async (
+		scope: RuntimeTrpcWorkspaceScope,
+		input: RuntimePrConflictRepairRequest,
+	): Promise<RuntimePrConflictRepairResponse> => {
+		const service = deps.getConflictRepairService?.() ?? null;
+		if (service === null) {
+			return {
+				ok: false,
+				taskId: input.taskId,
+				prKey: input.prKey,
+				headSha: null,
+				dispatchedAt: null,
+				reason: "send_failed",
+				error: "Conflict repair is not available in this runtime.",
+			};
+		}
+		return await service.resolveTaskPrConflicts(scope, input);
 	};
 
 	const getTaskPrSnapshot = async (
@@ -1256,6 +1381,8 @@ export function createPrTrackingApi(deps: CreatePrTrackingApiDependencies) {
 		selectTaskAutomationPr,
 		resumeTaskPrTracking,
 		getTaskTrackingState,
+		refreshTaskPrConflict,
+		resolveTaskPrConflicts,
 		getTaskPrSnapshot,
 		refreshTaskPrSnapshot,
 		updateTaskCommentDispatch,

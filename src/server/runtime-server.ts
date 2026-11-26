@@ -39,6 +39,8 @@ import { registerAutoMergeConsumer } from "../pr-tracking/auto-merge-eligibility
 import { createAutoMergeExecutor } from "../pr-tracking/auto-merge-executor";
 import { AutoMergePolicyStore } from "../pr-tracking/auto-merge-policy-store";
 import { createPrCommentAutomationService } from "../pr-tracking/comment-automation-service";
+import { createConflictRepairService } from "../pr-tracking/conflict-repair-dispatch";
+import { createConflictStateService } from "../pr-tracking/conflict-state-service";
 import { createGitHubGhAdapter } from "../pr-tracking/github-gh-adapter";
 import { createGitHubPrClient, resolveGitHubAccessScopeId } from "../pr-tracking/github-pr-client";
 import { sendPreparedPiRepair } from "../pr-tracking/pi-repair-dispatch";
@@ -382,6 +384,97 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 		warn: (message) => deps.warn(`[pr-comment-automation] ${message}`),
 	});
 	void prCommentAutomationService.start();
+	// PCR-1/PCR-2: the merge-conflict signal and the explicit Resolve-conflicts
+	// dispatch. The state service reads the durable record directly (never
+	// auto-merge's opt-in-gated status) and tops the snapshot up lazily; the
+	// repair dispatcher delivers the server-rendered turn through the same
+	// Cline/Pi lanes the comment repair uses.
+	const resolveTaskWorktreeOrNull = async (input: {
+		workspacePath: string;
+		taskId: string;
+		baseRef: string;
+	}): Promise<string | null> => {
+		try {
+			return await resolveTaskCwd({
+				cwd: input.workspacePath,
+				taskId: input.taskId,
+				baseRef: input.baseRef,
+				ensure: false,
+			});
+		} catch {
+			// A missing/unreadable task checkout is a refusal, never a re-create.
+			return null;
+		}
+	};
+	const conflictStateService = createConflictStateService({
+		getCoordinator: () => getPrTrackingState().coordinator,
+		getStore: () => getPrTrackingState().store,
+		resolveWorktreePath: resolveTaskWorktreeOrNull,
+		warn: (message) => deps.warn(`[pr-conflict] ${message}`),
+	});
+	// Automated sends never feed the last-prompt preview or PR-linking
+	// classification (same rule as the comment-automation sender).
+	const conflictRepairChatSender = createTaskChatMessageSender({
+		getScopedClineTaskSessionService,
+		broadcastTaskChatCleared: deps.runtimeStateHub.broadcastTaskChatCleared,
+		resolveClineLaunchConfig: () => clineProviderService.resolveLaunchConfig(),
+	});
+	const conflictRepairService = createConflictRepairService({
+		loadWorkspaceState: (workspacePath) => loadWorkspaceState(workspacePath),
+		getCoordinator: () => getPrTrackingState().coordinator,
+		getStore: () => getPrTrackingState().store,
+		resolveWorktreePath: resolveTaskWorktreeOrNull,
+		// Deferred read: the writer probe is declared below in this factory.
+		isTaskWriterActive: async (workspaceId, taskId) => await probeTaskWriterActive(workspaceId, taskId),
+		getEffectiveTaskAgentId: async (scope, taskId) => await resolveEffectiveTaskAgentId(scope, taskId),
+		sendClineMessage: async (scope, taskId, prompt) =>
+			await conflictRepairChatSender(scope, { taskId, text: prompt, mode: "act", source: "automated" }),
+		sendPiMessage: async (scope, taskId, prompt) => {
+			const manager = await getScopedTerminalManager(scope);
+			return await sendPreparedPiRepair({
+				manager,
+				taskId,
+				// The conflict prompt is fully rendered server-side; no per-turn
+				// feedback capture is needed, so the preparation is static.
+				prepare: async () => prompt,
+				// A conflict-repair turn is a Pi coding turn like any other: it
+				// waits behind the shared per-model budget.
+				capacity: async ({ taskId: repairTaskId, manager: repairManager, onNotRun, run }) => {
+					await sharedPiModelCapacityGate.request({
+						kind: "turn",
+						workspaceId: scope.workspaceId,
+						taskId: repairTaskId,
+						manager: repairManager,
+						target: await resolvePiTurnTarget(),
+						onNotRun,
+						run,
+					});
+				},
+				restoreSavedSession: async () => {
+					const state = await loadWorkspaceState(scope.workspacePath);
+					const card = state.board.columns
+						.flatMap((column) => column.cards)
+						.find((candidate) => candidate.id === taskId);
+					if (!card) return { ok: false, error: "The conflict-repair task was removed." };
+					const result = await buildRuntimeApi().startTaskSession(scope, {
+						taskId,
+						agentId: "pi",
+						prompt: "",
+						baseRef: card.baseRef,
+						restoreDetachedSession: true,
+					});
+					return { ok: result.ok, error: result.error };
+				},
+			});
+		},
+		getConflictPromptTemplate: async (scope) => {
+			const config = await deps.workspaceRegistry.loadScopedRuntimeConfig(scope);
+			return config.conflictPromptTemplate;
+		},
+		broadcastWorkspaceUpdated: (scope) =>
+			broadcastRuntimeWorkspaceStateUpdatedWithReconcile(scope.workspaceId, scope.workspacePath),
+		warn: (message) => deps.warn(`[pr-conflict] ${message}`),
+	});
 	// PRTRACK-1: runtime-wide PR tracking state (coordinator + durable record
 	// store + consumer registry). One coordinator serves every workspace; the
 	// trpc API and board-save reconciliation share these singletons.
@@ -927,6 +1020,9 @@ export async function createRuntimeServer(deps: CreateRuntimeServerDependencies)
 				// workspace default. An unset per-card agentId inherits the
 				// workspace agent, which may be unservable.
 				getEffectiveTaskAgentId: resolveEffectiveTaskAgentId,
+				// PCR-1/PCR-2: conflict signal + explicit Resolve-conflicts dispatch.
+				getConflictStateService: () => conflictStateService,
+				getConflictRepairService: () => conflictRepairService,
 			}),
 		};
 	};

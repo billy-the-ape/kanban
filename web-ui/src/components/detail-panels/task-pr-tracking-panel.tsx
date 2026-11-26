@@ -111,6 +111,12 @@ export function TaskPrTrackingPanel({
 							const isExplicitPrimary = isWinner && pullRequest.isPrimary === true;
 							const isAutomationPr =
 								automationPrKey !== null && toCanonicalPrKeyForLink(pullRequest) === automationPrKey;
+							// PCR-1: the conflict block is scoped to one PR (the tracked
+							// Automation PR); only the matching row receives it.
+							const conflict =
+								tracking?.conflict != null && toCanonicalPrKeyForLink(pullRequest) === tracking.conflict.prKey
+									? tracking.conflict
+									: null;
 							return (
 								<TaskPullRequestRow
 									key={key}
@@ -121,6 +127,8 @@ export function TaskPrTrackingPanel({
 									canManage={workspaceId !== null}
 									actions={actions}
 									mobile={mobile}
+									conflict={conflict}
+									conflictRepair={card.conflictRepair ?? null}
 								/>
 							);
 						})}

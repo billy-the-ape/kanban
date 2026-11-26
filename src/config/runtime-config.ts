@@ -32,6 +32,8 @@ interface RuntimeGlobalConfigFileShape {
 	readyForReviewNotificationsEnabled?: boolean;
 	commitPromptTemplate?: string;
 	openPrPromptTemplate?: string;
+	/** PCR-2: server-rendered conflict-repair template (global, like the other two). */
+	conflictPromptTemplate?: string;
 	clineConcurrencyLimit?: number | null;
 	contextBudget?: RuntimeContextBudget;
 	reviewPolicy?: RuntimeReviewPolicySave;
@@ -58,6 +60,9 @@ export interface RuntimeConfigState {
 	openPrPromptTemplate: string;
 	commitPromptTemplateDefault: string;
 	openPrPromptTemplateDefault: string;
+	/** PCR-2: the conflict-repair template and its shipped default. */
+	conflictPromptTemplate: string;
+	conflictPromptTemplateDefault: string;
 	/** Maximum Cline turns per endpoint/model; null or absent discovers server slots (fallback 1). */
 	clineConcurrencyLimit?: number | null;
 	/** B-2.9: global context budget settings; absent means all defaults. */
@@ -80,6 +85,8 @@ export interface RuntimeConfigUpdateInput {
 	shortcuts?: RuntimeProjectShortcut[];
 	commitPromptTemplate?: string;
 	openPrPromptTemplate?: string;
+	/** PCR-2: conflict-repair template; mirrors the commit/PR templates. */
+	conflictPromptTemplate?: string;
 	/** Null restores automatic capacity discovery; undefined preserves the setting. */
 	clineConcurrencyLimit?: number | null;
 	/** B-2.9: `null` clears all context budget settings; `undefined` leaves them untouched. */
@@ -153,6 +160,115 @@ Steps:
    - Base branch
    - Head branch
    - Any follow-up needed
+
+${PR_CI_HANDOFF_GUIDANCE}`;
+
+// PCR-2: the default conflict-repair template. The fenced block below is the
+// single source of truth for what the turn is told: anything this block is
+// meant to instruct must live inside it (documentation written after the
+// fence is silence for the model), the shared CI-handoff constant is appended
+// exactly like `DEFAULT_OPEN_PR_PROMPT_TEMPLATE` does, and the hard refusals
+// (no force-push, no merges, no bypass) also live in Kanban's dispatch guards
+// because an operator may edit this template. Exported for the renderer tests.
+export const DEFAULT_CONFLICT_PROMPT_TEMPLATE = `Resolve merge conflicts for the tracked pull request:
+
+PR: {{pr_url}}
+Repository: {{repository}}
+Head branch: '{{head_branch}}'
+Base branch: '{{base_branch}}'
+Task card base ref: '{{base_ref}}'
+Kanban only ever names branches built from [A-Za-z0-9._/@+-]; still, quote
+every branch name below when you use it in a shell command.
+The card's own base ref may differ from the PR base branch named above; the PR base branch wins for this repair.
+Known remote head: {{head_sha}}   Known remote base: {{base_sha}}
+
+This turn is the explicit exception to the standing "do not fetch, pull,
+rebase, or merge" guidance: fetching the base and merging it into the PR head
+is required. Everything else in that guidance still applies. Never force-push,
+never rewrite published history, never touch any checkout other than the one
+named here, and never merge the pull request.
+
+Your goal is to preserve the intended behavior of both the PR and the latest
+base branch, resolve their conflicts, and push a tested update to the existing
+PR branch.
+
+1. Establish the current state
+   - Read the repository's AGENTS.md and relevant contribution instructions.
+   - Retrieve the PR's current head/base branches and commit SHAs from the
+     remote provider. Treat these as authoritative; the supplied metadata may
+     be stale.
+   - Fetch both branches and inspect the working tree.
+   - Work only in the task checkout at {{task_worktree_path}}. Do not create or
+     switch to another worktree or checkout, and do not touch any other working
+     copy — including the one holding the base branch. Use it only if it is on
+     the PR head, either as the head branch itself or as a detached HEAD at that
+     commit (the Kanban default), and only if its state is understood; preserve
+     uncommitted work. If it is unusable (missing, dirty beyond your work,
+     mid-operation, or diverged from the PR head), stop and report instead of
+     improvising.
+   - Confirm that a conflict still exists against the latest base. If it has
+     already been resolved, report that and make no unnecessary changes.
+
+2. Explain the source of the conflicts
+   Before resolving them, inspect:
+   - The PR description and changes relative to its merge base.
+   - The relevant changes introduced on the base branch.
+   - The conflicting files, surrounding code, and affected callers or tests.
+   Identify what each side intended and explain why the changes conflict.
+   Distinguish overlapping edits from behavioral incompatibilities, renames,
+   deletions, generated files, and dependency changes.
+
+3. Resolve the conflicts
+   Merge the latest remote base branch into the PR head branch. Prefer a merge
+   commit so existing PR history is preserved; do not rebase or force-push.
+   Resolve each conflict by reconciling the intended behavior of both sides.
+   Do not blindly accept "ours" or "theirs," discard tests, weaken assertions,
+   or remove functionality merely to obtain a clean merge.
+   Follow existing architecture and formatting conventions. If dependencies or
+   generated files conflict, reconcile their source inputs and regenerate
+   outputs using the repository's documented tools and pinned tool versions.
+   Keep the repair focused. If the intended behavior cannot be determined from
+   the code, tests, PR context, and repository instructions, stop and describe
+   the exact decision needed rather than guessing.
+
+4. Validate the result
+   - Confirm that no unmerged index entries or unintended conflict markers remain.
+   - Review the staged diff and resulting changes relative to the latest base.
+   - Run relevant tests, type checks, linting, formatting checks, and builds as
+     appropriate for the affected code.
+   - Add or update focused tests where the reconciliation changes behavior or
+     exposes a regression that existing tests do not cover.
+   - Verify that both the PR's intended behavior and relevant base-branch
+     behavior are preserved.
+   - Clearly report any checks that could not run and why. Do not describe an
+     untested repair as fully verified.
+
+5. Publish safely
+   - Before pushing, check whether the remote PR head changed while you worked.
+     If it did, fetch and incorporate those changes, then repeat relevant
+     validation. Do not overwrite another actor's commits.
+   - Commit the resolution and push normally to the existing PR head branch.
+     The task checkout is usually a detached HEAD with no local branch of the
+     PR's own, so push the current commit to the remote ref explicitly:
+     \`git push <remote-for-the-head-repository> HEAD:refs/heads/<head_branch>\`.
+     Never force. A rejected (non-fast-forward) push means the remote moved:
+     fetch, re-verify, and incorporate it — do not reach for \`--force\` or
+     \`--force-with-lease\`, and do not push a new branch into another
+     repository.
+   - If the base moved again, assess whether another merge is necessary. Avoid
+     an unbounded repair loop; report persistent concurrent updates.
+   - Leave the PR open for CI and review. Do not merge the PR, approve it,
+     bypass repository protections, or poll waiting for CI/review completion.
+
+Finish with:
+- The source of each conflict.
+- How the resolution preserves the intent of both branches.
+- Validation performed and any remaining limitations.
+- The pushed commit SHA and PR URL.
+
+If blocked, explain the concrete blocker and leave the checkout in a clearly
+reported state. Do not claim the conflict is resolved unless the repair has
+been committed and pushed successfully.
 
 ${PR_CI_HANDOFF_GUIDANCE}`;
 
@@ -1002,6 +1118,11 @@ function toRuntimeConfigState({
 		),
 		commitPromptTemplateDefault: DEFAULT_COMMIT_PROMPT_TEMPLATE,
 		openPrPromptTemplateDefault: DEFAULT_OPEN_PR_PROMPT_TEMPLATE,
+		conflictPromptTemplate: normalizePromptTemplate(
+			globalConfig?.conflictPromptTemplate,
+			DEFAULT_CONFLICT_PROMPT_TEMPLATE,
+		),
+		conflictPromptTemplateDefault: DEFAULT_CONFLICT_PROMPT_TEMPLATE,
 		clineConcurrencyLimit: normalizeClineConcurrencyLimit(globalConfig?.clineConcurrencyLimit),
 		contextBudget: normalizeContextBudget(globalConfig?.contextBudget),
 		reviewPolicy: normalizeReviewPolicy(globalConfig?.reviewPolicy),
@@ -1029,6 +1150,8 @@ async function writeRuntimeGlobalConfigFile(
 		readyForReviewNotificationsEnabled?: boolean;
 		commitPromptTemplate?: string;
 		openPrPromptTemplate?: string;
+		/** PCR-2: conflict-repair template (global, like the other two). */
+		conflictPromptTemplate?: string;
 		clineConcurrencyLimit?: number | null;
 		/** B-2.9: `null` clears the stored context budget; `undefined` preserves the existing one. Null fields clear individual settings (normalized before write). */
 		contextBudget?: RuntimeContextBudgetSave | null;
@@ -1068,6 +1191,10 @@ async function writeRuntimeGlobalConfigFile(
 		config.openPrPromptTemplate === undefined
 			? DEFAULT_OPEN_PR_PROMPT_TEMPLATE
 			: normalizePromptTemplate(config.openPrPromptTemplate, DEFAULT_OPEN_PR_PROMPT_TEMPLATE);
+	const conflictPromptTemplate =
+		config.conflictPromptTemplate === undefined
+			? DEFAULT_CONFLICT_PROMPT_TEMPLATE
+			: normalizePromptTemplate(config.conflictPromptTemplate, DEFAULT_CONFLICT_PROMPT_TEMPLATE);
 
 	const payload: RuntimeGlobalConfigFileShape = {};
 	if (selectedAgentId !== undefined) {
@@ -1101,6 +1228,9 @@ async function writeRuntimeGlobalConfigFile(
 	}
 	if (hasOwnKey(existing, "openPrPromptTemplate") || openPrPromptTemplate !== DEFAULT_OPEN_PR_PROMPT_TEMPLATE) {
 		payload.openPrPromptTemplate = openPrPromptTemplate;
+	}
+	if (hasOwnKey(existing, "conflictPromptTemplate") || conflictPromptTemplate !== DEFAULT_CONFLICT_PROMPT_TEMPLATE) {
+		payload.conflictPromptTemplate = conflictPromptTemplate;
 	}
 	if (config.clineConcurrencyLimit !== undefined) {
 		payload.clineConcurrencyLimit = normalizeClineConcurrencyLimit(config.clineConcurrencyLimit);
@@ -1239,6 +1369,8 @@ function createRuntimeConfigStateFromValues(input: {
 	shortcuts: RuntimeProjectShortcut[];
 	commitPromptTemplate: string;
 	openPrPromptTemplate: string;
+	/** PCR-2: conflict-repair template. */
+	conflictPromptTemplate?: string;
 	clineConcurrencyLimit?: number | null;
 	contextBudget?: RuntimeContextBudgetSave | null;
 	reviewPolicy?: RuntimeReviewPolicySave | null;
@@ -1262,8 +1394,10 @@ function createRuntimeConfigStateFromValues(input: {
 		shortcuts: normalizeShortcuts(input.shortcuts),
 		commitPromptTemplate: normalizePromptTemplate(input.commitPromptTemplate, DEFAULT_COMMIT_PROMPT_TEMPLATE),
 		openPrPromptTemplate: normalizePromptTemplate(input.openPrPromptTemplate, DEFAULT_OPEN_PR_PROMPT_TEMPLATE),
+		conflictPromptTemplate: normalizePromptTemplate(input.conflictPromptTemplate, DEFAULT_CONFLICT_PROMPT_TEMPLATE),
 		commitPromptTemplateDefault: DEFAULT_COMMIT_PROMPT_TEMPLATE,
 		openPrPromptTemplateDefault: DEFAULT_OPEN_PR_PROMPT_TEMPLATE,
+		conflictPromptTemplateDefault: DEFAULT_CONFLICT_PROMPT_TEMPLATE,
 		clineConcurrencyLimit: normalizeClineConcurrencyLimit(input.clineConcurrencyLimit),
 		contextBudget: normalizeContextBudget(input.contextBudget),
 		reviewPolicy: normalizeReviewPolicy(input.reviewPolicy),
@@ -1314,6 +1448,7 @@ export function toGlobalRuntimeConfigState(current: RuntimeConfigState): Runtime
 		shortcuts: [],
 		commitPromptTemplate: current.commitPromptTemplate,
 		openPrPromptTemplate: current.openPrPromptTemplate,
+		conflictPromptTemplate: current.conflictPromptTemplate,
 		clineConcurrencyLimit: current.clineConcurrencyLimit,
 		contextBudget: current.contextBudget,
 		reviewPolicy: current.reviewPolicy,
@@ -1354,6 +1489,8 @@ export async function saveRuntimeConfig(
 		shortcuts: RuntimeProjectShortcut[];
 		commitPromptTemplate: string;
 		openPrPromptTemplate: string;
+		/** PCR-2: conflict-repair template (optional; omission follows the commit-template omission behavior). */
+		conflictPromptTemplate?: string;
 		clineConcurrencyLimit?: number | null;
 		contextBudget?: RuntimeContextBudgetSave | null;
 		reviewPolicy?: RuntimeReviewPolicySave | null;
@@ -1375,6 +1512,7 @@ export async function saveRuntimeConfig(
 			readyForReviewNotificationsEnabled: config.readyForReviewNotificationsEnabled,
 			commitPromptTemplate: config.commitPromptTemplate,
 			openPrPromptTemplate: config.openPrPromptTemplate,
+			conflictPromptTemplate: config.conflictPromptTemplate,
 			clineConcurrencyLimit: config.clineConcurrencyLimit,
 			contextBudget: config.contextBudget,
 			reviewPolicy: config.reviewPolicy,
@@ -1397,6 +1535,7 @@ export async function saveRuntimeConfig(
 			reviewPolicy: config.reviewPolicy,
 			verification: config.verification,
 			gitDeliveryPolicy: config.gitDeliveryPolicy,
+			conflictPromptTemplate: config.conflictPromptTemplate,
 		});
 	});
 }
@@ -1435,6 +1574,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			shortcuts: projectConfigPath ? (updates.shortcuts ?? current.shortcuts) : current.shortcuts,
 			commitPromptTemplate: updates.commitPromptTemplate ?? current.commitPromptTemplate,
 			openPrPromptTemplate: updates.openPrPromptTemplate ?? current.openPrPromptTemplate,
+			conflictPromptTemplate: updates.conflictPromptTemplate ?? current.conflictPromptTemplate,
 			clineConcurrencyLimit:
 				updates.clineConcurrencyLimit === undefined ? current.clineConcurrencyLimit : updates.clineConcurrencyLimit,
 			contextBudget: mergedContextBudget === undefined ? current.contextBudget : mergedContextBudget,
@@ -1453,6 +1593,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			nextConfig.readyForReviewNotificationsEnabled !== current.readyForReviewNotificationsEnabled ||
 			nextConfig.commitPromptTemplate !== current.commitPromptTemplate ||
 			nextConfig.openPrPromptTemplate !== current.openPrPromptTemplate ||
+			nextConfig.conflictPromptTemplate !== current.conflictPromptTemplate ||
 			!areRuntimeProjectShortcutsEqual(nextConfig.shortcuts, current.shortcuts) ||
 			(nextConfig.clineConcurrencyLimit ?? null) !== (current.clineConcurrencyLimit ?? null) ||
 			!areRuntimeContextBudgetsEqual(nextConfig.contextBudget, current.contextBudget) ||
@@ -1472,6 +1613,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			readyForReviewNotificationsEnabled: nextConfig.readyForReviewNotificationsEnabled,
 			commitPromptTemplate: nextConfig.commitPromptTemplate,
 			openPrPromptTemplate: nextConfig.openPrPromptTemplate,
+			conflictPromptTemplate: nextConfig.conflictPromptTemplate,
 			clineConcurrencyLimit: updates.clineConcurrencyLimit,
 			contextBudget: updates.contextBudget === undefined ? undefined : mergedContextBudget,
 			reviewPolicy: updates.reviewPolicy === undefined ? undefined : mergedReviewPolicy,
@@ -1492,6 +1634,7 @@ export async function updateRuntimeConfig(cwd: string, updates: RuntimeConfigUpd
 			shortcuts: nextConfig.shortcuts,
 			commitPromptTemplate: nextConfig.commitPromptTemplate,
 			openPrPromptTemplate: nextConfig.openPrPromptTemplate,
+			conflictPromptTemplate: nextConfig.conflictPromptTemplate,
 			clineConcurrencyLimit: nextConfig.clineConcurrencyLimit,
 			contextBudget: nextConfig.contextBudget,
 			reviewPolicy: nextConfig.reviewPolicy,
@@ -1544,6 +1687,7 @@ export async function updateGlobalRuntimeConfig(
 				shortcuts: current.shortcuts,
 				commitPromptTemplate: updates.commitPromptTemplate ?? current.commitPromptTemplate,
 				openPrPromptTemplate: updates.openPrPromptTemplate ?? current.openPrPromptTemplate,
+				conflictPromptTemplate: updates.conflictPromptTemplate ?? current.conflictPromptTemplate,
 				clineConcurrencyLimit:
 					updates.clineConcurrencyLimit === undefined
 						? current.clineConcurrencyLimit
@@ -1565,6 +1709,7 @@ export async function updateGlobalRuntimeConfig(
 				nextConfig.readyForReviewNotificationsEnabled !== current.readyForReviewNotificationsEnabled ||
 				nextConfig.commitPromptTemplate !== current.commitPromptTemplate ||
 				nextConfig.openPrPromptTemplate !== current.openPrPromptTemplate ||
+				nextConfig.conflictPromptTemplate !== current.conflictPromptTemplate ||
 				(nextConfig.clineConcurrencyLimit ?? null) !== (current.clineConcurrencyLimit ?? null) ||
 				!areRuntimeContextBudgetsEqual(nextConfig.contextBudget, current.contextBudget) ||
 				!areRuntimeReviewPoliciesEqual(nextConfig.reviewPolicy, current.reviewPolicy) ||
@@ -1583,6 +1728,7 @@ export async function updateGlobalRuntimeConfig(
 				readyForReviewNotificationsEnabled: nextConfig.readyForReviewNotificationsEnabled,
 				commitPromptTemplate: nextConfig.commitPromptTemplate,
 				openPrPromptTemplate: nextConfig.openPrPromptTemplate,
+				conflictPromptTemplate: nextConfig.conflictPromptTemplate,
 				clineConcurrencyLimit: updates.clineConcurrencyLimit,
 				contextBudget: updates.contextBudget === undefined ? undefined : mergedContextBudget,
 				reviewPolicy: updates.reviewPolicy === undefined ? undefined : mergedReviewPolicy,
@@ -1601,6 +1747,7 @@ export async function updateGlobalRuntimeConfig(
 				shortcuts: nextConfig.shortcuts,
 				commitPromptTemplate: nextConfig.commitPromptTemplate,
 				openPrPromptTemplate: nextConfig.openPrPromptTemplate,
+				conflictPromptTemplate: nextConfig.conflictPromptTemplate,
 				clineConcurrencyLimit: nextConfig.clineConcurrencyLimit,
 				contextBudget: nextConfig.contextBudget,
 				reviewPolicy: nextConfig.reviewPolicy,

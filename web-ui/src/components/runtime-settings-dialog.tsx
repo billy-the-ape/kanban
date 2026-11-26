@@ -103,10 +103,44 @@ function normalizeTemplateForComparison(value: string): string {
 	return value.replaceAll("\r\n", "\n").trim();
 }
 
-const GIT_PROMPT_VARIANT_OPTIONS: Array<{ value: TaskGitAction; label: string }> = [
+const GIT_PROMPT_VARIANT_OPTIONS: Array<{ value: PromptTemplateVariant; label: string }> = [
 	{ value: "commit", label: "Commit" },
 	{ value: "pr", label: "Make PR" },
+	{ value: "conflict", label: "Resolve conflicts" },
 ];
+
+/** The template editor variant selector (PCR-2 adds the third template). */
+export type PromptTemplateVariant = TaskGitAction | "conflict";
+
+interface PromptVariableDoc {
+	token: string;
+	description: string;
+}
+
+/**
+ * Per-variant `{{token}}` help. The conflict list documents every server-
+ * rendered variable: required ones refuse the dispatch when unavailable,
+ * optional ones drop their whole line - never a rendered `null`.
+ */
+const PROMPT_VARIABLES_BY_VARIANT: Record<PromptTemplateVariant, PromptVariableDoc[]> = {
+	commit: [
+		{ token: TASK_GIT_BASE_REF_PROMPT_VARIABLE.token, description: TASK_GIT_BASE_REF_PROMPT_VARIABLE.description },
+	],
+	pr: [{ token: TASK_GIT_BASE_REF_PROMPT_VARIABLE.token, description: TASK_GIT_BASE_REF_PROMPT_VARIABLE.description }],
+	conflict: [
+		{ token: "{{pr_url}}", description: "the tracked pull request's URL (required)" },
+		{ token: "{{repository}}", description: "the PR repository as owner/repo (required)" },
+		{ token: "{{head_branch}}", description: "the PR head branch reported by the provider (required)" },
+		{ token: "{{base_branch}}", description: "the PR base branch reported by the provider (required)" },
+		{ token: "{{task_worktree_path}}", description: "the only checkout the repair turn may touch (required)" },
+		{ token: "{{head_sha}}", description: "known remote head commit SHA (optional; omitted cleanly)" },
+		{ token: "{{base_sha}}", description: "known remote base commit SHA (optional; omitted cleanly)" },
+		{
+			token: "{{base_ref}}",
+			description: "this task card's base ref, which may differ from the PR base (optional; the PR base wins)",
+		},
+	],
+};
 
 export type RuntimeSettingsSection = "shortcuts";
 
@@ -402,7 +436,8 @@ export function RuntimeSettingsDialog({
 	const [shortcuts, setShortcuts] = useState<RuntimeProjectShortcut[]>([]);
 	const [commitPromptTemplate, setCommitPromptTemplate] = useState("");
 	const [openPrPromptTemplate, setOpenPrPromptTemplate] = useState("");
-	const [selectedPromptVariant, setSelectedPromptVariant] = useState<TaskGitAction>("commit");
+	const [conflictPromptTemplate, setConflictPromptTemplate] = useState("");
+	const [selectedPromptVariant, setSelectedPromptVariant] = useState<PromptTemplateVariant>("commit");
 	const [copiedVariableToken, setCopiedVariableToken] = useState<string | null>(null);
 	const [saveError, setSaveError] = useState<string | null>(null);
 	const [pendingShortcutScrollIndex, setPendingShortcutScrollIndex] = useState<number | null>(null);
@@ -415,19 +450,40 @@ export function RuntimeSettingsDialog({
 	const controlsDisabled = isLoading || isSaving || config === null;
 	const commitPromptTemplateDefault = config?.commitPromptTemplateDefault ?? "";
 	const openPrPromptTemplateDefault = config?.openPrPromptTemplateDefault ?? "";
+	const conflictPromptTemplateDefault = config?.conflictPromptTemplateDefault ?? "";
 	const isCommitPromptAtDefault =
 		normalizeTemplateForComparison(commitPromptTemplate) ===
 		normalizeTemplateForComparison(commitPromptTemplateDefault);
 	const isOpenPrPromptAtDefault =
 		normalizeTemplateForComparison(openPrPromptTemplate) ===
 		normalizeTemplateForComparison(openPrPromptTemplateDefault);
-	const selectedPromptValue = selectedPromptVariant === "commit" ? commitPromptTemplate : openPrPromptTemplate;
+	const isConflictPromptAtDefault =
+		normalizeTemplateForComparison(conflictPromptTemplate) ===
+		normalizeTemplateForComparison(conflictPromptTemplateDefault);
+	const selectedPromptValue =
+		selectedPromptVariant === "commit"
+			? commitPromptTemplate
+			: selectedPromptVariant === "pr"
+				? openPrPromptTemplate
+				: conflictPromptTemplate;
 	const selectedPromptDefaultValue =
-		selectedPromptVariant === "commit" ? commitPromptTemplateDefault : openPrPromptTemplateDefault;
+		selectedPromptVariant === "commit"
+			? commitPromptTemplateDefault
+			: selectedPromptVariant === "pr"
+				? openPrPromptTemplateDefault
+				: conflictPromptTemplateDefault;
 	const isSelectedPromptAtDefault =
-		selectedPromptVariant === "commit" ? isCommitPromptAtDefault : isOpenPrPromptAtDefault;
+		selectedPromptVariant === "commit"
+			? isCommitPromptAtDefault
+			: selectedPromptVariant === "pr"
+				? isOpenPrPromptAtDefault
+				: isConflictPromptAtDefault;
 	const selectedPromptPlaceholder =
-		selectedPromptVariant === "commit" ? "Commit prompt template" : "PR prompt template";
+		selectedPromptVariant === "commit"
+			? "Commit prompt template"
+			: selectedPromptVariant === "pr"
+				? "PR prompt template"
+				: "Conflict repair prompt template";
 	const bypassPermissionsCheckboxId = "runtime-settings-bypass-permissions";
 	const refreshNotificationPermission = useCallback(() => {
 		setNotificationPermission(getBrowserNotificationPermission());
@@ -476,6 +532,7 @@ export function RuntimeSettingsDialog({
 	const initialShortcuts = config?.shortcuts ?? [];
 	const initialCommitPromptTemplate = config?.commitPromptTemplate ?? "";
 	const initialOpenPrPromptTemplate = config?.openPrPromptTemplate ?? "";
+	const initialConflictPromptTemplate = config?.conflictPromptTemplate ?? "";
 	const clineSettings = useRuntimeSettingsClineController({
 		open,
 		workspaceId,
@@ -526,9 +583,15 @@ export function RuntimeSettingsDialog({
 		) {
 			return true;
 		}
-		return (
+		if (
 			normalizeTemplateForComparison(openPrPromptTemplate) !==
 			normalizeTemplateForComparison(initialOpenPrPromptTemplate)
+		) {
+			return true;
+		}
+		return (
+			normalizeTemplateForComparison(conflictPromptTemplate) !==
+			normalizeTemplateForComparison(initialConflictPromptTemplate)
 		);
 	}, [
 		agentAutonomousModeEnabled,
@@ -541,11 +604,13 @@ export function RuntimeSettingsDialog({
 		draftThemeId,
 		initialAgentAutonomousModeEnabled,
 		initialCommitPromptTemplate,
+		initialConflictPromptTemplate,
 		initialOpenPrPromptTemplate,
 		initialReadyForReviewNotificationsEnabled,
 		initialSelectedAgentId,
 		initialShortcuts,
 		initialThemeId,
+		conflictPromptTemplate,
 		openPrPromptTemplate,
 		readyForReviewNotificationsEnabled,
 		selectedAgentId,
@@ -565,12 +630,14 @@ export function RuntimeSettingsDialog({
 		setShortcuts(config?.shortcuts ?? []);
 		setCommitPromptTemplate(config?.commitPromptTemplate ?? "");
 		setOpenPrPromptTemplate(config?.openPrPromptTemplate ?? "");
+		setConflictPromptTemplate(config?.conflictPromptTemplate ?? "");
 		setSaveError(null);
 	}, [
 		config?.clineConcurrencyLimit,
 		config?.agentAutonomousModeEnabled,
 		config?.commitPromptTemplate,
 		config?.openPrPromptTemplate,
+		config?.conflictPromptTemplate,
 		config?.readyForReviewNotificationsEnabled,
 		config?.reliableCompletion?.enabled,
 		config?.selectedAgentId,
@@ -700,7 +767,11 @@ export function RuntimeSettingsDialog({
 			setCommitPromptTemplate(value);
 			return;
 		}
-		setOpenPrPromptTemplate(value);
+		if (selectedPromptVariant === "pr") {
+			setOpenPrPromptTemplate(value);
+			return;
+		}
+		setConflictPromptTemplate(value);
 	};
 
 	const handleResetSelectedPrompt = () => {
@@ -765,6 +836,7 @@ export function RuntimeSettingsDialog({
 			shortcuts,
 			commitPromptTemplate,
 			openPrPromptTemplate,
+			conflictPromptTemplate,
 			// B-10.6: send the reliable completion master switch only when the
 			// operator toggled it; the runtime expands it into the underlying
 			// review/verification/delivery/dispatch policies in the same save.
@@ -1001,12 +1073,13 @@ export function RuntimeSettingsDialog({
 					</div>
 					<div className="rounded-lg border border-border bg-surface-0 px-4 py-3 mb-4">
 						<p className="text-text-secondary text-[13px] mt-0 mb-2">
-							Modify the prompts sent to the agent when using Commit or Make PR on tasks in Review.
+							Modify the prompts sent to the agent when using Commit or Make PR on tasks in Review, or Resolve
+							conflicts on a pull request that no longer merges cleanly.
 						</p>
 						<div className="flex items-center justify-between gap-2 mb-2">
 							<NativeSelect
 								value={selectedPromptVariant}
-								onChange={(event) => setSelectedPromptVariant(event.target.value as TaskGitAction)}
+								onChange={(event) => setSelectedPromptVariant(event.target.value as PromptTemplateVariant)}
 								disabled={controlsDisabled}
 								style={{ minWidth: 220 }}
 							>
@@ -1033,23 +1106,28 @@ export function RuntimeSettingsDialog({
 							disabled={controlsDisabled}
 							className="w-full rounded-md border border-border bg-surface-2 p-3 text-[13px] text-text-primary font-mono placeholder:text-text-tertiary focus:border-border-focus focus:outline-none resize-none disabled:opacity-40"
 						/>
-						<p className="text-text-secondary text-[13px] mt-2 mb-0">
-							Use{" "}
-							<InlineUtilityButton
-								text={
-									copiedVariableToken === TASK_GIT_BASE_REF_PROMPT_VARIABLE.token
-										? "Copied!"
-										: TASK_GIT_BASE_REF_PROMPT_VARIABLE.token
-								}
-								monospace
-								widthCh={Math.max(TASK_GIT_BASE_REF_PROMPT_VARIABLE.token.length, "Copied!".length) + 2}
-								onClick={() => {
-									handleCopyVariableToken(TASK_GIT_BASE_REF_PROMPT_VARIABLE.token);
-								}}
-								disabled={controlsDisabled}
-							/>{" "}
-							to reference {TASK_GIT_BASE_REF_PROMPT_VARIABLE.description}
-						</p>
+						<div className="flex flex-col gap-1">
+							<p className="text-text-secondary text-[13px] mt-2 mb-0">
+								Use these variables (unknown {"{{tokens}}"} are left untouched):
+							</p>
+							{PROMPT_VARIABLES_BY_VARIANT[selectedPromptVariant].map((variable) => (
+								<p
+									key={variable.token}
+									className="flex flex-wrap items-center gap-1 text-text-secondary text-[13px] m-0"
+								>
+									<InlineUtilityButton
+										text={copiedVariableToken === variable.token ? "Copied!" : variable.token}
+										monospace
+										widthCh={Math.max(variable.token.length, "Copied!".length) + 2}
+										onClick={() => {
+											handleCopyVariableToken(variable.token);
+										}}
+										disabled={controlsDisabled}
+									/>
+									<span>— {variable.description}</span>
+								</p>
+							))}
+						</div>
 					</div>
 
 					{/* ---- Notifications ---- */}

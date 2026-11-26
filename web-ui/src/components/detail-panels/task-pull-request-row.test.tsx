@@ -1,9 +1,9 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { TaskPullRequestActions } from "@/hooks/use-task-pull-request-actions";
-import type { RuntimeTaskPullRequest } from "@/runtime/types";
+import type { RuntimePrConflictState, RuntimeTaskConflictRepairRecord, RuntimeTaskPullRequest } from "@/runtime/types";
 import { TaskPullRequestRow } from "./task-pull-request-row";
 
 const noop = () => {};
@@ -28,6 +28,12 @@ const actions: TaskPullRequestActions = {
 	findBranchPullRequests: asyncNoop,
 	refreshAllPending: false,
 	refreshAll: asyncNoop,
+	repairPendingKey: null,
+	recheckPendingKey: null,
+	repairError: null,
+	clearRepairError: noop,
+	resolveConflicts: async () => true,
+	recheckConflict: asyncNoop,
 };
 
 function createPullRequest(overrides?: Partial<RuntimeTaskPullRequest>): RuntimeTaskPullRequest {
@@ -43,10 +49,36 @@ function createPullRequest(overrides?: Partial<RuntimeTaskPullRequest>): Runtime
 	};
 }
 
+const HEAD_SHA = "abc123def4567890abc123def4567890abc123de";
+const PR_KEY = "github|github.com|octo/repo|42";
+
+function makeConflict(overrides?: Partial<RuntimePrConflictState>): RuntimePrConflictState {
+	return {
+		state: "conflicting",
+		source: "provider_snapshot",
+		note: null,
+		prKey: "github|github.com|octo/repo|42",
+		headRef: "feature",
+		baseRef: "main",
+		headSha: HEAD_SHA,
+		baseSha: null,
+		checkedAt: 1_800_000_000_000,
+		...overrides,
+	};
+}
+
 let container: HTMLDivElement | null = null;
 let root: Root | null = null;
 
-function renderRow(pullRequest: RuntimeTaskPullRequest): void {
+function renderRow(
+	pullRequest: RuntimeTaskPullRequest,
+	options: {
+		canManage?: boolean;
+		conflict?: RuntimePrConflictState | null;
+		conflictRepair?: RuntimeTaskConflictRepairRecord | null;
+		actions?: TaskPullRequestActions;
+	} = {},
+): void {
 	const activeRoot = root;
 	if (!activeRoot || !container) {
 		throw new Error("test root not initialized");
@@ -58,8 +90,10 @@ function renderRow(pullRequest: RuntimeTaskPullRequest): void {
 				isWinner={false}
 				isExplicitPrimary={false}
 				isAutomationPr={false}
-				canManage={false}
-				actions={actions}
+				canManage={options.canManage === true}
+				actions={options.actions ?? actions}
+				conflict={options.conflict}
+				conflictRepair={options.conflictRepair}
 				mobile={false}
 			/>,
 		);
@@ -118,5 +152,98 @@ describe("TaskPullRequestRow", () => {
 	it("omits the detail line when no provider details are stored", () => {
 		renderRow(createPullRequest());
 		expect(container?.querySelector('[data-testid="task-pr-view-details-42"]')).toBeNull();
+	});
+
+	it("shows the Resolve conflicts action for a provider-confirmed conflict", () => {
+		const resolveConflicts = vi.fn(async () => true);
+		renderRow(createPullRequest(), {
+			canManage: true,
+			conflict: makeConflict(),
+			actions: { ...actions, resolveConflicts },
+		});
+		const state = container?.querySelector('[data-testid="task-pr-view-conflict-state-42"]');
+		expect(state?.textContent).toContain("does not merge cleanly");
+		const button = container?.querySelector(
+			'[data-testid="task-pr-view-resolve-conflicts-42"]',
+		) as HTMLButtonElement | null;
+		expect(button).not.toBeNull();
+		expect(button?.disabled).toBe(false);
+		act(() => {
+			button?.click();
+		});
+		expect(resolveConflicts).toHaveBeenCalledTimes(1);
+	});
+
+	it("hides the repair action for read-only viewers and non-conflicting states", () => {
+		renderRow(createPullRequest(), { canManage: false, conflict: makeConflict() });
+		expect(container?.querySelector('[data-testid="task-pr-view-resolve-conflicts-42"]')).toBeNull();
+		renderRow(createPullRequest(), {
+			canManage: true,
+			conflict: makeConflict({ state: "clean", source: "provider_snapshot", note: null }),
+		});
+		expect(container?.querySelector('[data-testid="task-pr-view-resolve-conflicts-42"]')).toBeNull();
+		// A clean block never claims local knowledge and never offers repair.
+		expect(container?.querySelector('[data-testid="task-pr-view-conflict-42"]')?.textContent).toContain("clean");
+	});
+
+	it("offers Re-check for the unknown state — never a silent guess", () => {
+		const recheckConflict = vi.fn(async () => {});
+		renderRow(createPullRequest(), {
+			canManage: true,
+			conflict: makeConflict({ state: "unknown", source: "none", note: "provider is still computing mergeability" }),
+			actions: { ...actions, recheckConflict },
+		});
+		const button = container?.querySelector('[data-testid="task-pr-view-recheck-42"]') as HTMLButtonElement | null;
+		expect(button).not.toBeNull();
+		expect(container?.querySelector('[data-testid="task-pr-view-conflict-state-42"]')?.textContent).toContain(
+			"still computing",
+		);
+		act(() => {
+			button?.click();
+		});
+		expect(recheckConflict).toHaveBeenCalledTimes(1);
+	});
+
+	it("disables repair and explains the outstanding dispatch for the same head", () => {
+		const conflict = makeConflict();
+		renderRow(createPullRequest(), {
+			canManage: true,
+			conflict,
+			conflictRepair: {
+				prKey: PR_KEY,
+				headSha: HEAD_SHA,
+				dispatchedAt: 1_800_000_000_000,
+				status: "dispatched",
+			},
+		});
+		const button = container?.querySelector(
+			'[data-testid="task-pr-view-resolve-conflicts-42"]',
+		) as HTMLButtonElement | null;
+		expect(button?.disabled).toBe(true);
+		expect(container?.querySelector('[data-testid="task-pr-view-conflict-42"]')?.textContent).toContain(
+			"repair dispatched",
+		);
+	});
+
+	it("surfaces a failed repair and keeps the retry lane open", () => {
+		const conflict = makeConflict();
+		renderRow(createPullRequest(), {
+			canManage: true,
+			conflict,
+			conflictRepair: {
+				prKey: PR_KEY,
+				headSha: HEAD_SHA,
+				dispatchedAt: 1_800_000_000_000,
+				status: "failed",
+				error: "Cline is starting. Stop it before sending a message.",
+			},
+		});
+		const button = container?.querySelector(
+			'[data-testid="task-pr-view-resolve-conflicts-42"]',
+		) as HTMLButtonElement | null;
+		expect(button?.disabled).toBe(false);
+		expect(container?.querySelector('[data-testid="task-pr-view-conflict-42"]')?.textContent).toContain(
+			"repair failed",
+		);
 	});
 });
