@@ -227,8 +227,8 @@ function getWorkspaceMetaPath(workspaceId: string): string {
 }
 
 /**
- * The shared workspace-index lock handle. Registering a project is the only index
- * write that needs it — resolving an indexed project is a lock-free read — so
+ * The shared workspace-index lock handle. Index writes (registering or removing a
+ * project) need it — resolving an indexed project is a lock-free read — so
  * callers that need to observe index contention take the same handle the runtime
  * locks on instead of guessing a lockfile path.
  */
@@ -620,7 +620,7 @@ export async function loadWorkspaceContext(
 		throw new Error(`Project ${repoPath} is not added to Kanban yet.`);
 	}
 	// Registering a project is a read-append-write on the shared index and stays
-	// serialized; `ensureWorkspaceEntry` re-reads inside the lock, so a concurrent
+	// serialized; the index is re-read inside the lock, so a concurrent
 	// registration is reused instead of duplicated.
 	const entry = await lockedFileSystem.withLock(getWorkspaceIndexLockRequest(), async () => {
 		const index = await readWorkspaceIndex();
