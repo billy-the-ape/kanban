@@ -1022,6 +1022,65 @@ function collectBareIdLines(texts: string[]): number[] | null {
 	return ids;
 }
 
+/**
+ * A jq projection can emit the same response more than once. Accept only
+ * one explicit write with a single, identical validated identity in every
+ * object. Never infer identity from arbitrary strings or mixed listings.
+ */
+function resolveRepeatedPublicationIdentity(
+	objects: Record<string, unknown>[],
+	operations: PrPublicationOperation[],
+	target: PrPublicationTarget | null,
+): PrPublishedIdentity | null {
+	const operation = operations[0];
+	if (
+		objects.length < 2 ||
+		target === null ||
+		operations.length !== 1 ||
+		!operation ||
+		operation.operation !== "gh api" ||
+		operation.kind === null ||
+		operation.explicitRepository?.toLowerCase() !== target.repository.toLowerCase() ||
+		operation.explicitNumber !== target.number
+	) {
+		return null;
+	}
+	let identity: PrPublishedIdentity | null = null;
+	for (const object of objects) {
+		const mapped = mapApiResponseIdentity(object, target);
+		if (mapped.kind === "error") return null;
+		let current = mapped.identities.length === 1 ? mapped.identities[0] : null;
+		if (mapped.identities.length === 0) {
+			current = mapFilteredApiResponseIdentity(object, operations, target);
+			// A filtered response may retain the canonical HTML URL instead
+			// of the REST URL. Require the top-level id to agree with it.
+			if (
+				current === null &&
+				!["issue_url", "pull_request_url", "url", "comments"].some((key) => key in object)
+			) {
+				const id = readPositiveInt(object, "id");
+				const htmlUrl = readString(object, "html_url");
+				if (id !== null && htmlUrl !== null) {
+					const anchor =
+						operation.kind === "inline"
+							? `discussion_r${id}`
+							: operation.kind === "conversation"
+								? `issuecomment-${id}`
+								: `pullrequestreview-${id}`;
+					const expected = `https://${target.host}/${target.repository}/pull/${target.number}#${anchor}`;
+					if (htmlUrl.toLowerCase() === expected.toLowerCase()) {
+						current = { kind: operation.kind, id };
+					}
+				}
+			}
+		}
+		if (!current || current.kind !== operation.kind) return null;
+		if (identity && prPublishedIdentityKey(identity) !== prPublishedIdentityKey(current)) return null;
+		identity = current;
+	}
+	return identity;
+}
+
 const MULTI_OBJECT_UNCERTAINTY_REASON =
 	"The output contained several GitHub objects; the published identity could not be confirmed.";
 /**
@@ -1038,9 +1097,8 @@ const BARE_ID_UNCERTAINTY_REASON =
  * the resolved target, tied to the write invocation: when the output is a
  * structured per-fragment command result, only the result(s) whose query is
  * a write fragment contribute, so a read fragment in the same tool call can
- * never register identities. Several identity-bearing objects in the
- * evidence (a listing mixed into the write's output) can never register —
- * it is explicit uncertainty, never a guess. A clear API/CLI failure means
+ * never register identities. Multiple objects remain uncertain unless they
+ * all prove the same identity for one explicit write. A clear API/CLI failure means
  * nothing was published; anything else is explicit uncertainty.
  */
 export function resolvePublicationOutput(input: {
@@ -1089,9 +1147,11 @@ export function resolvePublicationOutput(input: {
 	let identityObjects = 0;
 	let totalObjects = 0;
 	let responseObject: Record<string, unknown> | null = null;
+	const responseObjects: Record<string, unknown>[] = [];
 	for (const candidate of candidateTexts) {
 		const objects = extractJsonObjects(candidate);
 		totalObjects += objects.length;
+		responseObjects.push(...objects);
 		for (const object of objects) {
 			responseObject = object;
 			const mapped = mapApiResponseIdentity(object, input.target);
@@ -1107,6 +1167,17 @@ export function resolvePublicationOutput(input: {
 			}
 		}
 	}
+	const scopedOperations = scopedWriteOperations(input.operations, matched, writeFragments);
+	if (
+		totalObjects > 1 &&
+		!sawError &&
+		input.error === null &&
+		!evidenceEntries.some((entry) => entry.success === false) &&
+		(entries.length === 0 || matched.length === 1)
+	) {
+		const repeated = resolveRepeatedPublicationIdentity(responseObjects, scopedOperations, input.target);
+		if (repeated) return { status: "published", identities: [repeated], reason: null };
+	}
 	if (identityObjects > 1) {
 		return { status: "uncertain", identities: [], reason: MULTI_OBJECT_UNCERTAINTY_REASON };
 	}
@@ -1116,7 +1187,6 @@ export function resolvePublicationOutput(input: {
 	// every scoped write does that and nothing else is in the evidence,
 	// the line set is attributable exactly once per write; a mismatch is
 	// explicit uncertainty, never a guess.
-	const scopedOperations = scopedWriteOperations(input.operations, matched, writeFragments);
 	if (input.target !== null && totalObjects === 0 && scopedOperations.length > 0) {
 		const bareIdScope = scopedOperations.filter(
 			(operation): operation is PrPublicationOperation & { kind: PrPublishedIdentityKind } =>

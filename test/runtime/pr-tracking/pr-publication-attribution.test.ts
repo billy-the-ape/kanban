@@ -421,6 +421,56 @@ describe("resolvePublicationOutput multi-object guard", () => {
 		bareIdOutput: false,
 	};
 
+	const inlineOperation: PrPublicationOperation = {
+		operation: "gh api",
+		kind: "inline",
+		explicitRepository: "octo/repo",
+		explicitNumber: 42,
+		fragment: "gh api repos/octo/repo/pulls/42/comments/123/replies -f body=x",
+		bareIdOutput: false,
+	};
+
+	it.each(["filtered", "full"])("deduplicates repeated %s objects from one explicit write", (shape) => {
+		const response = {
+			id: 4702111146,
+			html_url: "https://github.com/octo/repo/pull/42#discussion_r4702111146",
+			in_reply_to_id: 123,
+			...(shape === "full"
+				? { pull_request_url: "https://api.github.com/repos/octo/repo/pulls/42", path: "x.ts", diff_hunk: "@@" }
+				: {}),
+		};
+		const result = [80, 149, 3165].map((rows) => JSON.stringify({ ...response, rows_in_table: rows })).join("\n");
+		const output = JSON.stringify([{ query: inlineOperation.fragment, result, success: true }]);
+		expect(resolvePublicationOutput({ operations: [inlineOperation], target: TARGET, output, error: null })).toEqual({
+			status: "published",
+			identities: [{ kind: "inline", id: 4702111146 }],
+			reason: null,
+		});
+	});
+
+	it("keeps distinct filtered identities uncertain", () => {
+		const output = [9, 10]
+			.map((id) => JSON.stringify({ id, html_url: `https://github.com/octo/repo/pull/42#discussion_r${id}` }))
+			.join("\n");
+		expect(
+			resolvePublicationOutput({ operations: [inlineOperation], target: TARGET, output, error: null }).status,
+		).toBe("uncertain");
+	});
+
+	it("rejects repeated filtered objects with contradictory ids or targets", () => {
+		const response = { id: 9, html_url: "https://github.com/octo/repo/pull/42#discussion_r9" };
+		for (const invalid of [
+			{ ...response, id: 10 },
+			{ ...response, html_url: "https://github.com/octo/repo/pull/43#discussion_r9" },
+			{ ...response, pull_request_url: "https://api.github.com/repos/octo/repo/pulls/43" },
+		]) {
+			const output = [response, invalid].map((object) => JSON.stringify(object)).join("\n");
+			expect(
+				resolvePublicationOutput({ operations: [inlineOperation], target: TARGET, output, error: null }).status,
+			).toBe("uncertain");
+		}
+	});
+
 	it("treats a listing mixed into the write's own output as uncertain", () => {
 		const output = JSON.stringify([
 			{ id: 9, issue_url: "https://github.com/octo/repo/issues/42" },
