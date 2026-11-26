@@ -694,6 +694,45 @@ describe("pr-tracking-coordinator", () => {
 		expect(coordinator.getState().subscriptions.every((sub) => sub.blocker === "auth")).toBe(true);
 	});
 
+	it("recovers initial auth-blocked subscriptions on refresh before any poll exists", async () => {
+		const scope: AccessScope = { accessScopeId: "scope-A", login: "alice", tokenSource: "GH_TOKEN" };
+		const harness = makeCoordinator({
+			scopeResult: (index) =>
+				index === 0
+					? { ok: false, failure: failure("auth", { message: "credentials unavailable" }) }
+					: { ok: true, scope },
+		});
+		const coordinator = track(harness.coordinator);
+		expect((await coordinator.addSubscription(descriptor())).status).toBe("blocked");
+		expect((await coordinator.addSubscription(descriptor({ taskId: "task-2" }))).status).toBe("blocked");
+		expect(coordinator.getState().polls).toHaveLength(0);
+		await coordinator.refresh(PR49, "unresolved");
+		expect(harness.fake.scopeCalls()).toBe(2);
+		expect(coordinator.getState().authBlocker).toBeNull();
+		expect(coordinator.getState().subscriptions.every((sub) => sub.active)).toBe(true);
+		expect(coordinator.getState().polls[0]?.nextPollAt).not.toBeNull();
+		const record = await harness.store.loadRecord(PR49);
+		expect(record.ok && record.record.taskBindings).toHaveLength(2);
+	});
+
+	it("throttles failed initial credential probes during reconciliation", async () => {
+		const scope: AccessScope = { accessScopeId: "scope-A", login: "alice", tokenSource: "GH_TOKEN" };
+		const harness = makeCoordinator({
+			scopeResult: (index) =>
+				index === 0
+					? { ok: false, failure: failure("auth", { message: "credentials unavailable" }) }
+					: { ok: true, scope },
+		});
+		const coordinator = track(harness.coordinator);
+		await coordinator.addSubscription(descriptor());
+		await coordinator.recoverBlockedSubscriptions();
+		expect(harness.fake.scopeCalls()).toBe(1);
+		await vi.advanceTimersByTimeAsync(POLL_MS);
+		await coordinator.recoverBlockedSubscriptions();
+		expect(harness.fake.scopeCalls()).toBe(2);
+		expect(coordinator.getState().subscriptions[0]?.active).toBe(true);
+	});
+
 	it("keeps the runtime serving when another process holds the scheduler lock", async () => {
 		const lockDir = join(root, "scheduler-lock");
 		const first = track(makeCoordinator({ schedulerLockPath: lockDir }).coordinator);
