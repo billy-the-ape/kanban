@@ -2,7 +2,7 @@
 // from the agent's hook payload — raw tool output never crosses the wire.
 import { describe, expect, it } from "vitest";
 
-import { extractHookPullRequestUrls, extractPiPublicationTool } from "../../src/commands/hooks";
+import { extractHookPullRequestUrls, extractTerminalPublicationTool } from "../../src/commands/hooks";
 
 describe("extractHookPullRequestUrls", () => {
 	it("detects a PR created via gh in a Claude-style Bash payload", () => {
@@ -86,7 +86,7 @@ describe("extractHookPullRequestUrls", () => {
 	});
 });
 
-describe("extractPiPublicationTool", () => {
+describe("extractTerminalPublicationTool", () => {
 	it("records recognized writes before execution with the matching call id", () => {
 		const payload = {
 			hook_event_name: "tool_execution_start",
@@ -94,25 +94,28 @@ describe("extractPiPublicationTool", () => {
 			tool_call_id: "call-42",
 			tool_input: { command: "gh api -X POST repos/octo/repo/pulls/42/comments -F in_reply_to=12 -f body=done" },
 		};
-		expect(extractPiPublicationTool(payload, "pi")).toMatchObject({
+		expect(extractTerminalPublicationTool(payload, "pi")).toMatchObject({
 			phase: "started",
 			toolCallId: "call-42",
 			output: null,
 			error: null,
 		});
-		expect(extractPiPublicationTool({ ...payload, tool_call_id: null }, "pi")).toBeUndefined();
+		expect(extractTerminalPublicationTool({ ...payload, tool_call_id: null }, "pi")).toBeUndefined();
 	});
-	it("captures Pi's attributed gh comment write with its tool call id", () => {
-		const event = extractPiPublicationTool(
+	it.each([
+		["pi", "tool_execution_end"],
+		["opencode", "AfterTool"],
+	])("captures %s comment publication with its tool call id", (source, hook) => {
+		const event = extractTerminalPublicationTool(
 			{
-				hook_event_name: "tool_execution_end",
+				hook_event_name: hook,
 				tool_name: "bash",
 				tool_call_id: "call-42",
 				tool_input: { command: "gh pr comment 42 --repo octo/repo --body 'Addressed'" },
 				tool_response: { output: "https://github.com/octo/repo/pull/42#issuecomment-51" },
 				tool_is_error: false,
 			},
-			"pi",
+			source,
 		);
 		expect(event).toMatchObject({
 			phase: "finished",
@@ -127,7 +130,7 @@ describe("extractPiPublicationTool", () => {
 	it("ignores ordinary Pi commands and read-only GitHub operations", () => {
 		for (const command of ["git status --short", "npm test", "gh pr view 42 --json comments"]) {
 			expect(
-				extractPiPublicationTool(
+				extractTerminalPublicationTool(
 					{
 						hook_event_name: "tool_execution_end",
 						tool_name: "bash",
@@ -148,7 +151,7 @@ describe("extractPiPublicationTool", () => {
 			tool_response: { output: "HTTP 403" },
 			tool_is_error: true,
 		};
-		expect(extractPiPublicationTool(payload, "cline")).toBeUndefined();
-		expect(extractPiPublicationTool(payload, "pi")?.error).toBe("HTTP 403");
+		expect(extractTerminalPublicationTool(payload, "cline")).toBeUndefined();
+		expect(extractTerminalPublicationTool(payload, "pi")?.error).toBe("HTTP 403");
 	});
 });

@@ -122,11 +122,12 @@ const DISPATCH_RETRY_MS = 30_000;
  */
 const TERMINAL_FAILURE_CONFIRM_MS = 30_000;
 /**
- * `dispatch.turnRef` marker for a repair turn handed to Pi through the
- * prepared terminal sender. Such a turn is settled only by Pi's own hook
- * observer, so every reader of the marker shares this one rule.
+ * Terminal turns settle through their live hook observer. A lost observer
+ * cannot infer completion from persisted terminal output.
  */
-const PI_TURN_REF_PREFIX = "pi:";
+function isTerminalRepairRef(ref: string | null | undefined): boolean {
+	return ref?.startsWith("pi:") === true || ref?.startsWith("opencode:") === true;
+}
 /** How long dispose() waits for already-running work before giving up on it. */
 const DISPOSE_GRACE_MS = 3_000;
 const BACKOFF_SCHEDULE_MS = [60_000, 120_000, 240_000, 480_000, 900_000];
@@ -185,6 +186,7 @@ export interface PrCommentAutomationServiceDependencies {
 		taskId: string,
 		preparePrompt: ClineTurnPreparation,
 	) => Promise<RuntimeTaskChatSendResponse>;
+	sendPreparedOpenCodeTaskMessage?: PrCommentAutomationServiceDependencies["sendPreparedPiTaskMessage"];
 	/**
 	 * Effective agent for a card — a live session's agent when one exists,
 	 * else the workspace's selected agent (same precedence as task start).
@@ -655,7 +657,8 @@ export class PrCommentAutomationService {
 		}
 		return (
 			effectiveAgentId === "cline" ||
-			(effectiveAgentId === "pi" && this.deps.sendPreparedPiTaskMessage !== undefined)
+			(effectiveAgentId === "pi" && this.deps.sendPreparedPiTaskMessage !== undefined) ||
+			(effectiveAgentId === "opencode" && this.deps.sendPreparedOpenCodeTaskMessage !== undefined)
 		);
 	}
 
@@ -975,12 +978,12 @@ export class PrCommentAutomationService {
 			return;
 		}
 		if (dispatch !== null && dispatch.status === "running") {
-			if (dispatch.turnRef?.startsWith(PI_TURN_REF_PREFIX)) {
-				// Pi's exact turn is settled by its live hook observer, never by
+			if (isTerminalRepairRef(dispatch.turnRef)) {
+				// A terminal turn is settled by its live hook observer, never by
 				// a generic output timestamp. If the observer is gone, fail closed.
 				await this.setDispatchFailed(
 					sub,
-					"Pi PR repair lost its completion observer; inspect GitHub and Resume explicitly.",
+					"Terminal PR repair lost its completion observer; inspect GitHub and Resume explicitly.",
 					dispatch.dispatchId,
 				);
 				return;
@@ -1339,12 +1342,13 @@ export class PrCommentAutomationService {
 		// Both agents use the same queued intent, preparation, and completion receipt.
 		const effectiveAgentId = (await this.deps.getEffectiveTaskAgentId?.(scope, owner.taskId)) ?? "cline";
 		let response: RuntimeTaskChatSendResponse;
-		if (effectiveAgentId === "pi") {
-			const sendPi = this.deps.sendPreparedPiTaskMessage;
-			response = sendPi
-				? await sendPi(scope, owner.taskId, prepare)
-				: { ok: false, summary: null, error: "Pi PR comment dispatcher is not configured." };
-		} else {
+		if (effectiveAgentId === "pi" || effectiveAgentId === "opencode") {
+			const send =
+				effectiveAgentId === "pi" ? this.deps.sendPreparedPiTaskMessage : this.deps.sendPreparedOpenCodeTaskMessage;
+			response = send
+				? await send(scope, owner.taskId, prepare)
+				: { ok: false, summary: null, error: "The terminal PR comment dispatcher is not configured." };
+		} else if (effectiveAgentId === "cline") {
 			response = await this.deps.sendTaskChatMessage(
 				scope,
 				{
@@ -1354,6 +1358,12 @@ export class PrCommentAutomationService {
 				},
 				prepare,
 			);
+		} else {
+			response = {
+				ok: false,
+				summary: null,
+				error: "The task agent changed and no longer supports PR comment handling.",
+			};
 		}
 		if (response.ok) {
 			await upsertPrTrackingRecord(sub.key, identity, (record) => {
@@ -1367,8 +1377,8 @@ export class PrCommentAutomationService {
 						dispatch: {
 							...dispatch,
 							turnRef:
-								effectiveAgentId === "pi"
-									? `${PI_TURN_REF_PREFIX}${dispatchId}`
+								effectiveAgentId === "pi" || effectiveAgentId === "opencode"
+									? `${effectiveAgentId}:${dispatchId}`
 									: (response.message?.id ?? null),
 						},
 					},
@@ -2212,15 +2222,15 @@ export class PrCommentAutomationService {
 			let sessionLastOutputAt: number | null = null;
 			let taskExists = false;
 			let workspaceStateUnavailable = false;
-			let piOwnerAtRestart = false;
+			let terminalOwnerAtRestart = false;
 			if (owner) {
 				const workspace = await this.resolveWorkspaceScope(owner.workspaceId);
 				if (workspace) {
 					const state = await this.deps.loadWorkspaceState(workspace.workspacePath).catch(() => null);
 					if (state) {
-						piOwnerAtRestart =
+						terminalOwnerAtRestart =
 							(await this.deps.getEffectiveTaskAgentId?.(workspace, owner.taskId).then(
-								(agentId) => agentId === "pi",
+								(agentId) => agentId === "pi" || agentId === "opencode",
 								() => false,
 							)) ?? false;
 						taskExists = state.board.columns.some((column) =>
@@ -2284,8 +2294,8 @@ export class PrCommentAutomationService {
 				// Otherwise: keep queued; the deadline pass re-validates.
 				continue;
 			}
-			if (piOwnerAtRestart || dispatch.turnRef?.startsWith(PI_TURN_REF_PREFIX)) {
-				// After a restart no exact Pi turn outcome can be proved. Require
+			if (terminalOwnerAtRestart || isTerminalRepairRef(dispatch.turnRef)) {
+				// After a restart no exact terminal turn outcome can be proved. Require
 				// explicit Resume rather than replaying feedback or guessing success.
 				await upsertPrTrackingRecord(
 					record.canonicalPrKey,
@@ -2306,7 +2316,7 @@ export class PrCommentAutomationService {
 								dispatch: {
 									...active,
 									status: "failed",
-									error: "Pi repair was interrupted by server restart; inspect GitHub and Resume explicitly.",
+									error: "Terminal repair was interrupted by server restart; inspect GitHub and Resume explicitly.",
 								},
 							},
 						};
@@ -2401,9 +2411,7 @@ export class PrCommentAutomationService {
 		);
 		// Same effective-agent gate as subscription and dispatch (an unset
 		// card agentId inherits the workspace's selected agent, not Cline).
-		const supported = enabled
-			? await this.isSupportedAgentTask(scope, card)
-			: (card.agentId ?? "cline") === "cline" || card.agentId === "pi";
+		const supported = enabled && (await this.isSupportedAgentTask(scope, card));
 		if (!enabled) {
 			return { ok: true, state: { ...neutral, pr: prs[0] ?? null } };
 		}
@@ -2415,7 +2423,7 @@ export class PrCommentAutomationService {
 					enabled: true,
 					supported: false,
 					pr: prs[0] ?? null,
-					blocker: `Automatic comment handling requires a Cline or Pi task session.`,
+					blocker: `Automatic comment handling requires a Cline, Pi, or OpenCode task session.`,
 				},
 			};
 		}

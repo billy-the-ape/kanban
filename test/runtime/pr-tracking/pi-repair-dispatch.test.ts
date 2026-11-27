@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { ClineTurnOutcome, ClineTurnPreparation } from "../../../src/cline-sdk/cline-turn-preparation";
 import { normalizePiHookMetadata } from "../../../src/commands/hook-events/pi-hook-events";
 import type { RuntimeTaskSessionSummary } from "../../../src/core/api-contract";
-import { sendPreparedPiRepair } from "../../../src/pr-tracking/pi-repair-dispatch";
+import { sendPreparedOpenCodeRepair, sendPreparedPiRepair } from "../../../src/pr-tracking/terminal-repair-dispatch";
 import { TerminalSessionManager } from "../../../src/terminal/session-manager";
 
 const PI_PASTE_SETTLE_TEST_MS = 200;
@@ -22,7 +22,7 @@ function piActivity(
 	};
 }
 
-function createPiManager() {
+function createPiManager(args: string[] = []) {
 	let summary: RuntimeTaskSessionSummary = {
 		taskId: "pi-task",
 		state: "awaiting_review",
@@ -42,6 +42,7 @@ function createPiManager() {
 	const listeners = new Set<(next: RuntimeTaskSessionSummary) => void>();
 	const writes: string[] = [];
 	const manager = {
+		getLaunchArgs: () => args,
 		getSummary: (taskId: string) => (taskId === "pi-task" ? summary : null),
 		hasActiveProcess: (taskId: string) => taskId === "pi-task" && active,
 		onSummary: (listener: (next: RuntimeTaskSessionSummary) => void) => {
@@ -520,5 +521,49 @@ describe("sendPreparedPiRepair", () => {
 		expect(result.ok).toBe(true);
 		expect(pi.writes).toEqual([]);
 		expect(settled).toHaveBeenCalledExactlyOnceWith({ status: "skipped" });
+	});
+});
+
+describe("sendPreparedOpenCodeRepair", () => {
+	it("accepts one repair and requires a completed hook from the same session", async () => {
+		const terminal = createPiManager();
+		const { prepare, settled } = createPreparation();
+		const input = { manager: terminal.manager, taskId: "pi-task", prepare };
+		terminal.emit({ agentId: "opencode", externalSessionId: "ses_opencode" });
+		expect((await sendPreparedOpenCodeRepair(input)).ok).toBe(true);
+		expect((await sendPreparedOpenCodeRepair(input)).ok).toBe(false);
+
+		const hook = (notificationType: string) => ({
+			...piActivity("session.status", notificationType),
+			source: "opencode",
+		});
+		terminal.emit({ state: "running", lastHookAt: Date.now(), latestHookActivity: hook("turn.started") });
+		terminal.emit({
+			state: "awaiting_review",
+			reviewReason: "attention",
+			lastHookAt: Date.now(),
+			latestHookActivity: hook("permission.asked"),
+		});
+		expect(settled).not.toHaveBeenCalled();
+		terminal.emit({
+			externalSessionId: "ses_other",
+			reviewReason: "hook",
+			lastHookAt: Date.now(),
+			latestHookActivity: hook("turn.completed"),
+		});
+		expect(settled).not.toHaveBeenCalled();
+		terminal.emit({ externalSessionId: "ses_opencode", lastHookAt: Date.now() });
+		expect(settled).toHaveBeenCalledExactlyOnceWith({ status: "completed" });
+		expect(terminal.writes).toHaveLength(2);
+	});
+
+	it("leaves the prompt untouched in a plan session", async () => {
+		const terminal = createPiManager(["--agent", "plan"]);
+		const { prepare } = createPreparation();
+		terminal.emit({ agentId: "opencode", externalSessionId: "ses_opencode" });
+		const response = await sendPreparedOpenCodeRepair({ manager: terminal.manager, taskId: "pi-task", prepare });
+		expect(response.ok).toBe(false);
+		expect(prepare).not.toHaveBeenCalled();
+		expect(terminal.writes).toEqual([]);
 	});
 });

@@ -65,6 +65,7 @@ const PLUGIN_SOURCE = `const kanbanOpenCodeBridge = async ({ client }) => {
   let lastErrorKey = null;
   let lastReviewWasCompletion = false;
   let spawnImpl = null;
+  let transition = Promise.resolve();
 
   const assistantTextByMessage = new Map();
   const latestAssistantText = new Map();
@@ -162,6 +163,13 @@ const PLUGIN_SOURCE = `const kanbanOpenCodeBridge = async ({ client }) => {
     if (metadata.toolInputSummary) {
       payload.tool_input_summary = metadata.toolInputSummary;
     }
+    if (metadata.command && metadata.callID) {
+      payload.tool_input = { command: metadata.command };
+      payload.tool_call_id = metadata.callID;
+      if (metadata.toolResponse) {
+        payload.tool_response = metadata.toolResponse;
+      }
+    }
     if (metadata.finalMessage) {
       payload.final_message = metadata.finalMessage;
     }
@@ -208,6 +216,13 @@ const PLUGIN_SOURCE = `const kanbanOpenCodeBridge = async ({ client }) => {
     });
   };
 
+  // Ingest runs in a separate process. Preserve turn order even when the
+  // provider returns before the busy hook reaches Kanban.
+  const notifyTransition = (argv, sessionID, metadata) => {
+    transition = transition.then(() => notify(argv, sessionID, metadata));
+    return transition;
+  };
+
   const isChildSession = async (sessionID) => {
     if (!sessionID) {
       return true;
@@ -248,6 +263,9 @@ const PLUGIN_SOURCE = `const kanbanOpenCodeBridge = async ({ client }) => {
     if (await isChildSession(sessionID)) {
       return false;
     }
+    if (rootBound) {
+      return sessionID === rootSessionID;
+    }
     rootSessionID = sessionID;
     rootBound = true;
     return true;
@@ -276,7 +294,7 @@ const PLUGIN_SOURCE = `const kanbanOpenCodeBridge = async ({ client }) => {
     }
     lastErrorKey = null;
     lastReviewWasCompletion = false;
-    await notify(inProgressArgv, sessionID, { hookEventName });
+    await notifyTransition(inProgressArgv, sessionID, { hookEventName, notificationType: "turn.started" });
   };
 
   const markError = async (sessionID, hookEventName, detail) => {
@@ -293,7 +311,7 @@ const PLUGIN_SOURCE = `const kanbanOpenCodeBridge = async ({ client }) => {
     // An error review keeps the card visible for the human while the error
     // review reason says why; the completion review for this turn stays
     // suppressed, so a failed model call never reads as a finished task.
-    await notify(reviewArgv, sessionID, {
+    await notifyTransition(reviewArgv, sessionID, {
       hookEventName,
       notificationType: "error",
       activityText: detail || "OpenCode reported an error",
@@ -319,8 +337,9 @@ const PLUGIN_SOURCE = `const kanbanOpenCodeBridge = async ({ client }) => {
     lastReviewKey = reviewKey;
     lastReviewWasCompletion = true;
     state = "review";
-    await notify(reviewArgv, sessionID, {
+    await notifyTransition(reviewArgv, sessionID, {
       hookEventName,
+      notificationType: "turn.completed",
       activityText: "OpenCode finished the turn",
       finalMessage: (latestAssistantText.get(sessionID) || "").trim() || null,
     });
@@ -356,14 +375,20 @@ const PLUGIN_SOURCE = `const kanbanOpenCodeBridge = async ({ client }) => {
     // after-phase forgets it. Reading it afterwards always produced an empty
     // summary, so the card lost the detail the before-event carried.
     let toolInputSummary;
+    let command;
     if (phase === "before") {
       if (callKey) {
         toolInputSummary = summarizeToolArgs(output && output.args) || undefined;
-        toolInputByCall.set(callKey, toolInputSummary);
+        command = toolName === "bash" && typeof output?.args?.command === "string"
+          ? output.args.command.slice(0, 10000)
+          : undefined;
+        toolInputByCall.set(callKey, { toolInputSummary, command });
       }
       await markBusy(sessionID, "BeforeTool");
     } else {
-      toolInputSummary = callKey ? toolInputByCall.get(callKey) || undefined : undefined;
+      const saved = toolInputByCall.get(callKey);
+      toolInputSummary = saved?.toolInputSummary;
+      command = saved?.command;
       if (callKey) {
         toolInputByCall.delete(callKey);
       }
@@ -382,6 +407,29 @@ const PLUGIN_SOURCE = `const kanbanOpenCodeBridge = async ({ client }) => {
       hookEventName: phase === "before" ? "BeforeTool" : "AfterTool",
       toolName,
       toolInputSummary,
+      callID,
+      command,
+      toolResponse: command && typeof output?.output === "string" ? output.output.slice(0, 4000) : undefined,
+    });
+  };
+
+  const markPermission = async (permission) => {
+    const sessionID = permission && typeof permission.sessionID === "string" ? permission.sessionID : null;
+    if (!(await owns(sessionID)) || (state === "review" && !lastReviewWasCompletion)) {
+      return;
+    }
+    // A parked approval is attention, not completion: the state keeps the
+    // following idle from being reported as a finished turn.
+    state = "review";
+    lastReviewWasCompletion = false;
+    const requested = clip(permission && permission.permission) || undefined;
+    const patterns = Array.isArray(permission.patterns) ? permission.patterns.filter((item) => typeof item === "string") : [];
+    const resource = clip(patterns.join(", ") || permission.pattern) || undefined;
+    const summary = [requested, resource].filter(Boolean).join(" ");
+    await notifyTransition(reviewArgv, sessionID, {
+      hookEventName: "PermissionRequest",
+      notificationType: "permission.asked",
+      activityText: summary ? "OpenCode is waiting for approval: " + summary : "OpenCode is waiting for approval",
     });
   };
 
@@ -443,6 +491,16 @@ const PLUGIN_SOURCE = `const kanbanOpenCodeBridge = async ({ client }) => {
       }
 
       const sessionID = typeof properties.sessionID === "string" ? properties.sessionID : null;
+      if (type === "permission.asked") {
+        await markPermission(properties);
+        return;
+      }
+      if (type === "permission.replied") {
+        if (state === "review" && !lastReviewWasCompletion) {
+          await markBusy(sessionID, type);
+        }
+        return;
+      }
       if (type === "session.status") {
         const status = asRecord(properties.status);
         const statusType = status && typeof status.type === "string" ? status.type : "";
@@ -470,8 +528,8 @@ const PLUGIN_SOURCE = `const kanbanOpenCodeBridge = async ({ client }) => {
       await recordTool("before", input, output);
     },
 
-    "tool.execute.after": async (input) => {
-      await recordTool("after", input);
+    "tool.execute.after": async (input, output) => {
+      await recordTool("after", input, output);
     },
 
     "permission.ask": async (permission, output) => {
@@ -479,22 +537,7 @@ const PLUGIN_SOURCE = `const kanbanOpenCodeBridge = async ({ client }) => {
       if (status !== "ask") {
         return;
       }
-      const sessionID = permission && typeof permission.sessionID === "string" ? permission.sessionID : null;
-      if (!(await owns(sessionID))) {
-        return;
-      }
-      // A parked approval is attention, not completion: the state keeps the
-      // following idle from being reported as a finished turn.
-      state = "review";
-      lastReviewWasCompletion = false;
-      const requested = clip(permission && permission.permission) || undefined;
-      const resource = clip(permission && permission.pattern) || undefined;
-      const summary = [requested, resource].filter(Boolean).join(" ");
-      await notify(reviewArgv, sessionID, {
-        hookEventName: "PermissionRequest",
-        notificationType: "permission.asked",
-        activityText: summary ? "OpenCode is waiting for approval: " + summary : "OpenCode is waiting for approval",
-      });
+      await markPermission(permission);
     },
   };
 };

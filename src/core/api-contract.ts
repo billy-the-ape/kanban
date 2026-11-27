@@ -4427,7 +4427,7 @@ export const runtimeTaskTrackingStateResponseSchema = z.object({
 			message: z.string(),
 		}),
 	),
-	/** Per-task agent support: comments serve native Cline and Pi; merge is provider-independent. */
+	/** Per-task agent support: comments serve native Cline, Pi, and OpenCode; merge is provider-independent. */
 	commentsSupportedForTask: z.boolean(),
 	owner: runtimePrTaskOwnerSchema.nullable(),
 	/** "Repairs owned by <workspace/task>" label for non-owner tasks. */

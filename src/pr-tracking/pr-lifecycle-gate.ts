@@ -9,17 +9,11 @@ import type { RuntimeAgentId, RuntimeBoardCard } from "../core/api-contract";
 import type { PrInstalledConsumers } from "./pr-consumer-registry";
 import { resolveCardAutomationPrKey } from "./pr-owner-selection";
 
-/**
- * Whether the comment-follow-up automation can serve a task whose effective
- * agent is `agentId`. Native Cline always is; Pi is servable because the
- * runtime server wires its prepared-turn dispatcher (the dispatcher itself
- * remains the authoritative admission gate at dispatch time in
- * `PrCommentAutomationService.isSupportedAgentTask`). Other terminal harnesses
- * stay blocked so dispatch receipts are never lost.
- * Mirrored client-side in `web-ui/src/utils/pr-tracking.ts`.
- */
-export function isCommentServableAgent(agentId: RuntimeAgentId | null | undefined): agentId is "cline" | "pi" {
-	return agentId === "cline" || agentId === "pi";
+/** Agents with a prepared-turn dispatcher for review feedback. */
+export function isCommentServableAgent(
+	agentId: RuntimeAgentId | null | undefined,
+): agentId is "cline" | "pi" | "opencode" {
+	return agentId === "cline" || agentId === "pi" || agentId === "opencode";
 }
 
 export interface PrLifecycleGateInput {
